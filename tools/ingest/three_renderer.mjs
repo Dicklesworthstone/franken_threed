@@ -33,7 +33,7 @@ import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTarget, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
-import {createThreePassSnapshots, captureThreeArrayCamera} from './three_pass_snapshot.mjs';
+import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground} from './three_pass_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -92,9 +92,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   const {NoToneMapping, SRGBColorSpace} = THREE;
 
   /** Cheap, per-frame profile of scene-level features that select bridge options. */
-  function sceneKey(renderer, scene) {
+  function sceneKey(renderer, scene, backgroundState) {
     const isScene = scene.isScene === true;
-    const background = isScene && scene.background !== null && scene.background !== undefined && !scene.background.isColor;
+    const selected = backgroundState ? backgroundState.background : scene.background;
+    const background = isScene && selected !== null && selected !== undefined && !selected.isColor;
     return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
@@ -124,10 +125,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, frame) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -148,9 +149,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             // A changed feature profile selects different bridge pipelines.
             // Retire the old owner only after the replacement is published.
             const sourceScene = scene.isScene === true;
-            const background = sourceScene && scene.background && !scene.background.isColor;
-            // Options and the entry key describe the same live profile.
-            const liveKey = sceneKey(owner, scene);
+            const selectedBackground = passOptions?.backgroundState ? passOptions.backgroundState.background : scene.background;
+            const background = sourceScene && selectedBackground && !selectedBackground.isColor;
+            // The captured background and live structural options must select
+            // the same profile during preparation and submission.
+            const liveKey = sceneKey(owner, scene, passOptions?.backgroundState);
             let bridge;
             try { bridge = await createGpuThreeScene(device, scene, {
               // Mesh-count caps follow the binding capacity; the byte budgets
@@ -160,6 +163,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // device-scale default (1 GiB) rather than the bridge's 128 MiB.
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
+              backgroundState: passOptions?.backgroundState,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -183,7 +187,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             }); } catch (error) {
               // The scene gained/lost fog, environment or background while the
               // bridge was being created: the next preparation round rebuilds it.
-              if (error?.code === 'THREE_SCENE_SCENE' && sceneKey(owner, scene) !== liveKey) continue;
+              if (error?.code === 'THREE_SCENE_SCENE' && sceneKey(owner, scene, passOptions?.backgroundState) !== liveKey) continue;
               throw error;
             }
             if (disposed) { bridge.dispose(); return; }
@@ -630,7 +634,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel;
       const destination = target ? this._targets.capture(target) : this;
-      const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene);
+      const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
+      const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene, backgroundState);
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
@@ -668,12 +673,26 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const nodeFrame = native && !nodeCaptureDeferred
         ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras}) : null;
       if (nodeFrame) matricesUpdated = true;
+      // Native callbacks retain the original camera in _captureNodeFrame.
+      // Fixed draws can wait on pipeline/texture preparation; capture their
+      // ordinary camera only after the source matrix and node updates finish.
+      if (native && !nodeCaptureDeferred && captureCameras && !camera.isArrayCamera) {
+        if (!matricesUpdated) this._updateNativeMatrices(scene, camera);
+        camera = captureThreeCamera(THREE, camera); matricesUpdated = true;
+      }
       return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, frame, overrideMaterial,
-        nodeCaptureDeferred, captureCameras,
+        nodeCaptureDeferred, captureCameras, backgroundState,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
           outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height}};
+    }
+    _updateNativeMatrices(scene, camera) {
+      if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
+      if (camera.coordinateSystem !== this.coordinateSystem) {
+        camera.coordinateSystem = this.coordinateSystem; camera.updateProjectionMatrix();
+      }
+      if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
     }
     _renderFrame(scene, camera, clearOnly = null) {
       const request = this._makeRequest(scene, camera, clearOnly);
@@ -720,7 +739,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, deferred = false}) {
+    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, deferred = false}) {
       snapshot?.install();
       nodeFrame?.installAttributes?.();
       const previous = this._programFrame;
@@ -729,8 +748,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._programFrame = deferred ? programFrame : undefined;
       try {
         const issue = () => {
-          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, frame);
-          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame}, {...frame, ...attachments}), {mipLevel});
+          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, frame);
+          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, {...frame, ...attachments}), {mipLevel});
         };
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
         const resources = () => {
@@ -805,12 +824,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         for (let attempts = 0; ; attempts++) {
           if (attempts > 8) fail('PREPARE', 'Source structure kept changing during preparation');
           if (destination !== this) this._targets.assertCurrent(destination);
-          destination._wanted.set(scene, sceneKey(this, scene));
+          destination._wanted.set(scene, sceneKey(this, scene, request.backgroundState));
           await this._prepare(destination, request);
           if (this._disposed) return;
           try {
             const entry = destination._dispatcher?.entry(scene);
-            if (!entry || entry.key !== sceneKey(this, scene)) fail('PREPARE', 'Scene profile changed during preparation');
+            if (!entry || entry.key !== sceneKey(this, scene, request.backgroundState)) fail('PREPARE', 'Scene profile changed during preparation');
             this._submit(request); break;
           } catch (error) {
             if (!isPrepareBoundary(error)) throw error;
@@ -848,8 +867,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         if (request?.nodeCaptureDeferred) {
+          // The source's async-before-init path observes scene inputs at this
+          // boundary. Refresh the selector before callbacks so fixed background
+          // ownership and native sky packets describe that same accepted frame.
+          request.backgroundState = captureThreeBackground(THREE, request.scene);
+          request.key = sceneKey(this, request.scene, request.backgroundState);
+          destination._wanted.set(request.scene, request.key);
           request.nodeFrame = this._captureNodeFrame(request);
           request.matricesUpdated ||= !!request.nodeFrame;
+          if (request.captureCameras && !request.camera.isArrayCamera) {
+            if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
+            request.camera = captureThreeCamera(THREE, request.camera); request.matricesUpdated = true;
+          }
           request.nodeCaptureDeferred = false;
         }
         const captured = request?.nodeFrame;
@@ -860,7 +889,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const previousOptions = destination._preparationOptions;
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
-        destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame} : undefined;
+        destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame,
+          backgroundState: request.backgroundState} : undefined;
         try {
           request?.snapshot?.install();
           captured?.prepareAttributes?.();
@@ -1126,10 +1156,13 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
   return WebGLRenderer;
 }
 
-/** `PMREMGenerator` for renderers on this route. Upstream PMREM renders into
- * CubeUV render targets with renderer internals this route does not have; here
- * the result's texture describes the source instead, and the scene bridge's
- * environment owner prepares it at its preparation boundary:
+/** The native WebGPU route retains the pinned PMREM construction/filtering
+ * helper and supplies this renderer for every generated draw. The helper does
+ * not construct a source renderer or backend. Its real CubeUV targets can be
+ * sampled by native node materials and backgrounds through the target owner.
+ *
+ * The WebGL-authored route still describes the source for the scene bridge's
+ * environment owner to prepare at its preparation boundary:
  * - fromScene(scene, sigma, near, far, {size, position}): captured into an
  *   rgba16float cubemap with the native scene bridge when first prepared (not at
  *   this call; later edits to the captured scene before preparation are seen),
@@ -1140,12 +1173,56 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
  * render targets fail explicitly. Other renderers get the upstream class.
  */
 export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
+  const nativeGenerator = renderer => {
+    const generator = new THREE.PMREMGenerator(renderer), source = THREE.PMREMGenerator.prototype;
+    const releaseWhenReady = release => {
+      if (!renderer._drain && !renderer._preparing) { release(); return; }
+      renderer.waitForGPU().then(release, release).catch(error => { renderer._deferredError ??= error; });
+    };
+    const retire = (method, all) => {
+      // r186 replaces these fields on a size change. Capture their resource
+      // identities now: cleanup of the live generator after the queue drains
+      // would otherwise dispose the next generation's targets and materials.
+      const retired = Object.assign(Object.create(source), {
+        _blurMaterial: generator._blurMaterial, _ggxMaterial: generator._ggxMaterial,
+        _pingPongRenderTarget: generator._pingPongRenderTarget,
+        _lodMeshes: generator._lodMeshes.map(mesh => ({geometry: mesh.geometry})),
+      });
+      if (all) Object.assign(retired, {
+        _cubemapMaterial: generator._cubemapMaterial, _equirectMaterial: generator._equirectMaterial,
+        _backgroundBox: generator._backgroundBox && {
+          geometry: generator._backgroundBox.geometry, material: generator._backgroundBox.material,
+        },
+      });
+      const release = () => source[method].call(retired);
+      // Submitted GPU work already owns its resources. Deferred preparation and
+      // submission still need the source objects to remain valid. Both rejected
+      // drains and successful drains must release the retired private resources;
+      // the returned public output target is deliberately absent from this view.
+      releaseWhenReady(release);
+    };
+    Object.defineProperties(generator, {
+      _dispose: {configurable: true, writable: true, value() { retire('_dispose', false); }},
+      dispose: {configurable: true, writable: true, value() { retire('dispose', true); }},
+      _sceneToCubeUV: {configurable: true, writable: true, value(...args) {
+        // The source helper reuses a mutable fixed-material background box.
+        // Each generation needs its own color while previous draws are queued.
+        const previous = generator._backgroundBox; generator._backgroundBox = null;
+        if (previous) releaseWhenReady(() => { previous.geometry.dispose(); previous.material.dispose(); });
+        return source._sceneToCubeUV.apply(generator, args);
+      }},
+    });
+    return generator;
+  };
   class PMREMGenerator {
     constructor(renderer) {
       if (!renderer?.isF3DRenderer) {
         if (exactBackend) return new exactBackend(renderer);
         fail('ROUTE', 'This PMREMGenerator serves the new-backend renderer route');
       }
+      if (renderer.isWebGPURenderer === true && renderer._shaderEncodedOutput !== true &&
+          typeof THREE.WGSLNodeBuilder === 'function' && typeof THREE.PMREMGenerator === 'function')
+        return nativeGenerator(renderer);
       this._renderer = renderer;
     }
     fromScene(scene, sigma = 0, near = 0.1, far = 100, options = {}) {

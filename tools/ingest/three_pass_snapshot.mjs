@@ -27,6 +27,39 @@ const MATH = ['Vector2', 'Vector3', 'Vector4', 'Matrix3', 'Matrix4', 'Color', 'Q
 const TEXTURE_STATE = ['version', 'format', 'type', 'colorSpace', 'mapping', 'channel', 'wrapS', 'wrapT', 'magFilter', 'minFilter',
   'anisotropy', 'flipY', 'premultiplyAlpha', 'generateMipmaps', 'rotation', 'matrixAutoUpdate'];
 
+/** Native callbacks observe the source camera before this private execution
+ * view is captured. Queued fixed draws then keep that call's projection, pose,
+ * layers and viewport without invoking source clone/copy hooks. */
+export function captureThreeCamera(T, source, array = false) {
+  if (!(source instanceof T.Camera) || (!source.isPerspectiveCamera && !source.isOrthographicCamera) ||
+      (!array && source.isArrayCamera) || source.isMultiViewCamera || source.reversedDepth)
+    fail('CAMERA', 'Native camera views require non-reversed perspective or orthographic cameras');
+  const result = view(source);
+  for (const key of ['id', 'uuid', 'name', 'type', 'isCamera', 'isPerspectiveCamera', 'isOrthographicCamera',
+    'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth'])
+    if (key in source) put(result, key, source[key]);
+  for (const key of ['matrixWorld', 'matrixWorldInverse', 'projectionMatrix', 'projectionMatrixInverse'])
+    put(result, key, new T.Matrix4().copy(source[key]));
+  const layers = new T.Layers(); layers.mask = source.layers.mask; put(result, 'layers', layers);
+  if (source.viewport) put(result, 'viewport', new T.Vector4().copy(source.viewport));
+  put(result, 'parent', null); put(result, 'children', []); put(result, 'matrixWorldAutoUpdate', false);
+  return result;
+}
+
+/** Background selectors and numeric controls belong to the accepted render,
+ * including an explicit null while retained PMREM captures a Color scene.
+ * Textures/nodes retain resource identity; mutable Color/Euler values do not. */
+export function captureThreeBackground(T, scene) {
+  if (scene.isScene !== true) return undefined;
+  const background = scene.background, rotation = scene.backgroundRotation;
+  return Object.freeze({
+    background: background?.isColor ? new T.Color().copy(background) : background,
+    backgroundNode: scene.backgroundNode,
+    backgroundBlurriness: scene.backgroundBlurriness, backgroundIntensity: scene.backgroundIntensity,
+    backgroundRotation: rotation?.isEuler ? new T.Euler(rotation.x, rotation.y, rotation.z, rotation.order) : rotation,
+  });
+}
+
 /** An ArrayCamera render may wait for scene preparation. Keep every view's
  * call-time matrices, layers and viewport in a private data view; later changes
  * to the cameras array or its children must not retarget an earlier render.
@@ -39,19 +72,8 @@ export function captureThreeArrayCamera(T, camera, maxViews = 256) {
     fail('CAMERA', 'Expected an ordinary ArrayCamera within the view capacity');
   const copied = new Map();
   function capture(source, array = false) {
-    if (!(source instanceof T.Camera) || (!source.isPerspectiveCamera && !source.isOrthographicCamera) ||
-        (!array && source.isArrayCamera) || source.reversedDepth)
-      fail('CAMERA', 'ArrayCamera views require non-reversed perspective or orthographic cameras');
     if (copied.has(source)) return copied.get(source);
-    const result = view(source); copied.set(source, result);
-    for (const key of ['id', 'uuid', 'name', 'type', 'isCamera', 'isPerspectiveCamera', 'isOrthographicCamera',
-      'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth'])
-      if (key in source) put(result, key, source[key]);
-    for (const key of ['matrixWorld', 'matrixWorldInverse', 'projectionMatrix', 'projectionMatrixInverse'])
-      put(result, key, new T.Matrix4().copy(source[key]));
-    const layers = new T.Layers(); layers.mask = source.layers.mask; put(result, 'layers', layers);
-    if (source.viewport) put(result, 'viewport', new T.Vector4().copy(source.viewport));
-    put(result, 'parent', null); put(result, 'children', []); put(result, 'matrixWorldAutoUpdate', false);
+    const result = captureThreeCamera(T, source, array); copied.set(source, result);
     return result;
   }
   const result = capture(camera, true);

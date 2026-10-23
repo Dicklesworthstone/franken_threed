@@ -74,6 +74,44 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_scene_environment(T, renderer) {
+    const room = new T.Scene(); room.background = new T.Color(.035, .055, .09);
+    const walls = new T.Mesh(new T.BoxGeometry(7, 5, 7),
+      new T.MeshBasicMaterial({color: new T.Color(.12, .14, .18), side: T.BackSide}));
+    room.add(walls);
+    const geometry = new T.BoxGeometry(1, 1, 1);
+    for (const [position, scale, color] of [
+      [[-2.7, .6, -.6], [.2, 2.8, 2], [3, .35, .08]],
+      [[1.6, 1.8, -.8], [1.7, .2, 1.3], [.1, 1.3, 3]],
+      [[.4, -.9, -2.5], [2, 1.1, .2], [.3, 2, .5]],
+    ]) {
+      const panel = new T.Mesh(geometry, new T.MeshBasicMaterial({
+        color: new T.Color(...color), toneMapped: false,
+      }));
+      panel.position.set(...position); panel.scale.set(...scale); room.add(panel);
+    }
+    const generator = new T.PMREMGenerator(renderer);
+    const atlas = generator.fromScene(room, .04, .1, 30, {size: 32, position: new T.Vector3(.15, .35, -.2)});
+    generator.dispose();
+    // Restored public background changes must not clear the queued cube faces.
+    room.background.setRGB(1, 0, 1);
+    const result = {scene: new T.Scene(), camera: camera(T)};
+    result.scene.environment = result.scene.background = atlas.texture;
+    result.scene.backgroundBlurriness = .35; result.scene.backgroundIntensity = .55;
+    result.scene.environmentRotation.set(.08, -.4, .1);
+    result.scene.backgroundRotation.copy(result.scene.environmentRotation);
+    const materials = [
+      new T.MeshStandardMaterial({color: 0xdba05c, metalness: .65, roughness: .2}),
+      new T.MeshPhysicalMaterial({color: 0x83b5d5, metalness: .15, roughness: .24, clearcoat: .7}),
+    ];
+    for (const [index, material] of materials.entries()) {
+      material.positionNode = T.TSL.positionLocal;
+      material.roughnessNode = T.TSL.uniform(material.roughness).setName('sceneEnvironmentRoughness');
+      const mesh = new T.Mesh(new T.SphereGeometry(.7, 32, 20), material);
+      mesh.position.x = index ? .84 : -.84; result.scene.add(mesh);
+    }
+    return {...result, room, atlas, materials};
+  },
   native_tsl_source_materials(T, renderer) {
     const {positionLocal, normalLocal, transformNormalToView, vec3, uniform} = T.TSL;
     const result = {scene: scene(T), camera: camera(T)};

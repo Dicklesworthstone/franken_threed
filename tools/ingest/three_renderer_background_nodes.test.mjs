@@ -6,7 +6,7 @@ import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {nativeTSLScenarios} from '../../tests/e2e/webgpu_renderer/scenarios_native_tsl.js';
-const Renderer = createWebGPURendererClass(THREE), N = THREE.TSL;
+const Renderer = createWebGPURendererClass(THREE, {maxDraws: 64, maxBindings: 64}), N = THREE.TSL;
 function panorama(value = 0x3800) {
   const texture = new THREE.DataTexture(new Uint16Array(64 * 32 * 4).fill(value), 64, 32,
     THREE.RGBAFormat, THREE.HalfFloatType);

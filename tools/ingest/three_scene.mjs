@@ -69,7 +69,7 @@ export async function createGpuThreeScene(device,scene,{
   maxNodes=16384,maxGeometries=256,maxBindings=1024,maxGeometryBytes=128*1024*1024,sortObjects=true,
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
-  program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,
+  program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,backgroundState:initialBackgroundState=undefined,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
@@ -86,6 +86,11 @@ export async function createGpuThreeScene(device,scene,{
   // consumes descriptors only; it never replays NodeFrame updates or reads later
   // values from the application's UniformNodes.
   let passNodeFrame=initialNodeFrame;
+  // Native facade calls may wait for preparation after a retained helper has
+  // restored the public scene. Keep only this pass's background state here;
+  // the source Scene itself and its callback identity remain untouched.
+  let passBackgroundState=initialBackgroundState;
+  const backgroundScene=()=>passBackgroundState??scene;
   const colorMaterial=m=>m&&m.allowOverride===true&&passOverride!==null?passOverride:m;
   const colorMaterials=o=>(Array.isArray(o.material)?o.material:[o.material]).map(colorMaterial);
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
@@ -153,7 +158,10 @@ export async function createGpuThreeScene(device,scene,{
   if(backgroundEnabled&&renderOptions.outputTransfer==='srgb')fail('OPTIONS','Texture background passes do not encode shader-side sRGB output');
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
-  const sourceBackground=()=>!passNodeFrame?.background&&scene.background!==null&&!scene.background?.isColor?scene.background:null;
+  const sourceBackground=()=>{
+    const selected=backgroundScene().background;
+    return !passNodeFrame?.background&&selected!==null&&!selected?.isColor?selected:null;
+  };
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
   const models=new Map([
@@ -369,7 +377,7 @@ export async function createGpuThreeScene(device,scene,{
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
-      backgroundApi.inspectThreeBackgroundState(scene);
+      backgroundApi.inspectThreeBackgroundState(backgroundScene());
     }
     if(coreEnvironment()!==null)environmentApi.inspectThreeEnvironment(scene.environment,three,environmentOptions);
     if(shadowEnabled){
@@ -1075,12 +1083,12 @@ export async function createGpuThreeScene(device,scene,{
   /** One retry per mesh the core deformer refused at capture: the next pass
    * describes it as its ShaderLib program. */
   async function prepare(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','nodeFrame'].includes(k)))
-      fail('OPTIONS','Expected preparation options with optional overrideMaterial and native node frame');
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','nodeFrame','backgroundState'].includes(k)))
+      fail('OPTIONS','Expected preparation options with optional overrideMaterial, native node frame and background state');
     const explicit=Object.hasOwn(options,'overrideMaterial');
     const selected=explicit?options.overrideMaterial:scene.overrideMaterial;
     for(let attempt=0;;attempt++){
-      try{passNodeFrame=options.nodeFrame??null;return await prepareOnce(selected,!explicit);}
+      try{passNodeFrame=options.nodeFrame??null;passBackgroundState=options.backgroundState;return await prepareOnce(selected,!explicit);}
       catch(error){if(error?.code!=='THREE_SCENE_DEFORMATION_ROUTE'||attempt>=8)throw error;}
     }
   }
@@ -1329,7 +1337,7 @@ export async function createGpuThreeScene(device,scene,{
         const current=sourceBackground();
         if(current!==selectedBackground||(current&&!same(backgroundSignature,backgroundApi.inspectThreeBackground(current,three,backgroundOptions).signature)))
           fail('CHANGED','Source background changed during preparation');
-        nextBackground?.check();if(current)backgroundApi.inspectThreeBackgroundState(scene);
+        nextBackground?.check();if(current)backgroundApi.inspectThreeBackgroundState(backgroundScene());
       }
       if(shadowOwner!==nextShadow){shadowOwner?.dispose();shadowStats=null;}
       else for(const [entry,caster] of casters)if(!nextCasters.has(entry))caster.dispose();
@@ -1350,7 +1358,7 @@ export async function createGpuThreeScene(device,scene,{
       for(const source of addedInstances){instances.get(source)?.dispose();instances.delete(source);}
       if(!textureOwner?.disposed&&!textureOwner?.failed)textureOwner?.retain(retainedTextures);
       return failed(error);
-    }finally{busy=false;preparing=false;passNodeFrame=null;}
+    }finally{busy=false;preparing=false;passNodeFrame=null;passBackgroundState=undefined;}
   }
   function checkCamera(camera){
     if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.reversedDepth)
@@ -1403,7 +1411,7 @@ export async function createGpuThreeScene(device,scene,{
           {cameraPosition:position(child)}),viewMatrix:child.matrixWorldInverse.elements.slice()},
         fog:fogEnabled?fogApi.threeFogDescriptor(scene.fog,shadingCamera,three):null,
         // Pinned Background inserts a default-layer mesh after parent culling.
-        background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(scene,child):null};
+        background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(backgroundScene(),child):null};
     });
   }
   function render(camera,frame,options={}){
@@ -1411,10 +1419,11 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame'].includes(k)))
-        fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame and matrix-update flag');
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState'].includes(k)))
+        fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
+      passBackgroundState=options.backgroundState;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
@@ -1456,7 +1465,7 @@ export async function createGpuThreeScene(device,scene,{
       // falls back to the parent camera for objects with frustumCulled=false.
       const singleCamera=arrayViews?.length===0?Object.assign(Object.create(camera),{isArrayCamera:false}):camera;
       const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(scene.fog,singleCamera,three):null;
-      const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(scene,singleCamera)??null:null;
+      const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(backgroundScene(),singleCamera)??null:null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transmissive=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
       const get=(m,topology,object=null)=>{
@@ -1745,8 +1754,8 @@ export async function createGpuThreeScene(device,scene,{
         ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
       if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
-      if(scene.background?.isColor&&!passNodeFrame?.background){
-        prepared.clearColor=rgba(scene.background);prepared.loadOp='clear';
+      if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
+        prepared.clearColor=rgba(backgroundScene().background);prepared.loadOp='clear';
         // Shader-side sRGB output: the attachment stores encoded values.
         if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];
       }
@@ -1821,7 +1830,7 @@ export async function createGpuThreeScene(device,scene,{
       // Do not expose a partially submitted owner as safe for accidental retry.
       if(backgroundSubmitted){terminal??=error;rejectStopped(terminal);}
       return failed(error);
-    }finally{busy=false;frameTextures=null;passNodeFrame=null;if(disposed||terminal)release();}
+    }finally{busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene:root,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
@@ -1850,6 +1859,6 @@ export async function createGpuThreeScene(device,scene,{
       if(fogEnabled)renderer=fogApi.withThreeFogReceivers(renderer,renderOptions.maxDraws??1024);
       return renderer;
     });
-    await Promise.race([construction,stopped]);live();await prepare({...(initialOverride===undefined?{}:{overrideMaterial:initialOverride}),nodeFrame:initialNodeFrame});return bridge;
+    await Promise.race([construction,stopped]);live();await prepare({...(initialOverride===undefined?{}:{overrideMaterial:initialOverride}),nodeFrame:initialNodeFrame,backgroundState:initialBackgroundState});return bridge;
   }catch(error){disposed=true;release();throw error;}
 }

@@ -113,6 +113,20 @@ intensity and rotation remain source uniforms; replacing the environment selects
 its corresponding atlas and preserves already queued draw bindings. A wholly
 native scene bypasses the separate fixed-material environment filter.
 
+The public native `PMREMGenerator.fromScene()` and `fromEquirectangular()`
+methods execute the pinned helper through F3D-owned render requests and return
+real CubeUV render targets. Scene generation supports the source capture size,
+position and near/far controls, optional Gaussian pre-blur, and GGX filtering.
+Each of the six face renders retains its own camera matrices. The helper's
+temporary null background stays null for those accepted renders after it
+restores the application scene.
+
+Immediate generator disposal and later generator resizing retain private filter
+resources until accepted work drains. Repeated scene generations use separate
+private solid-background boxes, preserving each generation's color. The public
+output target remains caller-owned and sampleable after generator disposal.
+The WebGL/core placeholder route retains its existing behavior.
+
 A same-size equirectangular input can set `needsPMREMUpdate = true` between
 native renders and regenerate its existing atlas. The cached graph must place
 its exact source PMREM before-updates at the first draw boundary. A private
@@ -156,11 +170,12 @@ sky material and geometry; disposing it does not dispose the application's
 background node. Unsupported graph resources fail before application callbacks
 or submission.
 
-Sharp equirectangular backgrounds still use the existing fixed background path.
-Its controls are read during deferred preparation, so drain outstanding renders
-before crossing between zero and positive blurriness. The new native background
-path captures positive-to-positive updates and CubeUV updates, including CubeUV
-blur zero. These boundaries do not establish full H7 or H8 compatibility.
+Sharp equirectangular backgrounds continue through the fixed background pass,
+with their selector, camera, intensity and rotation captured for each accepted
+native render. Queued sharp-to-blurred-to-sharp transitions now preserve all
+three states, including later edits to the public scene. Mutable Color
+backgrounds likewise retain each call's clear value. These capabilities do not
+establish full H7 or H8 compatibility.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -566,3 +581,14 @@ mixed-foreground refusal, stale graph recompilation, and accepted child filters
 surviving an outer callback failure. A private native background permits safe
 refresh with both fixed and native scene draws. These are command/resource
 ordering checks; refreshed-environment pixel parity is not established.
+
+Public PMREM regressions exercise actual RoomEnvironment scene capture, optional
+sigma blur and GGX filtering, six distinct submitted face matrices, temporary
+background restoration, independent generation colors, resize/disposal lifetime,
+and failed-wait cleanup. Native camera/background tests also cover immutable
+Color clears, sharp/blurred transitions, original callback camera identity and
+coherent pre-initialization selection. The registered
+`native_tsl_scene_environment` browser scenario bakes an asymmetric room, disposes
+the helper immediately, and lights mapped-source-compatible Standard/Physical
+surfaces while also displaying the generated sky. Its recording-device path is
+tested; GPU pixel parity for the new scene bake is not yet measured.
