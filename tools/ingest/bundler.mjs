@@ -19,6 +19,10 @@ import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
+import {
+  LOADER_RESOURCES_IMPORT, LOADER_RESOURCES_FILE,
+  threeLoaderResourceEdits, createThreeLoaderResourceModule,
+} from "./three_loader_resources.mjs";
 
 /**
  * Resolves the directory of a module on disk given its Rollup module ID.
@@ -104,8 +108,10 @@ export function f3dRollupPlugin(options = {}) {
   const dynamicChunkRefIds = new Set();
   const gltfAssetRefIds = new Set();
   const documentAssets = new Map();
+  const documentResourceURLs = new Map();
   const documentRequests = [];
   let defaultManagerExposed = false;
+  let loaderResourceCalls = false;
 
   function emitModuleAsset(context, assetPath) {
     if (emittedAssetsByPath.has(assetPath)) return emittedAssetsByPath.get(assetPath);
@@ -181,11 +187,15 @@ export function f3dRollupPlugin(options = {}) {
     name: "f3d-ingest-resolver",
 
     generateBundle(_outputOptions, bundle) {
-      if (defaultManagerExposed) return;
-      for (const { requests, id } of documentRequests) {
+      for (const { requests, id } of defaultManagerExposed ? [] : documentRequests) {
         for (const [fileName, asset] of collectThreeLoaderAssets(requests, {
           documentUrl: options.documentUrl,
           documentBaseUrl: mapBaseUrl,
+          onResource: (filename, url) => {
+            const root = new URL("./", options.documentUrl).href;
+            if (!documentResourceURLs.has(filename)) documentResourceURLs.set(filename, new Set());
+            documentResourceURLs.get(filename).add(url.slice(root.length));
+          },
           fail: (code, message) => this.error({ code, message: `${message} (loader in ${JSON.stringify(id)})` }),
         })) documentAssets.set(fileName, asset);
       }
@@ -199,6 +209,12 @@ export function f3dRollupPlugin(options = {}) {
           this.error(`Loader resource ${JSON.stringify(fileName)} collides with an emitted bundle file`);
         }
         this.emitFile({ type: "asset", fileName, ...asset });
+      }
+      if (loaderResourceCalls) {
+        if (bundle[LOADER_RESOURCES_FILE] || documentAssets.has(LOADER_RESOURCES_FILE))
+          this.error("Embedded loader resolver collides with an emitted application resource");
+        this.emitFile({ type: "asset", fileName: LOADER_RESOURCES_FILE,
+          source: createThreeLoaderResourceModule(documentAssets, { logicalURLs: documentResourceURLs }) });
       }
     },
 
@@ -220,6 +236,8 @@ export function f3dRollupPlugin(options = {}) {
     },
 
     resolveId(source, importer) {
+      if (source === LOADER_RESOURCES_IMPORT && options.prepareStandaloneLoaders)
+        return { id: "./" + LOADER_RESOURCES_FILE, external: true, moduleSideEffects: false };
       if (inlineModules.has(source)) {
         return source;
       }
@@ -354,6 +372,10 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
+        if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith("file:")) {
+          const loaderEdits = threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
+          if (loaderEdits.length) { edits.push(...loaderEdits); loaderResourceCalls = true; }
+        }
         if (options.documentUrl && (code.includes("load") || code.includes("LoadingManager"))) {
           const requests = findThreeLoaderRequests(ast, {
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
@@ -673,6 +695,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           inlineModules,
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls,
+          prepareStandaloneLoaders: options.prepareStandaloneLoaders,
           ...(isHtml ? { documentUrl: entryUrl } : {}),
         }),
         ...(numericPlugin ? [numericPlugin] : []),

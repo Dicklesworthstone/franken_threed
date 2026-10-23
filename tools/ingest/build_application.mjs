@@ -909,6 +909,7 @@ function pathExistsOrSymlink(targetPath) {
  * @param {string} outDir - Destination directory for emitted application (must be fresh)
  * @param {Object} [options]
  * @param {string} [options.packageRootUrl] - Base URL or directory for package fallback
+ * @param {boolean} [options.prepareStandaloneLoaders] - Embed finite pinned-loader resources for a following packHtml call; unknown routes remain networked
  * @returns {Promise<{
  *   entryPoint: string,
  *   outDir: string,
@@ -1203,6 +1204,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     packageRootUrl: options.packageRootUrl,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
+    prepareStandaloneLoaders: options.prepareStandaloneLoaders,
     ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets } } : {}),
   });
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {

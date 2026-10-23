@@ -293,7 +293,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
 }
 
 /** Copies the finite local closure without changing the loader's original URL strings. */
-export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl, fail }) {
+export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl, fail, onResource }) {
   const result = new Map(), entryDir = path.dirname(fileURLToPath(documentUrl));
   const add = (uri) => {
     if (!relativeUrl(uri)) return null;
@@ -309,6 +309,7 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
     // missing resource. Retain that request and its source success/error path.
     if (!fs.existsSync(filename) || !fs.statSync(filename).isFile()) return null;
     const fileName = relative.split(path.sep).join("/");
+    onResource?.(fileName, new URL(uri, documentBaseUrl).href);
     if (!result.has(fileName)) result.set(fileName, { source: fs.readFileSync(filename), originalFileName: filename });
     return result.get(fileName);
   };

@@ -18,6 +18,7 @@ Options:
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
   --out-dir <dir>       Alias for --build-app
   --pack-html <file>    Export emitted HTML as one file, alone or after --build-app
+                       With --build-app, embeds discovered pinned Three.js loader resources
   --specialize-numeric Discover and compile guarded numeric updates in --build-app
   --route-webgpu-renderer Route WebGPURenderer to the general new WebGPU backend in --build-app
                        when the whole-graph route decision admits every construction site
@@ -352,6 +353,7 @@ async function main() {
         specializeNumeric: specializeNumeric ? { maxMemoryPages } : false,
         routeWebGPURenderer,
         routeWebGLRenderer,
+        prepareStandaloneLoaders: Boolean(packHtmlFile),
       });
       if (appResult.rendererRoute) {
         const route = appResult.rendererRoute;
