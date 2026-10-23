@@ -36,6 +36,25 @@ program. The source's shared 16×16 RG16F DFG lookup texture goes through the sa
 versioned texture owner as authored textures, preserving its aliasing across
 materials and clearcoat samples.
 
+Native Standard and Physical graphs also use ready 2D equirectangular or source
+CubeUV `scene.environment` textures. The pinned native `PMREMGenerator` supplies
+conversion/filter graphs and atlas layout; FrankenThreeD captures and submits
+those ordinary node draws through its own renderer. Generated PMREM targets and
+the source DFG texture are borrowed through the same versioned texture owner.
+The retained renderer/backend does not submit commands. Live environment
+intensity and rotation remain source uniforms; replacing the environment selects
+its corresponding atlas and preserves already queued draw bindings. A wholly
+native scene bypasses the separate fixed-material environment filter.
+
+In-place equirectangular `needsPMREMUpdate` regeneration currently fails with
+`THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before callbacks or submission. The
+existing whole-render resource transaction is preserved; regeneration from
+source before-updates needs further nested-pass ownership work. Replacing the
+source texture is admitted, and directly supplied CubeUV textures retain their
+ordinary upload-version behavior. Cube environment inputs, custom environment
+nodes and the compatibility adapter's placeholder PMREM textures remain outside
+this native profile.
+
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
 matrix selection, explicit/generated UVs, color-space interpretation, explicit
@@ -185,7 +204,7 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone matrix storage arrays, nested/boolean/atomic
 struct members, PBO storage, explicit uniform-buffer arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, environment lighting, area/probe/custom lights,
+PBR transmission/dispersion, cube/custom environment lighting, area/probe/custom lights,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
@@ -285,7 +304,8 @@ count before readback. All three images matched the pinned reference exactly in
 RGB, including the empty target; CPU storage remained unchanged. Recording
 regressions cover post-update capture, callbacks on zero draws, indexed and
 nonindexed commands, bundle reuse/invalidation and source draw-call counts.
-The `native_tsl_storage_structs` scenario uses the H8 particle layout with
-compute-written position, velocity and matrix fields. This bounded structured
-particle path does not establish compatibility for the complete H8 fluid
-application.
+The `native_tsl_storage_structs` scenario uses the exact H8 particle schema,
+including its 80-byte stride and padded mat3 columns. Its bounded comparison
+matched the pinned reference exactly for three queued images and all 100
+read-back float words, including a second compute update and unmarked CPU edits.
+This does not establish compatibility for the complete H8 fluid application.

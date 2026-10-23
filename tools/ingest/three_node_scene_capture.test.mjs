@@ -55,6 +55,30 @@ test('native draws capture source identities, matrices, frame context and indepe
   assert.deepEqual(captured.draws.map(draw => draw.nodeUniforms), old); assert.equal(captured.draws.length, 2);
   assert.equal(f.frame.frameId, 7); assert.equal(f.renderer.info.calls, 3);
 });
+test('nested preparation preserves the outer render clock and source update frequency', t => {
+  const f = rig(t), m = f.material(), seen = [];
+  const observe = (phase, frame) => seen.push([phase, frame.frameId, frame.renderId, frame.time, frame.deltaTime]);
+  const tint = N.uniform(.5).onRenderUpdate(frame => { observe('current', frame); return .5; });
+  tint.updateBeforeType = 'render'; tint.updateBefore = frame => { observe('before', frame); };
+  tint.updateAfterType = 'render'; tint.updateAfter = frame => { observe('after', frame); };
+  m.colorNode = N.vec3(tint); f.mesh(m); f.mesh(m);
+  let prepared = false;
+  const programs = {...f.owner, compile(...args) {
+    if (!prepared) {
+      prepared = true;
+      // A retained preparation helper may render before returning its program.
+      // Its global call counters belong to those nested passes, not this draw.
+      f.renderer.info.calls += 13;
+      Object.assign(f.frame, {frameId: 8, time: 2, deltaTime: .25});
+    }
+    return f.owner.compile(...args);
+  }};
+  const captured = f.capture({getPrograms: () => programs});
+  assert.equal(captured.draws.length, 2);
+  assert.deepEqual(seen, ['before', 'current', 'after'].map(phase => [phase, 7, 3, 1.25, .125]));
+  assert.equal(f.renderer.info.calls, 16, 'capturing the outer clock does not roll back nested counters');
+  assert.deepEqual([f.frame.frameId, f.frame.time, f.frame.deltaTime], [8, 2, .25]);
+});
 test('compile-only capture prepares hidden bindings without node updates or frame advancement', t => {
   const f = rig(t), m = f.material(); let calls = 0;
   m.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { calls++; return new THREE.Color(1, 0, 0); });

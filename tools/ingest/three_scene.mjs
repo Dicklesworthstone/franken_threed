@@ -584,7 +584,9 @@ export async function createGpuThreeScene(device,scene,{
     try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
   }
-  const coreEnvironment=()=>environmentEnabled&&!programEnvironmentOwned()?scene.environment:null;
+  // Captured native node programs bind the source PMREM atlas themselves.
+  // Keep the fixed environment owner only for scenes with fixed draws.
+  const coreEnvironment=()=>environmentEnabled&&!nativeLightMode&&!programEnvironmentOwned()?scene.environment:null;
   let programCamera=null;
   /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
   function programLightList(camera){

@@ -73,6 +73,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
+  // Source construction can render nested preparation passes (PMREM does so).
+  // Preserve this logical render's clock before any builder advances info.calls.
+  const frame = renderer._nodes.nodeFrame;
+  const frameStamp = {frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
+    renderId: renderer.info.calls};
   const programs = getPrograms(), context = {scene: root, camera, lights: Object.freeze([]),
     lightingEnabled: renderer.lighting?.enabled !== false};
   // Admission is completed before camera updates, graph construction or node
@@ -165,9 +170,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!Number.isSafeInteger(bytes) || bytes > maxUniformBytes)
       fail('LIMIT', 'Native scene capture exceeds its pending uniform byte budget');
   }
-  const frame = renderer._nodes.nodeFrame;
-  const frameContext = {...context, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
-    renderId: renderer.info.calls};
+  const frameContext = {...context, ...frameStamp};
   const textureUses = [], storageUses = [];
   const capture = () => {
     for (const draw of draws) {

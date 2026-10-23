@@ -58,7 +58,52 @@ function sampledNormal(T) {
   result.wrapS = result.wrapT = T.RepeatWrapping;
   result.colorSpace = T.NoColorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
 }
+function environmentTexture(T, variant) {
+  const data = new Uint16Array(64 * 32 * 4);
+  for (let y = 0; y < 32; y++) for (let x = 0; x < 64; x++) {
+    const u = (x + .5) / 64, v = (y + .5) / 32;
+    const du = u - (.18 + .17 * variant), dv = v - (.25 + .12 * variant);
+    const spot = Math.exp(-(du * du * 80 + dv * dv * 30));
+    const color = [.08 + u * .5 + spot * (2.5 - .4 * variant),
+      .1 + v * .35 + spot * (.8 + .35 * variant), .12 + (1 - u) * .45 + spot * (.25 + .5 * variant), 1];
+    for (let channel = 0; channel < 4; channel++) data[(y * 64 + x) * 4 + channel] = T.DataUtils.toHalfFloat(color[channel]);
+  }
+  const texture = new T.DataTexture(data, 64, 32, T.RGBAFormat, T.HalfFloatType);
+  texture.mapping = T.EquirectangularReflectionMapping; texture.colorSpace = T.LinearSRGBColorSpace;
+  texture.minFilter = texture.magFilter = T.LinearFilter; texture.generateMipmaps = false; texture.needsUpdate = true;
+  return texture;
+}
 export const nativeTSLScenarios = {
+  native_tsl_environment(T, renderer) {
+    const {uniform, vec3} = T.TSL;
+    const standard = new T.MeshStandardNodeMaterial(), physical = new T.MeshPhysicalNodeMaterial();
+    standard.colorNode = vec3(.75, .42, .16); standard.roughnessNode = uniform(.28); standard.metalnessNode = uniform(.65);
+    physical.colorNode = vec3(.13, .48, .7); physical.roughnessNode = uniform(.36); physical.metalnessNode = uniform(.08);
+    physical.clearcoatNode = uniform(.75); physical.clearcoatRoughnessNode = uniform(.12);
+    physical.sheenNode = vec3(.3, .09, .22); physical.sheenRoughnessNode = uniform(.45); physical.retroreflectivityNode = uniform(.3);
+    const environments = [environmentTexture(T, 0), environmentTexture(T, 1)];
+    const result = {scene: new T.Scene(), camera: camera(T), materials: [standard, physical], environments};
+    result.scene.environment = environments[0];
+    // Keep background null so this compares lighting independently of the
+    // separately owned panorama/background pass.
+    const geometry = new T.SphereGeometry(.68, 32, 20);
+    for (const [index, material] of result.materials.entries()) {
+      const mesh = new T.Mesh(geometry, material); mesh.position.x = index === 0 ? -.82 : .82; result.scene.add(mesh);
+    }
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      // PMREM filtering calls render() for its own internal meshes.
+      if (args[0] !== result.scene) return render(...args);
+      frame++;
+      if (frame === 8) { result.scene.environmentIntensity = .45; result.scene.environmentRotation.set(.1, .8, .25); }
+      if (frame === 13) {
+        result.scene.environment = environments[1]; result.scene.environmentIntensity = .9;
+        result.scene.environmentRotation.set(0, -.55, .1);
+      }
+      return render(...args);
+    };
+    return result;
+  },
   native_tsl_storage_structs(T, renderer) {
     const {struct, instancedArray, Fn, instanceIndex, positionLocal, vec3, mat3, uniform} = T.TSL;
     // Exact H8 particle layout: position at byte 0, velocity at 16, and
