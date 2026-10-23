@@ -69,8 +69,9 @@ range and per-stage limits. Cached groups use buffer identity, offset and size,
 so a new resource wrapper does not allocate another equivalent bind group.
 
 Authored node materials can use `storage().element()` expressions in vertex and
-fragment slots with Float32, Int32 and Uint32 scalar/vector arrays, plus flat
-non-atomic structs containing scalar, vector and matrix fields. A vec3 array uses
+fragment slots with Float32, Int32 and Uint32 scalar/vector arrays, standalone
+Float32 `mat4` arrays, plus flat non-atomic structs containing scalar, vector and
+matrix fields. A vec3 array uses
 a padded four-word stride; structs retain the pinned source's member alignment
 and matrix-column padding. This public route uses the compute owner's shared
 upload history to initialize storage or apply marked host uploads at queued
@@ -80,10 +81,48 @@ compute-produced GPU contents.
 
 Node updates may replace a compatible attribute, while alias/layout changes
 require a new program. Ordinary `Mesh.count` and TSL `instanceIndex` also work
-with these shader reads; authored node materials on `InstancedMesh` are not yet
-admitted. Graphics storage writes, atomics, nested/boolean/atomic struct members,
-standalone matrix arrays and PBO-backed storage remain outside this profile.
+with these shader reads. Graphics storage writes, atomics, nested/boolean/atomic
+struct members, standalone `mat2`/`mat3` arrays and PBO-backed storage remain
+outside this profile.
 See `THREE_NODE_PROGRAMS.md` for the graph, capture and browser-check contracts.
+
+## Authored materials on storage-backed InstancedMesh
+
+Authored node materials can also consume the source's built-in instance matrix
+and color transforms directly from storage. Matrices require a Float32
+`StorageInstancedBufferAttribute` with item size 16; optional colors use item size
+3 or padded size 4. The source builder preserves matrix position transforms,
+inverse-transpose normals and instance-color multiplication. Additional authored
+storage expressions can use `instanceIndex`, and `positionNode` runs after the
+instance transform.
+
+```js
+const material = new THREE.MeshBasicNodeMaterial();
+material.colorNode = TSL.vec3(0.8, 0.6, 0.4);
+const mesh = new THREE.InstancedMesh(geometry, material, 3);
+mesh.setMatrixAt(1, new THREE.Matrix4().makeTranslation(2, 0, 0));
+mesh.setMatrixAt(2, new THREE.Matrix4().makeTranslation(-2, 0, 0));
+mesh.instanceMatrix = new THREE.StorageInstancedBufferAttribute(
+  mesh.instanceMatrix.array, 16);
+mesh.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 3);
+mesh.instanceColor.array.fill(1);
+mesh.frustumCulled = false; // Or supply conservative bounds for GPU transforms.
+scene.add(mesh);
+renderer.render(scene, camera); // Host data can initialize storage directly.
+```
+
+Compute kernels can address these same attributes with `storage(..., 'mat4',
+capacity)` and `storage(..., 'vec3', capacity)`. The graphics path consumes their
+resident GPU values without an additional upload when the host version is
+unchanged. Matrix/color attribute replacement or capacity changes rebuild the
+graph; data, version and draw-count changes reuse it. Each queued draw keeps the
+attributes and count captured before after-update callbacks. Its count must fit
+the smaller matrix/color capacity, with zero still running source callbacks.
+
+Culling continues to use CPU bounds, so GPU transforms require conservative
+`mesh.boundingSphere` values or disabled frustum culling. Ordinary CPU instance
+attributes, `InstancedBufferGeometry`, skinning and morphing remain outside this
+authored-material profile.
 
 ## Checks
 

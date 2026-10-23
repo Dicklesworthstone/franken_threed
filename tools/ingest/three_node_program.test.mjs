@@ -41,6 +41,16 @@ function pbrRig(t, Material = THREE.MeshStandardNodeMaterial, parameters = {}) {
   const context = {...f.context, material, lights};
   return {...f, material, lights, context, compile: () => f.owner.compile(material, f.object, context)};
 }
+function instanceRig(t, Material = THREE.MeshBasicNodeMaterial, colorStride = 4) {
+  const f = rig(t), material = new Material();
+  material.colorNode = f.tint; material.positionNode = N.positionLocal.add(N.vec3(f.shift, 0, 0));
+  const object = new THREE.InstancedMesh(f.object.geometry, material, 4);
+  object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(object.instanceMatrix.array, 16);
+  object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, colorStride); object.count = 3;
+  f.scene.remove(f.object); f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object, material, lights: []};
+  return {...f, material, object, context, compile: () => f.owner.compile(material, object, context)};
+}
 test('real pinned node graphs preserve native WGSL groups, attributes and linear output', t => {
   const f = rig(t), d = f.compile();
   assert.equal(d.nodeProgram, true); assert.equal('reflection' in d, false);
@@ -481,6 +491,81 @@ test('graphics storage assignments fail before a descriptor is published, includ
   })();
   assert.equal(f.owner.storage(f.compile())[0].attribute, storage.value, 'writes to a local copy remain valid');
 });
+for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshStandardNodeMaterial]) {
+  test(`${Material.name} storage instancing retains source matrix, normal, color and authored instance-index reads`, t => {
+    const f = instanceRig(t, Material, 3), extra = new THREE.StorageBufferAttribute(4, 4);
+    f.material.colorNode = f.tint.mul(N.storage(extra, 'vec4', 4).element(N.instanceIndex).xyz);
+    const d = f.compile(), draw = f.owner.captureDraw(d, f.context);
+    assert.equal(d.instanceCapacity, 3);
+    assert.match(d.vertex, /@builtin\( instance_index \)/);
+    assert.match(d.vertex, /array< mat4x4<f32> >/);
+    assert.match(d.vertex, /normalLocal = normalize\(.*transpose\( tsl_inverse_mat3/);
+    assert.match(d.vertex, /varyings\.vInstanceColor = .*\[ instanceIndex \]/);
+    assert.match(d.fragment, /vInstanceColor/); assert.match(d.fragment, /var<storage, read>/);
+    assert.ok(d.vertex.indexOf('positionLocal = ( NodeBuffer_') < d.vertex.indexOf('positionLocal = ( positionLocal +'),
+      'the source applies instance transforms before authored positionNode');
+    assert.ok(d.attributes.every(attribute => f.object.geometry.attributes[attribute.name]), 'instance data adds no vertex streams');
+    for (const [attribute, bytes] of [[f.object.instanceMatrix, 256], [f.object.instanceColor, 48], [extra, 64]]) {
+      const binding = draw.storage.find(value => value.attribute === attribute); assert.ok(binding);
+      assert.equal(d.groups[binding.group].entries[binding.binding].buffer.minBindingSize, bytes);
+    }
+    assert.equal(f.object.instanceColor.itemSize, 3, 'graphics does not normalize or upload source storage');
+  });
+}
+test('instance graph keys retain data/count updates but rebuild captured matrix/color identities and capacities', t => {
+  const f = instanceRig(t, THREE.MeshBasicNodeMaterial, 3), d = f.compile();
+  f.object.instanceMatrix.array[12] = .25; f.object.instanceMatrix.needsUpdate = true;
+  f.object.instanceColor.array = new Float32Array(12); f.object.instanceColor.itemSize = 4;
+  f.object.instanceColor.needsUpdate = true;
+  for (const count of [3, 1, 0, 99, -2]) {
+    f.object.count = count; assert.equal(f.compile(), d, 'only post-update scene capture bounds draw counts');
+  }
+  f.object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 16);
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const matrix = f.compile(); assert.notEqual(matrix, d); assert.equal(matrix.instanceCapacity, 3);
+  f.object.instanceColor = new THREE.StorageInstancedBufferAttribute(2, 4);
+  assert.throws(() => f.owner.captureDraw(matrix, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const color = f.compile(); assert.notEqual(color, matrix); assert.equal(color.instanceCapacity, 2);
+  f.object.instanceColor = null;
+  const plain = f.compile(); assert.equal(plain.instanceCapacity, 4); assert.doesNotMatch(plain.fragment, /vInstanceColor/);
+  assert.equal(f.owner.captureDraw(plain, f.context).storage.length, 1);
+  f.object.instanceMatrix.array = new Float32Array(32); f.object.instanceMatrix.count = 2;
+  const smaller = f.compile(); assert.notEqual(smaller, plain); assert.equal(smaller.instanceCapacity, 2);
+  assert.equal(rig(t).compile().instanceCapacity, undefined);
+});
+test('instance replacements during source updates fail before stale generated bindings can be captured', t => {
+  const f = instanceRig(t); let updates = 0, replace = false;
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => {
+    updates++;
+    if (replace) f.object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 16);
+  });
+  const d = f.compile(); f.object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 4);
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(updates, 0);
+  const changed = f.compile(); replace = true;
+  assert.throws(() => f.owner.captureDraw(changed, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'}); assert.equal(updates, 1);
+  replace = false;
+  const current = f.compile(); assert.ok(f.owner.captureDraw(current, {...f.context, renderId: 2})); assert.equal(updates, 2);
+  f.object.morphTexture = new THREE.DataTexture();
+  assert.throws(() => f.owner.captureDraw(current, {...f.context, renderId: 3}), {code: 'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(updates, 2);
+});
+test('instance admission refuses CPU streams, malformed storage and deformation before node updates', t => {
+  for (const [change, code] of [
+    [object => { object.instanceMatrix = new THREE.InstancedBufferAttribute(new Float32Array(64), 16); }, 'OBJECT'],
+    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3); }, 'OBJECT'],
+    [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 4); }, 'STORAGE'],
+    [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 16, Uint32Array); }, 'STORAGE'],
+    [object => { object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 2); }, 'STORAGE'],
+    [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(0, 16); }, 'STORAGE'],
+    [object => { object.morphTexture = new THREE.DataTexture(); }, 'OBJECT'],
+    [object => { object.isSkinnedMesh = true; }, 'OBJECT'],
+    [object => { object.geometry = new THREE.InstancedBufferGeometry(); }, 'OBJECT'],
+  ]) {
+    const f = instanceRig(t); let updates = 0;
+    f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; }); change(f.object);
+    assert.throws(f.compile, {code: `THREE_NODE_PROGRAM_${code}`}); assert.equal(updates, 0);
+  }
+});
 test('nested captures and thrown callbacks restore the exact outer NodeFrame context', t => {
   const f = rig(t), innerMaterial = new THREE.MeshBasicNodeMaterial(), innerObject = new THREE.Mesh(f.object.geometry, innerMaterial);
   innerMaterial.colorNode = N.vec3(.2); const inner = f.owner.compile(innerMaterial, innerObject, f.context);
@@ -503,7 +588,7 @@ for (const [name, change, code] of [
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
   ['custom renderer context', f => { f.renderer.contextNode = N.context({getOutput: output => output}); }, 'GRAPH'],
-  ['instancing', f => { f.object.isInstancedMesh = true; }, 'OBJECT'],
+  ['spoofed instancing', f => { f.object.isInstancedMesh = true; }, 'OBJECT'],
   ['fog', f => { f.scene.fog = new THREE.Fog(0, 1, 10); }, 'EFFECT'],
 ]) test(`${name} is explicitly refused`, t => {
   const f = rig(t); change(f); assert.throws(f.compile, {code: `THREE_NODE_PROGRAM_${code}`});

@@ -1,7 +1,8 @@
 # Native TSL graphics programs
 
 The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
-meshes. It retains the exact r186 `WGSLNodeBuilder`, node classes, uniform packing
+meshes and storage-backed `InstancedMesh` objects. It retains the exact r186
+`WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
 uniform buffers, command encoding and submission. The path does not construct an
 upstream renderer, translate through ESSL reflection, or claim measured
@@ -67,7 +68,8 @@ Authored `storage(attribute, type, count).element(index)` reads in vertex and
 fragment graphs share the renderer's compute allocation. Float32, Int32 and
 Uint32 scalar/vector `StorageBufferAttribute` and
 `StorageInstancedBufferAttribute` arrays are admitted, including source vec3
-padding. Flat non-atomic `struct()` records also work with scalar/vector 32-bit
+padding. Standalone Float32 `mat4` storage arrays use a 16-word stride. Flat
+non-atomic `struct()` records also work with scalar/vector 32-bit
 members and `mat2`, `mat3` or `mat4` fields. The pinned `StructTypeNode` defines
 their padded stride; mixed integer/float backing bytes and matrix-column padding
 remain unchanged. The H8 fluid particle record (`position: vec3`,
@@ -92,8 +94,21 @@ draw captures the count after before/current node updates and resource capture,
 before after-updates. Queued preparation cannot replace it with a later live
 count. Zero counts still run source node callbacks but emit no physical draw;
 direct and render-bundle paths retain the captured count. Negative source counts
-clamp to zero; admitted counts must fit an unsigned 32-bit integer. This does not
-yet admit `InstancedMesh` or `InstancedBufferGeometry`.
+clamp to zero; admitted counts must fit an unsigned 32-bit integer.
+
+`InstancedMesh` can use the same authored materials when `instanceMatrix` is a
+Float32 `StorageInstancedBufferAttribute` with item size 16. Optional
+`instanceColor` must also use Float32 storage, with item size 3 or the source's
+padded size 4. The retained source builder applies each instance matrix to
+positions, transforms normals with its inverse transpose, and multiplies
+instance RGB into the material color. Authored `positionNode` runs after the
+instance transform, and its graph can read other storage through `instanceIndex`.
+No extra instance vertex stream or duplicate GPU allocation is introduced.
+
+The program records the smaller matrix/color capacity, or the matrix capacity
+when colors are absent. After node updates, the captured count must fit that
+capacity; an excessive count is rejected before submission rather than silently
+reduced. Zero instances retain the same callback behavior described above.
 
 ```js
 const tint = TSL.uniform(new THREE.Color(0.2, 0.5, 0.8));
@@ -181,6 +196,21 @@ within a single logical render are rejected before any storage writes. They
 require additional per-draw storage scheduling; separate logical renders already
 retain each version.
 
+For `InstancedMesh`, replacing a matrix/color attribute, changing its capacity,
+or adding/removing instance colors selects a new graph. Data, upload-version and
+draw-count changes reuse the graph, including the source RGB padding transition.
+Replacement during before/current node updates is explicitly refused because
+the source-generated instance nodes retain their compiled attribute identities.
+After-update changes cannot replace the current draw's captured resources or
+count; a later render compiles against the new instance attributes. Objects
+sharing one material retain their own instance storage.
+
+Instance culling still uses the source mesh's CPU `boundingSphere` before node
+updates. GPU writes do not refresh CPU matrices, bounds or raycasting data.
+Applications with compute-driven transforms must supply conservative bounds or
+set `frustumCulled = false`; the renderer does not infer GPU bounds or change that
+source setting.
+
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
 the compiler cache, and subsequent graph or structural changes select a new
@@ -201,7 +231,7 @@ material. Original material visibility and render-list partitioning still apply.
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
-atomic graphics storage, standalone matrix storage arrays, nested/boolean/atomic
+atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, explicit uniform-buffer arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
 PBR transmission/dispersion, cube/custom environment lighting, area/probe/custom lights,
@@ -211,10 +241,10 @@ or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, material
-textures, wireframe, alpha hashing and alpha-to-coverage; `InstancedMesh`,
-`InstancedBufferGeometry`, skinned, batched or morph meshes; ArrayCamera, reversed
-depth and XR views; custom
-object/material render hooks and effectful attribute upload callbacks. A
+textures, wireframe, alpha hashing and alpha-to-coverage; ordinary CPU instance
+matrix/color streams, `InstancedBufferGeometry`, skinned, batched or morph meshes,
+including per-instance morph textures; ArrayCamera, reversed depth and XR views;
+custom object/material render hooks and effectful attribute upload callbacks. A
 transparent DoubleSide graph currently requires `forceSinglePass: true`.
 Unsupported graph slots, material subclasses, bindings and attribute layouts
 produce explicit errors rather than silently selecting another renderer.
@@ -290,13 +320,12 @@ Chromium 151 with SwiftShader. They execute vertex/fragment reads, actual comput
 kernels and separate queued render-target histories. This is correctness
 evidence for that software-GPU environment, not a hardware performance result.
 
-The scenario now named `native_tsl_storage_fifo` exercises compute-produced
+The `native_tsl_storage_fifo` scenario exercises compute-produced
 positions, colors and signed/unsigned indices, a partial final workgroup, two
-queued target renders and a later upload-version reset. Its pre-merge run on
-Chrome 151 software Vulkan had zero pixels outside the existing 12-channel/2%
-tolerance, mean difference 0.02 and maximum channel difference 1 against the
-pinned renderer. That result predates integration with versioned graphics
-uploads and is not a rerun of the merged storage path.
+queued target renders and a later upload-version reset. A rerun of the current
+storage integration on Chrome 151 software Vulkan had zero pixels outside the
+existing 12-channel tolerance, mean difference 0.01859375 and maximum channel
+difference 1 against the pinned renderer. The pixel budget remained 2%.
 
 A direct-module browser comparison additionally queued compute-backed
 `Mesh.count` values 3, 0 and 5 into independent targets, then changed the live
@@ -309,3 +338,21 @@ including its 80-byte stride and padded mat3 columns. Its bounded comparison
 matched the pinned reference exactly for three queued images and all 100
 read-back float words, including a second compute update and unmarked CPU edits.
 This does not establish compatibility for the complete H8 fluid application.
+
+The storage-backed `InstancedMesh` extension passes the 60-test compiler suite
+and four focused facade regressions. These check source matrix/normal/color
+generation, cache invalidation, queued compute and host versions, zero counts,
+attribute replacement, shared-material isolation and capacity refusal before
+submission. The browser differential scenario `native_tsl_storage_instanced_mesh`
+exercises compute-generated rotations and nonuniform scale on lit meshes,
+authored position and color storage reads, and independent targets with changing
+counts. Its Chrome 151 software-Vulkan comparison passed the unchanged 2% pixel
+budget: 3 of 76,800 pixels (0.00390625%) exceeded the channel threshold of 12,
+with mean difference 0.004609375 and maximum channel difference 154 at three
+object-boundary pixels. Both implementations visibly retained panel counts
+`[6, 3, 0, 5]`, including the empty target.
+
+The instanced-mesh and FIFO runs imported the current renderer modules directly
+and used the unchanged runner and scenarios for 30 frames. They validate native
+GPU execution against pinned r186 in that software-GPU environment. They do not
+include a fresh bundled-application build or a hardware performance measurement.

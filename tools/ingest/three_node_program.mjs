@@ -2,9 +2,10 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid meshes, unlit or Toon/Lambert/Phong/Standard/Physical
+ * The profile is rigid meshes and storage-backed InstancedMesh objects, unlit
+ * or Toon/Lambert/Phong/Standard/Physical
  * with ordinary source lights, float attributes, scalar/vector/matrix uniforms,
- * sampled 2D float textures and read-only scalar/vector or flat-struct storage buffers.
+ * sampled 2D float textures and read-only scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting. Transmission,
  * writable/atomic storage, shadows, clipping and MRT graphs fail explicitly.
@@ -58,8 +59,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
   function inspectStorage(node) {
     const attribute = node.value, struct = node.structTypeNode;
-    const type = /^(?:(i|u)?vec([234])|(float|int|uint))$/.exec(node.nodeType ?? '');
-    const components = type?.[2] ? Number(type[2]) : 1;
+    const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat4))$/.exec(node.nodeType ?? '');
+    const components = type?.[3] === 'mat4' ? 16 : type?.[2] ? Number(type[2]) : 1;
     const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
       : type?.[1] === 'u' || type?.[3] === 'uint' ? Uint32Array : Float32Array;
     let stride = components === 3 ? 4 : components;
@@ -84,7 +85,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !(struct ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
-      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector or flat-struct 32-bit storage attributes');
+      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector/mat4 or flat-struct 32-bit storage attributes');
     if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
       fail('HOOK', 'Native storage reads require the source upload callback');
     const bytes = attribute.count * stride * 4;
@@ -106,6 +107,28 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [unsized ? aliases.get(attribute) : null, node.nodeType, node.bufferCount, attribute.count, bytes, node.groupNode?.name,
         struct ? [struct.name, struct.membersLayout.map(({name, type}) => [name, type])] : null];
     }));
+  }
+  function inspectInstances(object) {
+    if (!object.isInstancedMesh) return null;
+    if (!(object instanceof three.InstancedMesh) || object.isSkinnedMesh || object.isBatchedMesh || object.morphTexture != null ||
+        !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
+        Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
+      fail('OBJECT', 'Native instancing requires source InstancedMesh objects without skinning or morph data');
+    const shape = (attribute, type) => {
+      if (!(attribute instanceof three.StorageInstancedBufferAttribute) || attribute.isInstancedBufferAttribute !== true ||
+          attribute.isStorageInstancedBufferAttribute !== true)
+        fail('OBJECT', 'Native InstancedMesh matrices and colors require StorageInstancedBufferAttribute');
+      const bytes = inspectStorage({value: attribute, nodeType: type, bufferCount: attribute.count, access: 'readWrite'});
+      return [attribute.id, attribute.count, bytes];
+    };
+    const matrix = shape(object.instanceMatrix, 'mat4'), color = object.instanceColor == null ? null : shape(object.instanceColor, 'vec3');
+    // The source instancedMesh Fn captures these attribute objects at build.
+    // Packed vec3 colors and their compute-padded form share one shader layout.
+    return {signature: JSON.stringify([matrix, color]), capacity: Math.min(matrix[1], color?.[1] ?? Infinity)};
+  }
+  function assertInstances(object, signature) {
+    if ((inspectInstances(object)?.signature ?? null) !== signature)
+      fail('CHANGED', 'Native instance matrix/color identity or layout changed; compile the graph again');
   }
   function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
     if (!litMaterial(material) || material.lights !== true || material.fragmentNode != null) return [];
@@ -200,10 +223,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (physical && (material.useTransmission || material.useDispersion))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
-    if (!(object instanceof three.Mesh) || object.isSkinnedMesh || object.isInstancedMesh || object.isBatchedMesh ||
+    if (!(object instanceof three.Mesh) || object.isSkinnedMesh || object.isBatchedMesh ||
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
         Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
-      fail('OBJECT', 'Native node graphs currently require rigid ordinary meshes');
+      fail('OBJECT', 'Native node graphs require rigid meshes or storage-backed InstancedMesh objects');
+    inspectInstances(object);
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
       fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
     if (object.castShadow || object.receiveShadow) fail('SHADOW', 'Native node graph shadows are not admitted');
@@ -279,14 +303,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
   }
-  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null) {
+  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
     return JSON.stringify([material.version, material.customProgramCacheKey(), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       material.alphaTest > 0, material.depthWrite, material.depthTest, material.lights,
-      object.geometry.id, camera?.isPerspectiveCamera === true,
+      object.geometry.id, camera?.isPerspectiveCamera === true, instanceSignature,
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
@@ -305,7 +329,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function compile(material, object, context = {}) {
     inspect(material, object, context);
     const lights = sourceLights(material, context), environment = sourceEnvironment(material, context);
-    const key = keyOf(material, object, context, lights, environment), byMaterial = cache.get(object);
+    const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
+    const key = keyOf(material, object, context, lights, environment, instanceSignature), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature) return previous.descriptor;
@@ -322,6 +347,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (cause instanceof ThreeNodeProgramError) throw cause;
       throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
     }
+    assertInstances(object, instanceSignature);
     // PMREM setup has now generated the source atlas. A later in-place refresh
     // would recursively capture renderer calls inside a whole-render texture
     // transaction. Refuse that boundary explicitly, before source callbacks;
@@ -385,7 +411,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const vertex = builder.vertexShader, fragment = builder.fragmentShader, bytes = 2 * (vertex.length + fragment.length);
     if (bytes > maxShaderBytes - shaderBytes + (previous?.bytes ?? 0)) fail('LIMIT', 'Native node shader byte budget exceeded');
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment,
-      attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups)});
+      attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
+      ...(instances ? {instanceCapacity: instances.capacity} : {})});
     const textureNodes = [...builder.nodes].filter(node => node.isTextureNode && boundTextures.has(node.value));
     const signature = textureSignature(textureNodes);
     // Node.build() deduplicates unsized storage by attribute before addNode().
@@ -398,7 +425,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, textureNodes, textureSignature: signature,
+    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, textureNodes, textureSignature: signature,
       storageNodes, storageSignature: storageKey});
     const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, textureNodes, textureSignature: signature,
       storageNodes, storageSignature: storageKey};
@@ -442,6 +469,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function captureDraw(descriptor, context = {}) {
     const state = stateOf(descriptor);
+    const object = context.object ?? state.object;
+    assertInstances(object, state.instanceSignature);
     assertEnvironmentVersion(state.environment);
     // Reject a stale or newly atomic schema before observable NodeFrame updates;
     // readStorage below also catches mutations performed by those updates.
@@ -449,6 +478,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => {
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
+      assertInstances(object, state.instanceSignature);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {

@@ -53,6 +53,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       fail('GEOMETRY', 'Native node meshes require bounded source BufferGeometry groups');
     const owners = new Set(Object.values(geometry.attributes).map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
     if (geometry.index) owners.add(geometry.index);
+    if (object.isInstancedMesh) {
+      if (object.instanceMatrix) owners.add(object.instanceMatrix);
+      if (object.instanceColor) owners.add(object.instanceColor);
+    }
     for (const owner of owners) {
       const prototype = owner.isInterleavedBuffer ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
       if (owner.onUploadCallback !== prototype.onUploadCallback)
@@ -201,6 +205,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       draw.instanceCount = requestedInstances === undefined ? 1 : Math.max(0, requestedInstances);
       if (!integer(draw.instanceCount) || draw.instanceCount > 0xffffffff)
         fail('OBJECT', 'Native node instance counts must fit a nonnegative 32-bit integer');
+      if (draw.binding.nodeProgram.instanceCapacity !== undefined &&
+          draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
+        fail('OBJECT', 'Native node instance count exceeds its captured matrix or color storage capacity');
       programs.after(draw.binding.nodeProgram, updateContext);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
     }

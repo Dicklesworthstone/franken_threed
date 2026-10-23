@@ -459,3 +459,114 @@ test('storage-only node callbacks cannot enqueue compute inside the draw capture
   assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
   assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.device.computePasses.length,0);
 });
+
+function storageInstances(f,count=4){
+  const mesh=new T.InstancedMesh(f.mesh.geometry,f.material,count);
+  const matrices=new T.StorageInstancedBufferAttribute(count,16),colors=new T.StorageInstancedBufferAttribute(count,3);
+  for(let i=0;i<count;i++){
+    new T.Matrix4().makeScale(1+i*.25,.75,1).setPosition(i*.5,0,0).toArray(matrices.array,i*16);
+    colors.array.set([.125+i*.125,.5,.75],i*3);
+  }
+  mesh.instanceMatrix=matrices;mesh.instanceColor=colors;mesh.frustumCulled=false;
+  f.scene.remove(f.mesh);f.scene.add(mesh);
+  return {mesh,matrices,colors};
+}
+
+test('native InstancedMesh borrows compute matrices and colors while retaining queued counts and source normals',async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const {mesh,matrices,colors}=storageInstances(f),offsets=new T.StorageInstancedBufferAttribute(4,4);
+  const matrixNode=T.TSL.storage(matrices,'mat4',4),colorNode=T.TSL.storage(colors,'vec3',4),
+    offsetNode=T.TSL.storage(offsets,'vec4',4);
+  const kernel=T.TSL.Fn(()=>{
+    const index=T.TSL.instanceIndex;
+    matrixNode.element(index).assign(matrixNode.element(index));
+    colorNode.element(index).addAssign(T.TSL.vec3(0));
+    offsetNode.element(index).addAssign(T.TSL.vec4(0));
+  })().compute(4);
+  const requested=[3,1,0],updates=[],after=[];
+  const gain=T.TSL.uniform(1).onObjectUpdate(frame=>{
+    frame.object.count=requested.shift();updates.push(frame.object.count);return 1;
+  });
+  gain.updateAfterType='object';gain.updateAfter=frame=>{after.push(frame.object.count);frame.object.count=4;};
+  const material=new T.MeshPhongNodeMaterial();material.colorNode=T.TSL.vec3(.8,.6,.4).mul(gain);
+  material.positionNode=T.TSL.positionLocal.add(offsetNode.element(T.TSL.instanceIndex).xyz);
+  mesh.material=material;f.scene.add(new T.DirectionalLight(0xffffff,2));
+  await f.renderer.compileAsync(f.scene,f.camera);assert.deepEqual(updates,[]);
+  const first=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=1.5;matrices.needsUpdate=true;
+  colors.array[0]=.875;colors.needsUpdate=true;offsets.array[0]=.25;offsets.needsUpdate=true;
+  const second=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  f.renderer.render(f.scene,f.camera);
+  mesh.count=99;matrices.array.fill(99);colors.array.fill(99);offsets.array.fill(99);
+  await Promise.all([first,second,drain(f.renderer)]);await f.renderer.waitForGPU();
+  const draws=nativeDraws(f.device);assert.deepEqual(draws.map(draw=>draw.args[1]),[3,1]);
+  assert.deepEqual(updates,[3,1,0]);assert.deepEqual(after,[3,1,0]);
+  assert.equal(draws[0].pipeline,draws[1].pipeline,'count, upload version and vec3 normalization retain the program');
+  const buffers=[matrices,colors,offsets].map(attribute=>captureComputeStorage(f.device,attribute).resolve().buffer);
+  for(const draw of draws)assert.ok(buffers.every(buffer=>storageResources(draw).some(resource=>resource.buffer===buffer)));
+  const words=(draw,buffer)=>new Float32Array(draw.contents.get(buffer).buffer);
+  assert.deepEqual(draws.map(draw=>words(draw,buffers[0])[12]),[0,1.5]);
+  assert.deepEqual(draws.map(draw=>words(draw,buffers[1])[0]),[.125,.875]);
+  assert.deepEqual(draws.map(draw=>words(draw,buffers[2])[0]),[0,.25]);
+  for(const buffer of buffers){
+    assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,2,'only captured host versions upload');
+    assert.ok(f.device.computePasses.every(pass=>[...pass.groups.values()].some(group=>
+      group.entries.some(entry=>entry.resource?.buffer===buffer))));
+  }
+  assert.match(draws[0].pipeline.vertex.module.code,/@builtin\(\s*instance_index\s*\)/);
+  assert.match(draws[0].pipeline.vertex.module.code,/array<\s*mat4x4<f32>/);
+  assert.equal(f.renderer.info.render.drawCalls,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native InstancedMesh captures replacement storage identities before later queued changes',async t=>{
+  const f=fixture(t),{mesh,matrices:a,colors:firstColor}=storageInstances(f,2);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  const b=new T.StorageInstancedBufferAttribute(a.array.slice(),16),secondColor=new T.StorageInstancedBufferAttribute(2,3);
+  b.array[12]=2;secondColor.array.set([.875,.25,.5,.5,.75,.25]);
+  mesh.instanceMatrix=b;mesh.instanceColor=secondColor;mesh.count=1;f.renderer.render(f.scene,f.camera);
+  mesh.instanceMatrix=new T.StorageInstancedBufferAttribute(2,16);mesh.instanceColor=null;mesh.count=99;
+  await drain(f.renderer);await f.renderer.waitForGPU();
+  const draws=nativeDraws(f.device);assert.deepEqual(draws.map(draw=>draw.args[1]),[2,1]);
+  for(const [index,attribute,color,translation] of [[0,a,firstColor,0],[1,b,secondColor,2]]){
+    const buffer=captureComputeStorage(f.device,attribute).resolve().buffer;
+    const colorBuffer=captureComputeStorage(f.device,color).resolve().buffer;
+    assert.ok(storageResources(draws[index]).some(resource=>resource.buffer===buffer));
+    assert.ok(storageResources(draws[index]).some(resource=>resource.buffer===colorBuffer));
+    assert.equal(new Float32Array(draws[index].contents.get(buffer).buffer)[12],translation);
+  }
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native InstancedMesh refuses post-update capacity overflow before any GPU submission',async t=>{
+  const f=fixture(t),{mesh}=storageInstances(f,2);await f.renderer.init();
+  f.material.colorNode=T.TSL.vec3(T.TSL.uniform(1).onObjectUpdate(frame=>{frame.object.count=3;return 1;}));
+  const writes=f.device.writes.length,submissions=f.device.submissions.length;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(mesh.count,3);assert.equal(f.acquired(),0);
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('shared native material keeps object-specific instance storage and validates the smaller color capacity',async t=>{
+  const f=fixture(t),left=storageInstances(f,4),right=storageInstances(f,2);
+  left.mesh.renderOrder=-1;right.matrices.array[12]=3;
+  left.mesh.userData.drawCount=2;right.mesh.userData.drawCount=1;
+  left.mesh.count=right.mesh.count=99;
+  const gain=T.TSL.uniform(1).onObjectUpdate(frame=>{frame.object.count=frame.object.userData.drawCount;return 1;});
+  gain.updateAfterType='object';gain.updateAfter=frame=>{frame.object.count=99;};
+  f.material.colorNode=T.TSL.vec3(.5).mul(gain);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.deepEqual(draws.map(draw=>draw.args[1]),[2,1]);
+  const leftBuffer=captureComputeStorage(f.device,left.matrices).resolve().buffer,
+    rightBuffer=captureComputeStorage(f.device,right.matrices).resolve().buffer;
+  assert.notEqual(leftBuffer,rightBuffer);
+  assert.ok(storageResources(draws[0]).some(resource=>resource.buffer===leftBuffer));
+  assert.ok(storageResources(draws[1]).some(resource=>resource.buffer===rightBuffer));
+  assert.ok(!storageResources(draws[0]).some(resource=>resource.buffer===rightBuffer));
+  assert.ok(!storageResources(draws[1]).some(resource=>resource.buffer===leftBuffer));
+  left.mesh.instanceColor=new T.StorageInstancedBufferAttribute(1,3);
+  const writes=f.device.writes.length,submissions=f.device.submissions.length,acquired=f.acquired();
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);
+});

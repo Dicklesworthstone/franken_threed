@@ -309,7 +309,9 @@ export async function createGpuThreeScene(device,scene,{
         }
         geometryAdmission(object.geometry,object);
         if(instancedMorph(object))programDeformed.add(object);
-        else if(object.isInstancedMesh)instanceAdmission(object);
+        // Native draws already captured their instance storage and active count.
+        // Async preparation must not reread a later live instance configuration.
+        else if(object.isInstancedMesh&&!capturedNodeObject(object))instanceAdmission(object);
       } else if(object.isLine||object.isPoints){
         // One-pixel native lines/points with LineBasicMaterial/PointsMaterial.
         // LineLoop: the WebGL surface draws it (gl.LINE_LOOP) through programs;

@@ -323,6 +323,87 @@ export const nativeTSLScenarios = {
     };
     return result;
   },
+  native_tsl_storage_instanced_mesh(T, renderer) {
+    const {Fn, storage, instanceIndex, positionLocal, uniform, vec3, vec4, mat4} = T.TSL;
+    const count = 6, matrices = new T.StorageInstancedBufferAttribute(count, 16);
+    // The source uploader pads these three-word colors to vec3's four-word stride.
+    const colors = new T.StorageInstancedBufferAttribute(count, 3);
+    const offsets = new T.StorageBufferAttribute(count, 4), weights = new T.StorageBufferAttribute(count, 4);
+    const matrixWrite = storage(matrices, 'mat4', count), colorWrite = storage(colors, 'vec3', count);
+    const offsetWrite = storage(offsets, 'vec4', count), weightWrite = storage(weights, 'vec4', count);
+    const phase = uniform(.2), tint = uniform(new T.Color(.95, .82, .72));
+    const initialize = Fn(() => {
+      const index = instanceIndex.toFloat(), angle = phase.add(index.mul(.27)), tilt = index.mul(.18).add(.25);
+      const cz = angle.cos(), sz = angle.sin(), cy = tilt.cos(), sy = tilt.sin();
+      const sx = index.mul(.06).add(.7), scaleY = index.mod(2).mul(.2).add(.9), scaleZ = phase.mul(.05).add(.65);
+      // Column-major Rz * Ry * scale plus translation: nonuniform scale also
+      // requires the source instance normal transform for the lit faces.
+      matrixWrite.element(instanceIndex).assign(mat4(
+        vec4(cz.mul(cy).mul(sx), sz.mul(cy).mul(sx), sy.negate().mul(sx), 0),
+        vec4(sz.negate().mul(scaleY), cz.mul(scaleY), 0, 0),
+        vec4(cz.mul(sy).mul(scaleZ), sz.mul(sy).mul(scaleZ), cy.mul(scaleZ), 0),
+        vec4(index.mod(3).sub(1).mul(.95), index.div(3).floor().sub(.5).mul(.9), index.mul(.025), 1),
+      ));
+      colorWrite.element(instanceIndex).assign(vec3(index.mul(.1).add(.25), phase.mul(.08).add(.3), index.mul(-.08).add(.8)));
+      offsetWrite.element(instanceIndex).assign(vec4(angle.sin().mul(.07), angle.cos().mul(.04), 0, 0));
+      weightWrite.element(instanceIndex).assign(vec4(index.mul(.04).add(.65), phase.mul(-.025).add(.8), .9, 1));
+    })().compute(count, [64]);
+    const material = new T.MeshPhongNodeMaterial(); material.shininess = 24; material.specular.setRGB(.25, .3, .4);
+    // Authored nodes compose with the built-in instance transform/color, and
+    // independently address storage by instanceIndex in both shader stages.
+    material.positionNode = positionLocal.add(storage(offsets, 'vec4', count).toReadOnly().element(instanceIndex).xyz);
+    material.colorNode = tint.mul(storage(weights, 'vec4', count).toReadOnly().element(instanceIndex).rgb);
+    const mesh = new T.InstancedMesh(new T.BoxGeometry(.62, .5, .42), material, count);
+    mesh.instanceMatrix = matrices; mesh.instanceColor = colors; mesh.frustumCulled = false;
+    const writer = scene(T), light = new T.DirectionalLight(0xe5edff, 1.65); light.position.set(-2, 3, 4);
+    writer.add(mesh, new T.AmbientLight(0xffd5b0, .35), light, light.target);
+    const writeCamera = new T.OrthographicCamera(-1.6, 1.6, 1.2, -1.2, .1, 10); writeCamera.position.z = 4;
+    const targets = Array.from({length: 4}, () => new T.RenderTarget(128, 96,
+      {generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.9, 1.425), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.set(i % 2 ? 1 : -1, i < 2 ? .76 : -.76, 0); result.scene.add(panel);
+    }
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      await renderer.compileComputeAsync(initialize);
+      const previous = renderer.getRenderTarget(), previousMip = renderer.getActiveMipmapLevel();
+      try {
+        for (const target of targets) { renderer.setRenderTarget(target); await compile(writer, writeCamera); }
+      } finally { renderer.setRenderTarget(previous, 0, previousMip); }
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 1 || frame === 8) {
+        if (frame === 8) {
+          // A fresh source version is uploaded once before compute replaces it;
+          // instance setup must not upload these zeros over the GPU result.
+          for (const attribute of [matrices, colors, offsets, weights]) {
+            attribute.array.fill(0); attribute.needsUpdate = true;
+          }
+        }
+        for (const [i, target] of targets.entries()) {
+          phase.value = (frame === 8 ? 1.1 : .2) + i * .45;
+          tint.value.setRGB(.95 - i * .1, .75 + i * .06, frame === 8 ? .9 : .65);
+          renderer.compute(initialize);
+          mesh.count = (frame === 8 ? [6, 3, 0, 5] : [6, 4, 0, 2])[i];
+          renderer.setRenderTarget(target); render(writer, writeCamera);
+        }
+        renderer.setRenderTarget(null);
+        // Each accepted target retains its count, uniforms, and GPU writes.
+        mesh.count = 1; phase.value = 20; tint.value.setRGB(0, 0, 0);
+        for (const attribute of [matrices, colors, offsets, weights]) attribute.array.fill(73);
+      }
+      for (const attribute of [matrices, colors, offsets, weights])
+        if (attribute.array.some(value => value !== 73)) throw new Error('Compute changed source CPU instance storage');
+      return render(...args);
+    };
+    return {...result, mesh, initialize, matrices, colors, offsets, weights};
+  },
   native_tsl_pbr_materials(T) {
     const {uniform, vec2, vec3} = T.TSL;
     const result = pbrScene(T), [rough, metal, physical] = result.materials;
