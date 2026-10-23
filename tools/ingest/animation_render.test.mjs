@@ -370,6 +370,7 @@ test("scissored clears follow GL: only the scissor rectangle is cleared", async 
   assert.deepEqual(clearPass.viewport.slice(0, 4), [4, 5, 6, 7]);
   assert.deepEqual(clearPass.scissor, [4, 5, 6, 7]);
   assert.equal(clearPass.draws.length, 1);
+  assert.match(clearPass.draws[0].pipeline.fragment.module.code, /@builtin\(frag_depth\)/);
   assert.equal(main.descriptor.colorAttachments[0].loadOp, "load");
   assert.equal(main.descriptor.depthStencilAttachment.depthLoadOp, "load");
   r.render(frame([mesh], {loadOp: "clear", depthLoadOp: "clear"}));
@@ -392,6 +393,16 @@ test("clear-only submissions and explicit no-depth mode require no geometry", as
     a: 1,
   });
   assert.throws(() => r.render(frame([])), code("ANIMATION_RENDER_ATTACHMENT"));
+  r.render(frame([], {depthView: null, clearColor: [0.5, 0.25, 0.125, 1], scissor: [1, 2, 8, 9]}));
+  await r.whenIdle();
+  const clearPass = d.passes[1], clear = clearPass.draws[0].pipeline;
+  assert.equal(clearPass.descriptor.depthStencilAttachment, undefined);
+  assert.equal(clear.depthStencil, undefined);
+  assert.doesNotMatch(clear.fragment.module.code, /frag_depth|info\.depth\.x/,
+    "a depthless PMREM target must not use a shader that writes fragment depth");
+  assert.deepEqual(clearPass.viewport.slice(0, 4), [1, 2, 8, 9]);
+  assert.deepEqual(clearPass.scissor, [1, 2, 8, 9]);
+  assert.equal(clear.fragment.targets[0].writeMask, 0xf);
   r.dispose();
 });
 

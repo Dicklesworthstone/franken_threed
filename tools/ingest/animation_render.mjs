@@ -1437,12 +1437,12 @@ export async function createGpuAnimationRenderer(
       const module = device.createShaderModule({label: `${label}/scissor-clear`, code: `
 struct ClearInfo { color: vec4<f32>, depth: vec4<f32> };
 @group(0) @binding(0) var<uniform> info: ClearInfo;
-struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 };
+struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth) depth: f32" : ""} };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
   return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
 }
-@fragment fn fs() -> Out { return Out(info.color, info.depth.x); }`});
+@fragment fn fs() -> Out { return Out(info.color${depthFormat ? ", info.depth.x" : ""}); }`});
       const pipeline = device.createRenderPipeline({label: `${label}/scissor-clear`, layout: "auto",
         vertex: {module, entryPoint: "vs"},
         fragment: {module, entryPoint: "fs", targets: format === null ? [] : [{format, writeMask: color !== null ? 0xf : 0}]},
