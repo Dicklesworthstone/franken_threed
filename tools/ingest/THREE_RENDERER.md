@@ -147,3 +147,10 @@ scene/object/material render hooks retain their existing explicit rejection.
   upstream `WebGPURenderer` in headless Chromium on SwiftShader. In that
   SwiftShader build, MSAA resolves into a reinterpreted `-srgb` canvas view lose
   sRGB encoding even for raw WebGPU code, so parity runs single-sample.
+
+Native authored graphs also support ordinary `Mesh.count` and TSL
+`instanceIndex`. Counts are captured after source node updates and retained
+across queued pipeline preparation. Zero instances preserve update callbacks
+while omitting GPU draws and source draw-call increments. This connects
+scalar/vector compute storage to instanced particle geometry; struct storage and
+the separate `InstancedMesh`/`InstancedBufferGeometry` surfaces remain pending.

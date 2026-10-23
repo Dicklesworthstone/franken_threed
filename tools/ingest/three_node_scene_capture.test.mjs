@@ -61,6 +61,23 @@ test('compile-only capture prepares hidden bindings without node updates or fram
   assert.equal(result.draws.length, 0); assert.equal(result.bytes, 0); assert.equal(calls, 0);
   assert.deepEqual([f.frame.frameId, f.frame.time, f.frame.deltaTime, f.renderer.info.calls], [7, 1.25, .125, 3]);
 });
+test('native Mesh.count is captured after updates, including empty draws, before after-updates', t => {
+  const f = rig(t), m = f.material(), requested = [3, 0, -2, undefined], seen = [];
+  const tint = N.uniform(.5).onObjectUpdate(frame => {
+    frame.object.count = requested.shift(); seen.push('update'); return .5;
+  });
+  tint.updateAfterType = 'object'; tint.updateAfter = frame => { seen.push('after'); frame.object.count = 99; };
+  m.colorNode = N.vec3(tint); m.positionNode = N.positionLocal.add(N.vec3(N.instanceIndex.toFloat().mul(.1), 0, 0));
+  const object = f.mesh(m);
+  const prepared = f.capture({uniforms: false}); assert.equal(seen.length, 0);
+  const frames = Array.from({length: 4}, () => f.capture());
+  assert.deepEqual(frames.map(frame => frame.draws[0].instanceCount), [3, 0, 0, 1]);
+  assert.deepEqual(seen, ['update', 'after', 'update', 'after', 'update', 'after', 'update', 'after']);
+  assert.equal(object.count, 99);
+  assert.ok(frames.every(frame => frame.bindings[0].nodeProgram === prepared.bindings[0].nodeProgram));
+  assert.match(prepared.bindings[0].nodeProgram.vertex, /@builtin\(\s*instance_index\s*\)/);
+});
+
 test('source selection keeps hidden bindings and follows visibility, layers, frustum and LOD', t => {
   const f = rig(t), hidden = new THREE.Group(); hidden.visible = false; f.scene.add(hidden);
   const hiddenChild = f.mesh(undefined, hidden), offscreen = f.mesh(); offscreen.position.x = 100;

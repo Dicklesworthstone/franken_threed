@@ -239,6 +239,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
     if (!records.has(record) || record.disposed) fail('ANIMATION_RENDER_VALUE', 'Native node graphics record is not live');
     if (stagedDraws >= maxDraws) limit('Native node draw capacity exhausted for this frame');
     if (['first', 'count'].some(key => input[key] !== undefined && (!Number.isSafeInteger(input[key]) || input[key] < 0)) ||
+        (input.instanceCount !== undefined && (!Number.isSafeInteger(input.instanceCount) || input.instanceCount < 0 || input.instanceCount > 0xffffffff)) ||
         (input.frontFaceCW !== undefined && typeof input.frontFaceCW !== 'boolean') ||
         (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== 'boolean') ||
         (input.nodeRangeCaptured === true && (input.first === undefined || input.count === undefined)))
@@ -271,7 +272,7 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       nodeProgram: {groups}, vertexBuffers: geometry.vertexBuffers,
       indexBuffer: geometry.indexBuffer, indexFormat: geometry.indexFormat,
-      instanceCount: 1, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
+      instanceCount: input.instanceCount ?? 1, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
     return geometry;
   }
   return Object.freeze({add, stage, prepare,

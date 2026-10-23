@@ -293,7 +293,6 @@ test('queued Physical feature changes keep earlier programs and shared lookup st
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
-
 test('native storage captures queued upload versions and ignores CPU edits without needsUpdate',async t=>{
   const f=fixture(t),attribute=new T.StorageBufferAttribute(new Float32Array([.125,.375,.625,1]),4);
   f.material.colorNode=T.TSL.storage(attribute,'vec4',1).toReadOnly().element(0).rgb;
@@ -362,4 +361,25 @@ test('native graphics borrows compute storage without uploading stale CPU values
   assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,storageWrites);
   assert.equal(f.device.buffers.filter(value=>value.label==='f3d-compute-buffer'&&(value.usage&128)).length,1);
   await f.renderer.waitForGPU();f.renderer.dispose();assert.equal(buffer.destroyed,true);
+});
+
+test('queued native instances preserve post-update Mesh.count and skip empty draws without skipping callbacks',async t=>{
+  const f=fixture(t),requested=[3,0,2],updates=[],after=[];
+  const tint=T.TSL.uniform(new T.Color(.25,.5,.75)).onObjectUpdate(frame=>{
+    frame.object.count=requested.shift();updates.push(frame.object.count);return new T.Color(.25,.5,.75);
+  });
+  tint.updateAfterType='object';tint.updateAfter=frame=>{after.push(frame.object.count);frame.object.count=99;};
+  f.material.colorNode=tint;
+  f.material.positionNode=T.TSL.positionLocal.add(T.TSL.vec3(T.TSL.instanceIndex.toFloat().mul(.2),0,0));
+  await f.renderer.init();
+  for(let i=0;i<3;i++)f.renderer.render(f.scene,f.camera);
+  assert.deepEqual(updates,[3,0,2]);assert.deepEqual(after,[3,0,2]);
+  f.mesh.count=42;
+  await drain(f.renderer);await f.renderer.waitForGPU();
+  const draws=nativeDraws(f.device);
+  assert.deepEqual(draws.map(draw=>draw.args[1]),[3,2]);
+  assert.ok(draws.every(draw=>draw.args[4]===0),'native instance indices start at zero for each draw');
+  assert.equal(draws[0].pipeline,draws[1].pipeline,'count updates retain the native shader');
+  assert.equal(f.renderer.info.render.drawCalls,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+  assert.deepEqual(updates,[3,0,2]);assert.deepEqual(after,[3,0,2]);
 });

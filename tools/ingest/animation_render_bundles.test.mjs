@@ -102,6 +102,28 @@ test('instancing preserves native calls, firstInstance and BLEND order', () => {
   cache.execute(pass,[a,a,b,b,a],5);assert.equal(device.calls,4);
 });
 
+test('native instance counts reach direct and bundled draws while empty draws emit no GPU work', () => {
+  for (const indexed of [false, true]) {
+    const device = bundleDevice(), config = parameters(), cache = createAnimationRenderBundleCache(device, config);
+    const native = count => draw({first: 2, count: 6, instanceCount: count,
+      nodeProgram: {groups: [{group: {}, offset: null}]},
+      ...(indexed ? {indexBuffer: {}, indexFormat: 'uint16'} : {})});
+    const commands = [native(0), native(4), {...native(7), count: 0}], direct = device.pass(), bundled = device.pass();
+    const expected = indexed ? [6, 4, 2, 0, 0] : [6, 4, 2, 0];
+    assert.equal(encodeAnimationDraws(direct, commands, commands.length, config), 1);
+    assert.deepEqual(direct.record.draws.map(value => value.args), [expected]);
+    assert.equal(cache.execute(bundled, commands, commands.length), 1);
+    assert.deepEqual(bundled.record.draws.map(value => value.args), [expected]);
+    commands[1].instanceCount = 2;
+    assert.equal(cache.execute(bundled, commands, commands.length), 1);
+    assert.equal(bundled.record.draws.at(-1).args[1], 2);
+    assert.equal(cache.diagnostics.builds, 2, 'a changed instance count selects a new recorded command');
+    commands[1].instanceCount = 0;
+    assert.equal(cache.execute(bundled, commands, commands.length), 0);
+    assert.equal(bundled.record.draws.length, 2);
+  }
+});
+
 test('all state is rebound for direct draws after both a bundle and an empty executeBundles', () => {
   const device=bundleDevice(),config=parameters(),cache=createAnimationRenderBundleCache(device,config),
     a=draw({indexBuffer:{},indexFormat:'uint16'}),b=draw({indexBuffer:{},indexFormat:'uint32'}),pass=device.pass();

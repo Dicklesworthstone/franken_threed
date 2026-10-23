@@ -25,6 +25,28 @@ function packets(d,submission=-1){
   return out;
 }
 const f32=values=>Array.from(values,Math.fround);
+test('native scene packets retain captured instance counts and exclude zero instances from source draw totals',async()=>{
+  const f=fixture(new T.MeshBasicMaterial()),fixed=new T.Mesh(f.g,new T.MeshBasicMaterial());f.s.add(fixed);
+  const binding=Object.freeze({object:f.mesh,geometry:f.g,material:f.m,
+    nodeProgram:{nodeProgram:true,key:'captured-instance-count',vertex:'// native vertex',fragment:'// native fragment',
+      attributes:[{name:'position',location:0,locations:1,components:3,scalar:'float'}],groups:[{index:0,byteLength:16}]},
+    raster:{frontFace:'ccw',cullMode:'none',writeMask:15,depthWriteEnabled:true,depthCompare:'less-equal',blend:null}});
+  const capture=instanceCount=>Object.freeze({objects:new Set([f.mesh]),bindings:Object.freeze([binding]),
+    draws:Object.freeze([Object.freeze({binding,object:f.mesh,geometry:f.g,material:f.m,listMaterial:f.m,
+      group:null,groupOrder:0,z:0,renderOrder:0,first:0,count:3,frontFaceCW:false,nodeUniforms:[new Uint8Array(16)],
+      ...(instanceCount===undefined?{}:{instanceCount})})])});
+  const first=capture(3);f.mesh.count=99;
+  const b=await create(f,{nodeFrame:first});
+  for(const nodeFrame of [first,capture(0),capture(undefined),capture(2)]) {
+    b.render(f.c,attachments(),{nodeFrame});
+    const expected=nodeFrame.draws[0].instanceCount??1;
+    const native=f.d.snapshots.at(-1).filter(snapshot=>snapshot.pipeline.vertex.entryPoint==='main');
+    assert.deepEqual(native.map(snapshot=>snapshot.args[1]),expected===0?[]:[expected]);
+    assert.equal(b.diagnostics.sourceDraws,expected===0?1:2);
+    assert.equal(b.diagnostics.drawCalls,expected===0?1:2);
+  }
+  assert.equal(f.mesh.count,99);await b.whenIdle();b.dispose();
+});
 function packedLights(d){
   // The Three.js light profile appends three view-rotation rows (48 bytes) to the 544-byte lighting block.
   const draw=d.snapshots.at(-1)[0],group=[...draw.groups.values()].find(x=>x.group.entries[0]?.resource?.size===592).group;

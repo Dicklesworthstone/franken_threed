@@ -35,6 +35,9 @@ export function encodeAnimationDraws(encoder, commands, length, {
   for (let i = start; i < end;) {
     const command = commands[i], {record, first, count, pipeline} = command;
     if (command.nodeProgram) {
+      // Source node updates still run for an empty draw, but the backend emits
+      // no GPU call. Preserve that distinction in direct and bundled encoding.
+      if (count === 0 || command.instanceCount === 0) { i++; continue; }
       // Native node WGSL owns all groups in their source builder order. Its
       // dynamic offsets select this logical draw, independent of arena index i.
       encoder.setPipeline(pipeline);

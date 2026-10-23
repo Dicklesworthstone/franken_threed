@@ -59,6 +59,29 @@ function sampledNormal(T) {
   result.colorSpace = T.NoColorSpace; result.generateMipmaps = false; result.needsUpdate = true; return result;
 }
 export const nativeTSLScenarios = {
+  native_tsl_storage_instances(T, renderer) {
+    const {storage, Fn, instanceIndex, positionLocal, vec4} = T.TSL;
+    const positions = new T.StorageBufferAttribute(9, 4), output = storage(positions, 'vec4', 9);
+    const initialize = Fn(() => {
+      const index = instanceIndex.toFloat();
+      output.element(instanceIndex).assign(vec4(index.mod(3).sub(1).mul(.85), index.div(3).floor().sub(1).mul(.75), 0, 1));
+    })().compute(9);
+    const material = new T.MeshBasicNodeMaterial(); material.color.setRGB(.15, .55, .8);
+    material.positionNode = positionLocal.add(storage(positions, 'vec4', 9).toReadOnly().element(instanceIndex).xyz);
+    const mesh = new T.Mesh(new T.PlaneGeometry(.6, .6), material); mesh.count = 9; mesh.frustumCulled = false;
+    const result = {scene: scene(T), camera: camera(T)}; result.scene.add(mesh);
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => { await renderer.computeAsync(initialize); return compile(...args); };
+    let frame = 0;
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 8) mesh.count = 4;
+      if (frame === 12) mesh.count = 0;
+      if (frame === 13) mesh.count = 6;
+      return render(...args);
+    };
+    return result;
+  },
   native_tsl_storage(T) {
     const {storage, vertexIndex, uv, positionLocal} = T.TSL;
     const geometry = new T.PlaneGeometry(1.45, 1.4, 12, 12);

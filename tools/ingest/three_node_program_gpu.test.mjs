@@ -96,6 +96,7 @@ test('captured source ranges survive later drawRange changes while direct draws 
 test('invalid native draw ranges and flags fail without consuming uniform slots', async t => {
   const f = rig(t, {maxDraws: 1}), record = await f.add();
   for (const input of [{first: -1}, {first: NaN}, {count: .5}, {count: Infinity}, {frontFaceCW: 1},
+    {instanceCount: -1}, {instanceCount: .5}, {instanceCount: NaN}, {instanceCount: 0x100000000},
     {nodeRangeCaptured: 'yes'}, {nodeRangeCaptured: true, first: 0}])
     assert.throws(() => f.stage(record, [1, 2], input), {code: 'ANIMATION_RENDER_VALUE'});
   assert.equal(f.owner.uniformDiagnostics.draws, 0); f.stage(record);

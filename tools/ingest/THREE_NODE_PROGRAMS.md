@@ -51,6 +51,15 @@ read by graphics; the pinned builder supplies read-only graphics bindings.
 There is no readback, second graphics allocation, or CPU upload merely because
 a graphics draw consumes compute-produced values.
 
+Ordinary meshes support `Mesh.count` with TSL `instanceIndex`, including
+compute-driven scalar/vector particle positions. Each logical draw captures the
+count after before/current node updates and resource capture, before after-updates.
+Queued preparation cannot replace it with a later live count. Zero counts still
+run source node callbacks but emit no physical draw; direct and render-bundle
+paths retain the captured count. Negative source counts clamp to zero; admitted
+counts must fit an unsigned 32-bit integer. This does not yet admit
+`InstancedMesh` or `InstancedBufferGeometry`.
+
 ```js
 const tint = TSL.uniform(new THREE.Color(0.2, 0.5, 0.8));
 const shift = TSL.uniform(0);
@@ -159,7 +168,8 @@ or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, material
-textures, wireframe, alpha hashing and alpha-to-coverage; instanced, skinned,
+textures, wireframe, alpha hashing and alpha-to-coverage; InstancedMesh,
+InstancedBufferGeometry, skinned,
 batched or morph meshes; ArrayCamera, reversed depth and XR views; custom
 object/material render hooks and effectful attribute upload callbacks. A
 transparent DoubleSide graph currently requires `forceSinglePass: true`.
@@ -231,3 +241,11 @@ Browser scenes `native_tsl_storage`, `native_tsl_storage_compute` and
 Chromium 151 with SwiftShader. They execute vertex/fragment reads, actual compute
 kernels and separate queued render-target histories. This is correctness
 evidence for that software-GPU environment, not a hardware performance result.
+
+A direct-module browser comparison additionally queued compute-backed
+`Mesh.count` values 3, 0 and 5 into independent targets, then changed the live
+count before readback. All three images matched the pinned reference exactly in
+RGB, including the empty target; CPU storage remained unchanged. Recording
+regressions cover post-update capture, callbacks on zero draws, indexed and
+nonindexed commands, bundle reuse/invalidation and source draw-call counts.
+The full H8 fluid application still requires struct storage beyond this profile.

@@ -44,8 +44,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!effective.some(hasThreeNodeProgram)) continue;
     if (effective.some(material => material && !hasThreeNodeProgram(material)))
       fail('MATERIAL', 'A native node mesh cannot mix authored node and fixed materials');
-    if (!(object instanceof three.Mesh) || object.intersectsFrustum !== three.Mesh.prototype.intersectsFrustum ||
-        (object.count !== undefined && object.count !== 1))
+    if (!(object instanceof three.Mesh) || object.intersectsFrustum !== three.Mesh.prototype.intersectsFrustum)
       fail('OBJECT', 'Native node scenes require ordinary meshes with the source frustum implementation');
     if (object.onBeforeRender !== three.Object3D.prototype.onBeforeRender || object.onAfterRender !== three.Object3D.prototype.onAfterRender)
       fail('HOOK', 'Native node object render hooks are not admitted');
@@ -192,6 +191,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         storageUses.push(lease);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
+      // r186 reads Mesh.count after node/binding updates and before after-updates.
+      // Capture it here even for zero instances: callbacks still ran, while the
+      // backend will omit the empty draw. Later queued calls cannot replace it.
+      const requestedInstances = draw.object.count;
+      draw.instanceCount = requestedInstances === undefined ? 1 : Math.max(0, requestedInstances);
+      if (!integer(draw.instanceCount) || draw.instanceCount > 0xffffffff)
+        fail('OBJECT', 'Native node instance counts must fit a nonnegative 32-bit integer');
       programs.after(draw.binding.nodeProgram, updateContext);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
     }

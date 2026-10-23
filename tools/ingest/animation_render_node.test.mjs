@@ -24,8 +24,8 @@ function words(snapshot,index) {
   const start=binding.offsets[0]??0;
   return new Float32Array(snapshot.contents.get(resource.buffer).slice(start,start+resource.size).buffer);
 }
-async function setup(options={}) {
-  const d=geometryDevice(),s=source(),ordinary=createGpuBufferGeometry(d,s),gpu=createGpuProgramGeometry(d,s,attributes);
+async function setup(options={},s=source()) {
+  const d=geometryDevice(),ordinary=createGpuBufferGeometry(d,s),gpu=createGpuProgramGeometry(d,s,attributes);
   const r=await createGpuAnimationRenderer(d,{maxDraws:8,...options});
   const builtin=await r.addMesh(ordinary),node=await r.addMesh(gpu,{nodeProgram:descriptor(),raster:raster()});
   return {d,r,source:s,ordinary,gpu,builtin,node};
@@ -104,6 +104,23 @@ test('captured native ranges survive later source edits while ordinary and uncap
   const writes=d.writes.length;
   assert.throws(()=>r.render(frame([{mesh:builtin,nodeRangeCaptured:true}])));
   assert.equal(d.writes.length,writes);
+  await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
+});
+
+for(const indexed of [false,true]) for(const renderBundles of [false,true])
+test(`native instance counts reach draws, omit zero calls and invalidate bundles (${indexed}/${renderBundles})`,async()=>{
+  const s=source();if(!indexed)s.index=null;
+  const {d,r,ordinary,gpu,builtin,node}=await setup({renderBundles},s);
+  for(const instanceCount of [3,0,2,3]) {
+    const captured=Object.freeze({...draw(node,instanceCount),instanceCount});
+    r.render(frame([builtin,captured,draw(node,7)]));
+    const native=d.snapshots.at(-1).filter(snapshot=>snapshot.pipeline.vertex.entryPoint==='main');
+    assert.deepEqual(native.map(snapshot=>snapshot.args[1]),instanceCount===0?[1]:[instanceCount,1]);
+    assert.ok(native.every(snapshot=>snapshot.indexed===indexed));
+    assert.ok(native.every(snapshot=>snapshot.args[indexed?4:3]===0));
+    assert.equal(r.drawCallCount,instanceCount===0?2:3);
+  }
+  if(renderBundles){assert.equal(r.bundleDiagnostics.builds,3);assert.equal(r.bundleDiagnostics.reuses,1);}
   await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
 });
 
