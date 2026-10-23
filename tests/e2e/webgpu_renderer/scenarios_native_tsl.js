@@ -74,6 +74,52 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_background_blur(T, renderer) {
+    const panorama = environmentTexture(T, 0);
+    const writer = new T.Scene(), writeCamera = camera(T);
+    writer.background = panorama;
+    const material = new T.MeshBasicNodeMaterial();
+    material.colorNode = T.TSL.vec3(.04, .16, .8);
+    const marker = new T.Mesh(new T.PlaneGeometry(.65, .55), material);
+    marker.rotation.z = .2; marker.renderOrder = -10; writer.add(marker);
+    const states = [
+      {blur: .08, intensity: .95, rotation: [.05, .2, .1]},
+      {blur: .72, intensity: .95, rotation: [.05, .2, .1]},
+      {blur: .32, intensity: .42, rotation: [.1, -.85, .25]},
+    ];
+    const targets = states.map(() => new T.RenderTarget(96, 72, {
+      depthBuffer: true, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter,
+    }));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    const panelGeometry = new T.PlaneGeometry(1.25, .9375);
+    for (const [index, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(panelGeometry, new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = (index - 1) * 1.4; result.scene.add(panel);
+    }
+    const render = renderer.render.bind(renderer); let submitted = false;
+    renderer.render = (...args) => {
+      // Source PMREM filtering also calls render() for its internal meshes.
+      if (args[0] !== result.scene) return render(...args);
+      if (!submitted) {
+        submitted = true;
+        const previous = renderer.getRenderTarget(), mip = renderer.getActiveMipmapLevel();
+        try {
+          for (const [index, state] of states.entries()) {
+            writer.backgroundBlurriness = state.blur; writer.backgroundIntensity = state.intensity;
+            writer.backgroundRotation.set(...state.rotation);
+            renderer.setRenderTarget(targets[index]); render(writer, writeCamera);
+          }
+        } finally { renderer.setRenderTarget(previous, 0, mip); }
+        // These later edits must not replace any accepted target render's state.
+        // Targets are written only once, so later frames cannot hide a queue bug.
+        writer.backgroundBlurriness = .97; writer.backgroundIntensity = .01;
+        writer.backgroundRotation.set(1.7, 2.1, -.8);
+      }
+      return render(...args);
+    };
+    return {...result, writer, writeCamera, panorama, targets};
+  },
   native_tsl_environment(T, renderer) {
     const {uniform, vec3} = T.TSL;
     const standard = new T.MeshStandardNodeMaterial(), physical = new T.MeshPhysicalNodeMaterial();

@@ -153,7 +153,7 @@ export async function createGpuThreeScene(device,scene,{
   if(backgroundEnabled&&renderOptions.outputTransfer==='srgb')fail('OPTIONS','Texture background passes do not encode shader-side sRGB output');
   const backgroundApi=backgroundEnabled?await import('./three_background.mjs'):null;
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
-  const sourceBackground=()=>scene.background!==null&&!scene.background?.isColor?scene.background:null;
+  const sourceBackground=()=>!passNodeFrame?.background&&scene.background!==null&&!scene.background?.isColor?scene.background:null;
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
   const models=new Map([
@@ -1548,11 +1548,14 @@ export async function createGpuThreeScene(device,scene,{
       const shadowFrame=lightIndex<0?null:shadowOwner.capture(camera);
       if(shadowFrame?.update)for(const object of casterObjects)
         if(!object.frustumCulled||shadowFrame.frustum===null||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
+      let nativeBackground = null;
       if(passNodeFrame)for(const packet of passNodeFrame.draws){
         const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
         const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&same(e.structural,desc.structural));
         if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
-        (packet.listMaterial.transparent?transparent:opaque).push({...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true});
+        const draw={...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true};
+        if(packet.background)nativeBackground=draw;
+        else (packet.listMaterial.transparent?transparent:opaque).push(draw);
       }
       if(sortObjects){
         const order=(a,b)=>a.groupOrder-b.groupOrder||(a.renderOrder??a.object.renderOrder)-(b.renderOrder??b.object.renderOrder);
@@ -1560,6 +1563,8 @@ export async function createGpuThreeScene(device,scene,{
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
         transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
       }
+      // Native sky draws lead even when fixed meshes share this scene or sorting is disabled.
+      if(nativeBackground)opaque.unshift(nativeBackground);
       // WebGLBackground.addToRenderList: after sorting, the background mesh leads.
       const bg=programBackground();
       if(bg){

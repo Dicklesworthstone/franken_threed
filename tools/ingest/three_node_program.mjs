@@ -156,7 +156,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (scene?.environmentNode != null)
       fail('ENVIRONMENT', 'Custom scene environment nodes require an explicit lighting context');
     const texture = scene?.environment ?? null;
-    if (texture === null) return null;
+    return texture === null ? null : sourcePMREMTexture(texture);
+  }
+  function sourcePMREMTexture(texture) {
     if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource ||
         ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping].includes(texture.mapping))
       fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image or source CubeUV texture');
@@ -167,6 +169,25 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function assertEnvironmentVersion(texture) {
     if (texture && environmentVersions.has(texture) && environmentVersions.get(texture) !== texture.pmremVersion)
       fail('ENVIRONMENT_REFRESH', 'In-place source PMREM regeneration requires a nested preparation boundary; use a different environment texture identity for fresh source filtering');
+  }
+  function inspectPMREMNode(node) {
+    const texture = sourcePMREMTexture(node.value), target = node._generator?._pingPongRenderTarget;
+    if (target && texture.mapping !== three.CubeUVReflectionMapping && texture.isPMREMTexture !== true) {
+      // Match the pinned generator's source size and CubeUV target allocation.
+      // Resizing would dispose resources still held by accepted queued draws.
+      const size = 2 ** Math.floor(Math.log2(texture.image.width / 4));
+      if (target.width !== 3 * Math.max(size, 16 * 7) || target.height !== 4 * size)
+        fail('ENVIRONMENT_REFRESH', 'Changing a prepared PMREM source atlas size requires a new PMREMNode to preserve queued render work');
+    }
+    return texture;
+  }
+  function pmremSignature(nodes) {
+    return JSON.stringify(nodes.map(node => {
+      const texture = inspectPMREMNode(node);
+      // Source PMREMNode.setup chooses its atlas and Y orientation from this
+      // input. A same-format replacement still needs source setup to run again.
+      return [texture.id, texture.mapping, texture.isRenderTargetTexture === true, texture.isPMREMTexture === true];
+    }));
   }
   function environmentNodeFor(texture) {
     if (!texture) return null;
@@ -273,8 +294,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (boundTextures === null || boundTextures.has(node.value)) inspectTexture(node.value);
       if (node.compareNode !== null || node.depthNode !== null)
         fail('TEXTURE', 'Texture comparison and array-layer sampling are not admitted');
-    } else if (node.value?.isTexture && !(environmentNode && node.constructor === three.PMREMNode && node.value === environmentNode.value))
-      fail('TEXTURE', 'Native graphics textures require source TextureNode bindings');
+    } else if (node.constructor === three.PMREMNode) inspectPMREMNode(node);
+    else if (node.value?.isTexture)
+      fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');
     if (node.isStorageBufferNode) inspectStorage(node);
     else if (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode)
       fail('STORAGE', 'Explicit uniform buffers, attribute conversions, atomic and compute graphs are not admitted');
@@ -332,7 +354,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const key = keyOf(material, object, context, lights, environment, instanceSignature), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
-    if (previous?.key === key && textureSignature(previous.textureNodes) === previous.textureSignature &&
+    if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
+        textureSignature(previous.textureNodes) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature) return previous.descriptor;
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     const builder = new three.WGSLNodeBuilder(object, renderer);
@@ -352,8 +375,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // would recursively capture renderer calls inside a whole-render texture
     // transaction. Refuse that boundary explicitly, before source callbacks;
     // changing environment identity still builds a fresh atlas normally.
-    if (environment && environment.mapping !== three.CubeUVReflectionMapping)
-      environmentVersions.set(environment, environment.pmremVersion);
+    const pmremNodes = [...builder.nodes].filter(node => node.constructor === three.PMREMNode);
+    for (const node of pmremNodes) if (node.value.mapping !== three.CubeUVReflectionMapping && !node.value.isPMREMTexture)
+      environmentVersions.set(node.value, node.value.pmremVersion);
+    const pmremKey = pmremSignature(pmremNodes);
     if (builder.nodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
     const bindings = builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
@@ -425,9 +450,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
-    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, textureNodes, textureSignature: signature,
+    nodeStates.set(descriptor, {owner: api, builder, bindings, material, object, environment, instanceSignature, pmremNodes, pmremSignature: pmremKey,
+      textureNodes, textureSignature: signature,
       storageNodes, storageSignature: storageKey});
-    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, textureNodes, textureSignature: signature,
+    const entry = {key, descriptor, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
+      textureNodes, textureSignature: signature,
       storageNodes, storageSignature: storageKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
@@ -448,6 +475,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       renderId: context.renderId ?? renderer.info.calls});
     for (const key of ['frameId', 'time', 'deltaTime']) if (context[key] !== undefined) frame[key] = context[key];
     try { return run(); } finally { Object.assign(frame, previous); }
+  }
+  function checkPMREM(state) {
+    if (pmremSignature(state.pmremNodes) !== state.pmremSignature)
+      fail('CHANGED', 'Native PMREM input identity or sampling orientation changed; compile the graph again');
   }
   function readTextures(state) {
     if (textureSignature(state.textureNodes) !== state.textureSignature)
@@ -472,6 +503,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const object = context.object ?? state.object;
     assertInstances(object, state.instanceSignature);
     assertEnvironmentVersion(state.environment);
+    checkPMREM(state);
     // Reject a stale or newly atomic schema before observable NodeFrame updates;
     // readStorage below also catches mutations performed by those updates.
     if (state.storageNodes.length) readStorage(state);
@@ -479,6 +511,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       for (const node of state.builder.updateBeforeNodes) frame.updateBeforeNode(node);
       for (const node of state.builder.updateNodes) frame.updateNode(node);
       assertInstances(object, state.instanceSignature);
+      checkPMREM(state);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {

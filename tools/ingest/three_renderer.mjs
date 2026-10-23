@@ -42,6 +42,7 @@ import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 import {withThreeCompute} from './three_compute.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createThreeNodeBackgrounds} from './three_node_background.mjs';
 import {createThreeSceneRaster} from './three_scene_raster.mjs';
 // r186 src/renderers/webgpu/utils/WebGPUConstants.js GPUFeatureName values.
 const R186_GPU_FEATURES = ['core-features-and-limits', 'depth-clip-control', 'depth32float-stencil8', 'texture-compression-bc',
@@ -282,6 +283,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
       this._passSnapshots = createThreePassSnapshots(THREE);
       this._nodeProgramSupport = null;
+      this._nodeBackgrounds = null;
       this._nodeCaptureBytes = 0;
       this._nodeRaster = new Map();
       this._initialized = false;
@@ -390,6 +392,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._session = null;
       this._wanted.clear();
       this._passSnapshots.dispose();
+      this._nodeBackgrounds?.dispose(); this._nodeBackgrounds = null;
       this._nodeProgramSupport?.dispose();
       this._nodeProgramSupport = null;
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
@@ -680,7 +683,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let raster = this._nodeRaster.get(stencilAttachment);
       if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
-      const captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster,
+      const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
+      const captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh,
         getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
         getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
         maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,

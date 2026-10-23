@@ -56,6 +56,29 @@ ordinary upload-version behavior. Cube environment inputs, custom environment
 nodes and the compatibility adapter's placeholder PMREM textures remain outside
 this native profile.
 
+Native panoramic backgrounds use the pinned source sphere, camera projection,
+far-plane placement and PMREM sampling graph. Equirectangular backgrounds with
+positive blurriness and direct CubeUV backgrounds are captured before ordinary
+scene draws, including scenes whose user materials follow the fixed route.
+Blur, intensity, rotation and camera uniforms retain their values for each queued
+call. The private sky mesh does not enter the user hierarchy and stays first
+after mixed native/fixed sorting, including when sorting is disabled.
+
+Backgrounds keep a separate source PMREM node for each panorama identity.
+Queued A-to-B-to-A replacements can therefore use differently sized atlases
+without retiring A's filtering targets. Authored `pmremTexture()` graphs also use
+the native path. Replacing one authored node's source with a different required
+atlas size fails before callbacks; use a new PMREM node for that replacement.
+Ordinary same-size replacements remain supported.
+
+Authored `scene.backgroundNode` graphs are explicitly refused by this bounded
+background entrance. Sharp equirectangular backgrounds still use the existing
+fixed background path. Its controls are read during deferred preparation, so
+drain outstanding renders before crossing between zero and positive blurriness.
+The new native background path captures positive-to-positive updates and CubeUV
+updates, including CubeUV blur zero. These boundaries do not establish full H8
+application compatibility.
+
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
 matrix selection, explicit/generated UVs, color-space interpretation, explicit
@@ -356,3 +379,14 @@ The instanced-mesh and FIFO runs imported the current renderer modules directly
 and used the unchanged runner and scenarios for 30 frames. They validate native
 GPU execution against pinned r186 in that software-GPU environment. They do not
 include a fresh bundled-application build or a hardware performance measurement.
+
+The environment and PMREM-background recording-device regressions cover initial
+source filtering, shared PBR/sky atlases, queued control values, mixed draw order,
+differently sized texture replacement, and rejection before callbacks or
+submission when an authored PMREM node would retire queued resources.
+`native_tsl_environment` and `native_tsl_background_blur` are registered browser
+comparisons; their new pixel-parity results remain unverified. The first actual
+environment run exposed the corrected color-only scissor-clear depth bug.
+A subsequent candidate run crashed during compilation under exhausted workspace
+memory/storage before producing its baseline image.
+

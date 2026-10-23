@@ -27,6 +27,52 @@ test('ordinary scenes do not create a node compiler or change the source camera'
   assert.equal(f.capture({getPrograms() { assert.fail('unexpected native compiler'); }}), null);
   assert.equal(f.camera.coordinateSystem, THREE.WebGLCoordinateSystem); assert.equal(f.frame.frameId, 7);
 });
+test('private native backgrounds precede scene draws independently of sorting, layers and overrides', t => {
+  for (const sortObjects of [false, true]) {
+    const f = rig(t), seen = [], foreground = f.mesh(), fixed = f.mesh(new THREE.MeshBasicMaterial());
+    foreground.renderOrder = -100; f.renderer.sortObjects = sortObjects;
+    const override = f.material();
+    override.colorNode = N.uniform(.75).onObjectUpdate(frame => { seen.push(frame.object); return .75; });
+    const material = f.material();
+    const background = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+    background.visible = false; background.layers.set(4); background.renderOrder = 100;
+    background.position.x = 100; // projection traversal would also cull it
+    material.colorNode = N.uniform(.25).onObjectUpdate(frame => {
+      assert.equal(frame.scene, f.scene); assert.equal(frame.camera, f.camera);
+      assert.equal(frame.object, background); assert.equal(frame.material, material);
+      assert.equal(frame.object.modelViewMatrix.elements[12], 100);
+      assert.equal(frame.object.modelViewMatrix.elements[14], -5);
+      seen.push(frame.object); return .25;
+    });
+    const children = f.scene.children.slice();
+    const captured = f.capture({backgroundMesh: background, overrideMaterial: override});
+    assert.equal(captured.background, true);
+    assert.equal(captured.bindings[0].object, background);
+    assert.equal(captured.bindings[0].material, material, 'scene override cannot replace the private background material');
+    assert.deepEqual(captured.draws.map(draw => draw.object), [background, foreground, fixed]);
+    assert.deepEqual(captured.draws.map(draw => draw.background), [true, false, false]);
+    assert.deepEqual(seen, [background, foreground, fixed]);
+    assert.deepEqual(f.scene.children, children); assert.equal(background.parent, null);
+    assert.ok(children.every(child => child.parent === f.scene));
+  }
+});
+test('a private background prepares and captures when all user scene materials use the fixed route', t => {
+  const f = rig(t), fixed = f.mesh(new THREE.MeshBasicMaterial()), material = f.material(); let updates = 0;
+  const background = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  f.scene.visible = false; background.layers.set(5);
+  const children = f.scene.children.slice();
+  const prepared = f.capture({backgroundMesh: background, uniforms: false});
+  assert.equal(prepared.background, true); assert.equal(prepared.bindings.length, 1);
+  assert.equal(prepared.bindings[0].object, background); assert.equal(prepared.draws.length, 0); assert.equal(updates, 0);
+  const captured = f.capture({backgroundMesh: background});
+  assert.equal(captured.background, true); assert.deepEqual([...captured.objects], [background]);
+  assert.equal(captured.draws.length, 1); assert.equal(captured.draws[0].object, background);
+  assert.equal(captured.draws[0].background, true); assert.equal(updates, 1);
+  assert.deepEqual(f.scene.children, children); assert.equal(fixed.parent, f.scene); assert.equal(background.parent, null);
+  const attached = new THREE.Group(); attached.add(background);
+  assert.throws(() => f.capture({backgroundMesh: background}), {code: 'THREE_NODE_PROGRAM_BACKGROUND'});
+});
 test('native draws capture source identities, matrices, frame context and independent uniform histories', t => {
   const f = rig(t), seen = [], m = f.material(), tint = N.uniform(new THREE.Color());
   tint.onObjectUpdate(frame => { seen.push({object: frame.object, material: frame.material, camera: frame.camera,

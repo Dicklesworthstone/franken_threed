@@ -12,10 +12,17 @@ const transparent = material => material.transparent === true || material.transm
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
-  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null} = {}) {
+  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
+  if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
+      backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
+      !hasThreeNodeProgram(backgroundMesh.material)))
+    fail('BACKGROUND', 'Native backgrounds require a separate childless mesh with one authored node material');
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root];
+  // The source inserts a private background object into the render list. Admit
+  // and prepare it without adding it to, or updating through, the user's root.
+  if (backgroundMesh) stack.push(backgroundMesh);
   // Traverse hidden objects too: preparation must admit every program before a
   // visible logical draw can run an application node callback.
   while (stack.length) {
@@ -29,7 +36,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!object.material) continue;
     const originals = Array.isArray(object.material) ? object.material.slice() : [object.material];
     if (originals.length > maxNodes) fail('LIMIT', 'Native scene material array exceeds its budget');
-    const effective = originals.map(original => original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
+    const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
     for (let i = 0; i < originals.length; i++) {
       const original = originals[i], material = effective[i];
       if (original === material || (!hasThreeNodeProgram(original) && !hasThreeNodeProgram(material))) continue;
@@ -89,20 +96,21 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // visible update callbacks followed by a preparation refusal.
   for (const binding of bindings) programs.inspect(binding.material, binding.object, context);
   if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+  if (backgroundMesh?.matrixWorldAutoUpdate === true) backgroundMesh.updateMatrixWorld();
   if (camera.coordinateSystem !== three.WebGPUCoordinateSystem) {
     if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
     camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
   }
   if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-  const opaque = [], translucent = [], draws = [], lights = [];
+  const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [];
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
     const center = new three.Vector4(), sortObjects = renderer.sortObjects === true;
     const visible = [{object: root, groupOrder: 0}];
-    const append = (object, state, original, material, group, groupOrder, z) => {
+    const append = (object, state, original, material, group, groupOrder, z, background = false) => {
       if (!original?.visible || !material) return;
-      if (opaque.length + translucent.length >= maxDraws) fail('LIMIT', 'Native source draw list exceeds its capacity');
+      if (opaque.length + translucent.length + backgroundDraws.length >= maxDraws) fail('LIMIT', 'Native source draw list exceeds its capacity');
       const {geometry, byMaterial} = state, range = geometry.drawRange;
       const extent = geometry.index ? geometry.index.count : geometry.attributes.position?.count;
       if (!integer(extent) || !integer(range?.start) || !(range.count === Infinity || integer(range.count)) ||
@@ -114,9 +122,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const packet = {binding: byMaterial.get(material), object, geometry, material, listMaterial,
         group: group ? Object.freeze({...group}) : null, groupOrder, z, renderOrder: object.renderOrder,
         first, count: Math.max(0, end - first), frontFaceCW: object.matrixWorld.determinant() < 0,
-        nodeRangeCaptured: true, nodeUniforms: null};
-      (listMaterial.transparent ? translucent : opaque).push(packet);
+        nodeRangeCaptured: true, nodeUniforms: null, background};
+      (background ? backgroundDraws : listMaterial.transparent ? translucent : opaque).push(packet);
     };
+    if (uniforms && backgroundMesh) {
+      const state = pairs.get(backgroundMesh);
+      append(backgroundMesh, state, state.originals[0], state.effective[0], null, 0, 0, true);
+    }
     while (visible.length) {
       const item = visible.pop(), object = item.object; let {groupOrder} = item;
       if (object.visible === false) continue;
@@ -145,7 +157,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       opaque.sort((a, b) => order(a, b) || a.z - b.z || a.object.id - b.object.id);
       translucent.sort((a, b) => order(a, b) || b.z - a.z || a.object.id - b.object.id);
     }
-    draws.push(...opaque, ...translucent);
+    draws.push(...backgroundDraws, ...opaque, ...translucent);
   }
   // The source projects lights for compileAsync as well as rendering. Keep the
   // selected source objects (including LOD visibility), not packed radiance;
@@ -222,6 +234,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (const lease of storageUses) storageOwner.release(lease);
     throw error;
   }
-  return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes,
+  return Object.freeze({objects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     textureOwner, textureUses: Object.freeze(textureUses), storageOwner, storageUses: Object.freeze(storageUses)});
 }

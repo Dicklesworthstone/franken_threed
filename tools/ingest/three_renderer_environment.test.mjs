@@ -91,3 +91,45 @@ test('queued source environment replacement keeps atlas identity and source unif
   assert.ok(uniformValues(draws[0]).includes(.375)); assert.ok(uniformValues(draws[1]).includes(.875));
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+test('authored equirectangular PMREM inputs prepare, replace and refuse refresh before callbacks', async t => {
+  const f = fixture(t); await f.renderer.init(); let updates = 0;
+  const pmrem = N.pmremTexture(f.scene.environment, N.vec3(0, 0, 1), N.float(.375));
+  const material = new THREE.NodeMaterial(); material.lights = false;
+  material.colorNode = N.vec4(pmrem).mul(N.uniform(1).setName('environmentSurface').onObjectUpdate(() => { updates++; return 1; }));
+  f.scene.children[0].material = material; f.scene.environment = null;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(updates, 1); assert.equal(f.renderer.info.f3d.offscreenRenders, 13);
+  const first = pbrDraws(f.device)[0], firstAtlas = targetTextures(first)[0]; assert.ok(firstAtlas);
+  pmrem.value = panorama(0x3400);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(updates, 2); assert.equal(f.renderer.info.f3d.offscreenRenders, 26);
+  assert.notEqual(targetTextures(pbrDraws(f.device)[1])[0], firstAtlas);
+  const submissions = f.device.submissions.length;
+  pmrem.value.needsPMREMUpdate = true;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH'});
+  assert.equal(updates, 2); assert.equal(f.device.submissions.length, submissions);
+  assert.equal(f.renderer.info.f3d.offscreenRenders, 26); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('authored PMREM size changes refuse before retiring queued filter targets', async t => {
+  const f = fixture(t); await f.renderer.init(); let updates = 0;
+  const pmrem = N.pmremTexture(f.scene.environment, N.vec3(0, 0, 1), N.float(.375));
+  const material = new THREE.NodeMaterial(); material.lights = false;
+  material.colorNode = N.vec4(pmrem).mul(N.uniform(1).setName('environmentSurface').onObjectUpdate(() => { updates++; return 1; }));
+  f.scene.children[0].material = material; f.scene.environment = null;
+  f.renderer.render(f.scene, f.camera);
+  const pending = f.renderer._pending.length, submissions = f.device.submissions.length;
+  let disposed = 0;
+  pmrem._generator._pingPongRenderTarget.addEventListener('dispose', () => { disposed++; });
+  const larger = panorama(0x3400);
+  larger.image = {data: new Uint16Array(128 * 64 * 4).fill(0x3400), width: 128, height: 64};
+  larger.needsUpdate = true; pmrem.value = larger;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), error =>
+    error.code === 'THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH' && /new PMREMNode/.test(error.message));
+  assert.equal(updates, 1); assert.equal(disposed, 0);
+  assert.equal(f.renderer._pending.length, pending); assert.equal(f.device.submissions.length, submissions);
+  await drain(f.renderer);
+  assert.equal(f.renderer.info.f3d.offscreenRenders, 13); assert.equal(pbrDraws(f.device).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
