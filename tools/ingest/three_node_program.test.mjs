@@ -310,6 +310,80 @@ test('source morphing precedes skinning and their independently captured uniform
   assert.ok(d.groups.flatMap(group => group.uniforms).some(member => member.byteLength === 128));
   assert.equal(f.object.skeleton.boneMatrices[28], .375);
 });
+function instancedMorphRig(t, {relative = true, uniformInfluences = false} = {}) {
+  const f = morphRig(t, {relative}), object = new THREE.InstancedMesh(f.object.geometry, f.material, 4);
+  for (let index = 0; index < 4; index++) {
+    object.setMatrixAt(index, new THREE.Matrix4().makeTranslation(index * .5, 0, 0));
+    f.object.morphTargetInfluences = [index * .25 - .25, 1.25 - index * .5];
+    object.setMorphAt(index, f.object);
+  }
+  if (!relative || uniformInfluences) object.morphTargetInfluences = [.25, .5];
+  object.morphTexture.needsUpdate = true;
+  f.scene.remove(f.object); f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object};
+  return {...f, object, context, compile: () => f.owner.compile(f.material, object, context)};
+}
+for (const relative of [true, false]) test(`native per-instance morphs preserve source texture loads and ${relative ? 'relative' : 'absolute'} base semantics`, t => {
+  const f = instancedMorphRig(t, {relative});
+  // In r186 the texture branch does not initialize an unused influences UBO.
+  // The source-valid absolute case first constructs its single-instance path.
+  if (!relative) { f.object.count = 1; f.compile(); f.object.count = 4; }
+  const d = f.compile();
+  const builder = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  builder.scene = f.scene; builder.camera = f.camera; builder.build();
+  const canonical = shader => shader.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(d.vertex), canonical(builder.vertexShader)); assert.equal(d.fragment, builder.fragmentShader);
+  assert.match(d.vertex, /texture_2d<f32>/); assert.match(d.vertex, /texture_2d_array<f32>/);
+  assert.match(d.vertex, /textureLoad\([^\n]*instanceIndex/);
+  assert.ok(d.vertex.indexOf('textureLoad') < d.vertex.indexOf('.value[ instanceIndex ] * vec4<f32>( positionLocal'));
+  const draw = f.owner.captureDraw(d, f.context);
+  assert.equal(draw.textures.find(binding => binding.texture === f.object.morphTexture).isSampledTexture, true);
+  assert.equal(draw.textures.some(binding => binding.isSampler && !binding.isSampledTexture), false);
+  assert.equal(d.instanceCapacity, 4);
+  assert.ok(d.groups.flatMap(group => group.entries).some(entry =>
+    entry.texture?.viewDimension === '2d' && entry.texture.sampleType === 'unfilterable-float'));
+});
+test('native instance morph graph keys retain weight uploads and rebuild source texture/count branches', t => {
+  const f = instancedMorphRig(t, {uniformInfluences: true});
+  f.object.count = 1; f.compile(); f.object.count = 4;
+  const d = f.compile();
+  f.object.morphTexture.image.data[1] = -.75; f.object.morphTexture.needsUpdate = true;
+  f.object.count = 2; assert.equal(f.compile(), d);
+  f.object.morphTexture = f.object.morphTexture.clone(); f.object.morphTexture.needsUpdate = true;
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const replaced = f.compile(); assert.notEqual(replaced, d);
+  assert.equal(f.owner.captureDraw(replaced, f.context).textures.some(binding => binding.texture === f.object.morphTexture), true);
+  f.object.count = 1;
+  assert.throws(() => f.owner.captureDraw(replaced, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const uniform = f.compile();
+  assert.equal(f.owner.captureDraw(uniform, f.context).textures.some(binding => binding.texture === f.object.morphTexture), false);
+  assert.deepEqual(uniformValues(f.owner.capture(uniform, f.context), morphMember(uniform)), [.25, 0, 0, 0, .5, 0, 0, 0]);
+  f.object.count = 3;
+  const textured = f.compile(); assert.notEqual(textured, uniform);
+  assert.equal(f.owner.captureDraw(textured, f.context).textures.some(binding => binding.texture === f.object.morphTexture), true);
+});
+test('instance morph structural changes during node updates reject stale captured texture bindings', t => {
+  const f = instancedMorphRig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color(.2, .4, .6)).onObjectUpdate(() => {
+    updates++; f.object.morphTexture = f.object.morphTexture.clone();
+  });
+  const d = f.compile();
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 1);
+});
+test('instanced morphs preserve source influence prerequisites and reject unsupported weight textures before callbacks', t => {
+  for (const change of [
+    object => { object.geometry.morphTargetsRelative = false; },
+    object => { object.count = 1; },
+    object => { object.morphTexture = new THREE.CubeTexture(); },
+    object => { object.morphTargetInfluences = [.5]; },
+  ]) {
+    const f = instancedMorphRig(t); let updates = 0;
+    f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; });
+    change(f.object);
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(updates, 0);
+  }
+});
 test('managed uniform arrays retain source scalar/vector/color/matrix padding and current values', t => {
   const cases = [
     ['float', [1, 2], Float32Array, [1, 0, 0, 0, 2, 0, 0, 0], value => value.element(0)],

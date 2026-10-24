@@ -68,7 +68,76 @@ function paired(T, skinned = false) {
   return {...result, meshes, rigs};
 }
 
+function instanced(T, count = 6) {
+  const result = stage(T), g = geometry(T, true), m = material(T, 0xffffff);
+  const mesh = new T.InstancedMesh(g, m, count), template = new T.Mesh(g, m);
+  const transform = new T.Object3D(), columns = count === 2 ? 1 : 3, rows = Math.ceil(count / columns);
+  const weights = [[0, 0], [.85, .1], [-.3, .9], [.25, 1.1], [1.15, -.2], [.55, .65]];
+  for (let i = 0; i < count; i++) {
+    transform.position.set((i % columns - (columns - 1) / 2) * 1.25, (rows - 1) * .8 - Math.floor(i / columns) * 1.6, 0);
+    transform.rotation.set(.1, (i % 3 - 1) * .35, (i % 2 ? -1 : 1) * .08);
+    transform.scale.set(.86 + (i % 2) * .12, .84, .8 + (i % 3) * .1); transform.updateMatrix();
+    mesh.setMatrixAt(i, transform.matrix);
+    mesh.setColorAt(i, new T.Color().setHSL(.06 + i * .12, .62, .56));
+    template.morphTargetInfluences = weights[i]; mesh.setMorphAt(i, template);
+  }
+  mesh.instanceMatrix.needsUpdate = true; mesh.instanceColor.needsUpdate = true; mesh.morphTexture.needsUpdate = true;
+  result.scene.add(mesh); result.camera.position.set(.2, .25, count === 2 ? 4.9 : 6.5); result.camera.lookAt(0, 0, 0);
+  const writeWeights = (values, upload = true) => {
+    for (let i = 0; i < count; i++) { template.morphTargetInfluences = values[i % values.length]; mesh.setMorphAt(i, template); }
+    if (upload) mesh.morphTexture.needsUpdate = true;
+  };
+  return {...result, mesh, template, writeWeights};
+}
+
 export const nativeMorphScenarios = {
+  native_tsl_morph_instances(T, renderer) {
+    const result = instanced(T), render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene) {
+        if (++frame === 8) result.writeWeights([[.2, .95], [1.1, -.2], [-.35, .4], [.7, .15], [.1, 1.2], [.8, .6]]);
+        // Public CPU writes without needsUpdate must leave the uploaded weights unchanged.
+        if (frame === 18) result.writeWeights([[3, -2]], false);
+      }
+      return render(...args);
+    };
+    return result;
+  },
+  native_tsl_morph_instances_targets(T, renderer) {
+    const writer = instanced(T, 2); writer.camera.aspect = 3 / 4; writer.camera.updateProjectionMatrix();
+    const targets = Array.from({length: 3}, () => new T.RenderTarget(96, 128,
+      {generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: new T.Scene(), camera: new T.OrthographicCamera(-2.2, 2.2, 1.65, -1.65, .1, 10)};
+    result.scene.background = new T.Color(0x15202d); result.camera.position.z = 4;
+    for (const [i, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.35, 1.8), new T.MeshBasicMaterial({map: target.texture}));
+      panel.position.x = (i - 1) * 1.45; result.scene.add(panel);
+    }
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      const previous = renderer.getRenderTarget(), face = renderer.getActiveCubeFace(), mip = renderer.getActiveMipmapLevel();
+      try { for (const target of targets) { renderer.setRenderTarget(target); await compile(writer.scene, writer.camera); } }
+      finally { renderer.setRenderTarget(previous, face, mip); }
+      return compile(...args);
+    };
+    let captured = false;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene && !captured) {
+        captured = true;
+        const previous = renderer.getRenderTarget(), face = renderer.getActiveCubeFace(), mip = renderer.getActiveMipmapLevel();
+        const poses = [[[.05, .1], [.9, -.2]], [[.85, .1], [-.3, 1]], [[.15, 1.15], [1.1, .3]]];
+        try {
+          for (const [i, target] of targets.entries()) {
+            writer.writeWeights(poses[i]); renderer.setRenderTarget(target); render(writer.scene, writer.camera);
+          }
+        } finally { renderer.setRenderTarget(previous, face, mip); }
+        writer.writeWeights([[4, -3]], false);
+      }
+      return render(...args);
+    };
+    return {...result, writer, targets};
+  },
   native_tsl_morph(T, renderer) {
     const result = paired(T), render = renderer.render.bind(renderer); let frame = 0;
     renderer.render = (...args) => {

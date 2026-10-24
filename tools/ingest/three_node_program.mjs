@@ -258,10 +258,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function inspectInstances(object) {
     if (!object.isInstancedMesh) return null;
-    if (!(object instanceof three.InstancedMesh) || object.isSkinnedMesh || object.isBatchedMesh || object.morphTexture != null ||
+    if (!(object instanceof three.InstancedMesh) || object.isSkinnedMesh || object.isBatchedMesh ||
         !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry ||
-        Object.values(object.geometry.morphAttributes ?? {}).some(list => list.length))
-      fail('OBJECT', 'Native instancing requires source InstancedMesh objects without skinning or morph data');
+        object.morphTexture != null && !object.geometry.morphAttributes.position?.length)
+      fail('OBJECT', 'Native instancing requires source InstancedMesh objects, with position targets for per-instance morph textures');
     const cpu = [];
     const shape = (attribute, type) => {
       if (attribute instanceof three.StorageInstancedBufferAttribute && attribute.isStorageInstancedBufferAttribute === true) {
@@ -329,11 +329,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (![position, normal, color].some(list => list?.length)) return null;
     const count = position?.length, vertices = geometry.attributes.position?.count;
     const influences = object.morphTargetInfluences;
-    if (object.isInstancedMesh || object.isBatchedMesh || !Array.isArray(position) ||
+    // Match Morph.js's construction branch. Its instance texture contains each
+    // row's weights, while the source base multiplier remains an object uniform.
+    // Absolute morphs therefore still require the source influence array; do
+    // not invent a different base calculation from the texture's first texel.
+    const texture = object.count > 1 && object.morphTexture != null ? object.morphTexture : null;
+    const influenceArray = Array.isArray(influences) || ArrayBuffer.isView(influences) && !(influences instanceof DataView);
+    if (object.isBatchedMesh || !Array.isArray(position) ||
         !Number.isSafeInteger(count) || count < 1 || !Number.isSafeInteger(vertices) || vertices < 1 ||
-        !(Array.isArray(influences) || ArrayBuffer.isView(influences) && !(influences instanceof DataView)) ||
-        influences.length !== count)
-      fail('OBJECT', 'Native morphs require ordinary meshes with source position targets and matching influence arrays');
+        ((!texture || !geometry.morphTargetsRelative || influences != null) && (!influenceArray || influences.length !== count)))
+      fail('OBJECT', 'Native morphs require source position targets and matching influence arrays for the source uniform/base path');
+    if (texture) {
+      if (!(texture instanceof three.DataTexture) || texture.isDataTexture !== true)
+        fail('OBJECT', 'Native per-instance morph weights require a source DataTexture');
+      inspectTexture(texture);
+    }
     if (count > (renderer._device?.limits?.maxTextureArrayLayers ?? 256))
       fail('LIMIT', 'Native morph targets exceed the device texture layer limit');
     for (const [name, list] of [['position', position], ['normal', normal], ['color', color]]) {
@@ -346,7 +356,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // The pinned Morph.js owns packing and caches by geometry/count. Influence
     // values and relative mode stay live; attribute edits do not silently
     // regenerate a source texture that remains cached until geometry disposal.
-    return JSON.stringify([count, vertices, normal !== undefined && geometry.hasAttribute('normal'), color !== undefined]);
+    return JSON.stringify([count, vertices, normal !== undefined && geometry.hasAttribute('normal'), color !== undefined,
+      texture ? sourceId(texture) : null]);
   }
   function assertMorphs(object, signature) {
     if (inspectMorphs(object) !== signature)

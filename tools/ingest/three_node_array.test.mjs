@@ -146,3 +146,40 @@ test('actual native graphics bind nearest float32 arrays without the optional fi
   const bytes = f.device.textureWrites.find(write => write.texture === view.texture).bytes;
   assert.ok([...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)].every(value => value === .125));
 });
+
+test('queued instance morph draws retain marked weight versions and ignore later unmarked CPU changes', async t => {
+  const f = recording(t); await f.renderer.init();
+  const geometry = new T.PlaneGeometry(); geometry.morphTargetsRelative = true;
+  geometry.morphAttributes.position = [0, 1].map(axis => new T.Float32BufferAttribute(
+    Array.from(geometry.attributes.position.array, (_, component) => component % 3 === axis ? .25 : 0), 3));
+  const source = new T.Mesh(geometry), mesh = new T.InstancedMesh(geometry, f.material, 3);
+  for (let i = 0; i < 3; i++) mesh.setMatrixAt(i, new T.Matrix4().makeTranslation((i - 1) * .6, 0, 0));
+  const setWeights = (a, b) => {
+    for (let i = 0; i < 3; i++) {
+      source.morphTargetInfluences[0] = a + i * .25; source.morphTargetInfluences[1] = b - i * .25;
+      mesh.setMorphAt(i, source);
+    }
+  };
+  f.scene.remove(f.scene.children[0]); f.scene.add(mesh);
+  f.material.colorNode = N.vec3(.5).mul(N.uniform(1).setName('nativeInstanceMorphHistory'));
+  setWeights(.25, .75); mesh.morphTexture.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  setWeights(1.25, -.5); mesh.morphTexture.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  setWeights(99, 99);
+  f.renderer.render(f.scene, f.camera);
+  while (f.renderer._drain) await f.renderer._drain;
+  const draws = f.device.snapshots.flat().filter(draw => draw.pipeline.fragment.module.code.includes('nativeInstanceMorphHistory'));
+  assert.equal(draws.length, 3);
+  const weights = draws.map(draw => views(draw).find(view => view.texture.format === 'r32float').texture);
+  assert.notEqual(weights[0], weights[1]); assert.equal(weights[1], weights[2]);
+  const values = texture => {
+    const bytes = f.device.textureWrites.find(write => write.texture === texture).bytes;
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)];
+  };
+  assert.deepEqual(values(weights[0]), [1, .25, .75, 1, .5, .5, 1, .75, .25]);
+  assert.deepEqual(values(weights[1]), [1, 1.25, -.5, 1, 1.5, -.75, 1, 1.75, -1]);
+  assert.deepEqual([...mesh.morphTexture.image.data], [1, 99, 99, 1, 99.25, 98.75, 1, 99.5, 98.5]);
+  assert.ok(draws.every(draw => draw.pipeline.vertex.module.code.includes('texture_2d_array<f32>')));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
