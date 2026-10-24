@@ -289,6 +289,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._scissorTest = false;
       this._clearScene = null;
       this._renderTarget = null;
+      this._activeCubeFace = 0;
       this._activeMipmapLevel = 0;
       this._targetLifetime = new AbortController();
       this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
@@ -477,7 +478,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     setScissorTest(value) { this._scissorTest = value; }
     // WebGPU's maximum sampler anisotropy, as the source WebGPU backend reports.
     getMaxAnisotropy() { return 16; }
-    getActiveCubeFace() { return 0; }
+    getActiveCubeFace() { return this._activeCubeFace; }
     getActiveMipmapLevel() { return this._activeMipmapLevel; }
     /** Source Renderer.clear(): a clear-only pass on the canvas with the current
      * clear color/depth, honoring viewport/scissor state like other passes. */
@@ -516,12 +517,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getMRT() { return this._mrt; }
     setMRT(value) { this._mrt = value; return this; }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
-      if (activeCubeFace !== 0) fail('UNSUPPORTED', 'Cube faces are not admitted');
       if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
         fail('UNSUPPORTED', 'Nonzero target mips on the WebGL-authored route are not admitted');
-      if (renderTarget !== null) inspectThreeRenderTargetMip(this._targets.capture(renderTarget).shape, activeMipmapLevel);
-      else if (activeMipmapLevel !== 0) fail('UNSUPPORTED', 'The canvas has only mip level zero');
+      if (renderTarget !== null) inspectThreeRenderTargetMip(this._targets.capture(renderTarget).shape, activeMipmapLevel, activeCubeFace);
+      else if (activeMipmapLevel !== 0 || activeCubeFace !== 0) fail('UNSUPPORTED', 'The canvas has only mip level and face zero');
       this._renderTarget = renderTarget;
+      this._activeCubeFace = activeCubeFace;
       this._activeMipmapLevel = activeMipmapLevel;
     }
     /** F3D extensions: call-time upload snapshots and ordered GPU-only copies.
@@ -541,6 +542,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         const destination = this._targets.capture(target);
+        if (destination.shape.cube) fail('UNSUPPORTED', 'Cube target readbacks require explicit face-aware transfer support');
         const issue = () => {
           this._targets.ensure(destination);
           return readGpuTargetPixels(destination.session, {...options, signal: this._targetLifetime.signal});
@@ -667,7 +669,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
-      const target = this._renderTarget, mipLevel = this._activeMipmapLevel;
+      const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target) : this;
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
@@ -716,7 +718,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!matricesUpdated) this._updateNativeMatrices(scene, camera);
         camera = captureThreeCamera(THREE, camera); matricesUpdated = true;
       }
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, frame, overrideMaterial,
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial,
         nodeCaptureDeferred, captureCameras, backgroundState,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), key,
@@ -777,7 +779,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, deferred = false}) {
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, deferred = false}) {
       snapshot?.install();
       nodeFrame?.installAttributes?.();
       const previous = this._programFrame;
@@ -787,7 +789,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         const issue = () => {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, frame);
-          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, {...frame, ...attachments}), {mipLevel});
+          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, {...frame, ...attachments}), {mipLevel, face});
         };
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
         const resources = () => {
@@ -846,8 +848,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     async _drainPending() {
       await this.init();
-      while (this._pending.length && !this._disposed) {
+      pending: while (this._pending.length && !this._disposed) {
         const request = this._pending[0];
+        if (request.nodeCaptureFailure) throw request.nodeCaptureFailure.error;
         if (request.readback || request.transfer) {
           // Image compute can await private source readiness before submitting.
           // Ordinary transfers already submit synchronously; their mapping and
@@ -865,6 +868,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           destination._wanted.set(scene, sceneKey(this, scene, request.backgroundState));
           await this._prepare(destination, request);
           if (this._disposed) return;
+          // First-use node capture can accept shadow passes while this parent
+          // is already in the FIFO. They must submit before its depth reads.
+          // Preparation and callback capture remain valid while those children
+          // drain; never shift or release the displaced parent here.
+          if (this._pending[0] !== request) continue pending;
+          if (request.nodeCaptureFailure) throw request.nodeCaptureFailure.error;
           try {
             const entry = destination._dispatcher?.entry(scene);
             if (!entry || entry.key !== sceneKey(this, scene, request.backgroundState)) fail('PREPARE', 'Scene profile changed during preparation');
@@ -911,13 +920,35 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           request.backgroundState = captureThreeBackground(THREE, request.scene);
           request.key = sceneKey(this, request.scene, request.backgroundState);
           destination._wanted.set(request.scene, request.key);
-          request.nodeFrame = this._captureNodeFrame(request);
-          request.matricesUpdated ||= !!request.nodeFrame;
-          if (request.captureCameras && !request.camera.isArrayCamera) {
-            if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
-            request.camera = captureThreeCamera(THREE, request.camera); request.matricesUpdated = true;
+          const pendingBefore = this._pending.length;
+          try {
+            request.nodeFrame = this._captureNodeFrame(request);
+            request.matricesUpdated ||= !!request.nodeFrame;
+            if (request.captureCameras && !request.camera.isArrayCamera) {
+              if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
+              request.camera = captureThreeCamera(THREE, request.camera); request.matricesUpdated = true;
+            }
+          } catch (error) {
+            request.nodeCaptureFailure = {error};
+          } finally {
+            request.nodeCaptureDeferred = false;
+            const parent = this._pending.indexOf(request);
+            if (parent !== -1 && this._pending.length > pendingBefore) {
+              // Capture is synchronous: this suffix contains precisely the
+              // recursive calls accepted by its source lifecycle. Preserve
+              // their order before this parent and leave preexisting later
+              // requests behind it, including on a late capture failure.
+              const prerequisites = this._pending.splice(pendingBefore);
+              this._pending.splice(parent, 0, ...prerequisites);
+            }
           }
-          request.nodeCaptureDeferred = false;
+          if (request.nodeCaptureFailure) {
+            // Accepted children survive a failed parent capture just as they
+            // do on the initialized synchronous path. Its error reaches the
+            // caller after those writes; the parent is never submitted.
+            if (this._pending.includes(request)) return;
+            throw request.nodeCaptureFailure.error;
+          }
         }
         const captured = request?.nodeFrame;
         const textureReady = captured?.textureOwner?.preparation(captured.textureUses);

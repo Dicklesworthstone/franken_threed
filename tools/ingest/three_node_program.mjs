@@ -312,12 +312,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (light.map != null || light.colorNode != null)
         fail('LIGHTS', 'Native lit graph projected maps and custom light color nodes are not admitted');
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
-      if (shadow && (!(shadow instanceof three.LightShadow) || shadow.isPointLightShadow ||
+      if (shadow && (!(shadow instanceof three.LightShadow) ||
           ![three.BasicShadowMap, three.PCFShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
           shadow.filterNode != null || shadow.shadowNode != null ||
-          ![three.DirectionalLight, three.SpotLight].includes(light.constructor) &&
+          ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
-        fail('SHADOW', 'Native source shadows require ordinary directional, spot or registered SunLight Basic/PCF maps');
+        fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF maps');
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
         id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true];
@@ -403,10 +403,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('TEXTURE', 'Native graphics nodes sample ordinary 2D textures, CPU-data cubes and target-owned color/depth textures');
     const depth = texture.isDepthTexture === true;
     if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
-        texture.renderTarget.depthTexture !== texture || texture.isCubeTexture))
-      fail('TEXTURE', 'Native depth sampling requires an attached source 2D DepthTexture');
+        texture.renderTarget.depthTexture !== texture ||
+        texture.isCubeTexture && (!(texture instanceof three.CubeDepthTexture) || texture.isCubeDepthTexture !== true)))
+      fail('TEXTURE', 'Native depth sampling requires an attached source DepthTexture or CubeDepthTexture');
     const viewDimension = texture.isCubeTexture === true ? 'cube' : '2d';
-    if (viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture ||
+    if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
         !Array.isArray(texture.image) || texture.image.length !== 6 || texture.image.some(face =>
           !(face instanceof three.DataTexture) || face.isDataTexture !== true ||

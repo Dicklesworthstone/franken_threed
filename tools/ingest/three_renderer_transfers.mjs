@@ -30,6 +30,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     if (renderer._disposed) fail('DISPOSED', 'Renderer is disposed');
     if (renderer._deferredError) throw renderer._deferredError;
   };
+  function transferEntry(target) {
+    const entry = renderer._targets.capture(target);
+    if (entry.shape.cube) fail('UNSUPPORTED', 'Cube target transfers require explicit face-aware support');
+    return entry;
+  }
   function options(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value) ||
         ![Object.prototype, null].includes(Object.getPrototypeOf(value)))
@@ -145,7 +150,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       try {
         live();
         assertThreeNativeTextureWrite(renderer, target?.texture);
-        const {value, signal} = options(supplied), entry = renderer._targets.capture(target);
+        const {value, signal} = options(supplied), entry = transferEntry(target);
         const plan = inspectGpuTargetWrite(entry.shape, data, value);
         // Pick built-in constructors, not a caller-controlled data.constructor.
         const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint16Array ? Uint16Array : Uint8Array;
@@ -168,7 +173,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         live();
         assertThreeNativeTextureWrite(renderer, destination?.depthTexture);
         const {value, signal} = options(supplied);
-        const from = renderer._targets.capture(source), to = renderer._targets.capture(destination);
+        const from = transferEntry(source), to = transferEntry(destination);
         if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
         const plan = inspectGpuDepthCopy({...from.shape, sampleDepth: from.shape.depthTexture !== null}, to.shape, value);
         const copyOptions = Object.freeze({...value, width: plan.width, height: plan.height});
@@ -180,7 +185,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         live();
         assertThreeNativeTextureWrite(renderer, destination?.texture);
         const {value, signal} = options(supplied);
-        const from = renderer._targets.capture(source), to = renderer._targets.capture(destination);
+        const from = transferEntry(source), to = transferEntry(destination);
         if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
         const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
         const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
@@ -201,7 +206,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       ? texture.isDepthTexture !== true || target.depthTexture !== texture
       : texture.isRenderTargetTexture !== true || target.texture !== texture))
       fail('UNSUPPORTED', 'Texture copies require matching target-owned 2D color or depth textures');
-    return renderer._targets.capture(target);
+    return transferEntry(target);
   }
   function initialize(target) {
     live();
@@ -243,7 +248,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
   }
   function readPixels(target, supplied = {}, mipLevel = 0, depth = false) {
     live();
-    const {value, signal} = options(supplied), entry = renderer._targets.capture(target);
+    const {value, signal} = options(supplied), entry = transferEntry(target);
     const allowed = ['x', 'y', 'width', 'height', 'flipY', 'output', 'maxBytes', 'maxInFlightBytes',
       ...(depth ? ['sampleIndex'] : [])];
     for (const name of Object.keys(value))

@@ -586,6 +586,7 @@ export function withThreeCompute(Base, THREE) {
         fail('STORAGE', 'Expected a source storage buffer attribute');
       if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected copy options');
       const destination = this._targets.capture(target), copiedOptions = {...options};
+      if (destination.shape.cube) fail('TARGET', 'Cube target buffer copies require explicit face-aware support');
       return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions));
     }
     async getArrayBufferAsync(attribute) { return await submit(this, () => owner(this).read(attribute)); }

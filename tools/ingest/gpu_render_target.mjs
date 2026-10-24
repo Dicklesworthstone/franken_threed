@@ -32,6 +32,9 @@
  * Enable sampleDepth on the source and copyDestination on the destination.
  * Submission is synchronous; whenIdle includes validation and the copy fence.
  * No framebuffer emulation or frame loop.
+ * cube:true admits six square single-sample mip-zero attachments. withFrame's
+ * face selects one 2D attachment; depth borrowers retain the entire native cube.
+ * Cube uploads, copies, readbacks and mip generation are explicitly unsupported.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -101,13 +104,13 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
   for (const key of Object.keys(options))
-    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'mipLevelCount', 'sampleDepth', 'copyDestination'].includes(key))
+    if (!['width', 'height', 'format', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'mipLevelCount', 'sampleDepth', 'copyDestination', 'cube'].includes(key))
       fail('OPTIONS', `Unknown target option: ${key}`);
   const {
     width: initialWidth = 1, height: initialHeight = 1,
     format = 'rgba16float', depthFormat = 'depth24plus', sampleCount = 1,
     maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false,
-    mipLevelCount: requestedMipLevels, sampleDepth = false, copyDestination = false,
+    mipLevelCount: requestedMipLevels, sampleDepth = false, copyDestination = false, cube = false,
   } = options;
   if (!COLOR_BYTES.has(format) || !DEPTH_BYTES.has(depthFormat))
     fail('FORMAT', 'Unsupported color or depth format');
@@ -118,6 +121,9 @@ export function createGpuRenderTarget(device, options = {}) {
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
+  if (typeof cube !== 'boolean') fail('OPTIONS', 'cube must be boolean');
+  if (cube && (sampleCount !== 1 || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1 || copyDestination))
+    fail('UNSUPPORTED', 'Cube targets require one sample, mip zero and no transfer destination usage');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
     fail('OPTIONS', 'mipLevelCount must be a positive integer');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string')
@@ -128,12 +134,16 @@ export function createGpuRenderTarget(device, options = {}) {
     fail('FEATURE', 'depth32float-stencil8 must be enabled on the supplied device');
   const limit = device.limits?.maxTextureDimension2D;
   if (!Number.isSafeInteger(limit) || limit < 1) fail('DEVICE', 'Missing texture dimension limit');
+  if (cube && (!Number.isSafeInteger(device.limits?.maxTextureArrayLayers) || device.limits.maxTextureArrayLayers < 6))
+    fail('DEVICE', 'Cube targets require capacity for six texture array layers');
   const dimension = value => {
     if (!Number.isSafeInteger(value) || value < 0 || value > limit)
       fail('SIZE', 'Target dimensions must fit the device limit');
     return value;
   };
   let width = dimension(initialWidth), height = dimension(initialHeight);
+  if (cube && width !== height) fail('SIZE', 'Cube faces must be square');
+  const layers = cube ? 6 : 1;
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
@@ -144,8 +154,8 @@ export function createGpuRenderTarget(device, options = {}) {
     if (requestedMipLevels > maximum) fail('SIZE', 'mipLevelCount exceeds the target extent');
     return requestedMipLevels ?? (generateMipmaps ? maximum : 1);
   };
-  const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height)});
-  const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth});
+  const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height), cube});
+  const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth, cube});
   const retired = new Set(), readbacks = new Set();
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
@@ -159,8 +169,8 @@ export function createGpuRenderTarget(device, options = {}) {
       mw = Math.max(1, Math.floor(mw / 2)); mh = Math.max(1, Math.floor(mh / 2));
       texels += mw * mh;
     }
-    const bytes = COLOR_BYTES.get(format) * (texels + (sampleCount === 4 ? base * 4 : 0)) +
-      base * DEPTH_BYTES.get(depthFormat) * sampleCount;
+    const bytes = layers * (COLOR_BYTES.get(format) * (texels + (sampleCount === 4 ? base * 4 : 0)) +
+      base * DEPTH_BYTES.get(depthFormat) * sampleCount);
     if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte count exceeds safe integer precision');
     return bytes;
   };
@@ -209,10 +219,11 @@ export function createGpuRenderTarget(device, options = {}) {
       mipLevelCount: levels(w, h), mipsDirty: true, mipSteps: null};
     try {
       checked(() => {
-        const size = {width: w, height: h, depthOrArrayLayers: 1};
+        const size = {width: w, height: h, depthOrArrayLayers: layers};
         pair.color = device.createTexture({label: label + ' color', size, format,
           dimension: '2d', sampleCount: 1, mipLevelCount: pair.mipLevelCount, usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
-        pair.view = pair.color.createView({baseMipLevel: 0, mipLevelCount: 1});
+        const faceZero = cube ? {dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1} : {};
+        pair.view = pair.color.createView({baseMipLevel: 0, mipLevelCount: 1, ...faceZero});
         if (sampleCount === 4) {
           pair.multisample = device.createTexture({label: label + ' MSAA', size, format,
             dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16});
@@ -221,13 +232,18 @@ export function createGpuRenderTarget(device, options = {}) {
         if (depthFormat !== null) {
           pair.depth = device.createTexture({label: label + ' depth', size, format: depthFormat,
             dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | (sampleDepth ? 4 : 0)});
-          pair.depthView = pair.depth.createView();
+          pair.depthView = pair.depth.createView(faceZero);
         }
       });
       pair.frame = Object.freeze({colorView: pair.multisampleView ?? pair.view,
         ...(pair.depthView ? {depthView: pair.depthView} : {}),
         ...(pair.multisampleView ? {resolveTarget: pair.view} : {})});
       pair.frames.set(0, pair.frame);
+      if (cube) pair.cubeFrames = checked(() => Array.from({length: 6}, (_, face) => face === 0 ? pair.frame : Object.freeze({
+        colorView: pair.color.createView({dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: face, arrayLayerCount: 1}),
+        ...(pair.depth ? {depthView: pair.depth.createView({dimension: '2d', baseMipLevel: 0, mipLevelCount: 1,
+          baseArrayLayer: face, arrayLayerCount: 1})} : {}),
+      })));
       return pair;
     } catch (error) { destroy(pair); throw error; }
   }
@@ -284,8 +300,10 @@ export function createGpuRenderTarget(device, options = {}) {
     retirement = Promise.all([retirement, fence]);
     retirement.catch(stop);
   }
-  function frameAllocationBytes(mipLevel = 0) {
+  function frameAllocationBytes(mipLevel = 0, face = 0) {
     exclusive();
+    if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
+      fail('FACE', cube ? 'Cube face must be an integer from zero to five' : '2D targets require face zero');
     if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= (current?.mipLevelCount ?? 1))
       fail('MIP', 'Render mip level is not allocated');
     if (mipLevel > 0 && (sampleCount !== 1 || sampleDepth))
@@ -293,7 +311,8 @@ export function createGpuRenderTarget(device, options = {}) {
     if (!current || current.frames.has(mipLevel) || depthFormat === null) return 0;
     return Math.max(1, Math.floor(width / 2 ** mipLevel)) * Math.max(1, Math.floor(height / 2 ** mipLevel)) * DEPTH_BYTES.get(depthFormat);
   }
-  function frameAt(mipLevel, bytes) {
+  function frameAt(mipLevel, bytes, face) {
+    if (cube) return current.cubeFrames[face];
     if (current.frames.has(mipLevel)) return current.frames.get(mipLevel);
     if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     let depth = null;
@@ -312,17 +331,17 @@ export function createGpuRenderTarget(device, options = {}) {
       return frame;
     } catch (error) { depth?.destroy(); throw error; }
   }
-  function borrow(callback, kind, mipLevel = 0) {
+  function borrow(callback, kind, mipLevel = 0, face = 0) {
     exclusive();
     if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
-    const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel) : 0;
+    const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel, face) : 0;
     if (!current) return false;
     // Budget rejection is retryable and happens before marking this owner busy.
     if (extraBytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     busy = true;
     try {
-      const frame = kind === 'frame' ? frameAt(mipLevel, extraBytes) : null;
+      const frame = kind === 'frame' ? frameAt(mipLevel, extraBytes, face) : null;
       current.used = true; // Even a throwing callback may have submitted work.
       if (kind === 'frame') current.mipsDirty = true;
       else if (kind === 'color' || kind === 'sampled') refreshMips(current);
@@ -339,6 +358,7 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   async function read(operation, options = {}) {
     exclusive();
+    if (cube) fail('UNSUPPORTED', 'Cube target readbacks require an explicit face-aware transfer API');
     if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
     const caller = options.signal;
     if (caller !== undefined && (!caller || typeof caller.addEventListener !== 'function' || typeof caller.removeEventListener !== 'function'))
@@ -365,10 +385,11 @@ export function createGpuRenderTarget(device, options = {}) {
     get suspended() { return width === 0 || height === 0; },
     get version() { return version; }, get disposed() { return disposed; },
     get failed() { return terminal !== null; }, get allocatedBytes() { return allocated(); },
-    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth, copyDestination, colorUploads, colorCopies, depthCopies,
+    get diagnostics() { return Object.freeze({width, height, version, format, depthFormat, sampleCount, sampleDepth, copyDestination, cube, layers, colorUploads, colorCopies, depthCopies,
       allocatedBytes: allocated(), retiredTargets: retired.size, mipLevelCount: current?.mipLevelCount ?? 0, mipGenerations, pendingReadbacks: readbacks.size}); },
     resize(w, h) {
       exclusive(); dimension(w); dimension(h);
+      if (cube && w !== h) fail('SIZE', 'Cube faces must be square');
       if (w === width && h === height) return api;
       if (version === Number.MAX_SAFE_INTEGER) fail('VERSION', 'Target version exhausted');
       const bytes = cost(w, h);
@@ -387,12 +408,13 @@ export function createGpuRenderTarget(device, options = {}) {
       finally { busy = false; if (terminal !== null) release(); }
     },
     frameAllocationBytes,
-    withFrame(callback, {mipLevel = 0} = {}) { return borrow(callback, 'frame', mipLevel); },
+    withFrame(callback, {mipLevel = 0, face = 0} = {}) { return borrow(callback, 'frame', mipLevel, face); },
     withTexture(callback) { return borrow(callback, 'color'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
     withSampledTextures(callback) { return borrow(callback, 'sampled'); },
     writePixels(data, options = {}) {
       exclusive();
+      if (cube) fail('UNSUPPORTED', 'Cube target uploads require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before uploading target color');
       const plan = inspectGpuTargetWrite(transferShape(), data, options);
       if (plan.empty) return false;
@@ -408,9 +430,11 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     copyFrom(source, options = {}) {
       exclusive();
+      if (cube) fail('UNSUPPORTED', 'Cube target copies require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target color');
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
+      if (other.shape().cube) fail('UNSUPPORTED', 'Cube target copies require an explicit face-aware transfer API');
       if (other.device !== device) fail('DEVICE', 'Target copies require the same GPUDevice');
       if (source === api) fail('FEEDBACK', 'In-place target copies are not admitted');
       other.exclusive();
@@ -434,9 +458,11 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     copyDepthFrom(source, options = {}) {
       exclusive();
+      if (cube) fail('UNSUPPORTED', 'Cube depth copies require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target depth');
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
+      if (other.shape().cube) fail('UNSUPPORTED', 'Cube depth copies require an explicit face-aware transfer API');
       if (other.device !== device) fail('DEVICE', 'Depth copies require the same GPUDevice');
       if (source === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
       other.exclusive();

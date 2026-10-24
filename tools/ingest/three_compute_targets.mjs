@@ -1,4 +1,4 @@
-/** Native render-target inputs for the r186 TSL compute route.
+/** Native render-target inputs for the r186 TSL graphics and compute routes.
  * Capture target generation and sampler state now; observe GPU contents at the
  * renderer FIFO slot. Never snapshot GPU pixels, flip UVs, allocate source IDs,
  * or own/destroy the renderer's target storage. All native views are borrowed
@@ -52,7 +52,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
     const sampler = binding.isSampler && !binding.isSampledTexture;
     const layout = sampler ? {sampler: {type: source.sampler.compare !== undefined ? 'comparison'
       : source.sampleType === 'depth' || source.sampleType === 'unfilterable-float' ? 'non-filtering' : 'filtering'}}
-      : {texture: {sampleType: source.sampleType, viewDimension: '2d', multisampled: false}};
+      : {texture: {sampleType: source.sampleType, viewDimension: source.viewDimension, multisampled: false}};
     return {source, sampler, layout};
   }
   function validate(snapshot) {
@@ -153,7 +153,8 @@ export function createThreeComputeTargets({targets, device, signal = null,
       if (!texture) fail('BORROW', 'The native source has not been borrowed');
       let view = views.get(texture);
       if (!view) {
-        view = native(() => texture.createView({dimension: '2d', baseMipLevel: 0, mipLevelCount: source.depth ? 1 : source.entry.shape.mipLevelCount,
+        view = native(() => texture.createView({dimension: source.viewDimension, baseMipLevel: 0, mipLevelCount: source.depth ? 1 : source.entry.shape.mipLevelCount,
+          ...(source.viewDimension === 'cube' ? {baseArrayLayer: 0, arrayLayerCount: 6} : {}),
           ...(source.depth ? {aspect: 'depth-only'} : {})}));
         views.set(texture, view);
       }

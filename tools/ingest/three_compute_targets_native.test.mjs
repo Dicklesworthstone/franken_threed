@@ -6,16 +6,18 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
 import {THREE, depthTarget, sampled, sampler, plain} from './three_compute_targets_test_fixture.mjs';
+import {createThreeComputeTextures} from './three_compute_textures.mjs';
 
-async function rig() {
+async function rig(three = THREE) {
   const textures = [], events = [], errors = [];
-  const device = {limits: {maxTextureDimension2D: 8192}, features: new Set(), lost: new Promise(() => {}),
+  const device = {limits: {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256}, features: new Set(), lost: new Promise(() => {}),
     queue: {submit() { events.push('submit'); }, async onSubmittedWorkDone() { events.push('fence'); }},
     pushErrorScope() { events.push('push'); }, popErrorScope() { events.push('pop'); return Promise.resolve(errors.shift() ?? null); },
     createTexture(descriptor) {
       const texture = {descriptor, destroyed: false, createView(view = {}) {
         assert.equal(texture.destroyed, false);
         assert.ok((view.baseMipLevel ?? 0) + (view.mipLevelCount ?? 1) <= descriptor.mipLevelCount);
+        assert.ok((view.baseArrayLayer ?? 0) + (view.arrayLayerCount ?? 1) <= (descriptor.size.depthOrArrayLayers ?? 1));
         return {texture, descriptor: plain(view)};
       }, destroy() { texture.destroyed = true; }};
       textures.push(texture); return texture;
@@ -44,7 +46,7 @@ async function rig() {
   for (const module of modules.values()) if (module.status === 'unlinked') await module.link(link);
   for (const module of modules.values()) if (module.status !== 'evaluated') await module.evaluate();
   const create = options => modules.get('./gpu_render_target.mjs').namespace.createGpuRenderTarget(device, options);
-  const targets = modules.get('./three_render_targets.mjs').namespace.createThreeRenderTargets(THREE, {getDevice: () => device});
+  const targets = modules.get('./three_render_targets.mjs').namespace.createThreeRenderTargets(three, {getDevice: () => device});
   const adapter = modules.get('./three_compute_targets.mjs').namespace.createThreeComputeTargets({targets, device});
   return {create, targets, adapter, textures, events, errors, device, dispose() { adapter.dispose(); targets.dispose(); }};
 }
@@ -219,4 +221,89 @@ test('source shadow resize leases distinguish generations and retire only after 
   assert.ok(r.textures.slice(2).every(texture => !texture.destroyed));
   assert.equal(r.targets.size, 1); assert.equal(r.targets.allocatedBytes, 8 * 8 * 8);
   r.adapter.release(current); r.dispose();
+});
+
+test('pinned cube depth borrows all six native layers with independent comparison sampler histories', async () => {
+  const three = await import('../../upstream/three.js/build/three.webgpu.js');
+  const r = await rig(three), target = new three.CubeRenderTarget(8);
+  target.depthTexture = new three.CubeDepthTexture(8);
+  const depth = target.depthTexture;
+  assert.equal(depth.isDepthTexture, true); assert.equal(depth.isCubeTexture, true); assert.equal(depth.isCubeDepthTexture, true);
+  depth.compareFunction = three.LessEqualCompare;
+  depth.minFilter = depth.magFilter = three.LinearFilter;
+  const read = r.adapter.captureBinding(sampled(depth));
+  const first = r.adapter.captureBinding({...sampler(depth), comparison: true});
+  const ordinary = r.adapter.captureBinding(sampler(depth));
+  depth.compareFunction = three.GreaterCompare;
+  depth.minFilter = depth.magFilter = three.NearestFilter;
+  const second = r.adapter.captureBinding({...sampler(depth), comparison: true});
+  assert.deepEqual(plain(r.adapter.layout(read)), {texture: {sampleType: 'depth', viewDimension: 'cube', multisampled: false}});
+  assert.deepEqual(plain(r.adapter.layout(first)), {sampler: {type: 'comparison'}});
+  assert.deepEqual(plain(r.adapter.layout(ordinary)), {sampler: {type: 'non-filtering'}});
+  assert.deepEqual(plain(r.adapter.sampleData(depth)), {samples: 1, primarySamples: 1, isMSAA: false});
+  depth.compareFunction = null;
+  r.adapter.withDispatch([read, first, ordinary, second], () => {
+    const view = r.adapter.resolve(read), earlier = r.adapter.resolve(first).descriptor, later = r.adapter.resolve(second).descriptor;
+    assert.equal(view.texture, r.textures[1]);
+    assert.deepEqual(view.descriptor, {dimension: 'cube', baseMipLevel: 0, mipLevelCount: 1,
+      baseArrayLayer: 0, arrayLayerCount: 6, aspect: 'depth-only'});
+    assert.equal(r.adapter.resolve(read), view, 'all native consumers reuse the same cube view');
+    assert.equal(view.texture.descriptor.size.depthOrArrayLayers, 6);
+    assert.equal(view.texture.descriptor.format, 'depth24plus');
+    assert.equal(view.texture.descriptor.sampleCount, 1);
+    assert.equal(earlier.compare, 'less-equal'); assert.equal(earlier.minFilter, 'linear'); assert.equal(earlier.magFilter, 'linear');
+    assert.equal(later.compare, 'greater'); assert.equal(later.minFilter, 'nearest');
+    assert.equal(r.adapter.resolve(ordinary).descriptor.compare, undefined);
+    assert.equal(r.adapter.resolve(ordinary).descriptor.minFilter, 'nearest');
+    assert.equal(r.targets.capture(target).busy, true);
+    r.device.queue.submit([]);
+  });
+  const entry = r.targets.capture(target);
+  assert.equal(r.textures.length, 2); assert.equal(entry.depthSample, null);
+  assert.equal(entry.shape.layers, 6); assert.equal(r.targets.allocatedBytes, 8 * 8 * 6 * 8);
+  assert.equal(r.events.filter(event => event === 'mipPass').length, 0);
+  assert.equal(r.device.features.size, 0);
+  await r.adapter.whenIdle(); r.dispose();
+});
+
+test('shared native texture inputs route pinned cube depth to target residency without CPU snapshots or uploads', async () => {
+  const three = await import('../../upstream/three.js/build/three.webgpu.js');
+  const r = await rig(three), target = new three.CubeRenderTarget(4);
+  target.depthTexture = new three.CubeDepthTexture(4);
+  target.depthTexture.compareFunction = three.LessEqualCompare;
+  const source = target.depthTexture.source, images = target.depthTexture.image;
+  const inputs = createThreeComputeTextures({
+    storage: {validateDispatch(values) { assert.deepEqual(values, []); }, async whenIdle() {}},
+    poolFactory() { assert.fail('Target-owned cube depth must not reach the CPU texture uploader'); },
+    targetFactory: () => r.adapter,
+  });
+  const binding = sampled(target.depthTexture), comparison = {...sampler(target.depthTexture), comparison: true};
+  assert.deepEqual(plain(inputs.layoutOf(binding)), {texture: {sampleType: 'depth', viewDimension: 'cube', multisampled: false}});
+  const read = inputs.captureBinding(binding), compare = inputs.captureBinding(comparison), leases = [read, compare];
+  assert.equal(inputs.preparation(leases), null); inputs.validateDispatch(leases);
+  inputs.withDispatch(leases, () => {
+    const view = inputs.resolve(read);
+    assert.equal(view.texture, r.textures[1]); assert.equal(view.descriptor.dimension, 'cube');
+    assert.equal(inputs.resolve(compare).descriptor.compare, 'less-equal');
+    r.device.queue.submit([]);
+  });
+  assert.equal(target.depthTexture.source, source); assert.equal(target.depthTexture.image, images);
+  assert.deepEqual(inputs.diagnostics, {textures: 0, versions: 0, snapshotBytes: 0});
+  assert.equal(r.textures.length, 2);
+  await inputs.whenIdle(); for (const lease of leases) inputs.release(lease);
+  assert.equal(r.adapter.diagnostics.bindings, 0);
+  inputs.dispose(); r.dispose();
+});
+
+for (const retire of ['dispose', 'resize']) test(`pinned cube depth ${retire} invalidates queued cube views and comparison samplers before submission`, async () => {
+  const three = await import('../../upstream/three.js/build/three.webgpu.js');
+  const r = await rig(three), target = new three.CubeRenderTarget(4);
+  target.depthTexture = new three.CubeDepthTexture(4);
+  target.depthTexture.compareFunction = three.LessEqualCompare;
+  const read = r.adapter.captureBinding(sampled(target.depthTexture));
+  const compare = r.adapter.captureBinding({...sampler(target.depthTexture), comparison: true});
+  if (retire === 'dispose') target.dispose(); else target.setSize(8, 8);
+  assert.throws(() => r.adapter.withDispatch([read, compare], () => assert.fail('stale cube shadow consumer')), {code: 'THREE_TARGET_STALE'});
+  assert.equal(r.textures.length, 0); assert.equal(r.events.includes('submit'), false);
+  r.dispose();
 });

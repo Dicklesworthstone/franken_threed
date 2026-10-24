@@ -12,6 +12,7 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !texture.renderTarget || !destinationTexture?.isStorageTexture)
     fail('SOURCE', 'Expected target-owned color and a storage texture destination');
   const entry = targets.capture(texture.renderTarget);
+  if (entry.shape.cube) fail('SOURCE', 'Cube target copies require explicit face-aware support');
   if (entry.shape.texture !== texture) fail('STALE', 'Color texture no longer belongs to its render target');
   // A transfer does not sample. Build the owner-native borrow record directly
   // from capture(), rather than imposing a float-filtering feature or creating

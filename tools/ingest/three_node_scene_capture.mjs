@@ -63,13 +63,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
-  // established route; explicit node materials and ShadowMaterial opt the
-  // complete shadow scene into native compilation. Unsupported mixed material
+  // established route; explicit node materials, ShadowMaterial and point-light
+  // cube shadows opt the complete scene into native compilation. Mixed material
   // classes then fail at the compiler instead of creating a second shadow map.
   const nativeShadowScene = !shadowPass && renderer?.shadowMap?.enabled === true &&
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
-      (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-        hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true));
+      (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
+        (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
+          hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const nativeMaterial = material => nativeShadowScene ? material != null : hasThreeNodeProgram(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;

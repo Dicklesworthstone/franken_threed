@@ -17,26 +17,29 @@ export function registerThreeNativeShadow(three, renderer, node) {
   if (!(node instanceof three.ShadowNode)) return false;
   const source = three.ShadowNode.prototype, base = three.ShadowBaseNode.prototype;
   const prototype = Object.getPrototypeOf(node), ordinary = prototype === source;
+  const point = prototype === three.PointShadowNode?.prototype && node.light?.constructor === three.PointLight &&
+    node.shadow?.isPointLightShadow === true;
   const sun = !ordinary && Object.getPrototypeOf(prototype) === source &&
     node.light?.isSunLight === true && node.shadow?.isSunLightShadow === true;
-  if ((!ordinary && !sun) || !(node.light instanceof three.Light) || node.shadow !== node.light.shadow ||
-      !(node.shadow instanceof three.LightShadow) || node.shadow.isPointLightShadow ||
+  if ((!ordinary && !sun && !point) || !(node.light instanceof three.Light) || node.shadow !== node.light.shadow ||
+      !(node.shadow instanceof three.LightShadow) || !point && node.shadow.isPointLightShadow ||
       ordinary && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
-    reject('Native shadow maps require directional, spot or registered SunLight source shadows');
+    reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
   if (![three.BasicShadowMap, three.PCFShadowMap].includes(renderer.shadowMap?.type) || renderer.shadowMap.transmitted)
     reject('Native shadow maps currently require Basic or PCF filtering without transmitted shadows');
   if (node.shadow.filterNode != null || node.shadow.shadowNode != null && node.shadow.shadowNode !== node)
     reject('Custom shadow filter and shadow replacement nodes require an explicit native adapter');
+  const passSource = point ? three.PointShadowNode.prototype : source;
   if (['setup', 'updateBefore', 'updateShadow', 'dispose', '_reset', 'getShadowFilterFn', 'setupShadowCoord', 'setupShadowFilter']
-      .some(key => node[key] !== source[key]) ||
+      .some(key => node[key] !== passSource[key]) ||
       ['getShadowMaterial', 'disposeShadowMaterial', 'getShadowRenderObjectFunction', 'setupShadowPosition']
         .some(key => node[key] !== base[key]) ||
       ['getUpdateBeforeType', 'getUpdateType', 'getUpdateAfterType', 'updateReference']
         .some(key => node[key] !== three.Node.prototype[key]) ||
       node.updateBeforeType !== 'render' || node.updateType !== 'none' || node.updateAfterType !== 'none')
     reject('Native shadow nodes must retain the pinned source lifecycle');
-  if (ordinary && ['setupRenderTarget', 'setupShadow', 'renderShadow', 'vsmPass'].some(key => node[key] !== source[key]))
-    reject('Native directional and spot shadows require the pinned source pass construction');
+  if ((ordinary || point) && ['setupRenderTarget', 'setupShadow', 'renderShadow', 'vsmPass'].some(key => node[key] !== passSource[key]))
+    reject('Native directional, spot and point shadows require the pinned source pass construction');
   if (sun && (node.shadow.getViewportCount() !== 2 || node.shadow.getFrameExtents().x !== 2 ||
       node.shadow.getFrameExtents().y !== 1))
     reject('Native SunLight shadows require the source two-cascade horizontal atlas');
@@ -62,14 +65,22 @@ export function getThreeNativeShadowPass(renderer, overrideMaterial) {
  * fails, while leaving successful source updates completely source-controlled.
  */
 export function updateThreeNativeShadow(three, renderer, node, frame) {
+  // The pinned NodeFrame and ShadowNode can both skip a before-update. Dormant
+  // mapSize edits must not request a resize that the source would never perform.
+  // Leave update-marker changes to NodeFrame even on these skipped paths.
+  const update = () => frame.updateBeforeNode(node);
+  if (renderer._isPreCompiling === true || !(node.shadow.needsUpdate || node.shadow.autoUpdate) ||
+      node._cameraFrameId.get(frame.camera) === frame.frameId ||
+      (frame.updateBeforeMap.get(node)?.renderId ?? 0) === frame.renderId)
+    return update();
   const scene = frame.scene, camera = node.shadow.camera, layers = camera.layers.mask;
   const name = scene.name, state = three.RendererUtils.saveRendererAndSceneState(renderer, scene);
   try {
-    const extents = node.shadow.getFrameExtents();
-    const update = () => frame.updateBeforeNode(node);
+    const extents = node.shadow.getFrameExtents(), point = node instanceof three.PointShadowNode;
     return renderer._targets?.withNativeShadowResize
       ? renderer._targets.withNativeShadowResize(node.shadowMap,
-        node.shadow.mapSize.width * extents.x, node.shadow.mapSize.height * extents.y, update)
+        node.shadow.mapSize.width * (point ? 1 : extents.x),
+        point ? node.shadow.mapSize.width : node.shadow.mapSize.height * extents.y, update)
       : update();
   }
   catch (error) {

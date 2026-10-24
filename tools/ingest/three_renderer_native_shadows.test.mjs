@@ -36,11 +36,12 @@ function uniformValues(draw) {
 
 function fixture(t) {
   const device = geometryDevice();
-  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxBindingsPerBindGroup: 1000});
+  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
   device.textures = []; device.textureWrites = [];
   device.createTexture = descriptor => {
-    const texture = {dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...descriptor,
+    const texture = {dimension: '2d', sampleCount: 1, ...descriptor,
       width: descriptor.size.width ?? descriptor.size[0], height: descriptor.size.height ?? descriptor.size[1],
+      depthOrArrayLayers: descriptor.size.depthOrArrayLayers ?? descriptor.size[2] ?? 1,
       createView(options = {}) { return {texture, ...options}; }, destroy() { this.destroyed = true; }};
     device.textures.push(texture); return texture;
   };
@@ -116,6 +117,186 @@ function animationHost(renderer) {
     callbacks.delete(id); callback(time);
   }};
 }
+
+function pointFixture(t) {
+  const f = fixture(t);
+  f.scene.remove(f.light);
+  const light = new T.PointLight(0xffe6cc, 30, 15);
+  light.position.set(1, 2, 3); light.castShadow = true; light.shadow.mapSize.set(16, 16);
+  light.shadow.camera.near = .1; light.shadow.camera.far = 15;
+  light.shadow.camera.updateProjectionMatrix(); f.scene.add(light);
+  return {...f, light};
+}
+
+for (const point of [false, true]) {
+  test(`first renderAsync submits ${point ? 'all six point faces' : 'directional shadow'} before its parent and already queued later work`, async t => {
+    const f = point ? pointFixture(t) : fixture(t), faces = [];
+    f.caster.onBeforeShadow = () => faces.push(f.renderer.getActiveCubeFace());
+    const later = new T.Scene(), laterMaterial = new T.MeshBasicNodeMaterial();
+    laterMaterial.colorNode = N.uniform(new T.Color(.2, .4, .6)).setName('laterNativeReceiver');
+    later.add(new T.Mesh(new T.PlaneGeometry(), laterMaterial));
+    assert.equal(f.renderer._initialized, false);
+    const first = f.renderer.renderAsync(f.scene, f.camera);
+    const second = f.renderer.renderAsync(later, f.camera);
+    await Promise.all([first, second]);
+    const passes = point ? targetPasses(f.device, 16, 16) : targetPasses(f.device);
+    const casters = passes.filter(pass => pass.draws.length), commands = f.device.submissions.flat(2);
+    const parent = commands.find(pass => pass.draws?.some(draw => shader(draw).includes('nativeShadowReceiver')));
+    const following = commands.find(pass => pass.draws?.some(draw => shader(draw).includes('laterNativeReceiver')));
+    assert.equal(casters.length, point ? 6 : 1);
+    assert.ok(passes.every(pass => commands.indexOf(pass) < commands.indexOf(parent)),
+      'deferred capture moves its accepted prerequisites before the parent depth sampling pass');
+    assert.ok(commands.indexOf(parent) < commands.indexOf(following), 'preexisting later FIFO requests stay after their parent');
+    assert.deepEqual(faces, point ? [0, 1, 2, 3, 4, 5] : [0], 'resuming parent preparation never replays source callbacks');
+    const depth = casters[0].desc.depthStencilAttachment.view.texture;
+    assert.ok(textureResources(receiverDraws(f.device)[0]).some(view => view.texture === depth));
+    assert.equal(f.renderer.info.f3d.presentedRenders, 2); assert.equal(f.renderer._nodeCaptureBytes, 0);
+    assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getActiveCubeFace(), 0);
+  });
+}
+
+test('failed first renderAsync preserves accepted point faces before rejecting its parent and later work', async t => {
+  const f = pointFixture(t), failure = new Error('deferred point face failed'), faces = [];
+  f.receiver.renderOrder = -1;
+  f.caster.onBeforeShadow = () => {
+    const face = f.renderer.getActiveCubeFace(); faces.push(face);
+    if (face === 2) throw failure;
+  };
+  const first = f.renderer.renderAsync(f.scene, f.camera);
+  const later = f.renderer.renderAsync(new T.Scene(), f.camera);
+  await Promise.all([assert.rejects(first, error => error === failure), assert.rejects(later, error => error === failure)]);
+  const accepted = targetPasses(f.device, 16, 16).filter(pass => pass.draws.length);
+  assert.deepEqual(accepted.map(pass => pass.desc.depthStencilAttachment.view.baseArrayLayer), [0, 1]);
+  assert.deepEqual(faces, [0, 1, 2]);
+  assert.equal(receiverDraws(f.device).length, 0); assert.equal(f.renderer.info.f3d.presentedRenders, 0);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getActiveCubeFace(), 0);
+  assert.equal(f.scene.overrideMaterial, null); assert.equal(f.renderer.getRenderObjectFunction(), null);
+});
+
+test('point mapSize edits stay dormant on source update skips and reject only an actual resize', async t => {
+  const f = pointFixture(t), faces = [];
+  f.caster.onBeforeShadow = () => faces.push(f.renderer.getActiveCubeFace());
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const map = f.light.shadow.map;
+  f.light.shadow.mapSize.set(32, 32);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(faces.length, 6, 'the source same-camera/frame marker skips a dormant desired-size edit');
+  f.light.shadow.autoUpdate = false; f.light.shadow.needsUpdate = false;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(faces.length, 6, 'frozen shadows retain the original six faces after the frame advances');
+  assert.equal(map.width, 16); assert.equal(map.height, 16);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 3);
+  f.light.shadow.needsUpdate = true;
+  f.renderer._nodes.nodeFrame.update();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(map.width, 16); assert.equal(faces.length, 6);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.light.shadow.mapSize.set(16, 16);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(faces.length, 12, 'restoring a supported size allows the still-requested explicit refresh');
+  assert.equal(f.light.shadow.needsUpdate, false);
+});
+
+for (const type of [T.BasicShadowMap, T.PCFShadowMap]) {
+  test(`native point shadows submit six captured cube faces before their depth comparison (type ${type})`, async t => {
+    const f = pointFixture(t), faces = [];
+    f.renderer.shadowMap.type = type;
+    f.caster.onBeforeShadow = () => faces.push(f.renderer.getActiveCubeFace());
+    await f.renderer.compileAsync(f.scene, f.camera);
+    assert.equal(f.device.submissions.length, 0);
+    f.renderer.render(f.scene, f.camera);
+    assert.deepEqual(faces, [0, 1, 2, 3, 4, 5], 'each source callback sees its current cube face synchronously');
+    assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getActiveCubeFace(), 0);
+    await drain(f.renderer);
+    const passes = targetPasses(f.device, 16, 16), casters = passes.filter(pass => pass.draws.length);
+    assert.equal(casters.length, 6);
+    assert.equal(passes.filter(pass => pass.desc.depthStencilAttachment.depthLoadOp === 'clear').length, 6);
+    assert.deepEqual(casters.map(pass => pass.desc.depthStencilAttachment.view.baseArrayLayer), [0, 1, 2, 3, 4, 5]);
+    assert.ok(passes.every(pass => pass.desc.depthStencilAttachment.view.dimension === '2d' &&
+      pass.desc.depthStencilAttachment.view.arrayLayerCount === 1));
+    const depth = casters[0].desc.depthStencilAttachment.view.texture;
+    assert.equal(depth.depthOrArrayLayers, 6);
+    assert.ok(casters.every(pass => pass.desc.depthStencilAttachment.view.texture === depth));
+    const capturedCasters = nativeDraws(f.device).filter(draw =>
+      draw.pipeline.vertex.module.code.includes('nativeShadowDeformation')).slice(0, 6);
+    assert.equal(new Set(capturedCasters.map(draw => JSON.stringify(uniformValues(draw)))).size, 6,
+      'the shared source camera contributes six separately captured face transforms');
+    assert.ok(casters.every(pass => pass.draws[0].pipeline.vertex.module.code.includes('nativeShadowDeformation')));
+    const receiver = receiverDraws(f.device)[0];
+    assert.match(shader(receiver), /texture_depth_cube/); assert.match(shader(receiver), /textureSampleCompare/);
+    assert.ok(textureResources(receiver).some(view => view.texture === depth && view.dimension === 'cube' &&
+      view.aspect === 'depth-only'));
+    assert.ok([...receiver.groups.values()].some(({group}) => group.layout.entries.some(entry =>
+      entry.texture?.sampleType === 'depth' && entry.texture.viewDimension === 'cube')));
+    const commands = f.device.submissions.flat(2);
+    const receiverPass = commands.find(pass => pass.draws?.some(draw => shader(draw).includes('nativeShadowReceiver')));
+    assert.ok(casters.every(pass => commands.indexOf(pass) < commands.indexOf(receiverPass)));
+    assert.equal(f.light.shadow.map.texture.renderTarget, null, 'native admission does not rewrite source cube ownership');
+    f.light.shadow.autoUpdate = false;
+    f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+    assert.equal(targetPasses(f.device, 16, 16).filter(pass => pass.draws.length).length, 6, 'frozen point shadows retain all six faces');
+    f.light.shadow.needsUpdate = true;
+    f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+    assert.equal(targetPasses(f.device, 16, 16).filter(pass => pass.draws.length).length, 12);
+    assert.equal(f.renderer._nodeCaptureBytes, 0); await f.renderer.waitForGPU();
+  });
+}
+
+test('ordinary point-light materials use one native shadow owner and queued target faces retain their selection', async t => {
+  const f = pointFixture(t);
+  f.receiver.material = new T.MeshStandardMaterial({color: 0x706050});
+  f.caster.material = new T.MeshBasicMaterial({color: 0xc07040});
+  f.noncaster.material = new T.MeshBasicMaterial({color: 0x4070c0});
+  const target = new T.CubeRenderTarget(16);
+  target.depthTexture = new T.CubeDepthTexture(16);
+  await f.renderer.init();
+  for (const face of [4, 1, 5]) {
+    f.renderer.setRenderTarget(target, face); f.renderer.render(f.scene, f.camera);
+  }
+  f.renderer.setRenderTarget(null); await drain(f.renderer);
+  const sampled = nativeDraws(f.device).filter(draw => shader(draw).includes('texture_depth_cube'));
+  assert.equal(sampled.length, 3, 'ordinary Standard materials compile into native cube-depth receivers');
+  const parents = f.device.passes.filter(pass => pass.draws.some(draw => shader(draw).includes('texture_depth_cube')));
+  assert.deepEqual(parents.map(pass => pass.desc.depthStencilAttachment.view.baseArrayLayer), [4, 1, 5]);
+  assert.ok(parents.every(pass => pass.desc.colorAttachments[0].view.baseArrayLayer ===
+    pass.desc.depthStencilAttachment.view.baseArrayLayer));
+  assert.equal(f.renderer.getActiveCubeFace(), 0);
+  for (const face of [-1, .5, 6]) assert.throws(() => f.renderer.setRenderTarget(target, face));
+  assert.throws(() => f.renderer.setRenderTarget(new T.RenderTarget(16, 16), 1));
+  assert.throws(() => f.renderer.setRenderTarget(null, 1));
+  assert.throws(() => f.renderer.setRenderTarget(target, 0, 1));
+});
+
+test('throwing point-shadow callbacks restore the parent cube face and preserve earlier accepted faces', async t => {
+  const f = pointFixture(t), target = new T.CubeRenderTarget(16);
+  target.depthTexture = new T.CubeDepthTexture(16);
+  await f.renderer.init(); f.renderer.setRenderTarget(target, 4);
+  f.receiver.renderOrder = -1;
+  f.scene.name = 'Point shadow parent';
+  const before = {autoClear: f.renderer.autoClear, color: f.renderer.getClearColor(new T.Color()).clone(),
+    alpha: f.renderer.getClearAlpha(), layers: f.light.shadow.camera.layers.mask};
+  const failure = new Error('point face callback failed');
+  const faces = [];
+  f.caster.onBeforeShadow = () => {
+    const face = f.renderer.getActiveCubeFace(); faces.push(face);
+    if (face === 2) throw failure;
+  };
+  assert.throws(() => f.renderer.render(f.scene, f.camera), error => error === failure);
+  assert.deepEqual(faces, [0, 1, 2]);
+  assert.equal(f.renderer.getRenderTarget(), target); assert.equal(f.renderer.getActiveCubeFace(), 4);
+  assert.equal(f.renderer.autoClear, before.autoClear); assert.equal(f.renderer.getClearAlpha(), before.alpha);
+  assert.deepEqual(f.renderer.getClearColor(new T.Color()), before.color);
+  assert.equal(f.scene.name, 'Point shadow parent'); assert.equal(f.scene.overrideMaterial, null);
+  assert.equal(f.light.shadow.camera.layers.mask, before.layers);
+  assert.equal(f.renderer.getRenderObjectFunction(), null);
+  await drain(f.renderer);
+  const accepted = targetPasses(f.device, 16, 16).filter(pass => pass.draws.length);
+  assert.deepEqual(accepted.map(pass => pass.desc.depthStencilAttachment.view.baseArrayLayer), [0, 1],
+    'source face draws accepted before the throw remain ordered; the parent was never accepted');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
 
 test('native directional PCF submits only visible casters before sampling their depth attachment', async t => {
   const f = fixture(t);
