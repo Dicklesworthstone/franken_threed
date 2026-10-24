@@ -79,6 +79,18 @@ test('interleaved attributes share one expanded buffer, upload callback and colu
   assert.deepEqual(values(h, f).slice(0, 12), [1,2,77,11,1,2,77,11,1,2,77,11]);
   assert.equal(data.updateRanges.length, 0); assert.equal(data.uploads, 2); assert.equal(f.writes.at(-1).bytes.length, 48);
 });
+test('native WebGPU Uint16 joints retain integer inputs without rewriting the WebGL gpuType contract', t => {
+  const f = device(t), a = attr(new Uint16Array([0, 257, 65535, 2, 1, 258, 0, 3]), 4, 1,
+    {isInstancedBufferAttribute: false, gpuType: 1015});
+  const g = geometry({skinIndex: a}, {isInstancedBufferGeometry: false});
+  const inputs = [reflection('skinIndex', 0, 'uint', 1, 4)];
+  assert.throws(() => createGpuProgramGeometry(f.d, g, inputs), {code: 'GEOMETRY_GPU_FORMAT'}, 'WebGL still requires IntType');
+  const h = own(t, f, g, inputs, {attributeTypes: 'webgpu'});
+  assert.equal(programGeometrySnapshot(h, f.d).layouts[0].attributes[0].format, 'uint32x4');
+  assert.deepEqual(values(h, f, 0, Uint32Array), [0, 257, 65535, 2, 1, 258, 0, 3]);
+  a.array[1] = 511; a.version++; a.updateRanges.push({start: 1, count: 1}); h.update();
+  assert.equal(values(h, f, 0, Uint32Array)[1], 511); assert.equal(a.gpuType, 1015);
+});
 test('partial updates crossing source records retain other uploaded elements', t => {
   const f = device(t), a = attr(new Float32Array([1,2,3,4,5,6,7,8]), 2, 3);
   const h = own(t, f, geometry({a}), [reflection('a', 0, 'float', 1, 2)]);

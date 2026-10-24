@@ -100,8 +100,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!effective.some(nativeMaterial)) continue;
     if (effective.some(material => material && !nativeMaterial(material)))
       fail('MATERIAL', 'A native node mesh cannot mix authored node and fixed materials');
-    if (!(object instanceof three.Mesh) || object.intersectsFrustum !== three.Mesh.prototype.intersectsFrustum)
-      fail('OBJECT', 'Native node scenes require ordinary meshes with the source frustum implementation');
+    if (!(object instanceof three.Mesh) || object.intersectsFrustum !==
+        (object.isSkinnedMesh ? three.SkinnedMesh.prototype.intersectsFrustum : three.Mesh.prototype.intersectsFrustum))
+      fail('OBJECT', 'Native node scenes require ordinary meshes with their source frustum implementation');
     if (object.onBeforeRender !== three.Object3D.prototype.onBeforeRender || object.onAfterRender !== three.Object3D.prototype.onAfterRender)
       fail('HOOK', 'Native node object render hooks are not admitted');
     const geometry = object.geometry;
@@ -232,8 +233,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           const state = pairs.get(object), {geometry} = state;
           let z = 0;
           if (sortObjects) {
-            if (geometry.boundingSphere === null) geometry.computeBoundingSphere();
-            z = center.copy(geometry.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projection).z;
+            const bounds = object.boundingSphere !== undefined ? object : geometry;
+            if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
+            z = center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projection).z;
           }
           if (state.array) for (const group of geometry.groups)
             append(object, state, state.originals[group.materialIndex], state.effective[group.materialIndex], group, groupOrder, z);

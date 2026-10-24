@@ -8,9 +8,11 @@ import { renderMipScenarios } from './scenarios_render_mips.js';
 import { matcapScenarios } from './scenarios_matcap.js';
 import { nativeTSLScenarios } from './scenarios_native_tsl.js';
 import { nativeShadowScenarios } from './scenarios_native_shadows.js';
+import { nativeSkinningScenarios } from './scenarios_native_skinning.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
+  ...nativeSkinningScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

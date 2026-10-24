@@ -73,6 +73,96 @@ function cpuInstanceRig(t, {Material = THREE.MeshBasicNodeMaterial, count = 4, c
   const context = {...f.context, object, material, lights: []};
   return {...f, material, object, context, compile: () => f.owner.compile(material, object, context)};
 }
+function skinnedRig(t, {Material = THREE.MeshBasicNodeMaterial, count = 2} = {}) {
+  const f = rig(t), material = new Material(), geometry = f.object.geometry;
+  material.colorNode = f.tint; material.positionNode = N.positionLocal.add(N.vec3(f.shift, 0, 0));
+  geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute([0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0], 4));
+  geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute([.25, .75, 0, 0, .25, .75, 0, 0, .25, .75, 0, 0, .25, .75, 0, 0], 4));
+  geometry.computeTangents();
+  const object = new THREE.SkinnedMesh(geometry, material), bones = Array.from({length: count}, () => new THREE.Bone());
+  bones[0].add(...bones.slice(1)); object.add(bones[0]); object.bind(new THREE.Skeleton(bones));
+  f.scene.remove(f.object); f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object, material, lights: []};
+  return {...f, material, object, bones, context, compile: () => f.owner.compile(material, object, context)};
+}
+function paletteMember(descriptor) {
+  const name = /var<uniform>\s+(NodeBuffer_\d+)\s*:/.exec(descriptor.vertex)?.[1];
+  assert.ok(name, 'the source skinning palette retains its raw matrix buffer');
+  return uniformMember(descriptor, name, 'vertex');
+}
+for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshStandardNodeMaterial]) {
+  test(`${Material.name} skins source Uint16 joints and captures the live matrix palette`, t => {
+    const f = skinnedRig(t, {Material});
+    if (Material === THREE.MeshStandardNodeMaterial) f.material.normalMap = dataTexture();
+    const d = f.compile(), palette = paletteMember(d);
+    assert.equal(d.attributes.find(a => a.name === 'skinIndex').scalar, 'uint');
+    assert.equal(f.object.geometry.attributes.skinIndex.gpuType, THREE.FloatType, 'native admission never rewrites source gpuType');
+    assert.match(d.vertex, /skinIndex\s*:\s*vec4<u32>/);
+    assert.match(d.vertex, /array< mat4x4<f32>, 2 >/);
+    assert.ok(d.vertex.indexOf('skinWeight.x') < d.vertex.indexOf('object.testShift'), 'skinning precedes the authored position node');
+    if (Material === THREE.MeshStandardNodeMaterial) {
+      assert.match(d.vertex, /normalLocal = .*mat3x3/); assert.match(d.vertex, /tangentLocal/);
+    }
+    f.bones[1].position.y = .375; f.scene.updateMatrixWorld();
+    const first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+    assert.deepEqual(uniformValues(first, palette), [...f.object.skeleton.boneMatrices]);
+    f.bones[1].position.y = .875; f.scene.updateMatrixWorld();
+    const second = f.owner.capture(d, {...f.context, frameId: 2, renderId: 2});
+    assert.equal(f.compile(), d); assert.notDeepEqual(second, first); assert.deepEqual(first, saved);
+    assert.equal(uniformValues(second, palette)[29], .875);
+  });
+}
+test('source skinning updates a shared skeleton once per frame across separately captured meshes', t => {
+  const f = skinnedRig(t), skeleton = f.object.skeleton, update = skeleton.update;
+  let updates = 0; skeleton.update = function () { updates++; return update.call(this); };
+  const other = new THREE.SkinnedMesh(f.object.geometry, f.material); other.bind(skeleton, f.object.bindMatrix);
+  f.scene.add(other); f.scene.updateMatrixWorld();
+  const first = f.compile(), second = f.owner.compile(f.material, other, {...f.context, object: other});
+  const a = f.owner.capture(first, f.context);
+  f.bones[1].position.x = .5; f.scene.updateMatrixWorld();
+  const b = f.owner.capture(second, {...f.context, object: other, renderId: 2});
+  assert.equal(updates, 1);
+  assert.deepEqual(uniformValues(a, paletteMember(first)), uniformValues(b, paletteMember(second)));
+  f.owner.capture(second, {...f.context, object: other, frameId: 2, renderId: 3});
+  assert.equal(updates, 2); assert.equal(skeleton.boneMatrices[28], .5);
+});
+test('compatible skeleton replacements stay live while palette layout changes rebuild and reject stale captures', t => {
+  const f = skinnedRig(t), d = f.compile(), first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  const previous = f.object.skeleton;
+  f.object.skeleton = new THREE.Skeleton(f.bones, previous.boneInverses.map(m => m.clone()));
+  f.bones[1].position.x = .625; f.scene.updateMatrixWorld();
+  assert.equal(f.compile(), d);
+  const second = f.owner.capture(d, {...f.context, frameId: 2, renderId: 2});
+  assert.equal(uniformValues(second, paletteMember(d))[28], .625);
+  const bone = new THREE.Bone(); f.object.add(bone); f.scene.updateMatrixWorld();
+  f.object.skeleton = new THREE.Skeleton([...f.bones, bone], [...previous.boneInverses, new THREE.Matrix4()]);
+  assert.throws(() => f.owner.capture(d, {...f.context, frameId: 3, renderId: 3}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const next = f.compile(); assert.notEqual(next, d); assert.match(next.vertex, /array< mat4x4<f32>, 3 >/);
+  f.owner.capture(next, {...f.context, frameId: 3, renderId: 3}); assert.deepEqual(first, saved);
+});
+test('source skinning falls back to an unfiltered bone texture above the device uniform palette limit', t => {
+  const f = skinnedRig(t, {count: 1025}), d = f.compile(), skeleton = f.object.skeleton;
+  assert.ok(skeleton.boneTexture instanceof THREE.DataTexture);
+  assert.match(d.vertex, /textureLoad/); assert.doesNotMatch(d.vertex, /array< mat4x4<f32>, 1025 >/);
+  assert.ok(d.groups.some(group => group.entries.some(entry => entry.texture?.sampleType === 'unfilterable-float')));
+  const texture = skeleton.boneTexture, version = texture.version;
+  f.bones.at(-1).position.z = .375; f.scene.updateMatrixWorld();
+  const captured = f.owner.captureDraw(d, f.context);
+  assert.ok(captured.textures.some(binding => binding.texture === texture));
+  assert.equal(texture.version, version + 1); assert.equal(skeleton.boneMatrices[1024 * 16 + 14], .375);
+});
+test('malformed native skeleton palettes refuse before source draw updates', t => {
+  for (const change of [
+    f => { f.object.skeleton = null; },
+    f => { f.object.skeleton.boneMatrices = new Float32Array(16); },
+    f => { f.object.geometry.deleteAttribute('skinWeight'); },
+    f => { f.object.bindMatrix = {}; },
+  ]) {
+    const f = skinnedRig(t); let updates = 0;
+    f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; }); change(f);
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(updates, 0);
+  }
+});
 test('real pinned node graphs preserve native WGSL groups, attributes and linear output', t => {
   const f = rig(t), d = f.compile();
   assert.equal(d.nodeProgram, true); assert.equal('reflection' in d, false);
@@ -542,7 +632,7 @@ test('callback texture edits cannot silently retain an incompatible compiled lay
 test('unsupported texture families, actual borrowed layouts and device binding limits refuse explicitly', t => {
   const f = rig(t);
   const values = [new THREE.CubeTexture(), new THREE.Data3DTexture(new Uint8Array(4), 1, 1, 1),
-    new THREE.DataArrayTexture(new Uint8Array(4), 1, 1, 1), new THREE.DepthTexture(1, 1),
+    new THREE.DepthTexture(1, 1),
     new THREE.StorageTexture(1, 1), dataTexture({type: THREE.FloatType})];
   const integral = dataTexture(); integral.type = THREE.UnsignedIntType; integral.format = THREE.RGBAIntegerFormat; values.push(integral);
   const video = dataTexture(); video.isVideoTexture = true; values.push(video);

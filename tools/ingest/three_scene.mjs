@@ -259,7 +259,7 @@ export async function createGpuThreeScene(device,scene,{
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
     if(g.isInstancedBufferGeometry)programGeometries_.add(g);
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
-    if(hasThreeDeformation(object)&&!programToneMapping()){
+    if(hasThreeDeformation(object)&&!programToneMapping()&&!capturedNodeObject(object)){
       try{inspectThreeDeformation(object,{...deformationOptions,three});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
@@ -1139,6 +1139,7 @@ export async function createGpuThreeScene(device,scene,{
           gpu=byKey.get(compiled.attributesKey);
           if(!gpu){
             gpu=(native?createGpuProgramGeometry:programSupport.createGeometry)(device,item.programSource,native?compiled.attributes:compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+              ...(native?{attributeTypes:'webgpu'}:{}),
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(compiled.attributesKey,gpu);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});

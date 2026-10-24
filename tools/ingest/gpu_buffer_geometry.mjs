@@ -464,7 +464,7 @@ function createResidency(device, geometry, {
  * them. Released CPU arrays remain usable until the next required upload.
  * Attributes the geometry lacks are reported in
  * `missing` so the renderer binds GL's constant (0, 0, 0, 1) default instead. */
-function describeProgram(program) {
+function describeProgram(program, attributeTypes) {
   return (geometry, device) => {
     const attributes = geometry?.attributes;
     if (!attributes) fail('SHAPE', 'Expected a BufferGeometry');
@@ -481,10 +481,11 @@ function describeProgram(program) {
         continue;
       }
       const owner = ownerOf(attribute), source = sourceArray(owner), array = source.array;
-      // r186 WebGLBindingStates: gpuType IntType -> vertexAttribIPointer, else
-      // vertexAttribPointer. A mismatch with the shader input type is a GL error
-      // or undefined value there, so it is explicit here.
-      const intType = attribute.gpuType === INT_TYPE;
+      // WebGL selects IPointer through gpuType; source WebGPU instead derives
+      // integer inputs from the typed array and normalization. The native
+      // builder has already reflected that type (including ordinary Uint16
+      // skinIndex attributes), without changing the public attribute's gpuType.
+      const intType = attributeTypes === 'webgpu' ? integerInput : attribute.gpuType === INT_TYPE;
       if (integerInput !== intType) fail('FORMAT', integerInput ? `Integer attribute ${a.name} needs gpuType IntType` : `Attribute ${a.name} has gpuType IntType but the program reads floats`);
       if (intType && (attribute.normalized === true || attribute.isFloat16BufferAttribute === true)) fail('FORMAT', `Integer attribute ${a.name} cannot be normalized or half-float`);
       const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner, {integer: intType}) : null;
@@ -547,7 +548,9 @@ function describeProgram(program) {
 }
 const programStates = new WeakMap();
 export function createGpuProgramGeometry(device, geometry, programAttributes, options) {
-  const handle = createResidency(device, geometry, options, describeProgram(programAttributes), range, programStates);
+  const attributeTypes = options?.attributeTypes ?? 'webgl';
+  if (!['webgl', 'webgpu'].includes(attributeTypes)) fail('FORMAT', 'Program attributes require source WebGL or WebGPU type semantics');
+  const handle = createResidency(device, geometry, options, describeProgram(programAttributes, attributeTypes), range, programStates);
   return handle;
 }
 /** Program-geometry snapshot: buffers/layouts plus GL's missing constant locations. */
