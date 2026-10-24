@@ -3,7 +3,10 @@
  * mipLevel selects an allocated color mip; bounds and omitted extents are local
  * to that mip, including NPOT and 1D tails. No implicit downsampling is performed.
  * BGRA targets return RGBA bytes; float32 targets preserve full precision and
- * half-float values remain their original Uint16 bit patterns. Scalar/vector
+ * half-float values remain their original Uint16 bit patterns. Cube reads require
+ * an explicit face (0..5); 2D reads accept only face zero, which is the default.
+ * Selection is captured before submission, independently of the rendering face.
+ * Scalar/vector
  * targets return one/two components per pixel, without inventing RGBA channels.
  * maxBytes bounds each staging buffer. maxInFlightBytes bounds shared per-device
  * staging plus internally allocated output for all unfinished reads. At most 64
@@ -22,6 +25,17 @@ const FORMATS = new Map([
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
   ['r32float', [Float32Array, 1, false]], ['rg32float', [Float32Array, 2, false]],
 ]);
+
+// A cube's active rendering face is not readback state. Require the caller to
+// select it explicitly, including for empty requests, rather than quietly
+// returning +X. A 2D target retains its existing default face-zero behavior.
+function readbackFace(shape, face) {
+  const cube = shape?.cube === true;
+  if (face === undefined && !cube) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
+    fail('FACE', cube ? 'Cube readback requires an explicit face from zero to five' : '2D readback requires face zero');
+  return face;
+}
 
 // One device-loss handler, not one permanently retained promise closure per
 // frame. Completed reads remove their waiter and release all staging/output data.
@@ -55,13 +69,14 @@ function reserve(state, bytes, limit) {
   };
 }
 
-export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height, mipLevel = 0, flipY = false, output,
+export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height, mipLevel = 0, face, flipY = false, output,
   signal, maxBytes = 64 * 1024 * 1024, maxInFlightBytes = 128 * 1024 * 1024} = {}) {
   if (!session || typeof session.withTexture !== 'function') fail('SOURCE', 'Expected an offscreen session');
   if (session.disposed || session.failed) fail('SOURCE', 'Offscreen session is no longer usable');
   for (const value of [session.width, session.height])
     if (!Number.isSafeInteger(value) || value < 0) fail('SOURCE', 'Expected finite integer target dimensions');
   const diagnostics = session.diagnostics;
+  face = readbackFace(diagnostics?.target ?? diagnostics, face);
   let mipLevelCount = diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
   // Suspended owners have no allocation, but still admit an empty base-level read.
   if (mipLevelCount === 0 && (session.width === 0 || session.height === 0)) mipLevelCount = 1;
@@ -117,7 +132,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
       try {
         buffer = device.createBuffer({label: 'Render target pixel readback', size, usage: 1 | 8});
         const encoder = device.createCommandEncoder();
-        encoder.copyTextureToBuffer({texture, mipLevel, origin: {x, y: flipY ? mipHeight - y - height : y, z: 0}},
+        encoder.copyTextureToBuffer({texture, mipLevel, origin: {x, y: flipY ? mipHeight - y - height : y, z: face}},
           {buffer, bytesPerRow, rowsPerImage: height}, {width, height, depthOrArrayLayers: 1});
         device.queue.submit([encoder.finish()]);
       } catch (cause) { error = cause; }
@@ -197,13 +212,15 @@ struct Region {
 /** Read sampled depth as tightly packed Float32Array values in native depth
  * space, not linearized distance. Requires sampleDepth on the target. MSAA reads
  * require an explicit sampleIndex: samples are never averaged or resolved.
+ * Cube depth reads require an explicit face and borrow a single depth-only 2D
+ * view. No cube filtering, depth conversion or color mip generation is involved.
  * Submission captures depth before returning its promise. The same per-device
  * budgets and cancellation gate as color readback own all temporary buffers;
  * maxBytes limits each data buffer, maxInFlightBytes also charges the compute
  * output, 32-byte uniform and any internally allocated host output.
  */
 export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, sampleIndex,
-  mipLevel = 0, flipY = false, output, signal, maxBytes = 64 * 1024 * 1024,
+  mipLevel = 0, face, flipY = false, output, signal, maxBytes = 64 * 1024 * 1024,
   maxInFlightBytes = 128 * 1024 * 1024} = {}) {
   if (!session || typeof session.withDepthTexture !== 'function' || session.disposed || session.failed)
     fail('SOURCE', 'Expected a live sampled-depth session');
@@ -211,6 +228,7 @@ export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, 
     if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fffffff)
       fail('SOURCE', 'Expected finite integer depth dimensions');
   const shape = session.diagnostics?.target ?? session.diagnostics;
+  face = readbackFace(shape, face);
   if (!DEPTH_FORMATS.has(shape?.depthFormat)) fail('FORMAT', 'Expected a depth attachment');
   if (shape.sampleDepth === false) fail('SOURCE', 'Enable sampleDepth before reading depth');
   const samples = shape.sampleCount;
@@ -269,7 +287,8 @@ export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, 
         device.queue.writeBuffer(uniform, 0, new Uint32Array([x, flipY ? session.height - y - height : y,
           width, height, sampleIndex, flipY ? 1 : 0, 0, 0]));
         const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [
-          {binding: 0, resource: texture.createView({aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1})},
+          {binding: 0, resource: texture.createView({dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1,
+            aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1})},
           {binding: 1, resource: {buffer: storage}}, {binding: 2, resource: {buffer: uniform}},
         ]});
         const encoder = device.createCommandEncoder({label: 'Depth pixel readback'}), pass = encoder.beginComputePass();
