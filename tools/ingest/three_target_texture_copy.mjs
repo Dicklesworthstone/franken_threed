@@ -13,13 +13,14 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
     fail('SOURCE', 'Expected target-owned color and a storage texture destination');
   const entry = targets.capture(texture.renderTarget);
   if (entry.shape.cube) fail('SOURCE', 'Cube target copies require explicit face-aware support');
-  if (entry.shape.texture !== texture) fail('STALE', 'Color texture no longer belongs to its render target');
+  const colorIndex = entry.shape.textures.indexOf(texture);
+  if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   // A transfer does not sample. Build the owner-native borrow record directly
   // from capture(), rather than imposing a float-filtering feature or creating
   // a sampler through captureNativeTexture(). The resolved color is single-
   // sample even when the source render attachment is multisampled.
-  const source = Object.freeze({entry, texture, device, depth: false});
-  const shape = {...entry.shape, depth: 1, viewDimension: '2d'};
+  const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
+  const shape = {...entry.shape.colors[colorIndex], depth: 1, viewDimension: '2d'};
   const destination = storage.capture(destinationTexture);
   const plan = inspectStorageTextureCopy(shape, destination.shape, region, position, sourceLevel, destinationLevel);
   const write = plan.empty ? null : storage.captureBinding({texture: destinationTexture,
@@ -28,7 +29,7 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
     if (renderer._disposed) fail('DISPOSED', 'Renderer is disposed');
     if (renderer._device !== device) fail('DEVICE', 'Texture copies cannot migrate between devices');
     targets.assertCurrent(entry); storage.assertCurrent(destination);
-    if (entry.shape.texture !== texture) fail('STALE', 'Captured color texture was replaced');
+    if (entry.shape.textures[colorIndex] !== texture) fail('STALE', 'Captured color texture was replaced');
     if (plan.empty) return false;
     // Check both budgets and all device extents before allocating either side.
     targets.validateNativeTextures([source]); storage.validateAllocations([destination]);
@@ -42,7 +43,7 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
       targets.assertCurrent(entry); storage.assertCurrent(destination);
       if (renderer._disposed || renderer._device !== device) fail('STALE', 'Renderer changed during a texture copy');
       device.queue.submit([encoder.finish()]);
-    }, write));
+    }, write, {validation: Promise.all([entry.validation, entry.storage.validation])}));
     return true;
   }});
 }

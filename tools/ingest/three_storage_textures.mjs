@@ -138,13 +138,13 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     }
     return value;
   }
-  function checked(run) {
+  function checked(run, validation) {
     const d = device(); d.pushErrorScope('out-of-memory'); d.pushErrorScope('validation');
     try { return run(d); }
     catch (error) { stop(error); throw error; }
     finally {
-      const task = Promise.all([d.popErrorScope(), d.popErrorScope()]).then(errors => {
-        const error = errors.find(Boolean); if (error) throw new ThreeStorageTextureError('GPU', error.message);
+      const task = Promise.all([d.popErrorScope(), d.popErrorScope(), validation]).then(([invalid, oom]) => {
+        const error = invalid || oom; if (error) throw new ThreeStorageTextureError('GPU', error.message);
       }).catch(error => { stop(error); throw error; });
       pending.add(task); task.finally(() => pending.delete(task)).catch(() => {});
     }
@@ -189,7 +189,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   // The callback must submit before returning. Other renderer-owned resources
   // can participate in the same native command without bypassing this owner's
   // validation, mip policy, disposal checks or completion accounting.
-  function withTexture(entry, callback, write = null) {
+  function withTexture(entry, callback, write = null, {validation} = {}) {
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous native texture callback');
     if (write !== null && (write.entry !== entry || write.kind !== 'storage' || write.access === 'read-only'))
       fail('ACCESS', 'Expected a captured storage write for the borrowed texture');
@@ -201,7 +201,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
         const value = callback(entry.native);
         if (value?.then) fail('CALLBACK', 'Native texture callbacks must submit synchronously');
         assertCurrent(entry); return value;
-      });
+      }, validation);
       if (write !== null) written([write]);
       return result;
     } finally { borrowed.delete(entry); }
@@ -360,6 +360,9 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     finally { stopped.signal.removeEventListener('abort', abort); }
   }
   return {capture, assertCurrent, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
+    // A queue-free snapshot for cross-owner consumers. Capture synchronously:
+    // awaiting whenIdle here would insert a fence into every GPU-only copy.
+    get validation() { live(); return Promise.all([...pending]).then(() => {}); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     dispose: () => stop(new ThreeStorageTextureError('DISPOSED', 'Storage texture owner disposed'))};
 }
