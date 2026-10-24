@@ -1,5 +1,5 @@
 /** Queue-ordered color readback. The texture copy is submitted synchronously;
- * only buffer mapping waits. Returned rows exclude WebGPU's 256-byte padding.
+ * mapping and captured producer validation wait. Returned rows exclude WebGPU's 256-byte padding.
  * mipLevel selects an allocated color mip; bounds and omitted extents are local
  * to that mip, including NPOT and 1D tails. No implicit downsampling is performed.
  * BGRA targets return RGBA bytes; float32 targets preserve full precision and
@@ -152,7 +152,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
     }, {colorIndex});
     if (error) throw error;
     if (!buffer) fail('SOURCE', 'Target storage was suspended before the copy');
-    await Promise.race([Promise.all([validation, buffer.mapAsync(1)]), stopped]);
+    await Promise.race([Promise.all([validation, session.validation, buffer.mapAsync(1)]), stopped]);
     // Mapping may win Promise.race in the same turn as cancellation/device loss.
     // The caller's array is committed only after all three conditions hold.
     checkAbort();
@@ -313,7 +313,7 @@ export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, 
     });
     if (error) throw error;
     if (!staging) fail('SOURCE', 'Depth storage was suspended before submission');
-    await Promise.race([Promise.all([validation, staging.mapAsync(1)]), stopped]);
+    await Promise.race([Promise.all([validation, session.validation, staging.mapAsync(1)]), stopped]);
     checkAbort();
     if (state.error) throw state.error;
     const mapped = new Uint8Array(staging.getMappedRange());

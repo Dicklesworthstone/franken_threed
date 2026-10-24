@@ -33,6 +33,14 @@
  * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
  * Upload/copy destinations must be single-sample. No implicit color conversion.
+ * withColorDestination(callback, {colorIndex, validation}) admits externally
+ * owned GPU producers through the same copyDestination capability. The callback
+ * writes level zero and submits synchronously; it must not retain the texture.
+ * It neither samples nor refreshes old mips. Subsequent readers regenerate them.
+ * Optional source validation is a captured promise, not a queue wait. Both it
+ * and this callback's GPU error scopes gate whenIdle and readback publication.
+ * The validation getter snapshots checks already issued, without waiting for
+ * the queue or preventing another owner from submitting its dependent copy.
  * copyDepthFrom(sourceTarget, options) writes only depth, preserving color and
  * stencil. Equal MSAA counts preserve every sample; MSAA-to-single requires an
  * explicit sampleIndex. Different depth formats require allowFormatConversion.
@@ -379,10 +387,14 @@ export function createGpuRenderTarget(device, options = {}) {
       return frame;
     } catch (error) { depth?.destroy(); throw error; }
   }
-  function borrow(callback, kind, mipLevel = 0, face = 0, colorIndex = 0) {
+  function borrow(callback, kind, mipLevel = 0, face = 0, colorIndex = 0, dependency) {
     exclusive();
     if (!Number.isSafeInteger(colorIndex) || colorIndex < 0 || colorIndex >= colorFormats.length)
       fail('ATTACHMENT', 'Color attachment index is out of range');
+    if (kind === 'destination') {
+      if (!copyDestination) fail('USAGE', 'Enable copyDestination before borrowing a color destination');
+      if (sampleCount !== 1) fail('SAMPLES', 'Color destinations require one sample');
+    }
     if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
     const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel, face) : 0;
@@ -393,9 +405,14 @@ export function createGpuRenderTarget(device, options = {}) {
     try {
       const frame = kind === 'frame' ? frameAt(mipLevel, extraBytes, face) : null;
       current.used = true; // Even a throwing callback may have submitted work.
-      if (kind === 'frame') current.mipsDirty = true;
+      if (kind === 'frame' || kind === 'destination') current.mipsDirty = true;
       else if (kind === 'color' || kind === 'sampled' || kind === 'attachments') refreshMips(current);
-      const result = kind === 'frame' ? callback(frame, current.color)
+      if (kind === 'destination' && dependency !== undefined) {
+        validation = Promise.all([validation, dependency]).then(() => {});
+        validation.catch(stop);
+      }
+      const result = kind === 'destination' ? checked(() => callback(current.colors[colorIndex]))
+        : kind === 'frame' ? callback(frame, current.color)
         : kind === 'sampled' ? callback(current.color, current.depth)
         : kind === 'attachments' ? callback(Object.freeze(current.colors.slice()), sampleDepth ? current.depth : null)
         : callback(kind === 'depth' ? current.depth : current.colors[colorIndex]);
@@ -422,6 +439,7 @@ export function createGpuRenderTarget(device, options = {}) {
       // draws cannot change which version of the texture this call observes.
       return await operation({device, width, height, diagnostics: {target: {...transferShape(), depthFormat, sampleDepth}},
         get disposed() { return disposed; }, get failed() { return terminal !== null; },
+        get validation() { return validation; },
         withTexture: api.withTexture, withDepthTexture: api.withDepthTexture}, {...options, signal: controller.signal});
     } finally {
       readbacks.delete(controller);
@@ -430,6 +448,7 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   const api = Object.freeze({
     rendererOptions,
+    get validation() { live(); return validation; },
     get width() { return width; }, get height() { return height; },
     get mipLevelCount() { return current?.mipLevelCount ?? 0; },
     get suspended() { return width === 0 || height === 0; },
@@ -460,6 +479,9 @@ export function createGpuRenderTarget(device, options = {}) {
     frameAllocationBytes,
     withFrame(callback, {mipLevel = 0, face = 0} = {}) { return borrow(callback, 'frame', mipLevel, face); },
     withTexture(callback, {colorIndex = 0} = {}) { return borrow(callback, 'color', 0, 0, colorIndex); },
+    withColorDestination(callback, {colorIndex = 0, validation} = {}) {
+      return borrow(callback, 'destination', 0, 0, colorIndex, validation);
+    },
     withAttachments(callback) { return borrow(callback, 'attachments'); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
     withSampledTextures(callback) { return borrow(callback, 'sampled'); },
