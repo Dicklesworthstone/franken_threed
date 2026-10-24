@@ -352,6 +352,19 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
       }
     }();
   }
+  function validationSnapshot() {
+    live();
+    if (!pending.size) return Promise.resolve();
+    let abort;
+    const cancelled = new Promise((_, reject) => {
+      abort = () => reject(terminal); stopped.signal.addEventListener('abort', abort, {once: true});
+    });
+    // Source disposal must not leave a dependent target waiting forever on an
+    // unfinished producer. Remove completed waiters rather than retaining one
+    // stopped-promise reaction for every frame for the device's whole lifetime.
+    return Promise.race([Promise.all([...pending]), cancelled]).then(() => {})
+      .finally(() => stopped.signal.removeEventListener('abort', abort));
+  }
   async function whenIdle() {
     live(); if (!watchedDevice) return;
     let abort;
@@ -362,7 +375,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   return {capture, assertCurrent, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
     // A queue-free snapshot for cross-owner consumers. Capture synchronously:
     // awaiting whenIdle here would insert a fence into every GPU-only copy.
-    get validation() { live(); return Promise.all([...pending]).then(() => {}); },
+    get validation() { return validationSnapshot(); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size; },
     dispose: () => stop(new ThreeStorageTextureError('DISPOSED', 'Storage texture owner disposed'))};
 }

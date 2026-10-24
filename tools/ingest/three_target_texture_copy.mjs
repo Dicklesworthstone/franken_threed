@@ -1,4 +1,4 @@
-/** Connect source RenderTarget color to GPU-authored storage without a CPU
+/** Connect source RenderTarget color and GPU-authored storage without a CPU
  * image, UV replica, sampler, conversion shader or additional texture owner.
  * The renderer facade schedules the captured request in its ordinary FIFO.
  */
@@ -45,5 +45,57 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
       device.queue.submit([encoder.finish()]);
     }, write, {validation: Promise.all([entry.validation, entry.storage.validation])}));
     return true;
+  }});
+}
+
+/** Copy a storage mip or array layer into a selected single-sample target color.
+ * Keep GPU contents at the submission point, while the source-shaped box,
+ * destination position, formats and attachment identities are captured now.
+ */
+export function captureStorageToTargetCopy(renderer, texture, destinationTexture,
+  region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
+  const targets = renderer._targets, storage = renderer._storageTextures, device = renderer._device;
+  if (!targets || !storage || !device) fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
+  if (!texture?.isStorageTexture || !destinationTexture?.isRenderTargetTexture ||
+      destinationTexture.isDepthTexture || !destinationTexture.renderTarget)
+    fail('SOURCE', 'Expected a storage texture and target-owned color destination');
+  const entry = targets.capture(destinationTexture.renderTarget);
+  if (entry.shape.cube) fail('SOURCE', 'Cube target copies require explicit face-aware support');
+  if (entry.shape.sampleCount !== 1) fail('SAMPLES', 'Storage copies require a single-sample target destination');
+  if (destinationLevel !== 0) fail('LEVEL', 'Storage copies write target mip zero; derived mips regenerate on demand');
+  const colorIndex = entry.shape.textures.indexOf(destinationTexture);
+  if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
+  const destination = Object.freeze({entry, texture: destinationTexture, device, depth: false, colorIndex});
+  const shape = {...entry.shape.colors[colorIndex], depth: 1, viewDimension: '2d'};
+  const source = storage.capture(texture);
+  const plan = inspectStorageTextureCopy(source.shape, shape, region, position, sourceLevel, destinationLevel);
+  return Object.freeze({issue() {
+    if (renderer._disposed) fail('DISPOSED', 'Renderer is disposed');
+    if (renderer._device !== device) fail('DEVICE', 'Texture copies cannot migrate between devices');
+    targets.assertCurrent(entry); storage.assertCurrent(source);
+    if (entry.shape.textures[colorIndex] !== destinationTexture) fail('STALE', 'Captured color texture was replaced');
+    if (plan.empty) return false;
+    targets.validateNativeTextures([destination]); storage.validateAllocations([source]);
+    const limit = device.limits?.maxTextureDimension2D;
+    if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit)
+      fail('LIMIT', 'Destination target exceeds the device texture dimension limit');
+    // The source borrow closes its validation scope only after the destination
+    // submits. Resolve with the snapshot synchronously after that scope closes:
+    // a deferred getter could include later reverse copies and create a cycle.
+    let resolve, reject;
+    const validation = new Promise((yes, no) => { resolve = yes; reject = no; });
+    validation.catch(() => {});
+    try {
+      storage.withTexture(source, nativeSource => targets.withNativeColorDestination(destination, nativeDestination => {
+        const encoder = device.createCommandEncoder({label: 'f3d-storage-to-target-copy'});
+        encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
+          {texture: nativeDestination, mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+        targets.assertCurrent(entry); storage.assertCurrent(source);
+        if (renderer._disposed || renderer._device !== device) fail('STALE', 'Renderer changed during a texture copy');
+        device.queue.submit([encoder.finish()]);
+      }, {validation}));
+      resolve(storage.validation);
+      return true;
+    } catch (error) { reject(error); throw error; }
   }});
 }

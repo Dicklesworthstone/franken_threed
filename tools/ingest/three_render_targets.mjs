@@ -368,6 +368,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.session = {device, get width() { return width; }, get height() { return height; },
       get disposed() { return !entry.alive; }, get failed() { return !!entry.error || !!entry.storage?.failed; },
       get diagnostics() { return {target: {format, colorFormats, mipLevelCount, cube}}; },
+      get validation() { assertCurrent(entry); return Promise.all([entry.validation, entry.storage.validation]); },
       withTexture(callback, options) {
         assertCurrent(entry);
         if (cube) fail('UNSUPPORTED', 'Cube target readbacks require an explicit face-aware transfer API');
@@ -671,6 +672,23 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (color && depth) return entry.storage.withSampledTextures((native, nativeDepth) => invoke([native], nativeDepth));
         if (depth) return entry.storage.withDepthTexture(native => invoke(null, native));
         return entry.storage.withTexture(native => invoke([native], null));
+      } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
+    },
+    // A raw transfer destination must not sample old mips or allocate a UV
+    // replica. Keep identity, lifetime, allocation and validation with this owner.
+    withNativeColorDestination(source, callback, {validation} = {}) {
+      if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
+      this.validateNativeTextures([source]);
+      const {entry, colorIndex} = source;
+      if (source.depth || entry.shape.cube || entry.shape.sampleCount !== 1)
+        fail('UNSUPPORTED', 'Native color destinations require single-sample 2D color attachments');
+      ensure(entry);
+      entry.busy = true;
+      if (colorIndex === 0) entry.dirty = true;
+      try {
+        return entry.storage.withColorDestination(native => {
+          const result = callback(native); assertCurrent(entry); return result;
+        }, {colorIndex, validation});
       } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
     },
     writePixels(entry, data, options = {}) {
