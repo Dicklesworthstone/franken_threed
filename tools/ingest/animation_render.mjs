@@ -236,6 +236,7 @@ import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./an
 import {createProgramMeshes} from "./animation_program_mesh.mjs";
 import {createThreeNodeProgramMeshes} from "./three_node_program_gpu.mjs";
 import {createAnimationColorTargetProfile} from "./animation_color_target.mjs";
+import {inspectGpuRenderTargetColors} from "./gpu_render_target.mjs";
 import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
   ANIMATION_NORMAL_BLEND} from "./animation_raster.mjs";
 import {bufferGeometrySnapshot, instanceAttributesSnapshot} from "./gpu_buffer_geometry.mjs";
@@ -1103,6 +1104,7 @@ export async function createGpuAnimationRenderer(
   device,
   {
     format = "rgba8unorm",
+    colorFormats = format === null ? [] : [format],
     depthFormat = "depth24plus",
     sampleCount = 1,
     shadows = false,
@@ -1145,6 +1147,12 @@ export async function createGpuAnimationRenderer(
     fail("ANIMATION_RENDER_DEVICE", "Lend a live WebGPU device");
   const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail("ANIMATION_RENDER_OPTIONS", message));
+  if (!Array.isArray(colorFormats) || (format === null ? colorFormats.length !== 0 : colorFormats[0] !== format))
+    fail("ANIMATION_RENDER_OPTIONS", "Color attachment formats must retain the primary format");
+  colorFormats = colorFormats.length > 1 ? inspectGpuRenderTargetColors(device, colorFormats) : Object.freeze(colorFormats.slice());
+  for (const attachmentFormat of colorFormats.slice(1))
+    createAnimationColorTargetProfile(device, {format: attachmentFormat, sampleCount},
+      message => fail("ANIMATION_RENDER_OPTIONS", message));
   if (
     ![null, "depth24plus", "depth32float", "depth16unorm", "depth24plus-stencil8", "depth32float-stencil8"].includes(depthFormat) ||
     typeof label !== "string"
@@ -1429,33 +1437,36 @@ export async function createGpuAnimationRenderer(
   /** A scissor-limited clear: one full-target triangle (the scissor rect clips
    * it) writing the clear color, depth (frag_depth) and stencil (replace). */
   let clearPipelines = null, clearUniform = null;
-  function scissorClear(pass, rectangle, {color, depth, stencil}) {
+  function scissorClear(pass, rectangle, {colors, depth, stencil}) {
     clearPipelines ??= new Map();
-    const key = `${color !== null}|${depth !== null}|${stencil !== null}`;
+    const key = `${colors !== null}|${depth !== null}|${stencil !== null}`, slots = Math.max(1, colorFormats.length);
     let entry = clearPipelines.get(key);
     if (!entry) {
       const module = device.createShaderModule({label: `${label}/scissor-clear`, code: `
-struct ClearInfo { color: vec4<f32>, depth: vec4<f32> };
+struct ClearInfo { colors: array<vec4<f32>, ${slots}>, depth: vec4<f32> };
 @group(0) @binding(0) var<uniform> info: ClearInfo;
-struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth) depth: f32" : ""} };
+struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${index}: vec4<f32>`),
+  ...(depthFormat ? ["@builtin(frag_depth) depth: f32"] : [])].join(", ")} };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
   return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
 }
-@fragment fn fs() -> Out { return Out(info.color${depthFormat ? ", info.depth.x" : ""}); }`});
+@fragment fn fs() -> Out { return Out(${[...colorFormats.map((_, index) => `info.colors[${index}]`),
+  ...(depthFormat ? ["info.depth.x"] : [])].join(", ")}); }`});
       const pipeline = device.createRenderPipeline({label: `${label}/scissor-clear`, layout: "auto",
         vertex: {module, entryPoint: "vs"},
-        fragment: {module, entryPoint: "fs", targets: format === null ? [] : [{format, writeMask: color !== null ? 0xf : 0}]},
+        fragment: {module, entryPoint: "fs", targets: colorFormats.map(format => ({format, writeMask: colors !== null ? 0xf : 0}))},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: depth !== null, depthCompare: "always",
           ...(stencilAttachment ? {stencilFront: {compare: "always", passOp: stencil !== null ? "replace" : "keep"},
             stencilBack: {compare: "always", passOp: stencil !== null ? "replace" : "keep"}, stencilWriteMask: stencil !== null ? 0xff : 0} : {})}} : {}),
         multisample: {count: sampleCount}});
-      clearUniform ??= device.createBuffer({label: `${label}/scissor-clear`, size: 32, usage: 64 | 8});
+      clearUniform ??= device.createBuffer({label: `${label}/scissor-clear`, size: (slots + 1) * 16, usage: 64 | 8});
       entry = {pipeline, group: device.createBindGroup({layout: pipeline.getBindGroupLayout(0), entries: [{binding: 0, resource: {buffer: clearUniform}}]})};
       clearPipelines.set(key, entry);
     }
     // Written before this render's own submission (queue order per frame).
-    device.queue.writeBuffer(clearUniform, 0, new Float32Array([...(color ?? [0, 0, 0, 0]), depth ?? 1, 0, 0, 0]));
+    device.queue.writeBuffer(clearUniform, 0, new Float32Array([
+      ...(colors ? colors.flatMap(value => Array.from(value)) : Array(slots * 4).fill(0)), depth ?? 1, 0, 0, 0]));
     const [x, y, w, h] = rectangle;
     if (w === 0 || h === 0) return;
     // The scissor rectangle as viewport: the triangle covers exactly that area.
@@ -1468,6 +1479,8 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
   }
   async function addProgramMesh(gpu, options) {
     keys(options, ["program", "textures", "raster", "topology", "stripIndexFormat"], "program mesh");
+    if (colorFormats.length > 1)
+      fail("ANIMATION_RENDER_OPTIONS", "Multiple color attachments require native node programs; ESSL programs currently write one attachment");
     if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
     pendingMeshes++;
     try {
@@ -1491,7 +1504,7 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
     pendingMeshes++;
     let record;
     try {
-      nodePrograms ??= createThreeNodeProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost,
+      nodePrograms ??= createThreeNodeProgramMeshes({device, format, colorFormats, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost,
         maxBindGroups: Math.min(4, device.limits.maxBindGroups)});
       record = await nodePrograms.add(gpu, options);
       live();
@@ -1688,16 +1701,9 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
               fragment: {
                 module,
                 entryPoint: "fragment_main",
-                targets:
-                  format === null
-                    ? []
-                    : [
-                        {
-                          format,
-                          ...(colorWrite ? {} : {writeMask: 0}),
-                          ...(blendState ? {blend: blendState} : {}),
-                        },
-                      ],
+                targets: colorFormats.map((format, index) => index === 0
+                  ? {format, ...(colorWrite ? {} : {writeMask: 0}), ...(blendState ? {blend: blendState} : {})}
+                  : {format, writeMask: 0}),
               },
               primitive: {
                 topology: primitiveTopology,
@@ -1887,7 +1893,7 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
     await Promise.race([Promise.all([initialized.value, initialized.errors]), lost]);
     live();
     if (renderBundles) bundleCache = createAnimationRenderBundleCache(device, {
-      format, depthFormat, sampleCount, bindGroup, stride, instancing,
+      format, colorFormats, depthFormat, sampleCount, bindGroup, stride, instancing,
       maxBundles: maxRenderBundles, maxDraws, label: `${label}/bundle`,
     });
   } catch (error) {
@@ -2535,13 +2541,16 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
         frame,
         [
           "colorView",
+          "colorViews",
           "depthView",
           "resolveTarget",
+          "resolveTargets",
           "viewProjection",
           "draws",
           "loadOp",
           "depthLoadOp",
           "clearColor",
+          "clearColors",
           "clearDepth",
           "stencilLoadOp", "clearStencil",
           "viewport",
@@ -2578,13 +2587,22 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
         fog: fogInput = null,
         renderBundles: useBundles = renderBundles,
       } = frame;
+      const colorViews = frame.colorViews ?? (colorView ? [colorView] : []);
+      if (!Array.isArray(colorViews) || colorViews.length !== colorFormats.length || colorViews.some(view => !view))
+        fail("ANIMATION_RENDER_ATTACHMENT", "Color attachments must match the pipeline layout");
+      const resolveTargets = frame.resolveTargets ?? colorViews.map((_, index) => index === 0 ? resolveTarget : undefined),
+        clearColors = frame.clearColors ?? colorViews.map(() => clearColor);
+      if (!Array.isArray(resolveTargets) || resolveTargets.length !== colorFormats.length ||
+          !Array.isArray(clearColors) || clearColors.length !== colorFormats.length ||
+          colorView != null && colorView !== colorViews[0] || resolveTarget != null && resolveTarget !== resolveTargets[0])
+        fail("ANIMATION_RENDER_ATTACHMENT", "Color attachments, resolves and clear values must match the pipeline layout");
       if (typeof useBundles !== "boolean" || (useBundles && !renderBundles))
         fail("ANIMATION_RENDER_OPTIONS", "Enable renderer renderBundles before using bundled frames");
       if (
-        (format === null ? colorView || resolveTarget : !colorView) ||
+        (format === null && (colorView || resolveTarget)) ||
         (depthFormat && !depthView) ||
         (!depthFormat && depthView) ||
-        (sampleCount === 1 && resolveTarget)
+        (sampleCount === 1 && resolveTargets.some(Boolean))
       )
         fail("ANIMATION_RENDER_ATTACHMENT", "Attachment configuration differs from pipeline");
       if (!["clear", "load"].includes(loadOp) || !["clear", "load"].includes(depthLoadOp))
@@ -2596,6 +2614,11 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
         integer(clearStencil, 0, 255, "clear stencil");
       }
       color(clearColor);
+      for (const value of clearColors) {
+        array(value, 4, "Attachment clear value");
+        if (value.some(component => !Number.isFinite(Math.fround(component))))
+          fail("ANIMATION_RENDER_VALUE", "Attachment clear values must be finite f32");
+      }
       finite(clearDepth, "Clear depth");
       if (clearDepth < 0 || clearDepth > 1)
         fail("ANIMATION_RENDER_RANGE", "Clear depth must be in [0,1]");
@@ -2634,9 +2657,7 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
         shadow === null ? null : packProjectedShadow(device, shadow, lightWords, shadowWords, fail);
       if (
         projected &&
-        (projected.snapshot.view === depthView ||
-          projected.snapshot.view === colorView ||
-          projected.snapshot.view === resolveTarget)
+        [depthView, ...colorViews, ...resolveTargets].includes(projected.snapshot.view)
       ) {
         fail("ANIMATION_RENDER_SHADOW", "A sampled shadow map cannot also be a frame attachment");
       }
@@ -2657,7 +2678,7 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
       if (
         ambient &&
         ["diffuseView", "specularView", "brdfView"].some((key) =>
-          [colorView, depthView, resolveTarget].includes(ambient.snapshot[key]),
+          [...colorViews, depthView, ...resolveTargets].includes(ambient.snapshot[key]),
         )
       ) {
         fail(
@@ -2949,33 +2970,21 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
         if (scissoredClear) {
           // Its own pass, ahead of the frame's, so no pass state leaks into draws.
           const clearPass = encoder.beginRenderPass({label: `${label}/scissor-clear`,
-            colorAttachments: format === null ? [] : [{view: colorView, loadOp: "load", storeOp: "store"}],
+            colorAttachments: colorViews.map(view => ({view, loadOp: "load", storeOp: "store"})),
             ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp: "load", depthStoreOp: "store",
               ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})});
           clearPass.setScissorRect(...scissor);
-          scissorClear(clearPass, scissor, {color: format !== null && loadOp === "clear" ? clearColor : null,
+          scissorClear(clearPass, scissor, {colors: format !== null && loadOp === "clear" ? clearColors : null,
             depth: depthFormat && depthLoadOp === "clear" ? clearDepth : null, stencil: stencilAttachment && stencilLoadOp === "clear" ? clearStencil : null});
           clearPass.end();
         }
         const pass = encoder.beginRenderPass({
           label,
-          colorAttachments:
-            format === null
-              ? []
-              : [
-                  {
-                    view: colorView,
-                    ...(resolveTarget ? { resolveTarget } : {}),
-                    loadOp: scissoredClear ? "load" : loadOp,
-                    storeOp: "store",
-                    clearValue: {
-                      r: clearColor[0],
-                      g: clearColor[1],
-                      b: clearColor[2],
-                      a: clearColor[3],
-                    },
-                  },
-                ],
+          colorAttachments: colorViews.map((view, index) => ({view,
+            ...(resolveTargets[index] ? {resolveTarget: resolveTargets[index]} : {}),
+            loadOp: scissoredClear ? "load" : loadOp, storeOp: "store",
+            clearValue: {r: clearColors[index][0], g: clearColors[index][1], b: clearColors[index][2], a: clearColors[index][3]},
+          })),
           ...(depthFormat
             ? {
                 depthStencilAttachment: {
@@ -3068,6 +3077,7 @@ struct Out { @location(0) color: vec4<f32>${depthFormat ? ", @builtin(frag_depth
   }
   const renderer = Object.freeze({
     format,
+    colorFormats,
     depthFormat,
     sampleCount,
     shadows,

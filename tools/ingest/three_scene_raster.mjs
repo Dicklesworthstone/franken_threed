@@ -49,7 +49,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
   }
   // Native programs need the complete pipeline state rather than the core's
   // compact material defaults. Both routes use the same blend/bias/stencil map.
-  describe.program=m=>{
+  describe.program=(m,{mrt=null,textures=null}={})=>{
     if(![three.FrontSide,three.BackSide,three.DoubleSide].includes(m.side)||!DEPTH[m.depthFunc])
       fail('MATERIAL','Unsupported native side/depth state');
     for(const key of ['transparent','depthWrite','depthTest','colorWrite'])
@@ -60,9 +60,25 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
         fail('MATERIAL',`Expected boolean ${key}`);
     const {options,values}=describe(m),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
       alpha:{operation:'add',srcFactor:'one',dstFactor:'one-minus-src-alpha'}};
-    return {...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,
+    const state={...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,
       writeMask:m.colorWrite?15:0,depthWriteEnabled:m.depthWrite,depthCompare:m.depthTest?DEPTH[m.depthFunc]:'always',
       frontFace:m.side===three.BackSide?'cw':'ccw',cullMode:m.side===three.DoubleSide?'none':'back'};
+    if(mrt&&textures){
+      // The source render context controls attachment blending; material MRT
+      // nodes override shader outputs without replacing that context.
+      state.colorBlends=textures.map(texture=>{
+        const mode=mrt.getBlendMode(texture.name);
+        if(mode.blending===three.MaterialBlending)return state.blend;
+        const mapped=describe({...m,...mode,transparent:true,premultipliedAlpha:mode.premultipliedAlpha===true});
+        return mapped.options.blend===undefined?normal:mapped.options.blend;
+      });
+      // WebGPUBackend advances this pass state for CustomBlending materials
+      // only. An auxiliary constant-factor output on any other material uses
+      // the preceding draw's constant, or the pass's initial zero value.
+      state.blendConstant=m.blending===three.CustomBlending
+        ?[m.blendColor.r,m.blendColor.g,m.blendColor.b,m.blendAlpha]:null;
+    }
+    return state;
   };
   return describe;
 }

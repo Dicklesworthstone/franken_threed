@@ -378,6 +378,56 @@ test("scissored clears follow GL: only the scissor rectangle is cleared", async 
   r.dispose();
 });
 
+test("multiple attachments retain independent clears, MSAA resolves and single-output write masks", async () => {
+  const d = deviceSpy(); Object.assign(d.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  const formats = ["rgba8unorm", "rgba16float"], colorViews = [{color: 0}, {color: 1}], resolveTargets = [{resolve: 0}, {resolve: 1}];
+  const r = await createGpuAnimationRenderer(d, {colorFormats: formats, sampleCount: 4});
+  const mesh = await r.addMesh(gpu());
+  r.render(frame([mesh], {colorView: colorViews[0], colorViews, resolveTarget: resolveTargets[0], resolveTargets,
+    clearColors: [[.25, .5, .75, 1], [-1, 2, 3, 4]]}));
+  const attachments = d.passes[0].descriptor.colorAttachments;
+  assert.deepEqual(attachments.map(value => value.view), colorViews);
+  assert.deepEqual(attachments.map(value => value.resolveTarget), resolveTargets);
+  assert.deepEqual(attachments.map(value => value.clearValue), [{r: .25, g: .5, b: .75, a: 1}, {r: -1, g: 2, b: 3, a: 4}]);
+  assert.ok(d.pipelines.every(value => value.fragment.targets.length === 2 && value.fragment.targets[1].writeMask === 0));
+  formats[1] = "r32float"; assert.deepEqual(r.colorFormats, ["rgba8unorm", "rgba16float"]);
+  await r.whenIdle(); r.dispose();
+});
+
+test("scissored MRT clears write every attachment and preserve each submitted clear version", async () => {
+  const d = deviceSpy(); Object.assign(d.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  const r = await createGpuAnimationRenderer(d, {colorFormats: ["rgba8unorm", "rgba16float"]}), colorViews = [{}, {}];
+  for (const phase of [1, 2]) r.render(frame([], {colorView: colorViews[0], colorViews,
+    clearColors: [[phase, .25, .5, 1], Float32Array.of(.75, phase, -.125, 0)], clearDepth: phase / 4, scissor: [4, 5, 6, 7]}));
+  const clears = d.passes.filter(value => value.descriptor.label.endsWith("/scissor-clear"));
+  assert.equal(clears.length, 2); assert.equal(d.submissions.length, 2);
+  for (const clear of clears) {
+    assert.deepEqual(clear.descriptor.colorAttachments.map(value => value.view), colorViews);
+    assert.ok(clear.descriptor.colorAttachments.every(value => value.loadOp === "load"));
+    assert.deepEqual(clear.scissor, [4, 5, 6, 7]);
+    assert.match(clear.draws[0].pipeline.fragment.module.code, /@location\(1\) color1/);
+    assert.ok(clear.draws[0].pipeline.fragment.targets.every(value => value.writeMask === 15));
+  }
+  const writes = d.writes.filter(value => value.buffer.label.endsWith("/scissor-clear"));
+  assert.deepEqual(writes.map(value => [...new Float32Array(value.bytes.buffer)]),
+    [[1, .25, .5, 1, .75, 1, -.125, 0, .25, 0, 0, 0], [2, .25, .5, 1, .75, 2, -.125, 0, .5, 0, 0, 0]]);
+  await r.whenIdle(); r.dispose();
+});
+
+test("MRT attachment shape and device limits reject before frame writes or submissions", async () => {
+  const d = deviceSpy(); Object.assign(d.limits, {maxColorAttachments: 2, maxColorAttachmentBytesPerSample: 16});
+  await assert.rejects(createGpuAnimationRenderer(d, {colorFormats: ["rgba8unorm", "rgba16float", "rgba8unorm"]}), code("GPU_TARGET_LIMIT"));
+  assert.equal(d.buffers.length, 0); assert.equal(d.pipelines.length, 0);
+  const r = await createGpuAnimationRenderer(d, {colorFormats: ["rgba8unorm", "rgba16float"]}), colorViews = [{}, {}];
+  const pipelines = d.pipelines.length;
+  await assert.rejects(r.addMesh(gpu(), {program: {vertex: "// ESSL", fragment: "// ESSL"}}), code("ANIMATION_RENDER_OPTIONS"));
+  assert.equal(d.pipelines.length, pipelines);
+  for (const options of [{colorViews: {}}, {colorViews: [{}]}, {colorViews, colorView: {}},
+    {colorViews, clearColors: [[0, 0, 0, 1]]}, {colorViews, resolveTargets: [{}, {}]}])
+    assert.throws(() => r.render(frame([], {colorView: null, ...options})), code("ANIMATION_RENDER_ATTACHMENT"));
+  assert.equal(d.writes.length, 0); assert.equal(d.submissions.length, 0); r.dispose();
+});
+
 test("clear-only submissions and explicit no-depth mode require no geometry", async () => {
   const d = deviceSpy(),
     r = await createGpuAnimationRenderer(d, { depthFormat: null });

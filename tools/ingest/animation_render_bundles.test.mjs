@@ -177,6 +177,10 @@ test('empty frames allocate nothing and attachment layouts are fixed per device 
     assert.equal(device.encoders[0].descriptor.depthStencilFormat,depthFormat??undefined);
     assert.equal(device.encoders[0].descriptor.sampleCount,sampleCount);
   }
+  const device=bundleDevice(),formats=['rgba8unorm','rgba16float'];
+  const cache=createAnimationRenderBundleCache(device,{...parameters(),colorFormats:formats}),pass=device.pass();
+  formats[1]='r32float'; cache.execute(pass,[draw()],1);
+  assert.deepEqual(device.encoders[0].descriptor.colorFormats,['rgba8unorm','rgba16float']);
 });
 
 test('bundle creation, finish and execution failures never publish a reusable entry or replay directly', () => {

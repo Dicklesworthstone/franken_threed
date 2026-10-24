@@ -44,6 +44,7 @@ import {createThreeProgramShadows} from './three_program_shadows.mjs';
 import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 import {withThreeCompute} from './three_compute.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
+import {inspectThreeMRT} from './three_node_passes.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
 import {assertThreeNativeTargetWrite, captureThreeShadowMaterialState} from './three_node_shadows.mjs';
 import {createThreeNodeBackgrounds} from './three_node_background.mjs';
@@ -650,6 +651,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!this._compositedAlpha()) frame.clearColor[3] = 1;
         frame.output = {toneMapping: tone, exposure: this.toneMappingExposure};
       }
+      if (target && !this._shaderEncodedOutput) {
+        const context = inspectThreeMRT(THREE, this);
+        if (context) frame.clearColors = target.textures.map((texture, index) => {
+          const color = context.mrt?.getClearColor(texture.name);
+          return color ? [color.r, color.g, color.b, color.a]
+            : index === 0 ? frame.clearColor.slice() : [0, 0, 0, 1];
+        });
+      }
       return frame;
     }
     render(scene, camera) {
@@ -691,7 +700,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true) {
-      const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace;
+      const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target) : this;
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
@@ -731,7 +740,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
       const nodeFrame = native && !nodeCaptureDeferred
-        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras}) : null;
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt}) : null;
       if (nodeFrame) matricesUpdated = true;
       // Native callbacks retain the original camera in _captureNodeFrame.
       // Fixed draws can wait on pipeline/texture preparation; capture their
@@ -740,7 +749,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!matricesUpdated) this._updateNativeMatrices(scene, camera);
         camera = captureThreeCamera(THREE, camera); matricesUpdated = true;
       }
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial,
+      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
         nodeCaptureDeferred, captureCameras, backgroundState,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
@@ -759,17 +768,24 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const request = this._makeRequest(scene, camera, clearOnly);
       return this._dispatchRequest(request);
     }
-    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras}) {
+    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let raster = this._nodeRaster.get(stencilAttachment);
       if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
       const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
-      const captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh,
-        getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
-        getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
-        maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
-        maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
+      // Pre-init requests can be captured after a PassNode restored the public
+      // renderer state. Build and update against that request's source context.
+      const previousTarget = this._renderTarget, previousMRT = this._mrt;
+      let captured;
+      try {
+        this._renderTarget = target; this._mrt = mrt;
+        captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh,
+          getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
+          getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
+          maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
+          maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
+      } finally { this._renderTarget = previousTarget; this._mrt = previousMRT; }
       if (captured) this._nodeCaptureBytes += captured.bytes;
       return captured;
     }

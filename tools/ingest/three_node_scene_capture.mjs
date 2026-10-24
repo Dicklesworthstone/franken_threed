@@ -71,7 +71,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
           hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
-  const nativeMaterial = material => nativeShadowScene ? material != null : hasThreeNodeProgram(material);
+  const mrt = destination ? renderer?.getMRT?.() ?? null : null;
+  const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
+  const nativeMaterial = material => nativeShadowScene || nativeMRTScene ? material != null : hasThreeNodeProgram(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -267,7 +269,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // Retain the selected private generated streams now. A later graph can
     // retire its compiler entry while this accepted render is still queued.
     binding.programGeometry = programs.geometry?.(binding.nodeProgram) ?? binding.geometry;
-    binding.raster = raster(binding.material);
+    binding.raster = raster(binding.material, {mrt, textures: destination?.textures ?? null});
     if (shadowPass) binding.shadowState = Object.freeze(captureThreeShadowMaterialState(binding.material));
     Object.freeze(binding);
     if (programs.textures(binding.nodeProgram).length) {

@@ -15,7 +15,8 @@
  * native material composition. The registered SunLight cascade lifecycle
  * retain source shadow nodes and ShadowMaterial receivers. Single-output source
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
- * Transmission, writable/atomic storage, VSM shadows, clipping and MRT fail explicitly.
+ * Named MRT outputs share native attachments and retain source graph construction.
+ * Transmission, writable/atomic storage, VSM shadows and clipping fail explicitly.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -23,7 +24,7 @@
  */
 import {createThreeNodeAttributes} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
-import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass} from './three_node_passes.mjs';
+import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -32,7 +33,7 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode']);
@@ -647,8 +648,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !(key === 'contextNode' && pipelineContext !== null))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
-    if (renderer.getMRT?.() != null) fail('MRT', 'Native node graphs currently write one color attachment');
-    const seen = new Set(), stack = GRAPH_SLOTS.map(key => material[key]).filter(Boolean);
+    const mrt = inspectThreeMRT(three, renderer, material);
+    const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => material[key]).filter(Boolean), ...(mrt?.nodes ?? [])];
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
@@ -718,7 +719,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
     }
-    if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
+    if (node.isOutputStructNode && Object.getPrototypeOf(node) !== three.OutputStructNode.prototype &&
+        Object.getPrototypeOf(node) !== three.MRTNode.prototype)
+      fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
   function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -730,6 +733,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
+      inspectThreeMRT(three, renderer, material)?.key ?? null,
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
@@ -754,6 +758,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object);
     const fogKey = fogSignature(preparedMaterial, context);
+    const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
@@ -783,6 +788,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertInstances(object, instanceSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
+    if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
+      fail('CHANGED', 'Native MRT context changed during source graph construction');
     if (fogSignature(material, context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
@@ -869,7 +876,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     });
     const vertex = builder.vertexShader, fragment = builder.fragmentShader, bytes = 2 * (vertex.length + fragment.length);
     if (bytes > maxShaderBytes - shaderBytes + (previous?.bytes ?? 0)) fail('LIMIT', 'Native node shader byte budget exceeded');
-    const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment,
+    const outputStruct = builder.structs.fragment.find(struct => struct.output === true);
+    const colorCount = outputStruct?.members.length ?? 1;
+    if (colorCount > (renderer.getRenderTarget?.()?.textures.length ?? 1))
+      fail('MRT', 'Native fragment outputs exceed the current color attachments');
+    const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment, colorCount,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
     // Node.build() deduplicates unsized storage by attribute before addNode().
@@ -907,7 +918,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
-      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, pmremNodes, pmremSignature: pmremKey,
+      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
@@ -1056,6 +1067,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkPipelineContext(state, object = state.object) {
     if (inspectThreePipelineContext(three, renderer, state.material, object) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
+    if ((inspectThreeMRT(three, renderer, state.material)?.key ?? null) !== state.mrtSignature)
+      fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
   }
   function checkFog(state, context) {
     if (fogSignature(state.material, {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)

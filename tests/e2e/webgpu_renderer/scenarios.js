@@ -12,6 +12,7 @@ import { nativeSkinningScenarios } from './scenarios_native_skinning.js';
 import { nativePipelineScenarios } from './scenarios_native_pipeline.js';
 import { nativeMorphScenarios } from './scenarios_native_morph.js';
 import { nativeFogScenarios } from './scenarios_native_fog.js';
+import { nativeMRTScenarios } from './scenarios_native_mrt.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
@@ -19,6 +20,7 @@ export const scenarios = {
   ...nativePipelineScenarios,
   ...nativeMorphScenarios,
   ...nativeFogScenarios,
+  ...nativeMRTScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

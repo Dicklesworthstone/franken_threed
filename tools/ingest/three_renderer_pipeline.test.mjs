@@ -18,7 +18,8 @@ const textures = draw => [...draw.groups.values()].flatMap(({group}) => group.en
 
 function fixture(t, options = {}) {
   const device = geometryDevice();
-  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
+  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000,
+    maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
   device.textures = []; device.textureWrites = [];
   device.createTexture = descriptor => {
     const texture = {dimension: '2d', sampleCount: 1, ...descriptor,
@@ -234,9 +235,79 @@ test('throwing pass capture restores source scene, camera and renderer state', a
   assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.device.submissions.length, 0);
 });
 
-test('unimplemented pass MRT, history and custom context fail before child updates', async t => {
-  for (const configure of [pass => pass.setMRT(N.mrt({output: N.vec4(1)})),
-    pass => pass.getPreviousTexture('output'), pass => { pass.contextNode = N.context({getUV: () => N.uv()}); }]) {
+for (const antialias of [false, true]) test(`named MRT passes preserve attachment sampling, clears and blend state (${antialias ? 4 : 1} samples)`, async t => {
+  const f = fixture(t, {antialias}); await f.renderer.init();
+  f.material.transparent = true; f.material.opacity = .5; f.material.premultipliedAlpha = true;
+  f.material.mrtNode = N.mrt({normal: N.vec4(.2, .4, .6, 1)});
+  const pass = N.pass(f.scene, f.camera), normal = pass.getTextureNode('normal');
+  const mrt = N.mrt({normal: N.normalView, output: N.output, unused: N.vec4(100)});
+  mrt.setClearColor('normal', new T.Color(.25, .5, .75), .5);
+  // An explicit BlendMode has its own alpha convention; it must not inherit
+  // the material's premultiplication from the primary attachment.
+  mrt.setBlendMode('normal', new T.BlendMode(T.NormalBlending)); pass.setMRT(mrt);
+  const pipeline = new T.RenderPipeline(f.renderer, N.vec4(pass.getTextureNode().rgb.add(normal.rgb), 1));
+  pipeline.render();
+  mrt.setClearColor('normal', new T.Color(.75, .25, .5), .25);
+  f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  await drain(f.renderer); await f.renderer.waitForGPU();
+  const scenes = commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')));
+  assert.equal(scenes.length, 2);
+  assert.deepEqual(scenes.map(p => p.desc.colorAttachments[1].clearValue),
+    [{r: .25, g: .5, b: .75, a: .5}, {r: .75, g: .25, b: .5, a: .25}]);
+  for (const p of scenes) {
+    const draw = p.draws.find(draw => shader(draw).includes('pipelineSceneColor'));
+    assert.equal(p.desc.colorAttachments.length, 2);
+    assert.equal(draw.pipeline.fragment.targets.length, 2);
+    assert.equal(draw.pipeline.fragment.targets[0].blend.color.srcFactor, 'one');
+    assert.equal(draw.pipeline.fragment.targets[1].blend.color.srcFactor, 'src-alpha');
+    for (const attachment of p.desc.colorAttachments) {
+      assert.equal(attachment.view.texture.sampleCount, antialias ? 4 : 1);
+      if (antialias) assert.equal(attachment.resolveTarget.texture.sampleCount, 1);
+    }
+  }
+  const sampled = textures(nativeDraws(f.device).at(-1)).map(view => view.texture);
+  for (const attachment of scenes.at(-1).desc.colorAttachments)
+    assert.ok(sampled.includes((attachment.resolveTarget ?? attachment.view).texture));
+  assert.equal(f.renderer.getMRT(), null); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('MRT auxiliary constant factors preserve source pass state across materials', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const second = f.mesh.clone(); second.material = f.material.clone();
+  second.material.colorNode = N.uniform(new T.Color(.5, .25, .125)).setName('secondMRTColor');
+  second.renderOrder = 1; f.scene.add(second);
+  f.material.blending = T.CustomBlending; f.material.blendColor.setRGB(.25, .5, .75); f.material.blendAlpha = .5;
+  second.material.blendColor.setRGB(.75, .25, .5); second.material.blendAlpha = .25;
+  const auxiliary = new T.BlendMode(T.CustomBlending);
+  auxiliary.blendSrc = T.ConstantColorFactor; auxiliary.blendDst = T.OneMinusConstantColorFactor;
+  auxiliary.blendSrcAlpha = T.ConstantAlphaFactor; auxiliary.blendDstAlpha = T.OneMinusConstantAlphaFactor;
+  const pass = N.pass(f.scene, f.camera), normal = pass.getTextureNode('normal');
+  pass.setMRT(N.mrt({output: N.output, normal: N.normalView}).setBlendMode('normal', auxiliary));
+  const pipeline = new T.RenderPipeline(f.renderer, N.vec4(pass.getTextureNode().rgb.add(normal.rgb), 1));
+  pipeline.render(); await drain(f.renderer);
+  const draws = nativeDraws(f.device).filter(draw => draw.pipeline.fragment.targets.length === 2);
+  assert.equal(draws.length, 2);
+  assert.deepEqual(draws.map(draw => draw.blendConstant), [[.25, .5, .75, .5], [.25, .5, .75, .5]]);
+  assert.equal(draws[1].pipeline.fragment.targets[1].blend.color.srcFactor, 'constant');
+});
+
+test('deferred MRT capture retains its target and output context after public state restoration', async t => {
+  const f = fixture(t), target = new T.RenderTarget(64, 48, {count: 2, type: T.HalfFloatType});
+  target.textures[0].name = 'output'; target.textures[1].name = 'normal';
+  const mrt = N.mrt({output: N.output, normal: N.normalView});
+  f.renderer.setRenderTarget(target); f.renderer.setMRT(mrt);
+  const accepted = f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); f.renderer.setMRT(null);
+  await accepted; await f.renderer.waitForGPU();
+  const draw = nativeDraws(f.device).find(draw => shader(draw).includes('pipelineSceneColor'));
+  assert.equal(draw.pipeline.fragment.targets.length, 2); assert.match(shader(draw), /output\.m1/);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getMRT(), null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('unimplemented pass history and custom context fail before child updates', async t => {
+  for (const configure of [pass => pass.getPreviousTexture('output'), pass => { pass.contextNode = N.context({getUV: () => N.uv()}); }]) {
     const f = fixture(t); await f.renderer.init(); let updates = 0;
     f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(1, 0, 0); });
     const pass = N.pass(f.scene, f.camera); configure(pass);

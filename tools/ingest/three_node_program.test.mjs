@@ -1289,12 +1289,84 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
   assert.throws(() => f.owner.capture(f.compile(), f.context), e => e === failure); assert.equal(nested, true);
   assert.deepEqual(Object.fromEntries(Object.keys(initial).map(k => [k, f.frame[k]])), initial);
 });
+function mrtRig(t) {
+  const f = rig(t), target = new THREE.RenderTarget(16, 16, {count: 2});
+  target.textures[0].name = 'output'; target.textures[1].name = 'normal';
+  const auxiliary = N.uniform(.25).setName('mrtAuxiliary');
+  const state = {target, mrt: N.mrt({output: N.output, normal: N.vec4(auxiliary, 0, 0, 1),
+    renamed: N.vec4(0, auxiliary, 0, 1)})};
+  f.renderer.getRenderTarget = () => state.target; f.renderer.getMRT = () => state.mrt;
+  return {...f, target, auxiliary, state};
+}
+function sourceMRTBuilder(f) {
+  const builder = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  builder.scene = f.scene; builder.camera = f.camera; builder.build(); return builder;
+}
+test('named MRT outputs preserve source attachment ordering and material override construction', t => {
+  const f = mrtRig(t); f.target.textures.reverse();
+  const override = N.uniform(.625).setName('mrtOverride');
+  f.material.mrtNode = N.mrt({normal: N.vec4(override, 0, 1, 1)});
+  const d = f.compile(), source = sourceMRTBuilder(f);
+  assert.equal(d.vertex, source.vertexShader); assert.equal(d.fragment, source.fragmentShader);
+  assert.equal(d.colorCount, 2);
+  assert.match(d.fragment, /@location\( 0 \) m0/); assert.match(d.fragment, /@location\( 1 \) m1/);
+  const output = /(\w+) = vec4<f32>\( object\.mrtOverride/.exec(d.fragment);
+  assert.ok(output); assert.match(d.fragment, new RegExp(`output\\.m0 = ${output[1]};`));
+  assert.doesNotMatch(d.fragment, /mrtAuxiliary/);
+  const first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  override.value = .875;
+  assert.equal(f.compile(), d);
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.ok(floats(first).includes(.625)); assert.ok(floats(second).includes(.875)); assert.deepEqual(first, saved);
+});
+test('MRT graph keys retain uniform and clear values but invalidate attachment and graph structure before callbacks', t => {
+  const f = mrtRig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color(.25, .5, .75)).onObjectUpdate(() => { updates++; });
+  let d = f.compile();
+  f.auxiliary.value = .75; f.state.mrt.setClearColor('normal', 0x123456, .25);
+  assert.equal(f.compile(), d); f.owner.capture(d, f.context);
+  for (const change of [
+    () => { f.target.textures.reverse(); },
+    () => { f.target.textures[0].name = 'renamed'; },
+    () => { f.target.textures[1].type = THREE.HalfFloatType; },
+    () => { f.state.mrt = N.mrt({...f.state.mrt.outputNodes}); },
+    () => { f.state.mrt.outputNodes.renamed = N.vec4(.125, .25, .5, 1); f.state.mrt.needsUpdate = true; },
+    () => { f.material.mrtNode = N.mrt({renamed: N.vec4(.5, .25, .125, 1)}); },
+  ]) {
+    change(); const before = updates;
+    assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(updates, before);
+    const next = f.compile(); assert.notEqual(next, d); d = next;
+    assert.equal(d.fragment, sourceMRTBuilder(f).fragmentShader); assert.equal(d.colorCount, 2);
+    f.owner.captureDraw(d, {...f.context, renderId: updates + 2});
+  }
+});
+test('MRT attachment mutations during source updates cannot submit a stale output mapping', t => {
+  const f = mrtRig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; f.target.textures.reverse(); });
+  const d = f.compile();
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 1);
+});
+test('explicit output structs retain all source fragment locations and bypass global MRT output selection', t => {
+  const f = mrtRig(t); f.material.fragmentNode = N.outputStruct(N.vec4(.125, .25, .5, 1), N.vec4(.75, .5, .25, 1));
+  const d = f.compile(), source = sourceMRTBuilder(f);
+  assert.equal(d.vertex, source.vertexShader); assert.equal(d.fragment, source.fragmentShader); assert.equal(d.colorCount, 2);
+  assert.doesNotMatch(d.fragment, /mrtAuxiliary/); f.owner.captureDraw(d, f.context);
+});
+test('renderer MRT context has no effect on the source canvas output', t => {
+  const f = mrtRig(t); f.state.target = null;
+  const d = f.compile(), source = sourceMRTBuilder(f);
+  assert.equal(d.fragment, source.fragmentShader); assert.equal(d.colorCount, 1);
+  f.state.mrt = N.mrt({output: N.vec4(.875)});
+  assert.equal(f.compile(), d); f.owner.captureDraw(d, f.context);
+});
 for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
   ['compute-backed buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.StorageBufferAttribute(4, 3)); }, 'ATTRIBUTE'],
   ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],
-  ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],
+  ['output struct exceeding canvas attachments', f => { f.material.fragmentNode = N.outputStruct(N.vec4(1), N.vec4(.5)); }, 'MRT'],
   ['lighting slot', f => { f.material.lightsNode = N.vec3(1); }, 'GRAPH'],
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
   ['custom renderer context', f => { f.renderer.contextNode = N.context({getOutput: output => output}); }, 'GRAPH'],

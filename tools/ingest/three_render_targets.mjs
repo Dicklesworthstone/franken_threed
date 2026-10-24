@@ -10,6 +10,9 @@
  * UV-oriented r32float image: no color conversion or half-float quantization.
  * Native node/compute inputs borrow the depth attachment directly, with distinct
  * ordinary and comparison samplers captured for each accepted use.
+ * Native MRT inputs retain each ordered source color attachment, format and
+ * sampler. All colors share the depth, budget and generation lifetime; the
+ * WebGL UV replica continues to cover the primary color only.
  * Native point shadows use six square cube faces. Rendering selects one face,
  * while native depth sampling borrows all six layers without a UV replica.
  * Cube targets currently admit one sample and mip zero; their transfers,
@@ -28,7 +31,7 @@
  * These explicit owner operations do not enqueue the public renderer's FIFO.
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
-import {createGpuRenderTarget} from './gpu_render_target.mjs';
+import * as gpuTargets from './gpu_render_target.mjs';
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 
@@ -60,15 +63,14 @@ function depthComparison(texture, three) {
   return compare;
 }
 
-export function inspectThreeRenderTarget(target, three) {
+function inspectThreeRenderTargetColor(target, three, texture) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   if (!positive(target.width) || !positive(target.height)) fail('SIZE', 'Target dimensions must be positive integers');
   const cube = target.isCubeRenderTarget === true;
-  if (target.isWebGLCubeRenderTarget || target.depth !== 1 || target.multiview || target.textures?.length !== 1)
-    fail('UNSUPPORTED', 'Only single-color 2D or native cube render targets are admitted');
+  if (target.isWebGLCubeRenderTarget || target.depth !== 1 || target.multiview)
+    fail('UNSUPPORTED', 'Only 2D or native cube render targets are admitted');
   if (cube && (typeof three.CubeRenderTarget !== 'function' || !(target instanceof three.CubeRenderTarget)))
     fail('SOURCE', 'Expected a source CubeRenderTarget');
-  const texture = target.texture;
   if (!(texture instanceof three.Texture) || texture.isDataArrayTexture || texture.isData3DTexture || texture.isRenderTargetTexture !== true)
     fail('SOURCE', 'Expected the target-owned color texture');
   if (cube) {
@@ -167,6 +169,20 @@ export function inspectThreeRenderTarget(target, three) {
     key: `${cube ? 'cube/' : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}/${mipLevelCount}`};
 }
 
+export function inspectThreeRenderTarget(target, three) {
+  if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
+  if (!Array.isArray(target.textures) || !target.textures.length || target.textures.length > 8 ||
+      new Set(target.textures).size !== target.textures.length || target.texture !== target.textures[0])
+    fail('SOURCE', 'Expected one to eight distinct target-owned color attachments');
+  const colors = target.textures.map(texture => inspectThreeRenderTargetColor(target, three, texture)), primary = colors[0];
+  if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1)))
+    fail('UNSUPPORTED', 'Multiple color attachments currently require 2D mip-zero targets');
+  const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes * (color.sampleCount === 4 ? 5 : 1), 0);
+  if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
+  return {...primary, colors, textures: colors.map(color => color.texture), colorFormats: colors.map(color => color.format), bytes,
+    key: colors.map(color => color.key).join('|')};
+}
+
 /** Validate a destination before any GPU allocation or queued submission. */
 export function inspectThreeRenderTargetMip(shape, mipLevel = 0, face = 0) {
   if (!Number.isSafeInteger(face) || face < 0 || face >= (shape.cube ? 6 : 1))
@@ -251,7 +267,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.alive = false;
     entry.lifetime.abort(new ThreeRenderTargetError('STALE', 'Source render target disposed or replaced'));
     entry.target.removeEventListener('dispose', entry.onDispose);
-    entry.shape.texture.removeEventListener('dispose', entry.onDispose);
+    for (const texture of entry.shape.textures) texture.removeEventListener('dispose', entry.onDispose);
     entry.shape.depthTexture?.removeEventListener('dispose', entry.onDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
     preserved.delete(entry);
@@ -270,14 +286,16 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     }).finally(() => { retiring.delete(task); entry.retirement = null; });
     entry.retirement = task; retiring.add(task);
   }
-  const sameShape = (a, b) => a.key === b.key && a.texture === b.texture && a.depthTexture === b.depthTexture;
+  const sameColors = (a, b) => a.textures.length === b.textures.length && a.textures.every((texture, index) =>
+    texture === b.textures[index] && a.colorFormats[index] === b.colorFormats[index]);
+  const sameShape = (a, b) => a.key === b.key && sameColors(a, b) && a.depthTexture === b.depthTexture;
   function sourceDisposed(entry, event) {
     const resize = nativeResizes.get(entry.target);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
         entry.target.width === resize.width && entry.target.height === resize.height && entry.target.depth === resize.depth) {
       const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
-      if (shape.texture === entry.shape.texture && shape.depthTexture === entry.shape.depthTexture &&
-          shape.format === entry.shape.format && shape.depthFormat === entry.shape.depthFormat &&
+      if (sameColors(shape, entry.shape) && shape.depthTexture === entry.shape.depthTexture &&
+          shape.depthFormat === entry.shape.depthFormat &&
           shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
         resize.event = event;
         // Capture leases can end before submitted GPU validation/fence
@@ -303,8 +321,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function capture(target) {
     live();
     const shape = inspectThreeRenderTarget(target, three);
+    const device = getDevice();
+    if (device && shape.textures.length > 1) gpuTargets.inspectGpuRenderTargetColors(device, shape.colorFormats);
     let entry = entries.get(target);
-    if (entry && (entry.shape.key !== shape.key || entry.shape.texture !== shape.texture || entry.shape.depthTexture !== shape.depthTexture)) { retire(entry); entry = null; }
+    if (entry && !sameShape(entry.shape, shape)) { retire(entry); entry = null; }
     if (entry) return entry;
     if (entries.size + preserved.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
@@ -312,7 +332,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
-    shape.texture.addEventListener('dispose', entry.onDispose);
+    for (const texture of shape.textures) texture.addEventListener('dispose', entry.onDispose);
     shape.depthTexture?.addEventListener('dispose', entry.onDispose);
     entries.set(target, entry);
     return entry;
@@ -337,8 +357,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     budget(entry.shape.bytes);
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
-    const {width, height, format, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube} = entry.shape;
-    entry.storage = createGpuRenderTarget(device, {width, height, format, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
+    const {width, height, format, colorFormats, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube} = entry.shape;
+    entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
       sampleDepth: entry.shape.depthTexture !== null, copyDestination: !cube, cube});
     entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     // The readback helper consumes this session-shaped object. It copies the
@@ -369,8 +389,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function colorSampler(entry, texture) {
     const device = getDevice();
-    const filterable = !entry.shape.float32 || device.features?.has?.('float32-filterable') === true;
-    const descriptor = samplerDescriptor(texture, three, entry.shape.mipLevelCount);
+    const shape = entry.shape.colors[entry.shape.textures.indexOf(texture)];
+    if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
+    const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
+    const descriptor = samplerDescriptor(texture, three, shape.mipLevelCount);
     if (!filterable) {
       if (texture.magFilter !== three.NearestFilter ||
           (texture.minFilter !== three.NearestFilter && texture.minFilter !== three.NearestMipmapNearestFilter))
@@ -530,7 +552,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (texture.renderTarget === destination) fail('FEEDBACK', 'A render pass cannot sample its own color or depth target');
         const entry = capture(texture.renderTarget);
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
-        if (entry.shape.texture !== texture) fail('STALE', 'Texture no longer belongs to its source target');
+        if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
+        if (entry.shape.texture !== texture) fail('UNSUPPORTED', 'Additional MRT attachments require native texture bindings');
         return sampling(entry, texture);
       }
     }();
@@ -583,8 +606,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (!targetTexture(texture))
         fail('SOURCE', 'Expected a target-owned color or depth texture for native sampling');
       const entry = capture(texture.renderTarget), device = getDevice();
-      const depth = texture.isDepthTexture === true;
-      if ((depth ? entry.shape.depthTexture : entry.shape.texture) !== texture)
+      const depth = texture.isDepthTexture === true, colorIndex = depth ? -1 : entry.shape.textures.indexOf(texture);
+      if (depth ? entry.shape.depthTexture !== texture : colorIndex < 0)
         fail('STALE', 'Texture no longer belongs to its source target');
       if (entry.shape.cube && !depth) fail('UNSUPPORTED', 'Cube target color sampling is not admitted');
       if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
@@ -601,7 +624,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           ...(comparison ? {compare: depthComparison(texture, three)} : {magFilter: 'nearest', minFilter: 'nearest'})}, sampleType: 'depth'}
         : colorSampler(entry, texture);
       const samples = entry.shape.sampleCount;
-      return Object.freeze({entry, texture, device, depth, sampler: Object.freeze(descriptor), sampleType, viewDimension: entry.shape.viewDimension,
+      return Object.freeze({entry, texture, device, depth, colorIndex, sampler: Object.freeze(descriptor), sampleType, viewDimension: entry.shape.viewDimension,
         // r186 resolves color into its primary image. Depth retains every
         // sample and the source builder selects its own textureLoad index.
         sampleData: Object.freeze({samples, primarySamples: depth ? samples : 1, isMSAA: !depth && samples > 1})});
@@ -612,7 +635,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       for (const source of sources) {
         const {entry, texture, device} = source;
         assertCurrent(entry);
-        if ((source.depth ? entry.shape.depthTexture : entry.shape.texture) !== texture)
+        if ((source.depth ? entry.shape.depthTexture : entry.shape.textures[source.colorIndex]) !== texture)
           fail('STALE', 'Native texture no longer belongs to its captured target');
         if (device !== getDevice() || entry.session && entry.session.device !== device)
           fail('DEVICE', 'Captured native target belongs to another GPUDevice');
@@ -637,15 +660,16 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const color = sources.some(source => !source.depth), depth = sources.some(source => source.depth);
       ensure(entry);
       if (entry.session.device !== device) fail('DEVICE', 'Native target storage belongs to another GPUDevice');
-      const invoke = (nativeColor, nativeDepth) => {
-        const textures = new Map(sources.map(source => [source.texture, source.depth ? nativeDepth : nativeColor]));
+      const invoke = (nativeColors, nativeDepth) => {
+        const textures = new Map(sources.map(source => [source.texture, source.depth ? nativeDepth : nativeColors[source.colorIndex]]));
         const result = callback(textures); assertCurrent(entry); return result;
       };
       entry.busy = true;
       try {
-        if (color && depth) return entry.storage.withSampledTextures(invoke);
+        if (entry.shape.textures.length > 1) return entry.storage.withAttachments(invoke);
+        if (color && depth) return entry.storage.withSampledTextures((native, nativeDepth) => invoke([native], nativeDepth));
         if (depth) return entry.storage.withDepthTexture(native => invoke(null, native));
-        return entry.storage.withTexture(native => invoke(native, null));
+        return entry.storage.withTexture(native => invoke([native], null));
       } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
     },
     writePixels(entry, data, options = {}) {

@@ -149,7 +149,7 @@ function matches(recorded, commands, length, lightGroup, start) {
  * Failed recording/execution never inserts an entry or retries the draw directly.
  */
 export function createAnimationRenderBundleCache(device, {
-  format, depthFormat, sampleCount, bindGroup, stride, instancing = false,
+  format, colorFormats = format === null ? [] : [format], depthFormat, sampleCount, bindGroup, stride, instancing = false,
   maxBundles = 4, maxDraws = 1024, label = 'f3d-draw-bundle',
 }) {
   if (typeof device?.createRenderBundleEncoder !== 'function')
@@ -157,7 +157,7 @@ export function createAnimationRenderBundleCache(device, {
   if (!Number.isSafeInteger(maxBundles) || maxBundles < 1 || maxBundles > 64 ||
       !Number.isSafeInteger(maxDraws) || maxDraws < 1 || maxDraws > 65536)
     throw new RangeError('Invalid render bundle cache capacity');
-  const descriptor = {label, colorFormats: format === null ? [] : [format], sampleCount,
+  const descriptor = {label, colorFormats: colorFormats.slice(), sampleCount,
     ...(depthFormat === null ? {} : {depthStencilFormat: depthFormat}),
     depthReadOnly: false, stencilReadOnly: !hasAnimationStencil(depthFormat)};
   let entries = [], disposed = false;

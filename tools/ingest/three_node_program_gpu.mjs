@@ -15,9 +15,10 @@
 import {programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {createProgramUniformArena} from './animation_program_uniforms.mjs';
 import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
-import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.mjs';
+import {hasAnimationStencil, snapshotAnimationRaster, snapshotAnimationBlendConstant} from './animation_raster.mjs';
+import {inspectGpuRenderTargetColors} from './gpu_render_target.mjs';
 
-export function createThreeNodeProgramMeshes({device, format, depthFormat, sampleCount, maxDraws,
+export function createThreeNodeProgramMeshes({device, format, colorFormats = format === null ? [] : [format], depthFormat, sampleCount, maxDraws,
   label, fail, scoped, lost = device.lost, maxUniformBytes = 64 * 1024 * 1024, maxBindGroups = 4}) {
   const limit = message => fail('ANIMATION_RENDER_LIMIT', message);
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || maxDraws > 65536 ||
@@ -28,8 +29,12 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
   const arenas = new Map(), records = new Set(), resourceGroups = new Map(), resourceIds = new WeakMap();
   const maxResourceGroups = maxDraws * maxBindGroups;
   let pendingGroups = [], stagedDraws = 0, nextResourceId = 0;
-  const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
-    message => fail('ANIMATION_RENDER_OPTIONS', message));
+  if (!Array.isArray(colorFormats) || (colorFormats[0] ?? null) !== format)
+    fail('ANIMATION_RENDER_OPTIONS', 'Native attachment formats must retain their primary format');
+  colorFormats = Object.freeze(colorFormats.slice());
+  if (colorFormats.length > 1) inspectGpuRenderTargetColors(device, colorFormats);
+  const colorTargets = colorFormats.map(format => createAnimationColorTargetProfile(device, {format, sampleCount},
+    message => fail('ANIMATION_RENDER_OPTIONS', message)));
   let stoppedError = null, rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   function error(code, message) { try { fail(code, message); } catch (value) { return value; } }
@@ -214,15 +219,30 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       if (groups.reduce((count, group) => count + group.entries.filter(entry => matches(entry) && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
         limit(`Native node bindings exceed ${name}`);
     const vertex = nodeProgram.vertex, fragment = nodeProgram.fragment;
+    const colorCount = nodeProgram.colorCount ?? 1;
+    if (!Number.isSafeInteger(colorCount) || colorCount < 1 || colorCount > Math.max(1, colorFormats.length))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native fragment outputs exceed the active color attachment layout');
     if (!raster || !['ccw', 'cw'].includes(raster.frontFace) || !['none', 'front', 'back'].includes(raster.cullMode) ||
         !Number.isSafeInteger(raster.writeMask) || raster.writeMask < 0 || raster.writeMask > 15 ||
         (depthFormat && (typeof raster.depthWriteEnabled !== 'boolean' ||
           !['never', 'less', 'equal', 'less-equal', 'greater', 'not-equal', 'greater-equal', 'always'].includes(raster.depthCompare))))
       fail('ANIMATION_RENDER_OPTIONS', 'Invalid native node graphics raster state');
+    if (raster.colorBlends !== undefined && (!Array.isArray(raster.colorBlends) || raster.colorBlends.length !== colorFormats.length))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native blend states must match the color attachment layout');
+    const colorStates = colorFormats.map((format, index) => {
+      const blend = index >= colorCount ? null : raster.colorBlends === undefined ? raster.blend : raster.colorBlends[index];
+      const state = snapshotAnimationRaster({...raster, blend, blendConstant: undefined}, {format, depthFormat});
+      colorTargets[index].assertBlend(state.blend);
+      return state;
+    });
+    const usesConstant = colorStates.some(state => state.usesConstant);
+    const blendConstant = raster.colorBlends !== undefined && raster.blendConstant !== undefined
+      ? raster.blendConstant === null ? null : snapshotAnimationBlendConstant(raster.blendConstant)
+      : usesConstant ? snapshotAnimationBlendConstant(raster.blendConstant ?? [0, 0, 0, 0]) : null;
     const state = Object.freeze({frontFace: raster.frontFace, cullMode: raster.cullMode, writeMask: raster.writeMask,
       depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
-      ...snapshotAnimationRaster(raster, {format, depthFormat})});
-    colorTarget.assertBlend(state.blend);
+      ...snapshotAnimationRaster({...raster, blendConstant: undefined}, {format, depthFormat}), usesConstant,
+      blendConstant});
     const geometry = programGeometrySnapshot(gpu, device);
     if (geometry.channels.missing.length || geometry.instanced)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete attributes on ordinary BufferGeometry');
@@ -243,8 +263,9 @@ export function createThreeNodeProgramMeshes({device, format, depthFormat, sampl
       const stencil = hasAnimationStencil(depthFormat) ? state.stencil : {};
       const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
         vertex: {module: vertexModule, entryPoint: 'main', buffers: layouts},
-        fragment: {module: fragmentModule, entryPoint: 'main', targets: format === null ? [] : [{format,
-          ...(state.blend ? {blend: state.blend} : {}), writeMask: state.writeMask}]},
+        fragment: {module: fragmentModule, entryPoint: 'main', targets: colorFormats.map((format, index) => ({format,
+          ...(colorStates[index].blend ? {blend: colorStates[index].blend} : {}),
+          writeMask: index < colorCount ? state.writeMask : 0}))},
         primitive: {topology: 'triangle-list', cullMode: state.cullMode, frontFace},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
           depthCompare: state.depthCompare, ...state.bias,
