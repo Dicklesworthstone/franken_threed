@@ -6,6 +6,7 @@
 import {hasThreeNodeProgram, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture} from './three_node_shadows.mjs';
+import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const integer = value => Number.isSafeInteger(value) && value >= 0;
@@ -73,7 +74,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
-  const nativeMaterial = material => nativeShadowScene || nativeMRTScene ? material != null : hasThreeNodeProgram(material);
+  const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
+    object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
+  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene ? material != null : hasThreeNodeProgram(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -171,10 +174,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     renderId: renderer.info.calls};
   const programs = getPrograms(), context = {scene: root, camera, lights: Object.freeze([]),
     lightingEnabled: renderer.lighting?.enabled !== false};
-  const withBinding = (binding, run) => shadowPass
-    ? withThreeShadowMaterial(three, renderer, binding.material, binding.original, material => {
-      material.side = binding.shadowSide; return run();
-    }) : run();
+  const withBinding = (binding, run) => {
+    const previous = context.clippingContext;
+    context.clippingContext = binding.clippingContext ?? null;
+    try {
+      return shadowPass ? withThreeShadowMaterial(three, renderer, binding.material, binding.original, material => {
+        material.side = binding.shadowSide; return run();
+      }) : run();
+    } finally { context.clippingContext = previous; }
+  };
   // Every active binding is admitted before graph construction or application
   // draw updates. Previously hidden graphs are re-admitted on their first live
   // call, so a refusal cannot follow partial visible draw callbacks.
@@ -185,6 +193,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
     camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
   }
+  const clippingContexts = nativeClippingScene ? captureThreeNodeClipping(three, {root, camera, hierarchy, visibility,
+    shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, fail}) : null;
+  for (const binding of bindings) binding.clippingContext = clippingContexts?.get(binding.object) ?? null;
   const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [], preparationBindings = new Set();
   let fixedDrawCandidates = false;
   {
@@ -296,7 +307,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const captureDraw = draw => {
       draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
       draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
-      const updateContext = {...frameContext, object: draw.object, material: draw.material};
+      const updateContext = {...frameContext, object: draw.object, material: draw.material,
+        clippingContext: draw.binding.clippingContext};
       // ShadowNode recursively renders here. Keep the complete source before
       // sequence outside this draw's resource transaction, without hoisting it
       // ahead of the preceding draw or replaying false-returning callbacks.
@@ -310,7 +322,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
       // target leases hold generation metadata and observe contents in the FIFO.
       draw.nodeTextures = Object.freeze(captured.textures.map(binding => {
-        if (destination && binding.texture.renderTarget === destination)
+        if (destination && (destination.textures.includes(binding.texture) || destination.depthTexture === binding.texture))
           fail('FEEDBACK', 'A native draw cannot sample its own render target');
         const lease = textureOwner.captureBinding(binding);
         textureUses.push(lease);

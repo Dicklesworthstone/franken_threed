@@ -66,7 +66,7 @@ class TextureNode extends Node {
   isSampleCompare() { return false; }
 }
 class Material extends Events {
-  constructor() { super(); this.isMaterial = true; this.version = 0; this.lights = false; this.fog = false; }
+  constructor() { super(); this.isMaterial = true; this.version = 0; this.lights = false; this.fog = false; this.alphaToCoverage = false; }
   onBeforeCompile() {}
   onBeforeRender() {}
   customProgramCacheKey() { return 'fixture'; }

@@ -52,7 +52,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
   describe.program=(m,{mrt=null,textures=null}={})=>{
     if(![three.FrontSide,three.BackSide,three.DoubleSide].includes(m.side)||!DEPTH[m.depthFunc])
       fail('MATERIAL','Unsupported native side/depth state');
-    for(const key of ['transparent','depthWrite','depthTest','colorWrite'])
+    for(const key of ['transparent','depthWrite','depthTest','colorWrite','alphaToCoverage'])
       // Renderer.renderObject's inherited OR expression ends in a nullable
       // node slot for opaque shadow casters. Preserve that exact source field;
       // raster selection interprets it as falsy without changing the material.
@@ -62,6 +62,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
       alpha:{operation:'add',srcFactor:'one',dstFactor:'one-minus-src-alpha'}};
     const state={...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,
       writeMask:m.colorWrite?15:0,depthWriteEnabled:m.depthWrite,depthCompare:m.depthTest?DEPTH[m.depthFunc]:'always',
+      alphaToCoverageEnabled:m.alphaToCoverage,
       frontFace:m.side===three.BackSide?'cw':'ccw',cullMode:m.side===three.DoubleSide?'none':'back'};
     if(mrt&&textures){
       // The source render context controls attachment blending; material MRT

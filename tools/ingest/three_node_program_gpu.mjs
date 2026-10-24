@@ -224,6 +224,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       fail('ANIMATION_RENDER_OPTIONS', 'Native fragment outputs exceed the active color attachment layout');
     if (!raster || !['ccw', 'cw'].includes(raster.frontFace) || !['none', 'front', 'back'].includes(raster.cullMode) ||
         !Number.isSafeInteger(raster.writeMask) || raster.writeMask < 0 || raster.writeMask > 15 ||
+        (raster.alphaToCoverageEnabled !== undefined && typeof raster.alphaToCoverageEnabled !== 'boolean') ||
         (depthFormat && (typeof raster.depthWriteEnabled !== 'boolean' ||
           !['never', 'less', 'equal', 'less-equal', 'greater', 'not-equal', 'greater-equal', 'always'].includes(raster.depthCompare))))
       fail('ANIMATION_RENDER_OPTIONS', 'Invalid native node graphics raster state');
@@ -241,6 +242,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       : usesConstant ? snapshotAnimationBlendConstant(raster.blendConstant ?? [0, 0, 0, 0]) : null;
     const state = Object.freeze({frontFace: raster.frontFace, cullMode: raster.cullMode, writeMask: raster.writeMask,
       depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
+      alphaToCoverageEnabled: raster.alphaToCoverageEnabled === true && sampleCount > 1,
       ...snapshotAnimationRaster({...raster, blendConstant: undefined}, {format, depthFormat}), usesConstant,
       blendConstant});
     const geometry = programGeometrySnapshot(gpu, device);
@@ -270,7 +272,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
           depthCompare: state.depthCompare, ...state.bias,
           ...stencil}} : {}),
-        multisample: {count: sampleCount}});
+        multisample: {count: sampleCount, alphaToCoverageEnabled: state.alphaToCoverageEnabled}});
       const ready = Promise.all([pipeline(state.frontFace), pipeline(state.frontFace === 'ccw' ? 'cw' : 'ccw')]);
       ready.catch(() => {}); return ready;
     });

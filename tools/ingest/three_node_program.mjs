@@ -17,7 +17,8 @@
  * retain source shadow nodes and ShadowMaterial receivers. Single-output source
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
  * Named MRT outputs share native attachments and retain source graph construction.
- * Transmission, writable/atomic storage, VSM shadows and clipping fail explicitly.
+ * ClippingGroup planes retain source union/intersection and alpha-to-coverage
+ * composition. Transmission, writable/atomic storage and VSM shadows fail explicitly.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -26,6 +27,7 @@
 import {createThreeNodeAttributes} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
+import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -630,10 +632,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
       fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
     sourceFog(material, context);
+    inspectThreeNodeClipping(three, context, maxNodes, fail);
     if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
-      fail('EFFECT', 'Native node graph clipping requires its own shader context');
-    if (material.wireframe || material.alphaHash || material.alphaToCoverage)
-      fail('RASTER', 'Native node graph wireframe, hashed alpha and alpha-to-coverage are not admitted');
+      fail('EFFECT', 'Native WebGPU clipping uses source ClippingGroup objects, not legacy material or renderer planes');
+    if (material.wireframe || material.alphaHash)
+      fail('RASTER', 'Native node graph wireframe and hashed alpha are not admitted');
+    if (typeof material.alphaToCoverage !== 'boolean')
+      fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
       fail('RASTER', 'Transparent DoubleSide node graphs require forceSinglePass until side variants are supported');
     if (Object.keys(renderer.contextNode?.getFlowContextData?.() ?? {}).length)
@@ -674,6 +679,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
+    if (node.isPassTextureNode === true) inspectThreeNativePass(three, renderer, node.passNode);
     if (node.isStorageTextureNode || node.isTexture3DNode)
       fail('TEXTURE', 'Graphics storage writes and volume texture graphs need additional native bindings; sample 2D/array storage with TextureNode');
     if (node.isTextureNode) {
@@ -734,13 +740,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null) {
+  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
     return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
-      material.alphaTest > 0, material.depthWrite, material.depthTest, material.lights,
+      material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
+      material.depthWrite, material.depthTest, material.lights, clippingKey,
       object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
@@ -769,14 +776,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object);
     const fogKey = fogSignature(preparedMaterial, context);
+    const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
-    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey), byMaterial = cache.get(object);
+    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
-        attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) return previous.descriptor;
+        attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) {
+      updateThreeNodeClipping(previous.builder.clippingContext, context);
+      return previous.descriptor;
+    }
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     // setup() itself may filter a PMREM source. An existing stale atlas must
     // reach the first draw's ordered preparation boundary through its cached
@@ -786,6 +797,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const builder = new three.WGSLNodeBuilder(object, renderer);
     builder.material = material; builder.context.material = material;
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
+    builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
+      [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
     const lightsNode = litMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
     if (lightsNode) builder.lightsNode = lightsNode;
     const environmentNode = environmentNodeFor(environment);
@@ -802,6 +815,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     if (fogSignature(material, context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
+    if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
+      fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.
@@ -929,7 +944,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
-      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey, pmremNodes, pmremSignature: pmremKey,
+      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
+      clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
+      clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
@@ -1085,10 +1102,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (fogSignature(state.material, {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
   }
+  function checkClipping(state, context) {
+    if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
+        state.material.alphaToCoverage !== state.alphaToCoverage ||
+        (state.material.alphaToCoverage && renderer.currentSamples > 1) !== state.clippingSamples)
+      fail('CHANGED', 'Native clipping layout or coverage mode changed; compile the graph again');
+  }
   function checkCapture(state, context) {
     const object = context.object ?? state.object;
     checkPipelineContext(state, object);
     checkFog(state, context);
+    checkClipping(state, context);
+    updateThreeNodeClipping(state.builder.clippingContext, context);
     checkMaterialMaps(state);
     checkLights(state);
     assertInstances(object, state.instanceSignature);
@@ -1144,6 +1169,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkAttributes(state);
       checkPipelineContext(state, object);
       checkFog(state, context);
+      checkClipping(state, context);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {

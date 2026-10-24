@@ -26,6 +26,56 @@ function rig(t, options = {}) {
     compile: () => owner.compile(material, object, context)};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
+function clippingPlanes(descriptor, packets, count) {
+  const match = new RegExp(`struct (NodeBuffer_\\d+)Struct \\{\\s*value : array< vec4<f32>, ${count} >`).exec(descriptor.fragment);
+  assert.ok(match, 'the retained source clipping uniform array exists');
+  return uniformValues(packets, uniformMember(descriptor, match[1]));
+}
+for (const samples of [1, 4]) test(`native clipping retains source union/intersection WGSL and ${samples}x coverage`, t => {
+  const f = rig(t); f.renderer.currentSamples = samples; f.material.alphaToCoverage = true;
+  f.context.clippingContext = {unionPlanes: [new THREE.Vector4(1, 0, 0, .25), new THREE.Vector4(0, 1, 0, .5)],
+    intersectionPlanes: [new THREE.Vector4(0, 0, 1, .75)]};
+  const d = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.clippingContext = f.context.clippingContext; source.build();
+  const canonical = shader => shader.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(d.vertex), canonical(source.vertexShader));
+  assert.equal(canonical(d.fragment), canonical(source.fragmentShader));
+  assert.equal(d.fragment.includes('fwidth'), samples > 1);
+  const first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  assert.deepEqual(clippingPlanes(d, first, 2), [1, 0, 0, .25, 0, 1, 0, .5]);
+  assert.deepEqual(clippingPlanes(d, first, 1), [0, 0, 1, .75]);
+  f.context.clippingContext = {unionPlanes: [new THREE.Vector4(0, 1, 0, 1.25), new THREE.Vector4(1, 0, 0, 1.5)],
+    intersectionPlanes: [new THREE.Vector4(0, 0, 1, 1.75)]};
+  assert.equal(f.compile(), d, 'live plane values reuse the clipping shader');
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.deepEqual(clippingPlanes(d, second, 2), [0, 1, 0, 1.25, 1, 0, 0, 1.5]);
+  assert.deepEqual(clippingPlanes(d, second, 1), [0, 0, 1, 1.75]);
+  assert.deepEqual(first, saved, 'accepted draws retain the earlier projected plane bytes');
+});
+test('clipping layouts and coverage changes require fresh programs before source draw updates', t => {
+  const f = rig(t); let updates = 0;
+  f.material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  let d = f.compile();
+  for (const change of [
+    () => { f.context.clippingContext = {unionPlanes: [new THREE.Vector4(1, 0, 0, 0)], intersectionPlanes: []}; },
+    () => { f.context.clippingContext.intersectionPlanes.push(f.context.clippingContext.unionPlanes.pop()); },
+    () => { f.material.alphaToCoverage = true; },
+    () => { f.renderer.currentSamples = 4; },
+    () => { f.context.clippingContext = null; },
+  ]) {
+    change(); const before = updates;
+    assert.throws(() => f.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(updates, before);
+    const next = f.compile(); assert.notEqual(next, d); d = next;
+    f.owner.capture(d, {...f.context, renderId: updates + 1});
+  }
+});
+test('native clipping keeps legacy material and renderer plane contracts separate', t => {
+  const f = rig(t), plane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+  f.material.clippingPlanes = [plane]; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_EFFECT'});
+  f.material.clippingPlanes = null; f.renderer.clippingPlanes = [plane];
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_EFFECT'});
+});
 function uniformMember(descriptor, name, stage = 'fragment') {
   const match = new RegExp(`@binding\\(\\s*(\\d+)\\s*\\)\\s*@group\\(\\s*(\\d+)\\s*\\)\\s*var<uniform>\\s+${name}\\s*:`).exec(descriptor[stage]);
   assert.ok(match, `${name} is bound in the ${stage} shader`);

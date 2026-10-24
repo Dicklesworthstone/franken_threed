@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {createThreeNodeProgramMeshes} from './three_node_program_gpu.mjs';
 import {createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
 const fail = (code, message) => { throw Object.assign(Error(message), {code}); };
-function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22,
+function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22, sampleCount = 1,
   configureGeometry = () => {}} = {}) {
   const buffers = [], bindGroups = [], pipelines = [], writes = [];
   let resolveLost, releasePipelines = null, pipelineGate = Promise.resolve(), pipelineError = null, scopeError = null;
@@ -43,7 +43,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
   configureGeometry(source, attributes);
   const gpu = createGpuProgramGeometry(device, source, attributes);
   const owner = createThreeNodeProgramMeshes({device, format: 'rgba8unorm', depthFormat: 'depth24plus',
-    sampleCount: 1, maxDraws, label: 'native-node-test', fail, scoped, maxUniformBytes, maxBindGroups});
+    sampleCount, maxDraws, label: 'native-node-test', fail, scoped, maxUniformBytes, maxBindGroups});
   const raster = {blend: null, frontFace: 'ccw', cullMode: 'back', writeMask: 15,
     depthWriteEnabled: true, depthCompare: 'less-equal'};
   const program = (sizes = [128, 96]) => ({nodeProgram: true, vertex: '// native vertex', fragment: '// native fragment',
@@ -65,6 +65,17 @@ function packet(command, index) {
   assert.equal(group.layout, command.pipeline.layout.bindGroupLayouts[index]);
   return buffer.bytes.slice(offset, offset + size);
 }
+test('native alpha-to-coverage snapshots the source flag and only enables multisample pipelines', async t => {
+  for (const sampleCount of [1, 4]) {
+    const f = rig(t, {sampleCount}); f.raster.alphaToCoverageEnabled = true;
+    const release = f.holdPipelines(), pending = f.add(); f.raster.alphaToCoverageEnabled = false; release();
+    const record = await pending;
+    assert.deepEqual(record.pipelines.normal.multisample, {count: sampleCount, alphaToCoverageEnabled: sampleCount > 1});
+    assert.deepEqual(record.pipelines.flipped.multisample, record.pipelines.normal.multisample);
+    f.raster.alphaToCoverageEnabled = 1;
+    await assert.rejects(f.add(), {code: 'ANIMATION_RENDER_OPTIONS'});
+  }
+});
 test('native graphics uses main entrypoints, native group order and F3D-owned pipelines', async t => {
   const f = rig(t), record = await f.add();
   assert.equal(record.nodeProgram, true); assert.equal(record.program, undefined);

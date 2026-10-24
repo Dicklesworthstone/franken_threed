@@ -7,6 +7,8 @@ import {withThreeNativeCapture, assertThreeNativeTargetWrite, assertThreeNativeC
 import {createGpuCompute} from './gpu_compute.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import ClippingContext from '../../upstream/three.js/src/renderers/common/ClippingContext.js';
+import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 const N = THREE.TSL;
 function rig(t) {
   const frame = new THREE.NodeFrame(); Object.assign(frame, {frameId: 7, time: 1.25, deltaTime: .125});
@@ -23,6 +25,63 @@ function rig(t) {
   return {owner, frame, renderer, scene, camera, material, mesh, capture};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
+const planeValues = context => Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
+  [key, (context?.[key] ?? []).map(plane => plane.toArray())]));
+test('nested native ClippingGroups match source camera projection, union/intersection and layer inheritance', t => {
+  const f = rig(t), outer = new THREE.ClippingGroup(), inner = new THREE.ClippingGroup(), excluded = new THREE.ClippingGroup();
+  outer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), .25)];
+  inner.clippingPlanes = [new THREE.Plane(new THREE.Vector3(0, 1, 0), .5), new THREE.Plane(new THREE.Vector3(0, 0, 1), .75)];
+  inner.clipIntersection = true; excluded.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), 99)];
+  excluded.layers.set(1); f.scene.add(outer); outer.add(inner); inner.add(excluded);
+  outer.position.set(20, 30, 40); inner.scale.set(2, 3, 4); // groups do not transform their world-space planes
+  const material = new THREE.MeshBasicMaterial(), a = f.mesh(material, outer), b = f.mesh(material, excluded);
+  f.camera.position.set(2, 3, 5); f.camera.lookAt(0, 0, 0);
+  const captured = f.capture(), source = new ClippingContext(); source.updateGlobal(f.scene, f.camera);
+  const sourceOuter = source.getGroupContext(outer), sourceInner = sourceOuter.getGroupContext(inner);
+  const binding = object => captured.bindings.find(value => value.object === object);
+  assert.deepEqual(planeValues(binding(a).clippingContext), planeValues(sourceOuter));
+  assert.deepEqual(planeValues(binding(b).clippingContext), planeValues(sourceInner));
+  assert.ok(captured.objects.has(a) && captured.objects.has(b), 'ordinary materials enter native clipping execution');
+  assert.notEqual(binding(a).nodeProgram, binding(b).nodeProgram, 'shared source materials retain distinct clipping layouts');
+  assert.ok(captured.draws.every(draw => draw.binding.nodeProgram.fragment.includes('discard')));
+});
+test('projected clip planes precede draw callbacks and keep separate accepted render snapshots', t => {
+  const f = rig(t), group = new THREE.ClippingGroup(); group.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), .25)];
+  f.scene.add(group); const material = f.material(); let updates = 0;
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => {
+    updates++; group.clippingPlanes[0].constant = updates + 1; return .5;
+  });
+  const object = f.mesh(material, group), first = f.capture(), draw = first.draws[0];
+  const saved = draw.nodeUniforms.map(bytes => bytes.slice());
+  assert.equal(draw.binding.clippingContext.unionPlanes[0].w, .25, 'source projection was captured before the callback');
+  f.renderer.info.calls++; f.camera.position.x = 1;
+  const second = f.capture();
+  assert.equal(second.draws[0].binding.nodeProgram, draw.binding.nodeProgram, 'moving camera and planes retain the layout');
+  assert.deepEqual(draw.nodeUniforms, saved); assert.notDeepEqual(second.draws[0].nodeUniforms, saved);
+  assert.equal(second.draws[0].binding.clippingContext.unionPlanes[0].w, 3);
+  group.enabled = false; f.renderer.info.calls++;
+  const disabled = f.capture();
+  assert.equal(disabled.draws[0].object, object); assert.deepEqual(planeValues(disabled.bindings[0].clippingContext),
+    {unionPlanes: [], intersectionPlanes: []});
+  assert.notEqual(disabled.bindings[0].nodeProgram, draw.binding.nodeProgram);
+});
+test('native shadow clipping follows the source clipShadows ancestry rule', () => {
+  const scene = new THREE.Scene(), outer = new THREE.ClippingGroup(), inner = new THREE.ClippingGroup();
+  const camera = new THREE.PerspectiveCamera(); camera.position.set(1, 2, 3); camera.updateMatrixWorld();
+  outer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), .25)];
+  inner.clippingPlanes = [new THREE.Plane(new THREE.Vector3(0, 1, 0), .5)];
+  inner.clipShadows = true; inner.clipIntersection = true; scene.add(outer); outer.add(inner);
+  scene.overrideMaterial = {isShadowPassMaterial: true};
+  const hierarchy = new Map([[scene, [outer]], [outer, [inner]], [inner, []]]), visibility = new Map([...hierarchy.keys()].map(o => [o, true]));
+  const capture = () => captureThreeNodeClipping(THREE, {root: scene, camera, hierarchy, visibility, shadowPass: true,
+    fail: (_, message) => assert.fail(message)});
+  let contexts = capture(), source = new ClippingContext(); source.updateGlobal(scene, camera);
+  assert.deepEqual(planeValues(contexts.get(inner)), planeValues(source.getGroupContext(outer).getGroupContext(inner)));
+  assert.equal(contexts.get(inner).unionPlanes.length, 0);
+  outer.clipShadows = true; contexts = capture(); source = new ClippingContext(); source.updateGlobal(scene, camera);
+  assert.deepEqual(planeValues(contexts.get(inner)), planeValues(source.getGroupContext(outer).getGroupContext(inner)));
+  assert.equal(contexts.get(inner).unionPlanes.length, 1);
+});
 test('ordinary scenes do not create a node compiler or change the source camera', t => {
   const f = rig(t); f.mesh(new THREE.MeshBasicMaterial());
   assert.equal(f.capture({getPrograms() { assert.fail('unexpected native compiler'); }}), null);

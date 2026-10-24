@@ -13,6 +13,7 @@ import { nativePipelineScenarios } from './scenarios_native_pipeline.js';
 import { nativeMorphScenarios } from './scenarios_native_morph.js';
 import { nativeFogScenarios } from './scenarios_native_fog.js';
 import { nativeMRTScenarios } from './scenarios_native_mrt.js';
+import { nativeClippingScenarios } from './scenarios_native_clipping.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
@@ -21,6 +22,7 @@ export const scenarios = {
   ...nativeMorphScenarios,
   ...nativeFogScenarios,
   ...nativeMRTScenarios,
+  ...nativeClippingScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,
