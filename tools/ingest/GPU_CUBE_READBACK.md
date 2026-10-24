@@ -2,9 +2,11 @@
 
 Native targets created with `createGpuRenderTarget(device, {cube: true, ...})`
 can read color and sampled depth, upload color, and copy color/depth between
-selected faces. This extends the core GPU target API, not the Three.js facade's
-`readRenderTargetPixelsAsync`. The facade's cube readback/transfer restrictions
-remain unchanged.
+selected faces. The Three.js facade's explicit target-transfer and extended
+readback APIs also expose these operations through its existing target owner
+and submission FIFO. Source-shaped `readRenderTargetPixelsAsync` and
+`copyTextureToTexture` retain their 2D restrictions; use the explicit APIs below
+for cube faces.
 
 ```js
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
@@ -104,6 +106,59 @@ The owner still admits only single-sample, mip-zero cube targets. Automatic cube
 mipmaps, array/volume targets, and complete Three.js cube compatibility remain
 outside this implementation.
 
+## Three.js renderer integration
+
+For admitted source `CubeRenderTarget` objects `source` and `destination`, use
+the existing renderer extensions rather than reaching into native storage:
+
+```js
+await renderer.writeRenderTargetPixelsAsync(source, rgbaBytes, {face: 2});
+await renderer.copyRenderTargetPixelsAsync(source, destination, {
+  sourceFace: 2, face: 5,
+});
+const color = await renderer.readRenderTargetMipPixelsAsync(destination, 0, {
+  face: 5,
+});
+
+// Both source cube targets have an attached source CubeDepthTexture.
+await renderer.copyRenderTargetDepthPixelsAsync(source, destination, {
+  sourceFace: 2, face: 5,
+});
+const depth = await renderer.readRenderTargetDepthPixelsAsync(destination, {
+  face: 5, x: 32, y: 48, width: 64, height: 64,
+});
+```
+
+The facade retains its existing cube admission profile: square, single-sample,
+linear RGBA8, mip zero, no stencil/array depth, and matching six-face source
+descriptors. Depth copies/readbacks require the corresponding source depth
+attachment; a cube uses `CubeDepthTexture`. This does not broaden cube color
+sampling, source cube resizing, `WebGLCubeRenderTarget`, or automatic mipmaps.
+Native target profiles remain broader than the source facade's profiles.
+
+Every cube endpoint requires an explicit face, even for an empty region. A 2D
+endpoint still defaults to face zero. Faces, regions, orientation and upload
+bytes are captured at the call; copies/readbacks observe GPU contents at their
+ordered submission. The active rendering face is never used as a transfer
+fallback. Source cube color textures may have a null `renderTarget` pointer:
+these target-based APIs preserve that source ownership rather than changing it.
+
+Requests made before initialization or during preparation join the same FIFO as
+rendering and 2D transfers. Readback mapping and GPU completion do not hold up
+later submissions. The returned promises include validation and native work
+completion. `signal` cancels pending requests and native mapping; cancellation
+cannot roll back an already submitted write. Target/texture disposal and changed
+generations invalidate pending uses. Caller output is left unchanged when a
+read is cancelled before completion.
+
+The renderer request/upload-byte limits, owner allocation budget, native
+readback staging budget and depth-copy uniform budget are shared across faces
+and with 2D targets. Color writes invalidate only color replicas; depth writes
+invalidate only depth replicas. Nested writes to attachments already sampled by
+a pending parent pass still fail, even when another cube face is selected.
+`flipY` defaults to the selected renderer surface's convention; it changes row
+orientation, not the cube face's direction or rotation.
+
 ## Verification
 
 The helper, owner and transfer suites use recording GPU devices. They check
@@ -119,7 +174,8 @@ node --test tools/ingest/gpu_target_readback.test.mjs \
   tools/ingest/gpu_render_target_cube_readback.test.mjs \
   tools/ingest/gpu_cube_transfer.test.mjs \
   tools/ingest/tests/gpu_depth_transfer.test.mjs \
-  tools/ingest/tests/gpu_cube_depth_transfer.test.mjs
+  tools/ingest/tests/gpu_cube_depth_transfer.test.mjs \
+  tools/ingest/three_renderer_cube_transfers.test.mjs
 ```
 
 WebGPU source basis: https://www.w3.org/TR/webgpu/#dom-gputextureviewdescriptor-basearraylayer

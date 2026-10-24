@@ -12,6 +12,10 @@
  * reads propagate renderer, target and caller cancellation to native mapping.
  * Target-owned DepthTextures use the same source copy APIs. The depth extension
  * preserves color/stencil and requires explicit consent for format conversion.
+ * Explicit target APIs also admit cube faces: face selects the destination or
+ * readback layer, sourceFace selects the copy source. Each cube endpoint must
+ * supply its face, independently of the active render face. Source-shaped
+ * texture copies remain 2D; cube operations use target identities directly.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -31,9 +35,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     if (renderer._deferredError) throw renderer._deferredError;
   };
   function transferEntry(target) {
-    const entry = renderer._targets.capture(target);
-    if (entry.shape.cube) fail('UNSUPPORTED', 'Cube target transfers require explicit face-aware support');
-    return entry;
+    return renderer._targets.capture(target);
   }
   function options(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -206,7 +208,10 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       ? texture.isDepthTexture !== true || target.depthTexture !== texture
       : texture.isRenderTargetTexture !== true || target.texture !== texture))
       fail('UNSUPPORTED', 'Texture copies require matching target-owned 2D color or depth textures');
-    return transferEntry(target);
+    const entry = transferEntry(target);
+    if (entry.shape.cube)
+      fail('UNSUPPORTED', 'Cube texture copies require explicit target sourceFace/face options');
+    return entry;
   }
   function initialize(target) {
     live();
@@ -249,10 +254,15 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
   function readPixels(target, supplied = {}, mipLevel = 0, depth = false) {
     live();
     const {value, signal} = options(supplied), entry = transferEntry(target);
-    const allowed = ['x', 'y', 'width', 'height', 'flipY', 'output', 'maxBytes', 'maxInFlightBytes',
+    const allowed = ['x', 'y', 'width', 'height', 'face', 'flipY', 'output', 'maxBytes', 'maxInFlightBytes',
       ...(depth ? ['sampleIndex'] : [])];
     for (const name of Object.keys(value))
       if (!allowed.includes(name)) fail('OPTIONS', `Unknown renderer readback option: ${name}`);
+    // Never infer a cube layer from mutable renderer state, even for an empty
+    // read. Validate before queueing or allocating native storage/staging.
+    const face = value.face === undefined && !entry.shape.cube ? 0 : value.face;
+    if (!Number.isSafeInteger(face) || face < 0 || face >= (entry.shape.cube ? 6 : 1))
+      fail('FACE', entry.shape.cube ? 'Cube readback requires an explicit face from zero to five' : '2D readback requires face zero');
     if (depth && !entry.shape.depthTexture)
       fail('UNSUPPORTED', 'Attach a source DepthTexture before requesting depth readback');
     const levels = depth ? 1 : entry.shape.mipLevelCount;
@@ -271,7 +281,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       if (!Number.isSafeInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= entry.shape.sampleCount)
         fail('UNSUPPORTED', 'Depth readback requires an explicit in-range sampleIndex for multisampled targets');
     }
-    const captured = Object.freeze({...value, x, y, width, height, mipLevel});
+    const captured = Object.freeze({...value, x, y, width, height, mipLevel, face});
     return schedule([entry], signal, 0, combinedSignal => () => {
       renderer._targets.ensure(entry);
       return depth ? entry.storage.readDepthPixels({...captured, signal: combinedSignal})

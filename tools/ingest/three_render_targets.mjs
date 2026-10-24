@@ -15,8 +15,9 @@
  * WebGL UV replica continues to cover the primary color only.
  * Native point shadows use six square cube faces. Rendering selects one face,
  * while native depth sampling borrows all six layers without a UV replica.
- * Cube targets currently admit one sample and mip zero; their transfers,
- * readbacks, color sampling and source resize are explicitly unsupported.
+ * Cube targets admit one sample and mip zero. Explicit face-aware color/depth
+ * transfers and native readbacks share this owner; cube color sampling and
+ * source resize remain unsupported.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * Source FloatType R/RG/RGBA attachments retain full precision through storage,
@@ -359,7 +360,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     const {width, height, format, colorFormats, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube} = entry.shape;
     entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
-      sampleDepth: entry.shape.depthTexture !== null, copyDestination: !cube, cube});
+      sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube});
     entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     // The readback helper consumes this session-shaped object. It copies the
     // original attachment, not the UV-oriented sampling replica.
@@ -560,8 +561,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function copyTarget(source, destination, options, depth = false) {
     assertCurrent(source); assertCurrent(destination);
-    if (source.shape.cube || destination.shape.cube)
-      fail('UNSUPPORTED', 'Cube target copies require an explicit face-aware transfer API');
     if (source === destination) fail('FEEDBACK', 'In-place target copies are not admitted');
     if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
     const plan = depth
@@ -674,7 +673,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     },
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
-      if (entry.shape.cube) fail('UNSUPPORTED', 'Cube target uploads require an explicit face-aware transfer API');
       if (entry.busy) fail('REENTRANT', 'Cannot upload during a target submission');
       if (inspectGpuTargetWrite(entry.shape, data, options).empty) return false;
       ensure(entry);
