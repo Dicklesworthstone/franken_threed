@@ -2,6 +2,8 @@
  * Owners must keep both attachments borrowed until submitGpuDepthCopy returns.
  * Submission is synchronous; its promise covers validation and GPU completion.
  * The only transient allocation is a bounded 32-byte uniform per pending copy.
+ * Cube endpoints explicitly select sourceFace/face; each view addresses one
+ * depth-only 2D face. No cube filtering or extra color attachment is introduced.
  */
 export class GpuDepthTransferError extends Error {
   constructor(code, message) {
@@ -19,6 +21,15 @@ const integer = (value, label, min = 0, max = Number.MAX_SAFE_INTEGER) => {
   return value;
 };
 const states = new WeakMap(), admittedPlans = new WeakSet(), UNIFORM_BYTES = 32;
+function depthFace(shape, face, name) {
+  const cube = shape.cube === true;
+  if (face === undefined && !cube) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
+    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five` : `${name} must be zero for a 2D target`);
+  if (cube && (shape.width !== shape.height || shape.sampleCount !== 1))
+    fail('SOURCE', 'Cube depth transfers require square single-sample faces');
+  return face;
+}
 
 /** Allocation-free admission. Coordinates address the selected depth attachment,
  * not color mip levels. flipY changes both origins, not the row order of a copy.
@@ -29,7 +40,7 @@ export function inspectGpuDepthCopy(source, destination, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options) ||
       ![Object.prototype, null].includes(Object.getPrototypeOf(options))) fail('OPTIONS', 'Expected plain depth copy options');
   const allowed = ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'flipY', 'sampleIndex',
-    'allowFormatConversion', 'maxBytes', 'maxInFlightBytes'];
+    'allowFormatConversion', 'maxBytes', 'maxInFlightBytes', 'sourceFace', 'face'];
   for (const key of Reflect.ownKeys(options))
     if (!allowed.includes(key) || !Object.hasOwn(Object.getOwnPropertyDescriptor(options, key), 'value'))
       fail('OPTIONS', `Unknown or accessor-backed depth copy option: ${String(key)}`);
@@ -38,6 +49,8 @@ export function inspectGpuDepthCopy(source, destination, options = {}) {
     integer(shape.width, 'depth width', 0, 0x7fffffff); integer(shape.height, 'depth height', 0, 0x7fffffff);
     if (![1, 4].includes(shape.sampleCount)) fail('SAMPLES', 'Depth copies require one or four samples');
   }
+  const sourceFace = depthFace(source, options.sourceFace, 'sourceFace');
+  const face = depthFace(destination, options.face, 'face');
   if (source.sampleDepth !== true) fail('USAGE', 'Enable sampleDepth on the source target');
   const {sourceX = 0, sourceY = 0, x = 0, y = 0, width = source.width - sourceX,
     height = source.height - sourceY, flipY = false, sampleIndex,
@@ -72,6 +85,7 @@ export function inspectGpuDepthCopy(source, destination, options = {}) {
     sourceFormat: source.depthFormat, format: destination.depthFormat,
     sourceSampleCount: source.sampleCount, sampleCount: destination.sampleCount,
     mode, sampleIndex: sampleIndex ?? 0, maxInFlightBytes,
+    sourceFace, face, sourceLayers: source.cube === true ? 6 : 1,
   });
   admittedPlans.add(plan);
   return plan;
@@ -121,7 +135,7 @@ export function submitGpuDepthCopy(device, texture, depthView, plan) {
   if (!texture || typeof texture.createView !== 'function' || !depthView) fail('SOURCE', 'Expected borrowed source depth and destination view');
   if (texture.format !== plan.sourceFormat || texture.sampleCount !== plan.sourceSampleCount ||
       texture.width !== plan.sourceWidth || texture.height !== plan.sourceHeight ||
-      texture.dimension !== '2d' || texture.depthOrArrayLayers !== 1 || (texture.usage & 4) === 0)
+      texture.dimension !== '2d' || texture.depthOrArrayLayers !== plan.sourceLayers || (texture.usage & 4) === 0)
     fail('SOURCE', 'Source depth texture does not match its captured profile or sampling usage');
   if (['maxBufferSize', 'maxUniformBufferBindingSize'].some(name =>
       device.limits?.[name] !== undefined && device.limits[name] < UNIFORM_BYTES))
@@ -166,7 +180,8 @@ export function submitGpuDepthCopy(device, texture, depthView, plan) {
       plan.sourceX, plan.sourceY, plan.x, plan.y, plan.sampleIndex, 0, 0, 0,
     ]));
     const group = device.createBindGroup({layout: cached.pipeline.getBindGroupLayout(0), entries: [
-      {binding: 0, resource: texture.createView({aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1})},
+      {binding: 0, resource: texture.createView({dimension: '2d', baseArrayLayer: plan.sourceFace, arrayLayerCount: 1,
+        aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1})},
       {binding: 1, resource: {buffer}},
     ]});
     const encoder = device.createCommandEncoder({label: 'Depth-only target copy'});

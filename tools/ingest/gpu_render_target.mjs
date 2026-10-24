@@ -37,8 +37,9 @@
  * readPixels({face}) and readDepthPixels({face}) select one explicit cube face,
  * retaining bounded staging, call-time submission and cancellation on disposal.
  * writePixels(data, {face}) and copyFrom(source, {sourceFace, face}) transfer
- * one explicit cube color face, including cube/2D copies. Cube depth copies
- * and mip generation remain unsupported.
+ * one explicit cube color face, including cube/2D copies. copyDepthFrom uses
+ * the same face selection for depth-only copies. Cube mip generation remains
+ * unsupported; no implicit multisample depth resolve is introduced.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -458,11 +459,9 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     copyDepthFrom(source, options = {}) {
       exclusive();
-      if (cube) fail('UNSUPPORTED', 'Cube depth copies require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target depth');
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
-      if (other.shape().cube) fail('UNSUPPORTED', 'Cube depth copies require an explicit face-aware transfer API');
       if (other.device !== device) fail('DEVICE', 'Depth copies require the same GPUDevice');
       if (source === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
       other.exclusive();
@@ -473,7 +472,8 @@ export function createGpuRenderTarget(device, options = {}) {
         current.used = true;
         let completion;
         other.borrowDepth(texture => {
-          completion = submitGpuDepthCopy(device, texture, current.depthView, plan);
+          const view = cube ? current.cubeFrames[plan.face].depthView : current.depthView;
+          completion = submitGpuDepthCopy(device, texture, view, plan);
         });
         // Depth-only writes must not regenerate color mips. Source validation
         // remains a dependency even if this pass itself validates successfully.

@@ -17,11 +17,11 @@ export function depthDevice() {
   const trip = stage => { if (control.fault === stage) { control.fault = null; throw new Error(`injected ${stage}`); } };
   const device = {
     features: new Set(['depth32float-stencil8']), lost: loss.promise,
-    limits: {maxTextureDimension2D: 4096, maxBufferSize: 64 * 1024 * 1024, maxUniformBufferBindingSize: 65536},
+    limits: {maxTextureDimension2D: 4096, maxTextureArrayLayers: 256, maxBufferSize: 64 * 1024 * 1024, maxUniformBufferBindingSize: 65536},
     createTexture(desc) {
       const {width, height, depthOrArrayLayers = 1} = desc.size;
       const texture = {...desc, width, height, depthOrArrayLayers, destroyed: false,
-        data: new Float32Array(width * height * desc.sampleCount), stencil: new Uint8Array(width * height * desc.sampleCount),
+        data: new Float32Array(width * height * desc.sampleCount * depthOrArrayLayers), stencil: new Uint8Array(width * height * desc.sampleCount * depthOrArrayLayers),
         createView(options = {}) { return {texture, options}; },
         destroy() { texture.destroyed = true; }};
       textures.push(texture); return texture;
@@ -79,11 +79,12 @@ export function depthDevice() {
         trip('submit'); submissions.push(batches); events.push('submit');
         for (const passes of batches) for (const packet of passes) {
           if (packet.kind === 'depth-read') {
-            const source = packet.group.entries[0].resource.texture;
+            const view = packet.group.entries[0].resource, source = view.texture;
+            const layerOffset = (view.options.baseArrayLayer ?? 0) * source.width * source.height * source.sampleCount;
             const output = new Float32Array(packet.group.entries[1].resource.buffer.bytes);
             const [x, y, w, h, sample, flipY] = new Uint32Array(packet.group.entries[2].resource.buffer.bytes);
             for (let j = 0; j < h; j++) for (let i = 0; i < w; i++)
-              output[j * w + i] = source.data[((y + (flipY ? h - j - 1 : j)) * source.width + x + i) * source.sampleCount + sample];
+              output[j * w + i] = source.data[layerOffset + ((y + (flipY ? h - j - 1 : j)) * source.width + x + i) * source.sampleCount + sample];
             continue;
           }
           if (packet.kind === 'buffer-copy') {
@@ -106,14 +107,16 @@ export function depthDevice() {
             }
             continue;
           }
-          const source = packet.group.entries[0].resource.texture;
-          const destination = packet.desc.depthStencilAttachment.view.texture;
+          const sourceView = packet.group.entries[0].resource, source = sourceView.texture;
+          const destinationView = packet.desc.depthStencilAttachment.view, destination = destinationView.texture;
+          const sourceOffset = (sourceView.options.baseArrayLayer ?? 0) * source.width * source.height * source.sampleCount;
+          const destinationOffset = (destinationView.options.baseArrayLayer ?? 0) * destination.width * destination.height * destination.sampleCount;
           const [sx, sy, dx, dy, selected] = new Uint32Array(packet.group.entries[1].resource.buffer.bytes);
           const [x, y, w, h] = packet.scissor;
           for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) for (let sample = 0; sample < destination.sampleCount; sample++) {
             const sampleIn = destination.sampleCount === 4 ? sample : selected;
-            const value = source.data[((sy + y - dy + j) * source.width + sx + x - dx + i) * source.sampleCount + sampleIn];
-            destination.data[((y + j) * destination.width + x + i) * destination.sampleCount + sample] = value;
+            const value = source.data[sourceOffset + ((sy + y - dy + j) * source.width + sx + x - dx + i) * source.sampleCount + sampleIn];
+            destination.data[destinationOffset + ((y + j) * destination.width + x + i) * destination.sampleCount + sample] = value;
           }
         }
       },
