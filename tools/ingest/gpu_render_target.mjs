@@ -34,7 +34,9 @@
  * No framebuffer emulation or frame loop.
  * cube:true admits six square single-sample mip-zero attachments. withFrame's
  * face selects one 2D attachment; depth borrowers retain the entire native cube.
- * Cube uploads, copies, readbacks and mip generation are explicitly unsupported.
+ * readPixels({face}) and readDepthPixels({face}) select one explicit cube face,
+ * retaining bounded staging, call-time submission and cancellation on disposal.
+ * Cube uploads, copies and mip generation are explicitly unsupported.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -358,7 +360,6 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   async function read(operation, options = {}) {
     exclusive();
-    if (cube) fail('UNSUPPORTED', 'Cube target readbacks require an explicit face-aware transfer API');
     if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
     const caller = options.signal;
     if (caller !== undefined && (!caller || typeof caller.addEventListener !== 'function' || typeof caller.removeEventListener !== 'function'))
