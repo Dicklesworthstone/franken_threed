@@ -267,7 +267,11 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   }
   function layout(snapshot) {
     const {entry, kind} = snapshot;
-    if (kind === 'sampler') return {sampler: {type: entry.shape.integerType ? 'non-filtering' : 'filtering'}};
+    // Match the sampled texture's feature-dependent layout, not merely its
+    // integer flag. Nearest R/RG/RGBA32F sampling is valid without enabling
+    // float32-filterable and must bind a non-filtering sampler in that case.
+    if (kind === 'sampler') return {sampler: {type: entry.shape.integerType ||
+      entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'non-filtering' : 'filtering'}};
     if (kind === 'storage') return {storageTexture: {access: snapshot.access, format: entry.shape.format, viewDimension: entry.shape.viewDimension}};
     return {texture: {sampleType: entry.shape.integerType ?? (entry.shape.float32 && !device().features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float'), viewDimension: entry.shape.viewDimension, multisampled: false}};
   }

@@ -7,7 +7,8 @@
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
  * source bone palettes, authored typed uniform arrays and multiple uniform blocks per source group,
- * sampled 2D/data-array/CPU-data cube textures, target-owned depth comparisons and read-only
+ * sampled 2D/data-array/CPU-data cube textures, GPU-authored 2D/array storage inputs,
+ * target-owned depth comparisons and read-only
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
@@ -445,7 +446,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return texture === null ? null : sourcePMREMTexture(texture);
   }
   function sourcePMREMTexture(texture) {
-    if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource ||
+    if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource || texture.isStorageTexture ||
         ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping].includes(texture.mapping))
       fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image or source CubeUV texture');
     inspectTexture(texture);
@@ -481,13 +482,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return node;
   }
   function inspectTexture(texture) {
-    const array = texture?.isDataArrayTexture === true;
-    if (!(texture instanceof three.Texture) || texture.isStorageTexture ||
+    const storage = texture?.isStorageTexture === true;
+    const array = texture?.isDataArrayTexture === true || storage && texture.isArrayTexture === true;
+    if (!(texture instanceof three.Texture) ||
         texture.is3DTexture || texture.isArrayTexture && !array || texture.isData3DTexture ||
-        array && !(texture instanceof three.DataArrayTexture) ||
+        array && !storage && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isFramebufferTexture || texture.isExternalTexture)
-      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, CPU-data cubes and target-owned color/depth textures');
+      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, CPU-data cubes, 2D/array storage and target-owned color/depth textures');
+    // Compute owns these images. Admission must use the same residency owner,
+    // never the CPU texture pool or an independently inferred storage layout.
+    // Ordinary TextureNode sampling remains read-only; StorageTextureNode stores
+    // and 3D graphs retain their explicit gates below.
+    if (storage && (texture.isDepthTexture || typeof renderer._getSampledTextureInputs !== 'function'))
+      fail('TEXTURE', 'Native storage sampling requires color and the shared renderer texture owner');
     const depth = texture.isDepthTexture === true;
     if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
         texture.renderTarget.depthTexture !== texture ||
@@ -517,6 +525,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
+    if (storage && !layout?.texture) fail('TEXTURE', 'Missing shared storage sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
       fail('TEXTURE', 'Native graphics texture bindings must match the source dimension and sample count');
@@ -544,7 +553,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
       return [aliases.get(texture.uuid), texture.type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.normalized === true, texture.isCubeTexture === true,
-        texture.isDataArrayTexture === true,
+        texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
         texture.isCubeTexture === true ? texture.mapping : null,
         renderer.backend.utils.getTextureSampleData(texture).primarySamples,
         texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
@@ -639,7 +648,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const value = material[key];
       if (value?.isTexture) {
         if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
-        if (value.isCubeTexture) fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
+        if (value.isCubeTexture || value.isStorageTexture && value.isArrayTexture)
+          fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
         inspectTexture(value);
       }
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
@@ -665,7 +675,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isStorageTextureNode || node.isTexture3DNode)
-      fail('TEXTURE', 'Storage and volume texture graphs need additional native bindings');
+      fail('TEXTURE', 'Graphics storage writes and volume texture graphs need additional native bindings; sample 2D/array storage with TextureNode');
     if (node.isTextureNode) {
       if (node.isCubeTextureNode && (node.constructor !== three.CubeTextureNode ||
           Object.getPrototypeOf(node) !== three.CubeTextureNode.prototype || node.sampler !== true))
@@ -684,8 +694,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (node.isSampleCompare?.() === true && (!node.value.isDepthTexture || node.value.compareFunction === null || !node.sampler))
           fail('TEXTURE', 'Native comparison sampling requires an attached depth texture with a comparison function');
       }
-      if (node.depthNode !== null && node.value?.isDataArrayTexture !== true)
-        fail('TEXTURE', 'Native layer coordinates require a source DataArrayTexture');
+      if (node.depthNode !== null && node.value?.isDataArrayTexture !== true &&
+          !(node.value?.isStorageTexture === true && node.value.isArrayTexture === true))
+        fail('TEXTURE', 'Native layer coordinates require a source DataArrayTexture or StorageArrayTexture');
     } else if (node.constructor === three.PMREMNode) inspectPMREMNode(node);
     else if (node.value?.isTexture)
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');
