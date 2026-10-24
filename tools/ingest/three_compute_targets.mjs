@@ -100,8 +100,9 @@ export function createThreeComputeTargets({targets, device, signal = null,
       const sources = new Map();
       for (const snapshot of snapshots) {
         const {source} = validate(snapshot);
-        let group = sources.get(source.entry);
-        if (!group) sources.set(source.entry, group = new Map());
+        const owner = source.entry.historyGroup ?? source.entry;
+        let group = sources.get(owner);
+        if (!group) sources.set(owner, group = new Map());
         group.set(source.texture, source);
       }
       if (pending.size + sources.size + 1 > maxPending) fail('BUDGET', 'Too many target submissions are awaiting completion');
@@ -123,7 +124,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
         const group = list[i], source = group[0];
         targets.withNativeTextures(group, textures => {
           borrowed.set(source.entry, source.entry.storage);
-          active.textures.set(source.entry, textures);
+          for (const member of group) active.textures.set(member.entry, textures);
           visit(i + 1);
         });
       };

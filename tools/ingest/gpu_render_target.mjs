@@ -16,6 +16,9 @@
  * Frames expose colorViews/resolveTargets, retaining their primary aliases.
  * withAttachments borrows all resolved colors and optional sampled depth at once;
  * withTexture's colorIndex selects one color. Every attachment shares retirement.
+ * reserveColorHistory adds one persistent alternate image for selected colors;
+ * captured colorSlots choose their resolved and MSAA images independently.
+ * Non-history colors and depth keep one shared identity across those selections.
  * readPixels/writePixels also accept colorIndex. copyFrom selects independent
  * sourceColorIndex/colorIndex attachments; all default to zero and preserve
  * the selected format without conversion, including resolved MSAA sources.
@@ -190,6 +193,7 @@ export function createGpuRenderTarget(device, options = {}) {
   let width = dimension(initialWidth), height = dimension(initialHeight);
   if (cube && width !== height) fail('SIZE', 'Cube faces must be square');
   const layers = cube ? 6 : 1;
+  const historyIndices = new Set();
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount, ...(multiple ? {colorFormats} : {})});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
@@ -215,7 +219,8 @@ export function createGpuRenderTarget(device, options = {}) {
       mw = Math.max(1, Math.floor(mw / 2)); mh = Math.max(1, Math.floor(mh / 2));
       texels += mw * mh;
     }
-    const bytes = layers * (colorFormats.reduce((sum, value) => sum + COLOR_BYTES.get(value), 0) * (texels + (sampleCount === 4 ? base * 4 : 0)) +
+    const colorBytes = colorFormats.reduce((sum, value, index) => sum + COLOR_BYTES.get(value) * (historyIndices.has(index) ? 2 : 1), 0);
+    const bytes = layers * (colorBytes * (texels + (sampleCount === 4 ? base * 4 : 0)) +
       base * DEPTH_BYTES.get(depthFormat) * sampleCount);
     if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte count exceeds safe integer precision');
     return bytes;
@@ -224,6 +229,8 @@ export function createGpuRenderTarget(device, options = {}) {
   const destroy = pair => {
     for (const texture of pair?.colors ?? []) texture.destroy();
     for (const texture of pair?.multisamples ?? []) texture.destroy();
+    for (const texture of pair?.historyColors?.values() ?? []) texture.destroy();
+    for (const texture of pair?.historyMultisamples?.values() ?? []) texture.destroy();
     pair?.depth?.destroy();
     for (const depth of pair?.mipDepths?.values() ?? []) depth.destroy();
   };
@@ -263,7 +270,8 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   function allocate(w, h, bytes) {
     if (w === 0 || h === 0) return null;
-    const pair = {bytes, used: false, colors: [], multisamples: [], color: null, multisample: null, depth: null, mipDepths: new Map(), frames: new Map(),
+    const pair = {bytes, used: false, colors: [], multisamples: [], historyColors: new Map(), historyMultisamples: new Map(),
+      historyViews: new Map(), historyMultisampleViews: new Map(), color: null, multisample: null, depth: null, mipDepths: new Map(), frames: new Map(),
       mipLevelCount: levels(w, h), mipsDirty: true, mipSteps: null};
     try {
       checked(() => {
@@ -283,6 +291,7 @@ export function createGpuRenderTarget(device, options = {}) {
         }
         pair.color = pair.colors[0]; pair.view = pair.views[0];
         pair.multisample = pair.multisamples[0]; pair.multisampleView = pair.multisampleViews[0];
+        for (const index of historyIndices) allocateHistory(pair, index, w, h);
         if (depthFormat !== null) {
           pair.depth = device.createTexture({label: label + ' depth', size, format: depthFormat,
             dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | (sampleDepth ? 4 : 0)});
@@ -302,6 +311,35 @@ export function createGpuRenderTarget(device, options = {}) {
       })));
       return pair;
     } catch (error) { destroy(pair); throw error; }
+  }
+  function allocateHistory(pair, index, w, h) {
+    const size = {width: w, height: h, depthOrArrayLayers: 1}, attachmentFormat = colorFormats[index];
+    const color = device.createTexture({label: `${label} history color ${index}`, size, format: attachmentFormat,
+      dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
+    pair.historyColors.set(index, color); pair.historyViews.set(index, color.createView());
+    if (sampleCount === 4) {
+      const multisample = device.createTexture({label: `${label} history MSAA ${index}`, size, format: attachmentFormat,
+        dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16});
+      pair.historyMultisamples.set(index, multisample); pair.historyMultisampleViews.set(index, multisample.createView());
+    }
+  }
+  function reserveColorHistory(indices) {
+    exclusive();
+    if (!Array.isArray(indices) || indices.some(index => !Number.isSafeInteger(index) || index < 0 || index >= colorFormats.length))
+      fail('ATTACHMENT', 'History requires allocated color attachment indices');
+    if (cube || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1)
+      fail('UNSUPPORTED', 'History colors currently require 2D mip-zero targets');
+    const additions = [...new Set(indices)].filter(index => !historyIndices.has(index));
+    if (!additions.length) return api;
+    const bytes = width * height * additions.reduce((sum, index) => sum + COLOR_BYTES.get(colorFormats[index]), 0) * (sampleCount === 4 ? 5 : 1);
+    if (bytes > maxBytes - allocated()) fail('BUDGET', 'History colors exceed maxBytes');
+    busy = true;
+    try {
+      if (current) checked(() => { for (const index of additions) allocateHistory(current, index, width, height); });
+      for (const index of additions) historyIndices.add(index);
+      if (current) current.bytes += bytes;
+      return api;
+    } finally { busy = false; if (disposed || terminal !== null) release(); }
   }
   function refreshMips(pair) {
     if (!generateMipmaps || !pair.mipsDirty || pair.mipLevelCount === 1) return;
@@ -387,10 +425,29 @@ export function createGpuRenderTarget(device, options = {}) {
       return frame;
     } catch (error) { depth?.destroy(); throw error; }
   }
-  function borrow(callback, kind, mipLevel = 0, face = 0, colorIndex = 0, dependency) {
+  function selectedSlots(colorSlots) {
+    const slots = colorSlots ?? colorFormats.map(() => 0);
+    if (!Array.isArray(slots) || slots.length !== colorFormats.length || slots.some((slot, index) =>
+      slot !== 0 && (slot !== 1 || !historyIndices.has(index)))) fail('ATTACHMENT', 'Invalid captured color history selection');
+    return slots;
+  }
+  function selectedFrame(frame, slots) {
+    if (!slots.some(Boolean)) return frame;
+    const key = `history/${slots.join(',')}`;
+    if (!current.frames.has(key)) {
+      const resolved = current.views.map((view, index) => slots[index] ? current.historyViews.get(index) : view);
+      const views = sampleCount === 4 ? current.multisampleViews.map((view, index) => slots[index] ? current.historyMultisampleViews.get(index) : view) : resolved;
+      current.frames.set(key, Object.freeze({...frame, colorView: views[0],
+        ...(multiple ? {colorViews: Object.freeze(views), ...(sampleCount === 4 ? {resolveTargets: Object.freeze(resolved)} : {})} : {}),
+        ...(sampleCount === 4 ? {resolveTarget: resolved[0]} : {})}));
+    }
+    return current.frames.get(key);
+  }
+  function borrow(callback, kind, mipLevel = 0, face = 0, colorIndex = 0, colorSlots = null, dependency) {
     exclusive();
     if (!Number.isSafeInteger(colorIndex) || colorIndex < 0 || colorIndex >= colorFormats.length)
       fail('ATTACHMENT', 'Color attachment index is out of range');
+    const slots = selectedSlots(colorSlots);
     if (kind === 'destination') {
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before borrowing a color destination');
       if (sampleCount !== 1) fail('SAMPLES', 'Color destinations require one sample');
@@ -401,9 +458,24 @@ export function createGpuRenderTarget(device, options = {}) {
     if (!current) return false;
     // Budget rejection is retryable and happens before marking this owner busy.
     if (extraBytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
-    busy = true;
+    busy = true; let active = true;
     try {
-      const frame = kind === 'frame' ? frameAt(mipLevel, extraBytes, face) : null;
+      const frame = kind === 'frame' ? selectedFrame(frameAt(mipLevel, extraBytes, face), slots) : null;
+      const colors = current.colors.map((color, index) => slots[index] ? current.historyColors.get(index) : color);
+      const handles = Object.freeze({colors: Object.freeze(current.colors.slice()),
+        historyColors: Object.freeze(colorFormats.map((_, index) => current.historyColors.get(index) ?? null)), depth: current.depth});
+      // A renderer may acquire sampled inputs before its destination frame.
+      // This capability stays inside the same synchronous native borrow. The
+      // source owner verifies disjoint read/write selections before using it.
+      const nestedFrame = (run, {colorSlots: selected = null} = {}) => {
+        if (!active) fail('BORROW', 'The attachment borrow has ended');
+        if (!historyIndices.size || cube || typeof run !== 'function') fail('CALLBACK', 'Expected a synchronous history frame callback');
+        const choice = selectedSlots(selected);
+        current.mipsDirty = true;
+        const result = run(selectedFrame(current.frame, choice), choice[0] ? current.historyColors.get(0) : current.color, handles);
+        if (result?.then) { Promise.resolve(result).catch(() => {}); fail('ASYNC_USE', 'A history frame cannot cross an await'); }
+        live(); return true;
+      };
       current.used = true; // Even a throwing callback may have submitted work.
       if (kind === 'frame' || kind === 'destination') current.mipsDirty = true;
       else if (kind === 'color' || kind === 'sampled' || kind === 'attachments') refreshMips(current);
@@ -411,20 +483,21 @@ export function createGpuRenderTarget(device, options = {}) {
         validation = Promise.all([validation, dependency]).then(() => {});
         validation.catch(stop);
       }
-      const result = kind === 'destination' ? checked(() => callback(current.colors[colorIndex]))
-        : kind === 'frame' ? callback(frame, current.color)
-        : kind === 'sampled' ? callback(current.color, current.depth)
-        : kind === 'attachments' ? callback(Object.freeze(current.colors.slice()), sampleDepth ? current.depth : null)
-        : callback(kind === 'depth' ? current.depth : current.colors[colorIndex]);
+      const result = kind === 'destination' ? checked(() => callback(colors[colorIndex]))
+        : kind === 'frame' ? callback(frame, colors[0], handles)
+        : kind === 'sampled' ? callback(colors[0], current.depth)
+        : kind === 'attachments' ? callback(Object.freeze(colors), sampleDepth ? current.depth : null,
+          handles.historyColors, nestedFrame)
+        : callback(kind === 'depth' ? current.depth : colors[colorIndex]);
       if (result && typeof result.then === 'function') {
         Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
       }
       live();
       return true;
-    } finally { busy = false; if (disposed || terminal !== null) release(); }
+    } finally { active = false; busy = false; if (disposed || terminal !== null) release(); }
   }
-  async function read(operation, options = {}) {
+  async function read(operation, options = {}, colorSlots = null) {
     exclusive();
     if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected readback options');
     const caller = options.signal;
@@ -440,7 +513,8 @@ export function createGpuRenderTarget(device, options = {}) {
       return await operation({device, width, height, diagnostics: {target: {...transferShape(), depthFormat, sampleDepth}},
         get disposed() { return disposed; }, get failed() { return terminal !== null; },
         get validation() { return validation; },
-        withTexture: api.withTexture, withDepthTexture: api.withDepthTexture}, {...options, signal: controller.signal});
+        withTexture: (callback, settings = {}) => api.withTexture(callback, {...settings, colorSlots}),
+        withDepthTexture: api.withDepthTexture}, {...options, signal: controller.signal});
     } finally {
       readbacks.delete(controller);
       caller?.removeEventListener('abort', abort);
@@ -477,16 +551,35 @@ export function createGpuRenderTarget(device, options = {}) {
       finally { busy = false; if (terminal !== null) release(); }
     },
     frameAllocationBytes,
-    withFrame(callback, {mipLevel = 0, face = 0} = {}) { return borrow(callback, 'frame', mipLevel, face); },
-    withTexture(callback, {colorIndex = 0} = {}) { return borrow(callback, 'color', 0, 0, colorIndex); },
-    withColorDestination(callback, {colorIndex = 0, validation} = {}) {
-      return borrow(callback, 'destination', 0, 0, colorIndex, validation);
+    reserveColorHistory,
+    selectColorSlots(colorSlots) {
+      live();
+      const selected = Object.freeze(selectedSlots(colorSlots).slice());
+      const view = Object.create(api, {
+        withFrame: {value: (callback, options = {}) => api.withFrame(callback, {...options, colorSlots: selected})},
+        withTexture: {value: (callback, options = {}) => api.withTexture(callback, {...options, colorSlots: selected})},
+        withColorDestination: {value: (callback, options = {}) => api.withColorDestination(callback, {...options, colorSlots: selected})},
+        withAttachments: {value: callback => api.withAttachments(callback, {colorSlots: selected})},
+        withSampledTextures: {value: callback => api.withSampledTextures(callback, {colorSlots: selected})},
+        writePixels: {value: (data, options = {}) => api.writePixels(data, options, selected)},
+        readPixels: {value: (options = {}) => api.readPixels(options, selected)},
+        copyFrom: {value: (source, options = {}) => api.copyFrom(source, options, selected)},
+      });
+      transferTargets.set(view, {...transferTargets.get(api),
+        borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex, selected)});
+      return view;
     },
-    withAttachments(callback) { return borrow(callback, 'attachments'); },
+    withFrame(callback, {mipLevel = 0, face = 0, colorSlots = null} = {}) { return borrow(callback, 'frame', mipLevel, face, 0, colorSlots); },
+    withTexture(callback, {colorIndex = 0, colorSlots = null} = {}) { return borrow(callback, 'color', 0, 0, colorIndex, colorSlots); },
+    withColorDestination(callback, {colorIndex = 0, colorSlots = null, validation} = {}) {
+      return borrow(callback, 'destination', 0, 0, colorIndex, colorSlots, validation);
+    },
+    withAttachments(callback, {colorSlots = null} = {}) { return borrow(callback, 'attachments', 0, 0, 0, colorSlots); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
-    withSampledTextures(callback) { return borrow(callback, 'sampled'); },
-    writePixels(data, options = {}) {
+    withSampledTextures(callback, {colorSlots = null} = {}) { return borrow(callback, 'sampled', 0, 0, 0, colorSlots); },
+    writePixels(data, options = {}, colorSlots = null) {
       exclusive();
+      const slots = selectedSlots(colorSlots);
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before uploading target color');
       const plan = inspectGpuTargetWrite(transferShape(), data, options);
       if (plan.empty) return false;
@@ -495,18 +588,19 @@ export function createGpuRenderTarget(device, options = {}) {
       busy = true;
       try {
         current.used = true; current.mipsDirty = true;
-        checked(() => device.queue.writeTexture({texture: current.colors[plan.colorIndex], mipLevel: 0, origin: plan.origin},
+        checked(() => device.queue.writeTexture({texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: 0, origin: plan.origin},
           upload.data, upload.layout, plan.size));
         live(); colorUploads++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }
     },
-    copyFrom(source, options = {}) {
+    copyFrom(source, options = {}, colorSlots = null) {
       exclusive();
+      const slots = selectedSlots(colorSlots);
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target color');
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
       if (other.device !== device) fail('DEVICE', 'Target copies require the same GPUDevice');
-      if (source === api) fail('FEEDBACK', 'In-place target copies are not admitted');
+      if (other.owner === api) fail('FEEDBACK', 'In-place target copies are not admitted');
       other.exclusive();
       const plan = inspectGpuTargetCopy(other.shape(), transferShape(), options);
       if (plan.empty) return false;
@@ -516,7 +610,7 @@ export function createGpuRenderTarget(device, options = {}) {
         other.borrow(texture => checked(() => {
           const encoder = device.createCommandEncoder({label: label + ' color copy'});
           encoder.copyTextureToTexture({texture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
-            {texture: current.colors[plan.colorIndex], mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+            {texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
           device.queue.submit([encoder.finish()]);
         }), plan.sourceColorIndex);
         // A source mip-generation/upload error must also fail the dependent
@@ -532,7 +626,7 @@ export function createGpuRenderTarget(device, options = {}) {
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
       if (other.device !== device) fail('DEVICE', 'Depth copies require the same GPUDevice');
-      if (source === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
+      if (other.owner === api) fail('FEEDBACK', 'In-place depth copies are not admitted');
       other.exclusive();
       const plan = inspectGpuDepthCopy(other.depthShape(), depthShape(), options);
       if (plan.empty) return false;
@@ -551,7 +645,7 @@ export function createGpuRenderTarget(device, options = {}) {
         live(); depthCopies++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }
     },
-    readPixels(options = {}) { return read(readGpuTargetPixels, options); },
+    readPixels(options = {}, colorSlots = null) { return read(readGpuTargetPixels, options, colorSlots); },
     readDepthPixels(options = {}) { return read(readGpuTargetDepth, options); },
     async whenIdle() {
       exclusive();
@@ -576,9 +670,10 @@ export function createGpuRenderTarget(device, options = {}) {
     current = allocate(width, height, bytes);
     if (device.lost && typeof device.lost.then === 'function')
       device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
-    transferTargets.set(api, {device, exclusive, shape: transferShape, depthShape,
+    transferTargets.set(api, {owner: api, device, exclusive, shape: transferShape, depthShape,
       borrowDepth: callback => borrow(callback, 'depth'),
       borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex), validation: () => validation});
     return api;
   } catch (error) { disposed = true; release(); throw error; }
 }
+

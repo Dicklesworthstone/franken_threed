@@ -13,6 +13,11 @@
  * Native MRT inputs retain each ordered source color attachment, format and
  * sampler. All colors share the depth, budget and generation lifetime; the
  * WebGL UV replica continues to cover the primary color only.
+ * Registered native PassNode histories bind persistent current/previous color
+ * identities to frozen per-use attachment selections. Resolved and MSAA colors
+ * alternate independently while depth and non-history colors remain shared.
+ * Queued selections survive recognized source resize; every detached image is
+ * charged and retained until its readers and submitted work have finished.
  * Native point shadows use six square cube faces. Rendering selects one face,
  * while native depth sampling borrows all six layers without a UV replica.
  * Cube targets admit one sample and mip zero. Explicit face-aware color/depth
@@ -250,14 +255,25 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes) || typeof flipY !== 'boolean')
     fail('OPTIONS', 'Invalid target owner options');
   const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), nativeResizes = new WeakMap();
+  const historyGroups = new Map(), historyEntries = new Set(), nativePasses = new WeakMap();
+  const allEntries = () => new Set([...entries.values(), ...historyEntries, ...preserved]);
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
   function release(entry) {
-    if (entry.busy || entry.released) return;
+    if (entry.busy || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
     entry.released = true;
     try { entry._dispatcher?.dispose(); }
     finally {
-      entry.storage?.dispose(); entry.sample?.destroy(); entry.depthSample?.destroy();
+      const group = entry.historyGroup;
+      if (group) {
+        group.entries.delete(entry);
+        if (!group.entries.size) {
+          group.storage?.dispose(); allocatedBytes -= group.charged; group.charged = 0;
+          for (const texture of group.watched) texture.removeEventListener('dispose', group.onDispose);
+          if (historyGroups.get(group.target) === group) historyGroups.delete(group.target);
+        }
+      } else entry.storage?.dispose();
+      entry.sample?.destroy(); entry.depthSample?.destroy();
       allocatedBytes -= entry.charged; entry.charged = 0;
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
       entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = null;
@@ -272,11 +288,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     for (const texture of entry.shape.textures) texture.removeEventListener('dispose', entry.onDispose);
     entry.shape.depthTexture?.removeEventListener('dispose', entry.onDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
-    preserved.delete(entry);
+    preserved.delete(entry); historyEntries.delete(entry);
     release(entry);
   }
   function collect(entry) {
-    if (!entry.alive || !preserved.has(entry) || entry.references || entry.busy || entry.retirement) return;
+    if (!entry.alive || !preserved.has(entry) || entry.references || entry.busy || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.retirement) return;
     if (!entry.storage && !entry._dispatcher) { retire(entry); return; }
     // A sampled generation can have validation/fence observers after its last
     // submitted reader releases its lease. Let those observers finish before
@@ -291,12 +307,17 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   const sameColors = (a, b) => a.textures.length === b.textures.length && a.textures.every((texture, index) =>
     texture === b.textures[index] && a.colorFormats[index] === b.colorFormats[index]);
   const sameShape = (a, b) => a.key === b.key && sameColors(a, b) && a.depthTexture === b.depthTexture;
+  function historyShape(group, shape, base = group.shape) {
+    return shape.key === base.key && shape.depthTexture === base.depthTexture &&
+      shape.textures.length === group.pairs.length && shape.textures.every((texture, index) => group.pairs[index].includes(texture));
+  }
+  function retireHistory(group) { for (const entry of [...group.entries]) retire(entry); }
   function sourceDisposed(entry, event) {
     const resize = nativeResizes.get(entry.target);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
         entry.target.width === resize.width && entry.target.height === resize.height && entry.target.depth === resize.depth) {
       const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
-      if (sameColors(shape, entry.shape) && shape.depthTexture === entry.shape.depthTexture &&
+      if ((entry.historyGroup ? shape.textures.every((texture, index) => entry.historyGroup.pairs[index]?.includes(texture)) : sameColors(shape, entry.shape)) && shape.depthTexture === entry.shape.depthTexture &&
           shape.depthFormat === entry.shape.depthFormat &&
           shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
         resize.event = event;
@@ -305,12 +326,24 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         // both owners, even when no queued consumer still retains a lease.
         // Source texture identities stay unchanged across setSize(). Only
         // this recognized automatic resize can detach a usable generation.
-        entry.sourceShape = shape; preserved.add(entry);
-        if (entries.get(entry.target) === entry) entries.delete(entry.target);
-        collect(entry); return;
+        const group = entry.historyGroup;
+        if (group) {
+          group.sourceShape = shape;
+          if (historyGroups.get(entry.target) === group) historyGroups.delete(entry.target);
+          for (const member of group.entries) {
+            member.sourceShape = shape; preserved.add(member); historyEntries.delete(member);
+            if (entries.get(entry.target) === member) entries.delete(entry.target);
+          }
+          for (const member of group.entries) collect(member);
+        } else {
+          entry.sourceShape = shape; preserved.add(entry);
+          if (entries.get(entry.target) === entry) entries.delete(entry.target);
+          collect(entry);
+        }
+        return;
       }
     }
-    retire(entry);
+    if (entry.historyGroup) retireHistory(entry.historyGroup); else retire(entry);
   }
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
@@ -325,26 +358,92 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const shape = inspectThreeRenderTarget(target, three);
     const device = getDevice();
     if (device && shape.textures.length > 1) gpuTargets.inspectGpuRenderTargetColors(device, shape.colorFormats);
+    // Source registration outlives an allocation group: PassNode.setSize()
+    // disposes its old attachments before swapping and rendering the next pair.
+    if (!historyGroups.has(target) && nativePasses.has(target)) registerNativePass(nativePasses.get(target));
+    const group = historyGroups.get(target);
+    if (group) {
+      if (!historyShape(group, shape)) { retireHistory(group); fail('STALE', 'Pass history attachments changed outside their registered source lifecycle'); }
+      const entry = historyEntry(group, shape); entries.set(target, entry); return entry;
+    }
     let entry = entries.get(target);
     if (entry && !sameShape(entry.shape, shape)) { retire(entry); entry = null; }
     if (entry) return entry;
-    if (entries.size + preserved.size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
-    entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
+    entry = createEntry(target, shape);
+    entries.set(target, entry);
+    return entry;
+  }
+  function createEntry(target, shape) {
+    if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
+    const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
       references: 0, sourceShape: null, retirement: null,
       dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
     for (const texture of shape.textures) texture.addEventListener('dispose', entry.onDispose);
     shape.depthTexture?.addEventListener('dispose', entry.onDispose);
-    entries.set(target, entry);
     return entry;
+  }
+  function historyEntry(group, shape) {
+    const slots = Object.freeze(shape.textures.map((texture, index) => group.pairs[index].indexOf(texture)));
+    const key = slots.join(',');
+    let entry = group.variants.get(key);
+    if (entry?.alive) return entry;
+    entry = createEntry(group.target, shape);
+    entry.historyGroup = group; entry.colorSlots = slots;
+    group.variants.set(key, entry); group.entries.add(entry); historyEntries.add(entry);
+    return entry;
+  }
+  function registerNativePass(node) {
+    live();
+    const target = node.renderTarget, shape = inspectThreeRenderTarget(target, three);
+    const names = Object.keys(node._previousTextures ?? {});
+    if (!names.length) return;
+    if (shape.cube || shape.colors.some(color => color.mipLevelCount !== 1 || color.generateMipmaps))
+      fail('UNSUPPORTED', 'Native pass histories currently require 2D mip-zero color attachments');
+    nativePasses.set(target, node);
+    let group = historyGroups.get(target);
+    if (group && (!historyShape(group, shape) || group.node !== node)) {
+      retireHistory(group); group = null;
+    }
+    if (!group) {
+      const existing = entries.get(target);
+      if (existing && !sameShape(existing.shape, shape)) retire(existing);
+      group = {node, target, shape, pairs: shape.textures.map(texture => [texture]), variants: new Map(),
+        entries: new Set(), watched: new Set(), storage: null, charged: 0, sourceShape: null, busy: false, frame: null};
+      group.onDispose = () => retireHistory(group);
+      historyGroups.set(target, group);
+      if (existing?.alive) {
+        if (existing.sample || existing.depthSample) fail('UNSUPPORTED', 'Pass histories require native attachment sampling');
+        existing.historyGroup = group; existing.colorSlots = Object.freeze(shape.textures.map(() => 0));
+        group.entries.add(existing); historyEntries.add(existing); group.variants.set(existing.colorSlots.join(','), existing);
+        group.storage = existing.storage; group.charged = existing.charged; existing.charged = 0; existing.storage = null;
+      }
+    }
+    for (const name of names) {
+      const current = node._textures[name], previous = node._previousTextures[name], index = shape.textures.indexOf(current);
+      if (index < 0 || previous === current || previous?.isDepthTexture)
+        fail('SOURCE', 'Pass histories require distinct current and previous color textures');
+      const color = inspectThreeRenderTargetColor(target, three, previous);
+      if (color.key !== shape.colors[index].key)
+        fail('SOURCE', 'Current and previous pass color formats must match');
+      const pair = group.pairs[index];
+      if (pair.length === 1) pair.push(previous);
+      else if (!pair.includes(previous) || !pair.includes(current))
+        fail('STALE', 'Pass history texture identity changed outside its source swap');
+      for (const texture of pair) if (!group.watched.has(texture)) {
+        group.watched.add(texture); texture.addEventListener('dispose', group.onDispose);
+      }
+    }
+    capture(target);
   }
   function assertCurrent(entry) {
     live();
-    if (!entry?.alive || entries.get(entry.target) !== entry && !preserved.has(entry))
+    if (!entry?.alive || entries.get(entry.target) !== entry && !preserved.has(entry) && !historyEntries.has(entry))
       fail('STALE', 'Target was disposed or replaced before its queued use');
     const shape = inspectThreeRenderTarget(entry.target, three);
-    if (!sameShape(shape, preserved.has(entry) ? entry.sourceShape : entry.shape))
+    if (entry.historyGroup ? !historyShape(entry.historyGroup, shape, entry.historyGroup.sourceShape ?? entry.historyGroup.shape)
+      : !sameShape(shape, preserved.has(entry) ? entry.sourceShape : entry.shape))
       fail('STALE', 'Target configuration changed before its queued use');
     if (entry.error) throw entry.error;
     if (entry.storage?.failed) fail('GPU', 'Native target storage failed');
@@ -353,16 +452,33 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function budget(bytes) {
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Render targets exceed their shared byte budget');
   }
+  function allocationBytes(entry) {
+    const group = entry.historyGroup;
+    return group ? entry.shape.bytes + group.pairs.reduce((sum, pair, index) => sum +
+      (pair.length > 1 ? entry.shape.colors[index].colorBytes * (entry.shape.sampleCount === 4 ? 5 : 1) : 0), 0) - group.charged
+      : entry.storage ? 0 : entry.shape.bytes;
+  }
   function ensure(entry) {
     assertCurrent(entry);
-    if (entry.storage) return entry;
-    budget(entry.shape.bytes);
+    const group = entry.historyGroup;
+    const additional = allocationBytes(entry), needed = group ? group.charged + additional : entry.shape.bytes;
+    if (entry.storage && (!group || group.charged === needed)) return entry;
+    budget(additional);
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     const {width, height, format, colorFormats, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube} = entry.shape;
-    entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
-      sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube});
-    entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
+    if (group) {
+      group.storage ??= gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
+        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube});
+      if (group.charged !== needed)
+        group.storage.reserveColorHistory(group.pairs.flatMap((pair, index) => pair.length > 1 ? [index] : []));
+      allocatedBytes += needed - group.charged; group.charged = needed;
+      entry.storage = group.storage.selectColorSlots(entry.colorSlots);
+    } else {
+      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
+        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube});
+      entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
+    }
     // The readback helper consumes this session-shaped object. It copies the
     // original attachment, not the UV-oriented sampling replica.
     entry.session = {device, get width() { return width; }, get height() { return height; },
@@ -563,13 +679,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function copyTarget(source, destination, options, depth = false) {
     assertCurrent(source); assertCurrent(destination);
-    if (source === destination) fail('FEEDBACK', 'In-place target copies are not admitted');
+    if (source === destination || source.historyGroup && source.historyGroup === destination.historyGroup)
+      fail('FEEDBACK', 'In-place target copies are not admitted');
     if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
     const plan = depth
       ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destination.shape, options)
       : inspectGpuTargetCopy(source.shape, destination.shape, options);
     if (plan.empty) return false;
-    budget((source.storage ? 0 : source.shape.bytes) + (destination.storage ? 0 : destination.shape.bytes));
+    budget(allocationBytes(source) + allocationBytes(destination));
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
     if (depth) destination.depthDirty = true;
@@ -594,7 +711,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     try { return run(); } finally { nativeResizes.delete(target); }
   }
   return {
-    capture, ensure, assertCurrent, bindingsFor, retainGeneration,
+    capture, ensure, assertCurrent, bindingsFor, retainGeneration, registerNativePass,
     // Only exact retained ShadowNode/PassNode updates enter these scopes.
     // Public setSize()/dispose() outside the synchronous operation still
     // invalidate pending requests and readers, including older generations.
@@ -607,7 +724,16 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       live();
       if (!targetTexture(texture))
         fail('SOURCE', 'Expected a target-owned color or depth texture for native sampling');
-      const entry = capture(texture.renderTarget), device = getDevice();
+      let entry = capture(texture.renderTarget);
+      const group = entry.historyGroup, device = getDevice();
+      if (group && !texture.isDepthTexture && !entry.shape.textures.includes(texture)) {
+        const index = group.pairs.findIndex(pair => pair.includes(texture));
+        if (index < 0) fail('STALE', 'Texture is not a registered previous pass color');
+        const colors = entry.shape.colors.slice(), textures = entry.shape.textures.slice();
+        colors[index] = inspectThreeRenderTargetColor(entry.target, three, texture); textures[index] = texture;
+        entry = historyEntry(group, {...entry.shape, ...colors[0], colors, textures,
+          colorFormats: colors.map(color => color.format), bytes: entry.shape.bytes, key: entry.shape.key});
+      }
       const depth = texture.isDepthTexture === true, colorIndex = depth ? -1 : entry.shape.textures.indexOf(texture);
       if (depth ? entry.shape.depthTexture !== texture : colorIndex < 0)
         fail('STALE', 'Texture no longer belongs to its source target');
@@ -643,9 +769,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           fail('DEVICE', 'Captured native target belongs to another GPUDevice');
         if (entry.shape.cube && (!Number.isSafeInteger(device.limits?.maxTextureArrayLayers) || device.limits.maxTextureArrayLayers < 6))
           fail('DEVICE', 'Cube targets require capacity for six texture array layers');
-        if (entry.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
-        if (!seen.has(entry) && !entry.storage) bytes += entry.shape.bytes;
-        seen.add(entry);
+        const group = entry.historyGroup;
+        if (group?.frame) {
+          if (source.depth || group.frame.writes.has(texture)) fail('FEEDBACK', 'A pass cannot sample its active color or depth attachments');
+        } else if (entry.busy || group?.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
+        const owner = group ?? entry;
+        if (!seen.has(owner)) bytes += allocationBytes(entry);
+        seen.add(owner);
       }
       budget(bytes);
     },
@@ -658,7 +788,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         fail('CALLBACK', 'Expected captured native inputs and a synchronous submitted-use callback');
       const {entry, device} = sources[0];
       this.validateNativeTextures(sources);
-      if (sources.some(source => source.entry !== entry)) fail('SOURCE', 'A native borrow group must belong to one target');
+      const group = entry.historyGroup;
+      if (sources.some(source => group ? source.entry.historyGroup !== group : source.entry !== entry))
+        fail('SOURCE', 'A native borrow group must belong to one target allocation');
       const color = sources.some(source => !source.depth), depth = sources.some(source => source.depth);
       ensure(entry);
       if (entry.session.device !== device) fail('DEVICE', 'Native target storage belongs to another GPUDevice');
@@ -666,6 +798,26 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const textures = new Map(sources.map(source => [source.texture, source.depth ? nativeDepth : nativeColors[source.colorIndex]]));
         const result = callback(textures); assertCurrent(entry); return result;
       };
+      if (group) {
+        const historyInvoke = handles => {
+          const textures = new Map(sources.map(source => [source.texture, source.depth ? handles.depth
+            : source.entry.colorSlots[source.colorIndex] ? handles.historyColors[source.colorIndex] : handles.colors[source.colorIndex]]));
+          const result = callback(textures);
+          for (const source of sources) assertCurrent(source.entry);
+          if (result?.then) { Promise.resolve(result).catch(() => {}); fail('ASYNC_USE', 'History texture borrows cannot cross an await'); }
+          return result;
+        };
+        if (group.frame) return historyInvoke(group.frame.handles);
+        group.busy = true;
+        try { return group.storage.withAttachments((colors, depth, historyColors, withFrame) => {
+          group.readBorrow = {withFrame, reads: new Set(sources.map(source => source.texture))};
+          return historyInvoke({colors, depth, historyColors});
+        }); }
+        finally {
+          group.readBorrow = null; group.busy = false;
+          for (const member of group.entries) { if (!member.alive) release(member); else collect(member); }
+        }
+      }
       entry.busy = true;
       try {
         if (entry.shape.textures.length > 1) return entry.storage.withAttachments(invoke);
@@ -704,26 +856,36 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     },
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
-    get allocatedBytes() { return allocatedBytes; }, get size() { return entries.size + preserved.size; },
+    get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
     render(entry, callback, {mipLevel = 0, face = 0} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
       ensure(entry);
-      if (entry.busy) fail('REENTRANT', 'Cannot reenter a target submission');
-      budget(entry.storage.frameAllocationBytes(mipLevel, face));
+      const group = entry.historyGroup;
+      const borrowed = group?.readBorrow;
+      if (entry.busy || group?.busy && !borrowed || group?.frame) fail('REENTRANT', 'Cannot reenter a target submission');
+      if (borrowed && [...entry.shape.textures, entry.shape.depthTexture].some(texture => borrowed.reads.has(texture)))
+        fail('FEEDBACK', 'A pass cannot write an attachment held by its sampled inputs');
+      if (!borrowed) budget(entry.storage.frameAllocationBytes(mipLevel, face));
       const allocatedBefore = entry.storage.allocatedBytes;
       entry.busy = true; entry.dirty = true;
       // Higher private depth levels never modify the source's level-zero depth.
       if (mipLevel === 0) entry.depthDirty = true;
-      try { return entry.storage.withFrame((frame, texture) => { const result = callback(frame, texture); assertCurrent(entry); return result; }, {mipLevel, face}); }
+      const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots}) : entry.storage.withFrame;
+      try { return withFrame((frame, texture, handles) => {
+        if (group) group.frame = {handles, writes: new Set(entry.shape.textures)};
+        try { const result = callback(frame, texture); assertCurrent(entry); return result; }
+        finally { if (group) group.frame = null; }
+      }, {mipLevel, face}); }
       finally {
         const delta = entry.storage.allocatedBytes - allocatedBefore;
         entry.charged += delta; allocatedBytes += delta;
         entry.busy = false; if (!entry.alive) release(entry); else collect(entry);
+        if (group) for (const member of group.entries) { if (!member.alive) release(member); else collect(member); }
       }
     },
     async whenIdle() {
       live();
-      try { await Promise.all([...entries.values(), ...preserved].flatMap(entry =>
+      try { await Promise.all([...allEntries()].flatMap(entry =>
         entry.retirement ? [entry.retirement] : [entry.validation, entry.storage?.whenIdle(), entry._dispatcher?.whenIdle()]).concat([...retiring])); }
       catch (error) { throw terminal ?? error; }
       live();
@@ -731,7 +893,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const entry of [...entries.values(), ...preserved]) retire(entry);
+      for (const entry of allEntries()) retire(entry);
       pipelines.clear();
     },
   };

@@ -67,6 +67,57 @@ test('source owner readback sessions forward selected attachment metadata and na
   await assert.rejects(readGpuTargetPixels(entry.session, {colorIndex: 3}), {code: 'GPU_READBACK_ATTACHMENT'}); f.close();
 });
 
+test('queued public MRT transfers retain both physical color histories across a source pass swap', async () => {
+  const f = fixture(), r = f.renderer;
+  const source = target(['rgba8unorm', 'rgba16float']), destination = target(['rgba8unorm', 'r32float', 'rgba16float']);
+  const current = source.textures[1], previous = Object.assign(new T.Texture(), {
+    isRenderTargetTexture: true, renderTarget: source, type: current.type, format: current.format,
+    colorSpace: current.colorSpace, minFilter: current.minFilter, magFilter: current.magFilter,
+  });
+  // The fixture controls source descriptors, as in the other controller tests.
+  // These are the exact identity changes made by the pinned PassNode toggle;
+  // actual PassNode construction and shader updates have separate integration.
+  const pass = {renderTarget: source, _textures: {output: source.texture, history: current},
+    _previousTextures: {history: previous}};
+  f.owner.registerNativePass(pass);
+  const a = payload('rgba16float', 12, 17), b = payload('rgba16float', 12, 43);
+  const expectedA = bytes(a).slice(), expectedB = bytes(b).slice();
+  const writeA = r.writeRenderTargetPixelsAsync(source, a, {colorIndex: 1});
+  const readA = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  source.textures[1] = previous; pass._textures.history = previous; pass._previousTextures.history = current;
+  f.owner.registerNativePass(pass);
+  const writeB = r.writeRenderTargetPixelsAsync(source, b, {colorIndex: 1});
+  const readB = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  const copyB = r.copyRenderTargetPixelsAsync(source, destination, {sourceColorIndex: 1, colorIndex: 2});
+  const copied = r.readRenderTargetMipPixelsAsync(destination, 0, {colorIndex: 2});
+  a.fill(0); b.fill(0);
+  assert.equal(f.calls.textures.length, 0, 'acceptance does not allocate or overwrite either history');
+  f.ready();
+  await Promise.all([writeA, writeB, copyB]);
+  assert.deepEqual(bytes(await readA), expectedA); assert.deepEqual(bytes(await readB), expectedB);
+  assert.deepEqual(bytes(await copied), expectedB);
+  assert.notEqual(f.uploads[0].destination.texture, f.uploads[1].destination.texture);
+  assert.equal(f.copies[0].source.texture, f.uploads[1].destination.texture);
+  assert.equal(f.copies[0].destination.texture.format, 'rgba16float');
+  const producer = deferred(), output = new Uint16Array(48).fill(65535);
+  f.owner.capture(source).storage.withColorDestination(texture => {
+    assert.equal(texture, f.uploads[1].destination.texture, 'external producers use the captured secondary history');
+    const encoder = f.device.createCommandEncoder(), origin = {x: 0, y: 0, z: 0};
+    encoder.copyTextureToTexture({texture: f.copies[0].destination.texture, origin, mipLevel: 0},
+      {texture, origin, mipLevel: 0}, {width: 4, height: 3, depthOrArrayLayers: 1});
+    f.device.queue.submit([encoder.finish()]);
+  }, {colorIndex: 1, validation: producer.promise});
+  let settled = false;
+  const validatedRead = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1, output});
+  validatedRead.then(() => { settled = true; }, () => { settled = true; });
+  await flush();
+  assert.equal(settled, false); assert.ok(output.every(value => value === 65535));
+  producer.resolve(); assert.equal(await validatedRead, output); assert.deepEqual(bytes(output), expectedB);
+  assert.ok((await r.readRenderTargetMipPixelsAsync(source)).every(value => value === 0), 'primary attachment stays independent');
+  assert.deepEqual(f.events.slice(0, 6), ['upload', 'read', 'upload', 'read', 'copy', 'read']);
+  f.close();
+});
+
 test('queued upload, MRT draw, selected copy/read and later overwrite keep distinct submission histories', async () => {
   const f = fixture(), r = f.renderer, source = target(), destination = target();
   const original = payload('rgba16float', 12, 19), rendered = payload('rgba16float', 12, 37), later = payload('rgba16float', 12, 57);
