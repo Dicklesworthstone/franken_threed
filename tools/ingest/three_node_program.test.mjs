@@ -42,6 +42,90 @@ function dataTexture({linear = true, type = THREE.UnsignedByteType} = {}) {
   if (linear) texture.minFilter = texture.magFilter = THREE.LinearFilter;
   return texture;
 }
+function sourceFogBuilder(f) {
+  const builder = new THREE.WGSLNodeBuilder(f.object, f.renderer), fog = f.scene.fog;
+  builder.material = f.material; builder.context.material = f.material;
+  builder.scene = f.scene; builder.camera = f.camera;
+  // The retained NodeManager.updateFog graph is the shader oracle. Keep its
+  // references and group, with no local fog equation or named replacement.
+  if (fog && f.material.fog === true) {
+    const color = N.reference('color', 'color', fog).setGroup(N.renderGroup);
+    builder.fogNode = fog.isFogExp2
+      ? N.fog(color, N.densityFogFactor(N.reference('density', 'float', fog).setGroup(N.renderGroup)))
+      : N.fog(color, N.rangeFogFactor(N.reference('near', 'float', fog).setGroup(N.renderGroup),
+        N.reference('far', 'float', fog).setGroup(N.renderGroup)));
+  }
+  builder.build(); return builder;
+}
+function fogValues(d, packets, exponential) {
+  // The pinned render block starts with the projection and view matrices;
+  // NodeManager's color and range/density references follow those 32 words.
+  return uniformValues(packets, uniformMember(d, 'render')).slice(32, exponential ? 36 : 37);
+}
+for (const Fog of [THREE.Fog, THREE.FogExp2]) {
+  test(`${Fog.name} retains the exact source shader and live render-group fields`, t => {
+    const f = rig(t), exponential = Fog === THREE.FogExp2;
+    f.scene.fog = exponential ? new Fog(new THREE.Color(.125, .25, .5), .125)
+      : new Fog(new THREE.Color(.125, .25, .5), 1.5, 8.5);
+    const d = f.compile(), source = sourceFogBuilder(f);
+    assert.equal(d.vertex, source.vertexShader); assert.equal(d.fragment, source.fragmentShader);
+    const first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+    assert.deepEqual(fogValues(d, first, exponential), exponential ? [.125, .25, .5, .125] : [.125, .25, .5, 1.5, 8.5]);
+    f.scene.fog.color = new THREE.Color(.75, .625, .875);
+    if (exponential) f.scene.fog.density = .375;
+    else { f.scene.fog.near = 2.5; f.scene.fog.far = 10.5; }
+    assert.equal(f.compile(), d, 'color replacement and scalar edits retain the compiled source graph');
+    const second = f.owner.capture(d, {...f.context, renderId: 2});
+    assert.deepEqual(fogValues(d, second, exponential), exponential ? [.75, .625, .875, .375] : [.75, .625, .875, 2.5, 10.5]);
+    assert.deepEqual(first, saved, 'accepted draws own their earlier fog bytes');
+  });
+}
+test('native fog honors the source render-group version across repeated captures', t => {
+  const f = rig(t); f.scene.fog = new THREE.Fog(new THREE.Color(.125, .25, .5), 1.5, 8.5);
+  const d = f.compile(), first = f.owner.capture(d, f.context);
+  f.scene.fog.color.setRGB(.75, .625, .875); f.scene.fog.near = 2.5; f.scene.fog.far = 10.5;
+  const sameRender = f.owner.capture(d, f.context);
+  assert.deepEqual(fogValues(d, sameRender, false), fogValues(d, first, false));
+  const nextRender = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.deepEqual(fogValues(d, nextRender, false), [.75, .625, .875, 2.5, 10.5]);
+  assert.deepEqual(fogValues(d, first, false), [.125, .25, .5, 1.5, 8.5]);
+});
+test('native fog identity, kind, presence and material enable changes rebuild before draw updates', t => {
+  const f = rig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; });
+  let d = f.compile();
+  for (const change of [
+    () => { f.scene.fog = new THREE.Fog(new THREE.Color(.125, .25, .5), 1, 8); },
+    () => { f.scene.fog = f.scene.fog.clone(); },
+    () => { f.scene.fog = new THREE.FogExp2(new THREE.Color(.125, .25, .5), .25); },
+    () => { f.material.fog = false; },
+    () => { f.material.fog = true; },
+    () => { f.scene.fog = null; },
+  ]) {
+    change(); const previousUpdates = updates;
+    assert.throws(() => f.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(updates, previousUpdates, 'stale fog contexts reject before application updates');
+    const next = f.compile(); assert.notEqual(next, d); d = next;
+    const source = sourceFogBuilder(f);
+    assert.equal(d.fragment, source.fragmentShader);
+    f.owner.capture(d, {...f.context, renderId: updates + 1});
+  }
+});
+test('material fog:false excludes ordinary and authored scene fog from its native graph', t => {
+  const f = rig(t); f.material.fog = false; const d = f.compile();
+  f.scene.fog = new THREE.Fog(new THREE.Color(.125, .25, .5), 1, 8);
+  assert.equal(f.compile(), d); assert.equal(d.fragment, sourceFogBuilder(f).fragmentShader);
+  f.scene.fogNode = N.vec4(.5);
+  assert.equal(f.compile(), d); f.owner.capture(d, f.context);
+  f.material.fog = true;
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_FOG'});
+});
+test('native fog identity changes made by a source update cannot submit a stale graph', t => {
+  const f = rig(t); f.scene.fog = new THREE.Fog(0, 1, 8);
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { f.scene.fog = new THREE.FogExp2(0, .25); });
+  const d = f.compile();
+  assert.throws(() => f.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+});
 function pbrRig(t, Material = THREE.MeshStandardNodeMaterial, parameters = {}) {
   const f = rig(t), material = new Material(parameters);
   material.colorNode = f.tint; f.object.material = material;
@@ -1141,7 +1225,7 @@ for (const [name, change, code] of [
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
   ['custom renderer context', f => { f.renderer.contextNode = N.context({getOutput: output => output}); }, 'GRAPH'],
   ['spoofed instancing', f => { f.object.isInstancedMesh = true; }, 'OBJECT'],
-  ['fog', f => { f.scene.fog = new THREE.Fog(0, 1, 10); }, 'EFFECT'],
+  ['authored scene fog', f => { f.scene.fogNode = N.vec4(.5); }, 'FOG'],
 ]) test(`${name} is explicitly refused`, t => {
   const f = rig(t); change(f); assert.throws(f.compile, {code: `THREE_NODE_PROGRAM_${code}`});
 });

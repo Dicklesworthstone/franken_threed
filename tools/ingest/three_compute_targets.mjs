@@ -52,7 +52,8 @@ export function createThreeComputeTargets({targets, device, signal = null,
     const sampler = binding.isSampler && !binding.isSampledTexture;
     const layout = sampler ? {sampler: {type: source.sampler.compare !== undefined ? 'comparison'
       : source.sampleType === 'depth' || source.sampleType === 'unfilterable-float' ? 'non-filtering' : 'filtering'}}
-      : {texture: {sampleType: source.sampleType, viewDimension: source.viewDimension, multisampled: false}};
+      : {texture: {sampleType: source.sampleType, viewDimension: source.viewDimension,
+        multisampled: source.sampleData.primarySamples > 1}};
     return {source, sampler, layout};
   }
   function validate(snapshot) {

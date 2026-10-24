@@ -116,13 +116,22 @@ test('depth compilation prepares native views without a dispatch or a color mip 
   assert.equal(dispatches(r).length, 0); assert.equal(r.events.filter(e => e[0] === 'mips').length, 0);
   assert.equal(r.storages[0].depth.options.format, 'depth32float'); r.renderer.dispose();
 });
-test('invalid comparison functions, MSAA depth and writable depth fail before allocation', async () => {
-  for (const [change, code] of [[t => { t.depthTexture.compareFunction = 999; }, 'THREE_TARGET_SAMPLER'],
-    [t => { t.samples = 4; }, 'THREE_TARGET_UNSUPPORTED']]) {
-    const r = await rig(), target = depthTarget(); change(target);
-    assert.throws(() => r.renderer.compute(kernel([sampled(target.depthTexture)])), {code});
-    assert.equal(r.storages.length, 0); r.renderer.dispose();
-  }
+test('compute compilation sees four native depth samples alongside single-sample resolved color', async () => {
+  const r = await rig(), target = depthTarget(); target.samples = 4;
+  r.renderer.produce(target, 7, .625);
+  r.renderer.compute(kernel([sampled(target.depthTexture), sampled(target.texture)]));
+  const [, shader] = dispatches(r)[0], layouts = shader.bindGroupLayouts[0].entries;
+  assert.equal(layouts[0].texture.multisampled, true); assert.equal(layouts[0].texture.sampleType, 'depth');
+  assert.equal(layouts[1].texture.multisampled, false);
+  assert.deepEqual(r.events.filter(e => e[0] === 'sampleData').map(e => e[1]),
+    [{samples: 4, primarySamples: 4, isMSAA: false}, {samples: 4, primarySamples: 1, isMSAA: true}]);
+  assert.equal(r.targets.capture(target).depthSample, null);
+  await r.renderer.waitForGPU(); r.renderer.dispose();
+});
+test('invalid comparison functions and writable depth fail before allocation', async () => {
+  const invalid = await rig(), bad = depthTarget(); bad.depthTexture.compareFunction = 999;
+  assert.throws(() => invalid.renderer.compute(kernel([sampled(bad.depthTexture)])), {code: 'THREE_TARGET_SAMPLER'});
+  assert.equal(invalid.storages.length, 0); invalid.renderer.dispose();
   const r = await rig(), target = depthTarget();
   assert.throws(() => r.renderer.compute(kernel([{...sampled(target.depthTexture), store: true}])), {code: 'THREE_COMPUTE_TARGET_ACCESS'});
   assert.equal(r.storages.length, 0); r.renderer.dispose();

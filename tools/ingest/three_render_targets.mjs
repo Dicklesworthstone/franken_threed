@@ -111,9 +111,9 @@ export function inspectThreeRenderTarget(target, three) {
     if (typeof three.DepthTexture !== 'function' || !(depthTexture instanceof three.DepthTexture) ||
         depthTexture.isDepthTexture !== true || depthTexture.renderTarget !== target)
       fail('SOURCE', 'Expected the target-owned source DepthTexture; shared depth attachments are not admitted');
-    if (!target.depthBuffer || sampleCount !== 1 || target.useArrayDepthTexture || depthTexture.isArrayTexture ||
+    if (!target.depthBuffer || target.useArrayDepthTexture || depthTexture.isArrayTexture ||
         (!cube && depthTexture.isCubeTexture) || (depthTexture.image?.depth ?? 1) !== 1)
-      fail('UNSUPPORTED', 'Source depth sampling requires a single-sample depth attachment of the target dimension');
+      fail('UNSUPPORTED', 'Source depth sampling requires a depth attachment of the target dimension');
     if (cube) {
       if (typeof three.CubeDepthTexture !== 'function' || !(depthTexture instanceof three.CubeDepthTexture) ||
           depthTexture.isCubeDepthTexture !== true || depthTexture.isCubeTexture !== true || depthTexture.mapping !== three.CubeReflectionMapping)
@@ -452,6 +452,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function depthSampling(entry, texture) {
     assertCurrent(entry);
     if (entry.shape.cube) fail('UNSUPPORTED', 'Cube depth sampling requires the native cube binding, not a 2D replica');
+    if (entry.shape.sampleCount !== 1)
+      fail('UNSUPPORTED', 'Multisampled depth requires a native per-sample binding, not the WebGL float replica');
     if (texture.compareFunction != null)
       fail('UNSUPPORTED', 'Comparison depth sampling requires the native depth binding, not the WebGL float replica');
     if (entry.busy) fail('REENTRANT', 'Cannot sample depth during a target submission');
@@ -588,6 +590,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
       if (comparison && (!depth || texture.compareFunction == null))
         fail('SAMPLER', 'Comparison sampling requires a source depth texture with compareFunction');
+      if (comparison && entry.shape.sampleCount !== 1)
+        fail('SAMPLER', 'Multisampled depth supports native texel loads, not comparison sampling');
       // Native depth formats are depth bindings, not the WebGL bridge's R32F
       // replica. r186 forces ordinary depth samplers to nearest even when the
       // texture requests linear filtering. Comparison uses the source filters
@@ -598,7 +602,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         : colorSampler(entry, texture);
       const samples = entry.shape.sampleCount;
       return Object.freeze({entry, texture, device, depth, sampler: Object.freeze(descriptor), sampleType, viewDimension: entry.shape.viewDimension,
-        sampleData: Object.freeze({samples, primarySamples: 1, isMSAA: samples > 1})});
+        // r186 resolves color into its primary image. Depth retains every
+        // sample and the source builder selects its own textureLoad index.
+        sampleData: Object.freeze({samples, primarySamples: depth ? samples : 1, isMSAA: !depth && samples > 1})});
     },
     validateNativeTextures(sources) {
       live();

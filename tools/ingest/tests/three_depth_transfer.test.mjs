@@ -225,16 +225,37 @@ test('depth copies share renderer request limits with initialization and existin
   await f.renderer.initRenderTargetAsync(f.source); assert.equal(f.transfers.pendingRequests, 0); f.owner.dispose();
 });
 
-test('source depth profile stays single-sample and conversion is explicit on the extension only', async () => {
-  const f = fixture(), old = f.source.samples;
-  f.source.samples = 4;
-  assert.throws(() => inspectThreeRenderTarget(f.source, T), /single-sample/);
-  f.source.samples = old; f.destination.depthTexture.type = T.UnsignedIntType;
+test('source depth format conversion is explicit on the extension only', async () => {
+  const f = fixture(); f.destination.depthTexture.type = T.UnsignedIntType;
   await assert.rejects(f.renderer.copyTextureToTextureAsync(f.source.depthTexture, f.destination.depthTexture), code('FORMAT'));
   await assert.rejects(f.renderer.copyRenderTargetDepthPixelsAsync(f.source, f.destination), code('FORMAT'));
   assert.equal(f.textures.length, 0);
   await f.renderer.copyRenderTargetDepthPixelsAsync(f.source, f.destination, {allowFormatConversion: true});
   assert.equal(f.pipelines[0].desc.depthStencil.format, 'depth24plus'); f.owner.dispose();
+});
+
+test('source multisampled depth copies preserve all samples and readback selects an explicit sample', async () => {
+  const f = fixture(), a = f.source, b = f.destination; a.samples = b.samples = 4;
+  assert.equal(inspectThreeRenderTarget(a, T).sampleCount, 4);
+  for (const sampleIndex of [undefined, null, -1, 4, .5])
+    await assert.rejects(f.renderer.readRenderTargetDepthPixelsAsync(a, {sampleIndex}), code('UNSUPPORTED'));
+  assert.equal(f.textures.length, 0); assert.equal(f.transfers.pendingRequests, 0);
+  const values = Float32Array.from({length: a.width * a.height * 4}, (_, i) => i / 64);
+  f.depth(a).data.set(values);
+  await f.renderer.copyTextureToTextureAsync(a.depthTexture, b.depthTexture);
+  assert.deepEqual(f.depth(b).data, values);
+  for (let sampleIndex = 0; sampleIndex < 4; sampleIndex++) {
+    const pixels = await f.renderer.readRenderTargetDepthPixelsAsync(b, {sampleIndex});
+    assert.deepEqual([...pixels], Array.from({length: a.width * a.height}, (_, i) => values[i * 4 + sampleIndex]));
+  }
+  const single = new T.RenderTarget();
+  await assert.rejects(f.renderer.copyTextureToTextureAsync(a.depthTexture, single.depthTexture), code('SAMPLES'));
+  await assert.rejects(f.renderer.copyRenderTargetDepthPixelsAsync(single, b), code('SAMPLES'));
+  await f.renderer.copyRenderTargetDepthPixelsAsync(a, single, {sampleIndex: 2});
+  assert.deepEqual([...await f.renderer.readRenderTargetDepthPixelsAsync(single)],
+    Array.from({length: a.width * a.height}, (_, i) => values[i * 4 + 2]));
+  assert.equal(f.entry(a).depthSample, null); assert.equal(f.entry(b).depthSample, null);
+  await f.owner.whenIdle(); f.owner.dispose();
 });
 
 test('combined depth-stencil targets retain stencil and permit depth-only copies to private depth storage', async () => {

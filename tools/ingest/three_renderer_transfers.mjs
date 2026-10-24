@@ -266,9 +266,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     if (typeof value.flipY !== 'boolean' || ['maxBytes', 'maxInFlightBytes'].some(name =>
       value[name] !== undefined && (!Number.isSafeInteger(value[name]) || value[name] < 1)))
       fail('OPTIONS', 'Invalid renderer readback orientation or byte budget');
-    // Source DepthTexture residency currently admits single-sample storage.
-    if (depth && value.sampleIndex !== undefined && value.sampleIndex !== 0)
-      fail('UNSUPPORTED', 'Source depth readback requires sample zero');
+    if (depth) {
+      const sampleIndex = value.sampleIndex === undefined && entry.shape.sampleCount === 1 ? 0 : value.sampleIndex;
+      if (!Number.isSafeInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= entry.shape.sampleCount)
+        fail('UNSUPPORTED', 'Depth readback requires an explicit in-range sampleIndex for multisampled targets');
+    }
     const captured = Object.freeze({...value, x, y, width, height, mipLevel});
     return schedule([entry], signal, 0, combinedSignal => () => {
       renderer._targets.ensure(entry);

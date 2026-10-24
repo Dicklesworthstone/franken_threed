@@ -136,6 +136,14 @@ test('comparison depth attachments cannot silently enter the WebGL float replica
   owner.dispose(); gone(f);
 });
 
+test('multisampled depth stays native and cannot silently enter the WebGL float replica path', () => {
+  const f = fixture({}, {samples: 4}), entry = f.owner.capture(f.target);
+  assert.equal(entry.shape.sampleCount, 4);
+  assert.throws(() => f.owner.bindingsFor().get(f.depth), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(f.textures.length, 0); assert.equal(f.submissions.length, 0); assert.equal(entry.depthSample, null);
+  f.owner.dispose();
+});
+
 test('sampler and version edits do not regenerate depth or replace its storage', () => {
   const f = fixture(), {owner, depth, target} = f, map = owner.bindingsFor(), a = map.get(depth);
   depth.wrapS = T.RepeatWrapping; depth.wrapT = T.MirroredRepeatWrapping;
@@ -241,7 +249,7 @@ test('shared-depth ownership is refused rather than rendering into an unrelated 
 });
 
 test('unsupported depth profiles fail before allocating native attachments or mirrors', () => {
-  const edits = [t => t.depthBuffer = false, t => t.samples = 4, t => t.useArrayDepthTexture = true,
+  const edits = [t => t.depthBuffer = false, t => t.useArrayDepthTexture = true,
     t => t.depthTexture.type = T.UnsignedShortType, t => t.depthTexture.type = 999,
     t => t.depthTexture.format = T.DepthStencilFormat, t => t.depthTexture.compareFunction = 999,
     t => t.depthTexture.generateMipmaps = true, t => t.depthTexture.mipmaps = [{}],

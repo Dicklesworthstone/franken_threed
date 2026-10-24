@@ -159,6 +159,64 @@ test('antialiasing is inherited by source color-only passes without silently red
   assert.ok(textures(output).some(view => view.texture === source.desc.colorAttachments[0].resolveTarget.texture));
 });
 
+test('default antialiased scene passes retain four depth samples and source depth-load shaders', async t => {
+  const f = fixture(t, {antialias: true}); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), pipeline = new T.RenderPipeline(f.renderer,
+    N.vec4(pass.getTextureNode().rgb.mul(pass.getLinearDepthNode().oneMinus()), 1));
+  pipeline.render(); await drain(f.renderer); await f.renderer.waitForGPU();
+  const source = commands(f.device).find(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')));
+  const depth = source.desc.depthStencilAttachment.view.texture, output = nativeDraws(f.device).at(-1);
+  assert.equal(pass.renderTarget.samples, 4); assert.equal(depth.sampleCount, 4);
+  assert.equal(source.desc.colorAttachments[0].resolveTarget.texture.sampleCount, 1);
+  assert.ok(textures(output).some(view => view.texture === depth && view.aspect === 'depth-only'));
+  const layouts = [...output.groups.values()].flatMap(({group}) => group.layout.entries);
+  assert.ok(layouts.some(entry => entry.texture?.sampleType === 'depth' && entry.texture.multisampled === true));
+  assert.match(shader(output), /texture_depth_multisampled_2d/);
+  assert.match(shader(output), /textureLoad\(/); assert.doesNotMatch(shader(output), /textureSampleCompare|textureGather/);
+  const entry = f.renderer._targets.capture(pass.renderTarget);
+  assert.equal(entry.depthSample, null); assert.equal(entry.depthCopies, 0);
+  assert.deepEqual(f.renderer.backend.utils.getTextureSampleData(pass.renderTarget.depthTexture),
+    {samples: 4, primarySamples: 4, isMSAA: false});
+  assert.deepEqual(f.renderer.backend.utils.getTextureSampleData(pass.renderTarget.texture),
+    {samples: 4, primarySamples: 1, isMSAA: true});
+});
+
+test('depth texture replacements recompile the source graph when the primary sample count changes', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const targets = [0, 4].map(samples => new T.RenderTarget(64, 48,
+    {samples, depthTexture: new T.DepthTexture(64, 48, T.FloatType)}));
+  for (const target of targets) {
+    f.renderer.setRenderTarget(target); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  }
+  f.renderer.setRenderTarget(null);
+  const depth = N.texture(targets[0].depthTexture), material = new T.NodeMaterial();
+  material.fragmentNode = N.vec4(depth, depth, depth, 1);
+  const quad = new T.QuadMesh(material);
+  quad.render(f.renderer); await drain(f.renderer);
+  depth.value = targets[1].depthTexture;
+  quad.render(f.renderer); await drain(f.renderer);
+  const outputs = nativeDraws(f.device).slice(-2);
+  assert.match(shader(outputs[0]), /texture_depth_2d/);
+  assert.match(shader(outputs[1]), /texture_depth_multisampled_2d/);
+  assert.deepEqual(outputs.map(draw => textures(draw).find(view => view.texture.format.startsWith('depth')).texture.sampleCount), [1, 4]);
+});
+
+test('multisampled depth refuses filtered operations before child updates or GPU work', async t => {
+  const operations = [node => node.compare(.5), node => node.gather(0), node => node.bias(1),
+    node => node.grad(N.vec2(1, 0), N.vec2(0, 1)), node => {
+      node.value.minFilter = T.LinearFilter; return node.level(0);
+    }];
+  for (const operation of operations) {
+    const f = fixture(t, {antialias: true}); await f.renderer.init(); let updates = 0;
+    f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(1, 0, 0); });
+    const pass = N.pass(f.scene, f.camera, {samples: 4}), depth = pass.getTextureNode('depth');
+    depth.value.compareFunction = T.LessEqualCompare;
+    const pipeline = new T.RenderPipeline(f.renderer, N.vec4(operation(depth)));
+    assert.throws(() => pipeline.render(), {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+    assert.equal(updates, 0); assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  }
+});
+
 test('throwing pass capture restores source scene, camera and renderer state', async t => {
   const f = fixture(t); await f.renderer.init();
   const failure = new Error('pass update failed'), target = new T.RenderTarget(32, 24);

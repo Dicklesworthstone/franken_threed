@@ -11,7 +11,8 @@
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
- * Directional/spot/point Basic/PCF shadows and the registered SunLight cascade lifecycle
+ * Source Fog/FogExp2 and directional/spot/point Basic/PCF shadows retain their
+ * native material composition. The registered SunLight cascade lifecycle
  * retain source shadow nodes and ShadowMaterial receivers. Single-output source
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
  * Transmission, writable/atomic storage, VSM shadows, clipping and MRT fail explicitly.
@@ -74,7 +75,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode]]);
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
-  const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap();
+  const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
   const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
   const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
   const materialViews = new WeakMap();
@@ -498,14 +499,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         (texture.magFilter !== three.NearestFilter ||
          ![three.NearestFilter, three.NearestMipmapNearestFilter].includes(texture.minFilter)))
       fail('TEXTURE', 'Native float32 texture filtering requires the float32-filterable feature; nearest texel reads remain available');
-    const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension || layout.texture.multisampled))
-      fail('TEXTURE', 'Native graphics texture bindings require a matching single-sampled color or depth view');
     if (typeof renderer.backend?.utils?.getTextureSampleData !== 'function')
       fail('SOURCE', 'The native renderer must provide source texture sample metadata');
-    if (renderer.backend.utils.getTextureSampleData(texture).primarySamples !== 1)
-      fail('TEXTURE', 'Native graphics texture bindings require resolved color views');
-    return layout?.texture ?? {sampleType, viewDimension, multisampled: false};
+    const {primarySamples} = renderer.backend.utils.getTextureSampleData(texture), multisampled = primarySamples > 1;
+    if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
+      fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
+    const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
+    if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
+        (layout.texture.multisampled === true) !== multisampled))
+      fail('TEXTURE', 'Native graphics texture bindings must match the source dimension and sample count');
+    return layout?.texture ?? {sampleType, viewDimension, multisampled};
   }
   function comparison(node, texture = node.value) {
     return texture.isDepthTexture === true && texture.compareFunction !== null &&
@@ -531,6 +534,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isRenderTargetTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true,
         texture.isCubeTexture === true ? texture.mapping : null,
+        renderer.backend.utils.getTextureSampleData(texture).primarySamples,
         texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
         node.isSampleCompare?.() === true, texture.isDepthTexture === true && texture.compareFunction !== null
           ? renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE) : null,
@@ -542,6 +546,42 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const maps = [...MATERIAL_MAPS].filter(key => material[key]?.isTexture);
     return JSON.stringify([maps, material.normalMapType,
       textureSignature(maps.map(key => ({value: material[key]})))]);
+  }
+  function sourceFog(material, {scene} = {}) {
+    // NodeMaterial.setupOutput applies fog only for the exact enabled flag.
+    // An authored scene fog graph has a separate context contract; never omit
+    // it silently or replace it with the ordinary scene.fog fallback.
+    if (material.fog !== true) return null;
+    if (scene?.fogNode) fail('FOG', 'Authored scene.fogNode graphs require an explicit native fog context');
+    const fog = scene?.fog;
+    if (fog == null) return null;
+    const linear = Object.getPrototypeOf(fog) === three.Fog.prototype,
+      exponential = Object.getPrototypeOf(fog) === three.FogExp2.prototype;
+    if (!(linear && fog.isFog === true && !fog.isFogExp2 ||
+        exponential && fog.isFogExp2 === true && !fog.isFog) ||
+        !(fog.color instanceof three.Color) || fog.color.isColor !== true)
+      fail('FOG', 'Native scene fog requires an ordinary source Fog/FogExp2 and Color');
+    return fog;
+  }
+  function fogSignature(material, context) {
+    const fog = sourceFog(material, context);
+    return JSON.stringify([material.fog === true, sourceId(fog), fog ? fog.isFogExp2 ? 'exp2' : 'linear' : null]);
+  }
+  function fogNodeFor(fog) {
+    if (!fog) return null;
+    const exponential = fog.isFogExp2 === true, previous = fogNodes.get(fog);
+    if (previous?.exponential === exponential) return previous.node;
+    // Retain NodeManager.updateFog's exact source graph and render group. Its
+    // references read live source fields through NodeFrame; only graph identity
+    // and kind belong in the program key, never color/range/density values.
+    const {reference, renderGroup} = three.TSL;
+    const color = reference('color', 'color', fog).setGroup(renderGroup);
+    const node = exponential
+      ? three.TSL.fog(color, three.TSL.densityFogFactor(reference('density', 'float', fog).setGroup(renderGroup)))
+      : three.TSL.fog(color, three.TSL.rangeFogFactor(reference('near', 'float', fog).setGroup(renderGroup),
+        reference('far', 'float', fog).setGroup(renderGroup)));
+    fogNodes.set(fog, {exponential, node});
+    return node;
   }
   function inspect(material, object, context = {}) {
     live();
@@ -568,8 +608,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspectMorphs(object);
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
       fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
-    if ((scene?.fog && material.fog !== false) || material.clippingPlanes?.length || renderer.clippingPlanes?.length)
-      fail('EFFECT', 'Native node graph fog and clipping require their own shader context');
+    sourceFog(material, context);
+    if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
+      fail('EFFECT', 'Native node graph clipping requires its own shader context');
     if (material.wireframe || material.alphaHash || material.alphaToCoverage)
       fail('RASTER', 'Native node graph wireframe, hashed alpha and alpha-to-coverage are not admitted');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
@@ -623,7 +664,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // an empty placeholder image. Only real native bindings need residency;
       // authored graph inputs were already inspected before construction.
       if (boundTextures === null || boundTextures.has(node.value)) {
-        inspectTexture(node.value);
+        const layout = inspectTexture(node.value);
+        if (layout.multisampled && (node.isSampleCompare?.() === true || node.biasNode != null ||
+            node.gradNode != null || node.gatherNode != null || node.sampler !== false && node.levelNode != null &&
+            (node.value.minFilter === three.LinearFilter || node.value.magFilter === three.LinearFilter)))
+          fail('TEXTURE', 'Multisampled depth supports source texel loads without comparison, gather, gradients, bias or filtered levels');
         if (node.isSampleCompare?.() === true && (!node.value.isDepthTexture || node.value.compareFunction === null || !node.sampler))
           fail('TEXTURE', 'Native comparison sampling requires an attached depth texture with a comparison function');
       }
@@ -664,7 +709,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     if (node.isOutputStructNode || node.isMRTNode) fail('MRT', 'Native node graphs currently write one color attachment');
   }
-  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null) {
+  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -672,7 +717,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       material.alphaTest > 0, material.depthWrite, material.depthTest, material.lights,
       object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
-      instanceSignature, skinSignature, morphSignature, materialMapSignature(material),
+      instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
@@ -697,7 +742,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object);
-    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature), byMaterial = cache.get(object);
+    const fogKey = fogSignature(preparedMaterial, context);
+    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey), byMaterial = cache.get(object);
     const previous = byMaterial?.get(material);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
@@ -717,6 +763,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (lightsNode) builder.lightsNode = lightsNode;
     const environmentNode = environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
+    builder.fogNode = fogNodeFor(sourceFog(preparedMaterial, context));
     try { builder.build(); }
     catch (cause) {
       if (cause instanceof ThreeNodeProgramError) throw cause;
@@ -725,6 +772,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertInstances(object, instanceSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
+    if (fogSignature(material, context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.
@@ -848,7 +896,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
-      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, pmremNodes, pmremSignature: pmremKey,
+      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
@@ -982,6 +1030,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (group.updateType === 'object' || history.version !== group.version) {
       binding.update();
       const array = binding.buffer, bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+      if (binding.isNodeUniformsGroup && bytes.byteLength !== byteLength)
+        fail('CHANGED', 'Native node uniform layout changed during its update');
       if (binding.updateRanges.length === 0) history.bytes.set(bytes);
       else for (const {start, count} of binding.updateRanges)
         history.bytes.set(bytes.subarray(start * 4, (start + count) * 4), start * 4);
@@ -996,9 +1046,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (inspectThreePipelineContext(three, renderer, state.material, object) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
   }
+  function checkFog(state, context) {
+    if (fogSignature(state.material, {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
+      fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
+  }
   function checkCapture(state, context) {
     const object = context.object ?? state.object;
     checkPipelineContext(state, object);
+    checkFog(state, context);
     checkMaterialMaps(state);
     checkLights(state);
     assertInstances(object, state.instanceSignature);
@@ -1036,6 +1091,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       assertInstances(object, state.instanceSignature);
       assertSkinning(object, state.skinSignature);
       assertMorphs(object, state.morphSignature);
+      checkFog(state, context);
       checkAttributes(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
@@ -1052,20 +1108,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkUniformBuffers(state);
       checkAttributes(state);
       checkPipelineContext(state, object);
+      checkFog(state, context);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {
         const layout = descriptor.groups[index], packet = new Uint8Array(layout.byteLength);
         for (const member of layout.uniforms) {
           const binding = group.bindings[member.binding];
-          if (binding.isNodeUniformBuffer) packet.set(readUniformBuffer(binding, member.byteLength), member.offset);
-          else {
-            binding.update();
-            const buffer = binding.buffer;
-            if (buffer.byteLength !== member.byteLength) fail('CHANGED', 'Native node uniform layout changed during its update');
-            packet.set(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength), member.offset);
-            binding.clearUpdateRanges();
-          }
+          // Both source arrays and scalar/vector groups obey their group
+          // version. Fog shares the camera's render group, which must keep its
+          // accepted bytes until the source render update advances that group.
+          packet.set(readUniformBuffer(binding, member.byteLength), member.offset);
         }
         return packet;
       });

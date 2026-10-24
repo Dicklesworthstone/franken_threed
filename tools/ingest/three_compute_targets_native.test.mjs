@@ -109,12 +109,22 @@ test('joint native sampling requires explicit depth usage and validates callback
   suspended.dispose(); r.dispose();
 });
 test('native four-sample depth remains multisampled while color is resolved, without depth conversion', async () => {
-  const r = await rig(), owner = r.create({sampleDepth: true, sampleCount: 4});
-  owner.withSampledTextures((color, depth) => {
-    assert.equal(color.descriptor.sampleCount, 1); assert.equal(depth.descriptor.sampleCount, 4);
-    assert.equal(color.descriptor.usage & 4, 4); assert.equal(depth.descriptor.usage & 4, 4);
+  const r = await rig(), target = depthTarget(); target.samples = 4;
+  const color = r.adapter.captureBinding(sampled(target.texture)), depth = r.adapter.captureBinding(sampled(target.depthTexture));
+  assert.deepEqual(plain(r.adapter.sampleData(target.texture)), {samples: 4, primarySamples: 1, isMSAA: true});
+  assert.deepEqual(plain(r.adapter.sampleData(target.depthTexture)), {samples: 4, primarySamples: 4, isMSAA: false});
+  assert.deepEqual(plain(r.adapter.layout(depth)), {texture: {sampleType: 'depth', viewDimension: '2d', multisampled: true}});
+  target.depthTexture.compareFunction = THREE.LessEqualCompare;
+  assert.throws(() => r.adapter.captureBinding({...sampler(target.depthTexture), comparison: true}), {code: 'THREE_TARGET_SAMPLER'});
+  assert.equal(r.textures.length, 0);
+  r.adapter.withDispatch([color, depth], () => {
+    const nativeColor = r.adapter.resolve(color).texture, nativeDepth = r.adapter.resolve(depth).texture;
+    assert.equal(nativeColor.descriptor.sampleCount, 1); assert.equal(nativeDepth.descriptor.sampleCount, 4);
+    assert.equal(nativeColor.descriptor.usage & 4, 4); assert.equal(nativeDepth.descriptor.usage & 4, 4);
+    assert.equal(r.adapter.resolve(depth).descriptor.aspect, 'depth-only');
   });
-  assert.equal(r.textures.length, 3); owner.dispose(); r.dispose();
+  assert.equal(r.textures.length, 3); assert.equal(r.targets.capture(target).depthSample, null);
+  await r.adapter.whenIdle(); r.dispose();
 });
 test('source retirement during a real joint native borrow releases both attachments only after unwinding', async () => {
   const r = await rig(), target = depthTarget(), color = r.adapter.captureBinding(sampled(target.texture)), depth = r.adapter.captureBinding(sampled(target.depthTexture));

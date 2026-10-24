@@ -10,6 +10,11 @@ function drive(T, renderer, pipeline, update = () => {}) {
 }
 
 export const nativePipelineScenarios = {
+  native_pipeline_msaa_depth(T, renderer) {
+    if (renderer.samples !== 4) throw new Error('The MSAA depth case requires the source antialias constructor');
+    // Both source scene passes inherit the renderer's real default4x sample count.
+    return nativePipelineScenarios.native_pipeline_passes(T, renderer);
+  },
   native_pipeline_output(T, renderer) {
     const N = T.TSL, gain = N.uniform(.8), p = N.uv();
     renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = .9;
