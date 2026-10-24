@@ -16,6 +16,9 @@
  * Frames expose colorViews/resolveTargets, retaining their primary aliases.
  * withAttachments borrows all resolved colors and optional sampled depth at once;
  * withTexture's colorIndex selects one color. Every attachment shares retirement.
+ * readPixels/writePixels also accept colorIndex. copyFrom selects independent
+ * sourceColorIndex/colorIndex attachments; all default to zero and preserve
+ * the selected format without conversion, including resolved MSAA sources.
  * Combined depth/stencil formats expose both aspects in frame.depthView. Sample
  * depth with a depth-only view; depth32float-stencil8 requires its device feature.
  * R/RG/RGBA32F storage stays full precision. Its mipmaps use textureLoad-based
@@ -189,7 +192,7 @@ export function createGpuRenderTarget(device, options = {}) {
     if (requestedMipLevels > maximum) fail('SIZE', 'mipLevelCount exceeds the target extent');
     return requestedMipLevels ?? (generateMipmaps ? maximum : 1);
   };
-  const transferShape = () => ({width, height, format, sampleCount, mipLevelCount: levels(width, height), cube});
+  const transferShape = () => ({width, height, format, colorFormats, sampleCount, mipLevelCount: levels(width, height), cube});
   const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth, cube});
   const retired = new Set(), readbacks = new Set();
   let rejectStopped;
@@ -470,7 +473,7 @@ export function createGpuRenderTarget(device, options = {}) {
       busy = true;
       try {
         current.used = true; current.mipsDirty = true;
-        checked(() => device.queue.writeTexture({texture: current.color, mipLevel: 0, origin: plan.origin},
+        checked(() => device.queue.writeTexture({texture: current.colors[plan.colorIndex], mipLevel: 0, origin: plan.origin},
           upload.data, upload.layout, plan.size));
         live(); colorUploads++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }
@@ -491,9 +494,9 @@ export function createGpuRenderTarget(device, options = {}) {
         other.borrow(texture => checked(() => {
           const encoder = device.createCommandEncoder({label: label + ' color copy'});
           encoder.copyTextureToTexture({texture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
-            {texture: current.color, mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+            {texture: current.colors[plan.colorIndex], mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
           device.queue.submit([encoder.finish()]);
-        }));
+        }), plan.sourceColorIndex);
         // A source mip-generation/upload error must also fail the dependent
         // copy, even if its own copy error scope happened to validate first.
         validation = Promise.all([validation, other.validation()]).then(() => {});
@@ -553,7 +556,7 @@ export function createGpuRenderTarget(device, options = {}) {
       device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     transferTargets.set(api, {device, exclusive, shape: transferShape, depthShape,
       borrowDepth: callback => borrow(callback, 'depth'),
-      borrow: callback => borrow(callback, 'color'), validation: () => validation});
+      borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex), validation: () => validation});
     return api;
   } catch (error) { disposed = true; release(); throw error; }
 }

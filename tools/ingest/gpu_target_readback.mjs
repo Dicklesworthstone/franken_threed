@@ -6,12 +6,16 @@
  * half-float values remain their original Uint16 bit patterns. Cube reads require
  * an explicit face (0..5); 2D reads accept only face zero, which is the default.
  * Selection is captured before submission, independently of the rendering face.
+ * colorIndex selects a resolved MRT attachment; its own format controls the
+ * output type, component count, channel conversion and shared byte charge.
  * Scalar/vector
  * targets return one/two components per pixel, without inventing RGBA channels.
  * maxBytes bounds each staging buffer. maxInFlightBytes bounds shared per-device
  * staging plus internally allocated output for all unfinished reads. At most 64
  * reads may be in flight per device; budget failures are retryable after drain.
  */
+import {gpuTargetColorFormat} from './gpu_target_transfer.mjs';
+
 export class GpuTargetReadbackError extends Error {
   constructor(code, message) {
     super(`GPU_READBACK_${code}: ${message}`);
@@ -69,13 +73,14 @@ function reserve(state, bytes, limit) {
   };
 }
 
-export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height, mipLevel = 0, face, flipY = false, output,
+export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height, mipLevel = 0, colorIndex = 0, face, flipY = false, output,
   signal, maxBytes = 64 * 1024 * 1024, maxInFlightBytes = 128 * 1024 * 1024} = {}) {
   if (!session || typeof session.withTexture !== 'function') fail('SOURCE', 'Expected an offscreen session');
   if (session.disposed || session.failed) fail('SOURCE', 'Offscreen session is no longer usable');
   for (const value of [session.width, session.height])
     if (!Number.isSafeInteger(value) || value < 0) fail('SOURCE', 'Expected finite integer target dimensions');
   const diagnostics = session.diagnostics;
+  const format = gpuTargetColorFormat(diagnostics?.target ?? diagnostics, colorIndex, fail);
   face = readbackFace(diagnostics?.target ?? diagnostics, face);
   let mipLevelCount = diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
   // Suspended owners have no allocation, but still admit an empty base-level read.
@@ -95,7 +100,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
   if (x > mipWidth - width || y > mipHeight - height) fail('REGION', 'Readback region exceeds the target');
   if (typeof flipY !== 'boolean' || ![maxBytes, maxInFlightBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Invalid readback options');
-  const layout = FORMATS.get(diagnostics?.target?.format ?? diagnostics?.format);
+  const layout = FORMATS.get(format);
   if (!layout) fail('FORMAT', 'Readback requires RGBA/BGRA8, RGBA16F, or R/RG/RGBA32F color storage');
   const [Type, components, bgra] = layout;
   const rowBytes = width * components * Type.BYTES_PER_ELEMENT, bytesPerRow = Math.ceil(rowBytes / 256) * 256;
@@ -128,6 +133,8 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
     const result = output ?? new Type(elements);
     let validation, error;
     session.withTexture(texture => {
+      if (colorIndex !== 0 && texture.format !== format)
+        fail('SOURCE', 'Borrowed color attachment does not match its selected format');
       device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
       try {
         buffer = device.createBuffer({label: 'Render target pixel readback', size, usage: 1 | 8});
@@ -142,7 +149,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
         if (cause) fail('GPU', cause.message ?? 'GPU rejected the readback copy');
       });
       validation.catch(() => {});
-    });
+    }, {colorIndex});
     if (error) throw error;
     if (!buffer) fail('SOURCE', 'Target storage was suspended before the copy');
     await Promise.race([Promise.all([validation, buffer.mapAsync(1)]), stopped]);

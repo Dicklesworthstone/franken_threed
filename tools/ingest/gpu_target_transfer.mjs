@@ -6,6 +6,8 @@
  * color-space conversion, blending, resizing or an MSAA destination resolve.
  * Cube endpoints require explicit face/sourceFace indices; every operation
  * addresses one 2D face, never the whole cube or an implicit active face.
+ * colorIndex/sourceColorIndex select independent MRT attachments, defaulting to
+ * zero. Their formats, not the primary attachment, determine layouts and budgets.
  */
 export class GpuTargetTransferError extends Error {
   constructor(code, message) {
@@ -32,8 +34,20 @@ function options(value, allowed) {
       fail('OPTIONS', `Unknown or accessor-backed transfer option: ${String(key)}`);
   }
 }
-function layout(shape) {
-  const value = FORMATS.get(shape?.format);
+/** Select before validating bytes or allocating anything. Owners supply an ordered
+ * colorFormats vector; legacy single-color sessions need only format. Readback
+ * supplies its error factory so admission retains the caller's error domain.
+ */
+export function gpuTargetColorFormat(shape, colorIndex = 0, reject = fail) {
+  const formats = shape?.colorFormats;
+  if (formats !== undefined && (!Array.isArray(formats) || !formats.length || formats[0] !== shape.format))
+    reject('FORMAT', 'Expected ordered color formats retaining the primary format');
+  if (!Number.isSafeInteger(colorIndex) || colorIndex < 0 || colorIndex >= (formats?.length ?? 1))
+    reject('ATTACHMENT', 'Color attachment index is out of range');
+  return formats === undefined ? shape?.format : formats[colorIndex];
+}
+function layout(shape, colorIndex = 0) {
+  const value = FORMATS.get(gpuTargetColorFormat(shape, colorIndex));
   if (!value) fail('FORMAT', 'Expected RGBA/BGRA8, RGBA16F or R/RG/RGBA32F color storage');
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
@@ -59,8 +73,9 @@ function budget(bytes, maxBytes) {
  * GPUQueue.writeTexture does not have the buffer-copy row alignment constraint.
  */
 export function inspectGpuTargetWrite(shape, data, value = {}) {
-  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes', 'face']);
-  const [Type, components, bgra] = layout(shape), pixelBytes = Type.BYTES_PER_ELEMENT * components;
+  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes', 'face', 'colorIndex']);
+  const {colorIndex = 0} = value;
+  const [Type, components, bgra] = layout(shape, colorIndex), pixelBytes = Type.BYTES_PER_ELEMENT * components;
   const face = transferFace(shape, value.face, 'face');
   if (shape.sampleCount !== 1) fail('SAMPLES', 'Color uploads require a single-sample destination');
   const {x = 0, y = 0, width = shape.width - x, height = shape.height - y, offset = 0,
@@ -80,7 +95,7 @@ export function inspectGpuTargetWrite(shape, data, value = {}) {
   // Limit the view passed to writeTexture: a tiny region must not snapshot an
   // arbitrarily large unused tail of the caller's underlying allocation.
   const bytes = empty ? null : new Uint8Array(data.buffer, data.byteOffset + offset, requiredBytes);
-  return {empty, data: bytes, bytesPerRow, rowBytes, packedBytes, flipY, bgra,
+  return {empty, colorIndex, data: bytes, bytesPerRow, rowBytes, packedBytes, flipY, bgra,
     origin: {x, y: flipY ? shape.height - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
 }
@@ -108,11 +123,13 @@ export function gpuTargetWriteData(plan) {
  * are subsequently derived from level zero, never overwritten by stale levels.
  */
 export function inspectGpuTargetCopy(source, destination, value = {}) {
-  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face']);
-  const [Type, components] = layout(source); layout(destination);
+  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
+  const {sourceColorIndex = 0, colorIndex = 0} = value;
+  const [Type, components] = layout(source, sourceColorIndex); layout(destination, colorIndex);
   const sourceFace = transferFace(source, value.sourceFace, 'sourceFace');
   const face = transferFace(destination, value.face, 'face');
-  if (source.format.replace(/-srgb$/, '') !== destination.format.replace(/-srgb$/, ''))
+  if (gpuTargetColorFormat(source, sourceColorIndex).replace(/-srgb$/, '') !==
+      gpuTargetColorFormat(destination, colorIndex).replace(/-srgb$/, ''))
     fail('FORMAT', 'Texture copies require copy-compatible color formats');
   if (destination.sampleCount !== 1) fail('SAMPLES', 'Color copies require a single-sample destination');
   const {sourceX = 0, sourceY = 0, x = 0, y = 0, sourceMipLevel = 0, flipY = false,
@@ -127,7 +144,7 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
   region(sw, sh, sourceX, sourceY, width, height); region(destination.width, destination.height, x, y, width, height);
   if (typeof flipY !== 'boolean') fail('OPTIONS', 'flipY must be boolean');
   budget(width * height * components * Type.BYTES_PER_ELEMENT, maxBytes);
-  return {empty: width === 0 || height === 0, sourceMipLevel,
+  return {empty: width === 0 || height === 0, sourceMipLevel, sourceColorIndex, colorIndex,
     sourceOrigin: {x: sourceX, y: flipY ? sh - sourceY - height : sourceY, z: sourceFace},
     destinationOrigin: {x, y: flipY ? destination.height - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
