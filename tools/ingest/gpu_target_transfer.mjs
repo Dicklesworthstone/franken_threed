@@ -4,6 +4,8 @@
  * half-floats are Uint16 bit patterns and float32 payloads are never converted.
  * Copies are raw GPU copies (including copy-compatible sRGB format pairs), not
  * color-space conversion, blending, resizing or an MSAA destination resolve.
+ * Cube endpoints require explicit face/sourceFace indices; every operation
+ * addresses one 2D face, never the whole cube or an implicit active face.
  */
 export class GpuTargetTransferError extends Error {
   constructor(code, message) {
@@ -36,6 +38,13 @@ function layout(shape) {
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
 }
+function transferFace(shape, face, name) {
+  const cube = shape.cube === true;
+  if (face === undefined && !cube) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
+    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five` : `${name} must be zero for a 2D target`);
+  return face;
+}
 function region(w, h, x, y, width, height) {
   for (const [name, value] of Object.entries({x, y, width, height})) integer(value, name);
   if (x > w - width || y > h - height) fail('REGION', 'Transfer region exceeds the target');
@@ -50,8 +59,9 @@ function budget(bytes, maxBytes) {
  * GPUQueue.writeTexture does not have the buffer-copy row alignment constraint.
  */
 export function inspectGpuTargetWrite(shape, data, value = {}) {
-  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes']);
+  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes', 'face']);
   const [Type, components, bgra] = layout(shape), pixelBytes = Type.BYTES_PER_ELEMENT * components;
+  const face = transferFace(shape, value.face, 'face');
   if (shape.sampleCount !== 1) fail('SAMPLES', 'Color uploads require a single-sample destination');
   const {x = 0, y = 0, width = shape.width - x, height = shape.height - y, offset = 0,
     bytesPerRow = width * pixelBytes, flipY = false, maxBytes = 64 * 1024 * 1024} = value;
@@ -71,7 +81,7 @@ export function inspectGpuTargetWrite(shape, data, value = {}) {
   // arbitrarily large unused tail of the caller's underlying allocation.
   const bytes = empty ? null : new Uint8Array(data.buffer, data.byteOffset + offset, requiredBytes);
   return {empty, data: bytes, bytesPerRow, rowBytes, packedBytes, flipY, bgra,
-    origin: {x, y: flipY ? shape.height - y - height : y, z: 0},
+    origin: {x, y: flipY ? shape.height - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
 }
 
@@ -98,8 +108,10 @@ export function gpuTargetWriteData(plan) {
  * are subsequently derived from level zero, never overwritten by stale levels.
  */
 export function inspectGpuTargetCopy(source, destination, value = {}) {
-  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes']);
+  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face']);
   const [Type, components] = layout(source); layout(destination);
+  const sourceFace = transferFace(source, value.sourceFace, 'sourceFace');
+  const face = transferFace(destination, value.face, 'face');
   if (source.format.replace(/-srgb$/, '') !== destination.format.replace(/-srgb$/, ''))
     fail('FORMAT', 'Texture copies require copy-compatible color formats');
   if (destination.sampleCount !== 1) fail('SAMPLES', 'Color copies require a single-sample destination');
@@ -116,7 +128,7 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
   if (typeof flipY !== 'boolean') fail('OPTIONS', 'flipY must be boolean');
   budget(width * height * components * Type.BYTES_PER_ELEMENT, maxBytes);
   return {empty: width === 0 || height === 0, sourceMipLevel,
-    sourceOrigin: {x: sourceX, y: flipY ? sh - sourceY - height : sourceY, z: 0},
-    destinationOrigin: {x, y: flipY ? destination.height - y - height : y, z: 0},
+    sourceOrigin: {x: sourceX, y: flipY ? sh - sourceY - height : sourceY, z: sourceFace},
+    destinationOrigin: {x, y: flipY ? destination.height - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
 }

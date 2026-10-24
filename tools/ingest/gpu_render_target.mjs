@@ -36,7 +36,9 @@
  * face selects one 2D attachment; depth borrowers retain the entire native cube.
  * readPixels({face}) and readDepthPixels({face}) select one explicit cube face,
  * retaining bounded staging, call-time submission and cancellation on disposal.
- * Cube uploads, copies and mip generation are explicitly unsupported.
+ * writePixels(data, {face}) and copyFrom(source, {sourceFace, face}) transfer
+ * one explicit cube color face, including cube/2D copies. Cube depth copies
+ * and mip generation remain unsupported.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
@@ -124,8 +126,8 @@ export function createGpuRenderTarget(device, options = {}) {
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
   if (typeof cube !== 'boolean') fail('OPTIONS', 'cube must be boolean');
-  if (cube && (sampleCount !== 1 || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1 || copyDestination))
-    fail('UNSUPPORTED', 'Cube targets require one sample, mip zero and no transfer destination usage');
+  if (cube && (sampleCount !== 1 || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1))
+    fail('UNSUPPORTED', 'Cube targets require one sample and mip zero');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
     fail('OPTIONS', 'mipLevelCount must be a positive integer');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string')
@@ -415,7 +417,6 @@ export function createGpuRenderTarget(device, options = {}) {
     withSampledTextures(callback) { return borrow(callback, 'sampled'); },
     writePixels(data, options = {}) {
       exclusive();
-      if (cube) fail('UNSUPPORTED', 'Cube target uploads require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before uploading target color');
       const plan = inspectGpuTargetWrite(transferShape(), data, options);
       if (plan.empty) return false;
@@ -431,11 +432,9 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     copyFrom(source, options = {}) {
       exclusive();
-      if (cube) fail('UNSUPPORTED', 'Cube target copies require an explicit face-aware transfer API');
       if (!copyDestination) fail('USAGE', 'Enable copyDestination before copying target color');
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
-      if (other.shape().cube) fail('UNSUPPORTED', 'Cube target copies require an explicit face-aware transfer API');
       if (other.device !== device) fail('DEVICE', 'Target copies require the same GPUDevice');
       if (source === api) fail('FEEDBACK', 'In-place target copies are not admitted');
       other.exclusive();
