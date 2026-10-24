@@ -1,6 +1,9 @@
 /** Owned WebGPU compute execution. Shader preparation is supplied by the caller;
  * this owner creates pipelines, keeps storage GPU-resident across dispatches,
  * submits real compute passes and performs asynchronous staging-buffer readback.
+ * Repeated dispatches reuse bounded, pipeline-local bind groups by native
+ * resource identity and buffer range, not by caller descriptor identity or
+ * upload version. External/unknown texture resources are never cached.
  * General WebGPU execution, not a Rust specialization or a speedup claim. */
 import {createComputeAttributeOwner} from './gpu_compute_attributes.mjs';
 
@@ -16,10 +19,14 @@ const COPY_SRC = 4, COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, STORAGE
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
 export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffers = 1024,
-  maxPipelines = 256, signal = null} = {}) {
+  maxPipelines = 256, maxCachedBindGroups = 256, signal = null} = {}) {
   if (!device?.queue || typeof device.createBuffer !== 'function' ||
-      ![maxBytes, maxBuffers, maxPipelines].every(positive)) fail('OPTIONS', 'Expected a GPUDevice and positive resource limits');
+      ![maxBytes, maxBuffers, maxPipelines].every(positive) ||
+      !Number.isSafeInteger(maxCachedBindGroups) || maxCachedBindGroups < 0)
+    fail('OPTIONS', 'Expected a GPUDevice, positive resource limits and a nonnegative bind-group cache limit');
   const buffers = new Map(), pipelines = new Map(), compiled = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
+  const bindGroups = new Map();
+  let bindingIds = new WeakMap(), bindingUsers = new WeakMap(), bindingLayouts = new WeakMap(), nextBindingId = 0;
   const lifetime = new AbortController();
   const attributeOwner = createComputeAttributeOwner(device);
   let terminal = null, allocatedBytes = 0;
@@ -29,6 +36,8 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     terminal = error instanceof Error ? error : new GpuComputeError('ABORTED', String(error ?? 'Compute execution aborted'));
     lifetime.abort(terminal);
     attributeOwner.dispose();
+    bindGroups.clear();
+    bindingIds = new WeakMap(); bindingUsers = new WeakMap(); bindingLayouts = new WeakMap();
     for (const entry of buffers.values()) entry.buffer.destroy();
     for (const buffer of staging) buffer.destroy();
     buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); compiled.clear(); allocatedBytes = 0;
@@ -97,7 +106,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
         usage: COPY_SRC | COPY_DST | (uniform ? UNIFORM : STORAGE | INDIRECT | INDEX | VERTEX)}));
       entry = {buffer, size, bytes, uniform, array: null, version: null};
       allocatedBytes += size; buffers.set(key, entry);
-      if (old) { old.buffer.destroy(); allocatedBytes -= old.size; }
+      if (old) { invalidateBindings(old.buffer); old.buffer.destroy(); allocatedBytes -= old.size; }
     }
     const source = new Uint8Array(array.buffer, array.byteOffset, bytes);
     checked(() => {
@@ -118,7 +127,97 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     const entry = buffers.get(key);
     if (!entry) return;
     attributeOwner.release(key);
+    invalidateBindings(entry.buffer);
     buffers.delete(key); entry.buffer.destroy(); allocatedBytes -= entry.size;
+  }
+  function bindingId(resource) {
+    let id = bindingIds.get(resource);
+    if (id === undefined) { id = ++nextBindingId; bindingIds.set(resource, id); }
+    return id;
+  }
+  function evictBindings(key) {
+    const record = bindGroups.get(key);
+    if (!record) return;
+    bindGroups.delete(key);
+    for (const buffer of record.buffers) {
+      const users = bindingUsers.get(buffer);
+      users.delete(key);
+      if (!users.size) bindingUsers.delete(buffer);
+    }
+  }
+  function invalidateBindings(buffer) {
+    for (const key of bindingUsers.get(buffer) ?? []) evictBindings(key);
+  }
+  function captureGroups(groups) {
+    const groupLimit = device.limits?.maxBindGroups ?? 4;
+    const bindingLimit = device.limits?.maxBindingsPerBindGroup ?? 1000;
+    if (!Array.isArray(groups) || groups.length > groupLimit)
+      fail('BINDINGS', 'Expected bounded compute bind groups');
+    const indices = new Set();
+    // Complete admission precedes any GPU allocation. Copy buffer range
+    // descriptors so later host edits cannot change a cached group's meaning.
+    return Array.from(groups, group => {
+      const {index, entries} = group ?? {};
+      if (!Number.isSafeInteger(index) || index < 0 || index >= groupLimit || indices.has(index) ||
+          !Array.isArray(entries) || entries.length > bindingLimit)
+        fail('BINDINGS', 'Expected distinct in-range group indices and bounded entries');
+      indices.add(index);
+      const slots = new Set(), resources = new Set(), keys = [];
+      let cacheable = maxCachedBindGroups > 0;
+      const captured = Array.from(entries, entry => {
+        const {binding, resource} = entry ?? {};
+        if (!Number.isSafeInteger(binding) || binding < 0 || binding >= bindingLimit || slots.has(binding) ||
+            !resource || typeof resource !== 'object')
+          fail('BINDINGS', 'Expected distinct in-range bindings and resource objects');
+        slots.add(binding);
+        // Native interface resources take precedence over dictionary members:
+        // an application may attach a harmless `buffer` property to a view.
+        const brand = Object.prototype.toString.call(resource);
+        if (brand === '[object Object]' && 'buffer' in resource) {
+          const {buffer, offset = 0, size} = resource;
+          if (!buffer || typeof buffer !== 'object' || !Number.isSafeInteger(offset) || offset < 0 ||
+              size !== undefined && (!Number.isSafeInteger(size) || size < 1))
+            fail('BINDINGS', 'Expected a native buffer and nonnegative offset with optional positive size');
+          resources.add(buffer);
+          keys.push([binding, 'buffer', bindingId(buffer), offset, size ?? null]);
+          return {binding, resource: {buffer, offset, ...(size === undefined ? {} : {size})}};
+        }
+        // GPUExternalTexture expires independently of object identity. Unknown
+        // resources retain the uncached path rather than guessing their lifetime.
+        if (brand !== '[object GPUTextureView]' && brand !== '[object GPUSampler]') cacheable = false;
+        keys.push([binding, brand, bindingId(resource)]);
+        return {binding, resource};
+      });
+      keys.sort((a, b) => a[0] - b[0]);
+      return {index, entries: captured, resources, key: cacheable ? JSON.stringify(keys) : null};
+    });
+  }
+  function resolveGroup(pipeline, snapshot) {
+    const {index, entries, resources} = snapshot;
+    // Auto layouts are exclusive to their pipeline, even for identical WGSL
+    // binding declarations. Never share groups across pipeline identities.
+    const key = snapshot.key === null ? null : `${bindingId(pipeline)}/${index}/${snapshot.key}`;
+    const existing = key === null ? null : bindGroups.get(key);
+    if (existing) {
+      bindGroups.delete(key); bindGroups.set(key, existing);
+      return {index, group: existing.group};
+    }
+    let layouts = bindingLayouts.get(pipeline);
+    if (!layouts) bindingLayouts.set(pipeline, layouts = new Map());
+    if (!layouts.has(index)) layouts.set(index, pipeline.getBindGroupLayout(index));
+    live();
+    const group = device.createBindGroup({layout: layouts.get(index), entries});
+    live();
+    if (key !== null) {
+      while (bindGroups.size >= maxCachedBindGroups) evictBindings(bindGroups.keys().next().value);
+      bindGroups.set(key, {group, buffers: resources});
+      for (const buffer of resources) {
+        let users = bindingUsers.get(buffer);
+        if (!users) bindingUsers.set(buffer, users = new Set());
+        users.add(key);
+      }
+    }
+    return {index, group};
   }
   // Explicit layouts are necessary for unfilterable float32 textureLoad inputs:
   // automatic layouts infer sampleType:float even when no sampler is used.
@@ -194,9 +293,9 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       if (!entry || !Number.isSafeInteger(offset) || offset < 0 || offset % 4 || offset + 12 > entry.bytes)
         fail('DISPATCH', 'Indirect dispatch requires twelve in-bounds bytes of owned storage');
     }
+    const snapshots = captureGroups(groups);
     checked(() => {
-      const bindings = groups.map(({index, entries}) => ({index, group: device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(index), entries})}));
+      const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
       const encoder = device.createCommandEncoder({label: 'f3d-compute'});
       const pass = encoder.beginComputePass({label: 'f3d-compute'});
       pass.setPipeline(pipeline);
@@ -241,5 +340,6 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
     get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
+    get cachedBindGroupCount() { return bindGroups.size; },
     dispose: () => stop(new GpuComputeError('DISPOSED', 'Compute owner is disposed'))};
 }
