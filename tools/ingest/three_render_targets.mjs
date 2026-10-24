@@ -231,7 +231,7 @@ const DEPTH_FLIP_WGSL = flipY => `
 export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, maxBytes = 512 * 1024 * 1024, flipY = true} = {}) {
   if (typeof getDevice !== 'function' || !positive(maxTargets) || !positive(maxBytes) || typeof flipY !== 'boolean')
     fail('OPTIONS', 'Invalid target owner options');
-  const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), shadowResizes = new WeakMap();
+  const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), nativeResizes = new WeakMap();
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
   function release(entry) {
@@ -272,7 +272,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   const sameShape = (a, b) => a.key === b.key && a.texture === b.texture && a.depthTexture === b.depthTexture;
   function sourceDisposed(entry, event) {
-    const resize = shadowResizes.get(entry.target);
+    const resize = nativeResizes.get(entry.target);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
         entry.target.width === resize.width && entry.target.height === resize.height && entry.target.depth === resize.depth) {
       const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
@@ -280,13 +280,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           shape.format === entry.shape.format && shape.depthFormat === entry.shape.depthFormat &&
           shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
         resize.event = event;
-        if (entry.references || preserved.has(entry)) {
-          // Source texture identities stay unchanged across setSize(). Only
-          // this recognized automatic resize can detach a still-usable entry.
-          entry.sourceShape = shape; preserved.add(entry);
-          if (entries.get(entry.target) === entry) entries.delete(entry.target);
-          collect(entry); return;
-        }
+        // Capture leases can end before submitted GPU validation/fence
+        // observers. Keep their generation alive until collect() has awaited
+        // both owners, even when no queued consumer still retains a lease.
+        // Source texture identities stay unchanged across setSize(). Only
+        // this recognized automatic resize can detach a usable generation.
+        entry.sourceShape = shape; preserved.add(entry);
+        if (entries.get(entry.target) === entry) entries.delete(entry.target);
+        collect(entry); return;
       }
     }
     retire(entry);
@@ -555,21 +556,23 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       finally { if (!destination.alive) release(destination); }
     }
   }
+  function withNativeResize(target, width, height, run) {
+    live();
+    if (typeof run !== 'function' || !positive(width) || !positive(height)) fail('OPTIONS', 'Expected a source target resize and synchronous callback');
+    if (!target || target.width === width && target.height === height) return run();
+    if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
+    if (inspectThreeRenderTarget(target, three).cube)
+      fail('UNSUPPORTED', 'Source cube shadow resizing is not admitted; create a new shadow target at the required size');
+    nativeResizes.set(target, {width, height, depth: target.depth, event: null, shape: null});
+    try { return run(); } finally { nativeResizes.delete(target); }
+  }
   return {
     capture, ensure, assertCurrent, bindingsFor, retainGeneration,
-    // Only the retained source ShadowNode calls this around its own update.
-    // Public setSize()/dispose() outside that synchronous source operation keep
-    // invalidating pending requests and readers, including older generations.
-    withNativeShadowResize(target, width, height, run) {
-      live();
-      if (typeof run !== 'function' || !positive(width) || !positive(height)) fail('OPTIONS', 'Expected a source shadow resize and synchronous callback');
-      if (!target || target.width === width && target.height === height) return run();
-      if (shadowResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source shadow resize');
-      if (inspectThreeRenderTarget(target, three).cube)
-        fail('UNSUPPORTED', 'Source cube shadow resizing is not admitted; create a new shadow target at the required size');
-      shadowResizes.set(target, {width, height, depth: target.depth, event: null, shape: null});
-      try { return run(); } finally { shadowResizes.delete(target); }
-    },
+    // Only exact retained ShadowNode/PassNode updates enter these scopes.
+    // Public setSize()/dispose() outside the synchronous operation still
+    // invalidate pending requests and readers, including older generations.
+    withNativeShadowResize: withNativeResize,
+    withNativePassResize: withNativeResize,
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.

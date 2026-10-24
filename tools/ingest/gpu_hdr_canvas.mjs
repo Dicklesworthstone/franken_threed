@@ -34,7 +34,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     fail('OPTIONS', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four scene samples');
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
     fail('OPTIONS', 'Invalid HDR target budget or label');
-  const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode',
+  const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode', 'srgbView',
     'maxBytes', 'width', 'height'], 'presentation target');
   // A premultiplied canvas composites over the page. The linear scene target is
   // cleared/blended into premultiplied values (straight-alpha blending over a
@@ -140,7 +140,8 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     try {
       if (signal.aborted) aborted(); live();
       offscreen = createGpuRenderTarget(device, {...hdr, width: canvas.width, height: canvas.height, format: 'rgba16float'});
-      const outputReady = createGpuAnimationOutput(device, {...defaults, format: presentation.format, outputColorSpace: 'srgb', signal}).then(value => {
+      const outputReady = createGpuAnimationOutput(device, {...defaults, format: presentation.format,
+        outputColorSpace: target.srgbView === false ? 'linear' : 'srgb', signal}).then(value => {
         if (closed()) { value.dispose(); throw terminal; }
         finalOutput = value; return value;
       });

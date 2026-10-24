@@ -178,7 +178,7 @@ test('unsupported source content surfaces as an explicit error instead of a sile
   assert.throws(() => renderer.render(f.scene, f.camera), /Unsupported source material/);
   renderer.setRenderTarget(null);
   assert.throws(() => renderer.setRenderTarget(new T.RenderTarget(4, 4, {samples: 2})), {code: 'THREE_TARGET_UNSUPPORTED'});
-  renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  renderer.outputColorSpace = T.DisplayP3ColorSpace;
   assert.throws(() => renderer.render(f.scene, f.camera), F3DRendererError);
   renderer.dispose();
 });

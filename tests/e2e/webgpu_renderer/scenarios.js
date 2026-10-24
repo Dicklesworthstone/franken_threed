@@ -9,10 +9,14 @@ import { matcapScenarios } from './scenarios_matcap.js';
 import { nativeTSLScenarios } from './scenarios_native_tsl.js';
 import { nativeShadowScenarios } from './scenarios_native_shadows.js';
 import { nativeSkinningScenarios } from './scenarios_native_skinning.js';
+import { nativePipelineScenarios } from './scenarios_native_pipeline.js';
+import { nativeMorphScenarios } from './scenarios_native_morph.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
   ...nativeSkinningScenarios,
+  ...nativePipelineScenarios,
+  ...nativeMorphScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

@@ -163,6 +163,91 @@ test('malformed native skeleton palettes refuse before source draw updates', t =
     assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(updates, 0);
   }
 });
+function morphRig(t, {relative = false, skinned = false} = {}) {
+  const f = skinned ? skinnedRig(t) : rig(t), geometry = f.object.geometry;
+  geometry.morphTargetsRelative = relative;
+  geometry.morphAttributes.position = [0, 1].map(target => new THREE.Float32BufferAttribute(
+    Array.from(geometry.attributes.position.array, (value, component) =>
+      (relative ? 0 : value) + (component % 3 === target ? .25 : 0)), 3));
+  geometry.morphAttributes.normal = [0, 1].map(target => new THREE.Float32BufferAttribute(
+    Array.from(geometry.attributes.normal.array, (value, component) =>
+      (relative ? 0 : value) + (component % 3 === target ? .125 : 0)), 3));
+  f.object.updateMorphTargets(); f.object.morphTargetInfluences.splice(0, 2, .25, .5);
+  return f;
+}
+function morphMember(descriptor, count = 2) {
+  const expression = new RegExp(`struct (NodeBuffer_\\d+)Struct \\{\\s*value : array< vec4<f32>, ${count} >`);
+  const name = expression.exec(descriptor.vertex)?.[1]; assert.ok(name, 'source morph influences use padded vec4 array elements');
+  return uniformMember(descriptor, name, 'vertex');
+}
+test('source morph influences retain independent same-frame captures and live relative mode', t => {
+  const f = morphRig(t), d = f.compile(), member = morphMember(d), first = f.owner.capture(d, f.context);
+  assert.match(d.vertex, /texture_2d_array<f32>/); assert.match(d.vertex, /textureLoad/);
+  assert.deepEqual(uniformValues(first, member), [.25, 0, 0, 0, .5, 0, 0, 0]);
+  f.object.morphTargetInfluences[0] = .75;
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  f.object.morphTargetInfluences = [1.25, -.5]; f.object.geometry.morphTargetsRelative = true;
+  assert.equal(f.compile(), d, 'weights, compatible array replacement and relative mode stay live source data');
+  const third = f.owner.capture(d, {...f.context, renderId: 3}); f.object.morphTargetInfluences.fill(99);
+  assert.deepEqual(uniformValues(first, member), [.25, 0, 0, 0, .5, 0, 0, 0]);
+  assert.deepEqual(uniformValues(second, member), [.75, 0, 0, 0, .5, 0, 0, 0]);
+  assert.deepEqual(uniformValues(third, member), [1.25, 0, 0, 0, -.5, 0, 0, 0]);
+});
+test('source morph texture packing remains cached until geometry disposal and preserves old captures', t => {
+  const f = morphRig(t), d = f.compile(), first = f.owner.captureDraw(d, f.context);
+  const texture = first.textures.find(binding => binding.texture.isDataArrayTexture).texture;
+  assert.deepEqual([texture.image.width, texture.image.height, texture.image.depth], [8, 1, 2]);
+  assert.deepEqual([...texture.image.data.subarray(0, 8)], [-.25, .5, 0, 0, .125, 0, 1, 0]);
+  const oldData = texture.image.data.slice(), target = f.object.geometry.morphAttributes.position[0];
+  target.array[0] = 5; target.needsUpdate = true;
+  assert.equal(f.compile(), d); f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.deepEqual(texture.image.data, oldData, 'same-count source attribute edits do not regenerate its cached texture');
+  f.object.geometry.dispose();
+  const next = f.compile(), second = f.owner.captureDraw(next, {...f.context, renderId: 3});
+  const replacement = second.textures.find(binding => binding.texture.isDataArrayTexture).texture;
+  assert.notEqual(next, d); assert.notEqual(replacement, texture); assert.equal(replacement.image.data[0], 5);
+  assert.deepEqual(texture.image.data, oldData); assert.equal(first.textures.find(binding => binding.texture.isDataArrayTexture).texture, texture);
+});
+test('morph count changes rebuild source textures and influence buffers before accepting another draw', t => {
+  const f = morphRig(t), d = f.compile(), first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  for (const name of ['position', 'normal']) f.object.geometry.morphAttributes[name].push(f.object.geometry.morphAttributes[name][0].clone());
+  f.object.updateMorphTargets();
+  assert.throws(() => f.owner.capture(d, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const next = f.compile(); assert.notEqual(next, d); assert.equal(morphMember(next, 3).byteLength, 48);
+  assert.equal(f.owner.captureDraw(next, {...f.context, renderId: 2}).textures.find(binding => binding.texture.isDataArrayTexture).texture.image.depth, 3);
+  assert.deepEqual(first, saved);
+});
+test('source morphing precedes skinning and their independently captured uniforms coexist', t => {
+  const f = morphRig(t, {relative: true, skinned: true}), d = f.compile();
+  assert.ok(d.vertex.indexOf('textureLoad') < d.vertex.indexOf('skinWeight.x'));
+  f.bones[1].position.x = .375; f.scene.updateMatrixWorld();
+  const draw = f.owner.captureDraw(d, f.context);
+  assert.deepEqual(uniformValues(draw.uniforms, morphMember(d)), [.25, 0, 0, 0, .5, 0, 0, 0]);
+  assert.ok(d.groups.flatMap(group => group.uniforms).some(member => member.byteLength === 128));
+  assert.equal(f.object.skeleton.boneMatrices[28], .375);
+});
+test('managed uniform arrays retain source scalar/vector/color/matrix padding and current values', t => {
+  const cases = [
+    ['float', [1, 2], Float32Array, [1, 0, 0, 0, 2, 0, 0, 0], value => value.element(0)],
+    ['int', [-1, 2], Int32Array, [-1, 0, 0, 0, 2, 0, 0, 0], value => value.element(0).toFloat()],
+    ['uint', [0xffffffff, 17], Uint32Array, [0xffffffff, 0, 0, 0, 17, 0, 0, 0], value => value.element(0).toFloat()],
+    ['vec2', [new THREE.Vector2(1, 2)], Float32Array, [1, 2, 0, 0], value => value.element(0).x],
+    ['color', [new THREE.Color(.25, .5, .75)], Float32Array, [.25, .5, .75, 0], value => value.element(0)],
+    ['mat3', [new THREE.Matrix3().set(1, 2, 3, 4, 5, 6, 7, 8, 9)], Float32Array,
+      [1, 4, 7, 0, 2, 5, 8, 0, 3, 6, 9, 0, 0, 0, 0, 1], value => value.element(0).mul(N.vec3(1))],
+  ];
+  for (const [type, array, Scalar, expected, use] of cases) {
+    const f = rig(t), values = N.uniformArray(array, type).setName('managedArray'); f.material.colorNode = use(values);
+    const d = f.compile(), member = uniformMember(d, 'managedArray');
+    const first = f.owner.capture(d, f.context); assert.deepEqual(uniformValues(first, member, Scalar), expected);
+    assert.equal(f.compile(), d);
+    if (type === 'float') {
+      values.array = [3, 4]; const second = f.owner.capture(d, {...f.context, renderId: 2});
+      assert.deepEqual(uniformValues(second, member), [3, 0, 0, 0, 4, 0, 0, 0]);
+      assert.deepEqual(uniformValues(first, member), expected);
+    }
+  }
+});
 test('real pinned node graphs preserve native WGSL groups, attributes and linear output', t => {
   const f = rig(t), d = f.compile();
   assert.equal(d.nodeProgram, true); assert.equal('reflection' in d, false);
@@ -1049,7 +1134,6 @@ test('nested captures and thrown callbacks restore the exact outer NodeFrame con
 for (const [name, change, code] of [
   ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
-  ['managed uniform array graph', f => { f.material.colorNode = N.uniformArray([new THREE.Vector4(1, 0, 0, 1)]).element(0).xyz; }, 'STORAGE'],
   ['compute-backed buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.StorageBufferAttribute(4, 3)); }, 'ATTRIBUTE'],
   ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],
   ['MRT graph', f => { f.material.fragmentNode = N.mrt({output: N.vec4(1)}); }, 'MRT'],

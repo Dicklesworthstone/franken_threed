@@ -26,7 +26,7 @@
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
- *   mapping, logarithmic/reversed depth, non-sRGB output,
+ *   mapping, logarithmic/reversed depth, unsupported output color spaces,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
  */
@@ -243,13 +243,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.depth = depth;
       this.stencil = stencil;
       this.antialias = antialias;
-      this.samples = samples;
+      this.samples = samples || (antialias === true ? 4 : 0);
       this.logarithmicDepthBuffer = logarithmicDepthBuffer;
       this.reversedDepthBuffer = reversedDepthBuffer;
       this.outputColorSpace = SRGBColorSpace;
       this.toneMapping = NoToneMapping;
       this.toneMappingExposure = 1;
       this.sortObjects = true;
+      this.opaque = true;
+      this.transparent = true;
       this.shadowMap = {enabled: false, transmitted: false, type: THREE.PCFShadowMap};
       this.lighting = {enabled: true};
       // The source node library instance (registrations such as addLight are
@@ -289,6 +291,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._scissorTest = false;
       this._clearScene = null;
       this._renderTarget = null;
+      this._outputRenderTarget = null;
+      this._outputBufferType = parameters.outputBufferType ?? parameters.colorBufferType ?? THREE.HalfFloatType;
       this._activeCubeFace = 0;
       this._activeMipmapLevel = 0;
       this._targetLifetime = new AbortController();
@@ -312,6 +316,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._rebuild = false;
       this._preparing = null;
       this._hdr = false;
+      this._srgbView = true;
       this._wanted = new Map();
       this._pending = [];
       this._drain = null;
@@ -364,6 +369,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const p = this._parameters;
       if (p.outputType !== undefined && p.outputType !== THREE.UnsignedByteType)
         fail('UNSUPPORTED', 'Extended-range canvas output types are not admitted');
+      if (this.isWebGPURenderer && ![THREE.UnsignedByteType, THREE.HalfFloatType, THREE.FloatType].includes(this._outputBufferType))
+        fail('UNSUPPORTED', 'Output buffers require unsigned-byte, half-float or float texture storage');
       // The renderer owns one device for its lifetime so the output path can be
       // rebuilt (tone mapping on/off) without losing it. A supplied device is borrowed.
       if (p.device) this._device = p.device;
@@ -389,21 +396,22 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     /** Tone mapping needs the linear HDR target plus a whole-image output pass
      * (the source renders through a half-float framebuffer target in that case);
      * otherwise frames go straight into the sRGB presentation view. */
-    async _createSession(hdr) {
+    async _createSession(hdr, srgbView = this._canvasSrgbView(this.outputColorSpace, hdr)) {
       const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
       const depthFormat = this.depth ? (this.stencil ? 'depth24plus-stencil8' : 'depth24plus') : null;
       const [width, height] = this._bufferSize();
       const common = {device: this._device};
       const format = this._preferredFormat ? {format: this._preferredFormat} : {};
       this._hdr = hdr;
+      this._srgbView = srgbView;
       this._dispatcher = null;
       this._session = hdr
         ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
-          target: {width, height, ...format, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
+          target: {width, height, ...format, srgbView, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
-          target: {width, height, depthFormat, sampleCount, ...format, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque',
-            ...(this._shaderEncodedOutput ? {srgbView: false} : {})}});
+          target: {width, height, depthFormat, sampleCount, ...format, srgbView,
+            alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
     }
     _release() {
       this._targets.dispose();
@@ -421,6 +429,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * output) tone-maps inside each material's program instead, unless a scene
      * needed a draw the program route cannot take (sticky fallback). */
     _wantsHdr(tone) { return tone !== 'none' && (!this._shaderEncodedOutput || this._hdrFallback === true); }
+    // Source RenderPipeline writes its output transform in the graph and sets
+    // working-linear output to suppress a second transfer. Each queued frame
+    // captures the attachment view separately from the live renderer property.
+    _canvasSrgbView(space = this.outputColorSpace, hdr = this._wantsHdr(this._toneMapping())) {
+      return this._shaderEncodedOutput ? hdr : space === SRGBColorSpace;
+    }
     /** Whether the canvas composites with the page by alpha. WebGLRenderer (r186)
      * always creates an alpha:true context; its `alpha` option only sets the
      * default clear alpha, so shader-written alpha and setClearAlpha show. */
@@ -514,6 +528,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
+    getOutputRenderTarget() { return this._outputRenderTarget; }
+    setOutputRenderTarget(target) {
+      if (target !== null) fail('UNSUPPORTED', 'Custom output targets require their own presentation route');
+      this._outputRenderTarget = null;
+    }
+    getOutputBufferType() { return this._outputBufferType; }
     getMRT() { return this._mrt; }
     setMRT(value) { this._mrt = value; return this; }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
@@ -559,11 +579,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const targetShape = target ? inspectThreeRenderTarget(target, THREE) : null;
       const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
-      if (!target && this.outputColorSpace !== SRGBColorSpace) fail('UNSUPPORTED', 'Only sRGB canvas output is admitted');
+      if (!target && this.outputColorSpace !== SRGBColorSpace &&
+          (this._shaderEncodedOutput || this.outputColorSpace !== THREE.LinearSRGBColorSpace))
+        fail('UNSUPPORTED', 'Native canvas output requires sRGB or linear-sRGB');
       const tone = this._toneMapping();
       // Switching between direct and tone-mapped output rebuilds the canvas
       // session (same device) at the next preparation boundary.
-      if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr;
+      if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr || this._canvasSrgbView() !== this._srgbView;
       const hdr = !target && this._wantsHdr(tone);
       const clear = this.autoClear === true;
       const color = this._clearColor, a = this._clearAlpha;
@@ -721,7 +743,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial,
         nodeCaptureDeferred, captureCameras, backgroundState,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
-        hdr: !target && this._wantsHdr(this._toneMapping()), key,
+        hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
           outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height},
         releaseDestination: destination === this ? null : this._targets.retainGeneration(destination)};
@@ -765,7 +787,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const {scene, destination, snapshot} = request;
       destination._wanted.set(scene, request.key);
       const entry = destination._dispatcher?.entry(scene);
-      if (this._drain || this._preparing || (destination === this && request.hdr !== this._hdr) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
+      if (this._drain || this._preparing || (destination === this &&
+          (request.hdr !== this._hdr || request.srgbView !== this._srgbView)) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
       try {
         const captured = request.nodeFrame;
@@ -985,15 +1008,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               }
               return hdr;
             };
-            const hdr = selectOutput();
-            if (hdr !== this._hdr) { this._session.dispose(); await this._createSession(hdr); }
+            const hdr = selectOutput(), srgbView = this._shaderEncodedOutput ? hdr : request?.srgbView ?? this._canvasSrgbView();
+            if (request) request.srgbView = srgbView;
+            if (hdr !== this._hdr || srgbView !== this._srgbView) { this._session.dispose(); await this._createSession(hdr, srgbView); }
             this._rebuild = false;
             try { await this._session.prepare(); }
             catch (error) {
               if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true) throw error;
               this._hdrFallback = true;
               this._session.dispose();
-              await this._createSession(selectOutput());
+              const fallbackHdr = selectOutput();
+              if (request && this._shaderEncodedOutput) request.srgbView = fallbackHdr;
+              await this._createSession(fallbackHdr, this._shaderEncodedOutput ? fallbackHdr : srgbView);
               this._rebuild = false;
               await this._session.prepare();
             }
