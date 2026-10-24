@@ -306,8 +306,130 @@ test('deferred MRT capture retains its target and output context after public st
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('unimplemented pass history and custom context fail before child updates', async t => {
-  for (const configure of [pass => pass.getPreviousTexture('output'), pass => { pass.contextNode = N.context({getUV: () => N.uv()}); }]) {
+for (const samples of [0, 4]) test(`native color history retains alternating images, shared MRT outputs and ${samples || 1} samples`, async t => {
+  const f = fixture(t); await f.renderer.init(); let updates = 0, builds = 0;
+  const color = f.material.colorNode;
+  color.onRenderUpdate(() => { updates++; return new T.Color(updates / 4, .5, .2); });
+  f.material.colorNode = N.Fn(() => { builds++; return color; })();
+  const pass = N.pass(f.scene, f.camera, {samples});
+  const current = pass.getTextureNode(), previous = pass.getPreviousTextureNode(), auxiliary = pass.getTextureNode('auxiliary');
+  pass.setMRT(N.mrt({output: N.output, auxiliary: N.vec4(N.normalView.mul(.5).add(.5), 1)}));
+  const pipeline = new T.RenderPipeline(f.renderer,
+    N.vec4(current.rgb.mul(.5).add(previous.rgb.mul(.25)).add(auxiliary.rgb.mul(.25)), 1));
+  const sourceImages = [];
+  for (let frame = 0; frame < 3; frame++) {
+    if (frame) f.renderer._nodes.nodeFrame.update();
+    pipeline.render(); sourceImages.push([current.value, previous.value]);
+  }
+  await drain(f.renderer); await f.renderer.waitForGPU();
+  assert.equal(updates, 3);
+  assert.equal(builds, 1, 'attachment swaps do not repeat authored graph construction');
+  assert.equal(sourceImages[0][0], sourceImages[1][1]); assert.equal(sourceImages[0][0], sourceImages[2][0]);
+  const scenes = commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')));
+  assert.equal(scenes.length, 3);
+  const colors = scenes.map(p => p.desc.colorAttachments.map(a => (a.resolveTarget ?? a.view).texture));
+  const writes = scenes.map(p => p.desc.colorAttachments[0].view.texture);
+  assert.notEqual(colors[0][0], colors[1][0]); assert.equal(colors[0][0], colors[2][0]);
+  assert.equal(colors[0][1], colors[1][1]); assert.equal(colors[0][1], colors[2][1]);
+  assert.notEqual(writes[0], writes[1]); assert.equal(writes[0], writes[2]);
+  assert.equal(writes[0].sampleCount, samples || 1);
+  assert.equal(scenes[0].desc.depthStencilAttachment.view.texture, scenes[2].desc.depthStencilAttachment.view.texture);
+  const consumers = nativeDraws(f.device).filter(draw => !shader(draw).includes('pipelineSceneColor'));
+  assert.equal(consumers.length, 3);
+  for (let i = 0; i < 3; i++) {
+    const inputs = textures(consumers[i]).map(view => view.texture);
+    assert.ok(inputs.includes(colors[i][0])); assert.ok(inputs.includes(colors[i][1]));
+    assert.ok(inputs.includes(colors[(i + 1) % 2][0]), 'each consumer reads the other persistent image');
+  }
+  const count = f.device.textures.length;
+  pipeline.render(); await drain(f.renderer);
+  assert.equal(updates, 3, 'repeated consumers in one source frame do not advance history');
+  assert.equal(commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor'))).length, 3);
+  assert.ok(f.device.textures.slice(count).every(texture => texture.format.startsWith('bgra')),
+    'only canvas images are acquired again; offscreen history residency stays bounded');
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.getRenderTarget(), null);
+});
+
+test('late source color history retains the already rendered current image', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), pipeline = new T.RenderPipeline(f.renderer, pass);
+  pipeline.render(); await drain(f.renderer);
+  const first = commands(f.device).find(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')))
+    .desc.colorAttachments[0].view.texture;
+  const previous = pass.getPreviousTextureNode();
+  pipeline.outputNode = N.vec4(pass.getTextureNode().rgb.mul(.5).add(previous.rgb.mul(.5)), 1); pipeline.needsUpdate = true;
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  assert.ok(textures(nativeDraws(f.device).at(-1)).some(view => view.texture === first),
+    'previous frame is the pre-history allocation');
+  assert.notEqual(commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')))
+    .at(-1).desc.colorAttachments[0].view.texture, first);
+  assert.equal(first.destroyed, undefined); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const antialias of [false, true]) test(`native scene color accumulates from its own previous frame with ${antialias ? 4 : 1} inherited samples`, async t => {
+  const f = fixture(t, {antialias}); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), previous = pass.getPreviousTextureNode();
+  f.material.fragmentNode = N.vec4(previous.rgb.mul(.75).add(f.material.colorNode.mul(.25)), 1);
+  const pipeline = new T.RenderPipeline(f.renderer, pass);
+  for (let frame = 0; frame < 3; frame++) {
+    if (frame) f.renderer._nodes.nodeFrame.update();
+    f.material.colorNode.value.setRGB(frame / 3, .2, .8); pipeline.render();
+  }
+  await drain(f.renderer); await f.renderer.waitForGPU();
+  assert.equal(pass.renderTarget.samples, antialias ? 4 : 0, 'PassNode.setup inherits constructor samples without explicit pass options');
+  const scenes = commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')));
+  assert.equal(scenes.length, 3, 'the source FRAME marker prevents recursive pass updates');
+  for (let i = 0; i < scenes.length; i++) {
+    const draw = scenes[i].draws.find(draw => shader(draw).includes('pipelineSceneColor'));
+    const attachment = scenes[i].desc.colorAttachments[0];
+    const destination = (attachment.resolveTarget ?? attachment.view).texture;
+    const inputs = textures(draw).map(view => view.texture);
+    assert.equal(inputs.includes(destination), false);
+    assert.equal(inputs.includes(attachment.view.texture), false);
+    assert.equal(attachment.view.texture.sampleCount, antialias ? 4 : 1);
+    if (i) {
+      const previous = scenes[i - 1].desc.colorAttachments[0];
+      assert.ok(inputs.includes((previous.resolveTarget ?? previous.view).texture));
+    }
+  }
+  assert.equal(f.renderer.info.f3d.offscreenRenders, 3); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued color history captures survive automatic resize with their accepted image extents', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const target = new T.RenderTarget(64, 48, {type: T.HalfFloatType}); f.renderer.setRenderTarget(target);
+  const pass = N.pass(f.scene, f.camera), previous = pass.getPreviousTextureNode();
+  const pipeline = new T.RenderPipeline(f.renderer, N.vec4(pass.getTextureNode().rgb.add(previous.rgb), 1));
+  pipeline.render();
+  f.renderer.setSize(40, 24, false); pass.setResolutionScale(.5);
+  f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  await drain(f.renderer); await f.renderer.waitForGPU();
+  const consumers = nativeDraws(f.device).filter(draw => !shader(draw).includes('pipelineSceneColor'));
+  assert.equal(consumers.length, 2);
+  assert.deepEqual(textures(consumers[0]).map(view => [view.texture.width, view.texture.height]), [[64, 48], [64, 48]]);
+  assert.deepEqual(textures(consumers[1]).map(view => [view.texture.width, view.texture.height]), [[20, 12], [20, 12]]);
+  assert.equal(f.renderer.getRenderTarget(), target); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('MRT default primary clears capture scene backgrounds while explicit output clears remain authoritative', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), auxiliary = pass.getTextureNode('auxiliary');
+  const mrt = N.mrt({output: N.output, auxiliary: N.vec4(.2, .4, .6, 1)}); pass.setMRT(mrt);
+  const pipeline = new T.RenderPipeline(f.renderer, N.vec4(pass.getTextureNode().rgb.add(auxiliary.rgb), 1));
+  f.scene.background = new T.Color(.7, .2, .1); pipeline.render();
+  f.scene.background.setRGB(.1, .3, .8); f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  mrt.setClearColor('output', new T.Color(.3, .6, .2), .4);
+  f.scene.background.setRGB(.9, .9, .9); f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  await drain(f.renderer);
+  const scenes = commands(f.device).filter(p => p.draws?.some(draw => shader(draw).includes('pipelineSceneColor')));
+  assert.deepEqual(scenes.map(p => p.desc.colorAttachments[0].clearValue),
+    [{r: .7, g: .2, b: .1, a: 1}, {r: .1, g: .3, b: .8, a: 1}, {r: .3, g: .6, b: .2, a: .4}]);
+  for (const p of scenes) assert.deepEqual(p.desc.colorAttachments[1].clearValue, {r: 0, g: 0, b: 0, a: 1});
+});
+
+test('incomplete or depth history and custom pass contexts fail before child updates', async t => {
+  for (const configure of [pass => pass.getPreviousTexture('output'), pass => pass.getPreviousTextureNode('depth'),
+    pass => { pass.contextNode = N.context({getUV: () => N.uv()}); }]) {
     const f = fixture(t); await f.renderer.init(); let updates = 0;
     f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(1, 0, 0); });
     const pass = N.pass(f.scene, f.camera); configure(pass);

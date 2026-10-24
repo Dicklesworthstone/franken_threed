@@ -1,4 +1,4 @@
-/** Pinned native scene passes, MRT outputs and the RenderPipeline graph context.
+/** Pinned native scene passes, MRT outputs, color histories and the RenderPipeline graph context.
  * Source nodes retain their construction and update frequencies; recursive
  * scene draws and sampled attachments remain owned by the native renderer.
  */
@@ -6,6 +6,7 @@ const fail = (message, code = 'PASS') => {
   const error = new Error(`THREE_NODE_PROGRAM_${code}: ${message}`);
   error.name = 'ThreeNodeProgramError'; error.code = `THREE_NODE_PROGRAM_${code}`; throw error;
 };
+const nativePasses = new WeakMap();
 
 /** Capture the source's named output mapping. Uniform values and clear colors
  * stay live; changing graph, attachment order/type or blend layout is structural.
@@ -37,8 +38,16 @@ export function inspectThreeMRT(three, renderer, material = null) {
     });
     return [node.uuid, node.getCacheKey(), blends];
   });
+  const pass = nativePasses.get(target);
+  const attachmentIdentity = texture => {
+    const name = pass && Object.keys(pass._textures).find(name => pass._textures[name] === texture);
+    const previous = name !== undefined ? pass?._previousTextures[name] : null;
+    // Source attachment bindings change on a history swap, but the shader's
+    // named output layout does not. Rebuilding would repeat authored Fn setup.
+    return previous ? [texture.uuid, previous.uuid].sort() : texture.uuid;
+  };
   return {target, mrt, nodes, key: JSON.stringify([target.uuid,
-    textures.map(texture => [texture.uuid, texture.name, texture.format, texture.type]), signatures])};
+    textures.map(texture => [attachmentIdentity(texture), texture.name, texture.format, texture.type]), signatures])};
 }
 
 /** A RenderPipeline supplies a material context for output transforms and
@@ -77,7 +86,7 @@ export function inspectThreePipelineContext(three, renderer, material, object) {
 export function inspectThreeNativePass(three, renderer, node) {
   const source = three.PassNode?.prototype;
   if (!source || Object.getPrototypeOf(node) !== source ||
-      ['setup', 'updateBefore', 'setSize', 'getTexture', 'getTextureNode', 'toggleTexture',
+      ['setup', 'updateBefore', 'setSize', 'getTexture', 'getTextureNode', 'getPreviousTexture', 'getPreviousTextureNode', 'toggleTexture',
         'getLinearDepthNode', 'getViewZNode'].some(key => node[key] !== source[key]) ||
       ['getUpdateBeforeType', 'getUpdateType', 'getUpdateAfterType', 'updateReference']
         .some(key => node[key] !== three.Node.prototype[key]) ||
@@ -89,14 +98,37 @@ export function inspectThreeNativePass(three, renderer, node) {
   if (node.scope !== three.PassNode.COLOR && node.scope !== three.PassNode.DEPTH)
     fail('Native scene passes require color or depth output');
   if (!node.renderTarget?.textures?.length || node.renderTarget.texture !== node._textures.output ||
-      node.renderTarget.textures.some(texture => !Object.values(node._textures).includes(texture)) || Object.keys(node._previousTextures).length ||
-      Object.keys(node._previousTextureNodes).length)
-    fail('Native scene passes require their own named color outputs without history swaps');
+      node.renderTarget.textures.some(texture => !Object.values(node._textures).includes(texture)))
+    fail('Native scene passes require their own named color outputs');
+  const histories = Object.entries(node._previousTextures), textures = new Set(node.renderTarget.textures);
+  for (const [name, previous] of histories) {
+    const current = node._textures[name], currentNode = node._textureNodes[name], previousNode = node._previousTextureNodes[name];
+    // The source swaps color attachments and both PassMultipleTextureNode
+    // references together. A cloned depth image is not a previous depth
+    // attachment: PassNode.toggleTexture does not swap renderTarget.depthTexture.
+    if (!node.renderTarget.textures.includes(current) || !(previous instanceof three.Texture) ||
+        previous.isDepthTexture || previous.isRenderTargetTexture !== true || previous.renderTarget !== node.renderTarget ||
+        textures.has(previous) || currentNode?.isPassMultipleTextureNode !== true ||
+        previousNode?.isPassMultipleTextureNode !== true || currentNode.passNode !== node || previousNode.passNode !== node ||
+        currentNode.textureName !== name || previousNode.textureName !== name ||
+        currentNode.previousTexture !== false || previousNode.previousTexture !== true ||
+        currentNode.value !== current || previousNode.value !== previous)
+      fail('Native color histories require the source current and previous texture-node pair');
+    textures.add(previous);
+  }
+  if (Object.keys(node._previousTextureNodes).some(name => node._previousTextures[name] === undefined))
+    fail('Native color histories require their source previous textures');
   inspectThreeMRT(three, {getRenderTarget: () => node.renderTarget, getMRT: () => node._mrt, _device: renderer._device});
   if (node.contextNode !== null || node.transparent !== true || node.opaque !== true)
     fail('Native scene passes currently require ordinary context and both opaque and transparent draws');
   if (renderer.getOutputRenderTarget() !== null || renderer.xr?.isPresenting)
     fail('Native scene passes currently target the ordinary canvas output');
+  if (histories.length) {
+    if (typeof renderer._targets?.registerNativePass !== 'function')
+      fail('Native color histories require the renderer target residency owner');
+    nativePasses.set(node.renderTarget, node);
+    renderer._targets.registerNativePass(node);
+  }
   return true;
 }
 

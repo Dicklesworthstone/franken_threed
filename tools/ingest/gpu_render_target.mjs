@@ -676,4 +676,3 @@ export function createGpuRenderTarget(device, options = {}) {
     return api;
   } catch (error) { disposed = true; release(); throw error; }
 }
-

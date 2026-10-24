@@ -653,10 +653,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       if (target && !this._shaderEncodedOutput) {
         const context = inspectThreeMRT(THREE, this);
+        // The source background overrides the ordinary primary clear before
+        // MRT defaults are selected. Capture it now, before queued preparation
+        // or node updates can change the scene; authored MRT clears still win.
+        const background = !clearOnly && scene.isScene === true && !scene.backgroundNode?.isNode &&
+          scene.background?.isColor ? scene.background : null;
         if (context) frame.clearColors = target.textures.map((texture, index) => {
           const color = context.mrt?.getClearColor(texture.name);
           return color ? [color.r, color.g, color.b, color.a]
-            : index === 0 ? frame.clearColor.slice() : [0, 0, 0, 1];
+            : index === 0 ? background ? [background.r, background.g, background.b, 1] : frame.clearColor.slice() : [0, 0, 0, 1];
         });
       }
       return frame;

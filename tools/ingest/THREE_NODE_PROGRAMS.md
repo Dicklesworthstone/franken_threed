@@ -619,3 +619,60 @@ immediate generator disposal and a sampled output atlas. The registered
 `native_tsl_cube_textures` scenario combines six asymmetric direction panels
 with Standard/Physical environment consumers; its recording-device path is
 tested. Browser pixel parity for this cube extension is unmeasured.
+
+## Native scene passes and previous-frame color
+
+The pinned `PassNode` and `RenderPipeline` can retain current and previous color
+outputs through `getTextureNode(name)` and `getPreviousTextureNode(name)`:
+
+```js
+const scenePass = TSL.pass(scene, camera);
+const current = scenePass.getTextureNode();
+const previous = scenePass.getPreviousTextureNode();
+const pipeline = new THREE.RenderPipeline(renderer, TSL.mix(previous, current, 0.8));
+pipeline.render();
+```
+
+This blends two consecutive scene images. For recursive accumulation, a material
+inside the scene pass can also sample its previous color output. The source
+`NodeFrame` schedules the scene pass once per logical frame, including when its
+own material references that pass. Sampling its active color or depth attachment
+remains invalid feedback.
+
+Named MRT outputs can each retain a history, including mixed RGBA8 and RGBA16F
+attachments. Current and previous colors have distinct persistent GPU images;
+four-sample targets also have distinct multisample attachments. Depth and colors
+without a history remain shared. History swaps update bindings without rerunning
+authored `Fn` setup. Late history activation preserves the already rendered
+current image.
+
+Automatic pass resizing creates new images while previously accepted draws,
+copies and readbacks retain their original generations. The new previous image
+starts with WebGPU's initialized contents. Selected MRT uploads, copies,
+readbacks and external GPU color producers retain their captured history image
+and validation dependencies. Allocations, including detached generations, count
+against the renderer's existing target budgets.
+
+The admitted history surface is 2D mip-zero color with one or four samples.
+Create the source current/previous texture-node pair; calling only
+`getPreviousTexture()` does not establish the source's complete swap lifecycle.
+Depth history, cube/mip histories, XR/view-offset histories and complete
+TRAA/SSGI addon effects are outside this surface. The focused owner and renderer
+tests cover swaps, feedback, queued resize, late activation, stable graph setup
+and transfer ordering. Browser scenarios are `native_pipeline_history`,
+`native_pipeline_history_resize` and `native_pipeline_history_accumulation`;
+the accumulation scenario uses four samples.
+
+## Native clipping groups
+
+Source `ClippingGroup` planes apply to native built-in and node-material meshes,
+including nested union/intersection groups, group enable/layer selection and
+`clipShadows`. Planes are projected into camera space with the pinned source
+math, and the pinned `ClippingNode` supplies the shader equations. Each queued
+draw retains its captured planes; moving a plane updates uniforms without
+rebuilding the graph. Background draws remain outside scene clipping.
+
+Source `alphaToCoverage` selects multisample coverage for four-sample targets.
+`native_clipping_groups` and `native_clipping_msaa` exercise these paths. Legacy
+renderer/material `clippingPlanes` are a separate API and are not enabled by
+this native ClippingGroup implementation.

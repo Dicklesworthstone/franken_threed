@@ -361,9 +361,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Source registration outlives an allocation group: PassNode.setSize()
     // disposes its old attachments before swapping and rendering the next pair.
     if (!historyGroups.has(target) && nativePasses.has(target)) registerNativePass(nativePasses.get(target));
-    const group = historyGroups.get(target);
+    let group = historyGroups.get(target);
+    if (group && !historyShape(group, shape)) {
+      // PassNode.setup inherits renderer samples during shader construction,
+      // after layout queries may have created allocation-free metadata. Such
+      // observations have no queued owner or image to preserve. Accepted uses
+      // and allocated histories still invalidate on unrecognized shape changes.
+      const cold = !group.storage && !group.busy && !group.frame && [...group.entries].every(entry =>
+        !entry.references && !entry._dispatcher && !entry.busy);
+      const node = group.node;
+      retireHistory(group);
+      if (!cold) fail('STALE', 'Pass history attachments changed outside their registered source lifecycle');
+      registerNativePass(node); group = historyGroups.get(target);
+    }
     if (group) {
-      if (!historyShape(group, shape)) { retireHistory(group); fail('STALE', 'Pass history attachments changed outside their registered source lifecycle'); }
       const entry = historyEntry(group, shape); entries.set(target, entry); return entry;
     }
     let entry = entries.get(target);

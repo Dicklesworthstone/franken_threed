@@ -184,3 +184,21 @@ test('history allocation failure retires each partially allocated resolved/MSAA 
     assert.equal(raw.failed, true); raw.dispose(); destroyed(f.calls.textures); f.owner.dispose();
   }
 });
+
+test('source setup refreshes cold history metadata but shape edits invalidate retained or allocated generations', () => {
+  for (const state of ['cold', 'retained', 'allocated']) {
+    const f = fixture(), pass = source(); f.owner.registerNativePass(pass);
+    const before = f.owner.capture(pass.renderTarget);
+    const release = state === 'retained' ? f.owner.retainGeneration(before) : null;
+    if (state === 'allocated') f.owner.ensure(before);
+    pass.renderTarget.samples = 4;
+    if (state === 'cold') {
+      const current = f.owner.captureNativeTexture(pass.renderTarget.texture);
+      const previous = f.owner.captureNativeTexture(pass._previousTextures.output);
+      assert.equal(current.sampleData.samples, 4); assert.equal(previous.sampleData.samples, 4);
+      assert.notEqual(current.entry, before); assert.equal(f.calls.textures.length, 0);
+    } else assert.throws(() => f.owner.capture(pass.renderTarget), {code: 'THREE_TARGET_STALE'});
+    assert.throws(() => f.owner.assertCurrent(before), {code: 'THREE_TARGET_STALE'});
+    release?.(); f.owner.dispose(); destroyed(f.calls.textures);
+  }
+});
