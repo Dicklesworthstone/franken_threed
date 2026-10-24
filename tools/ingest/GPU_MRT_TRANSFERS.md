@@ -51,6 +51,62 @@ readback rows. A later read cannot relax an earlier outstanding read's promised
 budget. Selecting a different attachment is not a way around request, ownership,
 nonreentrancy, feedback or device-identity checks.
 
+## Renderer integration
+
+The explicit renderer APIs use the same attachment selectors and shared FIFO:
+
+```js
+// Source RenderTargets retain their ordinary textures[] identities.
+// The selected source/destination attachments must have copy-compatible formats.
+await renderer.writeRenderTargetPixelsAsync(source, halfFloatBits, {
+  colorIndex: 1,
+});
+await renderer.copyRenderTargetPixelsAsync(source, destination, {
+  sourceColorIndex: 1, colorIndex: 2,
+});
+const pixels = await renderer.readRenderTargetMipPixelsAsync(destination, 0, {
+  colorIndex: 2,
+});
+
+// Source-shaped copies derive selection from the actual texture objects.
+await renderer.copyTextureToTextureAsync(
+  source.textures[1], destination.textures[2]
+);
+// The void copyTextureToTexture form and the storage facade's delegated form
+// use the same owner and queue; no compute/storage path is substituted.
+```
+
+Indices, rectangles, orientation and upload bytes are captured at the call,
+including before initialization or while preparation is pending. Texture copies
+capture the source/destination attachment identities and ordering, not merely
+an index into a later texture vector. Replacement, reordering, format changes
+or disposal invalidate the captured target generation instead of retargeting
+accepted work. Source automatic-resize leases retain their original attachment
+set until the existing retirement conditions permit release.
+
+Nested write protection checks the selected texture. A child write cannot
+replace a secondary attachment already sampled by an earlier parent draw, but
+a write to an independent, unsampled sibling does not falsely collide with the
+primary attachment. Ordinary same-target copy rejection remains unchanged.
+
+Only writes to attachment zero invalidate the existing primary WebGL sampling
+replica. Native MRT inputs borrow the actual per-attachment images and need no
+replica or CPU round trip. The source owner's readback session forwards the
+complete format vector and color selector to the shared native readback helper.
+
+Renderer upload-byte/request limits, target storage budgets, and native staging
+budgets remain shared across attachments. GPU completion and mapping do not
+block later queued submissions. Caller/renderer/texture cancellation stops pending
+reads without committing caller output; already-submitted writes are not undone.
+
+This extends the explicit `readRenderTargetMipPixelsAsync` readback method.
+It does not change the source-shaped `readRenderTargetPixelsAsync` method's
+primary-attachment restriction, admit MRT cubes/mip chains, or add additional
+WebGL material sampling paths. Depth remains a single shared attachment without
+a color selector. Source texture-shaped copies remain 2D; cube endpoints use
+explicit target/face APIs. The source facade retains its existing admitted color
+formats, which are narrower than the native target's format set.
+
 ## Verification
 
 `gpu_mrt_transfer.test.mjs` runs the production target, transfer and readback
@@ -61,7 +117,16 @@ faces, authored mips, resolved MSAA sources, snapshots, shared budgets, rejectio
 cancellation, resize, validation errors and device loss. It does not execute
 WGSL, rasterize MSAA, establish browser pixel parity or measure performance.
 
+`three_renderer_mrt_transfers.test.mjs` executes the production controller, source
+target owner and native modules with structural source-class descriptors and a
+controlled queue driver. It exercises selected typed reads, texture-shaped
+copies, snapshots, exact attachment hazards, generation invalidation, shared
+budgets, cancellation, and native sampling residency. It does not construct the
+full renderer class or substitute for pinned-source browser comparison.
+
 ```sh
 node --test tools/ingest/gpu_mrt_transfer.test.mjs \
-  tools/ingest/gpu_render_target.test.mjs
+  tools/ingest/gpu_render_target.test.mjs \
+  tools/ingest/three_render_targets.test.mjs \
+  tools/ingest/three_renderer_mrt_transfers.test.mjs
 ```

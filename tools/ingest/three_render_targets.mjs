@@ -25,7 +25,8 @@
  * linear filtering requires float32-filterable. This owner does not extend the
  * separate draw renderer's admitted attachment/pipeline formats.
  * writePixels(entry, data, options) and copyColor(source, destination, options)
- * update native level-zero color and lazily invalidate only the color replicas.
+ * update a colorIndex-selected native level-zero attachment. Only primary color
+ * writes invalidate its WebGL UV replica; native MRT reads borrow actual images.
  * copyDepth(source, destination, options) instead invalidates only the depth
  * replica, preserving color mipmaps and stencil. All copies share admission,
  * allocation budgets, generation checks and nonreentrant native submission.
@@ -366,11 +367,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // original attachment, not the UV-oriented sampling replica.
     entry.session = {device, get width() { return width; }, get height() { return height; },
       get disposed() { return !entry.alive; }, get failed() { return !!entry.error || !!entry.storage?.failed; },
-      get diagnostics() { return {target: {format, mipLevelCount, cube}}; },
-      withTexture(callback) {
+      get diagnostics() { return {target: {format, colorFormats, mipLevelCount, cube}}; },
+      withTexture(callback, options) {
         assertCurrent(entry);
         if (cube) fail('UNSUPPORTED', 'Cube target readbacks require an explicit face-aware transfer API');
-        return entry.storage.withTexture(callback);
+        return entry.storage.withTexture(callback, options);
       }};
     return entry;
   }
@@ -570,7 +571,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     budget((source.storage ? 0 : source.shape.bytes) + (destination.storage ? 0 : destination.shape.bytes));
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
-    if (depth) destination.depthDirty = true; else destination.dirty = true;
+    if (depth) destination.depthDirty = true;
+    else if (plan.colorIndex === 0) destination.dirty = true;
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
       assertCurrent(source); assertCurrent(destination); return result;
@@ -674,9 +676,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
       if (entry.busy) fail('REENTRANT', 'Cannot upload during a target submission');
-      if (inspectGpuTargetWrite(entry.shape, data, options).empty) return false;
+      const plan = inspectGpuTargetWrite(entry.shape, data, options);
+      if (plan.empty) return false;
       ensure(entry);
-      entry.busy = true; entry.dirty = true;
+      entry.busy = true;
+      if (plan.colorIndex === 0) entry.dirty = true;
       try { const result = entry.storage.writePixels(data, options); assertCurrent(entry); return result; }
       finally { entry.busy = false; if (!entry.alive) release(entry); }
     },

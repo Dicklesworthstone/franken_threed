@@ -16,9 +16,12 @@
  * readback layer, sourceFace selects the copy source. Each cube endpoint must
  * supply its face, independently of the active render face. Source-shaped
  * texture copies remain 2D; cube operations use target identities directly.
+ * colorIndex/sourceColorIndex select MRT attachments in explicit color APIs.
+ * Texture-shaped copies derive those indices from the supplied source identities,
+ * never from the active draw or the primary attachment's format.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
-import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetColorFormat} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 
@@ -151,12 +154,12 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     writePixels(target, data, supplied = {}) {
       try {
         live();
-        assertThreeNativeTextureWrite(renderer, target?.texture);
         const {value, signal} = options(supplied), entry = transferEntry(target);
         const plan = inspectGpuTargetWrite(entry.shape, data, value);
+        assertThreeNativeTextureWrite(renderer, (target.textures ?? [target.texture])[plan.colorIndex]);
         // Pick built-in constructors, not a caller-controlled data.constructor.
         const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint16Array ? Uint16Array : Uint8Array;
-        const uploadOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
+        const uploadOptions = Object.freeze({...value, colorIndex: plan.colorIndex, width: plan.size.width, height: plan.size.height,
           offset: 0, bytesPerRow: plan.rowBytes});
         return schedule([entry], signal, plan.packedBytes, () => {
           // Copy bytes rather than float values (preserves NaN/half-float bits).
@@ -185,13 +188,13 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     copyColor(source, destination, supplied = {}) {
       try {
         live();
-        assertThreeNativeTextureWrite(renderer, destination?.texture);
         const {value, signal} = options(supplied);
         const from = transferEntry(source), to = transferEntry(destination);
         if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
         const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
+        assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
         const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
-          sourceMipLevel: plan.sourceMipLevel});
+          sourceMipLevel: plan.sourceMipLevel, sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
         return schedule([from, to], signal, 0, () => () => renderer._targets.copyColor(from, to, copyOptions));
       } catch (error) { return Promise.reject(error); }
     },
@@ -206,7 +209,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // isRenderTargetTexture flag. Never mutate a source texture to admit it.
     if (texture?.isTexture !== true || !target || (depth
       ? texture.isDepthTexture !== true || target.depthTexture !== texture
-      : texture.isRenderTargetTexture !== true || target.texture !== texture))
+      : texture.isRenderTargetTexture !== true || !(target.textures ?? [target.texture]).includes(texture)))
       fail('UNSUPPORTED', 'Texture copies require matching target-owned 2D color or depth textures');
     const entry = transferEntry(target);
     if (entry.shape.cube)
@@ -233,7 +236,9 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     if (depth && sourceLevel !== 0) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
     const from = textureEntry(source, depth), to = textureEntry(destination, depth);
     if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
-    const value = {...(depth ? {} : {sourceMipLevel: sourceLevel}), flipY: renderer._bottomLeftOrigin === true,
+    const value = {...(depth ? {} : {sourceMipLevel: sourceLevel,
+      sourceColorIndex: (from.shape.textures ?? [source.renderTarget.texture]).indexOf(source),
+      colorIndex: (to.shape.textures ?? [destination.renderTarget.texture]).indexOf(destination)}), flipY: renderer._bottomLeftOrigin === true,
       sourceX: sourceRegion === null ? 0 : sourceRegion.min.x,
       sourceY: sourceRegion === null ? 0 : sourceRegion.min.y,
       x: destinationPosition === null ? 0 : destinationPosition.x,
@@ -255,9 +260,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     live();
     const {value, signal} = options(supplied), entry = transferEntry(target);
     const allowed = ['x', 'y', 'width', 'height', 'face', 'flipY', 'output', 'maxBytes', 'maxInFlightBytes',
-      ...(depth ? ['sampleIndex'] : [])];
+      ...(depth ? ['sampleIndex'] : ['colorIndex'])];
     for (const name of Object.keys(value))
       if (!allowed.includes(name)) fail('OPTIONS', `Unknown renderer readback option: ${name}`);
+    const colorIndex = value.colorIndex === undefined ? 0 : value.colorIndex;
+    if (!depth) gpuTargetColorFormat(entry.shape, colorIndex, fail);
     // Never infer a cube layer from mutable renderer state, even for an empty
     // read. Validate before queueing or allocating native storage/staging.
     const face = value.face === undefined && !entry.shape.cube ? 0 : value.face;
@@ -281,7 +288,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       if (!Number.isSafeInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= entry.shape.sampleCount)
         fail('UNSUPPORTED', 'Depth readback requires an explicit in-range sampleIndex for multisampled targets');
     }
-    const captured = Object.freeze({...value, x, y, width, height, mipLevel, face});
+    const captured = Object.freeze({...value, x, y, width, height, mipLevel, face, ...(depth ? {} : {colorIndex})});
     return schedule([entry], signal, 0, combinedSignal => () => {
       renderer._targets.ensure(entry);
       return depth ? entry.storage.readDepthPixels({...captured, signal: combinedSignal})
