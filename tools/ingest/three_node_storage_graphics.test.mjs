@@ -51,6 +51,9 @@ class StorageTexture extends Texture { constructor() { super(); this.isStorageTe
 class StorageArrayTexture extends StorageTexture {
   constructor() { super(); this.isArrayTexture = true; this.image.depth = 3; this.mipmapsAutoUpdate = undefined; }
 }
+class Storage3DTexture extends StorageTexture {
+  constructor() { super(); this.is3DTexture = true; this.image.depth = 3; this.wrapR = 'clamp'; this.mipmapsAutoUpdate = undefined; }
+}
 class DataArrayTexture extends Texture { constructor() { super(); this.isDataArrayTexture = this.isArrayTexture = true; this.image.depth = 3; } }
 class Node {
   constructor(children = []) { this.isNode = true; this.children = children; }
@@ -64,6 +67,9 @@ class TextureNode extends Node {
   }
   getBase() { return this; }
   isSampleCompare() { return false; }
+}
+class Texture3DNode extends TextureNode {
+  constructor(value, options) { super(value, options); this.isTexture3DNode = true; this.updateMatrix = false; }
 }
 class Material extends Events {
   constructor() { super(); this.isMaterial = true; this.version = 0; this.lights = false; this.fog = false; this.alphaToCoverage = false; }
@@ -101,7 +107,7 @@ class WGSLNodeBuilder {
   getBindings() { return this.bindings; }
   getAttributesArray() { return []; }
 }
-const THREE = {REVISION: '186', Texture, StorageTexture, StorageArrayTexture, DataArrayTexture,
+const THREE = {REVISION: '186', Texture, StorageTexture, StorageArrayTexture, Storage3DTexture, DataArrayTexture, Texture3DNode,
   Node, TextureNode, Material, NodeMaterial, MeshBasicNodeMaterial, BufferGeometry, Mesh, WGSLNodeBuilder,
   UnsignedByteType: 'u8', HalfFloatType: 'f16', FloatType: 'f32', IntType: 'i32', UnsignedIntType: 'u32',
   RGBAFormat: 'rgba', RedFormat: 'r', RGFormat: 'rg', RedIntegerFormat: 'ri', RGIntegerFormat: 'rgi', RGBAIntegerFormat: 'rgbai', RGBIntegerFormat: 'rgbi',
@@ -126,7 +132,7 @@ function gpu(features = []) {
   const textures = [], events = [], samplers = [], scopes = [];
   let lose; const lost = new Promise(resolve => { lose = resolve; });
   const device = {features: new Set(features), textures, events, samplers, lost, lose,
-    limits: {maxTextureDimension2D: 64, maxTextureArrayLayers: 8, maxComputeWorkgroupsPerDimension: 65535},
+    limits: {maxTextureDimension3D: 32, maxTextureDimension2D: 64, maxTextureArrayLayers: 8, maxComputeWorkgroupsPerDimension: 65535},
     pushErrorScope(type) { scopes.push(type); }, popErrorScope() { assert.ok(scopes.pop()); return Promise.resolve(null); },
     createTexture(descriptor) {
       const bytes = descriptor.format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(descriptor.format) ? 8 : 4;
@@ -275,7 +281,7 @@ for (const change of [texture => { texture.image.width = 8; }, texture => textur
 }
 for (const [name, change, code] of [
   ['integer formats', t => { t.type = 'u32'; }, 'THREE_NODE_PROGRAM_TEXTURE'],
-  ['volume', t => { t.is3DTexture = true; t.image.depth = 4; }, 'THREE_NODE_PROGRAM_TEXTURE'],
+  ['volume attached to a 2D node', t => { t.is3DTexture = true; t.image.depth = 4; }, 'THREE_NODE_PROGRAM_TEXTURE'],
   ['CPU pixel shadow', t => { t.image.data = new Uint8Array(64); }, 'THREE_STORAGE_TEXTURE_FORMAT'],
   ['sRGB storage', t => { t.colorSpace = 'srgb'; }, 'THREE_STORAGE_TEXTURE_FORMAT'],
   ['invalid extent', t => { t.image.width = 0; }, 'THREE_STORAGE_TEXTURE_SHAPE'],
@@ -418,4 +424,179 @@ test('graphics preparation never modifies source texture pixels, identity, versi
     version: texture.version, sourceVersion: texture.source.version, storage: texture.isStorageTexture,
     renderTarget: texture.isRenderTargetTexture, keys: Object.keys(texture)}, before);
   assert.equal(texture.image.data, undefined);
+});
+
+
+function volumeRig(t, options) {
+  const f = rig(t, options);
+  f.texture = new Storage3DTexture(); f.node = new Texture3DNode(f.texture);
+  f.material.colorNode = f.node;
+  return f;
+}
+// Exercise the production compiler's descriptor/capture path and the existing
+// storage owner, not a parallel volume uploader. These are recording-device
+// tests: the writes below stand in for an earlier producer, not executed WGSL.
+for (const [format, type, channels] of formats) for (const stage of [1, 2, 3]) for (const sampler of [false, true]) {
+  test(`volume ${format}, visibility ${stage}, sampler ${sampler}: one compute/graphics allocation`, t => {
+    const f = volumeRig(t); f.texture.type = type; f.texture.format = channels;
+    f.node.stage = stage; f.node.sampler = sampler;
+    const d = f.compile(), snapshots = f.capture(d), entries = d.groups[0].entries;
+    assert.equal(entries.length, sampler ? 2 : 1);
+    const sample = entries.find(entry => entry.texture);
+    assert.deepEqual(sample.texture, {sampleType: type === 'f32' ? 'unfilterable-float' : 'float',
+      viewDimension: '3d', multisampled: false});
+    snapshots.forEach((snapshot, i) => assert.deepEqual(f.storage.layout(snapshot),
+      entries[i].texture ? {texture: entries[i].texture} : {sampler: entries[i].sampler}));
+    for (const entry of entries) assert.equal(entry.visibility, stage);
+    assert.equal(f.device.textures.length, 0, 'admission and capture never allocate an image');
+    const write = f.storage.captureBinding({texture: f.texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+    const producer = f.storage.resolve(write).texture; producer.pixels.fill(43); f.storage.written([write]);
+    f.storage.validateDispatch(snapshots);
+    const consumer = f.storage.resolve(snapshots.find(value => value.kind === 'sampled'));
+    assert.equal(consumer.texture, producer); assert.equal(consumer.options.dimension, '3d');
+    assert.equal(producer.descriptor.dimension, '3d'); assert.deepEqual(producer.descriptor.size, [4, 4, 3]);
+    assert.ok(consumer.texture.pixels.every(value => value === 43));
+    assert.equal(f.compile(), d, 'GPU content changes do not recompile source graphs');
+    assert.equal(f.device.textures.length, 1); assert.equal(f.device.events.length, 0);
+    assert.equal(f.texture.image.data, undefined, 'no CPU pixel shadow');
+    assert.equal(f.device.samplers.length, 0, 'resolving a sampled view does not allocate a sampler');
+  });
+}
+test('volume wraps retain capture-time R coordinates and reuse the shader', t => {
+  const f = volumeRig(t), d = f.compile(), first = f.capture(d);
+  f.texture.wrapR = 'repeat'; f.texture.wrapS = 'mirror';
+  const second = f.capture(d); assert.equal(f.compile(), d);
+  assert.equal(f.storage.resolve(first[0]).addressModeW, 'clamp-to-edge');
+  assert.equal(f.storage.resolve(second[0]).addressModeW, 'repeat');
+  assert.equal(f.storage.resolve(second[0]).addressModeU, 'mirror-repeat');
+  assert.equal(f.storage.resolve(first[1]), f.storage.resolve(second[1]));
+});
+test('compatible volume replacement retains earlier captured images and sampler state', t => {
+  const f = volumeRig(t), d = f.compile(), first = f.capture(d), replacement = new Storage3DTexture();
+  replacement.wrapR = 'mirror'; f.node.value = replacement;
+  assert.equal(f.compile(), d); const second = f.capture(d);
+  const a = f.storage.resolve(first[1]), b = f.storage.resolve(second[1]);
+  assert.notEqual(a.texture, b.texture); a.texture.pixels.fill(17); b.texture.pixels.fill(91);
+  assert.equal(f.storage.resolve(first[1]).texture.pixels[0], 17);
+  assert.equal(f.storage.resolve(second[1]).texture.pixels[0], 91);
+  assert.equal(f.storage.resolve(first[0]).addressModeW, 'clamp-to-edge');
+  assert.equal(f.storage.resolve(second[0]).addressModeW, 'mirror-repeat');
+});
+test('queued volume reads observe preceding producers, not a capture-time copy', t => {
+  const f = volumeRig(t), d = f.compile(), snapshots = f.capture(d), seen = [];
+  const write = f.storage.captureBinding({texture: f.texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+  for (const value of [5, 123, 201]) {
+    f.storage.resolve(write).texture.pixels.fill(value); f.storage.written([write]);
+    f.storage.validateDispatch(snapshots); seen.push(f.storage.resolve(snapshots[1]).texture.pixels[0]);
+  }
+  assert.deepEqual(seen, [5, 123, 201]); assert.equal(f.device.textures.length, 1);
+  assert.equal(f.device.events.length, 0, 'no added copy, submission or fence');
+});
+test('volume texture aliases rebuild only when their binding partition changes', t => {
+  const f = volumeRig(t), sibling = new Texture3DNode(f.texture);
+  f.material.colorNode = new Node([f.node, sibling]); const d = f.compile();
+  assert.equal(d.groups[0].entries.length, 2); sibling.value = new Storage3DTexture();
+  assert.throws(() => f.owner.captureDraw(d), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const next = f.compile(); assert.notEqual(next, d); assert.equal(next.groups[0].entries.length, 4);
+});
+for (const initialVolume of [false, true]) test(`2D/3D dimension change from volume=${initialVolume} cannot reuse stale bindings`, t => {
+  const f = initialVolume ? volumeRig(t) : rig(t), d = f.compile();
+  // Keep the same node identity to expose a missing dimension cache key.
+  // A real source node's constructor must also match at the next compile.
+  f.node.value = initialVolume ? new StorageTexture() : new Storage3DTexture();
+  assert.throws(() => f.owner.captureDraw(d), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+  f.material.colorNode = initialVolume ? new TextureNode(f.node.value) : new Texture3DNode(f.node.value);
+  const next = f.compile(); assert.notEqual(next, d);
+  assert.equal(next.groups[0].entries[1].texture.viewDimension, initialVolume ? '2d' : '3d');
+});
+for (const [name, change, code = 'THREE_NODE_PROGRAM_TEXTURE'] of [
+  ['ordinary TextureNode', f => { f.material.colorNode = new TextureNode(f.texture); }],
+  ['forged Texture3DNode flag', f => { f.material.colorNode = Object.assign(new TextureNode(f.texture), {isTexture3DNode: true}); }],
+  ['subclassed Texture3DNode', f => { f.material.colorNode = new (class extends Texture3DNode {})(f.texture); }],
+  ['2D value in Texture3DNode', f => { f.node.value = new StorageTexture(); }],
+  ['array value in Texture3DNode', f => { f.node.value = new StorageArrayTexture(); }],
+  ['array-layer coordinate', f => { f.node.depthNode = new Node(); }],
+  ['texture gather', f => { f.node.gatherNode = new Node(); }],
+  ['depth comparison', f => { f.node.isSampleCompare = () => true; }],
+  ['graphics storage-store', f => { f.node.isStorageTextureNode = true; }],
+  ['integer samples', f => { f.texture.type = 'u32'; }],
+  ['CPU Data3D ownership', f => { f.texture.isStorageTexture = false; f.texture.isData3DTexture = true; }],
+  ['2D material map', f => { f.material.map = f.texture; }],
+  ['missing shared owner', f => { delete f.renderer._getSampledTextureInputs; }],
+  ['missing owner layout', f => { f.shared.layoutOf = () => null; }],
+  ['wrong owner dimension', f => { f.shared.layoutOf = () => ({texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}}); }],
+  ['multisampling', f => { f.renderer.backend.utils.getTextureSampleData = () => ({primarySamples: 4}); }],
+  ['CPU shadow', f => { f.texture.image.data = new Uint8Array(192); }, 'THREE_STORAGE_TEXTURE_FORMAT'],
+  ['nonlinear storage', f => { f.texture.colorSpace = 'srgb'; }, 'THREE_STORAGE_TEXTURE_FORMAT'],
+  ['zero depth', f => { f.texture.image.depth = 0; }, 'THREE_STORAGE_TEXTURE_SHAPE'],
+  ['fractional depth', f => { f.texture.image.depth = 1.5; }, 'THREE_STORAGE_TEXTURE_SHAPE'],
+]) test(`volume admission rejects ${name} before callbacks and allocation`, t => {
+  const f = volumeRig(t); let calls = 0; f.node.before = () => calls++; change(f);
+  assert.throws(f.compile, {code}); assert.equal(calls, 0); assert.equal(f.renderer.builds, 0);
+  assert.equal(f.device.textures.length, 0);
+});
+for (const axis of ['width', 'height', 'depth']) test(`volume ${axis} honors the 3D device limit`, t => {
+  const f = volumeRig(t); f.texture.image[axis] = 33;
+  const snapshots = f.capture(f.compile());
+  assert.throws(() => f.storage.resolve(snapshots[1]), {code: 'THREE_STORAGE_TEXTURE_LIMIT'});
+  assert.equal(f.device.textures.length, 0);
+});
+test('volume byte budget accounts for depth, not one 2D slice', t => {
+  const f = volumeRig(t, {maxBytes: 191}), snapshots = f.capture(f.compile());
+  assert.throws(() => f.storage.resolve(snapshots[1]), {code: 'THREE_STORAGE_TEXTURE_BUDGET'});
+  assert.equal(f.device.textures.length, 0);
+});
+for (const change of [t => { t.image.depth = 4; }, t => t.dispose(),
+  t => { t.type = 'f16'; }, t => { t.generateMipmaps = true; }]) {
+  test(`captured volume generations cannot be reused after ${change}`, t => {
+    const f = volumeRig(t), snapshots = f.capture(f.compile()); change(f.texture);
+    assert.throws(() => f.storage.validateDispatch(snapshots), {code: 'THREE_STORAGE_TEXTURE_STALE'});
+    assert.equal(f.device.textures.length, 0);
+  });
+}
+for (const auto of [false, true, undefined]) test(`volume mip ownership remains shared, auto=${auto}`, t => {
+  const f = volumeRig(t); f.texture.generateMipmaps = true; f.texture.mipmapsAutoUpdate = auto;
+  f.texture.image = {width: 9, height: 5, depth: 3};
+  const snapshots = f.capture(f.compile());
+  const write = f.storage.captureBinding({texture: f.texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+  const native = f.storage.resolve(write).texture; f.storage.written([write]);
+  const count = f.device.events.length; assert.equal(count, auto ? 1 : 0);
+  if (auto) assert.equal(f.device.events[0].descriptor.label, 'f3d-storage-volume-mips');
+  assert.equal(f.storage.resolve(snapshots[1]).texture, native);
+  assert.equal(f.device.events.length, count, 'sampling does not regenerate a current mip chain');
+  assert.equal(f.device.textures.length, 1); assert.equal(native.descriptor.mipLevelCount, 4);
+});
+for (const features of [[], ['float32-filterable']]) test(`volume float32 filtering follows features ${features}`, t => {
+  const f = volumeRig(t, {features}); f.texture.type = 'f32'; f.texture.minFilter = f.texture.magFilter = 'linear';
+  if (!features.length) {
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'}); assert.equal(f.renderer.builds, 0); return;
+  }
+  const d = f.compile(), snapshots = f.capture(d);
+  assert.equal(d.groups[0].entries[0].sampler.type, 'filtering');
+  assert.equal(f.storage.resolve(snapshots[0]).minFilter, 'linear');
+});
+test('a volume graphics reader cannot share a dispatch usage scope with its writer', t => {
+  const f = volumeRig(t), snapshots = f.capture(f.compile());
+  const write = f.storage.captureBinding({texture: f.texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+  assert.throws(() => f.storage.validateDispatch([...snapshots, write]), {code: 'THREE_STORAGE_TEXTURE_FEEDBACK'});
+});
+test('a volume consumer preserves producer validation failures', async t => {
+  const f = volumeRig(t), snapshots = f.capture(f.compile()), error = new Error('volume producer failed');
+  const write = f.storage.captureBinding({texture: f.texture, isSampledTexture: true, store: true, access: 'writeOnly'});
+  f.storage.withTexture(write.entry, () => {}, write, {validation: Promise.reject(error)});
+  await assert.rejects(f.storage.whenIdle(), error);
+  assert.throws(() => f.storage.resolve(snapshots[1]), error); assert.equal(f.storage.allocatedBytes, 0);
+});
+test('device loss invalidates captured volumes', async t => {
+  const f = volumeRig(t), snapshots = f.capture(f.compile()); f.device.lose({message: 'volume lost'}); await Promise.resolve();
+  assert.throws(() => f.storage.resolve(snapshots[1]), {code: 'THREE_STORAGE_TEXTURE_DEVICE_LOST'});
+});
+
+
+test('volume sampler capture rejects invalid wrapR before GPU allocation', t => {
+  const f = volumeRig(t), descriptor = f.compile();
+  f.texture.wrapR = 'invalid';
+  assert.throws(() => f.capture(descriptor), {code: 'THREE_STORAGE_TEXTURE_SAMPLER'});
+  assert.equal(f.device.textures.length, 0);
 });
