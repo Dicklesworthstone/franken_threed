@@ -17,7 +17,8 @@ function fixture(t, Material = THREE.MeshPhysicalNodeMaterial) {
     getViewport: value => value.set(0, 0, canvas.width, canvas.height), getPixelRatio: () => 1,
     copyFramebufferToTexture(texture) { copies.push({texture, target, width: texture.image.width,
       height: texture.image.height, mipmaps: texture.generateMipmaps}); },
-    _getSampledTextureInputs: () => ({layoutOf: ({texture}) => texture.isFramebufferTexture
+    _getSampledTextureInputs: () => ({prepareFramebuffer(texture, type) { texture.type = type; },
+      layoutOf: ({texture}) => texture.isFramebufferTexture
       ? {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}} : null}),
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: new THREE.NodeFrame()}, info: {calls: 1}};
   const programs = createThreeNodePrograms({three: THREE, renderer}); t.after(() => programs.dispose());

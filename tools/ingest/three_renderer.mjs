@@ -569,8 +569,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     copyFramebufferToTexture(texture, rectangle = null) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
-      if (!this._nodeFramebufferCopyRecorder)
-        fail('UNSUPPORTED', 'Framebuffer copies require an active native draw capture');
+      if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
+      if (!this._initialized) fail('SOURCE', 'Initialize the renderer before copying its framebuffer');
+      if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Public framebuffer copies require the native WebGPU route');
       if (!(texture instanceof THREE.FramebufferTexture) || texture.isDepthTexture)
         fail('SOURCE', 'Expected a source color FramebufferTexture');
       let region;
@@ -578,14 +579,61 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       else if (rectangle.isVector2) region = [rectangle.x, rectangle.y, texture.image.width, texture.image.height].map(Math.floor);
       else if (rectangle.isVector4) region = [rectangle.x, rectangle.y, rectangle.z, rectangle.w].map(Math.floor);
       else { (THREE.error ?? console.error)('Renderer.copyFramebufferToTexture: Invalid rectangle.'); return; }
-      // Textures.updateTexture performs this assignment before allocation. The
-      // physical copy format is selected independently by the backend context.
-      texture.type = this._renderTarget?.texture.type ?? THREE.UnsignedByteType;
       const textures = this._getSampledTextureInputs();
-      const lease = textures.captureFramebuffer(texture, {format: this._framebufferFormat(),
+      textures.prepareFramebuffer(texture, this._renderTarget?.texture.type ?? THREE.UnsignedByteType);
+      const format = this._framebufferFormat();
+      const source = !this._nodeFramebufferCopyRecorder && this._renderTarget
+        ? this._targets.capture(this._renderTarget) : null;
+      const [width, height] = source ? [source.shape.width, source.shape.height] : this._bufferSize();
+      if (!this._nodeFramebufferCopyRecorder &&
+          (region[0] + region[2] > width || region[1] + region[3] > height))
+        fail('COPY', 'Framebuffer copy rectangle exceeds the selected source');
+      const lease = textures.captureFramebuffer(texture, {format,
         rectangle: {x: region[0], y: region[1], z: region[2], w: region[3]}});
-      try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
-      catch (error) { textures.release(lease); throw error; }
+      if (this._nodeFramebufferCopyRecorder) {
+        try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
+        catch (error) { textures.release(lease); throw error; }
+      } else {
+        let releaseSource = null, released = false;
+        const release = () => {
+          if (released) return; released = true;
+          textures.release(lease); releaseSource?.();
+        };
+        try {
+          releaseSource = source ? this._targets.retainGeneration(source) : null;
+          const hdr = !source && this._wantsHdr(this._toneMapping());
+          const srgbView = this._canvasSrgbView(this.outputColorSpace, hdr);
+          const copy = () => {
+            if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+            textures.validateDispatch([lease]);
+            const encode = native => {
+              textures.validateDispatch([lease]);
+              textures.withDispatch([lease], () => {
+                const encoder = this._device.createCommandEncoder({label: 'f3d-public-framebuffer-copy'});
+                textures.encodeFramebufferCopy(lease, encoder, native);
+                this._device.queue.submit([encoder.finish()]);
+              });
+            };
+            if (source) this._targets.withFramebufferTexture(source, encode);
+            else this._session.withFramebufferTexture(encode, {width, height});
+          };
+          const request = {framebufferCopy: true, releaseFramebuffer: release, issue: () => {
+            // Invalid destinations must not acquire or replace presentation.
+            textures.validateDispatch([lease]);
+            if (!source && (hdr !== this._hdr || srgbView !== this._srgbView)) {
+              this._session.dispose();
+              return this._createSession(hdr, srgbView).then(copy);
+            }
+            return copy();
+          }};
+          // Public void calls share the render FIFO. An already prepared copy
+          // submits now; pending renders keep their original producer boundary.
+          if (!this._drain && !this._preparing && !this._pending.length &&
+              (source || hdr === this._hdr && srgbView === this._srgbView)) {
+            try { request.issue(); } finally { this._releaseRequest(request); }
+          } else this._enqueue(request);
+        } catch (error) { release(); throw error; }
+      }
       this._inspector.copyFramebufferToTexture?.(texture);
     }
     getOutputRenderTarget() { return this._outputRenderTarget; }
@@ -877,6 +925,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return captured;
     }
     _releaseRequest(request) {
+      request.releaseFramebuffer?.(); request.releaseFramebuffer = null;
       request.snapshot?.release();
       if (request.materialFrame) {
         this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
@@ -981,6 +1030,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       pending: while (this._pending.length && !this._disposed) {
         const request = this._pending[0];
         if (request.nodeCaptureFailure) throw request.nodeCaptureFailure.error;
+        if (request.framebufferCopy) {
+          try { const preparation = request.issue(); if (preparation?.then) await preparation; }
+          finally { this._releaseRequest(request); }
+          this._pending.shift(); continue;
+        }
         if (request.readback || request.transfer) {
           // Image compute can await private source readiness before submitting.
           // Ordinary transfers already submit synchronously; their mapping and

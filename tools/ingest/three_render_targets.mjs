@@ -790,6 +790,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
       budget(bytes);
     },
+    withFramebufferTexture(entry, callback) {
+      assertCurrent(entry);
+      const texture = entry.shape.textures[0];
+      const source = {entry, texture, device: getDevice(), depth: false, colorIndex: 0};
+      return this.withNativeTextures([source], textures => callback(textures.get(texture)));
+    },
     withNativeTexture(source, callback) {
       if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
       return this.withNativeTextures([source], textures => callback(textures.get(source.texture)));

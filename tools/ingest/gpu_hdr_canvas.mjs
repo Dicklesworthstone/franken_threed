@@ -130,6 +130,13 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
         } catch (error) { return childFailure(error); }
         finally { busy = false; if (closed()) release(); }
       },
+      withFramebufferTexture(callback, {width, height}) {
+        live(); if (busy || preparing) fail('REENTRANT', 'HDR framebuffer copies cannot overlap another operation');
+        busy = true;
+        try { offscreen.resize(width, height); return offscreen.withTexture(callback); }
+        catch (error) { return childFailure(error); }
+        finally { busy = false; if (closed()) release(); }
+      },
       async prepare() {
         live(); if (busy || preparing) fail('REENTRANT', 'HDR preparation cannot overlap another operation');
         preparing = true;

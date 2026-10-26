@@ -418,6 +418,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding,
+    prepareFramebuffer(texture, type) { live(); framebuffers().prepareFramebuffer(texture, type); },
     captureFramebuffer(texture, options) { live(); return framebuffers().captureFramebuffer(texture, options); },
     encodeFramebufferCopy(snapshot, encoder, source) { live(); return framebuffers().encodeFramebufferCopy(snapshot, encoder, source); },
     preparation(snapshots) {

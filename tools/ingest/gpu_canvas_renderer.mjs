@@ -113,6 +113,16 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         live(); return api;
       });
     },
+    withFramebufferTexture(callback, {width = target.width, height = target.height} = {}) {
+      return exclusive(() => {
+        if (typeof callback !== 'function') fail('FRAME', 'Expected a synchronous framebuffer copy');
+        if (typeof renderer.withFramebufferTexture === 'function')
+          return renderer.withFramebufferTexture(callback, {width, height});
+        if (width !== target.width || height !== target.height)
+          fail('SIZE_CHANGED', 'The direct canvas changed size before its framebuffer copy');
+        return target.withFrame((attachments, texture) => callback(texture));
+      });
+    },
     resize(width, height) { return exclusive(() => { target.resize(width, height); return api; }); },
     setSize(width, height, pixelRatio = 1) {
       return exclusive(() => {

@@ -537,7 +537,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // the GPU owner separately selects the actual framebuffer format (including
     // the canvas output intermediate). Normalize before freezing the layout so
     // the first ordered copy does not appear to mutate a compiled texture type.
-    if (framebuffer) texture.type = renderer.getRenderTarget()?.texture.type ?? three.UnsignedByteType;
+    if (framebuffer) {
+      const inputs = renderer._getSampledTextureInputs();
+      if (typeof inputs?.prepareFramebuffer !== 'function')
+        fail('TEXTURE', 'Framebuffer inputs require the shared versioned renderer texture owner');
+      inputs.prepareFramebuffer(texture, renderer.getRenderTarget()?.texture.type ?? three.UnsignedByteType);
+    }
     const depth = texture.isDepthTexture === true;
     if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
         texture.renderTarget.depthTexture !== texture ||

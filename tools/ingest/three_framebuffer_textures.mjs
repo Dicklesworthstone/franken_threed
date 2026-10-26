@@ -145,6 +145,12 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
       const shape = shapeOf(binding.texture), layout = bindingLayout(binding, shape), sampler = samplerOf(binding.texture, shape);
       return lease(entryOf(binding.texture, shape.format), {layout, sampler: binding.isSampler && !binding.isSampledTexture ? sampler : null});
     },
+    prepareFramebuffer(texture, type) {
+      live();
+      // Source Textures.updateTexture returns early for an allocated version.
+      // The public type can differ from the backend framebuffer's actual format.
+      if (current.get(texture)?.version !== texture.version) texture.type = type;
+    },
     captureFramebuffer(texture, {format = getFormat(), rectangle = null} = {}) {
       live();
       if (leases.size >= maxBindings) fail('BUDGET', 'Queued framebuffer bindings exceed maxBindings');

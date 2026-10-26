@@ -190,12 +190,33 @@ source RenderTarget identity, type and size; application target selection is
 restored after capture. Linear canvas output without tone mapping keeps its direct
 path. Existing linear targets now preserve explicit color/depth/stencil loads.
 
+Public `copyFramebufferToTexture(texture, rectangle)` also works outside node
+updates after renderer initialization. It captures the selected source target,
+floored Vector2/Vector4 rectangle and destination generation, then submits in the
+same FIFO as renders and compute. Prepared copies submit synchronously; a copy
+behind a cold render waits for that producer. A later material can sample the
+copied image through the same shared GPU owner.
+
+Public copies read resolved primary color, including MSAA targets and the
+persistent linear canvas intermediate, without rendering the scene again.
+Copy and destination mip generation share one command encoder. Destination
+resize/version changes preserve accepted older generations, and the initialized
+public texture type remains stable until its version advances. Disposed sources
+or destinations reject and release their queued leases; an invalid destination
+does not acquire or replace presentation. Ordinary public source-target resize
+retains the existing stale-use rejection contract.
+
 This path uses the existing owned WebGPU renderer and texture owners, with no
-readback or retained renderer submission. Framebuffer copies outside an active
-native draw capture, depth framebuffer copies and ArrayCamera transmission remain
-unimplemented. A distinct scene override on a transmissive DoubleSide original
-also requires further original/effective-material pass expansion and fails before
-updates. These are remaining compatibility tasks, not permanent exclusions.
+readback or retained renderer submission. Depth framebuffer copies, the
+WebGL-authored copy route and ArrayCamera transmission remain unimplemented.
+A distinct scene override on a transmissive DoubleSide original also requires
+further original/effective-material pass expansion and fails before updates.
+These are remaining compatibility tasks, not permanent exclusions.
+
+Fourteen public-copy facade cases cover source/destination selection, all three
+canvas precisions, direct linear output, MSAA resolves, FIFO ordering, mips,
+version/type transitions and failure cleanup. These run alongside the existing
+framebuffer-owner and transmission regressions.
 
 Thirteen framebuffer/output tests, ten program tests, nine capture-order tests and
 twelve complete facade integration tests cover this implementation. Program WGSL
