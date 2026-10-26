@@ -29,7 +29,7 @@ const mutableImage = image => instance(image, 'HTMLImageElement') || instance(im
  * with scene textures; this adapter does not implement another texture uploader.
  * The storage owner is borrowed and is not disposed by this adapter.
  */
-export function createThreeComputeTextures({storage, poolFactory, targetFactory = null,
+export function createThreeComputeTextures({storage, poolFactory, targetFactory = null, framebufferFactory = null,
   maxTextures = 256, maxSnapshotBytes = 128 * 1024 * 1024} = {}) {
   if (!storage || typeof poolFactory !== 'function' || !positive(maxTextures) || !positive(maxSnapshotBytes))
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
@@ -37,6 +37,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   const leases = new WeakSet(), imageSnapshots = new WeakMap();
   let captureState = null;
   let targetInputs = null;
+  let framebufferInputs = null;
+  const framebuffers = () => {
+    if (typeof framebufferFactory !== 'function') fail('SOURCE', 'Framebuffer inputs require the renderer framebuffer owner');
+    return framebufferInputs ??= framebufferFactory();
+  };
+  const isFramebuffer = binding => binding?.texture?.isFramebufferTexture === true;
   const targets = () => {
     if (typeof targetFactory !== 'function') fail('SOURCE', 'Native render-target inputs require the renderer target owner');
     return targetInputs ??= targetFactory();
@@ -146,6 +152,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function layoutOf(binding) {
     if (isStorage(binding)) return storage.layout(storage.captureBinding(binding));
     if (isTarget(binding)) return targets().layoutOf(binding);
+    if (isFramebuffer(binding)) return framebuffers().layoutOf(binding);
     return inputLayout(binding, describe(binding));
   }
   function syncPool() {
@@ -379,6 +386,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (isStorage(binding)) return storage.captureBinding(binding);
     if (resolving) fail('REENTRY', 'Cannot capture compute texture inputs from an upload callback');
     if (isTarget(binding)) return targets().captureBinding(binding);
+    if (isFramebuffer(binding)) return framebuffers().captureBinding(binding);
     const shape = describe(binding), original = binding.texture;
     let record = current.get(original);
     const unchanged = record && record.key === shape.key && record.source === original.source &&
@@ -410,6 +418,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding,
+    captureFramebuffer(texture, options) { live(); return framebuffers().captureFramebuffer(texture, options); },
+    encodeFramebufferCopy(snapshot, encoder, source) { live(); return framebuffers().encodeFramebufferCopy(snapshot, encoder, source); },
     preparation(snapshots) {
       const pending = new Set();
       for (const snapshot of snapshots) if (leases.has(snapshot)) {
@@ -471,20 +481,25 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     },
     sampleData(texture) {
       if (isTarget({texture})) return targets().sampleData(texture);
+      if (isFramebuffer({texture})) return framebuffers().sampleData(texture);
       layoutOf({texture, isSampledTexture: true});
       return {samples: 1, primarySamples: 1, isMSAA: false};
     },
     withDispatch(snapshots, run) {
       live();
-      return targetInputs ? targetInputs.withDispatch(snapshots.filter(s => targetInputs.owns(s)), run) : run();
+      const submit = () => framebufferInputs ? framebufferInputs.withDispatch(snapshots.filter(s => framebufferInputs.owns(s)), run) : run();
+      return targetInputs ? targetInputs.withDispatch(snapshots.filter(s => targetInputs.owns(s)), submit) : submit();
     },
-    layout(snapshot) { live(); if (targetInputs?.owns(snapshot)) return targetInputs.layout(snapshot); return leases.has(snapshot) ? snapshot.layout : storage.layout(snapshot); },
+    layout(snapshot) { live(); if (targetInputs?.owns(snapshot)) return targetInputs.layout(snapshot);
+      if (framebufferInputs?.owns(snapshot)) return framebufferInputs.layout(snapshot);
+      return leases.has(snapshot) ? snapshot.layout : storage.layout(snapshot); },
     validateDispatch(snapshots) {
       live();
       const owned = [];
       for (const snapshot of snapshots) {
         if (leases.has(snapshot)) validate(snapshot);
         else if (targetInputs?.owns(snapshot)) targetInputs.validateDispatch([snapshot]);
+        else if (framebufferInputs?.owns(snapshot)) framebufferInputs.validateDispatch([snapshot]);
         else owned.push(snapshot);
       }
       storage.validateDispatch(owned);
@@ -492,6 +507,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     resolve(snapshot) {
       live();
       if (targetInputs?.owns(snapshot)) return targetInputs.resolve(snapshot);
+      if (framebufferInputs?.owns(snapshot)) return framebufferInputs.resolve(snapshot);
       if (!leases.has(snapshot)) return storage.resolve(snapshot);
       validate(snapshot);
       if (snapshot.record.pixels.readyState === 'failed') throw snapshot.record.pixels.readyError;
@@ -508,15 +524,16 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       }
       return snapshot.sampler ? record.binding.sampler : record.binding.view;
     },
-    written(snapshots) { live(); storage.written(snapshots.filter(snapshot => !leases.has(snapshot) && !targetInputs?.owns(snapshot))); },
+    written(snapshots) { live(); storage.written(snapshots.filter(snapshot => !leases.has(snapshot) && !targetInputs?.owns(snapshot) && !framebufferInputs?.owns(snapshot))); },
     release(snapshot) {
       if (targetInputs?.owns(snapshot)) { targetInputs.release(snapshot); return; }
+      if (framebufferInputs?.owns(snapshot)) { framebufferInputs.release(snapshot); return; }
       if (!leases.has(snapshot) || snapshot.released) return;
       snapshot.released = true;
       const record = snapshot.record;
       if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
     },
-    async whenIdle() { live(); await Promise.all([storage.whenIdle(), pool?.whenIdle(), targetInputs?.whenIdle()]); live(); },
+    async whenIdle() { live(); await Promise.all([storage.whenIdle(), pool?.whenIdle(), targetInputs?.whenIdle(), framebufferInputs?.whenIdle()]); live(); },
     get diagnostics() { return {textures: current.size, versions: records.size, snapshotBytes}; },
     dispose() {
       if (disposed) return;
@@ -524,7 +541,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       for (const [original, listener] of watches) original.removeEventListener('dispose', listener);
       watches.clear();
       for (const record of records) retire(record);
-      current.clear(); syncPool(); targetInputs?.dispose();
+      current.clear(); syncPool(); targetInputs?.dispose(); framebufferInputs?.dispose();
     },
   };
 }

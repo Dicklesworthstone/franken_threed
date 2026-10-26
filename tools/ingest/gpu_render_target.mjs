@@ -38,8 +38,10 @@
  * Upload/copy destinations must be single-sample. No implicit color conversion.
  * withColorDestination(callback, {colorIndex, validation}) admits externally
  * owned GPU producers through the same copyDestination capability. The callback
- * writes level zero and submits synchronously; it must not retain the texture.
- * It neither samples nor refreshes old mips. Subsequent readers regenerate them.
+ * receives (texture, encodeMipmaps); encodeMipmaps(encoder) appends the primary
+ * 2D mip pyramid to that producer's encoder inside the same submitted borrow.
+ * The callback writes level zero and submits synchronously without retaining the
+ * texture. Borrowing alone never samples or refreshes the previous mip contents.
  * Optional source validation is a captured promise, not a queue wait. Both it
  * and this callback's GPU error scopes gate whenIdle and readback publication.
  * The validation getter snapshots checks already issued, without waiting for
@@ -341,8 +343,8 @@ export function createGpuRenderTarget(device, options = {}) {
       return api;
     } finally { busy = false; if (disposed || terminal !== null) release(); }
   }
-  function refreshMips(pair) {
-    if (!generateMipmaps || !pair.mipsDirty || pair.mipLevelCount === 1) return;
+  function refreshMips(pair, suppliedEncoder = null) {
+    if ((!generateMipmaps && suppliedEncoder === null) || !pair.mipsDirty || pair.mipLevelCount === 1) return;
     checked(() => {
       const methods = ['createShaderModule', 'createRenderPipeline', 'createBindGroup', 'createCommandEncoder',
         ...(float32 ? ['createBindGroupLayout', 'createPipelineLayout'] : ['createSampler'])];
@@ -371,13 +373,13 @@ export function createGpuRenderTarget(device, options = {}) {
         }
         pair.mipSteps = steps;
       }
-      const encoder = device.createCommandEncoder({label: label + ' mip chain'});
+      const encoder = suppliedEncoder ?? device.createCommandEncoder({label: label + ' mip chain'});
       for (const {view, group} of pair.mipSteps) {
         const pass = encoder.beginRenderPass({colorAttachments: [{view,
           loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
         pass.setPipeline(mipPipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
       }
-      device.queue.submit([encoder.finish()]);
+      if (suppliedEncoder === null) device.queue.submit([encoder.finish()]);
     });
     pair.mipsDirty = false; mipGenerations++;
   }
@@ -483,7 +485,16 @@ export function createGpuRenderTarget(device, options = {}) {
         validation = Promise.all([validation, dependency]).then(() => {});
         validation.catch(stop);
       }
-      const result = kind === 'destination' ? checked(() => callback(colors[colorIndex]))
+      // A framebuffer copy and its mip pyramid must use one command encoder:
+      // submitting mips before the caller's copy encoder would sample old data.
+      const encodeMipmaps = encoder => {
+        if (!active) fail('BORROW', 'The color destination borrow has ended');
+        if (colorIndex !== 0 || multiple || cube || !encoder || typeof encoder.beginRenderPass !== 'function')
+          fail('MIP', 'Expected the primary 2D destination and a command encoder');
+        current.mipsDirty = true;
+        refreshMips(current, encoder);
+      };
+      const result = kind === 'destination' ? checked(() => callback(colors[colorIndex], encodeMipmaps))
         : kind === 'frame' ? callback(frame, colors[0], handles)
         : kind === 'sampled' ? callback(colors[0], current.depth)
         : kind === 'attachments' ? callback(Object.freeze(colors), sampleDepth ? current.depth : null,

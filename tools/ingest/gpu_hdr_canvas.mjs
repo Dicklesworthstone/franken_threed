@@ -1,6 +1,6 @@
 /** Opaque whole-image HDR canvas composition, not per-material tone mapping.
  * The factory supplies a synchronous linear-sRGB renderer; this owner renders
- * into rgba16float (optionally MSAA), then runs the existing output pass onto
+ * into the selected linear texture format (optionally MSAA), then runs the existing output pass onto
  * the same-turn canvas texture. No readback, texture copy or frame loop.
  */
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
@@ -28,8 +28,10 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     'target', 'signal', 'renderTarget', 'output'], 'HDR canvas');
   if (typeof createRenderer !== 'function') fail('FACTORY', 'Expected a linear-scene renderer factory');
   const {renderTarget = {}, output = {}, ...session} = all;
-  const hdr = {depthFormat: 'depth24plus', sampleCount: 1, maxBytes: 256 * 1024 * 1024,
-    ...capture(renderTarget, ['depthFormat', 'sampleCount', 'maxBytes', 'label'], 'HDR target')};
+  const hdr = {format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 1, maxBytes: 256 * 1024 * 1024,
+    ...capture(renderTarget, ['format', 'depthFormat', 'sampleCount', 'maxBytes', 'label'], 'HDR target')};
+  if (!['rgba8unorm', 'rgba16float', 'rgba32float'].includes(hdr.format))
+    fail('OPTIONS', 'Expected a linear RGBA output buffer format');
   if (![null, 'depth24plus', 'depth32float', 'depth24plus-stencil8'].includes(hdr.depthFormat) || ![1, 4].includes(hdr.sampleCount))
     fail('OPTIONS', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four scene samples');
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
@@ -93,10 +95,8 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
           const {output: selectedOutput = {}, colorView, depthView, resolveTarget, ...sceneFrame} = frame;
           const selected = animationOutputSettings(capture(selectedOutput, OUTPUT_KEYS, 'frame output'), defaults);
           if (depthView || resolveTarget) fail('ATTACHMENT', 'Final HDR presentation must be depthless and single-sample');
-          // This profile renders a complete opaque scene before whole-image tone
-          // mapping. It does not pretend to preserve selectively unmapped layers.
-          if ((sceneFrame.loadOp ?? 'clear') !== 'clear' || (sceneFrame.depthLoadOp ?? 'clear') !== 'clear')
-            fail('FRAME', 'HDR canvas frames require clear color/depth loads; use explicit targets for multipass loads');
+          // The linear target persists between calls, so source color/depth/
+          // stencil loads retain its prior contents before the final output pass.
           const clear = sceneFrame.clearColor ?? [0, 0, 0, 1];
           if ((!Array.isArray(clear) && !ArrayBuffer.isView(clear)) || clear.length !== 4)
             fail('FRAME', 'Expected an opaque RGBA clear color');
@@ -106,7 +106,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
           live();
           offscreen.resize(texture.width, texture.height);
           offscreen.withFrame((attachments, source) => {
-            const result = renderer.render(input, {...sceneFrame, ...attachments});
+            const result = renderer.render(input, {...sceneFrame, ...attachments}, source);
             if (result && typeof result.then === 'function') {
               Promise.resolve(result).catch(() => {});
               fail('ASYNC_RENDER', 'Scene rendering must submit synchronously');
@@ -139,7 +139,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     signal.addEventListener('abort', aborted, {once: true});
     try {
       if (signal.aborted) aborted(); live();
-      offscreen = createGpuRenderTarget(device, {...hdr, width: canvas.width, height: canvas.height, format: 'rgba16float'});
+      offscreen = createGpuRenderTarget(device, {...hdr, width: canvas.width, height: canvas.height});
       const outputReady = createGpuAnimationOutput(device, {...defaults, format: presentation.format,
         outputColorSpace: target.srgbView === false ? 'linear' : 'srgb', signal}).then(value => {
         if (closed()) { value.dispose(); throw terminal; }

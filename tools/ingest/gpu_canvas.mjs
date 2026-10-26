@@ -14,6 +14,7 @@ export class GpuCanvasError extends Error {
 const fail = (code, message) => { throw new GpuCanvasError(code, message); };
 const owners = new WeakMap();
 const RENDER_ATTACHMENT = 16;
+const COPY_SRC = 1;
 
 export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
@@ -223,7 +224,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     exclusive(() => {
       checked(() => {
         configured = true;
-        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT,
+        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC,
           alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : []});
       });
       resize(initialWidth, initialHeight);

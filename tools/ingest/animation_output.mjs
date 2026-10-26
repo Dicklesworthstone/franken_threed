@@ -4,7 +4,7 @@
  * https://github.com/mrdoob/three.js/blob/148ef33ecb6d2502ff796d4554abd1549c95d519/src/renderers/shaders/ShaderChunk/tonemapping_pars_fragment.glsl.js
  * Copyright three.js authors. This is an opt-in whole-image operation, NOT a
  * substitute for per-material toneMapped semantics or complete renderer parity.
- * Input is a single-sample linear rgba16float/rgba8unorm/bgra8unorm texture.
+ * Input is a single-sample linear RGBA8/BGRA8, RGBA16F or RGBA32F texture.
  * Source and destination extents must match; no implicit resize/filter/flip.
  * Negative radiance is clamped before mapping. Alpha is not tone mapped.
  */
@@ -35,7 +35,7 @@ const formats = [
   "rgba16float",
   "rgba32float",
 ];
-const sourceFormats = ["rgba8unorm", "bgra8unorm", "rgba16float"];
+const sourceFormats = ["rgba8unorm", "bgra8unorm", "rgba16float", "rgba32float"];
 const alphaModes = ["straight", "premultiplied", "opaque"];
 const object = (v, label) => {
   if (!v || typeof v !== "object" || Array.isArray(v)) fail("OPTIONS", `Expected ${label}`);
@@ -373,7 +373,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
         if (source.texture === target.texture)
           fail("FEEDBACK", "Source and destination must differ");
         if (!sourceFormats.includes(source.format))
-          fail("FORMAT", "Source must contain linear rgba16float/rgba8unorm/bgra8unorm radiance");
+          fail("FORMAT", "Source must contain linear RGBA8/BGRA8, RGBA16F or RGBA32F radiance");
         if (
           target.format !== format &&
           !(format.endsWith("-srgb") && target.format === format.slice(0, -5))
