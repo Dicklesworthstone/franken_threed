@@ -452,6 +452,53 @@ function extractStaticString(node) {
   return null;
 }
 
+/** Finite property names without evaluating computed keys or their effects. */
+function staticPropertyNames(node) {
+  if (!node || (node.type !== "MemberExpression" && node.type !== "Property")) return null;
+  const key = node.property ?? node.key;
+  if (!node.computed && key?.type === "Identifier") return [key.name];
+  return extractFiniteStringCandidates(key);
+}
+
+/** Read a constructor option from object syntax in source order. Undefined means
+ * absent, null means unknown, and an AST node is the captured property value.
+ * Spreads copy own properties only; explicit __proto__ can supply inherited ones.
+ * Getters, opaque keys/sources and excessive nesting stay runtime decisions.
+ */
+function sourceOptionValue(node, name, ownOnly = false, depth = 0) {
+  if (depth > 32) return null;
+  if (!node) return undefined;
+  if (node.type === "SequenceExpression")
+    return sourceOptionValue(node.expressions.at(-1), name, ownOnly, depth + 1);
+  if (node.type === "Literal" && (node.value === null || typeof node.value !== "object"))
+    return undefined;
+  if (node.type !== "ObjectExpression") return null;
+  let own, inherited;
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement") {
+      const value = sourceOptionValue(property.argument, name, true, depth + 1);
+      if (value !== undefined) own = value;
+      continue;
+    }
+    const names = staticPropertyNames(property);
+    if (!names || names.length !== 1) {
+      if (!names || names.includes(name)) own = null;
+      continue;
+    }
+    if (names[0] === name) {
+      own = property.kind === "init" && !property.method ? property.value : null;
+    } else if (names[0] === "__proto__" && !property.computed &&
+        property.kind === "init" && !property.method) {
+      inherited = sourceOptionValue(property.value, name, false, depth + 1);
+    }
+  }
+  return own !== undefined ? own : ownOnly ? undefined : inherited;
+}
+
+const OPAQUE_GL_METHODS = new Set([
+  "getExtension", "getParameter", "createBuffer", "bindBuffer", "createTexture", "bindTexture",
+]);
+
 /**
  * Verifies that a node is strictly an import.meta.url property access:
  * noncomputed .url or computed literal ['url'] / [`url`].
@@ -810,11 +857,9 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       let constructorName = null;
       if (node.callee.type === "Identifier") {
         constructorName = node.callee.name;
-      } else if (
-        node.callee.type === "MemberExpression" &&
-        node.callee.property.type === "Identifier"
-      ) {
-        constructorName = node.callee.property.name;
+      } else {
+        const names = staticPropertyNames(node.callee);
+        if (names?.length === 1) constructorName = names[0];
       }
 
       if (
@@ -826,31 +871,14 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
           "SVGRenderer",
         ].includes(constructorName)
       ) {
-        let forceWebGL = false;
-        let forceWebGLUnresolved = false;
-        let canvasOption = null;
-
-        if (node.arguments.length > 0 && node.arguments[0].type === "ObjectExpression") {
-          for (const prop of node.arguments[0].properties) {
-            if (prop.type === "Property") {
-              const propKey = prop.key.name || prop.key.value;
-              if (propKey === "forceWebGL") {
-                if (prop.value.type === "Literal") {
-                  forceWebGL = Boolean(prop.value.value);
-                  forceWebGLUnresolved = false;
-                } else {
-                  // Non-literal value (variable, template, expression like !api.webgpu):
-                  // Must be classified as unresolved, not false
-                  forceWebGL = "unresolved";
-                  forceWebGLUnresolved = true;
-                }
-              } else if (propKey === "canvas") {
-                if (prop.value.type === "Literal") canvasOption = String(prop.value.value);
-                else if (prop.value.type === "Identifier") canvasOption = prop.value.name;
-              }
-            }
-          }
-        }
+        const forceValue = sourceOptionValue(node.arguments[0], "forceWebGL");
+        const forceWebGLUnresolved = forceValue === null ||
+          (forceValue !== undefined && forceValue.type !== "Literal");
+        const forceWebGL = forceWebGLUnresolved ? "unresolved" :
+          forceValue === undefined ? false : Boolean(forceValue.value);
+        const canvasValue = sourceOptionValue(node.arguments[0], "canvas");
+        const canvasOption = canvasValue?.type === "Literal" ? String(canvasValue.value) :
+          canvasValue?.type === "Identifier" ? canvasValue.name : null;
 
         const span = toSourceSpan(node, offsets);
         rendererConstructionSites.push({
@@ -870,77 +898,60 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       }
     },
 
-    CallExpression(node) {
-      // Check for native context access: e.g. canvas.getContext('webgl' | 'webgl2')
-      if (
-        node.callee.type === "MemberExpression" &&
-        node.callee.property.type === "Identifier" &&
-        node.callee.property.name === "getContext"
-      ) {
-        const arg = node.arguments[0];
+    MemberExpression(node, ancestors) {
+      // A borrowed accessor still exposes a native handle: e.g.
+      // const get = renderer['getContext']; get.call(renderer).
+      // Direct calls are classified below with their actual context arguments.
+      const parent = ancestors.at(-2);
+      if (parent?.type === "CallExpression" && parent.callee === node) return;
+      const names = staticPropertyNames(node);
+      if (!names) return;
+      if (names.includes("getContext")) {
+        hasNativeContextAccess = true;
+        hasUnresolvedContextAccess = true;
         const span = toSourceSpan(node, offsets);
-        const isLiteralString = arg && arg.type === "Literal" && typeof arg.value === "string";
+        escapes.push({type: "unresolved_native_context_access", classification: "accessor",
+          unresolved: true, source_span: span, sourceSpan: span});
+      }
+      for (const name of names) if (OPAQUE_GL_METHODS.has(name)) {
+        hasOpaqueGLEscapes = true;
+        escapes.push({type: "opaque_gl_method_access", method: name,
+          source_span: toSourceSpan(node, offsets)});
+      }
+    },
 
-        if (!isLiteralString) {
-          // getContext with a non-literal argument (variable, template literal, expression, or missing)
-          // MUST be classified as unresolved native-context access with a source span, never as non-native (Plan §3.3, §5.1)
+    CallExpression(node) {
+      const names = staticPropertyNames(node.callee);
+      if (!names) return;
+      if (names.includes("getContext")) {
+        const contexts = extractFiniteStringCandidates(node.arguments[0]);
+        const span = toSourceSpan(node, offsets);
+        if (!contexts) {
           hasNativeContextAccess = true;
           hasUnresolvedContextAccess = true;
           escapes.push({
-            type: "unresolved_native_context_access",
-            classification: "nonliteral",
-            unresolved: true,
-            source_span: span,
-            sourceSpan: span,
+            type: "unresolved_native_context_access", classification: "nonliteral",
+            unresolved: true, source_span: span, sourceSpan: span,
           });
-        } else {
-          const ctxType = arg.value;
-          if (ctxType === "2d" || ctxType === "bitmaprenderer") {
-            // Explicitly non-native 2D canvas context: ignore
-          } else {
-            hasNativeContextAccess = true;
-            if (ctxType.includes("webgl")) {
-              hasOpaqueGLEscapes = true;
-              escapes.push({
-                type: "webgl_context_acquisition",
-                context_type: ctxType,
-                contextType: ctxType,
-                source_span: span,
-                sourceSpan: span,
-              });
-            } else {
-              escapes.push({
-                type: "native_context_acquisition",
-                context_type: ctxType,
-                contextType: ctxType,
-                source_span: span,
-                sourceSpan: span,
-              });
-            }
-          }
+        } else for (const ctxType of contexts) {
+          // A finite choice of 2D contexts is still provably non-native. Any
+          // native alternative keeps the whole application on its exact route.
+          if (ctxType === "2d" || ctxType === "bitmaprenderer") continue;
+          hasNativeContextAccess = true;
+          const webgl = ctxType.includes("webgl");
+          if (webgl) hasOpaqueGLEscapes = true;
+          escapes.push({
+            type: webgl ? "webgl_context_acquisition" : "native_context_acquisition",
+            context_type: ctxType, contextType: ctxType,
+            source_span: span, sourceSpan: span,
+          });
         }
       }
 
-      // Check for direct WebGL method calls / extension queries
-      if (node.callee.type === "MemberExpression" && node.callee.property.type === "Identifier") {
-        const propName = node.callee.property.name;
-        if (
-          [
-            "getExtension",
-            "getParameter",
-            "createBuffer",
-            "bindBuffer",
-            "createTexture",
-            "bindTexture",
-          ].includes(propName)
-        ) {
-          hasOpaqueGLEscapes = true;
-          escapes.push({
-            type: "opaque_gl_method_call",
-            method: propName,
-            source_span: toSourceSpan(node, offsets),
-          });
-        }
+      for (const name of names) if (OPAQUE_GL_METHODS.has(name)) {
+        hasOpaqueGLEscapes = true;
+        escapes.push({type: "opaque_gl_method_call", method: name,
+          source_span: toSourceSpan(node, offsets)});
       }
     },
   });
