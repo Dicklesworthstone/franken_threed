@@ -571,3 +571,39 @@ test('compute reentry stays refused until the complete native capture unwinds', 
   });
   assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
 });
+
+test('ordinary AO-only materials keep their existing fixed rendering profile', t => {
+  for (const Material of [THREE.MeshBasicMaterial, THREE.MeshPhysicalMaterial])
+  for (const shadows of [false, true]) {
+    const f = rig(t), material = new Material();
+    material.aoMap = new THREE.DataTexture(new Uint8Array(16).fill(128), 2, 2); f.mesh(material);
+    f.renderer.shadowMap = {enabled: shadows};
+    assert.equal(f.capture({getPrograms() { assert.fail('AO alone must not change the fixed rendering profile'); }}), null);
+  }
+});
+
+for (const Material of [THREE.MeshBasicMaterial, THREE.MeshPhysicalMaterial])
+test(`ordinary ${Material.name} lightMap selects native capture and shares shadow ownership`, t => {
+  for (const shadows of [false, true]) {
+    const f = rig(t), material = new Material();
+    material.lightMap = new THREE.DataTexture(new Uint8Array(16).fill(128), 2, 2);
+    const object = f.mesh(material), fixed = f.mesh(new THREE.MeshBasicMaterial());
+    f.renderer.shadowMap = {enabled: shadows};
+    f.renderer.backend.utils = {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})};
+    const captured = f.capture({uniforms: false, getTextures: () => ({captureDispatch: run => run()})});
+    assert.ok(captured.objects.has(object)); assert.equal(captured.objects.has(fixed), shadows);
+    assert.equal(captured.bindings.length, shadows ? 2 : 1); assert.equal(captured.bindings[0].material, material);
+    assert.equal(material.colorNode, undefined); assert.equal(material.aoNode, undefined);
+    assert.equal(captured.draws.length, 0, 'compilation does not execute draw updates');
+  }
+});
+
+test('ordinary Physical sheen and AO compose on the native route without authored nodes', t => {
+  const f = rig(t), material = new THREE.MeshPhysicalMaterial({sheen: .5});
+  material.aoMap = new THREE.DataTexture(new Uint8Array(16).fill(128), 2, 2); const object = f.mesh(material);
+  f.renderer.backend.utils = {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})};
+  const captured = f.capture({uniforms: false, getTextures: () => ({captureDispatch: run => run()})});
+  assert.ok(captured.objects.has(object)); assert.equal(captured.bindings[0].material, material);
+  assert.match(captured.bindings[0].nodeProgram.fragment, /AmbientOcclusion/);
+  assert.equal(material.colorNode, undefined); assert.equal(material.aoNode, undefined);
+});

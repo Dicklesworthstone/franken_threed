@@ -17,7 +17,7 @@ const transparent = material => material.transparent === true || material.transm
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
-  material.bumpMap != null || material.displacementMap != null ||
+  material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
   (material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && (
     ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity'].some(key => material[key] > 0) ||
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',

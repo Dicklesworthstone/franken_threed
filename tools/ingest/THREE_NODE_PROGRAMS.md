@@ -15,7 +15,7 @@ Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
-they use bump or displacement maps, or Physical sheen, iridescence, anisotropy
+they use bump, displacement or baked light maps, or Physical sheen, iridescence, anisotropy
 or retroreflectivity and their maps. They require no authored node slot or
 application rewrite. Other materials keep their existing fixed rendering path.
 When one material group on a mesh needs native shading, its other groups use the
@@ -24,14 +24,19 @@ admission before any node update runs. Custom material subclasses and overridden
 conversion methods remain outside this entrance.
 
 Source material maps now lower through the pinned material accessors: base
-color, alpha, emissive, normal, bump, displacement, specular, roughness,
+color, alpha, emissive, normal, bump, displacement, AO, light, specular, roughness,
 metalness, gradient and the admitted Physical lobe maps. Their UV channel,
 transforms, color space and normal-map mode remain source behavior. Shared
 metalness/roughness textures retain one sampled binding; changing a map's
 sharing relationship with another map or authored texture rebuilds the binding
 layout. Compatible image replacement retains the compiled program and each
-queued draw's source pixel version. AO, light maps and material environment maps
-still require additional lighting adapters.
+queued draw's source pixel version. AO and baked light maps use the pinned
+material lighting nodes, including independent UV channels, live intensities and
+source diffuse/specular occlusion. Authored `aoNode` graphs use the same lighting
+context. Basic light maps keep their source normalization and do not start
+consuming scene analytic lights. Ordinary AO-only materials retain their existing
+fixed path; AO also composes with native graphs and Physical features. Material
+environment maps still require an additional lighting adapter.
 
 Automatically selected native materials capture active lobe values and map image
 versions independently for queued renders. Enabling a native-only feature while
@@ -425,7 +430,7 @@ Depth/comparison, decoded-image cube, array, volume, compressed, storage, video 
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions, fog/clipping/shadows, AO/light/material-environment
+The profile excludes shader context extensions, fog/clipping/shadows, material-environment
 maps, wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks.
@@ -457,6 +462,14 @@ The implementation follows Three.js r186 source commit
 `NodeMaterial`, `NodeFrame`, `NodeUniformsGroup`, common `Renderer` draw selection
 and `RenderList` ordering. Native opaque sorting uses depth and object identity,
 without WebGL's material-id sort key.
+
+Native AO/light-map regressions compare complete vertex and fragment WGSL with
+the pinned builder for Basic, Toon, Lambert, Phong, Standard and Physical, both
+ordinary and node-material forms. They cover separate UV channels, source light
+map normalization, AO composition, queued intensity values and compatible texture
+replacement. These execute the real source builder and capture code in an
+isolated JavaScript runtime; they do not establish browser pixel parity for the
+new light-map combinations.
 
 The ordinary-material browser scenarios `native_material_lobes`,
 `native_material_lobe_updates` and `native_material_relief_maps` produced zero

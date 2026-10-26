@@ -1747,7 +1747,7 @@ test('source material conversion refuses unregistered classes, shader hooks and 
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.onBeforeCompile;
   material.customProgramCacheKey = () => 'custom';
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.customProgramCacheKey;
-  for (const slot of ['envMap', 'lightMap', 'aoMap']) {
+  for (const slot of ['envMap']) {
     material[slot] = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'}); material[slot] = null;
   }
   material.map = new THREE.CubeTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
@@ -1908,4 +1908,80 @@ test('registered direct analytic nodes retain source lifecycle and native graph 
       {code: kind === 'storage write' ? 'THREE_NODE_PROGRAM_STORAGE' : 'THREE_NODE_PROGRAM_LIGHTS'});
     assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
   }
+});
+
+for (const family of ['Basic', 'Toon', 'Lambert', 'Phong', 'Standard', 'Physical'])
+for (const Material of [THREE[`Mesh${family}Material`], THREE[`Mesh${family}NodeMaterial`]])
+test(`${Material.name} retains source AO and baked light maps with independent queued values`, t => {
+  const f = pbrRig(t, Material); f.material.colorNode = null;
+  if (family === 'Basic') f.context.lights = [];
+  const ao = dataTexture(), light = dataTexture(); ao.channel = 1; light.channel = 2;
+  for (const name of ['uv1', 'uv2']) f.object.geometry.setAttribute(name, f.object.geometry.attributes.uv.clone());
+  Object.assign(f.material, {aoMap: ao, aoMapIntensity: .3125, lightMap: light, lightMapIntensity: 2.625});
+  const d = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.material = f.material; source.context.material = f.material;
+  source.scene = f.scene; source.camera = f.camera; source.lightsNode = N.lights(f.context.lights);
+  source.build();
+  assert.equal(d.vertex, source.vertexShader); assert.equal(d.fragment, source.fragmentShader);
+  assert.ok(d.attributes.some(attribute => attribute.name === 'uv1'));
+  assert.ok(d.attributes.some(attribute => attribute.name === 'uv2'));
+  assert.match(d.fragment, /AmbientOcclusion = .*\.x - 1\.0/);
+  if (family === 'Basic') assert.match(d.fragment, /0\.3183098861837907/);
+  if (family === 'Standard' || family === 'Physical') assert.match(d.fragment, /indirectSpecular/);
+  const first = f.owner.captureDraw(d, f.context), saved = first.uniforms.map(bytes => bytes.slice());
+  assert.ok(first.textures.some(binding => binding.texture === ao));
+  assert.ok(first.textures.some(binding => binding.texture === light));
+  assert.ok(floats(first.uniforms).includes(.3125)); assert.ok(floats(first.uniforms).includes(2.625));
+  f.material.aoMapIntensity = .8125; f.material.lightMapIntensity = 4.125; light.offset.set(.375, .625);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.equal(f.compile(), d, 'live light/AO intensity and UV transforms retain the shader');
+  assert.ok(floats(second.uniforms).includes(.8125)); assert.ok(floats(second.uniforms).includes(4.125));
+  assert.deepEqual(first.uniforms, saved);
+  const replacement = dataTexture(); replacement.channel = 2; f.material.lightMap = replacement;
+  assert.equal(f.compile(), d, 'compatible map replacement retains the binding layout');
+  const third = f.owner.captureDraw(d, {...f.context, renderId: 3});
+  assert.ok(third.textures.some(binding => binding.texture === replacement));
+  assert.ok(first.textures.some(binding => binding.texture === light));
+  assert.deepEqual(first.uniforms, saved);
+});
+
+for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshPhysicalNodeMaterial])
+test(`${Material.name} captures authored AO without admitting custom lighting contexts`, t => {
+  const f = pbrRig(t, Material); f.context.lights = [];
+  f.material.aoNode = N.uniform(.4375).setName('sourceAO');
+  const d = f.compile(), first = f.owner.capture(d, f.context);
+  assert.match(d.fragment, /AmbientOcclusion = object\.sourceAO/);
+  assert.ok(floats(first).includes(.4375));
+  f.material.aoNode.value = .6875;
+  const second = f.owner.capture(d, {...f.context, renderId: 2});
+  assert.equal(f.compile(), d); assert.ok(floats(second).includes(.6875));
+  assert.ok(floats(first).includes(.4375));
+  f.material.aoNode = new THREE.AONode(N.float(.5));
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  f.material.aoNode = null; f.material.colorNode = new THREE.IrradianceNode(N.materialLightMap);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+});
+
+test('Basic baked lighting follows renderer lighting enablement and ignores scene light admission', t => {
+  const f = pbrRig(t, THREE.MeshBasicMaterial); f.material.lightMap = dataTexture();
+  f.context.lights = [new THREE.RectAreaLight()];
+  const enabled = f.compile(); assert.match(enabled.fragment, /0\.3183098861837907/);
+  f.renderer.lighting.enabled = false;
+  const disabled = f.compile(); assert.notEqual(disabled, enabled);
+  assert.doesNotMatch(disabled.fragment, /0\.3183098861837907/);
+  f.renderer.lighting.enabled = true;
+  assert.equal(f.compile().fragment, enabled.fragment);
+});
+
+test('AO and light maps retain shared texture bindings until their aliases separate', t => {
+  const f = pbrRig(t, THREE.MeshBasicMaterial); f.context.lights = [];
+  const shared = dataTexture(); f.material.aoMap = shared; f.material.lightMap = shared;
+  const first = f.compile(), draw = f.owner.captureDraw(first, f.context);
+  assert.equal(draw.textures.filter(binding => binding.isSampledTexture).length, 1);
+  f.material.aoMap = dataTexture();
+  const second = f.compile(); assert.notEqual(second, first);
+  const next = f.owner.captureDraw(second, {...f.context, renderId: 2});
+  assert.equal(next.textures.filter(binding => binding.isSampledTexture).length, 2);
+  assert.ok(next.textures.some(binding => binding.texture === f.material.aoMap));
+  assert.ok(draw.textures.every(binding => binding.texture === shared));
 });

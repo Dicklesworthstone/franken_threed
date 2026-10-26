@@ -61,7 +61,7 @@ uniform layouts; F3D owns geometry, pipelines, bind groups, draw ordering and
 submission. Float attributes, scalar/vector/matrix uniforms and ordinary sampled
 2D texture graphs are supported. Graphics and compute share captured texture
 versions; native target sampling borrows the actual attachment storage.
-Ordinary materials with bump/displacement maps or Physical sheen, iridescence,
+Ordinary materials with bump/displacement/light maps or Physical sheen, iridescence,
 anisotropy and retroreflectivity use those source shaders without authored node
 slots. Other default node materials continue using the existing fixed path.
 
@@ -103,7 +103,10 @@ profile. Sheen, iridescence, anisotropy and retroreflectivity instead select the
 retained native node builder, including their ordinary material properties and
 maps. Live values and image versions are captured independently for queued native
 draws. This also supports bump and displacement maps on admitted ordinary mesh
-materials. Transmission and dispersion still need their scene-color protocol;
+materials. Baked light maps select the same native source builder; ambient
+occlusion maps and authored AO nodes compose with those native shaders. Plain
+AO-only materials retain their existing fixed profile, including ArrayCamera.
+Transmission and dispersion still need their scene-color protocol;
 see [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md).
 
 Ordinary `ArrayCamera` rendering is admitted on this native WebGPU route, with

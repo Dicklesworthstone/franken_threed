@@ -36,7 +36,7 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode']);
@@ -46,13 +46,13 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
 const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS, 'depthNode'];
-// These source material accessors lower to ordinary 2D texture bindings. Light
-// maps/AO introduce additional lighting nodes; environment maps have a separate
-// PMREM context. Keep those dependencies explicit instead of silently ignoring them.
+// These source material accessors lower to ordinary 2D texture bindings. AO and
+// light maps additionally retain their exact source material lighting nodes;
+// material environment maps still require a separate PMREM context.
 const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
   'specularMap', 'specularIntensityMap', 'specularColorMap', 'roughnessMap', 'metalnessMap', 'gradientMap',
   'clearcoatMap', 'clearcoatRoughnessMap', 'clearcoatNormalMap', 'sheenColorMap', 'sheenRoughnessMap',
-  'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap']);
+  'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap', 'aoMap', 'lightMap']);
 const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4',
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
@@ -92,6 +92,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   let disposed = false, shaderBytes = 0, serial = 0;
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  // Basic uses an empty source lighting context for AO and its PI-scaled light
+  // map, while remaining independent of the scene's analytic lights.
+  const lightingMaterial = material => litMaterial(material) ||
+    Object.getPrototypeOf(material) === three.MeshBasicNodeMaterial.prototype;
   function prepareMaterial(material) {
     if (material instanceof three.NodeMaterial) return material;
     const classes = material instanceof three.Material && sourceMaterialClasses.get(Object.getPrototypeOf(material));
@@ -679,7 +683,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return material;
   }
-  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null) {
+  function sourceMaterialLighting(node, material) {
+    if (!material || material.lights !== true || material.fragmentNode != null) return false;
+    const prototype = Object.getPrototypeOf(node);
+    if (prototype === three.AONode.prototype)
+      return (material.aoNode != null || material.aoMap?.isTexture === true) && node.aoNode === three.TSL.ambientOcclusion;
+    if (material.lightMap?.isTexture !== true) return false;
+    return material.isMeshBasicNodeMaterial === true
+      ? prototype === three.BasicLightMapNode.prototype && node.lightMapNode === three.TSL.materialLightMap
+      : prototype === three.IrradianceNode.prototype && node.node === three.TSL.materialLightMap;
+  }
+  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isPassTextureNode === true) inspectThreeNativePass(three, renderer, node.passNode);
@@ -739,7 +753,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     }
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
-      const admitted = lightsNode && (node === lightsNode ||
+      const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
         checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
@@ -764,7 +778,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
-      litMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
+      lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
       Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection] : null]);
   }
@@ -815,7 +829,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
     builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
       [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
-    const lightsNode = litMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
+    const lightsNode = lightingMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
     if (lightsNode) builder.lightsNode = lightsNode;
     const environmentNode = environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
@@ -845,7 +859,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
     for (const node of builder.nodes) {
-      checkNode(node, lightsNode, lights, environmentNode, boundTextures);
+      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
     }
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
