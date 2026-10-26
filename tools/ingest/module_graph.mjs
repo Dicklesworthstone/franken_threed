@@ -34,6 +34,12 @@ function isExternalUrl(url) {
   return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:");
 }
 
+// A module map is keyed by URL AND import type. Keep ordinary JavaScript IDs
+// stable; JSON gets a typed namespace and retains its actual URL separately.
+function moduleIdentity(url, type) {
+  return type === "json" && !isExternalUrl(url) ? `json:${url}` : url;
+}
+
 /**
  * Finds all elementary cycles in a directed graph using DFS.
  * @param {Map<string, string[]>} adj
@@ -148,13 +154,15 @@ export async function buildModuleGraph(entryPath, options = {}) {
   while (queue.length > 0) {
     const item = queue.shift();
     const moduleId = item.id;
+    const sourceUrl = item.sourceUrl ?? moduleId;
+    const moduleType = item.moduleType ?? "javascript";
 
     if (modules.has(moduleId) || externalModules.has(moduleId)) {
       continue;
     }
 
-    if (isExternalUrl(moduleId)) {
-      externalModules.add(moduleId);
+    if (isExternalUrl(sourceUrl)) {
+      externalModules.add(sourceUrl);
       continue;
     }
 
@@ -165,7 +173,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       sourceCode = item.inlineContent;
       sourcePath = resolvedEntryAbs;
     } else {
-      sourcePath = urlToFilePath(moduleId);
+      sourcePath = urlToFilePath(sourceUrl);
       try {
         sourceCode = fs.readFileSync(sourcePath, "utf-8");
       } catch (err) {
@@ -196,8 +204,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
       contentHashMap.set(hash, [moduleId]);
     }
 
-    // Run AST analysis
-    const analysis = analyzeModuleAst(sourceCode, moduleId, item.offsets || {});
+    // Native JSON is data, not executable JavaScript. Keep even invalid lazy
+    // input unparsed: its rejection belongs to the original import() boundary.
+    const analysis = analyzeModuleAst(moduleType === "json" ? "" : sourceCode, sourceUrl, item.offsets || {});
+    if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
     // Every source-bearing export is also a static module request. Keep it in
     // the same edge list used by route analysis, closure propagation and cycle
@@ -208,6 +218,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         .filter(exp => typeof exp.specifier === "string")
         .map(exp => ({
           specifier: exp.specifier,
+          module_type: exp.module_type,
           sourceSpan: exp.sourceSpan,
           imported_bindings: [],
           reexport: exp,
@@ -215,15 +226,19 @@ export async function buildModuleGraph(entryPath, options = {}) {
     ].sort((a, b) => a.sourceSpan.start.offset - b.sourceSpan.start.offset);
     const resolvedStaticImports = [];
     for (const imp of staticRequests) {
-      const resolvedTarget = resolveModuleSpecifier(imp.specifier, moduleId, importMap, {
+      const targetType = imp.module_type ?? "javascript";
+      const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
         mapBaseUrl,
         packageRootUrl: options.packageRootUrl,
         span: imp.sourceSpan,
       });
+      const resolvedTarget = moduleIdentity(resolvedUrl, targetType);
 
       resolvedStaticImports.push({
         specifier: imp.specifier,
         resolved_id: resolvedTarget,
+        resolved_url: resolvedUrl,
+        module_type: targetType,
         source_span: imp.sourceSpan,
         imported_bindings: imp.imported_bindings ?? imp.importedBindings ?? [],
         ...(imp.reexport ? { is_reexport: true } : {}),
@@ -237,6 +252,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
       if (!modules.has(resolvedTarget)) {
         queue.push({
           id: resolvedTarget,
+          sourceUrl: resolvedUrl,
+          moduleType: targetType,
           isInline: false,
           inlineContent: null,
           offsets: {},
@@ -248,14 +265,23 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // Resolve dynamic imports
     const resolvedDynamicImports = [];
     for (const dyn of analysis.dynamicImports) {
+      const targetType = dyn.module_type ?? "javascript";
+      if (targetType === "unknown") {
+        resolvedDynamicImports.push({...dyn, resolved_id: null, resolvedId: null,
+          unresolved: true, claims_closure: false, claimsClosure: false,
+          error: "The dynamic import's module type is not statically known"});
+        continue;
+      }
       if (dyn.classification === "literal" && dyn.specifier) {
         let resolvedTarget = null;
+        let resolvedUrl = null;
         try {
-          resolvedTarget = resolveModuleSpecifier(dyn.specifier, moduleId, importMap, {
+          resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
             mapBaseUrl,
             packageRootUrl: options.packageRootUrl,
             span: dyn.sourceSpan,
           });
+          resolvedTarget = moduleIdentity(resolvedUrl, targetType);
         } catch (err) {
           // If literal dynamic import cannot be resolved, mark unresolved with error
           resolvedDynamicImports.push({
@@ -278,6 +304,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
           specifier: dyn.specifier,
           resolved_id: resolvedTarget,
           resolvedId: resolvedTarget,
+          resolved_url: resolvedUrl,
+          module_type: targetType,
           unresolved: false,
           claims_closure: true,
           claimsClosure: true,
@@ -288,6 +316,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
         if (!modules.has(resolvedTarget)) {
           queue.push({
             id: resolvedTarget,
+            sourceUrl: resolvedUrl,
+            moduleType: targetType,
             isInline: false,
             inlineContent: null,
             offsets: {},
@@ -301,19 +331,24 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
         for (const cand of candidates) {
           try {
-            const resolvedTarget = resolveModuleSpecifier(cand, moduleId, importMap, {
+            const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
               mapBaseUrl,
               packageRootUrl: options.packageRootUrl,
               span: dyn.sourceSpan,
             });
+            const resolvedTarget = moduleIdentity(resolvedUrl, targetType);
             resolvedTargets.push({
               specifier: cand,
               resolved_id: resolvedTarget,
               resolvedId: resolvedTarget,
+              resolved_url: resolvedUrl,
+              module_type: targetType,
             });
             if (!modules.has(resolvedTarget)) {
               queue.push({
                 id: resolvedTarget,
+                sourceUrl: resolvedUrl,
+                moduleType: targetType,
                 isInline: false,
                 inlineContent: null,
                 offsets: {},
@@ -333,6 +368,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
         resolvedDynamicImports.push({
           classification: "finite_set",
+          module_type: targetType,
           specifier: null,
           specifiers: candidates,
           candidates,
@@ -366,6 +402,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
     const node = {
       id: moduleId,
+      source_url: sourceUrl,
+      module_type: moduleType,
       content_hash: `sha256:${hash}`,
       is_inline: item.isInline,
       source_path: sourcePath,

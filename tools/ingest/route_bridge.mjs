@@ -107,12 +107,12 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
   let hasOpaqueGLEscapes = false;
   let hasNativeContextAccess = false;
   let hasUnresolvedContextAccess = false;
+  const modules = Object.values(bundle.modules || {});
   const hasUnanalyzedModules =
-    Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0;
+    (Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0) ||
+    modules.some(mod => mod.dynamic_imports?.some(request => request.module_type === "unknown"));
   const escapes = [];
   const constructionSites = [];
-
-  const modules = Object.values(bundle.modules || {});
 
   // Pass 1: Aggregate application-wide escapes across reachable modules
   for (const mod of modules) {

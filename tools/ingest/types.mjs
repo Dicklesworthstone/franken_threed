@@ -61,6 +61,8 @@ export const SCHEMA_VERSION = "1.0.0";
  * @typedef {Object} StaticImport
  * @property {string} specifier - Raw import specifier string
  * @property {string} resolved_id - Normalized canonical URL of target module
+ * @property {'javascript' | 'json' | 'unknown'} [module_type] - Requested native module goal
+ * @property {string} [resolved_url] - Source URL before typed module identity is applied
  * @property {SourceSpan} source_span - Source location span of import declaration
  * @property {Array<{ imported: string, local: string }>} imported_bindings - Imported symbol bindings
  */
@@ -119,6 +121,8 @@ export const SCHEMA_VERSION = "1.0.0";
  * Module graph node representing an ingested ESM or inline script module.
  * @typedef {Object} ModuleNode
  * @property {string} id - Normalized file:// URL of the module
+ * @property {string} [source_url] - Actual source URL (JSON IDs are prefixed with json:)
+ * @property {'javascript' | 'json' | 'unknown'} [module_type] - Native module goal
  * @property {string} content_hash - SHA-256 hash of module content with 'sha256:' prefix
  * @property {boolean} is_inline - True if module was parsed from an inline <script> tag
  * @property {string | null} source_path - Absolute filesystem path (null for synthetic modules)

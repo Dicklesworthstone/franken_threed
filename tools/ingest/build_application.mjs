@@ -34,7 +34,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
-import { analyzeModuleAst } from "./ast_analyzer.mjs";
+import { analyzeModuleAst, classifyImportType } from "./ast_analyzer.mjs";
 import { bundleWithRollup } from "./bundler.mjs";
 import {
   parseHtmlEntries,
@@ -433,10 +433,15 @@ function extractConditionalStringLiterals(node) {
  */
 export function extractJsModuleDependencies(code, contextUrl = "script.js") {
   if (!code || typeof code !== "string") {
-    return { moduleSpecifiers: [], assetSpecifiers: [] };
+    return { moduleSpecifiers: [], moduleRequests: [], assetSpecifiers: [] };
   }
 
   const moduleSpecifiers = new Set();
+  const moduleRequests = new Map();
+  const addModule = (specifier, moduleType = "javascript") => {
+    moduleSpecifiers.add(specifier);
+    moduleRequests.set(JSON.stringify([specifier, moduleType]), {specifier, moduleType});
+  };
   const assetSpecifiers = new Set();
 
   let moduleError = null;
@@ -445,21 +450,21 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
     if (analysis) {
       if (Array.isArray(analysis.staticImports)) {
         for (const st of analysis.staticImports) {
-          if (st.specifier) moduleSpecifiers.add(st.specifier);
+          if (st.specifier) addModule(st.specifier, st.module_type);
         }
       }
       if (Array.isArray(analysis.staticExports)) {
         for (const ex of analysis.staticExports) {
-          if (ex.specifier) moduleSpecifiers.add(ex.specifier);
+          if (ex.specifier) addModule(ex.specifier, ex.module_type);
         }
       }
       if (Array.isArray(analysis.dynamicImports)) {
         for (const dyn of analysis.dynamicImports) {
           if (dyn.classification === "literal" && dyn.specifier) {
-            moduleSpecifiers.add(dyn.specifier);
+            addModule(dyn.specifier, dyn.module_type);
           } else if (dyn.classification === "finite_set" && Array.isArray(dyn.candidates)) {
             for (const cand of dyn.candidates) {
-              if (cand) moduleSpecifiers.add(cand);
+              if (cand) addModule(cand, dyn.module_type);
             }
           }
         }
@@ -471,6 +476,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
       }
       return {
         moduleSpecifiers: Array.from(moduleSpecifiers),
+        moduleRequests: Array.from(moduleRequests.values()),
         assetSpecifiers: Array.from(assetSpecifiers),
       };
     }
@@ -495,20 +501,21 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
   walk.simple(scriptAst, {
     ImportExpression(node) {
       if (!node.source) return;
+      const moduleType = classifyImportType(node);
       if (node.source.type === "Literal" && typeof node.source.value === "string") {
-        moduleSpecifiers.add(node.source.value);
+        addModule(node.source.value, moduleType);
       } else if (
         node.source.type === "TemplateLiteral" &&
         node.source.expressions.length === 0 &&
         node.source.quasis.length > 0
       ) {
         const spec = node.source.quasis.map((q) => q.value.cooked ?? q.value.raw).join("");
-        if (spec) moduleSpecifiers.add(spec);
+        if (spec) addModule(spec, moduleType);
       } else if (node.source.type === "ConditionalExpression") {
         const branches = extractConditionalStringLiterals(node.source);
         if (branches && Array.isArray(branches)) {
           for (const b of branches) {
-            if (b) moduleSpecifiers.add(b);
+            if (b) addModule(b, moduleType);
           }
         }
       }
@@ -517,6 +524,7 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
 
   return {
     moduleSpecifiers: Array.from(moduleSpecifiers),
+    moduleRequests: Array.from(moduleRequests.values()),
     assetSpecifiers: Array.from(assetSpecifiers),
   };
 }
@@ -996,13 +1004,14 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       const scriptBody = inlineMatch[2];
       if (!scriptBody || !scriptBody.trim()) continue;
 
-      const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(
+      const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
         scriptBody,
         parsedHtml.baseUrl,
       );
-      for (const spec of moduleSpecifiers) {
+      for (const {specifier, moduleType} of moduleRequests) {
         assetQueue.push({
-          specifier: spec,
+          specifier,
+          moduleType,
           referrerUrl: parsedHtml.baseUrl,
           referrerDir: effectiveBaseDir,
           referrerPath: resolvedEntryAbs,
@@ -1155,6 +1164,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       // If resource is a module or JS/MJS/CJS file (retained classic script),
       // scan for transitive module dependencies (static/dynamic imports, exports) and asset references
       if (
+        item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
         (item.isModuleSpecifier ||
           srcAssetAbs.endsWith(".js") ||
           srcAssetAbs.endsWith(".mjs") ||
@@ -1164,15 +1174,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
         visitedJsUrls.add(fileUrl);
         const jsContent = assetData.toString("utf-8");
-        const { moduleSpecifiers, assetSpecifiers } = extractJsModuleDependencies(
+        const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
           jsContent,
           fileUrl,
         );
         const jsDir = path.dirname(srcAssetAbs);
 
-        for (const childSpec of moduleSpecifiers) {
+        for (const {specifier, moduleType} of moduleRequests) {
           assetQueue.push({
-            specifier: childSpec,
+            specifier,
+            moduleType,
             referrerUrl: fileUrl,
             referrerDir: jsDir,
             referrerPath: srcAssetAbs,

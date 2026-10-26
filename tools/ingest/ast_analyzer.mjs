@@ -196,6 +196,43 @@ export function classifyDynamicImportArgument(sourceNode) {
   return { classification: "nonliteral", specifier: null };
 }
 
+/** The native module goal, without evaluating import options. Sequence prefixes
+ * remain runtime effects; opaque dictionaries/getters stay unresolved.
+ */
+export function classifyImportType(node) {
+  const tail = (value) => {
+    let depth = 0;
+    while (value?.type === "SequenceExpression") {
+      if (++depth > 64) return null;
+      value = value.expressions.at(-1);
+    }
+    return value;
+  };
+  const dictionary = (value) => {
+    value = tail(value);
+    if (value?.type !== "ObjectExpression" || value.properties.some((p) =>
+      p.type !== "Property" || p.computed || p.kind !== "init" || p.method ||
+      (p.key.name ?? p.key.value) === "__proto__")) return null;
+    return value.properties;
+  };
+  let attributes = node.attributes ?? [];
+  if (node.type === "ImportExpression") {
+    if (!node.options) return "javascript";
+    const options = dictionary(node.options);
+    if (!options) return "unknown";
+    const maps = options.filter((p) => (p.key.name ?? p.key.value) === "with");
+    // Import() reads options.with normally, so an absent own property can
+    // still resolve through Object.prototype. Do not assume that is absent.
+    if (maps.length !== 1) return "unknown";
+    attributes = dictionary(maps[0].value);
+    if (!attributes) return "unknown";
+  }
+  const types = attributes.filter((p) => (p.key.name ?? p.key.value) === "type");
+  if (!types.length) return "javascript";
+  return types.length === 1 && extractStaticString(tail(types[0].value)) === "json"
+    ? "json" : "unknown";
+}
+
 /**
  * Recursively collects all identifier names bound by a pattern.
  * Supports Identifiers, AssignmentPatterns, RestElements, ObjectPatterns, and ArrayPatterns.
@@ -544,6 +581,9 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         const span = toSourceSpan(node, offsets);
         staticImports.push({
           specifier,
+          module_type: classifyImportType(node),
+          import_attributes: Object.fromEntries((node.attributes ?? []).map((a) =>
+            [a.key.name ?? a.key.value, a.value.value])),
           source_span: span,
           sourceSpan: span,
           imported_bindings: importedBindings,
@@ -587,6 +627,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         staticExports.push({
           type: "named",
           specifier: reexportSpecifier,
+          ...(node.source ? {module_type: classifyImportType(node)} : {}),
           specifiers,
           source_span: span,
           sourceSpan: span,
@@ -621,6 +662,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
         staticExports.push({
           type: "all",
           specifier: node.source.value,
+          module_type: classifyImportType(node),
           exported: node.exported ? node.exported.name : null,
           source_span: span,
           sourceSpan: span,
@@ -670,6 +712,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       const span = toSourceSpan(node, offsets);
       dynamicImports.push({
         ...classified,
+        module_type: classifyImportType(node),
         unresolved: classified.classification === "nonliteral",
         source_span: span,
         sourceSpan: span,

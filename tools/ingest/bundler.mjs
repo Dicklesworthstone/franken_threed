@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import * as walk from "acorn-walk";
 import { rollup } from "rollup";
 
-import { analyzeModuleAst, classifyDynamicImportArgument } from "./ast_analyzer.mjs";
+import { analyzeModuleAst, classifyDynamicImportArgument, classifyImportType } from "./ast_analyzer.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
@@ -105,6 +105,8 @@ export function f3dRollupPlugin(options = {}) {
   const retainedModuleUrls = options.retainedModuleUrls || new Map();
   const emittedAssetsByPath = new Map();
   const emittedChunksByUrl = new Map();
+  const emittedJsonByUrl = new Map();
+  const emittedJsonTargets = new Set();
   const dynamicChunkRefIds = new Set();
   const gltfAssetRefIds = new Set();
   const documentAssets = new Map();
@@ -112,6 +114,23 @@ export function f3dRollupPlugin(options = {}) {
   const documentRequests = [];
   let defaultManagerExposed = false;
   let loaderResourceCalls = false;
+
+  function emitJsonModule(context, url) {
+    if (emittedJsonByUrl.has(url)) return emittedJsonByUrl.get(url);
+    const filename = urlToFilePath(url), source = fs.readFileSync(filename);
+    // Distinct URLs must never share a JSON module instance merely because
+    // their bytes match. Keep raw bytes, including BOM/duplicate keys/-0 and
+    // malformed lazy input, for the host's native JSON parsing and errors.
+    const hash = createHash("sha256").update(url).update("\0").update(source).digest("hex");
+    // Preserve the source extension/MIME boundary: `type: 'json'` must not
+    // relabel JavaScript (or another resource type) into a valid JSON import.
+    const fileName = `assets/f3d-json-${hash}${path.extname(filename)}`;
+    context.emitFile({type: "asset", fileName, source, originalFileName: filename});
+    const target = "./" + fileName.split("/").map(encodeURIComponent).join("/");
+    emittedJsonByUrl.set(url, target);
+    emittedJsonTargets.add(target);
+    return target;
+  }
 
   function emitModuleAsset(context, assetPath) {
     if (emittedAssetsByPath.has(assetPath)) return emittedAssetsByPath.get(assetPath);
@@ -235,7 +254,8 @@ export function f3dRollupPlugin(options = {}) {
       return null;
     },
 
-    resolveId(source, importer) {
+    resolveId(source, importer, {attributes = {}} = {}) {
+      if (emittedJsonTargets.has(source)) return {id: source, external: true, attributes};
       if (source === LOADER_RESOURCES_IMPORT && options.prepareStandaloneLoaders)
         return { id: "./" + LOADER_RESOURCES_FILE, external: true, moduleSideEffects: false };
       if (inlineModules.has(source)) {
@@ -259,6 +279,11 @@ export function f3dRollupPlugin(options = {}) {
       }
       if (isExternalUrl(resolvedUrl)) {
         return { id: resolvedUrl, external: true };
+      }
+      if (importer && (attributes.type === "json" || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".json")) {
+        // Untyped .json imports also stay native so missing/invalid attributes
+        // cannot accidentally become a successful JavaScript module import.
+        return {id: emitJsonModule(this, resolvedUrl), external: true, attributes};
       }
       return resolvedUrl;
     },
@@ -390,17 +415,18 @@ export function f3dRollupPlugin(options = {}) {
           ImportExpression: (node) => {
             if (!node.source) return;
             const classified = classifyDynamicImportArgument(node.source);
+            const moduleType = classifyImportType(node);
+            const candidates = classified.classification === "literal" && (moduleType === "json" || node.options)
+              ? [classified.specifier] : classified.classification === "finite_set" ? classified.candidates : null;
             if (
-              !classified ||
-              classified.classification !== "finite_set" ||
-              !classified.candidates ||
-              classified.candidates.length === 0
+              !candidates || candidates.length === 0
             ) {
               return;
             }
 
-            const uniqueBranches = Array.from(new Set(classified.candidates));
+            const uniqueBranches = Array.from(new Set(candidates));
             const specifierMap = new Map();
+            let bundledTarget = false;
 
             for (const cand of uniqueBranches) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
@@ -412,7 +438,10 @@ export function f3dRollupPlugin(options = {}) {
                 specifierMap.set(cand, JSON.stringify(retainedModuleUrls.get(resolvedUrl)));
               } else if (isExternalUrl(resolvedUrl)) {
                 specifierMap.set(cand, JSON.stringify(resolvedUrl));
+              } else if (moduleType === "json" || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".json") {
+                specifierMap.set(cand, JSON.stringify(emitJsonModule(this, resolvedUrl)));
               } else {
+                bundledTarget = true;
                 let chunkRefId = emittedChunksByUrl.get(resolvedUrl);
                 if (!chunkRefId) {
                   chunkRefId = this.emitFile({
@@ -428,6 +457,15 @@ export function f3dRollupPlugin(options = {}) {
             }
 
             if (specifierMap.size > 0) {
+              if (classified.classification === "literal") {
+                // Replacing a literal has no selector effects. Keeping a
+                // one-argument identity call for a bundled URL prevents
+                // Rollup from dropping import options and remains packable.
+                const target = specifierMap.get(classified.specifier);
+                edits.push({type: "replace", pos: node.source.start, end: node.source.end,
+                  priority: 2, text: bundledTarget ? `(s => s)(${target})` : target});
+                return;
+              }
               const chain = Array.from(specifierMap.entries())
                 .map(([cand, targetExpr]) => `s === ${JSON.stringify(cand)} ? ${targetExpr} : `)
                 .join("");
@@ -712,6 +750,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
     const { output } = await bundle.generate({
       format: "es",
+      // r186 applications use native import attributes; Rollup's default
+      // legacy `assert` syntax is rejected by current supported hosts.
+      importAttributesKey: "with",
       // An application may await compileAsync/renderAsync at module scope. The
       // renderer then imports optional UV/fog/background modules, which share
       // helpers with its static runtime. Keep that runtime (and its static
