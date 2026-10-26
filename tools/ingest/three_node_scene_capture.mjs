@@ -13,6 +13,16 @@ const integer = value => Number.isSafeInteger(value) && value >= 0;
 const transparent = material => material.transparent === true || material.transmission > 0 ||
   material.transmissionNode?.isNode === true || material.backdropNode?.isNode === true;
 
+// Additional source material features use the retained native shader builder.
+// Users must not add a dummy TSL slot to reach an existing implementation.
+// Keep admission separate: every selected material is checked before updates.
+const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
+  material.bumpMap != null || material.displacementMap != null ||
+  (material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && (
+    ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity'].some(key => material[key] > 0) ||
+    ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
+      'anisotropyMap', 'retroreflectivityMap'].some(key => material[key] != null)));
+
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
   maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null} = {}) {
@@ -71,12 +81,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          hasThreeNodeProgram(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
+          nativeFeatures(material) || material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
-  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene ? material != null : hasThreeNodeProgram(material);
+  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene ? material != null : nativeFeatures(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -103,8 +113,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         fail('EFFECT', 'Native node material overrides require matching inherited position, alpha, displacement and transparency state');
     }
     if (!effective.some(nativeMaterial)) continue;
-    if (effective.some(material => material && !nativeMaterial(material)))
-      fail('MATERIAL', 'A native node mesh cannot mix authored node and fixed materials');
+    // A mesh's material groups share one geometry owner. Admit all its groups
+    // through the source library conversion when any group needs native shading;
+    // unsupported classes still fail the complete preflight below.
     if (!(object instanceof three.Mesh) || object.intersectsFrustum !==
         (object.isSkinnedMesh ? three.SkinnedMesh.prototype.intersectsFrustum : three.Mesh.prototype.intersectsFrustum))
       fail('OBJECT', 'Native node scenes require ordinary meshes with their source frustum implementation');

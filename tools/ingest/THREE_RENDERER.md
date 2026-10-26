@@ -61,7 +61,9 @@ uniform layouts; F3D owns geometry, pipelines, bind groups, draw ordering and
 submission. Float attributes, scalar/vector/matrix uniforms and ordinary sampled
 2D texture graphs are supported. Graphics and compute share captured texture
 versions; native target sampling borrows the actual attachment storage.
-The existing fixed shader path continues serving default node materials.
+Ordinary materials with bump/displacement maps or Physical sheen, iridescence,
+anisotropy and retroreflectivity use those source shaders without authored node
+slots. Other default node materials continue using the existing fixed path.
 
 Each initialized native node render captures its program, visible draw selection,
 raster state, ranges, uniforms and texture versions before asynchronous preparation. Source
@@ -97,8 +99,12 @@ live; changing a map binding/channel or enabling/disabling the coating takes the
 ordinary preparation path. The native r186 roughness map reads its red channel.
 The dielectric coating uses the pinned GGX/Fresnel layering and leaves emission
 unattenuated. The existing environment receiver keeps its documented radiance
-profile. Other physical extensions remain outside this implementation; see
-[THREE_SCENE.md](./THREE_SCENE.md).
+profile. Sheen, iridescence, anisotropy and retroreflectivity instead select the
+retained native node builder, including their ordinary material properties and
+maps. Live values and image versions are captured independently for queued native
+draws. This also supports bump and displacement maps on admitted ordinary mesh
+materials. Transmission and dispersion still need their scene-color protocol;
+see [THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md).
 
 Ordinary `ArrayCamera` rendering is admitted on this native WebGPU route, with
 at most 256 non-reversed perspective or orthographic child cameras. The parent
@@ -124,6 +130,10 @@ scene/object/material render hooks retain their existing explicit rejection.
   requests are submitted in order when preparation completes. Counted in
   `info.f3d.deferredRenders`; call
   `compileAsync(scene, camera)` to prepare ahead of the first frame.
+- Enabling an automatically native material feature while an earlier fixed
+  request is still awaiting preparation can fail because the fixed mapper reads
+  live material state. Await the initial `renderAsync()` before this transition;
+  initially active features and queued native value updates are supported.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):

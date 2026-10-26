@@ -74,6 +74,33 @@ function environmentTexture(T, variant) {
   return texture;
 }
 export const nativeTSLScenarios = {
+  native_tsl_double_side_transparency(T) {
+    const result = {scene: scene(T), camera: camera(T)}, N = T.TSL;
+    const geometry = new T.SphereGeometry(.8, 40, 24);
+    const colors = [0xeb8a45, 0x52c3ad, 0x779fe8];
+    for (const [index, opacity] of [.25, .5, .7].entries()) {
+      const material = new T.MeshBasicNodeMaterial({
+        transparent: true, side: T.DoubleSide, depthWrite: false,
+      });
+      // Shared geometry and overlap expose interleaved draw ordering.
+      material.colorNode = N.color(colors[index]);
+      material.opacityNode = N.uniform(opacity);
+      const mesh = new T.Mesh(geometry, material);
+      mesh.position.set((index - 1) * .62, index === 1 ? .18 : -.12, (index - 1) * .28);
+      mesh.rotation.set(.17 * index, -.3 * index, .12);
+      if (index === 1) mesh.scale.x = -1;
+      result.scene.add(mesh);
+    }
+    return result;
+  },
+  native_tsl_double_side_normals(T) {
+    const result = nativeTSLScenarios.native_tsl_double_side_transparency(T), N = T.TSL;
+    for (const mesh of result.scene.children)
+      mesh.material.colorNode = N.normalView.mul(.25).add(.35).mul(mesh.material.colorNode);
+    // Pinned r186 compileAsync loses per-pass material.side. Cold rendering
+    // checks side-specific normals; --force-precompile reproduces that source gap.
+    return {...result, precompile: false};
+  },
   native_tsl_cube_textures(T, renderer) {
     const N = T.TSL, size = 16;
     const palettes = [

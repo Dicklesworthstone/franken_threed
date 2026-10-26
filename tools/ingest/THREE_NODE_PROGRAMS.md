@@ -14,8 +14,13 @@ Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 `MeshPhongMaterial`, `MeshStandardMaterial` and `MeshPhysicalMaterial` can also
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
-original source material identity. Materials without authored slots keep their
-existing fixed rendering path. Custom material subclasses and overridden
+original source material identity. Ordinary materials also enter this path when
+they use bump or displacement maps, or Physical sheen, iridescence, anisotropy
+or retroreflectivity and their maps. They require no authored node slot or
+application rewrite. Other materials keep their existing fixed rendering path.
+When one material group on a mesh needs native shading, its other groups use the
+same source library conversion and geometry owner. All selected groups must pass
+admission before any node update runs. Custom material subclasses and overridden
 conversion methods remain outside this entrance.
 
 Source material maps now lower through the pinned material accessors: base
@@ -27,6 +32,15 @@ sharing relationship with another map or authored texture rebuilds the binding
 layout. Compatible image replacement retains the compiled program and each
 queued draw's source pixel version. AO, light maps and material environment maps
 still require additional lighting adapters.
+
+Automatically selected native materials capture active lobe values and map image
+versions independently for queued renders. Enabling a native-only feature while
+an earlier fixed-path request is still awaiting preparation remains unsupported:
+the fixed mapper reads live material state and can reject that earlier request.
+Await the initial `renderer.renderAsync(scene, camera)` before activating the
+feature. Subsequent native value updates and a drained transition back to the
+fixed path preserve the original material identity. This is not a general fixed
+material snapshot implementation.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
@@ -421,6 +435,15 @@ retained program and captured uniforms; object updates run for each draw while
 frame/render updates retain the source `NodeFrame` frequency. `forceSinglePass`
 keeps its source meaning and selects one draw with culling disabled. This does not admit
 transmission's separate scene-color and scene-wide double-pass protocol.
+
+There is a remaining parity difference when the pinned reference explicitly
+precompiles a transparent `DoubleSide` normal-dependent graph. Its
+`_createObjectPipeline` queue retains each material after the source restores
+`DoubleSide`, so both queued side programs can compile with double-sided normals.
+The candidate retains separate back/front shader variants. Direct rendering
+without precompilation agrees on the side-specific normals. This is a documented
+precompilation compatibility gap, not complete parity for every call sequence.
+
 Unsupported graph slots, material subclasses, bindings and attribute layouts
 produce explicit errors rather than silently selecting another renderer.
 
@@ -434,6 +457,29 @@ The implementation follows Three.js r186 source commit
 `NodeMaterial`, `NodeFrame`, `NodeUniformsGroup`, common `Renderer` draw selection
 and `RenderList` ordering. Native opaque sorting uses depth and object identity,
 without WebGL's material-id sort key.
+
+The ordinary-material browser scenarios `native_material_lobes`,
+`native_material_lobe_updates` and `native_material_relief_maps` produced zero
+mismatched pixels and zero mean RGB difference against the pin on Chrome 151
+software Vulkan, using the unchanged channel tolerance 12 and pixel budget 2%.
+They cover default Physical lobe properties, live updates, and Phong bump /
+Standard displacement maps without authored nodes. The relief check reused its
+completed bundled build after the shared test machine ran out of disk space.
+These are correctness results, not hardware performance measurements.
+
+`native_tsl_double_side_transparency` keeps the usual precompile step and checks
+constant-color overlaps, varied opacity and negative scale.
+`native_tsl_double_side_normals` explicitly renders without precompilation to
+check side-specific normals. The precompilation difference above remains
+reproducible with:
+
+```sh
+node tests/e2e/webgpu_renderer/parity.mjs --force-precompile native_tsl_double_side_normals
+```
+
+That call sequence differed on 13.39% of pixels in the pinned reference
+comparison; it is a known parity gap, not an adjusted tolerance or excluded
+candidate failure. Other scenarios retain precompilation by default.
 
 The owner/capture test files cover actual
 pinned shader generation and packing, callback contexts and frequencies,

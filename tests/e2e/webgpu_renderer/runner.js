@@ -10,10 +10,12 @@ export async function run(THREE, createRenderer) {
     renderer.setPixelRatio(1); renderer.setSize(320, 240, false);
     // WebGPU apps initialize before PMREM/compute work; WebGLRenderer has no init().
     if (typeof renderer.init === 'function' && !renderer.isWebGLRenderer) await renderer.init();
-    const { scene, camera } = scenarios[name](THREE, renderer);
+    const { scene, camera, precompile = true } = scenarios[name](THREE, renderer);
     // Pixel comparisons start after both renderers' asynchronous pipeline warmup;
     // slow software-GPU compilation must not saturate the deferred-frame queue.
-    if (typeof renderer.compileAsync === 'function') await renderer.compileAsync(scene, camera);
+    // Explicit cold-render scenarios can still reproduce precompile differences.
+    const shouldPrecompile = precompile || new URLSearchParams(location.search).has('forcePrecompile');
+    if (shouldPrecompile && typeof renderer.compileAsync === 'function') await renderer.compileAsync(scene, camera);
     await renderer.setAnimationLoop(() => {
       try {
         renderer.render(scene, camera); state.frames++;

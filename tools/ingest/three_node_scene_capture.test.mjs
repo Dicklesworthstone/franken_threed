@@ -381,10 +381,20 @@ test('material groups capture their intersections and update once per logical dr
   assert.deepEqual(result.draws.map(draw => [draw.first, draw.count]), [[1, 2], [3, 2], [1, 3]]);
   assert.equal(result.draws[0].group.start, 0); assert.equal(result.draws[0].binding, result.draws[2].binding);
 });
-test('active invalid graphs, mixed arrays and effectful upload/object hooks refuse before updates', t => {
+test('mixed built-in and authored material groups share native geometry and retain identities', t => {
+  const f = rig(t), authored = f.material(), ordinary = new THREE.MeshBasicMaterial({color: 0x4488cc});
+  const object = f.mesh([authored, ordinary]);
+  object.geometry.clearGroups(); object.geometry.addGroup(0, 3, 0); object.geometry.addGroup(3, 3, 1);
+  const result = f.capture();
+  assert.deepEqual(result.bindings.map(binding => binding.material), [authored, ordinary]);
+  assert.deepEqual(result.draws.map(draw => [draw.material, draw.first, draw.count]), [[authored, 0, 3], [ordinary, 3, 3]]);
+  assert.ok(result.draws.every(draw => draw.object === object && draw.geometry === object.geometry));
+  assert.equal(ordinary.isNodeMaterial, undefined, 'source material identity is not replaced by conversion');
+});
+test('active invalid graphs, unsupported material groups and effectful upload/object hooks refuse before updates', t => {
   const cases = [
     f => { const m = f.material(); m.colorNode = N.texture(new THREE.Texture()); f.mesh(m); },
-    f => { f.mesh([f.material(), new THREE.MeshBasicMaterial()]); },
+    f => { f.mesh([f.material(), new THREE.ShaderMaterial()]); },
     f => { f.mesh().geometry.attributes.position.onUpload(() => {}); },
     f => { f.mesh().geometry.index.onUpload(() => {}); },
     f => { const o = f.mesh(); const data = new THREE.InterleavedBuffer(new Float32Array(12), 3); data.onUpload(() => {});

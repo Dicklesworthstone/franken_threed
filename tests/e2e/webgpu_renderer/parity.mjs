@@ -1,7 +1,7 @@
 // Differential pixel check: the routed general-webgpu WebGPURenderer build vs the
 // pinned upstream r186 WebGPURenderer (the same page built without routing) on
 // deterministic source scenes, in the same Chromium.
-// Usage: node tests/e2e/webgpu_renderer/parity.mjs [--reference webgl] [scenario...]
+// Usage: node tests/e2e/webgpu_renderer/parity.mjs [--reference webgl] [--force-precompile] [scenario...]
 //
 // This is a correctness oracle for the new backend, not a performance lane. A
 // scenario fails when its candidate errors or its pixels diverge beyond the
@@ -33,6 +33,10 @@ const CHANNEL_TOLERANCE = 12; // 8-bit levels per channel
 const PIXEL_BUDGET = 0.02; // fraction of pixels allowed beyond the channel tolerance
 
 const argv = process.argv.slice(2);
+// Override explicit cold-render scenarios to reproduce source precompile gaps.
+const forcePrecompileIndex = argv.indexOf("--force-precompile");
+const forcePrecompile = forcePrecompileIndex >= 0;
+if (forcePrecompile) argv.splice(forcePrecompileIndex, 1);
 const refIndex = argv.indexOf("--reference");
 const surfaceIndex = argv.indexOf("--surface");
 // --surface webgl: routed WebGLRenderer page vs the unchanged upstream WebGLRenderer page.
@@ -75,7 +79,8 @@ async function capture(kind, name) {
   // Program-route scenarios must not pass through the whole-image HDR fallback.
   if (kind === "candidate" && WEBGL_ONLY.has(name)) await page.addInitScript(() => { globalThis.F3D_NO_FALLBACK = true; });
   const html = kind === "candidate" ? `${surface}.html` : `${referenceKind}.html`;
-  await page.goto(`${base}/${kind}/${html}#${name}`);
+  const query = forcePrecompile ? "?forcePrecompile=1" : "";
+  await page.goto(`${base}/${kind}/${html}${query}#${name}`);
   const state = await page
     .waitForFunction(() => window.__f3d && (window.__f3d.pixels || window.__f3d.error) && window.__f3d, null, { timeout: 20000 })
     .then((h) => h.jsonValue())
@@ -86,10 +91,12 @@ async function capture(kind, name) {
 
 // Scenarios using WebGPU-build-only classes (node materials, BundleGroup).
 const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps_updates", "pbr_maps_layers",
+  "native_material_lobes", "native_material_lobe_updates", "native_material_relief_maps",
   "native_sprites", "native_sprites_orthographic", "native_sprites_updates", "native_sprites_array_camera",
   "native_render_mips", "native_render_mips_updates",
   "native_matcap_materials", "native_matcap_updates", "native_matcap_instanced",
-  "native_tsl_uniforms", "native_tsl_fragment", "native_tsl_object_targets",
+  "native_tsl_uniforms", "native_tsl_fragment", "native_tsl_object_targets", "native_tsl_double_side_transparency",
+  "native_tsl_double_side_normals",
   "native_tsl_buffer_arrays",
   "native_tsl_cpu_instanced_mesh",
   "native_tsl_shadows", "native_tsl_shadows_basic",

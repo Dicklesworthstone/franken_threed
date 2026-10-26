@@ -29,6 +29,51 @@ export const scenarios = {
   ...renderMipScenarios,
   ...spriteScenarios,
   ...pbrMapScenarios,
+  native_material_lobes(THREE) {
+    const result = scenarios.physical_specular_factors(THREE);
+    const objects = result.scene.children.filter(object => object.isMesh);
+    for (const [index, object] of objects.entries()) {
+      const material = object.material;
+      material[['sheen', 'iridescence', 'anisotropy', 'retroreflectivity', 'sheen', 'iridescence'][index]] = .8;
+      material.sheenColor.setRGB(.7, .15, .4); material.sheenRoughness = .4;
+      material.iridescenceThicknessRange = [150, 380]; material.anisotropyRotation = .6;
+    }
+    return result;
+  },
+  native_material_lobe_updates(THREE, renderer) {
+    const result = scenarios.native_material_lobes(THREE);
+    const objects = result.scene.children.filter(object => object.isMesh);
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (++frame === 8) for (const object of objects) {
+        object.material.sheen = .4; object.material.iridescence = .65;
+        object.material.anisotropy = .3; object.material.retroreflectivity = .2;
+        object.material.sheenColor.setRGB(.15, .6, .8); object.material.needsUpdate = true;
+      }
+      return render(...args);
+    };
+    return result;
+  },
+  native_material_relief_maps(THREE) {
+    const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
+    const data = new Uint8Array(16 * 16 * 4);
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+      const value = Math.round(128 + 110 * Math.sin(x * .8) * Math.cos(y * .6));
+      data.set([value, value, value, 255], (y * 16 + x) * 4);
+    }
+    const map = new THREE.DataTexture(data, 16, 16);
+    map.minFilter = map.magFilter = THREE.LinearFilter; map.generateMipmaps = false; map.needsUpdate = true;
+    const materials = [new THREE.MeshPhongMaterial({color: 0x4c86c4, bumpMap: map, bumpScale: .15}),
+      new THREE.MeshStandardMaterial({color: 0xc88648, roughness: .45, displacementMap: map,
+        displacementScale: .3, displacementBias: -.15})];
+    for (const [index, material] of materials.entries()) {
+      const object = new THREE.Mesh(new THREE.SphereGeometry(.7, 48, 32), material);
+      object.position.x = index ? .8 : -.8; scene.add(object);
+    }
+    const sun = new THREE.DirectionalLight(0xffedda, 2); sun.position.set(-1, 2, 3);
+    scene.add(sun, new THREE.HemisphereLight(0x667799, 0x332211, .5));
+    return {scene, camera: camera(THREE, [0, 0, 3.5])};
+  },
   physical_specular_factors(THREE) {
     const scene = new THREE.Scene(); scene.background = new THREE.Color(0x14191f);
     const geometry = new THREE.SphereGeometry(.47, 48, 32);

@@ -120,6 +120,7 @@ test('two unprepared render calls keep independent native uniforms until actual 
 
 test('transparent native DoubleSide renders submit ordered side pipelines with independent queued uniforms',async t=>{
   const f=fixture(t);f.material.transparent=true;f.material.side=T.DoubleSide;f.mesh.scale.x=-1;
+  f.material.colorNode=T.TSL.normalView.mul(.25).add(.35).mul(f.tint);
   await f.renderer.init();f.renderer.render(f.scene,f.camera);
   f.tint.value.setRGB(.875,.625,.375);f.renderer.render(f.scene,f.camera);
   f.tint.value.setRGB(.25,.5,.75);await drain(f.renderer);
@@ -127,6 +128,11 @@ test('transparent native DoubleSide renders submit ordered side pipelines with i
   assert.ok(draws.every(draw=>draw.pipeline.primitive.cullMode==='back'));
   assert.deepEqual(draws.map(draw=>draw.pipeline.primitive.frontFace),['ccw','cw','ccw','cw'],
     'source BackSide reverses winding; negative determinant flips both side pipelines');
+  assert.ok(draws[0].pipeline.fragment.module.code.includes('normalView = ( normalViewGeometry * vec3<f32>( -1.0 ) );'),
+    'the back-side shader reverses normals even though the pipeline regards its selected triangles as front-facing');
+  assert.ok(draws[1].pipeline.fragment.module.code.includes('normalView = normalViewGeometry;'));
+  assert.ok(draws.every(draw=>!draw.pipeline.fragment.module.code.includes('@builtin( front_facing )')),
+    'separate side shaders must not retain the single-pass front-facing normal expression');
   assert.ok(draws.slice(0,2).every(draw=>containsColor(draw,[.125,.375,.625])));
   assert.ok(draws.slice(2).every(draw=>containsColor(draw,[.875,.625,.375])));
   assert.equal(draws[0].pipeline,draws[2].pipeline);assert.equal(draws[1].pipeline,draws[3].pipeline);
@@ -140,6 +146,7 @@ test('transparent native DoubleSide renders submit ordered side pipelines with i
   f.material.forceSinglePass=true;f.renderer.render(f.scene,f.camera);await drain(f.renderer);
   assert.equal(nativeDraws(f.device).length,7);
   assert.equal(nativeDraws(f.device).at(-1).pipeline.primitive.cullMode,'none');
+  assert.ok(nativeDraws(f.device).at(-1).pipeline.fragment.module.code.includes('@builtin( front_facing )'));
 });
 
 test('compilation runs no node updates; logical source callbacks run once per visible draw before awaits',async t=>{
@@ -921,4 +928,45 @@ test('registered SunLight refuses unsupported shadow effects before updates and 
   f.renderer.shadowMap.enabled=false;
   f.renderer.render(f.scene,f.camera);await drain(f.renderer);assert.equal(updates,1);assert.equal(nativeDraws(f.device).length,1);
   assert.equal(sun.shadow.map,null);
+});
+
+for(const Material of [T.MeshPhysicalMaterial,T.MeshPhysicalNodeMaterial])
+for(const [feature,shader] of [['sheen',/sheenSpecularDirect/],['iridescence',/fn evalIridescence/],
+  ['anisotropy',/fn D_GGX_Anisotropic/],['retroreflectivity',/Retroreflectivity/]])
+test(`ordinary ${Material.name} ${feature} selects native shading without authored nodes`,async t=>{
+  const f=fixture(t),material=new Material({color:new T.Color(.125,.375,.625),roughness:.4});
+  material[feature]=.5;f.mesh.material=material;
+  const light=new T.DirectionalLight(0xffffff,2);light.position.set(1,2,3);f.scene.add(light);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  material.color.setRGB(.875,.625,.375);material[feature]=.75;f.renderer.render(f.scene,f.camera);
+  material.color.setRGB(0,0,0);material[feature]=0;
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(draws.every(draw=>shader.test(draw.pipeline.fragment.module.code)));
+  assert.ok(containsColor(draws[0],[.125,.375,.625]));assert.ok(containsColor(draws[1],[.875,.625,.375]));
+  assert.equal(draws[0].pipeline,draws[1].pipeline,'live factors reuse the native variant');
+  assert.equal(f.mesh.material,material);assert.equal(material.colorNode??null,null);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.equal(f.renderer.info.f3d.presentedRenders,3,'disabling the lobe returns through the ordinary preparation boundary');
+});
+
+for(const slot of ['bumpMap','displacementMap'])
+test(`ordinary built-in ${slot} reaches source native shaders and captures queued image versions`,async t=>{
+  const f=fixture(t),data=new Uint8Array(2*2*4).fill(64),map=new T.DataTexture(data,2,2);
+  map.generateMipmaps=false;map.needsUpdate=true;
+  const material=new T.MeshPhongMaterial({color:0x4488cc,[slot]:map});
+  f.mesh.material=material;f.scene.add(new T.DirectionalLight(0xffffff,2));
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  data.fill(192);map.needsUpdate=true;f.renderer.render(f.scene,f.camera);
+  data.fill(0);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  const code=draws[0].pipeline[slot==='displacementMap'?'vertex':'fragment'].module.code;
+  assert.match(code,/textureLoad|textureSample/);
+  assert.match(code,slot==='displacementMap'?/positionLocal = \( positionLocal \+/:/dpdx/);
+  const uploads=f.device.textureWrites.filter(write=>write.bytes.length===data.byteLength);
+  assert.ok(uploads.some(write=>write.bytes.every(value=>value===64)));
+  assert.ok(uploads.some(write=>write.bytes.every(value=>value===192)));
+  assert.equal(material.colorNode,undefined);assert.equal(material[slot],map);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
 });
