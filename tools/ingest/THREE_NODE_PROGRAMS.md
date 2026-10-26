@@ -226,8 +226,8 @@ draws, empty ranges, compilation without copies, and output precision; they do n
 establish browser pixel parity or performance.
 
 Native Standard and Physical graphs also use ready 2D equirectangular, source
-CubeUV or six-face CPU-data cube textures as `scene.environment` or material
-`envMap`. A material map overrides the scene environment and uses its own
+CubeUV or six-face CPU-data/decoded-image cube textures as `scene.environment`
+or material `envMap`. A material map overrides the scene environment and uses its own
 `envMapIntensity` and `envMapRotation`; scene fallback retains the scene controls.
 Changing this ownership selects a fresh graph even when both properties share
 the same texture. Stale captures reject before authored node callbacks run.
@@ -272,7 +272,7 @@ Immediate generator disposal and later generator resizing retain private filter
 resources until accepted work drains. Repeated scene generations use separate
 private solid-background boxes, preserving each generation's color. The public
 output target remains caller-owned and sampleable after generator disposal.
-`fromCubemap()` accepts the CPU-data cube profile below, runs the source cube
+`fromCubemap()` accepts the data and decoded-image cube profiles below, runs the source cube
 conversion and GGX filtering, and returns an ordinary CubeUV atlas for native
 PBR environments. The WebGL/core placeholder route retains its existing behavior.
 
@@ -340,18 +340,34 @@ backgrounds likewise retain each call's clear value. These capabilities do not
 establish full H7 or H8 compatibility.
 
 Authored `cubeTexture()` graphs sample source CubeTextures containing exactly
-six CPU DataTexture faces. The compiler retains the pinned direction, reflection/
-refraction mapping and explicit-level semantics and declares cube views in the
-source binding order. Compatible cube replacements reuse the program; changes
-to the texture alias partition or cube mapping select a new source graph.
-The existing texture owner captures all six faces and authored mip levels for
-each accepted upload version, preserving earlier draws after later CPU edits.
+six CPU DataTexture or decoded platform-image faces. The decoded profile accepts
+ImageData, ImageBitmap, HTMLImageElement, HTMLCanvasElement and OffscreenCanvas
+through the shared immutable-image owner. The compiler retains the pinned
+direction, reflection/refraction mapping and explicit-level semantics and
+declares cube views in source binding order. Compatible replacements reuse the
+program; alias-partition or mapping changes select a fresh source graph.
+
+All six faces and authored mip levels are captured for each accepted upload
+version. Mutable images retain call-time pixels before asynchronous upload;
+shared image identities are cloned once, and only private bitmap snapshots are
+closed. The native upload profile follows the pinned face swap, flipY and
+premultiply behavior, including authored/generated mipmaps and the source CPU
+base-level flip order. The default WebGL texture pool keeps its prior behavior.
 Float filtering retains the existing device-feature checks.
 
-Decoded-image cubes, render-target cubes and unsampled cube loads remain outside
-this profile. Cube textures cannot occupy ordinary 2D material map slots. The
-CPU-data cube profile is admitted for native Standard/Physical environment
-lighting, either directly or through the public generator's CubeUV result.
+Ordinary Standard/Physical material `envMap` and scene cube environments select
+the native environment graph automatically. The source PMREM helper performs
+conversion and filtering through F3D-owned draws before the consumer. Versioned
+refresh preserves earlier accepted faces. Fixed sprites, lines, points and Basic
+meshes can share that scene; disabled lighting does not upload an unused cube or
+send it through the fixed panorama owner.
+
+Render-target color cubes and unsampled cube loads remain outside this profile.
+Cube textures cannot occupy ordinary 2D material map slots. Eighteen decoded-cube
+regressions compare exact pinned WGSL and source upload descriptors, exercise
+ordinary PBR/PMREM submission and verify image ownership. Host/GPU recording
+doubles do not establish actual browser decoding, color conversion or pixel
+parity.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -567,7 +583,7 @@ struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
-Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
+Depth/comparison, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.

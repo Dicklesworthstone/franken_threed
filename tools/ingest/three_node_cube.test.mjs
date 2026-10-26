@@ -71,7 +71,7 @@ test('compatible cube replacements reuse bindings while alias and mapping change
   assert.throws(() => f.owner.captureDraw(separate, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.notEqual(f.compile(), separate);
 });
-test('native cube admission refuses image faces, malformed cubes, unsampled loads and mismatched node views', t => {
+test('native cube admission refuses non-platform faces, malformed cubes, unsampled loads and mismatched node views', t => {
   const f = rig(t), good = cube();
   const cases = [
     () => N.cubeTexture(new THREE.CubeTexture(Array.from({length: 6}, () => ({width: 2, height: 2}))), N.vec3(1, 0, 0)),
@@ -183,7 +183,8 @@ test('registered cube scenario combines six source cube views with a disposed-ge
   }, f.renderer);
   t.after(() => result.atlas.dispose());
   f.renderer.render(result.scene, result.camera); await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.at(-1);
+  const draws = f.device.snapshots.map(draws => draws.filter(draw =>
+    !draw.pipeline.label?.startsWith('Animation HDR output '))).filter(draws => draws.length).at(-1);
   assert.equal(draws.length, 8);
   const panels = draws.filter(draw => draw.pipeline.fragment.module.code.includes('texture_cube<f32>'));
   assert.equal(panels.length, 6);

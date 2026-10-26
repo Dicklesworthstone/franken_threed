@@ -535,7 +535,7 @@ export function withThreeCompute(Base, THREE) {
       check(this);
       if (!this._device) fail('DEVICE', 'Initialize the renderer before capturing sampled texture inputs');
       return this._sampledTextureInputs ??= createThreeComputeTextures({storage: this._storageTextures,
-        poolFactory: ({imageSnapshots}) => createGpuThreeTextures(this._device, {three: THREE, imageSnapshots}),
+        poolFactory: ({imageSnapshots}) => createGpuThreeTextures(this._device, {three: THREE, imageSnapshots, nativeCube: this._shaderEncodedOutput !== true}),
         targetFactory: () => createThreeComputeTargets({targets: this._targets, device: this._device,
           signal: this._targetLifetime.signal}),
         framebufferFactory: () => createThreeFramebufferTextures({three: THREE, device: this._device,

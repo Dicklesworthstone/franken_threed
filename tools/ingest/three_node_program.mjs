@@ -7,7 +7,7 @@
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
  * source bone palettes, authored typed uniform arrays and multiple uniform blocks per source group,
- * sampled 2D/data-array/CPU-data cube textures, GPU-authored 2D/array/3D storage inputs,
+ * sampled 2D/data-array/cube textures, GPU-authored 2D/array/3D storage inputs,
  * target-owned depth comparisons and read-only
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
@@ -476,7 +476,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource || texture.isStorageTexture ||
         ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping,
           three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping))
-      fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image, CPU-data cube or source CubeUV texture');
+      fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image, data or decoded cube faces, or source CubeUV texture');
     inspectTexture(texture);
     return texture;
   }
@@ -522,7 +522,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         array && !storage && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isExternalTexture)
-      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, CPU-data cubes, 2D/array/3D storage and target-owned color/depth textures');
+      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, data or decoded cube faces, 2D/array/3D storage and target-owned color/depth textures');
     // Compute owns these images. Admission must use the same residency owner,
     // never the CPU texture pool or an independently inferred storage layout.
     // TextureNode/Texture3DNode sampling remains read-only. Volume coordinates
@@ -552,9 +552,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
         !Array.isArray(texture.image) || texture.image.length !== 6 || texture.image.some(face =>
-          !(face instanceof three.DataTexture) || face.isDataTexture !== true ||
-          !ArrayBuffer.isView(face.image?.data) || face.image.data instanceof DataView)))
-      fail('TEXTURE', 'Native cube sampling requires six CPU DataTexture faces with source reflection or refraction mapping');
+          !(face instanceof three.DataTexture && face.isDataTexture === true &&
+            ArrayBuffer.isView(face.image?.data) && !(face.image.data instanceof DataView)) &&
+          !(typeof renderer._getSampledTextureInputs === 'function' &&
+            ['ImageData', 'ImageBitmap', 'HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas'].some(name =>
+              typeof globalThis[name] === 'function' && face instanceof globalThis[name])))))
+      fail('TEXTURE', 'Native cube sampling requires six source data or decoded image faces with reflection or refraction mapping');
     if (!depth && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');

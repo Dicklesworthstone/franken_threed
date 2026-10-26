@@ -73,7 +73,7 @@ export function inspectThreeTexture(texture, three, limits={}) {
 }
 function textureInspector(T,{
   maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxDimension3D=32768,maxLayers=2048,float32Filterable=false,features=new Set(),
-  imageSnapshots=null,
+  imageSnapshots=null,nativeCube=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');
@@ -81,6 +81,7 @@ function textureInspector(T,{
   integer(maxDimension3D,1,32768,'3D texture dimension');
   integer(maxLayers,1,Number.MAX_SAFE_INTEGER,'texture layers');
   if(!features||typeof features.has!=='function')fail('OPTIONS','Expected a device feature set');
+  if(typeof nativeCube!=='boolean')fail('OPTIONS','Expected a native cube upload profile');
   const wraps=new Map([[T.ClampToEdgeWrapping,'clamp-to-edge'],[T.RepeatWrapping,'repeat'],[T.MirroredRepeatWrapping,'mirror-repeat']]);
   const filters=new Map([[T.NearestFilter,['nearest','nearest',false]],[T.LinearFilter,['linear','nearest',false]],
     [T.NearestMipmapNearestFilter,['nearest','nearest',true]],[T.NearestMipmapLinearFilter,['nearest','linear',true]],
@@ -300,11 +301,13 @@ function textureInspector(T,{
     if(levels>full||(filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
     const uploads=[];
     if(cube){
-      for(let layer=0;layer<6;layer++)uploads.push({image:base[layer],level:0,layer});
+      // Native WebGPU flips the +Y/-Y faces as well as each face's rows.
+      const faceLayer=layer=>nativeCube&&t.flipY&&[2,3].includes(layer)?5-layer:layer;
+      for(let layer=0;layer<6;layer++)uploads.push({image:base[layer],level:0,layer:faceLayer(layer)});
       for(let mip=0;mip<t.mipmaps.length;mip++){
         const faces=t.mipmaps[mip]?.image;
         if(!Array.isArray(faces)||faces.length!==6)fail('MIPS','Each authored cube mip needs six faces');
-        for(let layer=0;layer<6;layer++)uploads.push({image:unwrap(faces[layer]),level:mip+1,layer});
+        for(let layer=0;layer<6;layer++)uploads.push({image:unwrap(faces[layer]),level:mip+1,layer:faceLayer(layer)});
       }
     }else for(const [level,image] of (manual?t.mipmaps:base).entries())uploads.push({image:unwrap(image),level,layer:0});
     let bytes=0;
@@ -318,10 +321,11 @@ function textureInspector(T,{
           fail('SOURCE','Use decoded images, ImageBitmaps, canvases or ImageData');
         // r186 WebGLTextures skips UNPACK_FLIP_Y/PREMULTIPLY for ImageBitmaps (their
         // decode options already decided both) while WebGPUTextureUtils applies them.
-        // Only the profile where both source renderers agree is admitted.
+        // The native cube profile follows WebGPU; ordinary pools admit only
+        // the bitmap flags where both source renderers agree.
         // A private bitmap captured from a mutable image/canvas retains that
         // source's upload contract. It is not an application-authored ImageBitmap.
-        if(bitmap&&!capturedImages.has(image)&&(t.flipY||t.premultiplyAlpha))
+        if(bitmap&&!capturedImages.has(image)&&!(nativeCube&&cube)&&(t.flipY||t.premultiplyAlpha))
           fail('SOURCE','ImageBitmap sources require flipY=false and premultiplyAlpha=false (orientation and alpha are decided at decode)');
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
@@ -372,12 +376,12 @@ function textureInspector(T,{
 
 export function createGpuThreeTextures(device,{
   three:T,maxTextureBytes=128*1024*1024,maxTextures=256,maxPixels=16*1024*1024,label='f3d-three-textures',
-  imageSnapshots=null,
+  imageSnapshots=null,nativeCube=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
-  const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
+  const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,nativeCube,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
@@ -491,8 +495,11 @@ export function createGpuThreeTextures(device,{
           const row=image.width*d.channels*d.bpc,pitch=Math.ceil(row/d.alignment)*d.alignment;
           const src=new Uint8Array(image.data.buffer,image.data.byteOffset,image.data.byteLength);
           let data=src;
-          if(d.flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
-          native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:d.flipY?row:pitch},[image.width,image.height,1]));stats.writeCalls++;
+          // r186's native CPU cube path flips the base after every authored
+          // mip upload; the authored mip rows themselves remain unchanged.
+          const flipY=nativeCube&&d.cube&&d.manual?d.flipY&&level===0&&d.levels%2===1:d.flipY;
+          if(flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
+          native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:flipY?row:pitch},[image.width,image.height,1]));stats.writeCalls++;
         }
       }else for(const {image,level,layer} of d.uploads){
         native(()=>device.queue.copyExternalImageToTexture({source:image,flipY:d.flipY},

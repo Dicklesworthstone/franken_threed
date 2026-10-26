@@ -18,6 +18,8 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
   material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
+  ((material.isMeshStandardMaterial === true || material.isMeshStandardNodeMaterial === true ||
+    material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && material.envMap != null) ||
   (material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && (
     ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity', 'transmission', 'dispersion'].some(key => material[key] > 0) ||
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
@@ -37,8 +39,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // the complete-list default; each control is observed at its source phase.
   const listEnabled = key => renderLists === null || renderLists[key] === true;
   const phases = {opaque: false, transparent: false, output: false};
-  // Preserve the ignored ordinary environment across queued mixed-owner draws.
-  const sceneEnvironmentNode = root?.environmentNode?.isNode === true;
+  // Native PBR owns node/cube environments. Fixed companions and inactive
+  // lighting must not acquire the legacy panorama owner for these inputs.
+  const sceneEnvironmentNode = root?.environmentNode?.isNode === true || root?.environment?.isCubeTexture === true;
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
       !hasThreeNodeProgram(backgroundMesh.material)))
@@ -95,9 +98,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Non-PBR lighting models have no rectangular-light contribution, but their
   // source light node still constructs its LTC inputs and runs its lifecycle.
   const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene) && litMaterial(material);
-  // An authored scene environment belongs to the source PBR lighting graph.
-  // Material environments take precedence, while unused scene graphs stay inert.
-  const nativeEnvironmentMaterial = material => root.environmentNode?.isNode === true &&
+  // Authored scene nodes and cube environments use the source PBR graph.
+  // Material environments take precedence, while unused scene inputs stay inert.
+  const nativeEnvironmentMaterial = material => (root.environmentNode?.isNode === true || root.environment?.isCubeTexture === true) &&
     renderer?.lighting?.enabled !== false && material?.lights !== false && material?.fragmentNode == null &&
     !material?.envNode && !material?.envMap && ['MeshStandard', 'MeshPhysical'].some(name =>
       material?.[`is${name}Material`] === true || material?.[`is${name}NodeMaterial`] === true);
