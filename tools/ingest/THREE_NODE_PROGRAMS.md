@@ -39,13 +39,19 @@ fixed path; AO also composes with native graphs and Physical features. Material
 environment maps still require an additional lighting adapter.
 
 Automatically selected native materials capture active lobe values and map image
-versions independently for queued renders. Enabling a native-only feature while
-an earlier fixed-path request is still awaiting preparation remains unsupported:
-the fixed mapper reads live material state and can reject that earlier request.
-Await the initial `renderer.renderAsync(scene, camera)` before activating the
-feature. Subsequent native value updates and a drained transition back to the
-fixed path preserve the original material identity. This is not a general fixed
-material snapshot implementation.
+versions independently for queued renders. Ordinary fixed-path requests now also
+capture material selectors and callback-free scalar, color, vector and plane
+values before asynchronous preparation. A fixed-to-native-to-fixed sequence can
+remain queued while each accepted render keeps its own material state. Material
+arrays, overrides, raster state, clipping and fog flags use those captured values;
+cache and disposal ownership remain keyed by the original source materials.
+
+Snapshot budgets are released after submission, failed preparation or disposal.
+Native packets retain their existing lifecycle. Geometry, texture objects and
+fixed-path image upload histories remain live; metadata and custom value objects
+retain their source identities. Exotic material-array selectors and custom
+accessor-backed values preserve their prior live behavior. This is a material
+snapshot, not a deep snapshot of the entire mutable scene.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
@@ -471,6 +477,14 @@ replacement. These execute the real source builder and capture code in an
 isolated JavaScript runtime; they do not establish browser pixel parity for the
 new light-map combinations.
 
+Material snapshot regressions exercise the actual facade, scene bridge and
+command owner with the existing recording device. They verify queued fixed /
+native transitions, source disposal, array group selection, double-sided source
+state preservation, failure cleanup and ArrayCamera/fog behavior. Snapshot-helper
+checks cover value copies, clipping/override state, accessors, capacity limits and
+borrowed metadata. These are command and ownership checks in the available
+JavaScript runtime, not browser pixel or performance measurements.
+
 The ordinary-material browser scenarios `native_material_lobes`,
 `native_material_lobe_updates` and `native_material_relief_maps` produced zero
 mismatched pixels and zero mean RGB difference against the pin on Chrome 151
@@ -500,6 +514,7 @@ independent byte history, call-time selection/ranges, admission and budgets,
 pipeline failures, device loss and disposal:
 
 ```sh
+node tools/ingest/three_material_snapshot.test.mjs
 node tools/ingest/three_node_program.test.mjs
 node tools/ingest/three_node_cube.test.mjs
 node tools/ingest/three_node_attributes.test.mjs

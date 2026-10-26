@@ -133,10 +133,11 @@ scene/object/material render hooks retain their existing explicit rejection.
   requests are submitted in order when preparation completes. Counted in
   `info.f3d.deferredRenders`; call
   `compileAsync(scene, camera)` to prepare ahead of the first frame.
-- Enabling an automatically native material feature while an earlier fixed
-  request is still awaiting preparation can fail because the fixed mapper reads
-  live material state. Await the initial `renderAsync()` before this transition;
-  initially active features and queued native value updates are supported.
+- Ordinary fixed-path material values and material-array selectors are captured
+  per request, so queued fixed/native transitions preserve accepted colors,
+  shading and raster state. Original materials remain cache/disposal identities.
+  Geometry, texture objects and fixed-path image upload histories retain their
+  existing live contract; this does not snapshot the entire scene.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):

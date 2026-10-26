@@ -37,6 +37,7 @@ import {createThreeRenderTargets, inspectThreeRenderTarget, inspectThreeRenderTa
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground} from './three_pass_snapshot.mjs';
+import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -73,6 +74,7 @@ const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth
   'device', 'outputBufferType', 'multiview', 'trackTimestamp', 'colorBufferType', 'getFallback', 'context']);
 const MAX_PENDING = 64;
 const MAX_NODE_CAPTURE_BYTES = 64 * 1024 * 1024;
+const MAX_MATERIAL_CAPTURE_VALUES = 1024 * 1024;
 
 /** True when the error is a recoverable "call prepare()" boundary from the bridge. */
 const isPrepareBoundary = error => error?.code === 'THREE_SCENE_PREPARE' || error?.code === 'F3D_RENDERER_PREPARE';
@@ -104,16 +106,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
-  function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null, nodeFrame = null) {
+  function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null, nodeFrame = null, materialFrame = null) {
+    const state = material => materialFrame?.materials.get(material) ?? material;
     let clipping = false;
     scene.traverse(object => {
       // A queued native render owns its visibility selection. Hidden source
       // objects must not force material admission during later preparation.
       if (nodeFrame?.excludedObjects?.has(object)) return;
-      const list = Array.isArray(object.material) ? object.material : object.material ? [object.material] : [];
-      if (list.some(m => m?.clippingPlanes?.length)) clipping = true;
+      const material = materialFrame?.objects.has(object) ? materialFrame.objects.get(object) : object.material;
+      const list = Array.isArray(material) ? material : material ? [material] : [];
+      if (list.some(m => state(m)?.clippingPlanes?.length)) clipping = true;
     });
-    if (overrideMaterial?.clippingPlanes?.length) clipping = true;
+    if (state(overrideMaterial)?.clippingPlanes?.length) clipping = true;
     return clipping;
   }
   // r186 WebGPURenderer applies material clipping planes without a renderer-level
@@ -133,10 +137,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, frame) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -148,7 +152,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           for (const [scene, key] of wanted) {
             const passOptions = root === scene ? destination._preparationOptions : undefined;
             const overrideMaterial = passOptions ? passOptions.overrideMaterial : scene.isScene === true ? scene.overrideMaterial : null;
-            const clipping = needsClipping(scene, overrideMaterial, passOptions?.nodeFrame) || owner._needsGlobalClipping?.() === true;
+            const clipping = needsClipping(scene, overrideMaterial, passOptions?.nodeFrame, passOptions?.materialFrame) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
               await previous.bridge.prepare(passOptions);
@@ -171,7 +175,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // device-scale default (1 GiB) rather than the bridge's 128 MiB.
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
-              backgroundState: passOptions?.backgroundState,
+              backgroundState: passOptions?.backgroundState, materialFrame: passOptions?.materialFrame,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
@@ -302,6 +306,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeProgramSupport = null;
       this._nodeBackgrounds = null;
       this._nodeCaptureBytes = 0;
+      this._materialCaptureValues = 0;
       this._nodeRaster = new Map();
       this._renderObjectFunction = null;
       this._handleObjectFunction = null;
@@ -754,8 +759,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!matricesUpdated) this._updateNativeMatrices(scene, camera);
         camera = captureThreeCamera(THREE, camera); matricesUpdated = true;
       }
+      let materialFrame = null;
+      if (native && !nodeCaptureDeferred) {
+        try { materialFrame = this._captureMaterialFrame({scene, nodeFrame, overrideMaterial}); }
+        catch (error) { this._releaseRequest({nodeFrame}); throw error; }
+      }
       return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
-        nodeCaptureDeferred, captureCameras, backgroundState,
+        nodeCaptureDeferred, captureCameras, backgroundState, materialFrame,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -794,8 +804,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (captured) this._nodeCaptureBytes += captured.bytes;
       return captured;
     }
+    _captureMaterialFrame({scene, nodeFrame, overrideMaterial}) {
+      const captured = captureThreeMaterialState(THREE, scene, {nodeFrame, overrideMaterial,
+        maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
+        maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
+      if (captured) this._materialCaptureValues += captured.values;
+      return captured;
+    }
     _releaseRequest(request) {
       request.snapshot?.release();
+      if (request.materialFrame) {
+        this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
+      }
       if (request.nodeFrame) {
         const captured = request.nodeFrame;
         for (const lease of captured.textureUses) captured.textureOwner.release(lease);
@@ -817,13 +837,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._submit(request); this._releaseRequest(request);
       }
       catch (error) {
-        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial, request.nodeFrame)))
+        if (isPrepareBoundary(error) || (error?.code === 'THREE_SCENE_MATERIAL' && !entry.clipping && needsClipping(scene, request.overrideMaterial, request.nodeFrame, request.materialFrame)))
           return this._defer(request);
         this._releaseRequest(request);
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, deferred = false}) {
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, deferred = false}) {
       snapshot?.install();
       nodeFrame?.installAttributes?.();
       const previous = this._programFrame;
@@ -832,8 +852,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._programFrame = deferred ? programFrame : undefined;
       try {
         const issue = () => {
-          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, frame);
-          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState}, {...frame, ...attachments}), {mipLevel, face});
+          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame);
+          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...frame, ...attachments}), {mipLevel, face});
         };
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
         const resources = () => {
@@ -972,6 +992,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
               request.camera = captureThreeCamera(THREE, request.camera); request.matricesUpdated = true;
             }
+            request.materialFrame = this._captureMaterialFrame(request);
           } catch (error) {
             request.nodeCaptureFailure = {error};
           } finally {
@@ -1003,7 +1024,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
         destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame,
-          backgroundState: request.backgroundState} : undefined;
+          backgroundState: request.backgroundState, materialFrame: request.materialFrame} : undefined;
         try {
           request?.snapshot?.install();
           captured?.prepareAttributes?.();

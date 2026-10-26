@@ -70,6 +70,7 @@ export async function createGpuThreeScene(device,scene,{
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
   program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,backgroundState:initialBackgroundState=undefined,
+  materialFrame:initialMaterialFrame=null,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
@@ -91,8 +92,14 @@ export async function createGpuThreeScene(device,scene,{
   // the source Scene itself and its callback identity remain untouched.
   let passBackgroundState=initialBackgroundState;
   const backgroundScene=()=>passBackgroundState??scene;
-  const colorMaterial=m=>m&&m.allowOverride===true&&passOverride!==null?passOverride:m;
-  const colorMaterials=o=>(Array.isArray(o.material)?o.material:[o.material]).map(colorMaterial);
+  // Fixed materials use per-request value views, while caches, disposal and
+  // source-visible draw identities continue to use the original materials.
+  let passMaterialFrame=initialMaterialFrame;
+  const materialState=m=>passMaterialFrame?.materials.get(m)??m;
+  const sourceMaterial=o=>passMaterialFrame?.objects.has(o)?passMaterialFrame.objects.get(o):o.material;
+  const sourceMaterials=o=>{const m=sourceMaterial(o);return Array.isArray(m)?m:[m];};
+  const colorMaterial=m=>m&&materialState(m).allowOverride===true&&passOverride!==null?passOverride:m;
+  const colorMaterials=o=>sourceMaterials(o).map(colorMaterial).map(materialState);
   const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
@@ -306,7 +313,7 @@ export async function createGpuThreeScene(device,scene,{
         programHooked.add(object);
       }
       if(object.isMesh){
-        if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
+        if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
         if(!programRoute()&&colorMaterials(object).some(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
           fail('MATERIAL','Native sprite materials currently require a Sprite object');
         if((object.isBatchedMesh&&!programRoute())||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
@@ -332,7 +339,7 @@ export async function createGpuThreeScene(device,scene,{
         // elsewhere r186 WebGPU reports and skips it at draw time.
         if(object.isLineLoop&&!programRoute()){}
         else{
-          if(Array.isArray(object.material)&&object.material.length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
+          if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
           if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
             fail('OBJECT','Custom frustum tests are not admitted');
           // Line casters draw through the program shadow port (WebGL surface).
@@ -348,7 +355,7 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           if(!(object instanceof three.Sprite)||object.intersectsFrustum!==three.Sprite.prototype.intersectsFrustum)
             fail('OBJECT','Expected a source Sprite without custom frustum tests');
-          if(Array.isArray(object.material)||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
+          if(Array.isArray(sourceMaterial(object))||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
             fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
           threeSpriteCount(object);
           geometryAdmission(object.geometry,object);
@@ -367,7 +374,7 @@ export async function createGpuThreeScene(device,scene,{
     programLightMode=programShadowMode||(programRoute()&&activeNodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
     // Transmissive materials (r186 renderTransmissionPass) re-render the opaque
     // list offscreen through programs: every draw takes the program route.
-    programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&activeNodes.some(o=>(Array.isArray(o.material)?o.material:[o.material]).some(m=>m?.transmission>0));
+    programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&activeNodes.some(o=>sourceMaterials(o).some(m=>materialState(m)?.transmission>0));
     for(const object of activeNodes){
       if(!nativeLightMode&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       if(object.isLight&&!programLightMode&&!nativeLightMode)light(object);
@@ -375,8 +382,8 @@ export async function createGpuThreeScene(device,scene,{
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
             object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
           fail('HOOK','Custom shadow materials and callbacks need their original renderer');
-        const source=Array.isArray(object.material)?object.material:[object.material];
-        if(shadowBlend==='reject'&&source.some(m=>m?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
+        const source=sourceMaterials(object);
+        if(shadowBlend==='reject'&&source.some(m=>materialState(m)?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
     if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
@@ -805,7 +812,7 @@ export async function createGpuThreeScene(device,scene,{
     }
   }
   function materialDescription(m,clippingFrame,topology='triangles',object=null){
-    if(m?.isShaderMaterial)return programDescription(m,topology,object);
+    if(materialState(m)?.isShaderMaterial)return programDescription(m,topology,object);
     if(object&&programRoute()&&programSupport.shaderLibMaterial(m)){
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
@@ -832,6 +839,7 @@ export async function createGpuThreeScene(device,scene,{
     return coreDescription(m,clippingFrame,topology);
   }
   function coreDescription(m,clippingFrame,topology='triangles'){
+    const source=m;m=materialState(m);
     if(programToneMapping())fail('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${m?.type}`);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
@@ -961,7 +969,7 @@ export async function createGpuThreeScene(device,scene,{
         values.metallicFactor<0||values.metallicFactor>1||values.roughnessFactor<0||values.roughnessFactor>1||
         values.occlusionStrength<0||values.occlusionStrength>1)fail('VALUE','Source material is outside the admitted factor profile');
     if(textureTransforms){options.mapChannels=mapChannels;values.mapTransforms=mapTransforms;}
-    const epoch=trackMaterial(m);
+    const epoch=trackMaterial(source);
     const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?['back','front']:[['front','back','double'][m.side]];
     return sides.map(side=>{
       const config={...options,side};
@@ -1019,13 +1027,13 @@ export async function createGpuThreeScene(device,scene,{
       const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
       const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
       const instanceSignature=instanceSource&&!instancedMorph(instanceSource)?instanceAdmission(instanceSource).signature:null;
-      const source=Array.isArray(object.material)?object.material:[object.material];
+      const source=sourceMaterials(object);
       for(const original of source){
         if(!original)continue;
         // The original controls list admission, not the selected program. Do not
         // compile its shader or upload its maps when an override suppresses them.
         const m=colorMaterial(original);
-        const wire=object.isMesh&&m.wireframe===true;
+        const wire=object.isMesh&&materialState(m).wireframe===true;
         const isProgram=programCapable(m)&&get(m,wire?'lines':topology,object).some(d=>d.program);
         if(wire&&!isProgram&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
         const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=isProgram?programKeyOf(object):wire?geometry:key;
@@ -1089,12 +1097,12 @@ export async function createGpuThreeScene(device,scene,{
   /** One retry per mesh the core deformer refused at capture: the next pass
    * describes it as its ShaderLib program. */
   async function prepare(options={}){
-    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','nodeFrame','backgroundState'].includes(k)))
+    if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','nodeFrame','backgroundState','materialFrame'].includes(k)))
       fail('OPTIONS','Expected preparation options with optional overrideMaterial, native node frame and background state');
     const explicit=Object.hasOwn(options,'overrideMaterial');
     const selected=explicit?options.overrideMaterial:scene.overrideMaterial;
     for(let attempt=0;;attempt++){
-      try{passNodeFrame=options.nodeFrame??null;passBackgroundState=options.backgroundState;return await prepareOnce(selected,!explicit);}
+      try{passNodeFrame=options.nodeFrame??null;passBackgroundState=options.backgroundState;passMaterialFrame=options.materialFrame??null;return await prepareOnce(selected,!explicit);}
       catch(error){if(error?.code!=='THREE_SCENE_DEFORMATION_ROUTE'||attempt>=8)throw error;}
     }
   }
@@ -1244,7 +1252,7 @@ export async function createGpuThreeScene(device,scene,{
               vertexColors:options.vertexColors,baseColor:values.baseColor,
               // Native source profile: explicit shadowSide, otherwise reversed
               // material side, matching the retained WebGL depth-map default.
-              side:['front','back','double'][item.material.shadowSide??[1,0,2][item.material.side]],
+              side:['front','back','double'][materialState(item.material).shadowSide??[1,0,2][materialState(item.material).side]],
               ...opacityFields(options),
               ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),...surface,
               ...(textureTransforms&&entry.deformation?uvApi.threeDeformedMapCoordinates(baseChannels,entry.deformation.surface):{}),
@@ -1365,7 +1373,7 @@ export async function createGpuThreeScene(device,scene,{
       for(const source of addedInstances){instances.get(source)?.dispose();instances.delete(source);}
       if(!textureOwner?.disposed&&!textureOwner?.failed)textureOwner?.retain(retainedTextures);
       return failed(error);
-    }finally{busy=false;preparing=false;passNodeFrame=null;passBackgroundState=undefined;}
+    }finally{busy=false;preparing=false;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;}
   }
   function checkCamera(camera){
     if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.reversedDepth)
@@ -1426,11 +1434,12 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState'].includes(k)))
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame'].includes(k)))
         fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
       passBackgroundState=options.backgroundState;
+      passMaterialFrame=options.materialFrame??null;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
@@ -1485,15 +1494,16 @@ export async function createGpuThreeScene(device,scene,{
         const source=object.geometry,topology=topologyOf(object);
         if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
         function push(original,sourceGroup){
-              if(!original||!original.visible)return;
-              if(shadowPass&&original.transparent){
+              const originalState=materialState(original);
+              if(!originalState||!originalState.visible)return;
+              if(shadowPass&&originalState.transparent){
                 if(shadowBlend==='skip')return;
                 fail('SHADOW','BLEND casters require the explicit skip policy');
               }
               const material=shadowPass?original:colorMaterial(original);
               // Source WebGPU wireframe: a derived edge index drawn as a line
               // list, with draw ranges and groups scaled by two.
-              const wire=object.isMesh&&material.wireframe===true;
+              const wire=object.isMesh&&materialState(material).wireframe===true;
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
               const g=wire?wireframeGeometry(source):source;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
@@ -1505,7 +1515,7 @@ export async function createGpuThreeScene(device,scene,{
                 if(opaque.length+transmissive.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
                 updateObject(object);
                 // WebGLRenderList.push: transmission > 0 joins the transmissive list.
-                (original.transmission>0?transmissive:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
+                (originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
                 return;
               }
               const instanceSource=object.isInstancedMesh?object:null;
@@ -1519,10 +1529,11 @@ export async function createGpuThreeScene(device,scene,{
               if((shadowPass?casterItems.length:opaque.length+transmissive.length+transparent.length)>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
               // Source list partition and sorting precede the draw-time override.
               if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
-              (shadowPass?casterItems:original.transmission>0?transmissive:original.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
+              (shadowPass?casterItems:originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
             }
-        if(Array.isArray(object.material))for(const group of source.groups)push(object.material[group.materialIndex],group);
-        else push(object.material,null);
+        const selectedMaterial=sourceMaterial(object);
+        if(Array.isArray(selectedMaterial))for(const group of source.groups)push(selectedMaterial[group.materialIndex],group);
+        else push(selectedMaterial,null);
       }
       let visited=0;
       while(stack.length){
@@ -1731,7 +1742,7 @@ export async function createGpuThreeScene(device,scene,{
         }
         for(let i=0;i<item.bindings.length;i++){
           const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.isSprite?
-            threeSpriteWorldMatrix(three,item.object,item.material,drawCamera):item.object.matrixWorld.elements,first,count};
+            threeSpriteWorldMatrix(three,item.object,materialState(item.material),drawCamera):item.object.matrixWorld.elements,first,count};
           if(!item.shadowPass&&item.desc[i].coat)item.bindings[i].mesh.setClearcoat(item.desc[i].coat);
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
             ...(textureTransforms?{mapTransforms:opacityFields(values.mapTransforms)}:{}),
@@ -1752,7 +1763,7 @@ export async function createGpuThreeScene(device,scene,{
       // The retained WebGL behavior updates public versions twice per double-
       // sided transparent item. Native ArrayCamera rendering selects its side
       // pipelines without incrementing those source material versions.
-      for(const item of items)if(!arrayViews&&item.bindings.length===2){
+      for(const item of items)if(programRoute()&&!arrayViews&&item.bindings.length===2){
         item.material.side=three.BackSide;item.material.needsUpdate=true;
         item.material.side=three.FrontSide;item.material.needsUpdate=true;
         item.material.side=three.DoubleSide;
@@ -1837,7 +1848,7 @@ export async function createGpuThreeScene(device,scene,{
       // Do not expose a partially submitted owner as safe for accidental retry.
       if(backgroundSubmitted){terminal??=error;rejectStopped(terminal);}
       return failed(error);
-    }finally{busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;if(disposed||terminal)release();}
+    }finally{busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;if(disposed||terminal)release();}
   }
   const bridge=Object.freeze({scene:root,prepare,render,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
@@ -1866,6 +1877,6 @@ export async function createGpuThreeScene(device,scene,{
       if(fogEnabled)renderer=fogApi.withThreeFogReceivers(renderer,renderOptions.maxDraws??1024);
       return renderer;
     });
-    await Promise.race([construction,stopped]);live();await prepare({...(initialOverride===undefined?{}:{overrideMaterial:initialOverride}),nodeFrame:initialNodeFrame,backgroundState:initialBackgroundState});return bridge;
+    await Promise.race([construction,stopped]);live();await prepare({...(initialOverride===undefined?{}:{overrideMaterial:initialOverride}),nodeFrame:initialNodeFrame,backgroundState:initialBackgroundState,materialFrame:initialMaterialFrame});return bridge;
   }catch(error){disposed=true;release();throw error;}
 }

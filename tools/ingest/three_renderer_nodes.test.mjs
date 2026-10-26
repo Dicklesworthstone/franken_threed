@@ -970,3 +970,74 @@ test(`ordinary built-in ${slot} reaches source native shaders and captures queue
   assert.equal(material.colorNode,undefined);assert.equal(material[slot],map);
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
+
+test('unprepared fixed-native-fixed material transitions preserve each accepted state and source disposal',async t=>{
+  const f=fixture(t),material=new T.MeshPhysicalMaterial({color:new T.Color(.125,.375,.625),roughness:.4});
+  f.mesh.material=material;f.scene.add(new T.DirectionalLight(0xffffff,2));
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  material.sheen=.5;material.color.setRGB(.875,.625,.375);f.renderer.render(f.scene,f.camera);
+  material.sheen=0;material.color.setRGB(.25,.5,.75);f.renderer.render(f.scene,f.camera);
+  material.color.setRGB(0,0,0);
+  await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.has(0));
+  assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(draw=>draw.pipeline.vertex.entryPoint),['vertex_main','main','vertex_main']);
+  for(const [index,color] of [[.125,.375,.625],[.875,.625,.375],[.25,.5,.75]].entries())
+    assert.ok(containsColor(draws[index],color),'accepted material color '+index+' must survive later edits');
+  assert.equal(f.mesh.material,material);assert.equal(material.sheen,0);
+  assert.deepEqual(material.color.toArray(),[0,0,0]);
+  assert.equal(f.renderer.info.f3d.presentedRenders,3);assert.equal(f.renderer._pending.length,0);
+  assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.renderer._materialCaptureValues,0);
+  assert.equal(f.renderer._nodeProgramSupport.diagnostics.programs,1);
+  material.dispose();assert.equal(f.renderer._nodeProgramSupport.diagnostics.programs,0,
+    'the native cache must listen to the original material, not captured state');
+  material.sheen=.75;material.color.setRGB(.375,.125,.625);
+  await f.renderer.renderAsync(f.scene,f.camera);
+  assert.equal(f.renderer.info.f3d.presentedRenders,4);
+  assert.ok(containsColor(nativeDraws(f.device).at(-1),[.375,.125,.625]));
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('queued fixed material arrays retain group selection and independent material values',async t=>{
+  const f=fixture(t),a=new T.MeshBasicMaterial({color:new T.Color(.125,.25,.375)}),
+    b=new T.MeshBasicMaterial({color:new T.Color(.625,.75,.875)});
+  f.mesh.geometry.clearGroups();f.mesh.geometry.addGroup(0,3,0);f.mesh.geometry.addGroup(3,3,1);
+  const materials=[a,b];f.mesh.material=materials;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  materials.reverse();a.color.setRGB(.25,.375,.5);b.color.setRGB(.5,.625,.75);
+  f.renderer.render(f.scene,f.camera);
+  f.mesh.material=new T.ShaderMaterial();a.color.setRGB(0,0,0);b.color.setRGB(0,0,0);
+  await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.has(0));
+  assert.equal(draws.length,4);assert.ok(draws.every(draw=>draw.pipeline.vertex.entryPoint==='vertex_main'));
+  assert.deepEqual(draws.map(draw=>draw.args[0]),[3,3,3,3]);
+  for(const [index,color] of [[.125,.25,.375],[.625,.75,.875],[.5,.625,.75],[.25,.375,.5]].entries())
+    assert.ok(containsColor(draws[index],color),'queued group '+index+' lost its material selection');
+  assert.equal(f.renderer.info.f3d.presentedRenders,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+  assert.equal(f.renderer._materialCaptureValues,0);
+  assert.ok(f.mesh.material.isShaderMaterial,'request capture must not replace the application material');
+});
+
+test('captured fixed double-sided passes do not overwrite later source side or version',async t=>{
+  const f=fixture(t),material=new T.MeshBasicMaterial({transparent:true,side:T.DoubleSide,opacity:.5});
+  f.mesh.material=material;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  material.side=T.FrontSide;const version=material.version;
+  await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.has(0));
+  assert.equal(draws.length,2);assert.equal(material.side,T.FrontSide);assert.equal(material.version,version);
+  assert.equal(f.renderer.info.f3d.presentedRenders,1);assert.equal(f.renderer._materialCaptureValues,0);
+});
+
+test('fixed material capture budgets are released on disposal and preparation failure',async t=>{
+  for(const failure of [false,true]){
+    const f=fixture(t),material=new T.MeshBasicMaterial();f.mesh.material=material;
+    if(failure)material.alphaHash=true;
+    await f.renderer.init();f.renderer.render(f.scene,f.camera);
+    assert.ok(f.renderer._materialCaptureValues>0);
+    if(failure)await assert.rejects(drain(f.renderer),{code:'THREE_SCENE_MATERIAL'});
+    else{f.renderer.dispose();await drain(f.renderer);}
+    assert.equal(f.renderer._materialCaptureValues,0);assert.equal(f.renderer._pending.length,0);
+    assert.equal(f.renderer._nodeCaptureBytes,0);
+  }
+});

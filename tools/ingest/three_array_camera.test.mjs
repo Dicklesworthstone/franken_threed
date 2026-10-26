@@ -269,3 +269,19 @@ test('native callback admission and WebGL-authored ArrayCamera refusal stay expl
   assert.throws(() => gl.renderer.render(new T.Scene(), cameras()), {code: 'F3D_RENDERER_UNSUPPORTED'});
   assert.equal(gl.acquired(), 0);
 });
+
+test('queued fixed material snapshots preserve ArrayCamera views and fog admission',async t=>{
+  const h=fixture(),scene=new T.Scene(),camera=cameras();t.after(()=>h.renderer.dispose());
+  const material=new T.MeshPhongMaterial({color:new T.Color(.125,.375,.625)});
+  mesh(scene,0,0,material);scene.add(new T.AmbientLight(0xffffff,1));scene.fog=new T.Fog(0x222222,1,20);
+  await h.renderer.init();h.renderer.render(scene,camera);
+  material.color.setRGB(.875,.625,.375);material.fog=false;h.renderer.render(scene,camera);
+  material.color.setRGB(0,0,0);material.fog=true;
+  await flush(h.renderer);
+  const draws=snapshots(h.device);assert.equal(draws.length,4);
+  assert.deepEqual(draws.map(color),[[.125,.375,.625],[.125,.375,.625],[.875,.625,.375],[.875,.625,.375]]);
+  assert.ok(draws.every(draw=>draw.pipeline.vertex.entryPoint==='vertex_main'));
+  assert.equal(h.renderer.info.f3d.presentedRenders,2);assert.equal(h.renderer.info.render.drawCalls,4);
+  assert.deepEqual(material.color.toArray(),[0,0,0]);assert.equal(material.fog,true);
+  assert.equal(h.renderer._materialCaptureValues,0);
+});
