@@ -118,6 +118,30 @@ test('two unprepared render calls keep independent native uniforms until actual 
   assert.ok(draws.every(d=>d.pipeline.fragment.entryPoint==='main'));
 });
 
+test('transparent native DoubleSide renders submit ordered side pipelines with independent queued uniforms',async t=>{
+  const f=fixture(t);f.material.transparent=true;f.material.side=T.DoubleSide;f.mesh.scale.x=-1;
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  f.tint.value.setRGB(.875,.625,.375);f.renderer.render(f.scene,f.camera);
+  f.tint.value.setRGB(.25,.5,.75);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  assert.ok(draws.every(draw=>draw.pipeline.primitive.cullMode==='back'));
+  assert.deepEqual(draws.map(draw=>draw.pipeline.primitive.frontFace),['ccw','cw','ccw','cw'],
+    'source BackSide reverses winding; negative determinant flips both side pipelines');
+  assert.ok(draws.slice(0,2).every(draw=>containsColor(draw,[.125,.375,.625])));
+  assert.ok(draws.slice(2).every(draw=>containsColor(draw,[.875,.625,.375])));
+  assert.equal(draws[0].pipeline,draws[2].pipeline);assert.equal(draws[1].pipeline,draws[3].pipeline);
+  assert.equal(f.material.side,T.DoubleSide);assert.equal(f.renderer._nodeCaptureBytes,0);
+  assert.equal(f.renderer.info.f3d.presentedRenders,2);
+  const deferred=f.renderer.info.f3d.deferredRenders,pipelines=f.device.pipelines.length;
+  f.renderer.render(f.scene,f.camera);
+  assert.equal(f.renderer.info.f3d.deferredRenders,deferred,'both prepared side variants remain ready');
+  assert.equal(f.device.pipelines.length,pipelines);
+  assert.ok(nativeDraws(f.device).slice(-2).every(draw=>containsColor(draw,[.25,.5,.75])));
+  f.material.forceSinglePass=true;f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length,7);
+  assert.equal(nativeDraws(f.device).at(-1).pipeline.primitive.cullMode,'none');
+});
+
 test('compilation runs no node updates; logical source callbacks run once per visible draw before awaits',async t=>{
   const f=fixture(t),calls=[],frame=f.renderer._nodes.nodeFrame;
   const other=new T.Mesh(f.mesh.geometry,f.material);other.position.x=.5;f.scene.add(other);

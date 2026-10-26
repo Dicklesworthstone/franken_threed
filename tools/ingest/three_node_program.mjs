@@ -643,7 +643,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (typeof material.alphaToCoverage !== 'boolean')
       fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
-      fail('RASTER', 'Transparent DoubleSide node graphs require forceSinglePass until side variants are supported');
+      fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
     if (Object.keys(renderer.contextNode?.getFlowContextData?.() ?? {}).length)
       fail('GRAPH', 'Custom renderer node contexts require an explicit graphics context adapter');
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object);
@@ -774,7 +774,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
     if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
-    if (cache.get(entry.object)?.get(entry.material) === entry) cache.get(entry.object).delete(entry.material);
+    const materials = cache.get(entry.object), passes = materials?.get(entry.material);
+    if (passes?.get(entry.passId) === entry) {
+      passes.delete(entry.passId);
+      if (!passes.size) materials.delete(entry.material);
+    }
   }
   function compile(material, object, context = {}) {
     const preparedMaterial = inspect(material, object, context);
@@ -787,7 +791,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
-    const previous = byMaterial?.get(material);
+    // Source render objects distinguish the transparent back-side pass from
+    // the ordinary front-side pass. Both may own generated attribute streams;
+    // compiling one must not retire the other's accepted descriptor.
+    const passId = context.passId ?? null, passes = byMaterial?.get(material);
+    const previous = passes?.get(passId);
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
@@ -958,13 +966,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
-    const entry = {key, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
+    const entry = {key, passId, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
     if (previous) retire(previous);
-    const next = byMaterial ?? new Map(); next.set(material, entry); cache.set(object, next);
+    const next = byMaterial ?? new Map(), nextPasses = passes ?? new Map();
+    nextPasses.set(passId, entry); next.set(material, nextPasses); cache.set(object, next);
     entries.add(entry); shaderBytes += bytes;
     material.addEventListener('dispose', entry.onDispose); object.geometry.addEventListener('dispose', entry.onDispose);
     return descriptor;

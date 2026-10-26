@@ -133,16 +133,23 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
             ? [three.BackSide, three.FrontSide] : [material.side];
           for (const side of sides) {
             if (bindings.length >= maxDraws) fail('LIMIT', 'Native scene program binding capacity exceeded');
-            const binding = {object, geometry, material, original, shadowSide: side, nodeProgram: null, raster: null};
+            const binding = {object, geometry, material, original, shadowSide: side,
+              passId: sides.length > 1 && side === three.BackSide ? 'backSide' : null, nodeProgram: null, raster: null};
             variants.push(binding); bindings.push(binding);
           }
         });
         byMaterial.set(original, variants);
       }
     } else for (const material of effective) if (material && !byMaterial.has(material)) {
-        if (bindings.length >= maxDraws) fail('LIMIT', 'Native scene program binding capacity exceeded');
-        const binding = {object, geometry, material, nodeProgram: null, raster: null};
-        byMaterial.set(material, binding); bindings.push(binding);
+        const doubleSide = material.transparent === true && material.side === three.DoubleSide && material.forceSinglePass === false;
+        const sides = doubleSide ? [three.BackSide, three.FrontSide] : [material.side], variants = [];
+        for (const side of sides) {
+          if (bindings.length >= maxDraws) fail('LIMIT', 'Native scene program binding capacity exceeded');
+          const binding = {object, geometry, material, nodeProgram: null, raster: null,
+            ...(doubleSide ? {colorSide: side} : {}), passId: doubleSide && side === three.BackSide ? 'backSide' : null};
+          variants.push(binding); bindings.push(binding);
+        }
+        byMaterial.set(material, variants);
       }
     pairs.set(object, {originals, effective, byMaterial, array: Array.isArray(object.material), geometry});
     objects.add(object);
@@ -175,13 +182,18 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const programs = getPrograms(), context = {scene: root, camera, lights: Object.freeze([]),
     lightingEnabled: renderer.lighting?.enabled !== false};
   const withBinding = (binding, run) => {
-    const previous = context.clippingContext;
+    const previous = context.clippingContext, previousPass = context.passId, previousSide = binding.material.side;
     context.clippingContext = binding.clippingContext ?? null;
+    context.passId = binding.passId;
     try {
+      if (binding.colorSide !== undefined) binding.material.side = binding.colorSide;
       return shadowPass ? withThreeShadowMaterial(three, renderer, binding.material, binding.original, material => {
         material.side = binding.shadowSide; return run();
       }) : run();
-    } finally { context.clippingContext = previous; }
+    } finally {
+      if (binding.colorSide !== undefined) binding.material.side = previousSide;
+      context.clippingContext = previous; context.passId = previousPass;
+    }
   };
   // Every active binding is admitted before graph construction or application
   // draw updates. Previously hidden graphs are re-admitted on their first live
@@ -197,7 +209,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, fail}) : null;
   for (const binding of bindings) binding.clippingContext = clippingContexts?.get(binding.object) ?? null;
   const opaque = [], translucent = [], backgroundDraws = [], draws = [], lights = [], preparationBindings = new Set();
-  let fixedDrawCandidates = false;
+  let fixedDrawCandidates = false, expandedDraws = 0;
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
@@ -205,11 +217,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const visible = [{object: root, groupOrder: 0}];
     const append = (object, state, original, material, group, groupOrder, z, background = false) => {
       if (!original?.visible || !material) return;
-      const variants = shadowPass ? state.byMaterial.get(original) : null;
-      const binding = variants?.[0] ?? state.byMaterial.get(material);
-      for (const selected of variants ?? [binding]) preparationBindings.add(selected);
+      const variants = state.byMaterial.get(shadowPass ? original : material), binding = variants[0];
+      for (const selected of variants) preparationBindings.add(selected);
       if (!uniforms) return;
-      if (opaque.length + translucent.length + backgroundDraws.length >= maxDraws) fail('LIMIT', 'Native source draw list exceeds its capacity');
+      expandedDraws += variants.length;
+      if (expandedDraws > maxDraws) fail('LIMIT', 'Native source draw list exceeds its capacity');
       const {geometry, byMaterial} = state, range = geometry.drawRange;
       const extent = geometry.index ? geometry.index.count : geometry.attributes.position?.count;
       if (!integer(extent) || !integer(range?.start) || !(range.count === Infinity || integer(range.count)) ||
@@ -222,7 +234,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         group: group ? Object.freeze({...group}) : null, groupOrder, z, renderOrder: object.renderOrder,
         first, count: Math.max(0, end - first), frontFaceCW: object.matrixWorld.determinant() < 0,
         nodeRangeCaptured: true, nodeUniforms: null, background,
-        ...(shadowPass ? {sourceMaterial: original, sourceGroup: group, shadowBindings: variants} : {})};
+        ...(shadowPass ? {sourceMaterial: original, sourceGroup: group, shadowBindings: variants} : {colorBindings: variants})};
       (background ? backgroundDraws : listMaterial.transparent ? translucent : opaque).push(packet);
     };
     if (backgroundMesh) {
@@ -294,7 +306,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   });
   let bytes = 0;
   for (const draw of draws) {
-    for (const binding of draw.shadowBindings ?? [draw.binding])
+    for (const binding of draw.shadowBindings ?? draw.colorBindings)
       bytes += (programs.attributeBytes?.(binding.nodeProgram) ?? 0) +
         binding.nodeProgram.groups.reduce((sum, group) => sum + group.byteLength, 0);
     if (!Number.isSafeInteger(bytes) || bytes > maxUniformBytes)
@@ -354,7 +366,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   const capture = () => {
     for (const draw of draws) {
-      if (!shadowPass) { captureDraw(draw); continue; }
+      if (!shadowPass) {
+        // Renderer.renderObject executes both sides consecutively for ordinary
+        // alpha transparency. Each physical draw receives source NodeFrame
+        // updates; its FRAME/RENDER markers still deduplicate shared nodes.
+        for (const binding of draw.colorBindings)
+          withBinding(binding, () => captureDraw({...draw, binding}));
+        continue;
+      }
       // Execute the pinned caster selector and Renderer.renderObject lifecycle
       // once per source list item. Its temporary shared override remains live
       // through native uniform/resource capture and is restored by the source.
@@ -378,7 +397,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const first = draws[0];
       first.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, first.object.matrixWorld);
       first.object.normalMatrix.getNormalMatrix(first.object.modelViewMatrix);
-      programs.preparePMREM(draws.map(draw => draw.binding.nodeProgram),
+      programs.preparePMREM(draws.flatMap(draw => (draw.shadowBindings ?? draw.colorBindings).map(binding => binding.nodeProgram)),
         {...frameContext, object: first.object, material: first.material}, first.background || !fixedDrawCandidates);
     }
     withThreeNativeCapture(renderer, record => {

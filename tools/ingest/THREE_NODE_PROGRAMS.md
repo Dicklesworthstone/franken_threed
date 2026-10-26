@@ -414,8 +414,13 @@ or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows, AO/light/material-environment
 maps, wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
-custom object/material render hooks and effectful attribute upload callbacks. A
-transparent DoubleSide graph currently requires `forceSinglePass: true`.
+custom object/material render hooks and effectful attribute upload callbacks.
+Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
+front-side draws, matching the pinned renderer's source order. Each side owns a
+retained program and captured uniforms; object updates run for each draw while
+frame/render updates retain the source `NodeFrame` frequency. `forceSinglePass`
+keeps its source meaning and selects one draw with culling disabled. This does not admit
+transmission's separate scene-color and scene-wide double-pass protocol.
 Unsupported graph slots, material subclasses, bindings and attribute layouts
 produce explicit errors rather than silently selecting another renderer.
 

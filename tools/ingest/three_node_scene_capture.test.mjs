@@ -270,6 +270,105 @@ test('native opaque sorting uses depth before object id, with source group and t
   f.renderer.sortObjects = false;
   assert.deepEqual(f.capture().draws.map(draw => draw.object), [farOpaque, nearOpaque, ordered, nearTransparent, farTransparent]);
 });
+test('transparent native DoubleSide draws preserve source side order, identities and per-draw updates', t => {
+  const f = rig(t), material = f.material(), seen = [];
+  material.transparent = true; material.side = THREE.DoubleSide;
+  const color = N.uniform(.5).onObjectUpdate(frame => {
+    seen.push(['current', frame.object, frame.material, material.side]);
+    return material.side === THREE.BackSide ? .25 : .75;
+  });
+  color.updateBeforeType = 'object'; color.updateBefore = frame => { seen.push(['before', frame.object, frame.material, material.side]); };
+  color.updateAfterType = 'object'; color.updateAfter = frame => { seen.push(['after', frame.object, frame.material, material.side]); };
+  material.colorNode = N.vec3(color);
+  const near = f.mesh(material), far = f.mesh(material); near.position.z = 1; far.position.z = -1;
+  const expected = [];
+  for (const object of [far, near]) THREE.Renderer.prototype.renderObject.call({
+    _handleObjectFunction(object, material, scene, camera, lights, group, clipping, passId) {
+      expected.push([object, material.side, passId]);
+    },
+  }, object, f.scene, f.camera, object.geometry, material, null, null);
+  const captured = f.capture();
+  assert.deepEqual(captured.draws.map(draw => [draw.object, draw.binding.raster.side, draw.binding.passId]), expected);
+  assert.deepEqual(seen, expected.flatMap(([object, side]) =>
+    ['before', 'current', 'after'].map(phase => [phase, object, material, side])));
+  assert.equal(material.side, THREE.DoubleSide);
+  assert.equal(captured.bindings.length, 4); assert.equal(captured.draws.length, 4);
+  for (const draw of captured.draws) {
+    assert.equal(draw.material, material); assert.equal(draw.binding.material, material);
+    assert.ok(floats(draw.nodeUniforms).includes(draw.binding.raster.side === THREE.BackSide ? .25 : .75));
+  }
+  assert.equal(captured.bytes, captured.draws.reduce((sum, draw) =>
+    sum + draw.nodeUniforms.reduce((n, bytes) => n + bytes.byteLength, 0), 0));
+  const saved = captured.draws.map(draw => draw.nodeUniforms.map(bytes => bytes.slice()));
+  material.side = THREE.FrontSide; material.forceSinglePass = true; f.renderer.info.calls++;
+  assert.equal(f.capture().draws.length, 2);
+  assert.deepEqual(captured.draws.map(draw => draw.nodeUniforms), saved);
+  assert.deepEqual(captured.draws.map(draw => draw.binding.raster.side), [THREE.BackSide, THREE.FrontSide, THREE.BackSide, THREE.FrontSide]);
+});
+test('native transparent side variants retain generated streams and reuse both compiled programs', t => {
+  const f = rig(t), material = f.material(); material.transparent = true; material.side = THREE.DoubleSide;
+  const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  material.positionNode = N.bufferAttribute(positions, 'vec3');
+  f.mesh(material);
+  const first = f.capture(), descriptors = first.bindings.map(binding => binding.nodeProgram);
+  assert.equal(new Set(descriptors).size, 2); assert.equal(f.owner.diagnostics.programs, 2);
+  assert.ok(first.draws.every(draw => draw.nodeAttributes));
+  assert.doesNotThrow(() => first.installAttributes());
+  f.renderer.info.calls++;
+  const second = f.capture();
+  assert.deepEqual(second.bindings.map(binding => binding.nodeProgram), descriptors);
+  assert.equal(f.owner.diagnostics.programs, 2);
+  assert.doesNotThrow(() => first.installAttributes());
+  assert.doesNotThrow(() => second.installAttributes());
+  material.dispose(); assert.equal(f.owner.diagnostics.programs, 0);
+});
+test('transparent side compilation is callback-free and preserves source frame/render update frequencies', t => {
+  const f = rig(t), material = f.material(), counts = {frame: 0, render: 0, object: 0};
+  material.transparent = true; material.side = THREE.DoubleSide;
+  material.colorNode = N.vec3(
+    N.uniform(.25).onFrameUpdate(() => { counts.frame++; return .25; }),
+    N.uniform(.5).onRenderUpdate(() => { counts.render++; return .5; }),
+    N.uniform(.75).onObjectUpdate(() => { counts.object++; return .75; }));
+  f.mesh(material); f.mesh(material);
+  const prepared = f.capture({uniforms: false});
+  assert.equal(prepared.bindings.length, 4); assert.equal(prepared.draws.length, 0);
+  assert.deepEqual(counts, {frame: 0, render: 0, object: 0});
+  f.capture(); assert.deepEqual(counts, {frame: 1, render: 1, object: 4});
+  f.renderer.info.calls++; f.capture(); assert.deepEqual(counts, {frame: 1, render: 2, object: 8});
+  f.frame.frameId++; f.renderer.info.calls++; f.capture(); assert.deepEqual(counts, {frame: 2, render: 3, object: 12});
+  assert.equal(material.side, THREE.DoubleSide);
+});
+test('native transparent variants respect forceSinglePass, opacity and expanded capacity before updates', t => {
+  for (const [transparent, side, forceSinglePass, expected] of [
+    [true, THREE.DoubleSide, false, [THREE.BackSide, THREE.FrontSide]],
+    [true, THREE.DoubleSide, true, [THREE.DoubleSide]],
+    [false, THREE.DoubleSide, false, [THREE.DoubleSide]],
+    [true, THREE.BackSide, false, [THREE.BackSide]],
+  ]) {
+    const f = rig(t), material = f.material(); Object.assign(material, {transparent, side, forceSinglePass});
+    f.mesh(material);
+    assert.deepEqual(f.capture().draws.map(draw => draw.binding.raster.side), expected);
+    assert.equal(material.side, side);
+  }
+  const f = rig(t), material = f.material(); let updates = 0;
+  material.transparent = true; material.side = THREE.DoubleSide;
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  const object = f.mesh(material); object.geometry.clearGroups();
+  object.geometry.addGroup(0, 3, 0); object.geometry.addGroup(3, 3, 0); object.material = [material];
+  assert.throws(() => f.capture({maxDraws: 3}), {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  assert.equal(updates, 0); assert.equal(material.side, THREE.DoubleSide);
+  assert.equal(f.capture({maxDraws: 4}).draws.length, 4); assert.equal(updates, 4);
+});
+test('native transparent side state is restored when a later draw update fails', t => {
+  const f = rig(t), material = f.material(); material.transparent = true; material.side = THREE.DoubleSide;
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => {
+    if (material.side === THREE.FrontSide) throw new Error('front-side update failure');
+    return .25;
+  });
+  f.mesh(material);
+  assert.throws(f.capture, /front-side update failure/);
+  assert.equal(material.side, THREE.DoubleSide);
+});
 test('material groups capture their intersections and update once per logical draw', t => {
   const f = rig(t), a = f.material(), b = f.material(); let updates = 0;
   const value = N.uniform(.25).onObjectUpdate(() => { updates++; return .25; }); a.colorNode = N.vec3(value); b.colorNode = N.vec3(value);
