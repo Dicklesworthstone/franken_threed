@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {RectAreaLightTexturesLib} from './fixtures/three_rect_area_light.mjs';
 const N = THREE.TSL;
 
 async function fixture(t, options = {}) {
@@ -215,4 +216,16 @@ test('empty native draws still execute framebuffer copies before and after their
   renderer.render(scene, camera); await renderer.waitForGPU();
   assert.equal(copies(f.events).length, 2); assert.equal(meshDraws(f.events).length, 0);
   assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
+test('ordinary Physical transmission composes with source rectangular area lighting', async t => {
+  THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const light = new THREE.RectAreaLight(0xffffff, 2, 3, 2); light.position.z = 2; scene.add(light);
+  f.mesh(physical(null)); renderer.render(scene, camera); await renderer.waitForGPU();
+  const draws = meshDraws(f.events); assert.equal(draws.length, 1);
+  assert.ok(code(draws[0]).includes('Transmission =') && code(draws[0]).includes('LTC_Evaluate'));
+  assert.equal(sampled(draws[0]).filter(texture => texture.width === 64 && texture.height === 64).length, 2);
+  assert.equal(copies(f.events).length, 1);
+  assert.ok(sampled(draws[0]).includes(copies(f.events)[0].destination.texture));
 });

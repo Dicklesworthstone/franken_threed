@@ -87,6 +87,30 @@ test('ordinary scenes do not create a node compiler or change the source camera'
   assert.equal(f.capture({getPrograms() { assert.fail('unexpected native compiler'); }}), null);
   assert.equal(f.camera.coordinateSystem, THREE.WebGLCoordinateSystem); assert.equal(f.frame.frameId, 7);
 });
+test('inactive area lights preserve fixed ArrayCamera routing and their captured selection', t => {
+  for (const inactive of ['ancestor', 'layer', 'disabled']) {
+    const f = rig(t), light = new THREE.RectAreaLight(), object = f.mesh(new THREE.MeshStandardMaterial());
+    f.scene.add(light);
+    if (inactive === 'ancestor') { const parent = new THREE.Group(); parent.visible = false; parent.add(light); f.scene.add(parent); }
+    else if (inactive === 'layer') light.layers.set(1);
+    else f.renderer.lighting.enabled = false;
+    const captured = captureThreeNodeScene(THREE, f.scene, new THREE.ArrayCamera([f.camera]), {renderer: f.renderer,
+      getPrograms() { assert.fail('an inactive area light does not select native shaders'); }});
+    assert.equal(captured.bindings.length, 0); assert.equal(captured.draws.length, 0);
+    assert.equal(captured.nativeLights.has(light), true); assert.equal(captured.objects.has(object), false);
+  }
+});
+test('area lights leave unlit source materials on the fixed route', t => {
+  for (const Material of [THREE.MeshBasicMaterial, THREE.MeshNormalMaterial, THREE.MeshMatcapMaterial]) {
+    const f = rig(t), light = new THREE.RectAreaLight(), object = f.mesh(new Material()); f.scene.add(light);
+    const captured = f.capture({getPrograms() { assert.fail('unlit source materials do not construct area-light nodes'); }});
+    assert.equal(captured.bindings.length, 0); assert.equal(captured.nativeLights.has(light), true);
+    assert.equal(captured.objects.has(object), false);
+  }
+  const f = rig(t), material = new THREE.MeshStandardMaterial(); material.lights = false;
+  f.mesh(material); f.scene.add(new THREE.RectAreaLight());
+  assert.equal(f.capture({getPrograms() { assert.fail('disabled material lighting stays fixed'); }}).bindings.length, 0);
+});
 test('native shadow intent promotes default mesh materials without changing fixed-only scenes', t => {
   const fixed = rig(t); fixed.renderer.shadowMap = {enabled: true}; fixed.mesh(new THREE.MeshBasicMaterial());
   assert.equal(fixed.capture({getPrograms() { assert.fail('fixed-only shadows keep their existing owner'); }}), null);

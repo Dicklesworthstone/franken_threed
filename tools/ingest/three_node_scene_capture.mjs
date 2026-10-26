@@ -22,7 +22,7 @@ const nativeFeatures = material => hasThreeNodeProgram(material) || material?.is
     ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity', 'transmission', 'dispersion'].some(key => material[key] > 0) ||
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
       'anisotropyMap', 'retroreflectivityMap', 'transmissionMap', 'thicknessMap'].some(key => material[key] != null)));
-const probeMaterial = material => material?.isMaterial === true && material.lights !== false &&
+const litMaterial = material => material?.isMaterial === true && material.lights !== false &&
   ['MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
     material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true);
 
@@ -77,12 +77,17 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (let i = children.length - 1; i >= 0; i--)
       pendingVisibility.push({object: children[i], parentVisible: active});
   }
-  // The native source owner captures probe irradiance and its selection. The
-  // fixed owner must not reread or reject these lights in mixed scenes, even
-  // when a probe was inactive for this request. Its children remain traversable.
-  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true));
-  const nativeProbeScene = !shadowPass && renderer?.lighting?.enabled !== false && [...nativeLights].some(object =>
-    visibility.get(object) && object.layers.test(camera.layers));
+  // Native owners capture probe/area light selection. The fixed owner must not
+  // reread or reject these lights, including inactive lights and lights ignored
+  // by a material's source lighting model. Their children remain traversable.
+  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true));
+  const selectedLight = object => !shadowPass && renderer?.lighting?.enabled !== false &&
+    visibility.get(object) && object.layers.test(camera.layers);
+  const nativeProbeScene = [...nativeLights].some(object => object.isLightProbe === true && selectedLight(object));
+  const nativeAreaScene = [...nativeLights].some(object => object.isRectAreaLight === true && selectedLight(object));
+  // Non-PBR lighting models have no rectangular-light contribution, but their
+  // source light node still constructs its LTC inputs and runs its lifecycle.
+  const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene) && litMaterial(material);
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
   // established route; explicit node materials, ShadowMaterial and point-light
@@ -92,14 +97,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          nativeFeatures(material) || nativeProbeScene && probeMaterial(material) ||
+          nativeFeatures(material) || nativeLightMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
   const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene
-    ? material != null : nativeFeatures(material) || nativeProbeScene && probeMaterial(material);
+    ? material != null : nativeFeatures(material) || nativeLightMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;

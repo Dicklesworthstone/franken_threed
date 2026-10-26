@@ -81,7 +81,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode],
-    [three.LightProbe, three.LightProbeNode]]);
+    [three.LightProbe, three.LightProbeNode], [three.RectAreaLight, three.RectAreaLightNode]]);
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
@@ -416,7 +416,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
         fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF maps');
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
-        id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
+        id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true];
     }));
   }

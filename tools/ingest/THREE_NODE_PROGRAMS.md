@@ -110,6 +110,33 @@ and casters use the existing shared native shadow owner; skipping a probe in the
 fixed path does not shift another light's shadow index. This does not implement
 light-probe grids or additional custom light models.
 
+Source `RectAreaLight` now uses the pinned `RectAreaLightNode` and LTC lookup
+textures on ordinary and Node Standard/Physical materials. Applications retain
+the source initialization step:
+
+```js
+THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+```
+
+The unchanged addon supplies the source half-float or filterable-float tables;
+the existing texture owner uploads and shares them. Camera-space position,
+orientation, half-width, half-height, color and intensity retain the source
+RENDER update frequency. Queued draws preserve independent values, and removing
+the light restores ordinary fixed rendering where no other native feature is
+needed. Lit Toon/Lambert/Phong materials retain the source setup lifecycle and
+its initialization prerequisite without inventing an area-light contribution.
+Unlit materials, sprites, lines, points and independent light children keep
+their existing paths. Selection honors visibility, camera layers and the
+renderer lighting flag, and area-driven materials share native shadow ownership.
+
+Thirteen program tests cover both source LTC formats, source shader bodies,
+updates, initialization errors and registration identity. Two capture cases and
+six complete facade cases cover routing, actual lookup-table upload bytes,
+queued dimensions/radiance, mixed fixed objects, inactive ArrayCamera scenes and
+shadow ownership. An additional facade test combines ordinary Physical
+transmission with area lighting. These are source and recording-device checks;
+browser pixels and performance remain unverified.
+
 Explicit `renderer.library.addLight(NodeClass, LightClass)` registrations can
 supply direct analytic illumination, including the pinned H7 `SunLight` and
 `SunLightNode` addons. The light must directly extend the source `Light`, and
@@ -504,7 +531,7 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-custom scene environment lighting, area lights,
+custom scene environment lighting,
 light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
