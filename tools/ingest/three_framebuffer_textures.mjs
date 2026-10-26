@@ -57,31 +57,34 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
   const abort = () => stop(signal.reason ?? new ThreeFramebufferTextureError('ABORTED', 'Renderer lifetime ended'));
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, {once: true});
   device.lost?.then(info => stop(new ThreeFramebufferTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
-  function inspect(texture, format = getFormat()) {
+  function inspect(texture, format = getFormat(), layoutOnly = false) {
     live();
     if (!(texture instanceof three.FramebufferTexture) || texture.isFramebufferTexture !== true ||
         texture.isDepthTexture || texture.isCubeTexture || texture.isArrayTexture || texture.is3DTexture)
       fail('SOURCE', 'Expected a pinned color FramebufferTexture');
+    if (!texelBytes.has(format) || texture.mipmaps?.length || texture.internalFormat != null || typeof texture.generateMipmaps !== 'boolean')
+      fail('FORMAT', 'Expected an admitted framebuffer format with no authored mip or internal format override');
+    const sampleType = format.includes('32float') && !device.features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float';
+    // Source viewport textures have no extent until their first updateBefore.
+    // Shader layout inspection needs the format, never an allocation or size.
+    if (layoutOnly) return {format, sampleType, mipLevelCount: 1};
     const width = texture.image?.width, height = texture.image?.height;
     if (!positive(width) || !positive(height) || width > device.limits.maxTextureDimension2D || height > device.limits.maxTextureDimension2D ||
         (texture.image.depth ?? 1) !== 1 || texture.image.data != null)
       fail('SHAPE', 'Framebuffer texture dimensions must fit a 2D GPU attachment');
-    if (!texelBytes.has(format) || texture.mipmaps?.length || texture.internalFormat != null || typeof texture.generateMipmaps !== 'boolean')
-      fail('FORMAT', 'Expected an admitted framebuffer format with no authored mip or internal format override');
     const mipLevelCount = texture.generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(width, height))) : 1;
     let size = 0;
     for (let level = 0; level < mipLevelCount; level++)
       size += Math.max(1, Math.floor(width / 2 ** level)) * Math.max(1, Math.floor(height / 2 ** level)) * texelBytes.get(format);
     if (!Number.isSafeInteger(size)) fail('BUDGET', 'Framebuffer size exceeds integer precision');
-    const sampleType = format.includes('32float') && !device.features?.has?.('float32-filterable') ? 'unfilterable-float' : 'float';
     return Object.freeze({width, height, format, mipLevelCount, sampleType, bytes: size});
   }
-  function shapeOf(texture) {
+  function shapeOf(texture, layoutOnly = false) {
     live();
     // ViewportTextureNode restores generateMipmaps after copying. Source texture
     // allocation remains unchanged until its public version advances.
     const entry = current.get(texture);
-    return entry?.version === texture.version ? entry.shape : inspect(texture);
+    return entry?.version === texture.version ? entry.shape : inspect(texture, undefined, layoutOnly);
   }
   function samplerOf(texture, shape) {
     const filters = new Map([[three.NearestFilter, 'nearest'], [three.LinearFilter, 'linear']]);
@@ -135,8 +138,8 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
   }
   return {
     owns(token) { return tokens.has(token); },
-    layoutOf(binding) { const shape = shapeOf(binding.texture); samplerOf(binding.texture, shape); return bindingLayout(binding, shape); },
-    sampleData(texture) { shapeOf(texture); return {samples: 1, primarySamples: 1, isMSAA: false}; },
+    layoutOf(binding) { const shape = shapeOf(binding.texture, true); samplerOf(binding.texture, shape); return bindingLayout(binding, shape); },
+    sampleData(texture) { const shape = shapeOf(texture, true); samplerOf(texture, shape); return {samples: 1, primarySamples: 1, isMSAA: false}; },
     captureBinding(binding) {
       if (leases.size >= maxBindings) fail('BUDGET', 'Queued framebuffer bindings exceed maxBindings');
       const shape = shapeOf(binding.texture), layout = bindingLayout(binding, shape), sampler = samplerOf(binding.texture, shape);

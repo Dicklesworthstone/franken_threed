@@ -43,6 +43,23 @@ test('framebuffer layout is allocation-free and reports resolved single-sample i
   assert.equal(f.textures.length, 0); assert.equal(f.owner.diagnostics.generations, 0);
 });
 
+test('uninitialized source viewport extents admit shader metadata before the first captured copy', t => {
+  const f = fixture(t);
+  for (const texture of [new THREE.FramebufferTexture(), THREE.TSL.viewportMipTexture().value]) {
+    assert.equal(texture.image.width, undefined); assert.equal(texture.image.height, undefined);
+    assert.deepEqual(f.owner.layoutOf(sampled(texture)), {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}});
+    assert.deepEqual(f.owner.sampleData(texture), {samples: 1, primarySamples: 1, isMSAA: false});
+    assert.throws(() => f.owner.captureBinding(sampled(texture)), {code: 'THREE_FRAMEBUFFER_TEXTURE_SHAPE'});
+    assert.throws(() => f.owner.captureFramebuffer(texture), {code: 'THREE_FRAMEBUFFER_TEXTURE_SHAPE'});
+    assert.equal(f.owner.diagnostics.generations, f.textures.length);
+    texture.image.width = texture.image.height = 4; texture.generateMipmaps = true; texture.needsUpdate = true;
+    const lease = f.owner.captureFramebuffer(texture), read = f.owner.captureBinding(sampled(texture));
+    f.copy([lease, read], lease, f.source(), () => { assert.equal(f.owner.resolve(read).texture.width, 4); });
+    f.owner.release(lease); f.owner.release(read);
+  }
+  assert.equal(f.textures.length, 2);
+});
+
 test('copy and mip pyramid share one encoder after the temporary mip flag is restored', async t => {
   const f = fixture(t), texture = framebuffer(5, 3), rectangle = {x: 2, y: 1, z: 5, w: 3};
   const lease = f.owner.captureFramebuffer(texture, {rectangle});

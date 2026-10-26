@@ -15,8 +15,8 @@ Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
-they use bump, displacement or baked light maps, or Physical sheen, iridescence, anisotropy
-or retroreflectivity and their maps. They require no authored node slot or
+they use bump, displacement or baked light maps, or Physical sheen, iridescence, anisotropy,
+retroreflectivity, transmission or dispersion and their maps. They require no authored node slot or
 application rewrite. Other materials keep their existing fixed rendering path.
 When one material group on a mesh needs native shading, its other groups use the
 same source library conversion and geometry owner. All selected groups must pass
@@ -134,12 +134,48 @@ Authored `MeshStandardNodeMaterial` and `MeshPhysicalNodeMaterial` use the same
 direct-light path with the source GGX model and `metalnessNode`/`roughnessNode`.
 Physical also accepts clearcoat strength, roughness and normal; sheen color and
 roughness; iridescence strength, IOR and thickness; anisotropy; retroreflectivity;
-and IOR, specular color and specular intensity nodes. Unassigned slots read their
+IOR, specular color and specular intensity; transmission, thickness, attenuation
+color/distance and dispersion nodes. Unassigned slots read their
 ordinary material properties. Enabling or disabling a Physical feature selects
 the corresponding source shader branch; changing its live value keeps the
 program. The source's shared 16×16 RG16F DFG lookup texture goes through the same
 versioned texture owner as authored textures, preserving its aliasing across
 materials and clearcoat samples.
+
+### Native transmission and viewport snapshots
+
+Ordinary and Node Physical materials execute the pinned transmission, dispersion
+and volume equations, including transmission and thickness maps. The native
+`ViewportTextureNode` lifecycle records a framebuffer copy at the physical draw
+which requested it. GPU submission draws the preceding color span, copies its
+resolved color and generates mipmaps in one encoder, then resumes color, depth
+and stencil with load operations. The resumed pass retains viewport and scissor.
+All transmissive `DoubleSide` back faces precede the complete transparent/front
+list; ordinary alpha double-sided draws retain their consecutive side order.
+Shared front/back viewport nodes retain the source RENDER-frequency deduplication,
+including a front snapshot first requested by an earlier alpha material.
+
+The framebuffer owner preserves captured extents, texture generations, sampler
+settings and temporary mip flags across queued renders. Canvas refraction reads
+the linear scene target before output conversion, with the requested byte,
+half-float or float precision and resolved MSAA. Nodes observe the pinned internal
+source RenderTarget identity, type and size; application target selection is
+restored after capture. Linear canvas output without tone mapping keeps its direct
+path. Existing linear targets now preserve explicit color/depth/stencil loads.
+
+This path uses the existing owned WebGPU renderer and texture owners, with no
+readback or retained renderer submission. Framebuffer copies outside an active
+native draw capture, depth framebuffer copies and ArrayCamera transmission remain
+unimplemented. A distinct scene override on a transmissive DoubleSide original
+also requires further original/effective-material pass expansion and fails before
+updates. These are remaining compatibility tasks, not permanent exclusions.
+
+Thirteen framebuffer/output tests, ten program tests, nine capture-order tests and
+twelve complete facade integration tests cover this implementation. Program WGSL
+matches the pinned builder byte for byte. Recording-device tests establish actual
+copy/mip/draw ordering, queued uniforms and texture extents, mixed fixed/native
+draws, empty ranges, compilation without copies, and output precision; they do not
+establish browser pixel parity or performance.
 
 Native Standard and Physical graphs also use ready 2D equirectangular, source
 CubeUV or six-face CPU-data cube textures as `scene.environment` or material
@@ -468,7 +504,7 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, custom scene environment lighting, area lights,
+custom scene environment lighting, area lights,
 light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
@@ -483,8 +519,9 @@ Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
 front-side draws, matching the pinned renderer's source order. Each side owns a
 retained program and captured uniforms; object updates run for each draw while
 frame/render updates retain the source `NodeFrame` frequency. `forceSinglePass`
-keeps its source meaning and selects one draw with culling disabled. This does not admit
-transmission's separate scene-color and scene-wide double-pass protocol.
+keeps its source meaning and selects one draw with culling disabled. Native
+transmission uses the separate scene-color and scene-wide back-face protocol
+described above.
 
 There is a remaining parity difference when the pinned reference explicitly
 precompiles a transparent `DoubleSide` normal-dependent graph. Its

@@ -735,19 +735,16 @@ test('PBR authored sampled values coexist with the source DFG and preserve mutab
   assert.ok(second.textures.some(binding => binding.texture === replacement));
   assert.ok(first.textures.some(binding => binding.texture === image)); assert.deepEqual(first.uniforms, saved);
 });
-test('PBR scene-color and environment dependencies refuse before source construction', t => {
+test('PBR scene-color needs its copy owner and invalid environments refuse before source construction', t => {
   const f = pbrRig(t, THREE.MeshPhysicalNodeMaterial);
-  for (const feature of ['transmission', 'dispersion']) {
-    f.material[feature] = .25;
-    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
-    f.material[feature] = 0;
-    f.material[`${feature}Node`] = N.float(0);
-    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
-    f.material[`${feature}Node`] = null;
-  }
+  f.material.transmission = .25;
+  assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
+  f.material.transmission = 0; f.material.transmissionNode = N.float(0);
+  assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
+  f.material.transmissionNode = null;
   for (const slot of ['thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode']) {
     f.material[slot] = N.float(1);
-    assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_GRAPH'}); f.material[slot] = null;
+    assert.doesNotThrow(() => f.compile()); f.material[slot] = null;
   }
   for (const slot of ['environment', 'environmentNode']) {
     f.scene[slot] = slot === 'environment' ? dataTexture() : N.vec3(1);

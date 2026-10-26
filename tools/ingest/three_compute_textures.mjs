@@ -534,7 +534,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
     },
     async whenIdle() { live(); await Promise.all([storage.whenIdle(), pool?.whenIdle(), targetInputs?.whenIdle(), framebufferInputs?.whenIdle()]); live(); },
-    get diagnostics() { return {textures: current.size, versions: records.size, snapshotBytes}; },
+    get diagnostics() { return {textures: current.size, versions: records.size, snapshotBytes,
+      ...(framebufferInputs ? {framebuffers: framebufferInputs.diagnostics} : {})}; },
     dispose() {
       if (disposed) return;
       disposed = true;

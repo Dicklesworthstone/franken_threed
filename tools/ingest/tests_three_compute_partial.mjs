@@ -119,6 +119,7 @@ async function publicRig() {
     ['./gpu_compute_texture_copy.mjs', synthetic({copyComputeBufferToTarget: async (_a, _b, _c, _d, _e, o) => o.sourceCompletion()})],
     ['./three_storage_textures.mjs', synthetic({createThreeStorageTextures: () => r.storage, inspectThreeStorageTexture() {}})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures: () => r.pool})],
+    ['./three_framebuffer_textures.mjs', synthetic({createThreeFramebufferTextures() { throw new Error('No framebuffer textures in this fixture'); }})],
     ['./three_compute_targets.mjs', synthetic({createThreeComputeTargets() { throw new Error('No native targets in this fixture'); }})],
     ['./three_compute_textures.mjs', new vm.SourceTextModule(await readFile(new URL('./three_compute_textures.mjs', import.meta.url), 'utf8'), {context})],
   ]);

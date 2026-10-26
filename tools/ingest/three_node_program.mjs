@@ -18,7 +18,9 @@
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
  * Named MRT outputs share native attachments and retain source graph construction.
  * ClippingGroup planes retain source union/intersection and alpha-to-coverage
- * composition. Transmission, writable/atomic storage and VSM shadows fail explicitly.
+ * composition. Physical transmission and dispersion retain source framebuffer
+ * nodes and require the renderer's ordered scene-color copy owner. Writable/atomic
+ * storage and VSM shadows fail explicitly.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -42,7 +44,8 @@ const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode', 'envNode']);
 const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clearcoatNormalNode',
   'sheenNode', 'sheenRoughnessNode', 'iridescenceNode', 'iridescenceIORNode', 'iridescenceThicknessNode',
-  'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode']);
+  'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode',
+  'transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']);
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
 const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS, 'depthNode'];
@@ -52,7 +55,8 @@ const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, 
 const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
   'specularMap', 'specularIntensityMap', 'specularColorMap', 'roughnessMap', 'metalnessMap', 'gradientMap',
   'clearcoatMap', 'clearcoatRoughnessMap', 'clearcoatNormalMap', 'sheenColorMap', 'sheenRoughnessMap',
-  'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap', 'aoMap', 'lightMap']);
+  'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap', 'aoMap', 'lightMap',
+  'transmissionMap', 'thicknessMap']);
 const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 'vec4', 'ivec2', 'ivec3', 'ivec4',
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
@@ -506,6 +510,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
+    const framebuffer = texture?.isFramebufferTexture === true;
     const array = texture?.isDataArrayTexture === true || storage && texture.isArrayTexture === true;
     const volume = storage && texture.is3DTexture === true;
     if (!(texture instanceof three.Texture) ||
@@ -513,7 +518,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isArrayTexture && !array || texture.isData3DTexture ||
         array && !storage && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
-        texture.isFramebufferTexture || texture.isExternalTexture)
+        texture.isExternalTexture)
       fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, CPU-data cubes, 2D/array/3D storage and target-owned color/depth textures');
     // Compute owns these images. Admission must use the same residency owner,
     // never the CPU texture pool or an independently inferred storage layout.
@@ -521,6 +526,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // come from the pinned Texture3DNode, never an implicit array-layer adapter.
     if (storage && (texture.isDepthTexture || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TEXTURE', 'Native storage sampling requires color and the shared renderer texture owner');
+    if (framebuffer && (!(texture instanceof three.FramebufferTexture) ||
+        Object.getPrototypeOf(texture) !== three.FramebufferTexture.prototype || texture.isDepthTexture ||
+        texture.isCubeTexture || array || volume || typeof renderer._getSampledTextureInputs !== 'function'))
+      fail('TEXTURE', 'Native framebuffer sampling requires a source color FramebufferTexture and the shared renderer texture owner');
+    // Source Textures.updateTexture selects this type from the public target;
+    // the GPU owner separately selects the actual framebuffer format (including
+    // the canvas output intermediate). Normalize before freezing the layout so
+    // the first ordered copy does not appear to mutate a compiled texture type.
+    if (framebuffer) texture.type = renderer.getRenderTarget()?.texture.type ?? three.UnsignedByteType;
     const depth = texture.isDepthTexture === true;
     if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
         texture.renderTarget.depthTexture !== texture ||
@@ -550,7 +564,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if (storage && !layout?.texture) fail('TEXTURE', 'Missing shared storage sampling layout');
+    if ((storage || framebuffer) && !layout?.texture) fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
       fail('TEXTURE', 'Native graphics texture bindings must match the source dimension and sample count');
@@ -577,7 +591,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // replacing one compatible sampled image must not rebuild the shader.
       if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
       return [aliases.get(texture.uuid), texture.type, texture.format, texture.colorSpace, texture.channel,
-        texture.isRenderTargetTexture === true, texture.normalized === true, texture.isCubeTexture === true,
+        texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
         texture.is3DTexture === true, node.isTexture3DNode === true,
         texture.isCubeTexture === true ? texture.mapping : null,
@@ -593,6 +607,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const maps = [...MATERIAL_MAPS].filter(key => material[key]?.isTexture);
     return JSON.stringify([maps, material.normalMapType,
       textureSignature(maps.map(key => ({value: material[key]})))]);
+  }
+  function transmissionSignature(material) {
+    if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
+    return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
+      ...['transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']
+        .map(key => sourceId(material[key]))]);
   }
   function sourceFog(material, {scene} = {}) {
     // NodeMaterial.setupOutput applies fog only for the exact enabled flag.
@@ -644,7 +664,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     sourceLights(material, context);
-    if (physical && (material.useTransmission || material.useDispersion))
+    if (physical && material.useTransmission && (typeof renderer.copyFramebufferToTexture !== 'function' ||
+        typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
     if (!(object instanceof three.Mesh) || object.isBatchedMesh ||
@@ -809,7 +830,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
       lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
       Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
-        [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection] : null]);
+        [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection,
+          material.useTransmission, material.useDispersion] : null]);
   }
   function retire(entry) {
     if (!entries.delete(entry)) return;
@@ -1004,6 +1026,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraph(preparedMaterial),
+      transmissionSignature: transmissionSignature(preparedMaterial),
       instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
@@ -1169,6 +1192,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         environmentGraph(material) !== state.environmentGraph)
       fail('CHANGED', 'Native material or scene environment changed; compile the graph again');
   }
+  function checkTransmission(state) {
+    if (transmissionSignature(prepareMaterial(state.material)) !== state.transmissionSignature)
+      fail('CHANGED', 'Native transmission or dispersion graph changed; compile the physical draw variant again');
+  }
   function checkClipping(state, context) {
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
         state.material.alphaToCoverage !== state.alphaToCoverage ||
@@ -1180,6 +1207,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
+    checkTransmission(state);
     checkClipping(state, context);
     updateThreeNodeClipping(state.builder.clippingContext, context);
     checkMaterialMaps(state);
@@ -1221,6 +1249,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       assertMorphs(object, state.morphSignature);
       checkFog(state, context);
       checkEnvironment(state, context);
+      checkTransmission(state);
       checkAttributes(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
@@ -1239,6 +1268,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkPipelineContext(state, object);
       checkFog(state, context);
       checkEnvironment(state, context);
+      checkTransmission(state);
       checkClipping(state, context);
       const textures = readTextures(state);
       const storage = readStorage(state);

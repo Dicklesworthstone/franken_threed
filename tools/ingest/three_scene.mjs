@@ -1435,12 +1435,13 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame'].includes(k)))
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','framebuffer'].includes(k)))
         fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
       passBackgroundState=options.backgroundState;
       passMaterialFrame=options.materialFrame??null;
+      const sorting=passNodeFrame?.sortObjects??sortObjects;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
@@ -1484,7 +1485,7 @@ export async function createGpuThreeScene(device,scene,{
       const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(scene.fog,singleCamera,three):null;
       const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(backgroundScene(),singleCamera)??null:null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
-      const opaque=[],transmissive=[],transparent=[],stack=[{object:root,groupOrder:0}],descriptions=new Map();
+      const opaque=[],transmissive=[],transparent=[],transmissionBacks=[],stack=[{object:root,groupOrder:0}],descriptions=new Map(),projectionOrder=new Map();
       const get=(m,topology,object=null)=>{
         let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
         const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
@@ -1540,6 +1541,7 @@ export async function createGpuThreeScene(device,scene,{
       while(stack.length){
         const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
+        projectionOrder.set(object,visited);
         if(excludedNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
@@ -1556,7 +1558,7 @@ export async function createGpuThreeScene(device,scene,{
             if(!object.frustumCulled||object.intersectsFrustum(cullingFrustum)){
             const g=object.geometry;
             let z=0;
-            if(sortObjects){
+            if(sorting){
               if(object.isSprite){
                 // Source sprite sorting uses its origin, never mutable geometry bounds.
                 const e=object.matrixWorld.elements,p=vp.elements;
@@ -1585,13 +1587,19 @@ export async function createGpuThreeScene(device,scene,{
         if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
         const draw={...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true};
         if(packet.background)nativeBackground=draw;
-        else (packet.listMaterial.transparent?transparent:opaque).push(draw);
+        else (packet.transmissionBack?transmissionBacks:packet.listMaterial.transparent?transparent:opaque).push(draw);
       }
-      if(sortObjects){
+      if(sorting){
         const order=(a,b)=>a.groupOrder-b.groupOrder||(a.renderOrder??a.object.renderOrder)-(b.renderOrder??b.object.renderOrder);
         opaque.sort((a,b)=>order(a,b)||(programRoute()?a.listMaterial.id-b.listMaterial.id:0)||a.z-b.z||a.object.id-b.object.id);
         transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
         transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
+        transmissionBacks.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
+      }else if(passNodeFrame){
+        // Fixed and native packets are prepared separately, but disabling
+        // sorting preserves their original shared projection order.
+        const order=(a,b)=>projectionOrder.get(a.object)-projectionOrder.get(b.object);
+        opaque.sort(order);transparent.sort(order);transmissionBacks.sort(order);
       }
       // Native sky draws lead even when fixed meshes share this scene or sorting is disabled.
       if(nativeBackground)opaque.unshift(nativeBackground);
@@ -1603,7 +1611,10 @@ export async function createGpuThreeScene(device,scene,{
         if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
-      const items=[...opaque,...transmissive,...transparent],draws=[],drawObjects=[];
+      const items=[...opaque,...transmissive,...transmissionBacks,...transparent],draws=[],drawObjects=[],framebufferCopies=[];
+      const copiesAtDraw = copies => {
+        if(copies?.length)framebufferCopies.push({index:draws.length,copies});
+      };
       if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program?threeSpriteCount(item.object):1)*(arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
         fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
@@ -1650,8 +1661,10 @@ export async function createGpuThreeScene(device,scene,{
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
           if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
+          copiesAtDraw(item.nodeFramebufferCopies);
           draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+          copiesAtDraw(item.nodeFramebufferAfterCopies);
           continue;
         }
         if(item.program){
@@ -1836,10 +1849,35 @@ export async function createGpuThreeScene(device,scene,{
         // original depth clear/load policy; later receiver spans load both.
         prepared.loadOp='load';
       }
-      renderer.render(prepared);live();sourceDraws=items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0),0);
-      logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;
+      let passes=0;
+      if(framebufferCopies.length){
+        // Source ViewportTextureNode updates execute during synchronous capture,
+        // but their reads belong here: after the preceding color draws. Every
+        // span submits before its copy, and copy plus mip generation share one
+        // encoder. Later spans load all attachments and restore viewport/scissor.
+        const source=typeof options.framebuffer==='function'?options.framebuffer():options.framebuffer;
+        if(!source)fail('FRAME','Native framebuffer copies require the borrowed resolved color texture');
+        let first=0,loaded=false;
+        logicalDraws=0;drawCalls=0;
+        const span=end=>{
+          renderer.render({...prepared,draws:draws.slice(first,end),...(loaded?{loadOp:'load',depthLoadOp:'load',
+            ...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})}:{})});
+          backgroundSubmitted=true;loaded=true;first=end;
+          logicalDraws+=renderer.drawCount;drawCalls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+        };
+        for(const boundary of framebufferCopies){
+          if(!loaded||boundary.index!==first)span(boundary.index);
+          const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
+          for(const marker of boundary.copies)passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source);
+          device.queue.submit([encoder.finish()]);live();
+        }
+        span(draws.length);
+      }else{
+        renderer.render(prepared);live();logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;passes=renderer.colorPassCount??1;
+      }
+      sourceDraws=items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0),0);
       backgroundPasses=backgroundFrame?1:0;
-      if(backgroundEnabled)backgroundColorPasses=(renderer.colorPassCount??1)+backgroundPasses;
+      if(backgroundEnabled)backgroundColorPasses=passes+backgroundPasses;
       }
       shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
         mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;

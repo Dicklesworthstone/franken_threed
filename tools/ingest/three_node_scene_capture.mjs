@@ -10,8 +10,8 @@ import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const integer = value => Number.isSafeInteger(value) && value >= 0;
-const transparent = material => material.transparent === true || material.transmission > 0 ||
-  material.transmissionNode?.isNode === true || material.backdropNode?.isNode === true;
+const transmissive = material => material.transmission > 0 || material.transmissionNode?.isNode === true;
+const transparent = material => material.transparent === true || transmissive(material) || material.backdropNode?.isNode === true;
 
 // Additional source material features use the retained native shader builder.
 // Users must not add a dummy TSL slot to reach an existing implementation.
@@ -19,18 +19,20 @@ const transparent = material => material.transparent === true || material.transm
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
   material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
   (material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && (
-    ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity'].some(key => material[key] > 0) ||
+    ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity', 'transmission', 'dispersion'].some(key => material[key] > 0) ||
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
-      'anisotropyMap', 'retroreflectivityMap'].some(key => material[key] != null)));
+      'anisotropyMap', 'retroreflectivityMap', 'transmissionMap', 'thicknessMap'].some(key => material[key] != null)));
 const probeMaterial = material => material?.isMaterial === true && material.lights !== false &&
   ['MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
     material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true);
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
-  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null} = {}) {
+  maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null,
+  withFramebufferCopies = null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
+  const sortObjects = renderer?.sortObjects === true;
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
       !hasThreeNodeProgram(backgroundMesh.material)))
@@ -115,6 +117,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (let i = 0; i < originals.length; i++) {
       const original = originals[i], material = effective[i];
       if (shadowPass || original === material || (!nativeMaterial(original) && !nativeMaterial(material))) continue;
+      // _renderTransparents changes the original's side before renderObject
+      // installs a distinct override. That override can expand each original
+      // pass again. This capture profile must not silently replace those source
+      // passes with the effective material's two ordinary color variants.
+      if (transmissive(original) && original.side === three.DoubleSide && original.forceSinglePass === false)
+        fail('EFFECT', 'Transmissive DoubleSide overrides require capture of the original and effective pass expansion');
       // r186 renderObject inherits these values before applying an override.
       // The first profile admits the already-equivalent state without mutating
       // a shared override material or changing its callback identity.
@@ -163,12 +171,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         byMaterial.set(original, variants);
       }
     } else for (const material of effective) if (material && !byMaterial.has(material)) {
-        const doubleSide = material.transparent === true && material.side === three.DoubleSide && material.forceSinglePass === false;
+        const doubleSide = (material.transparent === true || transmissive(material)) &&
+          material.side === three.DoubleSide && material.forceSinglePass === false;
+        const transmissionDoublePass = doubleSide && transmissive(material);
         const sides = doubleSide ? [three.BackSide, three.FrontSide] : [material.side], variants = [];
         for (const side of sides) {
           if (bindings.length >= maxDraws) fail('LIMIT', 'Native scene program binding capacity exceeded');
           const binding = {object, geometry, material, nodeProgram: null, raster: null,
-            ...(doubleSide ? {colorSide: side} : {}), passId: doubleSide && side === three.BackSide ? 'backSide' : null};
+            ...(doubleSide ? {colorSide: side} : {}), transmissionDoublePass,
+            passId: doubleSide && side === three.BackSide ? 'backSide' : null};
           variants.push(binding); bindings.push(binding);
         }
         byMaterial.set(material, variants);
@@ -187,7 +198,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
-    return Object.freeze({objects, excludedObjects, visibility, nativeLights, bindings: Object.freeze([]), draws: Object.freeze([]),
+    return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, bindings: Object.freeze([]), draws: Object.freeze([]),
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
@@ -235,7 +246,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
-    const center = new three.Vector4(), sortObjects = renderer.sortObjects === true;
+    const center = new three.Vector4();
     const visible = [{object: root, groupOrder: 0}];
     const append = (object, state, original, material, group, groupOrder, z, background = false) => {
       if (!original?.visible || !material) return;
@@ -339,6 +350,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const capturedDraws = [];
   let recordTexture = () => {};
   const captureDraw = draw => {
+    const beforeCopies = [], afterCopies = [];
+    let copies = beforeCopies;
+    const recordCopy = marker => {
+      if (!textureOwner) {
+        if (typeof getTextures !== 'function') fail('SOURCE', 'Framebuffer copies require the renderer texture owner');
+        textureOwner = getTextures();
+      }
+      textureUses.push(marker.lease); copies.push(marker);
+    };
+    const run = () => {
       draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
       draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
       const updateContext = {...frameContext, object: draw.object, material: draw.material,
@@ -378,24 +399,48 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (draw.binding.nodeProgram.instanceCapacity !== undefined &&
           draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
         fail('OBJECT', 'Native node instance count exceeds its captured matrix or color capacity');
+      copies = afterCopies;
       programs.after(draw.binding.nodeProgram, updateContext);
+      draw.nodeFramebufferCopies = Object.freeze(beforeCopies);
+      draw.nodeFramebufferAfterCopies = Object.freeze(afterCopies);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
       capturedDraws.push(draw);
       };
       const captureStorage = () => storageOwner ? storageOwner.captureDispatch(capture) : capture();
       if (textureOwner) textureOwner.captureDispatch(captureStorage);
       else captureStorage();
+    };
+    if (withFramebufferCopies) withFramebufferCopies(recordCopy, run);
+    else run();
   };
   const capture = () => {
-    for (const draw of draws) {
-      if (!shadowPass) {
+    if (!shadowPass) {
+      const captureColor = (draw, side = null, transmissionBack = false) => {
         // Renderer.renderObject executes both sides consecutively for ordinary
         // alpha transparency. Each physical draw receives source NodeFrame
         // updates; its FRAME/RENDER markers still deduplicate shared nodes.
-        for (const binding of draw.colorBindings)
-          withBinding(binding, () => captureDraw({...draw, binding}));
-        continue;
+        for (const binding of draw.colorBindings) if (side === null || binding.colorSide === side)
+          withBinding(binding, () => captureDraw({...draw, binding, transmissionBack}));
+      };
+      const transparentDraws = draws.filter(draw => !draw.background && draw.listMaterial.transparent);
+      const doublePassDraws = transparentDraws.filter(draw => draw.binding.transmissionDoublePass);
+      for (const draw of draws) if (draw.background || !draw.listMaterial.transparent) captureColor(draw);
+      // r186 _renderTransparents renders all transmissive back faces before
+      // the complete transparent list. Every participating material already
+      // has the selected side when any of that phase's node callbacks run.
+      const sides = new Map(doublePassDraws.map(draw => [draw.material, draw.material.side]));
+      try {
+        for (const material of sides.keys()) material.side = three.BackSide;
+        for (const draw of doublePassDraws) captureColor(draw, three.BackSide, true);
+        for (const material of sides.keys()) material.side = three.FrontSide;
+        for (const draw of transparentDraws)
+          captureColor(draw, draw.binding.transmissionDoublePass ? three.FrontSide : null);
+      } finally {
+        for (const [material, side] of sides) material.side = side;
       }
+      return;
+    }
+    for (const draw of draws) {
       // Execute the pinned caster selector and Renderer.renderObject lifecycle
       // once per source list item. Its temporary shared override remains live
       // through native uniform/resource capture and is restored by the source.
@@ -441,7 +486,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   draws.splice(0, draws.length, ...capturedDraws);
   let preparedAttributes = null;
-  return Object.freeze({objects, excludedObjects, visibility, nativeLights, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+  return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (uniforms) return;
       // compileAsync uploads visible geometry even though this preparation

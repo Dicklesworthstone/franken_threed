@@ -137,10 +137,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame, framebuffer) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, framebuffer});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -361,6 +361,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     get initialized() { return this._initialized; }
     hasInitialized() { return this._initialized; }
     get coordinateSystem() { return THREE.WebGPUCoordinateSystem; }
+    get isOutputTarget() { return this._renderTarget === null || this._renderTarget === this._outputRenderTarget; }
+    get currentToneMapping() { return this.isOutputTarget ? this.toneMapping : NoToneMapping; }
+    get currentColorSpace() { return this.isOutputTarget ? this.outputColorSpace : THREE.LinearSRGBColorSpace; }
+    get needsFrameBufferTarget() { return this.currentToneMapping !== NoToneMapping || this.currentColorSpace !== THREE.LinearSRGBColorSpace; }
+    get currentSamples() { return this._renderTarget ? this._renderTarget.samples : this.needsFrameBufferTarget ? 0 : this.samples; }
     get backend() { this._backend.device = this._session?.device ?? null; return this._backend; }
 
     init() {
@@ -413,7 +418,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._dispatcher = null;
       this._session = hdr
         ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
-          target: {width, height, ...format, srgbView, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}, renderTarget: {depthFormat, sampleCount},
+          target: {width, height, ...format, srgbView, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
+          renderTarget: {depthFormat, sampleCount, format: this._outputBufferFormat()},
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...format, srgbView,
@@ -428,13 +434,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeBackgrounds?.dispose(); this._nodeBackgrounds = null;
       this._nodeProgramSupport?.dispose();
       this._nodeProgramSupport = null;
+      this._canvasTarget?.dispose();
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
 
     /** The whole-image tone-mapping output pass. WebGLRenderer (shader-encoded
      * output) tone-maps inside each material's program instead, unless a scene
      * needed a draw the program route cannot take (sticky fallback). */
-    _wantsHdr(tone) { return tone !== 'none' && (!this._shaderEncodedOutput || this._hdrFallback === true); }
+    _wantsHdr(tone, space = this.outputColorSpace) { return !this._shaderEncodedOutput &&
+      this._nativeFramebufferOutput === true && space !== THREE.LinearSRGBColorSpace ||
+      tone !== 'none' && (!this._shaderEncodedOutput || this._hdrFallback === true); }
+    _outputBufferFormat() {
+      return this._outputBufferType === THREE.UnsignedByteType ? 'rgba8unorm' :
+        this._outputBufferType === THREE.FloatType ? 'rgba32float' : 'rgba16float';
+    }
     // Source RenderPipeline writes its output transform in the graph and sets
     // working-linear output to suppress a second transfer. Each queued frame
     // captures the attachment view separately from the live renderer property.
@@ -534,6 +547,47 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
+    getCanvasTarget() {
+      // ViewportTextureNode keys its source-owned images by this real, stable
+      // CanvasTarget. Synchronize its read state without resizing the canvas
+      // while a render request is being captured.
+      const target = this._canvasTarget ??= new THREE.CanvasTarget(this.domElement);
+      target._width = this._width; target._height = this._height; target._pixelRatio = this._pixelRatio;
+      target._viewport.copy(this._viewport); target._scissor.copy(this._scissor); target._scissorTest = this._scissorTest;
+      return target;
+    }
+    _framebufferFormat() {
+      const internal = this._frameBufferTargets?.get(this._canvasTarget);
+      if (internal && this._renderTarget === internal) this._nativeFramebufferOutput = true;
+      if (this._renderTarget) return inspectThreeRenderTarget(this._renderTarget, THREE).format;
+      // Refraction reads working-linear scene color before the final output
+      // conversion. Sampling bytes copied from the sRGB presentation view
+      // would apply that conversion twice. Select the existing linear scene
+      // target at first framebuffer layout admission, before shader capture.
+      if (!this._shaderEncodedOutput && this.needsFrameBufferTarget) this._nativeFramebufferOutput = true;
+      return this._wantsHdr(this._toneMapping()) ? this._outputBufferFormat() : this._preferredFormat ?? 'bgra8unorm';
+    }
+    copyFramebufferToTexture(texture, rectangle = null) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (!this._nodeFramebufferCopyRecorder)
+        fail('UNSUPPORTED', 'Framebuffer copies require an active native draw capture');
+      if (!(texture instanceof THREE.FramebufferTexture) || texture.isDepthTexture)
+        fail('SOURCE', 'Expected a source color FramebufferTexture');
+      let region;
+      if (rectangle === null) region = [0, 0, texture.image.width, texture.image.height];
+      else if (rectangle.isVector2) region = [rectangle.x, rectangle.y, texture.image.width, texture.image.height].map(Math.floor);
+      else if (rectangle.isVector4) region = [rectangle.x, rectangle.y, rectangle.z, rectangle.w].map(Math.floor);
+      else { (THREE.error ?? console.error)('Renderer.copyFramebufferToTexture: Invalid rectangle.'); return; }
+      // Textures.updateTexture performs this assignment before allocation. The
+      // physical copy format is selected independently by the backend context.
+      texture.type = this._renderTarget?.texture.type ?? THREE.UnsignedByteType;
+      const textures = this._getSampledTextureInputs();
+      const lease = textures.captureFramebuffer(texture, {format: this._framebufferFormat(),
+        rectangle: {x: region[0], y: region[1], z: region[2], w: region[3]}});
+      try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
+      catch (error) { textures.release(lease); throw error; }
+      this._inspector.copyFramebufferToTexture?.(texture);
+    }
     getOutputRenderTarget() { return this._outputRenderTarget; }
     setOutputRenderTarget(target) {
       if (target !== null) fail('UNSUPPORTED', 'Custom output targets require their own presentation route');
@@ -795,9 +849,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       let captured;
       try {
         this._renderTarget = target; this._mrt = mrt;
+        if (target === null && this.needsFrameBufferTarget) {
+          // Retain source target construction/identity for node observations;
+          // actual color storage and submission stay in the owned canvas path.
+          this.getCanvasTarget(); this._frameBufferTargets ??= new Map();
+          this._renderTarget = THREE.Renderer.prototype._getFrameBufferTarget.call(this);
+        }
         captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh,
           getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
           getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
+          withFramebufferCopies: (record, run) => {
+            const previous = this._nodeFramebufferCopyRecorder;
+            this._nodeFramebufferCopyRecorder = record;
+            try { return run(); } finally { this._nodeFramebufferCopyRecorder = previous; }
+          },
           maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
           maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
       } finally { this._renderTarget = previousTarget; this._mrt = previousMRT; }
@@ -853,7 +918,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         const issue = () => {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame);
-          else this._targets.render(destination, attachments => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...frame, ...attachments}), {mipLevel, face});
+          else this._targets.render(destination, (attachments, framebuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...frame, ...attachments}, framebuffer), {mipLevel, face});
         };
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
         const resources = () => {
@@ -1037,7 +1102,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           } else {
             const tone = request ? TONE_MAPPINGS.get(request.programFrame.toneMapping) : this._toneMapping();
             const selectOutput = () => {
-              const hdr = this._wantsHdr(tone);
+              const hdr = this._wantsHdr(tone, request?.programFrame.outputColorSpace ?? this.outputColorSpace);
               if (request) {
                 request.hdr = hdr;
                 // A preceding queued request may have activated sticky HDR
