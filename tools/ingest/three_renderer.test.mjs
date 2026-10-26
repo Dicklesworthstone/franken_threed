@@ -201,6 +201,7 @@ test('tone mapping selects the HDR output pass at initialization', async () => {
 
 test('tone mapping can change after init: the output path is rebuilt on the same device', async () => {
   const {renderer, device} = await create();
+  renderer.outputColorSpace = T.LinearSRGBColorSpace;
   const f = sceneFixture();
   await renderer.compileAsync(f.scene, f.camera);
   renderer.render(f.scene, f.camera);
@@ -411,7 +412,7 @@ for (const antialias of [false, true]) test(`canvas stencil supports native mate
     assert.equal(first.desc.depthStencilAttachment.view.attachment.sampleCount, antialias ? 4 : 1);
     assert.equal(first.desc.depthStencilAttachment.stencilLoadOp, 'clear');
     assert.equal(first.desc.depthStencilAttachment.stencilClearValue, 5);
-    assert.equal(device.snapshots.at(-1)[0].stencilReference, 5);
+    assert.equal(first.draws[0].stencilReference, 5);
     renderer.autoClearStencil = false; renderer.render(f.scene, f.camera);
     const preserved = device.passes.at(-1).desc;
     assert.equal(preserved.colorAttachments[0].loadOp, 'clear');

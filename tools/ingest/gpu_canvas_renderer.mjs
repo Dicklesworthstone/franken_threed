@@ -176,7 +176,7 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
       return value;
     });
     await wait(construction); live();
-    await wait(renderer.whenIdle()); live();
+    await wait(typeof renderer.whenReady === 'function' ? renderer.whenReady() : renderer.whenIdle()); live();
     return api;
   } catch (error) { stop(error); throw error; }
 }

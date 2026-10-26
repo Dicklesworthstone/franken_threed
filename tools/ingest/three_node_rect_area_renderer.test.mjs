@@ -7,6 +7,7 @@ import {RectAreaLightTexturesLib} from './fixtures/three_rect_area_light.mjs';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const ltc = RectAreaLightTexturesLib.init();
+const isSceneDraw = draw => !draw.pipeline.label?.startsWith('Animation HDR output ');
 const isArea = draw => /LTC_Evaluate/.test(draw.pipeline.fragment?.module?.code ?? '');
 const values = draw => [...draw.contents.values()].flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
 const sampled = draw => [...draw.groups.values()].flatMap(({group}) => group.entries ?? []).map(entry => entry.resource?.texture).filter(Boolean);
@@ -37,7 +38,7 @@ async function fixture(t) {
 
 test('ordinary Standard area lighting submits exact source LTC bytes through the shared texture owner', async t => {
   const f = await fixture(t); f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(); assert.equal(draws.length, 1); assert.ok(isArea(draws[0]));
+  const draws = f.device.snapshots.flat().filter(isSceneDraw); assert.equal(draws.length, 1); assert.ok(isArea(draws[0]));
   const tables = sampled(draws[0]).filter(texture => texture.width === 64 && texture.height === 64);
   assert.equal(tables.length, 2); assert.equal(f.material.colorNode, undefined);
   for (const texture of tables) {
@@ -56,7 +57,7 @@ test('queued area-light dimensions and radiance stay independent and removal ret
   f.scene.remove(f.light); f.renderer.render(f.scene, f.camera);
   f.light.width = 99; f.light.intensity = 99;
   await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(); assert.equal(draws.length, 3);
+  const draws = f.device.snapshots.flat().filter(isSceneDraw); assert.equal(draws.length, 3);
   assert.ok(isArea(draws[0]) && isArea(draws[1])); assert.ok(!isArea(draws[2]));
   assert.ok(values(draws[0]).includes(1.6875)); assert.ok(!values(draws[0]).includes(3.1875));
   assert.ok(values(draws[1]).includes(3.1875)); assert.ok(!values(draws[1]).includes(1.6875));
@@ -76,7 +77,7 @@ test('area-light selection is captured while fixed children, sprites, lines and 
   f.renderer.lighting.enabled = false; f.renderer.render(f.scene, f.camera);
   f.renderer.lighting.enabled = true; f.light.layers.set(2);
   await f.renderer.waitForGPU();
-  const frames = f.device.snapshots.filter(draws => draws.length);
+  const frames = f.device.snapshots.map(draws => draws.filter(isSceneDraw)).filter(draws => draws.length);
   assert.deepEqual(frames.map(draws => draws.length), [5, 5, 5]);
   assert.deepEqual(frames.map(draws => draws.filter(isArea).length), [0, 1, 0]);
 });
@@ -86,7 +87,7 @@ test('area lights preserve source no-contribution lighting models while unlit ma
   for (const Material of [THREE.MeshLambertMaterial, THREE.MeshPhongMaterial, THREE.MeshToonMaterial, THREE.MeshBasicMaterial])
     f.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(), new Material()));
   f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(); assert.equal(draws.length, 4); assert.ok(draws.every(draw => !isArea(draw)));
+  const draws = f.device.snapshots.flat().filter(isSceneDraw); assert.equal(draws.length, 4); assert.ok(draws.every(draw => !isArea(draw)));
   assert.equal(draws.filter(draw => draw.pipeline.vertex.entryPoint === 'vertex_main').length, 1);
 });
 
@@ -95,7 +96,7 @@ test('inactive area lights keep ArrayCamera scenes on their existing fixed path'
   f.light.layers.set(1); f.renderer.render(f.scene, camera);
   f.light.layers.set(0); f.renderer.lighting.enabled = false; f.renderer.render(f.scene, camera);
   await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(); assert.equal(draws.length, 2);
+  const draws = f.device.snapshots.flat().filter(isSceneDraw); assert.equal(draws.length, 2);
   assert.ok(draws.every(draw => draw.pipeline.vertex.entryPoint === 'vertex_main'));
 });
 

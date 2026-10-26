@@ -99,7 +99,12 @@ export async function createGpuThreeScene(device,scene,{
   const sourceMaterial=o=>passMaterialFrame?.objects.has(o)?passMaterialFrame.objects.get(o):o.material;
   const sourceMaterials=o=>{const m=sourceMaterial(o);return Array.isArray(m)?m:[m];};
   const colorMaterial=m=>m&&materialState(m).allowOverride===true&&passOverride!==null?passOverride:m;
-  const colorMaterials=o=>sourceMaterials(o).map(colorMaterial).map(materialState);
+  const colorPhaseEnabled=original=>{
+    const state=materialState(original);
+    const transparent=state?.transparent===true||state?.transmission>0||state?.transmissionNode?.isNode===true||state?.backdropNode?.isNode===true;
+    return passNodeFrame?.phases?.[transparent?'transparent':'opaque']!==false;
+  };
+  const colorMaterials=o=>sourceMaterials(o).filter(m=>colorPhaseEnabled(m)||shadowEnabled&&o.castShadow).map(colorMaterial).map(materialState);
   const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
   const capturedNodeLight=o=>passNodeFrame?.nativeLights?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
@@ -169,7 +174,7 @@ export async function createGpuThreeScene(device,scene,{
   let backgroundOwner=null,pendingBackground=null,backgroundPasses=0,backgroundColorPasses=0;
   const sourceBackground=()=>{
     const selected=backgroundScene().background;
-    return !passNodeFrame?.background&&selected!==null&&!selected?.isColor?selected:null;
+    return passNodeFrame?.phases?.opaque!==false&&!passNodeFrame?.background&&selected!==null&&!selected?.isColor?selected:null;
   };
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
@@ -305,6 +310,9 @@ export async function createGpuThreeScene(device,scene,{
       // materials or geometry. Keep hierarchy/capacity validation, while the
       // accepted native capture retains inherited visibility through any await.
       if(excludedNodeObject(object))continue;
+      // Suppressed color lists retain hierarchy traversal and shadow casters,
+      // but acquire no color material, geometry or upload work for this pass.
+      if(sourceMaterial(object)&&!sourceMaterials(object).some(colorPhaseEnabled)&&!(shadowEnabled&&object.castShadow))continue;
       if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender){
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
@@ -1032,7 +1040,7 @@ export async function createGpuThreeScene(device,scene,{
       const instanceSignature=instanceSource&&!instancedMorph(instanceSource)?instanceAdmission(instanceSource).signature:null;
       const source=sourceMaterials(object);
       for(const original of source){
-        if(!original)continue;
+        if(!original||!colorPhaseEnabled(original)&&!(shadowEnabled&&object.castShadow))continue;
         // The original controls list admission, not the selected program. Do not
         // compile its shader or upload its maps when an override suppresses them.
         const m=colorMaterial(original);
@@ -1499,7 +1507,7 @@ export async function createGpuThreeScene(device,scene,{
         if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
         function push(original,sourceGroup){
               const originalState=materialState(original);
-              if(!originalState||!originalState.visible)return;
+              if(!originalState||!originalState.visible||!shadowPass&&!colorPhaseEnabled(original))return;
               if(shadowPass&&originalState.transparent){
                 if(shadowBlend==='skip')return;
                 fail('SHADOW','BLEND casters require the explicit skip policy');

@@ -133,7 +133,8 @@ function recording(t) {
   const camera = new THREE.PerspectiveCamera(50, 1, .1, 30); camera.position.z = 4;
   return {device, renderer, material, object, scene, probe, camera};
 }
-const allDraws = device => device.snapshots.flat();
+const isSceneDraw = draw => !draw.pipeline.label?.startsWith('Animation HDR output ');
+const allDraws = device => device.snapshots.flat().filter(isSceneDraw);
 function submittedSH(draw) {
   const found = [];
   for (const {group, offsets} of draw.groups.values()) {
@@ -187,7 +188,7 @@ test('queued probe selection retains camera layers and lighting enablement while
   f.renderer.lighting.enabled = false; f.renderer.render(f.scene, f.camera);
   f.renderer.lighting.enabled = true; f.probe.layers.set(2);
   await f.renderer.waitForGPU();
-  const frames = f.device.snapshots.filter(draws => draws.length);
+  const frames = f.device.snapshots.map(draws => draws.filter(isSceneDraw)).filter(draws => draws.length);
   assert.deepEqual(frames.map(draws => draws.length), [2, 2, 2], 'probe layer filtering does not hide its ordinary children');
   assert.deepEqual(frames.map(draws => draws.filter(draw => shShader.test(draw.pipeline.fragment.module.code)).length), [0, 1, 0]);
   assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);

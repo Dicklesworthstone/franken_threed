@@ -6,6 +6,7 @@ import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const N = THREE.TSL;
+const isSceneDraw = draw => !draw.pipeline.label?.startsWith('Animation HDR output ');
 const isEnvironment = draw => /authoredSceneEnvironment/.test(draw.pipeline.fragment?.module?.code ?? '');
 const values = draw => [...draw.contents.values()].flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
 const sampled = draw => [...draw.groups.values()].flatMap(({group}) => group.entries ?? []).map(entry => entry.resource?.texture).filter(Boolean);
@@ -64,7 +65,7 @@ test('queued scene environment values, graph replacement and removal keep accept
   f.scene.userData.irradiance.setRGB(99, 99, 99);
   assert.equal(f.updates.length, 2);
   await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(), native = draws.filter(isEnvironment);
+  const draws = f.device.snapshots.flat().filter(isSceneDraw), native = draws.filter(isEnvironment);
   assert.equal(native.length, 3);
   for (const [index, value] of [.1875, .6875, .5625].entries()) assert.ok(values(native[index]).includes(value));
   assert.ok(!values(native[0]).includes(.6875)); assert.ok(!values(native[1]).includes(.1875));
@@ -82,7 +83,7 @@ test('scene nodes override unused ordinary maps while mixed fixed objects retain
     new THREE.Sprite(new THREE.SpriteMaterial()), new THREE.Points(geometry, new THREE.PointsMaterial()),
     new THREE.Line(geometry, new THREE.LineBasicMaterial()));
   f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
-  const draws = f.device.snapshots.flat(), native = draws.filter(isEnvironment);
+  const draws = f.device.snapshots.flat().filter(isSceneDraw), native = draws.filter(isEnvironment);
   assert.equal(native.length, 2); assert.equal(f.updates.length, 2);
   assert.ok(values(native[0]).includes(.1875)); assert.ok(values(native[1]).includes(.6875));
   assert.equal(draws.filter(draw => draw.pipeline.vertex.entryPoint === 'vertex_main').length, 4);
@@ -98,7 +99,7 @@ test('disabled or unused scene environments keep existing fixed ArrayCamera rend
     const camera = new THREE.ArrayCamera([f.camera]);
     f.renderer.render(f.scene, camera); await f.renderer.waitForGPU();
     assert.equal(f.updates.length, 0);
-    assert.equal(f.device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'vertex_main').length, 1);
+    assert.equal(f.device.snapshots.flat().filter(isSceneDraw).filter(draw => draw.pipeline.vertex.entryPoint === 'vertex_main').length, 1);
   }
 });
 

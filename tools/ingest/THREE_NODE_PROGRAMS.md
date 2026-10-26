@@ -814,6 +814,33 @@ immediate generator disposal and a sampled output atlas. The registered
 with Standard/Physical environment consumers; its recording-device path is
 tested. Browser pixel parity for this cube extension is unmeasured.
 
+## Native render-list controls
+
+`renderer.opaque` and `renderer.transparent` select the corresponding native
+and fixed draw lists using the pinned renderer's strict `=== true` checks.
+Opaque selection is accepted before opaque node updates; transparent selection
+is accepted afterward, so an opaque update can enable or disable the later
+transparent phase. Disabled native phases do not compile their programs,
+capture uniforms, run node updates or copy the framebuffer. Queued calls retain
+their accepted selections. Filtering a parent mesh does not hide its children,
+and fixed ArrayCamera views apply the same controls in each viewport.
+
+Shader and texture backgrounds belong to the opaque phase. Color clears remain
+independent. The final canvas output quad has its own opaque selection after
+transparent updates, matching the source's output-pass ordering. Native tone
+mapping or output color conversion uses the linear scene target from the first
+render, preserving working-linear RGB above one until output conversion. The
+canvas is acquired only after successful scene preparation; initialization waits
+for resource validation without fencing unrelated GPU work.
+
+`compileAsync` prepares only the enabled native phases and does not run draw
+updates. The unchanged pinned `PassNode` can set `opaque = false` or
+`transparent = false` to render a filtered scene and then restore its caller's
+renderer controls. These controls are covered by recording-device tests of the
+actual facade and pinned PassNode, including callback-driven selection changes,
+queued captures, backgrounds and output conversion. They do not establish new
+browser pixel parity or native TSL ArrayCamera support.
+
 ## Native scene passes and previous-frame color
 
 The pinned `PassNode` and `RenderPipeline` can retain current and previous color

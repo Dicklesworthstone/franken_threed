@@ -51,6 +51,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
       (target.sampleCount !== undefined && target.sampleCount !== 1))
     fail('OPTIONS', 'Use renderTarget for scene depth/MSAA; the output pass is single-sample and depthless');
   session.target = {...target, depthFormat: null, sampleCount: 1};
+  session.lazyAttachments = true;
   return createGpuCanvasRenderer(canvas, async (device, presentation, {signal}) => {
     let offscreen = null, finalOutput = null, renderer = null;
     let disposed = false, terminal = null, busy = false, preparing = false;
@@ -92,19 +93,26 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
         live(); if (busy || preparing) fail('REENTRANT', 'HDR rendering cannot overlap another operation');
         busy = true;
         try {
-          const {output: selectedOutput = {}, colorView, depthView, resolveTarget, ...sceneFrame} = frame;
+          const {output: selectedOutput = {}, outputEnabled = true} = frame;
+          if (typeof outputEnabled !== 'boolean') fail('FRAME', 'Expected a boolean output selection');
+          // The borrowed canvas views are lazy. Keep their getters untouched
+          // until the inner scene has submitted successfully; a preparation
+          // boundary must leave the previous presentation intact.
+          const sceneFrame = Object.fromEntries(Object.keys(frame)
+            .filter(key => !['output', 'outputEnabled', 'colorView', 'depthView', 'resolveTarget'].includes(key))
+            .map(key => [key, frame[key]]));
           const selected = animationOutputSettings(capture(selectedOutput, OUTPUT_KEYS, 'frame output'), defaults);
-          if (depthView || resolveTarget) fail('ATTACHMENT', 'Final HDR presentation must be depthless and single-sample');
+          if (frame.depthView || frame.resolveTarget) fail('ATTACHMENT', 'Final HDR presentation must be depthless and single-sample');
           // The linear target persists between calls, so source color/depth/
           // stencil loads retain its prior contents before the final output pass.
           const clear = sceneFrame.clearColor ?? [0, 0, 0, 1];
           if ((!Array.isArray(clear) && !ArrayBuffer.isView(clear)) || clear.length !== 4)
             fail('FRAME', 'Expected an opaque RGBA clear color');
           sceneFrame.clearColor = Array.from(clear);
-          if (sceneFrame.clearColor.some(v => typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) ||
+          if (sceneFrame.clearColor.some(v => typeof v !== 'number' || !Number.isFinite(Math.fround(v)) || v < 0) || sceneFrame.clearColor[3] > 1 ||
               (!transparent && sceneFrame.clearColor[3] !== 1)) fail('FRAME', 'Opaque HDR canvas clear alpha must be one');
           live();
-          offscreen.resize(texture.width, texture.height);
+          offscreen.resize(canvas.width, canvas.height);
           offscreen.withFrame((attachments, source) => {
             const result = renderer.render(input, {...sceneFrame, ...attachments}, source);
             if (result && typeof result.then === 'function') {
@@ -112,7 +120,11 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
               fail('ASYNC_RENDER', 'Scene rendering must submit synchronously');
             }
             live();
-            finalOutput.render({source, target: texture, ...selected});
+            // Even a filtered source output pass acquires its canvas target.
+            // Only its quad draw is suppressed; successful empty passes retain
+            // the same presentation lifecycle as the pinned renderer.
+            const target = typeof texture === 'function' ? texture() : texture;
+            if (outputEnabled) finalOutput.render({source, target, ...selected});
           });
           live(); return api;
         } catch (error) { return childFailure(error); }
@@ -124,6 +136,14 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
         try { await wait(renderer.prepare?.()); live(); return api; }
         catch (error) { return childFailure(error); }
         finally { preparing = false; }
+      },
+      async whenReady() {
+        live();
+        // Output construction already awaited its checked pipeline creation.
+        // No frame has been submitted here; unrelated GPU work must not delay
+        // renderer initialization or admission of its first animation frame.
+        await wait(Promise.all([renderer.whenIdle(), offscreen.validation]));
+        live(); return api;
       },
       async whenIdle() {
         live(); if (busy || preparing) fail('REENTRANT', 'Cannot await HDR idle during another operation');

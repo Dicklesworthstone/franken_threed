@@ -38,7 +38,8 @@ function sourceBuilder(f) {
   const builder = new THREE.WGSLNodeBuilder(f.object, f.renderer);
   builder.material = f.material; builder.context.material = f.material;
   builder.scene = f.scene; builder.camera = f.camera;
-  builder.lightsNode = N.lights([]); builder.environmentNode = N.texture(f.scene.environment);
+  builder.lightsNode = N.lights([]);
+  builder.environmentNode = f.scene.environmentNode?.isNode ? f.scene.environmentNode : N.texture(f.scene.environment);
   builder.build(); return builder;
 }
 
@@ -98,12 +99,28 @@ test('material environment replacement, scene fallback and removal preserve prio
   assert.equal(f.programs.diagnostics.programs, 1);
 });
 
-test('a material override leaves an unused custom scene environment inert', t => {
-  const f = fixture(t); f.scene.environmentNode = N.vec3(.25, .5, 1);
-  const descriptor = f.compile();
-  assert.ok(sampled(f.programs.captureDraw(descriptor, f.context)).includes(f.material.envMap));
+test('a material environment overrides the scene node until its removal restores source scene lighting', t => {
+  const f = fixture(t), materialMap = f.material.envMap;
+  const color = new THREE.Color(.1875, .625, .9375); let updates = 0;
+  f.scene.environmentNode = N.uniform(color).onObjectUpdate(() => { updates++; return color; });
+  const descriptor = f.compile(), before = f.programs.captureDraw(descriptor, f.context);
+  assert.ok(sampled(before).includes(materialMap));
+  assert.ok(!sampled(before).includes(f.scene.environment));
+  assert.equal(updates, 0, 'the overridden scene environment stays inactive');
   f.material.envMap = null;
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'});
+  assert.throws(() => f.programs.captureDraw(descriptor, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 0, 'the stale graph rejects before entering the newly selected scene node');
+  const reference = sourceBuilder(f), fallback = f.compile();
+  assert.notEqual(fallback, descriptor);
+  assert.equal(fallback.vertex, reference.vertexShader);
+  assert.equal(fallback.fragment, reference.fragmentShader);
+  const after = f.programs.captureDraw(fallback, {...f.context, renderId: 2});
+  assert.equal(updates, 1);
+  assert.ok(!sampled(after).includes(materialMap));
+  assert.ok(!sampled(after).includes(f.scene.environment), 'the procedural scene node also overrides the scene texture');
+  for (const value of [.1875, .625, .9375, .0625]) assert.ok(values(after).includes(value));
+  assert.ok(!values(after).includes(.375), 'scene intensity replaces the former material intensity');
+  assert.ok(sampled(before).includes(materialMap), 'the earlier capture retains its accepted material texture');
 });
 
 test('sharing the same map between scene and material preserves source ownership transitions', t => {

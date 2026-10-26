@@ -119,8 +119,8 @@ export function inspectThreeNativePass(three, renderer, node) {
   if (Object.keys(node._previousTextureNodes).some(name => node._previousTextures[name] === undefined))
     fail('Native color histories require their source previous textures');
   inspectThreeMRT(three, {getRenderTarget: () => node.renderTarget, getMRT: () => node._mrt, _device: renderer._device});
-  if (node.contextNode !== null || node.transparent !== true || node.opaque !== true)
-    fail('Native scene passes currently require ordinary context and both opaque and transparent draws');
+  if (node.contextNode !== null)
+    fail('Native scene passes currently require ordinary context');
   if (renderer.getOutputRenderTarget() !== null || renderer.xr?.isPresenting)
     fail('Native scene passes currently target the ordinary canvas output');
   if (histories.length) {
