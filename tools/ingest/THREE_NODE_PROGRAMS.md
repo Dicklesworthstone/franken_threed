@@ -35,8 +35,9 @@ material lighting nodes, including independent UV channels, live intensities and
 source diffuse/specular occlusion. Authored `aoNode` graphs use the same lighting
 context. Basic light maps keep their source normalization and do not start
 consuming scene analytic lights. Ordinary AO-only materials retain their existing
-fixed path; AO also composes with native graphs and Physical features. Material
-environment maps still require an additional lighting adapter.
+fixed path; AO also composes with native graphs and Physical features. Standard
+and Physical material environment maps compose with these native graphs through
+the pinned source environment nodes and PMREM owner.
 
 Automatically selected native materials capture active lobe values and map image
 versions independently for queued renders. Ordinary fixed-path requests now also
@@ -128,8 +129,13 @@ program. The source's shared 16×16 RG16F DFG lookup texture goes through the sa
 versioned texture owner as authored textures, preserving its aliasing across
 materials and clearcoat samples.
 
-Native Standard and Physical graphs also use ready 2D equirectangular or source
-CubeUV `scene.environment` textures. The pinned native `PMREMGenerator` supplies
+Native Standard and Physical graphs also use ready 2D equirectangular, source
+CubeUV or six-face CPU-data cube textures as `scene.environment` or material
+`envMap`. A material map overrides the scene environment and uses its own
+`envMapIntensity` and `envMapRotation`; scene fallback retains the scene controls.
+Changing this ownership selects a fresh graph even when both properties share
+the same texture. Stale captures reject before authored node callbacks run.
+The pinned native `PMREMGenerator` supplies
 conversion/filter graphs and atlas layout; FrankenThreeD captures and submits
 those ordinary node draws through its own renderer. Generated PMREM targets and
 the source DFG texture are borrowed through the same versioned texture owner.
@@ -154,7 +160,7 @@ output target remains caller-owned and sampleable after generator disposal.
 conversion and GGX filtering, and returns an ordinary CubeUV atlas for native
 PBR environments. The WebGL/core placeholder route retains its existing behavior.
 
-A same-size equirectangular input can set `needsPMREMUpdate = true` between
+A same-size equirectangular or cube input can set `needsPMREMUpdate = true` between
 native renders and regenerate its existing atlas. The cached graph must place
 its exact source PMREM before-updates at the first draw boundary. A private
 native sky is always first; a scene without that sky must have no selected
@@ -168,9 +174,15 @@ simultaneous graph recompilation, and unsafe mixed fixed/native foreground
 ordering fail with `THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before the unsafe
 work runs. Atlas resizing still requires a fresh PMREM node. Replacing the source
 texture remains admitted; directly supplied CubeUV textures keep their ordinary
-upload-version behavior. Direct cube environment inputs, custom environment nodes and
-the compatibility adapter's placeholder PMREM textures remain outside this
-native profile.
+upload-version behavior. Custom environment nodes and the compatibility adapter's
+placeholder PMREM textures remain outside this native profile.
+
+Material-environment regressions compare complete vertex and fragment WGSL with
+the pinned builder for ordinary and Node Standard/Physical materials. Recording
+GPU tests execute automatic cube conversion, shared atlas use, six-face upload
+versions, replacement and refresh ordering through the F3D renderer. These checks
+establish source construction, capture and submission behavior; browser pixel
+parity and physical-device performance for these combinations remain unverified.
 
 Native panoramic backgrounds use the pinned source sphere, camera projection,
 far-plane placement and PMREM sampling graph. Equirectangular backgrounds with
@@ -214,9 +226,9 @@ each accepted upload version, preserving earlier draws after later CPU edits.
 Float filtering retains the existing device-feature checks.
 
 Decoded-image cubes, render-target cubes and unsampled cube loads remain outside
-this profile. Cube textures cannot occupy ordinary material map slots or be
-assigned directly as native scene environments; use the public generator's
-CubeUV result for environment lighting.
+this profile. Cube textures cannot occupy ordinary 2D material map slots. The
+CPU-data cube profile is admitted for native Standard/Physical environment
+lighting, either directly or through the public generator's CubeUV result.
 
 Authored `texture()` graphs sample ordinary 2D data, decoded image/canvas and
 resolved color render-target textures. The pinned builder owns UV channel and
@@ -430,14 +442,14 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, direct cube/custom environment lighting, area/probe and other custom light models,
+PBR transmission/dispersion, custom environment lighting, area/probe and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions, fog/clipping/shadows, material-environment
-maps, wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
+The profile excludes shader context extensions, fog/clipping/shadows,
+wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and

@@ -47,8 +47,8 @@ const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskS
   'receivedShadowPositionNode', 'receivedShadowNode']);
 const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS, 'depthNode'];
 // These source material accessors lower to ordinary 2D texture bindings. AO and
-// light maps additionally retain their exact source material lighting nodes;
-// material environment maps still require a separate PMREM context.
+// light maps additionally retain their exact source material lighting nodes.
+// Environment maps use their separate source PMREM identity and context below.
 const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
   'specularMap', 'specularIntensityMap', 'specularColorMap', 'roughnessMap', 'metalnessMap', 'gradientMap',
   'clearcoatMap', 'clearcoatRoughnessMap', 'clearcoatNormalMap', 'sheenColorMap', 'sheenRoughnessMap',
@@ -446,15 +446,19 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function sourceEnvironment(material, {scene} = {}) {
     if (!standardPrototypes.includes(Object.getPrototypeOf(material)) || material.lights !== true ||
         material.fragmentNode != null || renderer.lighting?.enabled === false) return null;
-    if (scene?.environmentNode != null)
+    // A material environment overrides the scene, including its custom node.
+    // Keep the source material reference in the builder so the pinned accessors
+    // select envMapIntensity/envMapRotation at each logical draw.
+    if (!material.envMap && scene?.environmentNode != null)
       fail('ENVIRONMENT', 'Custom scene environment nodes require an explicit lighting context');
-    const texture = scene?.environment ?? null;
+    const texture = material.envMap || scene?.environment || null;
     return texture === null ? null : sourcePMREMTexture(texture);
   }
   function sourcePMREMTexture(texture) {
     if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource || texture.isStorageTexture ||
-        ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping].includes(texture.mapping))
-      fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image or source CubeUV texture');
+        ![three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping, three.CubeUVReflectionMapping,
+          three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping))
+      fail('ENVIRONMENT', 'Native PBR environments require a ready equirectangular image, CPU-data cube or source CubeUV texture');
     inspectTexture(texture);
     return texture;
   }
@@ -467,7 +471,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (target && texture.mapping !== three.CubeUVReflectionMapping && texture.isPMREMTexture !== true) {
       // Match the pinned generator's source size and CubeUV target allocation.
       // Resizing would dispose resources still held by accepted queued draws.
-      const size = 2 ** Math.floor(Math.log2(texture.image.width / 4));
+      const inputSize = texture.isCubeTexture
+        ? texture.image[0].width || texture.image[0].image.width : texture.image.width / 4;
+      const size = 2 ** Math.floor(Math.log2(inputSize));
       if (target.width !== 3 * Math.max(size, 16 * 7) || target.height !== 4 * size)
         fail('ENVIRONMENT_REFRESH', 'Changing a prepared PMREM source atlas size requires a new PMREMNode to preserve queued render work');
     }
@@ -659,6 +665,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
+        // sourceEnvironment validates only the selected, active PBR input.
+        if (key === 'envMap' && standard) continue;
         if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
         if (value.isCubeTexture || value.is3DTexture || value.isData3DTexture || value.isStorageTexture && value.isArrayTexture)
           fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
@@ -686,6 +694,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function sourceMaterialLighting(node, material) {
     if (!material || material.lights !== true || material.fragmentNode != null) return false;
     const prototype = Object.getPrototypeOf(node);
+    if (prototype === three.EnvironmentNode.prototype && standardPrototypes.includes(Object.getPrototypeOf(material))) {
+      const reference = node.envNode;
+      return material.envMap?.isTexture === true && reference instanceof three.MaterialReferenceNode &&
+        Object.getPrototypeOf(reference) === three.MaterialReferenceNode.prototype &&
+        reference.property === 'envMap' && reference.material === null &&
+        reference.uniformType === (material.envMap.isCubeTexture ? 'cubeTexture' : 'texture') &&
+        reference.updateReference === three.MaterialReferenceNode.prototype.updateReference;
+    }
     if (prototype === three.AONode.prototype)
       return (material.aoNode != null || material.aoMap?.isTexture === true) && node.aoNode === three.TSL.ambientOcclusion;
     if (material.lightMap?.isTexture !== true) return false;
@@ -774,7 +790,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
       inspectThreeMRT(three, renderer, material)?.key ?? null,
-      environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true, environment.isPMREMTexture === true] : null,
+      environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
+        environment.isPMREMTexture === true, material.envMap === environment] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
@@ -974,7 +991,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
-      environment, instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
+      environment, materialEnvironment: environment !== null && preparedMaterial.envMap === environment,
+      instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
@@ -1133,6 +1151,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (fogSignature(state.material, {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
   }
+  function checkEnvironment(state, context) {
+    const material = prepareMaterial(state.material), environment = sourceEnvironment(material, {scene: context.scene ?? state.builder.scene});
+    if (environment !== state.environment || (environment !== null && material.envMap === environment) !== state.materialEnvironment)
+      fail('CHANGED', 'Native material or scene environment changed; compile the graph again');
+  }
   function checkClipping(state, context) {
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
         state.material.alphaToCoverage !== state.alphaToCoverage ||
@@ -1143,6 +1166,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const object = context.object ?? state.object;
     checkPipelineContext(state, object);
     checkFog(state, context);
+    checkEnvironment(state, context);
     checkClipping(state, context);
     updateThreeNodeClipping(state.builder.clippingContext, context);
     checkMaterialMaps(state);
@@ -1183,6 +1207,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       assertSkinning(object, state.skinSignature);
       assertMorphs(object, state.morphSignature);
       checkFog(state, context);
+      checkEnvironment(state, context);
       checkAttributes(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
@@ -1200,6 +1225,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkAttributes(state);
       checkPipelineContext(state, object);
       checkFog(state, context);
+      checkEnvironment(state, context);
       checkClipping(state, context);
       const textures = readTextures(state);
       const storage = readStorage(state);

@@ -79,7 +79,7 @@ test('unsupported authored PMREM sources and custom subclasses refuse before cal
   const f = fixture(t); let calls = 0;
   f.multiplier.onObjectUpdate(() => { calls++; return 1; });
   f.pmrem.value = new THREE.CubeTexture();
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'});
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
   const storage = new THREE.StorageTexture(16, 16); storage.mapping = THREE.CubeUVReflectionMapping;
   f.pmrem.value = storage; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
   class CustomPMREM extends THREE.PMREMNode {}

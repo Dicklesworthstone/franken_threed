@@ -1735,7 +1735,7 @@ test('source material references switch correctly between alternating objects an
     assert.ok(floats(draw.uniforms).includes(value));
   }
 });
-test('source material conversion refuses unregistered classes, shader hooks and unsupported map dependencies', t => {
+test('source material conversion refuses unregistered classes, shader hooks and incompatible map inputs', t => {
   const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
   const Custom = class extends THREE.MeshStandardMaterial {};
   const custom = new Custom(); custom.positionNode = N.positionLocal;
@@ -1747,9 +1747,8 @@ test('source material conversion refuses unregistered classes, shader hooks and 
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.onBeforeCompile;
   material.customProgramCacheKey = () => 'custom';
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.customProgramCacheKey;
-  for (const slot of ['envMap']) {
-    material[slot] = dataTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'}); material[slot] = null;
-  }
+  material.envMap = dataTexture();
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'}); material.envMap = null;
   material.map = new THREE.CubeTexture(); assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
 });
 
