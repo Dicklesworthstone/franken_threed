@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { embedGltfAssets } from "./pack_gltf.mjs";
+import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -123,7 +124,7 @@ function edits(source, replacements) {
 // Bounded abstract evaluation, never execution of application code. Besides
 // literal choices, admit Rollup's emitted `(s => s === 'a' ? 'chunk-a' : ...)(choice)`
 // dispatch expressions. The original expression still executes once at runtime.
-function finiteImports(node, environment = new Map(), depth = 0) {
+function finiteImports(node, environment = new Map(), depth = 0, classify = null) {
   if (!node || depth > 64)
     fail("DYNAMIC_IMPORT_OPEN", "Dynamic import analysis exceeded its bound");
   if (node.type === "Literal" && typeof node.value === "string") return new Set([node.value]);
@@ -132,7 +133,7 @@ function finiteImports(node, environment = new Map(), depth = 0) {
   if (node.type === "Identifier" && environment.has(node.name))
     return new Set([environment.get(node.name)]);
   if (node.type === "SequenceExpression")
-    return finiteImports(node.expressions.at(-1), environment, depth + 1);
+    return finiteImports(node.expressions.at(-1), environment, depth + 1, classify);
   if (node.type === "ConditionalExpression") {
     const test = node.test;
     let known;
@@ -148,10 +149,10 @@ function finiteImports(node, environment = new Map(), depth = 0) {
       if (a !== undefined && b !== undefined) known = test.operator === "===" ? a === b : a !== b;
     }
     if (known !== undefined)
-      return finiteImports(known ? node.consequent : node.alternate, environment, depth + 1);
+      return finiteImports(known ? node.consequent : node.alternate, environment, depth + 1, classify);
     const result = new Set([
-      ...finiteImports(node.consequent, environment, depth + 1),
-      ...finiteImports(node.alternate, environment, depth + 1),
+      ...finiteImports(node.consequent, environment, depth + 1, classify),
+      ...finiteImports(node.alternate, environment, depth + 1, classify),
     ]);
     if (result.size > 64) fail("DYNAMIC_IMPORT_OPEN", "Too many dynamic import targets");
     return result;
@@ -166,16 +167,19 @@ function finiteImports(node, environment = new Map(), depth = 0) {
     node.callee.params.length === 1 &&
     node.callee.params[0].type === "Identifier"
   ) {
-    const values = finiteImports(node.arguments[0], environment, depth + 1),
+    const values = finiteImports(node.arguments[0], environment, depth + 1, classify),
       result = new Set();
     for (const value of values) {
       const nested = new Map(environment);
       nested.set(node.callee.params[0].name, value);
-      for (const target of finiteImports(node.callee.body, nested, depth + 1)) result.add(target);
+      for (const target of finiteImports(node.callee.body, nested, depth + 1, classify)) result.add(target);
       if (result.size > 64) fail("DYNAMIC_IMPORT_OPEN", "Too many mapped import targets");
     }
     return result;
   }
+  const classified = classify?.(node);
+  if (classified?.classification === "finite_set" && classified.candidates.length <= 64)
+    return new Set(classified.candidates);
   fail("DYNAMIC_IMPORT_OPEN", "Dynamic import target is not a bounded literal expression");
 }
 
@@ -724,6 +728,7 @@ export function packHtml(
         fail("WORKER_IMPORT", "Bare worker imports must be bundled before export");
       return workerModuleFor(local(value, from), kind, worker).data;
     };
+    const classifyImport = createDynamicImportClassifier(ast);
     function importSource(node, kind, urlSemantics = false, depth = 0) {
       if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
       const value = literal(node);
@@ -753,7 +758,7 @@ export function packHtml(
         importSource(ref, kind, true, depth + 1);
         return;
       }
-      const targets = [...finiteImports(node)];
+      const targets = [...finiteImports(node, new Map(), 0, classifyImport)];
       const chain = targets
         .map(
           (target) =>

@@ -27,6 +27,31 @@ expressions are admitted without evaluating or removing their preceding effects.
 Spreads, computed/accessor properties and unknown types fail before publication.
 The original options and extra attributes are retained for native evaluation.
 
+## Immutable lazy module selectors
+
+Module ingestion, bundling and standalone packing follow lexical `const` string
+bindings, including aliases captured by functions and finite conditional,
+concatenation, template and sequence-result expressions:
+
+```js
+const mode = selectMode() ? 'viewer' : 'editor';
+const entry = `./features/${mode}.mjs`;
+export const open = () => import(entry);
+```
+
+Both modules are included while `selectMode()` and the chosen import still run
+at their original boundaries. The source binding keeps its original value;
+only the import argument receives a URL mapping. Native lazy evaluation, module
+identity, live bindings, JSON attributes and temporal-dead-zone failures remain
+host-owned. Document modules and packed module-worker helpers share this rule.
+
+Parameters, mutable or imported bindings, destructured values and property/call
+results are not assumed constant. Lexical shadowing is respected, including
+function defaults and switch discriminants. Alias cycles and excessive expansion
+remain unresolved: analysis admits at most 128 candidates, 64 nested expression
+or alias steps and 64 KiB per expanded string; packing retains its 64-target
+limit. Classic scripts keep their existing conservative import analysis.
+
 ## URL-object imports
 
 `import(new URL('./decoder.mjs', import.meta.url))` is an executable dependency,
@@ -87,7 +112,8 @@ outside this standalone route.
 ## Validation and boundaries
 
 ```sh
-node --test tools/ingest/pack_module_graph.test.mjs \
+node --test tools/ingest/dynamic_import_constants.test.mjs \
+  tools/ingest/pack_module_graph.test.mjs \
   tools/ingest/pack_worker_realms.test.mjs \
   tools/ingest/pack_workers.test.mjs \
   tools/ingest/pack_classic_workers.test.mjs

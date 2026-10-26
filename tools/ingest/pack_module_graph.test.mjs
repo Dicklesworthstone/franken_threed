@@ -239,3 +239,59 @@ test("typed resources retain identity/file/byte limits and atomic output", (t) =
     assert.equal(fs.existsSync(f.output), false);
   }
 });
+
+for (const lane of ["document", "worker"]) {
+  test(`${lane}: constant lazy selectors preserve effects, module identity and live bindings`, async (t) => {
+    await equivalent(t, lane, {
+      "main.mjs": `const log=[];
+        const directory='./', name=(log.push('choose'),true)?'lazy':'other';
+        const entry=directory+name+'.mjs';
+        export async function run(){
+          const alias=entry;
+          const one=await import((log.push('source'),alias),(log.push('options'),{}));
+          one.update();
+          const two=await import(entry);
+          const distinct=await import(entry+'?copy#view');
+          return [one===two,one!==distinct,two.value,distinct.value,entry,log];
+        }`,
+      "lazy.mjs": "export {value,update} from './state.mjs';",
+      "other.mjs": "throw new Error('unselected module must stay lazy');",
+      "state.mjs": "export let value=1;export const update=()=>++value;",
+    }, {ok: true, value: [true, true, 2, 2, "./lazy.mjs", ["choose", "source", "options"]]});
+  });
+
+  test(`${lane}: constant JSON imports preserve native identity and unselected parse errors`, async (t) => {
+    await equivalent(t, lane, {
+      "main.mjs": `const log=[];
+        const entry=(log.push('choose'),false)?'./bad.json':'./settings.json';
+        export async function run(){
+          const one=await import(entry,(log.push('options'),{with:{type:'json'}}));
+          const alias=entry, two=await import(alias,{with:{type:'json'}});
+          return [one===two,one.default.value,log];
+        }`,
+      "bad.json": "not valid json",
+    }, {ok: true, value: [true, 42, ["choose", "options"]]});
+  });
+
+  test(`${lane}: constant import rewriting preserves temporal-dead-zone rejection`, async (t) => {
+    await equivalent(t, lane, {
+      "main.mjs": `export async function run(){const log=[];try{
+          const pending=import(entry,(log.push('options'),{}));
+          const entry='./lazy.mjs';await pending;return 'incorrect success';
+        }catch(error){return [error.name,log]}}`,
+      "lazy.mjs": "throw new Error('TDZ must prevent module execution');",
+    }, {ok: true, value: ["ReferenceError", []]});
+  });
+
+  test(`${lane}: mapped constant selectors emitted by the bundler remain packable`, async (t) => {
+    await equivalent(t, lane, {
+      "main.mjs": `const name=true?'./lazy.mjs':'./other.mjs';
+        export async function run(){
+          return (await import((s=>s==='./lazy.mjs'?'./chunks/lazy.mjs':
+            s==='./other.mjs'?'./chunks/other.mjs':s)(name))).value;
+        }`,
+      "chunks/lazy.mjs": "export const value=42;",
+      "chunks/other.mjs": "throw new Error('unselected chunk must stay lazy');",
+    }, {ok: true, value: 42});
+  });
+}

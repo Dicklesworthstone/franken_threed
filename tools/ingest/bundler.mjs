@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import * as walk from "acorn-walk";
 import { rollup } from "rollup";
 
-import { analyzeModuleAst, classifyDynamicImportArgument, classifyImportType } from "./ast_analyzer.mjs";
+import { analyzeModuleAst, createDynamicImportClassifier, classifyImportType } from "./ast_analyzer.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
@@ -397,6 +397,7 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
+        const classifyImport = createDynamicImportClassifier(ast);
         if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith("file:")) {
           const loaderEdits = threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
           if (loaderEdits.length) { edits.push(...loaderEdits); loaderResourceCalls = true; }
@@ -414,7 +415,7 @@ export function f3dRollupPlugin(options = {}) {
         walk.simple(ast, {
           ImportExpression: (node) => {
             if (!node.source) return;
-            const classified = classifyDynamicImportArgument(node.source);
+            const classified = classifyImport(node.source);
             const moduleType = classifyImportType(node);
             const candidates = classified.classification === "literal" && (moduleType === "json" || node.options)
               ? [classified.specifier] : classified.classification === "finite_set" ? classified.candidates : null;

@@ -67,7 +67,7 @@ function toSourceSpan(node, offsets = {}) {
  * - ConditionalExpression (both branches finite string expressions)
  *
  * Strictly rejects:
- * - Identifiers, CallExpressions, MemberExpressions, TaggedTemplateExpressions
+ * - Unresolved Identifiers, CallExpressions, MemberExpressions, TaggedTemplateExpressions
  * - Non-string Literals (numbers, booleans, null, regex)
  * - Binary operators other than '+'
  * - Expressions whose Cartesian expansion exceeds limit
@@ -76,8 +76,9 @@ function toSourceSpan(node, offsets = {}) {
  * @param {number} [limit=128] - Maximum number of candidates before aborting to nonliteral
  * @returns {string[] | null}
  */
-function extractFiniteStringCandidates(node, limit = 128) {
-  if (!node) return null;
+function extractFiniteStringCandidates(node, limit = 128, resolveIdentifier = null, depth = 0) {
+  if (!node || depth > 64) return null;
+  const expand = child => extractFiniteStringCandidates(child, limit, resolveIdentifier, depth + 1);
 
   switch (node.type) {
     case "Literal": {
@@ -86,6 +87,9 @@ function extractFiniteStringCandidates(node, limit = 128) {
       }
       return null;
     }
+
+    case "Identifier":
+      return resolveIdentifier?.(node) ?? null;
 
     case "TemplateLiteral": {
       if (node.expressions.length === 0) {
@@ -97,7 +101,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
 
       let current = [node.quasis[0].value.cooked ?? node.quasis[0].value.raw];
       for (let i = 0; i < node.expressions.length; i++) {
-        const exprCands = extractFiniteStringCandidates(node.expressions[i], limit);
+        const exprCands = expand(node.expressions[i]);
         if (!exprCands || exprCands.length === 0) return null;
 
         const nextQuasi = node.quasis[i + 1].value.cooked ?? node.quasis[i + 1].value.raw;
@@ -106,6 +110,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
         const next = [];
         for (const prefix of current) {
           for (const cand of exprCands) {
+            if (prefix.length + cand.length + nextQuasi.length > 65536) return null;
             next.push(prefix + cand + nextQuasi);
           }
         }
@@ -117,9 +122,9 @@ function extractFiniteStringCandidates(node, limit = 128) {
 
     case "BinaryExpression": {
       if (node.operator !== "+") return null;
-      const left = extractFiniteStringCandidates(node.left, limit);
+      const left = expand(node.left);
       if (!left || left.length === 0) return null;
-      const right = extractFiniteStringCandidates(node.right, limit);
+      const right = expand(node.right);
       if (!right || right.length === 0) return null;
 
       if (left.length * right.length > limit) return null;
@@ -127,6 +132,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
       const combined = [];
       for (const l of left) {
         for (const r of right) {
+          if (l.length + r.length > 65536) return null;
           combined.push(l + r);
         }
       }
@@ -137,9 +143,9 @@ function extractFiniteStringCandidates(node, limit = 128) {
 
     case "ConditionalExpression": {
       // Preserve effects in conditional tests by only collecting alternatives and leaving source unchanged
-      const consequent = extractFiniteStringCandidates(node.consequent, limit);
+      const consequent = expand(node.consequent);
       if (!consequent || consequent.length === 0) return null;
-      const alternate = extractFiniteStringCandidates(node.alternate, limit);
+      const alternate = expand(node.alternate);
       if (!alternate || alternate.length === 0) return null;
 
       const unique = Array.from(new Set([...consequent, ...alternate]));
@@ -148,7 +154,10 @@ function extractFiniteStringCandidates(node, limit = 128) {
     }
 
     case "ParenthesizedExpression":
-      return extractFiniteStringCandidates(node.expression, limit);
+      return expand(node.expression);
+
+    case "SequenceExpression":
+      return expand(node.expressions.at(-1));
 
     default:
       return null;
@@ -161,7 +170,7 @@ function extractFiniteStringCandidates(node, limit = 128) {
  * @param {any} sourceNode
  * @returns {{ classification: 'literal' | 'finite_set' | 'nonliteral', specifier: string | null, specifiers?: string[], finite_set?: string[], finiteSet?: string[], candidates?: string[] }}
  */
-export function classifyDynamicImportArgument(sourceNode) {
+export function classifyDynamicImportArgument(sourceNode, resolveIdentifier = null) {
   if (!sourceNode) {
     return { classification: "nonliteral", specifier: null };
   }
@@ -181,7 +190,7 @@ export function classifyDynamicImportArgument(sourceNode) {
   }
 
   // Complex finite expressions (binary '+', template interpolation, conditionals)
-  const candidates = extractFiniteStringCandidates(sourceNode, 128);
+  const candidates = extractFiniteStringCandidates(sourceNode, 128, resolveIdentifier);
   if (candidates && candidates.length > 0) {
     return {
       classification: "finite_set",
@@ -194,6 +203,83 @@ export function classifyDynamicImportArgument(sourceNode) {
   }
 
   return { classification: "nonliteral", specifier: null };
+}
+
+/** Resolve only immutable lexical string bindings, without evaluating their
+ * initializers or rewriting reads. All other declarations still shadow outer
+ * constants. Runtime selection, TDZ failures and initializer effects stay in
+ * the source; this proves a set of possible import URLs, not a constant value.
+ */
+export function createDynamicImportClassifier(ast) {
+  // Sloppy scripts can introduce bindings with direct eval/with. Their existing
+  // literal-only path remains conservative; ES modules are always strict.
+  if (ast.sourceType === "script") return node => classifyDynamicImportArgument(node);
+  const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap();
+  const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+  const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
+    "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
+  const classes = new Set(["ClassDeclaration", "ClassExpression"]);
+  const put = (scope, names, initializer = null) => {
+    if (!scopes.has(scope)) scopes.set(scope, new Map());
+    const bindings = scopes.get(scope);
+    for (const name of names) bindings.set(name, bindings.has(name) ? null : initializer);
+  };
+  walk.fullAncestor(ast, (node, _state, ancestors) => {
+    const parents = ancestors.slice(0, -1);
+    const containing = predicate => parents.findLast(predicate);
+    if (node.type === "Identifier") {
+      enclosing.set(node, parents.filter((parent, index) =>
+        (lexical.has(parent.type) || classes.has(parent.type)) &&
+        // A switch's case bindings are not in scope in its discriminant.
+        !(parent.type === "SwitchStatement" && ancestors[index + 1] === parent.discriminant)));
+    } else if (node.type === "VariableDeclaration") {
+      let scope;
+      if (node.kind === "var") {
+        scope = containing(parent => functions.has(parent.type) ||
+          parent.type === "Program" || parent.type === "StaticBlock");
+        // Body vars do not shadow a function's default parameter expressions.
+        if (functions.has(scope.type)) scope = scope.body;
+      } else scope = containing(parent => lexical.has(parent.type));
+      for (const declaration of node.declarations) {
+        put(scope, collectPatternIdentifiers(declaration.id),
+          node.kind === "const" && declaration.id.type === "Identifier" ? declaration.init : null);
+      }
+    } else if (node.type === "ImportDeclaration") {
+      put(ast, node.specifiers.map(specifier => specifier.local.name));
+    } else if (functions.has(node.type)) {
+      for (const parameter of node.params) put(node, collectPatternIdentifiers(parameter));
+      if (node.id) {
+        put(node, [node.id.name]);
+        if (node.type === "FunctionDeclaration") put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+      }
+    } else if (node.type === "CatchClause") {
+      put(node, collectPatternIdentifiers(node.param));
+    } else if (classes.has(node.type) && node.id) {
+      put(node, [node.id.name]);
+      if (node.type === "ClassDeclaration") put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+    }
+  });
+  let depth = 0;
+  const resolveIdentifier = node => {
+    const chain = enclosing.get(node) ?? [];
+    for (let index = chain.length - 1; index >= 0; index--) {
+      const bindings = scopes.get(chain[index]);
+      if (!bindings?.has(node.name)) continue;
+      const initializer = bindings.get(node.name);
+      if (!initializer || depth >= 64) return null;
+      if (values.has(initializer)) return values.get(initializer);
+      // A pending value breaks alias cycles; memoization also bounds repeated
+      // aliases whose source expression would otherwise expand exponentially.
+      values.set(initializer, null);
+      depth++;
+      const result = extractFiniteStringCandidates(initializer, 128, resolveIdentifier);
+      depth--;
+      values.set(initializer, result);
+      return result;
+    }
+    return null;
+  };
+  return node => classifyDynamicImportArgument(node, resolveIdentifier);
 }
 
 /** The native module goal, without evaluating import options. Sequence prefixes
@@ -753,9 +839,10 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 3. Classes and prototype writes
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
+  const classifyImport = createDynamicImportClassifier(ast);
   walk.ancestor(ast, {
     ImportExpression(node) {
-      const classified = classifyDynamicImportArgument(node.source);
+      const classified = classifyImport(node.source);
       const span = toSourceSpan(node, offsets);
       dynamicImports.push({
         ...classified,
