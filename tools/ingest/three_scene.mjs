@@ -101,6 +101,7 @@ export async function createGpuThreeScene(device,scene,{
   const colorMaterial=m=>m&&materialState(m).allowOverride===true&&passOverride!==null?passOverride:m;
   const colorMaterials=o=>sourceMaterials(o).map(colorMaterial).map(materialState);
   const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
+  const capturedNodeLight=o=>passNodeFrame?.nativeLights?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
@@ -376,8 +377,8 @@ export async function createGpuThreeScene(device,scene,{
     // list offscreen through programs: every draw takes the program route.
     programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&activeNodes.some(o=>sourceMaterials(o).some(m=>materialState(m)?.transmission>0));
     for(const object of activeNodes){
-      if(!nativeLightMode&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
-      if(object.isLight&&!programLightMode&&!nativeLightMode)light(object);
+      if(!nativeLightMode&&!capturedNodeLight(object)&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
+      if(object.isLight&&!programLightMode&&!nativeLightMode&&!capturedNodeLight(object))light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode&&!capturedNodeObject(object)){
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
             object.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||object.onAfterShadow!==three.Object3D.prototype.onAfterShadow)
@@ -1543,7 +1544,7 @@ export async function createGpuThreeScene(device,scene,{
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
-          else if(object.isLight){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
+          else if(object.isLight&&!capturedNodeLight(object)){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop&&!programRoute()){
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');

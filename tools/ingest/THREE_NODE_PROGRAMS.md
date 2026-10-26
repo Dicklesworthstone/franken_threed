@@ -98,6 +98,18 @@ hemisphere, directional, point and spot lights. They accept `normalNode` and
 `emissiveNode`; Phong also accepts `shininessNode` and `specularNode`. These slots
 compose with ordinary TSL arithmetic and the sampled texture graphs below.
 
+Source `LightProbe` irradiance is also available to ordinary and Node Toon,
+Lambert, Phong, Standard and Physical materials. The exact pinned `LightProbeNode`
+packs all nine spherical-harmonic coefficients with source intensity and FRAME
+updates. Queued draws retain separate coefficient bytes without rebuilding a
+compatible shader. Visible probes on the camera's layers select this route
+automatically; disabled or excluded probes retain each request's inactive state.
+Unlit meshes, sprites, lines and points keep their fixed path in mixed scenes,
+and probe children remain independently traversable. Probe-lit shadow receivers
+and casters use the existing shared native shadow owner; skipping a probe in the
+fixed path does not shift another light's shadow index. This does not implement
+light-probe grids or additional custom light models.
+
 Explicit `renderer.library.addLight(NodeClass, LightClass)` registrations can
 supply direct analytic illumination, including the pinned H7 `SunLight` and
 `SunLightNode` addons. The light must directly extend the source `Light`, and
@@ -144,6 +156,17 @@ intensity and rotation remain source uniforms; replacing the environment selects
 its corresponding atlas and preserves already queued draw bindings. A wholly
 native scene bypasses the separate fixed-material environment filter.
 
+Standard and Physical materials also accept authored `envNode` graphs. Procedural
+irradiance, explicit `pmremTexture()` inputs, direct texture nodes and material
+references use the pinned `EnvironmentNode` radiance, roughness, clearcoat and
+rotation contexts. An authored graph takes precedence over material and scene
+maps. Direct texture/reference replacements rebuild their source PMREM setup;
+context-wrapped texture expressions retain ordinary source graph semantics.
+Per-object updates and queued uniform values remain independent. Replacing or
+removing the environment graph rejects stale captures before callbacks, then
+allows a fresh graph to restore the source fallback. Custom scene
+`environmentNode` remains a separate unsupported context.
+
 The public native `PMREMGenerator.fromScene()`, `fromEquirectangular()` and
 `fromCubemap()` methods execute the pinned helper through F3D-owned render requests and return
 real CubeUV render targets. Scene generation supports the source capture size,
@@ -174,13 +197,16 @@ simultaneous graph recompilation, and unsafe mixed fixed/native foreground
 ordering fail with `THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before the unsafe
 work runs. Atlas resizing still requires a fresh PMREM node. Replacing the source
 texture remains admitted; directly supplied CubeUV textures keep their ordinary
-upload-version behavior. Custom environment nodes and the compatibility adapter's
-placeholder PMREM textures remain outside this native profile.
+upload-version behavior. Custom scene environment nodes and the compatibility
+adapter's placeholder PMREM textures remain outside this native profile.
 
 Material-environment regressions compare complete vertex and fragment WGSL with
 the pinned builder for ordinary and Node Standard/Physical materials. Recording
 GPU tests execute automatic cube conversion, shared atlas use, six-face upload
-versions, replacement and refresh ordering through the F3D renderer. These checks
+versions, replacement and refresh ordering through the F3D renderer. Authored
+environment tests also compare exact source WGSL and submit an ordinary material
+whose sole native feature is `envNode`, preserving two queued irradiance values.
+These checks
 establish source construction, capture and submission behavior; browser pixel
 parity and physical-device performance for these combinations remain unverified.
 
@@ -442,7 +468,8 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused. Authored
-PBR transmission/dispersion, custom environment lighting, area/probe and other custom light models,
+PBR transmission/dispersion, custom scene environment lighting, area lights,
+light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
