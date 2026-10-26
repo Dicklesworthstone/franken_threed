@@ -450,11 +450,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   const environmentEnabled = material => standardPrototypes.includes(Object.getPrototypeOf(material)) &&
     material.lights === true && material.fragmentNode == null && renderer.lighting?.enabled !== false;
-  const environmentGraph = material => environmentEnabled(material) ? material.envNode || null : null;
+  const environmentGraph = (material, {scene} = {}) => environmentEnabled(material)
+    ? material.envNode || (!material.envMap && scene?.environmentNode?.isNode ? scene.environmentNode : null) : null;
+  function environmentGraphKey(material, context) {
+    const node = environmentGraph(material, context);
+    return node ? JSON.stringify([sourceId(node), node.getCacheKey()]) : null;
+  }
   const materialEnvironment = (material, texture) => texture !== null && !material.envNode && material.envMap === texture;
   function sourceEnvironment(material, {scene} = {}) {
     if (!environmentEnabled(material)) return null;
-    const node = material.envNode;
+    const node = environmentGraph(material, {scene});
     // EnvironmentNode turns these two source inputs into renderer-cached PMREM
     // nodes. Include the resolved texture identity even when the authored node
     // itself is unchanged; a compatible replacement needs fresh source setup.
@@ -464,8 +469,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // A material environment overrides the scene, including its custom node.
     // Keep the source material reference in the builder so the pinned accessors
     // select envMapIntensity/envMapRotation at each logical draw.
-    if (!material.envMap && scene?.environmentNode != null)
-      fail('ENVIRONMENT', 'Custom scene environment nodes require an explicit lighting context');
     const texture = material.envMap || scene?.environment || null;
     return texture === null ? null : sourcePMREMTexture(texture);
   }
@@ -711,7 +714,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     const mrt = inspectThreeMRT(three, renderer, material);
-    const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => material[key]).filter(Boolean), ...(mrt?.nodes ?? [])];
+    const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => material[key]).filter(Boolean),
+      ...[environmentGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
@@ -811,7 +815,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
+  function keyOf(material, object, {camera, scene, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -822,7 +826,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
-      inspectThreeMRT(three, renderer, material)?.key ?? null,
+      inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
@@ -882,7 +886,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
     const lightsNode = lightingMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
     if (lightsNode) builder.lightsNode = lightsNode;
-    const environmentNode = environmentNodeFor(environment);
+    const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
     builder.fogNode = fogNodeFor(sourceFog(preparedMaterial, context));
     try { builder.build(); }
@@ -1025,7 +1029,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
-      environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraph(preparedMaterial),
+      environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
       instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
@@ -1187,9 +1191,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
   }
   function checkEnvironment(state, context) {
-    const material = prepareMaterial(state.material), environment = sourceEnvironment(material, {scene: context.scene ?? state.builder.scene});
+    const material = prepareMaterial(state.material), environmentContext = {scene: context.scene ?? state.builder.scene};
+    const environment = sourceEnvironment(material, environmentContext);
     if (environment !== state.environment || materialEnvironment(material, environment) !== state.materialEnvironment ||
-        environmentGraph(material) !== state.environmentGraph)
+        environmentGraphKey(material, environmentContext) !== state.environmentGraph)
       fail('CHANGED', 'Native material or scene environment changed; compile the graph again');
   }
   function checkTransmission(state) {

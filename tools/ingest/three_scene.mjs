@@ -387,7 +387,7 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowBlend==='reject'&&source.some(m=>materialState(m)?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
-    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
+    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null&&!passNodeFrame?.sceneEnvironmentNode&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
@@ -610,7 +610,9 @@ export async function createGpuThreeScene(device,scene,{
   }
   // Captured native node programs bind the source PMREM atlas themselves.
   // Keep the fixed environment owner only for scenes with fixed draws.
-  const coreEnvironment=()=>environmentEnabled&&!nativeLightMode&&!programEnvironmentOwned()?scene.environment:null;
+  // A captured scene environment node overrides the ordinary texture even
+  // when fixed unlit draws share the pass.
+  const coreEnvironment=()=>environmentEnabled&&!nativeLightMode&&!passNodeFrame?.sceneEnvironmentNode&&!programEnvironmentOwned()?scene.environment:null;
   let programCamera=null;
   /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
   function programLightList(camera){

@@ -747,7 +747,7 @@ test('PBR scene-color needs its copy owner and invalid environments refuse befor
     assert.doesNotThrow(() => f.compile()); f.material[slot] = null;
   }
   for (const slot of ['environment', 'environmentNode']) {
-    f.scene[slot] = slot === 'environment' ? dataTexture() : N.vec3(1);
+    f.scene[slot] = slot === 'environment' ? dataTexture() : N.texture(dataTexture());
     assert.throws(() => f.compile(), {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'}); f.scene[slot] = null;
   }
   f.material.lights = false; f.scene.environment = dataTexture();

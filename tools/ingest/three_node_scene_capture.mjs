@@ -33,6 +33,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const sortObjects = renderer?.sortObjects === true;
+  // Preserve the ignored ordinary environment across queued mixed-owner draws.
+  const sceneEnvironmentNode = root?.environmentNode?.isNode === true;
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
       !hasThreeNodeProgram(backgroundMesh.material)))
@@ -88,6 +90,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Non-PBR lighting models have no rectangular-light contribution, but their
   // source light node still constructs its LTC inputs and runs its lifecycle.
   const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene) && litMaterial(material);
+  // An authored scene environment belongs to the source PBR lighting graph.
+  // Material environments take precedence, while unused scene graphs stay inert.
+  const nativeEnvironmentMaterial = material => root.environmentNode?.isNode === true &&
+    renderer?.lighting?.enabled !== false && material?.lights !== false && material?.fragmentNode == null &&
+    !material?.envNode && !material?.envMap && ['MeshStandard', 'MeshPhysical'].some(name =>
+      material?.[`is${name}Material`] === true || material?.[`is${name}NodeMaterial`] === true);
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
   // established route; explicit node materials, ShadowMaterial and point-light
@@ -97,14 +105,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          nativeFeatures(material) || nativeLightMaterial(material) ||
+          nativeFeatures(material) || nativeLightMaterial(material) || nativeEnvironmentMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
   const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene
-    ? material != null : nativeFeatures(material) || nativeLightMaterial(material);
+    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeEnvironmentMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -193,7 +201,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     objects.add(object);
   }
   if (!bindings.length) {
-    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured) return null;
+    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode) return null;
     // The facade marks every captured pass as having updated source matrices,
     // including an empty pass. Hidden skins still participate in CPU animation.
     updateMatrices();
@@ -203,7 +211,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
-    return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, bindings: Object.freeze([]), draws: Object.freeze([]),
+    return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, sceneEnvironmentNode, bindings: Object.freeze([]), draws: Object.freeze([]),
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
@@ -491,7 +499,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   draws.splice(0, draws.length, ...capturedDraws);
   let preparedAttributes = null;
-  return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+  return Object.freeze({objects, excludedObjects, visibility, nativeLights, sortObjects, sceneEnvironmentNode, bindings: Object.freeze(bindings), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (uniforms) return;
       // compileAsync uploads visible geometry even though this preparation

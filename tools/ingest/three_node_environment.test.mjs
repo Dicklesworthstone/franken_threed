@@ -73,7 +73,7 @@ test('environment identity and removal select fresh graphs without rewriting ear
 test('unsupported environment inputs refuse before authored node updates; source-disabled lighting stays inert', t => {
   const f = fixture(t); let calls = 0;
   f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { calls++; return new THREE.Color(1, 0, 0); });
-  f.scene.environmentNode = N.vec3(1);
+  f.scene.environmentNode = N.texture(new THREE.Texture());
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'}); assert.equal(calls, 0);
   f.scene.environmentNode = null; f.scene.environment = new THREE.Texture();
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ENVIRONMENT'}); assert.equal(calls, 0);

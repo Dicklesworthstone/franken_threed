@@ -227,8 +227,17 @@ maps. Direct texture/reference replacements rebuild their source PMREM setup;
 context-wrapped texture expressions retain ordinary source graph semantics.
 Per-object updates and queued uniform values remain independent. Replacing or
 removing the environment graph rejects stale captures before callbacks, then
-allows a fresh graph to restore the source fallback. Custom scene
-`environmentNode` remains a separate unsupported context.
+allows a fresh graph to restore the source fallback.
+
+Scene `environmentNode` graphs now use the same pinned lighting context. Material
+`envNode` and `envMap` retain precedence; a valid scene node overrides the ordinary
+scene texture. Procedural irradiance, PMREM expressions, texture and material
+reference inputs preserve scene intensity, rotation and source update frequencies.
+Ordinary Standard/Physical materials automatically select native shading when
+they consume the graph. Fixed unlit draws in a mixed scene retain the captured
+override decision without loading the unused scene texture. Graph replacement,
+removal and source-invalidated structural changes select fresh programs; accepted
+uniforms and texture leases keep their per-request values.
 
 The public native `PMREMGenerator.fromScene()`, `fromEquirectangular()` and
 `fromCubemap()` methods execute the pinned helper through F3D-owned render requests and return
@@ -260,8 +269,8 @@ simultaneous graph recompilation, and unsafe mixed fixed/native foreground
 ordering fail with `THREE_NODE_PROGRAM_ENVIRONMENT_REFRESH` before the unsafe
 work runs. Atlas resizing still requires a fresh PMREM node. Replacing the source
 texture remains admitted; directly supplied CubeUV textures keep their ordinary
-upload-version behavior. Custom scene environment nodes and the compatibility
-adapter's placeholder PMREM textures remain outside this native profile.
+upload-version behavior. The compatibility adapter's placeholder PMREM textures
+remain outside this native profile.
 
 Material-environment regressions compare complete vertex and fragment WGSL with
 the pinned builder for ordinary and Node Standard/Physical materials. Recording
@@ -269,6 +278,10 @@ GPU tests execute automatic cube conversion, shared atlas use, six-face upload
 versions, replacement and refresh ordering through the F3D renderer. Authored
 environment tests also compare exact source WGSL and submit an ordinary material
 whose sole native feature is `envNode`, preserving two queued irradiance values.
+Scene-node coverage adds twelve source compiler cases and ten facade integration
+cases, including mixed fixed/native draws, disabled lighting, compilation without
+draw updates, shared shadows and real PMREM generation/refresh. The focused
+compiler/environment/capture checkpoint passes all 232 cases without skips.
 These checks
 establish source construction, capture and submission behavior; browser pixel
 parity and physical-device performance for these combinations remain unverified.
@@ -530,9 +543,8 @@ material. Original material visibility and render-list partitioning still apply.
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
-graphics graphs and multiple-render-target graphics graphs are refused. Authored
-custom scene environment lighting,
-light-probe grids and other custom light models,
+graphics graphs and multiple-render-target graphics graphs are refused.
+Light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, decoded-image cube, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs still require additional native profiles. Sampled
