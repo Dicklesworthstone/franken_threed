@@ -177,6 +177,7 @@ export async function createGpuThreeScene(device,scene,{
     const selected=backgroundScene().background;
     return passNodeFrame?.phases?.opaque!==false&&!passNodeFrame?.background&&selected!==null&&!selected?.isColor?selected:null;
   };
+  const sourceFog=()=>passNodeFrame?.sceneFogNode?null:scene.fog;
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
   const models=new Map([
@@ -299,7 +300,7 @@ export async function createGpuThreeScene(device,scene,{
     return shape;
   }
   function graph(){
-    if(fogEnabled)fogApi.inspectThreeFog(scene.fog,three);
+    if(fogEnabled)fogApi.inspectThreeFog(sourceFog(),three);
     const nodes=[],seen=new Set(),stack=[root];
     while(stack.length){
       const object=stack.pop();
@@ -399,7 +400,7 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowBlend==='reject'&&source.some(m=>materialState(m)?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
-    if((!fogEnabled&&scene.fog!==null)||(!environmentEnabled&&scene.environment!==null&&!passNodeFrame?.sceneEnvironmentNode&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
+    if((!fogEnabled&&sourceFog()!==null)||(!environmentEnabled&&scene.environment!==null&&!passNodeFrame?.sceneEnvironmentNode&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
@@ -1440,7 +1441,7 @@ export async function createGpuThreeScene(device,scene,{
       return {camera:child,frustum:childFrustum,viewProjection,viewport,
         lighting:{...(camera.isOrthographicCamera?{viewDirection:[child.matrixWorld.elements[8],child.matrixWorld.elements[9],child.matrixWorld.elements[10]]}:
           {cameraPosition:position(child)}),viewMatrix:child.matrixWorldInverse.elements.slice()},
-        fog:fogEnabled?fogApi.threeFogDescriptor(scene.fog,shadingCamera,three):null,
+        fog:fogEnabled?fogApi.threeFogDescriptor(sourceFog(),shadingCamera,three):null,
         // Pinned Background inserts a default-layer mesh after parent culling.
         background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(backgroundScene(),child):null};
     });
@@ -1497,7 +1498,7 @@ export async function createGpuThreeScene(device,scene,{
       // An empty ArrayCamera has no culling frustums, but upstream's draw path
       // falls back to the parent camera for objects with frustumCulled=false.
       const singleCamera=arrayViews?.length===0?Object.assign(Object.create(camera),{isArrayCamera:false}):camera;
-      const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(scene.fog,singleCamera,three):null;
+      const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(sourceFog(),singleCamera,three):null;
       const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(backgroundScene(),singleCamera)??null:null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transmissive=[],transparent=[],transmissionBacks=[],stack=[{object:root,groupOrder:0}],descriptions=new Map(),projectionOrder=new Map();

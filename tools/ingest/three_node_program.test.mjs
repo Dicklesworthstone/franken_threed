@@ -186,7 +186,8 @@ function sourceFogBuilder(f) {
   builder.scene = f.scene; builder.camera = f.camera;
   // The retained NodeManager.updateFog graph is the shader oracle. Keep its
   // references and group, with no local fog equation or named replacement.
-  if (fog && f.material.fog === true) {
+  if (f.scene.fogNode && f.material.fog === true) builder.fogNode = f.scene.fogNode;
+  else if (fog && f.material.fog === true) {
     const color = N.reference('color', 'color', fog).setGroup(N.renderGroup);
     builder.fogNode = fog.isFogExp2
       ? N.fog(color, N.densityFogFactor(N.reference('density', 'float', fog).setGroup(N.renderGroup)))
@@ -256,13 +257,95 @@ test('material fog:false excludes ordinary and authored scene fog from its nativ
   f.scene.fogNode = N.vec4(.5);
   assert.equal(f.compile(), d); f.owner.capture(d, f.context);
   f.material.fog = true;
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_FOG'});
+  const enabled = f.compile();
+  assert.notEqual(enabled, d); assert.equal(enabled.fragment, sourceFogBuilder(f).fragmentShader);
 });
 test('native fog identity changes made by a source update cannot submit a stale graph', t => {
   const f = rig(t); f.scene.fog = new THREE.Fog(0, 1, 8);
   f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { f.scene.fog = new THREE.FogExp2(0, .25); });
   const d = f.compile();
   assert.throws(() => f.owner.capture(d, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+});
+test('authored height fog retains exact source WGSL and overrides ordinary scene fog', t => {
+  const f = rig(t), density = N.uniform(.0625), height = N.uniform(2.5);
+  f.scene.fog = new THREE.Fog(new THREE.Color(.875, .9375, .8125), 3, 9);
+  f.scene.fogNode = N.fog(N.color(.125, .25, .5), N.exponentialHeightFogFactor(density, height));
+  const descriptor = f.compile(), source = sourceFogBuilder(f);
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  const first = f.owner.capture(descriptor, f.context), saved = first.map(bytes => bytes.slice());
+  assert.ok(floats(first).includes(.0625)); assert.ok(floats(first).includes(2.5));
+  assert.ok(!floats(first).includes(.875));
+  f.scene.fog = new THREE.FogExp2(0xffffff, .9); density.value = .1875; height.value = 4.5;
+  assert.equal(f.compile(), descriptor, 'unused ordinary fog does not replace the authored graph');
+  const second = f.owner.capture(descriptor, {...f.context, renderId: 2});
+  assert.ok(floats(second).includes(.1875)); assert.ok(floats(second).includes(4.5));
+  assert.deepEqual(first, saved);
+});
+test('shared authored fog keeps source frame/render/object update frequencies and draw context', t => {
+  const f = rig(t), calls = {frame: 0, render: 0, object: 0}, contexts = [];
+  const perFrame = N.uniform(.125).onFrameUpdate(context => { calls.frame++; contexts.push(context.scene); return .125; });
+  const perRender = N.uniform(.25).onRenderUpdate(context => { calls.render++; contexts.push(context.scene); return context.scene.userData.fog; });
+  const perObject = N.uniform(.5).onObjectUpdate(context => { calls.object++; contexts.push(context.scene); return context.object.userData.fog; });
+  f.scene.userData.fog = .3125; f.object.userData.fog = .4375;
+  f.scene.fogNode = N.fog(N.vec3(perFrame, perRender, perObject), N.float(.5));
+  const other = new THREE.Mesh(f.object.geometry, f.material); other.userData.fog = .9375; f.scene.add(other);
+  f.scene.updateMatrixWorld();
+  const a = f.compile(), context = {...f.context, object: other}, b = f.owner.compile(f.material, other, context);
+  assert.deepEqual(calls, {frame: 0, render: 0, object: 0});
+  const first = f.owner.capture(a, f.context), saved = first.map(bytes => bytes.slice()), second = f.owner.capture(b, context);
+  assert.deepEqual(calls, {frame: 1, render: 1, object: 2});
+  assert.ok(floats(first).includes(.4375)); assert.ok(floats(second).includes(.9375));
+  f.scene.userData.fog = .6875;
+  const third = f.owner.capture(a, {...f.context, renderId: 2}); assert.ok(floats(third).includes(.6875));
+  assert.deepEqual(calls, {frame: 1, render: 2, object: 3});
+  f.owner.capture(b, {...context, renderId: 3, frameId: 2});
+  assert.deepEqual(calls, {frame: 2, render: 3, object: 4});
+  assert.ok(contexts.every(scene => scene === f.scene)); assert.deepEqual(first, saved);
+});
+test('authored fog replacement, structural changes and removal rebuild before updates', t => {
+  const f = rig(t); let updates = 0;
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { updates++; return new THREE.Color(.25, .5, .75); });
+  f.scene.fog = new THREE.Fog(0x88aabb, 1, 8);
+  f.scene.fogNode = N.vec4(.125, .25, .5, 1);
+  let descriptor = f.compile();
+  f.owner.capture(descriptor, f.context);
+  for (const change of [
+    () => { f.scene.fogNode = N.vec4(N.float(.5), N.float(.25), N.float(.125), N.float(1)); },
+    () => { f.scene.fogNode.node.nodes[0] = N.float(.75); f.scene.fogNode.needsUpdate = true; },
+    () => { f.scene.fogNode = null; },
+  ]) {
+    change(); const previous = updates;
+    assert.throws(() => f.owner.capture(descriptor, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(updates, previous);
+    const next = f.compile(); assert.notEqual(next, descriptor); descriptor = next;
+    assert.equal(descriptor.fragment, sourceFogBuilder(f).fragmentShader);
+    f.owner.capture(descriptor, {...f.context, renderId: updates + 1});
+  }
+  assert.deepEqual(fogValues(descriptor, f.owner.capture(descriptor, {...f.context, renderId: 5}), false).slice(-2), [1, 8]);
+});
+test('fog texture inputs retain native bindings and current per-draw texture identity', t => {
+  const f = rig(t), firstTexture = dataTexture(), input = N.texture(firstTexture);
+  firstTexture.needsUpdate = true;
+  f.scene.fogNode = N.fog(input.rgb, N.float(.375));
+  const descriptor = f.compile(); assert.equal(descriptor.fragment, sourceFogBuilder(f).fragmentShader);
+  const first = f.owner.captureDraw(descriptor, f.context);
+  assert.ok(first.textures.some(binding => binding.texture === firstTexture));
+  const secondTexture = dataTexture(); secondTexture.needsUpdate = true; input.value = secondTexture;
+  assert.equal(f.compile(), descriptor);
+  const second = f.owner.captureDraw(descriptor, {...f.context, renderId: 2});
+  assert.ok(second.textures.some(binding => binding.texture === secondTexture));
+  assert.ok(!second.textures.some(binding => binding.texture === firstTexture));
+  assert.ok(first.textures.some(binding => binding.texture === firstTexture));
+});
+test('inactive fog graphs remain inert and active graphs undergo the complete native admission checks', t => {
+  const f = rig(t);
+  f.scene.fogNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat();
+  f.material.fog = false; assert.doesNotThrow(f.compile);
+  f.material.fog = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  f.scene.fogNode = N.vec4(.5);
+  f.material.colorNode = N.uniform(new THREE.Color()).onObjectUpdate(() => { f.scene.fogNode = N.vec4(.25); });
+  const descriptor = f.compile();
+  assert.throws(() => f.owner.captureDraw(descriptor, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
 });
 function pbrRig(t, Material = THREE.MeshStandardNodeMaterial, parameters = {}) {
   const f = rig(t), material = new Material(parameters);
@@ -1558,7 +1641,7 @@ for (const [name, change, code] of [
   ['transparent double side', f => { f.material.side = THREE.DoubleSide; f.material.transparent = true; }, 'RASTER'],
   ['custom renderer context', f => { f.renderer.contextNode = N.context({getOutput: output => output}); }, 'GRAPH'],
   ['spoofed instancing', f => { f.object.isInstancedMesh = true; }, 'OBJECT'],
-  ['authored scene fog', f => { f.scene.fogNode = N.vec4(.5); }, 'FOG'],
+  ['invalid scene fog graph', f => { f.scene.fogNode = {fog: true}; }, 'FOG'],
 ]) test(`${name} is explicitly refused`, t => {
   const f = rig(t); change(f); assert.throws(f.compile, {code: `THREE_NODE_PROGRAM_${code}`});
 });

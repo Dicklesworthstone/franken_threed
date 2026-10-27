@@ -48,6 +48,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Native PBR owns node/cube environments. Fixed companions and inactive
   // lighting must not acquire the legacy panorama owner for these inputs.
   const sceneEnvironmentNode = root?.environmentNode?.isNode === true || root?.environment?.isCubeTexture === true;
+  // Keep the accepted source selection even when queued preparation observes a
+  // later graph replacement. The fixed adapter must not apply scene.fog again.
+  const sceneFogNode = !!root?.fogNode;
   const lightingContext = inspectThreeLightingContext(three, renderer?.contextNode);
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
@@ -127,6 +130,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     renderer?.lighting?.enabled !== false && material?.lights !== false && material?.fragmentNode == null &&
     !material?.envNode && !material?.envMap && ['MeshStandard', 'MeshPhysical'].some(name =>
       material?.[`is${name}Material`] === true || material?.[`is${name}NodeMaterial`] === true);
+  const nativeFogMaterial = material => sceneFogNode && material?.fog === true;
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
   // established route; explicit node materials, ShadowMaterial and point-light
@@ -137,14 +141,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) ||
+          nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
   const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene
-    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material);
+    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -254,7 +258,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       objects.add(draw.object); bundleObjects.add(draw.object);
     }
   if (!bindings.length) {
-    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && renderLists === null) return null;
+    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null) return null;
     phases.opaque = listEnabled('opaque'); phases.transparent = listEnabled('transparent'); phases.output = phases.opaque;
     // The facade marks every captured pass as having updated source matrices,
     // including an empty pass. Hidden skins still participate in CPU animation.
@@ -266,7 +270,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
-    return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sortObjects, sceneEnvironmentNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
+    return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
@@ -716,7 +720,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   draws.splice(0, draws.length, ...capturedDraws);
   let preparedAttributes = null;
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, bundleGeometries: Object.freeze(bundleGeometries),
-    sortObjects, sceneEnvironmentNode, phases: Object.freeze(phases), bindings: Object.freeze([...compiledBindings]), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+    sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([...compiledBindings]), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (uniforms) return;
       // compileAsync uploads visible geometry even though this preparation

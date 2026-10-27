@@ -680,12 +680,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ...['transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']
         .map(key => sourceId(material[key]))]);
   }
+  function fogGraph(material, {scene} = {}) {
+    // NodeManager.getFogNode gives a truthy authored graph precedence over the
+    // ordinary fog, while NodeMaterial.setupOutput consumes it only when enabled.
+    const node = material.fog === true ? scene?.fogNode || null : null;
+    if (node && (node.isNode !== true || typeof node.getCacheKey !== 'function'))
+      fail('FOG', 'Native scene fog graphs require a source TSL node');
+    return node;
+  }
   function sourceFog(material, {scene} = {}) {
-    // NodeMaterial.setupOutput applies fog only for the exact enabled flag.
-    // An authored scene fog graph has a separate context contract; never omit
-    // it silently or replace it with the ordinary scene.fog fallback.
-    if (material.fog !== true) return null;
-    if (scene?.fogNode) fail('FOG', 'Authored scene.fogNode graphs require an explicit native fog context');
+    if (material.fog !== true || fogGraph(material, {scene})) return null;
     const fog = scene?.fog;
     if (fog == null) return null;
     const linear = Object.getPrototypeOf(fog) === three.Fog.prototype,
@@ -697,8 +701,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return fog;
   }
   function fogSignature(material, context) {
-    const fog = sourceFog(material, context);
-    return JSON.stringify([material.fog === true, sourceId(fog), fog ? fog.isFogExp2 ? 'exp2' : 'linear' : null]);
+    const node = fogGraph(material, context), fog = sourceFog(material, context);
+    return JSON.stringify([material.fog === true, sourceId(fog), fog ? fog.isFogExp2 ? 'exp2' : 'linear' : null,
+      node ? [sourceId(node), node.getCacheKey()] : null]);
   }
   function fogNodeFor(fog) {
     if (!fog) return null;
@@ -782,7 +787,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const mrt = inspectThreeMRT(three, renderer, material);
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => material[key]).filter(Boolean),
-      ...[environmentGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
+      ...[environmentGraph(material, context), fogGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
@@ -969,7 +974,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (lightsNode) builder.lightsNode = lightsNode;
     const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
-    builder.fogNode = fogNodeFor(sourceFog(preparedMaterial, context));
+    builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
     try { builder.build(); }
     catch (cause) {
       if (cause instanceof ThreeNodeProgramError) throw cause;
@@ -1360,7 +1365,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function checkFog(state, context) {
     if (fogSignature(prepareMaterial(state.material), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
-      fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
+      fail('CHANGED', 'Native scene fog identity, graph, kind or material enable flag changed; compile the graph again');
   }
   function checkEnvironment(state, context) {
     const material = prepareMaterial(state.material), environmentContext = {scene: context.scene ?? state.builder.scene};
