@@ -971,6 +971,60 @@ and transfer ordering. Browser scenarios are `native_pipeline_history`,
 `native_pipeline_history_resize` and `native_pipeline_history_accumulation`;
 the accumulation scenario uses four samples.
 
+## Native Bloom and Gaussian blur
+
+The pinned `bloom` and `gaussianBlur` addons execute their original TSL graphs
+and source `updateBefore` passes through the native renderer. Bloom retains its
+luminance filter, five horizontal/vertical blur pairs and composite; Gaussian
+blur retains its two separable passes, direction, kernel and alpha options.
+They compose with scene passes, named MRT color outputs, ordinary node materials
+and a `RenderPipeline` targeting either the canvas or a native default output
+target. For example:
+
+```js
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import { gaussianBlur } from 'three/addons/tsl/display/GaussianBlurNode.js';
+
+const scenePass = TSL.pass(scene, camera);
+const color = scenePass.getTextureNode();
+const softened = gaussianBlur(color);
+const glow = bloom(softened, 0.8, 0.3, 1);
+const pipeline = new THREE.RenderPipeline(renderer, color.add(glow));
+pipeline.render();
+```
+
+The shared producer adapter discovers the source node's finite private target
+set and accepts shared material contexts constructed by the retained builder.
+It does not select shaders by effect name. Source `NodeFrame` frequency controls
+remain authoritative, so repeated renders in one logical frame reuse the effect
+output. Each accepted pass captures its uniforms and GPU texture dependencies;
+intermediate colors stay on the GPU. Source-driven size changes preserve earlier
+queued generations while retaining the existing target budget. Explicit effect
+disposal invalidates queued dependents, and failed updates restore the effect's
+temporary renderer controls.
+
+Small Bloom outputs can reduce their last private level to a logical zero size.
+Like pinned `Textures.getSize()`, native 2D targets retain one backing texel in a
+zero dimension while preserving the source target dimensions and zero viewport.
+That backing allocation is charged to the budget, and queued resizes through
+zero retain the same generation-lifetime rules.
+
+This surface requires ordinary frame-update effects with directly owned 2D
+targets and stable attachment formats during queued resizes. It does not admit
+arbitrary application-created material contexts or view-offset histories, and
+does not establish full temporal addon support. The actual pinned addon tests
+cover pass order, composition, frame reuse, shared-material uniform snapshots,
+queued controls and resize, GPU-only intermediates, disposal and failure cleanup.
+
+Chromium 151/SwiftShader differentials matched all 4,096 RGBA16F channel words
+exactly across four asymmetric 16x16 HDR cases: scene-pass Gaussian, scene-pass
+Bloom, original color plus Bloom(Gaussian), and direct-texture Gaussian with
+premultiplied alpha, half resolution, custom direction and sigma. Both renderers
+used the same identity-swizzle adapter; there were no GPU validation errors and
+no numeric tolerance. The comparison explicitly unpacked the pinned source's
+padded readback rows; this establishes image-content parity, not equality of the
+returned readback array layout. Native readbacks remain tightly packed.
+
 ## Native clipping groups
 
 Source `ClippingGroup` planes apply to native built-in and node-material meshes,

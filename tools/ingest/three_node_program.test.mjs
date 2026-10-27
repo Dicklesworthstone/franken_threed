@@ -873,8 +873,8 @@ test('source texture channel, UV matrix and native color-space metadata survive 
   assert.equal(f.compile(), d); assert.ok(floats(second.uniforms).includes(.625));
   assert.deepEqual(first.uniforms, saved);
 });
-test('compatible texture replacement reuses shaders and captures each logical update exactly once', t => {
-  const f = rig(t), a = dataTexture(), b = dataTexture(), sampled = N.texture(a), contexts = [];
+test('compatible byte/half-float texture replacement reuses shaders and captures each logical update exactly once', t => {
+  const f = rig(t), a = dataTexture(), b = dataTexture({type: THREE.HalfFloatType}), sampled = N.texture(a), contexts = [];
   b.offset.x = .75; let after = 0;
   const gain = N.uniform(.5).onObjectUpdate(frame => { contexts.push(frame.object); return .5; });
   gain.updateAfterType = 'object'; gain.updateAfter = () => { after++; };

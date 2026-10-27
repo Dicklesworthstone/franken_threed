@@ -50,6 +50,7 @@ export class ThreeRenderTargetError extends Error {
 }
 const fail = (code, message) => { throw new ThreeRenderTargetError(code, message); };
 const positive = n => Number.isSafeInteger(n) && n > 0;
+const extent = n => Number.isSafeInteger(n) && n >= 0;
 
 function inspectCubeFaces(texture, target, kind) {
   const faces = texture.image;
@@ -72,8 +73,13 @@ function depthComparison(texture, three) {
 
 function inspectThreeRenderTargetColor(target, three, texture) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
-  if (!positive(target.width) || !positive(target.height)) fail('SIZE', 'Target dimensions must be positive integers');
   const cube = target.isCubeRenderTarget === true;
+  if (!extent(target.width) || !extent(target.height) || cube && (!target.width || !target.height))
+    fail('SIZE', 'Target dimensions must be non-negative integers, or positive integers for cubes');
+  // Source Textures.getSize allocates one texel for a zero image dimension.
+  // Keep the logical target/viewport unchanged: Bloom's final small-image mip
+  // can have a zero viewport, while its cleared backing texture is still sampled.
+  const width = target.width || 1, height = target.height || 1;
   if (target.isWebGLCubeRenderTarget || target.depth !== 1 || target.multiview)
     fail('UNSUPPORTED', 'Only 2D or native cube render targets are admitted');
   if (cube && (typeof three.CubeRenderTarget !== 'function' || !(target instanceof three.CubeRenderTarget)))
@@ -154,7 +160,7 @@ function inspectThreeRenderTargetColor(target, three, texture) {
     samplerDescriptor(depthTexture, three, 1);
   }
   const generateMipmaps = texture.generateMipmaps;
-  const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(target.width, target.height)));
+  const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(width, height)));
   if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
   // Source Textures.getMipLevels uses authored descriptors before automatic
   // generation. Uncompressed CubeTexture descriptors omit the base level:
@@ -164,18 +170,18 @@ function inspectThreeRenderTargetColor(target, three, texture) {
     : generateMipmaps ? maximumMipLevels : 1;
   if (mipLevelCount > maximumMipLevels) fail('SIZE', 'Too many target mip levels for its extent');
   const texelBytes = format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
-  const layers = cube ? 6 : 1, baseColorBytes = target.width * target.height * texelBytes * layers;
-  let colorBytes = baseColorBytes, w = target.width, h = target.height;
+  const layers = cube ? 6 : 1, baseColorBytes = width * height * texelBytes * layers;
+  let colorBytes = baseColorBytes, w = width, h = height;
   for (let level = 1; level < mipLevelCount; level++) {
     w = Math.max(1, Math.floor(w / 2)); h = Math.max(1, Math.floor(h / 2));
     colorBytes += w * h * texelBytes * layers;
   }
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
-    (depthFormat ? target.width * target.height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * layers : 0);
+    (depthFormat ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * layers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
-  return {width: target.width, height: target.height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
+  return {width, height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     cube, layers, viewDimension: cube ? 'cube' : '2d',
-    depthTexture, depthSampleBytes: depthTexture ? target.width * target.height * 4 * layers : 0,
+    depthTexture, depthSampleBytes: depthTexture ? width * height * 4 * layers : 0,
     key: `${cube ? 'cube/' : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}/${mipLevelCount}`};
 }
 
@@ -322,8 +328,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retireHistory(group) { for (const entry of [...group.entries]) retire(entry); }
   function sourceDisposed(entry, event) {
     const resize = nativeResizes.get(entry.target);
+    const matchesSize = resize && (resize.dynamic
+      ? extent(entry.target.width) && extent(entry.target.height) &&
+        (entry.target.width !== resize.width || entry.target.height !== resize.height)
+      : entry.target.width === resize.width && entry.target.height === resize.height);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
-        entry.target.width === resize.width && entry.target.height === resize.height && entry.target.depth === resize.depth) {
+        matchesSize && entry.target.depth === resize.depth) {
       const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
       if ((entry.historyGroup ? shape.textures.every((texture, index) => entry.historyGroup.pairs[index]?.includes(texture)) : sameColors(shape, entry.shape)) && shape.depthTexture === entry.shape.depthTexture &&
           shape.depthFormat === entry.shape.depthFormat &&
@@ -738,13 +748,48 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     nativeResizes.set(target, {width, height, depth: target.depth, event: null, shape: null});
     try { return run(); } finally { nativeResizes.delete(target); }
   }
+  function withNativeEffectTargets(targets, run) {
+    live();
+    if (!Array.isArray(targets) || !targets.length || targets.length > 64 || typeof run !== 'function')
+      fail('OPTIONS', 'Expected a finite native effect target set and synchronous callback');
+    // Preflight every target before registering any scope. The effect computes
+    // its own dimensions in retained source code, so admit only an actual size
+    // change with stable attachments, formats and samples at the dispose event.
+    const scopes = [...new Set(targets)].map(target => {
+      const shape = inspectThreeRenderTarget(target, three);
+      if (shape.cube) fail('UNSUPPORTED', 'Native effect resize scopes require 2D targets');
+      if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
+      const scope = {width: target.width, height: target.height, depth: target.depth,
+        dynamic: true, event: null, shape: null};
+      // A cold target can resize before its first owner entry exists. Observe
+      // that event too, so a later explicit disposal cannot impersonate it.
+      scope.onDispose = event => { scope.event ??= event; };
+      return [target, scope];
+    });
+    const installed = [];
+    try {
+      for (const [target, scope] of scopes) {
+        nativeResizes.set(target, scope); installed.push([target, scope]);
+        target.addEventListener('dispose', scope.onDispose);
+      }
+      const result = run();
+      if (result && typeof result.then === 'function') fail('ASYNC_USE', 'Native effect target scopes require a synchronous update');
+      return result;
+    } finally {
+      for (const [target, scope] of installed) {
+        target.removeEventListener('dispose', scope.onDispose); nativeResizes.delete(target);
+      }
+    }
+  }
   return {
     capture, ensure, assertCurrent, bindingsFor, retainGeneration, registerNativePass,
-    // Only exact retained ShadowNode/PassNode updates enter these scopes.
+    // Retained shadow/pass updates and declared private effect targets enter
+    // these scopes.
     // Public setSize()/dispose() outside the synchronous operation still
     // invalidate pending requests and readers, including older generations.
     withNativeShadowResize: withNativeResize,
     withNativePassResize: withNativeResize,
+    withNativeEffectTargets,
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.

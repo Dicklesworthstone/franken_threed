@@ -55,9 +55,11 @@ export function inspectThreeMRT(three, renderer, material = null) {
  * contexts which can change the meaning of all implicit shader inputs.
  * The returned key is structural; ordinary uniform values remain live.
  */
-export function inspectThreePipelineContext(three, renderer, material, object) {
+export function inspectThreePipelineContext(three, renderer, material, object, effects = null) {
   const context = material.contextNode;
   if (context == null) return null;
+  const sharedKey = effects?.contextKey(context);
+  if (sharedKey !== undefined && sharedKey !== null) return sharedKey;
   const pipeline = context.value?.renderPipeline, source = three.RenderPipeline?.prototype;
   const prototype = pipeline && Object.getPrototypeOf(pipeline);
   if (!source || !(pipeline instanceof three.RenderPipeline) ||
@@ -121,8 +123,8 @@ export function inspectThreeNativePass(three, renderer, node) {
   inspectThreeMRT(three, {getRenderTarget: () => node.renderTarget, getMRT: () => node._mrt, _device: renderer._device});
   if (node.contextNode !== null)
     fail('Native scene passes currently require ordinary context');
-  if (renderer.getOutputRenderTarget() !== null || renderer.xr?.isPresenting)
-    fail('Native scene passes currently target the ordinary canvas output');
+  if (renderer.xr?.isPresenting)
+    fail('Native scene passes do not yet admit XR output');
   if (histories.length) {
     if (typeof renderer._targets?.registerNativePass !== 'function')
       fail('Native color histories require the renderer target residency owner');

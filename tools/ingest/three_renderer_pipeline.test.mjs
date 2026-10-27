@@ -7,6 +7,8 @@ import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {bloom} from '../../upstream/three.js/examples/jsm/tsl/display/BloomNode.js';
+import {gaussianBlur} from '../../upstream/three.js/examples/jsm/tsl/display/GaussianBlurNode.js';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
@@ -15,6 +17,15 @@ const nativeDraws = device => device.snapshots.flat().filter(draw => draw.pipeli
 const shader = draw => draw.pipeline.fragment.module.code;
 const textures = draw => [...draw.groups.values()].flatMap(({group}) => group.entries)
   .map(entry => entry.resource).filter(resource => resource?.texture);
+function uniformWords(draw) {
+  return [...draw.groups.values()].flatMap(({group, offsets}) => group.layout.entries
+    .filter(entry => entry.buffer?.type === 'uniform').sort((a, b) => a.binding - b.binding)
+    .flatMap((entry, index) => {
+      const resource = group.entries.find(value => value.binding === entry.binding).resource;
+      const bytes = draw.contents.get(resource.buffer), offset = (resource.offset ?? 0) + (offsets[index] ?? 0);
+      return [...new Float32Array(bytes.buffer, bytes.byteOffset + offset, resource.size / 4)];
+    }));
+}
 
 function fixture(t, options = {}) {
   const device = geometryDevice();
@@ -44,6 +55,165 @@ function fixture(t, options = {}) {
   return {renderer, device, canvas, configurations, scene, camera, material, mesh};
 }
 
+for (const [name, makeEffect, count] of [['bloom', bloom, 14], ['Gaussian blur', gaussianBlur, 4]])
+  test(`retained native ${name} executes its real source passes and shares their native textures`, async t => {
+    const f = fixture(t); await f.renderer.init();
+    let updates = 0; f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(.25, .5, .75); });
+    const pass = N.pass(f.scene, f.camera), effect = makeEffect(pass.getTextureNode());
+    const pipeline = new T.RenderPipeline(f.renderer, effect);
+    t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+    pipeline.render(); await drain(f.renderer);
+    const draws = nativeDraws(f.device); assert.equal(draws.length, count); assert.equal(updates, 1);
+    const output = effect.getTextureNode().value.renderTarget;
+    const entry = f.renderer._targets.capture(output);
+    assert.ok(entry.storage); assert.equal(f.device.textureWrites.length, 0);
+    assert.ok(textures(draws.at(-1)).some(view => view.texture.width === output.width && view.texture.height === output.height));
+    assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+    pipeline.render(); await drain(f.renderer);
+    assert.equal(nativeDraws(f.device).length, count + 1, 'FRAME producers are not replayed by a second render in the same frame');
+    assert.equal(updates, 1);
+  });
+
+for (const [name, makeEffect, count] of [['bloom', bloom, 14], ['Gaussian blur', gaussianBlur, 4]])
+  test(`queued ${name} resize preserves both accepted source effect generations`, async t => {
+    const f = fixture(t), destination = new T.RenderTarget(128, 96, {type: T.HalfFloatType});
+    t.after(() => destination.dispose()); f.renderer.setRenderTarget(destination); await f.renderer.init();
+    const pass = N.pass(f.scene, f.camera), effect = makeEffect(pass.getTextureNode());
+    const pipeline = new T.RenderPipeline(f.renderer, effect);
+    t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+    pipeline.render(); const firstWidth = effect.getTextureNode().value.image.width;
+    f.renderer.setSize(128, 96, false); f.renderer._nodes.nodeFrame.update(); pipeline.render();
+    const secondWidth = effect.getTextureNode().value.image.width;
+    assert.notEqual(firstWidth, secondWidth); await drain(f.renderer);
+    const draws = nativeDraws(f.device); assert.equal(draws.length, count * 2);
+    assert.deepEqual([draws[count - 1], draws[count * 2 - 1]].map(draw =>
+      textures(draw).find(view => view.texture.format === 'rgba16float').texture.width), [firstWidth, secondWidth]);
+    assert.equal(f.renderer.getRenderTarget(), destination); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  });
+
+test('retained Gaussian blur and bloom compose through a native default output target', async t => {
+  const f = fixture(t), destination = new T.RenderTarget(64, 48); t.after(() => destination.dispose());
+  f.renderer.setOutputRenderTarget(destination); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), blur = gaussianBlur(pass.getTextureNode()), glow = bloom(blur);
+  const pipeline = new T.RenderPipeline(f.renderer, glow.add(blur));
+  t.after(() => { pipeline.dispose(); glow.dispose(); blur.dispose(); pass.dispose(); });
+  pipeline.render(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 16);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 0);
+  assert.equal(f.renderer.getOutputRenderTarget(), destination); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('small native bloom retains the source zero-viewport mip with a one-pixel backing texture', async t => {
+  const f = fixture(t); f.renderer.setSize(16, 16, false); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), effect = bloom(pass.getTextureNode());
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  pipeline.render(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 14);
+  for (const target of [effect._renderTargetsHorizontal.at(-1), effect._renderTargetsVertical.at(-1)]) {
+    assert.deepEqual([target.width, target.height], [0, 0]);
+    assert.deepEqual(target.viewport.toArray(), [0, 0, 0, 0]);
+    const entry = f.renderer._targets.capture(target);
+    assert.deepEqual([entry.storage.diagnostics.width, entry.storage.diagnostics.height], [1, 1]);
+    assert.equal(entry.shape.bytes, 8);
+  }
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued bloom retains live controls and each horizontal/vertical uniform snapshot', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), effect = bloom(pass.getTextureNode());
+  effect.strength.setName('queuedBloomStrength'); effect.radius.setName('queuedBloomRadius');
+  effect.threshold.setName('queuedBloomThreshold');
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  const settings = [[.21875, .34375, .90625], [.46875, .71875, .03125]];
+  for (const [strength, radius, threshold] of settings) {
+    effect.strength.value = strength; effect.radius.value = radius; effect.threshold.value = threshold;
+    f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  }
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 28);
+  const highPass = draws.filter(draw => shader(draw).includes('queuedBloomThreshold'));
+  const composite = draws.filter(draw => shader(draw).includes('queuedBloomStrength'));
+  assert.equal(highPass.length, 2); assert.equal(composite.length, 2);
+  for (let frame = 0; frame < 2; frame++) {
+    const [strength, radius, threshold] = settings[frame], other = settings[1 - frame];
+    const high = uniformWords(highPass[frame]), mix = uniformWords(composite[frame]);
+    assert.ok(high.includes(threshold)); assert.ok(!high.includes(other[2]));
+    assert.ok(mix.includes(strength) && mix.includes(radius));
+    assert.ok(!mix.includes(other[0]) && !mix.includes(other[1]));
+    for (let mip = 0; mip < 5; mip++) {
+      const horizontal = uniformWords(draws[frame * 14 + 2 + mip * 2]);
+      const vertical = uniformWords(draws[frame * 14 + 3 + mip * 2]);
+      const changed = horizontal.flatMap((value, index) => value === vertical[index] ? [] : [[value, vertical[index]]]);
+      assert.deepEqual(changed, [[1, 0], [0, 1]], 'shared source blur material captures its direction independently for each draw');
+    }
+  }
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('ordinary native material graphs can consume a retained Gaussian blur without a RenderPipeline', async t => {
+  const f = fixture(t), input = new T.DataTexture(new Uint8Array(4 * 4 * 4).fill(128), 4, 4);
+  input.needsUpdate = true;
+  const effect = gaussianBlur(N.texture(input), N.vec2(2, .5), 2, {premultipliedAlpha: true, resolutionScale: .5});
+  t.after(() => { effect.dispose(); input.dispose(); });
+  f.material.fragmentNode = effect;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(nativeDraws(f.device).length, 3);
+  assert.deepEqual([effect._horizontalRT.width, effect._verticalRT.height], [2, 2]);
+  assert.equal(f.device.textureWrites.length, 1, 'only the source CPU image uploads; intermediate images stay on GPU');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('compileAsync builds the retained effect graph without executing its frame passes', async t => {
+  const f = fixture(t), input = new T.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
+  input.needsUpdate = true; const effect = gaussianBlur(N.texture(input));
+  t.after(() => { effect.dispose(); input.dispose(); });
+  f.material.fragmentNode = effect;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.ok(effect._hMaterial?.fragmentNode && effect._vMaterial?.fragmentNode);
+  assert.deepEqual([effect._horizontalRT.width, effect._verticalRT.height], [1, 1]);
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('disposing a queued source effect invalidates its dependent output and releases captured resources', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), effect = gaussianBlur(pass.getTextureNode());
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); pass.dispose(); });
+  pipeline.render(); effect.dispose();
+  await assert.rejects(drain(f.renderer), /disposed|replaced|stale/i);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('an effect update failure restores its temporary renderer controls and retains accepted producer work', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), effect = gaussianBlur(pass.getTextureNode());
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  pipeline.render(); await drain(f.renderer);
+  f.renderer.autoClear = false; f.renderer.autoClearColor = false; f.renderer.autoClearStencil = false;
+  effect._hMaterial.onBeforeRender = () => {}; f.renderer._nodes.nodeFrame.update();
+  assert.throws(() => pipeline.render(), /Custom material shader\/render hooks/);
+  assert.equal(f.renderer.autoClear, false); assert.equal(f.renderer.autoClearColor, false);
+  assert.equal(f.renderer.autoClearStencil, false); assert.equal(f.renderer.getRenderTarget(), null);
+  await drain(f.renderer); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('shared effect contexts require construction by the retained builder and reject later substitutions', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera), effect = gaussianBlur(pass.getTextureNode());
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  pipeline.render(); await drain(f.renderer);
+  effect._hMaterial.contextNode = N.context({...effect._hMaterial.contextNode.value});
+  f.renderer._nodes.nodeFrame.update();
+  assert.throws(() => pipeline.render(), /Native material contexts require/);
+  await drain(f.renderer); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('queued native canvas color spaces retain their own attachment transfer mode', async t => {
   const f = fixture(t); await f.renderer.init();
   f.renderer.render(f.scene, f.camera);
@@ -51,7 +221,9 @@ test('queued native canvas color spaces retain their own attachment transfer mod
   f.renderer.outputColorSpace = T.SRGBColorSpace; f.renderer.render(f.scene, f.camera);
   await drain(f.renderer);
   assert.deepEqual(nativeDraws(f.device).map(draw => draw.pipeline.fragment.targets[0].format),
-    ['bgra8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb']);
+    ['rgba16float', 'bgra8unorm', 'rgba16float']);
+  const conversions = f.device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint !== 'main');
+  assert.deepEqual(conversions.map(draw => draw.pipeline.fragment.targets[0].format), ['bgra8unorm-srgb', 'bgra8unorm-srgb']);
   assert.equal(f.renderer.info.f3d.presentedRenders, 3); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 

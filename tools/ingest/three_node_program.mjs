@@ -31,6 +31,7 @@ import {createThreeNodeAttributes} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
+import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
 
 export class ThreeNodeProgramError extends Error {
@@ -78,6 +79,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   for (const [name, value] of Object.entries({maxPrograms, maxNodes, maxShaderBytes, maxUniformBytes, maxAttributeBytes, maxBindGroups}))
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
+  const effects = createThreeNodeEffects(three, renderer, {fail});
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
@@ -623,7 +625,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // partition, not the identities themselves, in the structural signature:
       // replacing one compatible sampled image must not rebuild the shader.
       if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
-      return [aliases.get(texture.uuid), texture.type, texture.format, texture.colorSpace, texture.channel,
+      // Source byte and half-float colors have identical f32 sample/filter
+      // shaders. Effects can choose their output precision in updateBefore,
+      // after consumer construction. The image owner still validates formats
+      // and generations; float32 and integer layouts remain separate here.
+      const type = [three.UnsignedByteType, three.HalfFloatType].includes(texture.type) ? 'float-color' : texture.type;
+      return [aliases.get(texture.uuid), type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
         texture.is3DTexture === true, node.isTexture3DNode === true,
@@ -723,7 +730,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
     if (Object.keys(renderer.contextNode?.getFlowContextData?.() ?? {}).length)
       fail('GRAPH', 'Custom renderer node contexts require an explicit graphics context adapter');
-    const pipelineContext = inspectThreePipelineContext(three, renderer, material, object);
+    const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
     if (sourceMaterial.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
         sourceMaterial.onBeforeRender !== three.Material.prototype.onBeforeRender ||
         sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
@@ -783,7 +790,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
-    if (node.isPassTextureNode === true) inspectThreeNativePass(three, renderer, node.passNode);
+    if (node.isPassTextureNode === true) {
+      if (node.passNode?.isPassNode === true) inspectThreeNativePass(three, renderer, node.passNode);
+      else effects.inspectTexture(node);
+    }
     if (node.isStorageTextureNode)
       fail('TEXTURE', 'Graphics storage writes require additional native bindings; use read-only TextureNode/Texture3DNode samples');
     if (node.isTexture3DNode && (node.constructor !== three.Texture3DNode ||
@@ -861,7 +871,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material),
-      inspectThreePipelineContext(three, renderer, material, object),
+      inspectThreePipelineContext(three, renderer, material, object, effects),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
@@ -893,7 +903,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
-    const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object);
+    const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const fogKey = fogSignature(preparedMaterial, context);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
@@ -918,6 +928,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertEnvironmentVersion(environment);
     for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
     const builder = new three.WGSLNodeBuilder(object, renderer);
+    effects.installBuilder(builder);
     builder.material = material; builder.context.material = material;
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
     builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
@@ -1223,7 +1234,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return history.bytes;
   }
   function checkPipelineContext(state, object = state.object) {
-    if (inspectThreePipelineContext(three, renderer, state.material, object) !== state.pipelineSignature)
+    if (inspectThreePipelineContext(three, renderer, state.material, object, effects) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
     if ((inspectThreeMRT(three, renderer, state.material)?.key ?? null) !== state.mrtSignature)
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
@@ -1287,6 +1298,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         registerThreeNativeShadow(three, renderer, node);
         updateThreeNativeShadow(three, renderer, node, frame);
       } else if (node.isPassNode === true) updateThreeNativePass(three, renderer, node, frame);
+      else if (effects.owns(node)) effects.update(node, frame);
       else frame.updateBeforeNode(node);
       // PMREM refresh keeps its separate ordered-prefix contract. Shadow
       // recursion runs outside draw-resource capture at its source boundary.
@@ -1360,7 +1372,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
-    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); },
+    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); effects.dispose(); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});
   return api;
 }

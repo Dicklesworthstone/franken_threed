@@ -2630,8 +2630,8 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         if (
           viewport[0] < 0 ||
           viewport[1] < 0 ||
-          viewport[2] <= 0 ||
-          viewport[3] <= 0 ||
+          viewport[2] < 0 ||
+          viewport[3] < 0 ||
           viewport[4] < 0 ||
           viewport[5] > 1 ||
           viewport[4] > viewport[5]
