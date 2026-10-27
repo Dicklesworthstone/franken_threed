@@ -151,6 +151,10 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // Renderer mixins can delegate source-shaped target copies to this same
     // owner even when their prototype method prevents instance installation.
     copyTexture(...args) { return copyTexture(...args); },
+    readPixels(target, supplied = {}) {
+      try { return readPixels(target, supplied); }
+      catch (error) { return Promise.reject(error); }
+    },
     writePixels(target, data, supplied = {}) {
       try {
         live();

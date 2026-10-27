@@ -31,6 +31,37 @@ The WebGL-compatible surface takes a caller-provided typed array after `height`
 and uses bottom-left readback coordinates/row order. Its synchronous readback
 remains an exact-backend operation, not a disguised Promise.
 
+Both public asynchronous signatures select MRT color attachments. The native
+WebGPU signature also selects any of the six faces of a source `CubeRenderTarget`:
+
+```js
+// Native WebGPU: textureIndex defaults to 0; faceIndex defaults to +X (0).
+const selected = await renderer.readRenderTargetPixelsAsync(
+  target, x, y, width, height, textureIndex, faceIndex,
+);
+
+// WebGL-compatible surface: returns the same caller-provided output view.
+// Leave the cube-face argument undefined for an ordinary 2D MRT target.
+await renderer.readRenderTargetPixelsAsync(
+  target, x, y, width, height, output, undefined, textureIndex,
+);
+```
+
+The selected attachment determines the result's precision: RGBA8 uses
+`Uint8Array`, RGBA16F preserves raw half-float bits in `Uint16Array`, and
+R/RG/RGBA32F uses one/two/four `Float32Array` components per pixel. Reads use base
+mip zero regardless of the active render mip or cube face. The native cube
+profile remains single-sample with no generated mips; source
+`WebGLCubeRenderTarget`, array and 3D targets retain their existing explicit
+admission limits.
+
+Source-shaped reads and the explicit mip/depth readback extensions share the
+renderer transfer request limit, target generation and submission FIFO. A later
+write can submit while an earlier read waits for mapping, without changing the
+earlier copied bytes. Target disposal/reconfiguration and renderer disposal
+cancel unfinished reads before publishing caller-buffer contents. These paths
+reuse the existing bounded per-device staging budget.
+
 ## Implemented profile
 
 Single-color 2D RGBA8 (linear or sRGB) and linear RGBA16F targets; optional private
@@ -119,8 +150,9 @@ compiler and renderer admission restrictions also remain in force.
 
 ## Remaining gaps and verification
 
-MRT and cube/array targets remain outside this profile. Nonzero mip rendering
-retains the restrictions above. Shader programs retain their
+Public MRT and native cube readback does not close all target rendering and
+sampling contracts. Array/3D target readback and source `WebGLCubeRenderTarget`
+remain outside this profile. Nonzero mip rendering retains the restrictions above. Shader programs retain their
 explicit unsupported-feature errors. Mesh-root, offscreen shader and small-pass
 capture support remove postprocessing blockers but do not establish complete
 EffectComposer compatibility, effect parity or arbitrary scene snapshots.
@@ -132,7 +164,10 @@ execute WGSL or certify the pinned Three.js implementation or rasterized pixels.
 
 `node --test tools/ingest/three_render_targets.test.mjs tools/ingest/three_renderer_targets.test.mjs`
 checks residency and public renderer ordering using recording devices and
-scene/canvas factory doubles. The additional
+scene/canvas factory doubles. `node tools/ingest/three_renderer_public_readback.test.mjs`
+checks the public native/WebGL signatures with pinned Three.js target classes,
+six cube faces, mixed MRT precision, queue ordering, request limits and target
+cancellation. Native copies use a byte-array fixture, not a GPU rasterizer. The additional
 `three_renderer_program_targets.test.mjs`, `three_scene_program_targets.test.mjs`
 and `three_scene_roots.test.mjs` exercise destination-specific program state,
 the actual scene bridge, borrowed shader textures, uniforms, root identity,

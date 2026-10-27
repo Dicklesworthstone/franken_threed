@@ -34,7 +34,6 @@ import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTarget, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
-import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
@@ -663,22 +662,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return this._transfers.copyColor(source, destination, options);
     }
     readRenderTargetPixelsAsync(target, x, y, width, height, textureIndex = 0, faceIndex = 0) {
-      if (textureIndex !== 0 || faceIndex !== 0) return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Only the 2D color attachment is readable'));
-      return this._readTargetPixels(target, {x, y, width, height});
+      return this._readTargetPixels(target, {x, y, width, height, colorIndex: textureIndex, face: faceIndex});
     }
     _readTargetPixels(target, options) {
-      try {
-        if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
-        const destination = this._targets.capture(target);
-        if (destination.shape.cube) fail('UNSUPPORTED', 'Cube target readbacks require explicit face-aware transfer support');
-        const issue = () => {
-          this._targets.ensure(destination);
-          return readGpuTargetPixels(destination.session, {...options, signal: this._targetLifetime.signal});
-        };
-        // The helper submits its copy before returning the mapping promise.
-        if (this._initialized && !this._drain && !this._preparing) return issue();
-        return new Promise((resolve, reject) => this._enqueue({readback: true, issue, resolve, reject}));
-      } catch (error) { return Promise.reject(error); }
+      // Source-shaped reads share target generation/cancellation, request
+      // budgets and queue ordering with explicit mip/depth reads and transfers.
+      // Mapping never holds the FIFO up after its texture copy was submitted.
+      return this._transfers.readPixels(target, options);
     }
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
@@ -1380,10 +1370,11 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     getContextAttributes() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextLoss() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
-    readRenderTargetPixelsAsync(target, x, y, width, height, buffer, activeCubeFace = 0, textureIndex = 0) {
-      if (activeCubeFace !== 0 || textureIndex !== 0 || !ArrayBuffer.isView(buffer))
-        return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Supply an output array for the 2D color attachment'));
-      return this._readTargetPixels(target, {x, y, width, height, output: buffer, flipY: true});
+    readRenderTargetPixelsAsync(target, x, y, width, height, buffer, activeCubeFace, textureIndex = 0) {
+      if (!ArrayBuffer.isView(buffer))
+        return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Supply an output array for the selected color attachment'));
+      return this._readTargetPixels(target, {x, y, width, height, output: buffer, flipY: true,
+        face: activeCubeFace, colorIndex: textureIndex});
     }
     readRenderTargetPixels() { fail('ROUTE', 'Synchronous pixel readback requires the exact native backend'); }
     /** r186 compile(): returns the Set of the scene's materials synchronously, as
