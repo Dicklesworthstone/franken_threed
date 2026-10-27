@@ -2033,3 +2033,108 @@ test('AO and light maps retain shared texture bindings until their aliases separ
   assert.ok(next.textures.some(binding => binding.texture === f.material.aoMap));
   assert.ok(draw.textures.every(binding => binding.texture === shared));
 });
+
+test('identical native shaders retain independent builders, callbacks and draw bytes', t => {
+  const f = rig(t), calls = [], descriptors = [], packets = [];
+  for (const [index, color] of [[0, [.125, .25, .375]], [1, [.625, .75, .875]]]) {
+    const material = new THREE.MeshBasicNodeMaterial();
+    material.colorNode = N.uniform(new THREE.Color(...color)).setName('sharedTint')
+      .onObjectUpdate(frame => { calls.push(frame.object); return frame.object.userData.tint; });
+    const object = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+    object.userData.tint = new THREE.Color(...color); object.position.x = index + 1;
+    f.scene.add(object); f.scene.updateMatrixWorld();
+    const context = {...f.context, object, material};
+    const descriptor = f.owner.compile(material, object, context);
+    descriptors.push(descriptor); packets.push(f.owner.captureDraw(descriptor, context));
+    t.after(() => { object.geometry.dispose(); material.dispose(); });
+  }
+  const [a, b] = descriptors, first = packets[0].uniforms.map(bytes => bytes.slice());
+  assert.notEqual(a, b); assert.notEqual(a.key, b.key);
+  assert.equal(a.vertex, b.vertex); assert.equal(a.fragment, b.fragment);
+  assert.equal(f.owner.diagnostics.programs, 2);
+  assert.equal(f.owner.diagnostics.shaderBytes, 2 * (a.vertex.length + a.fragment.length));
+  assert.equal(calls.length, 2); assert.notEqual(calls[0], calls[1]);
+  assert.notDeepEqual(packets[0].uniforms, packets[1].uniforms);
+  calls[1].userData.tint.setRGB(.5, .25, .125);
+  f.owner.captureDraw(b, {...f.context, object: calls[1], material: calls[1].material, renderId: 2});
+  assert.deepEqual(packets[0].uniforms, first, 'sharing source never aliases accepted uniform bytes');
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2], calls[1], 'the second builder updates its own source object');
+  f.owner.release(a);
+  assert.equal(f.owner.diagnostics.shaderBytes, 2 * (b.vertex.length + b.fragment.length));
+  f.owner.captureDraw(b, {...f.context, object: calls[1], material: calls[1].material, renderId: 3});
+  f.owner.release(b);
+  assert.equal(f.owner.diagnostics.programs, 0); assert.equal(f.owner.diagnostics.shaderBytes, 0);
+});
+
+test('native shader budgets count shared pairs once and only reclaim the final replacement owner', t => {
+  const probe = rig(t), original = probe.compile(), bytes = 2 * (original.vertex.length + original.fragment.length);
+  const f = rig(t, {maxShaderBytes: bytes}), first = f.compile();
+  const material = f.material.clone(), object = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object, material};
+  const second = f.owner.compile(material, object, context), saved = material.colorNode;
+  t.after(() => { object.geometry.dispose(); material.dispose(); });
+  assert.equal(first.vertex, second.vertex); assert.equal(first.fragment, second.fragment);
+  assert.equal(f.owner.diagnostics.shaderBytes, bytes);
+  material.colorNode = N.vec3(.125, .25, .5);
+  assert.throws(() => f.owner.compile(material, object, context), {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  assert.equal(f.owner.diagnostics.programs, 2); assert.equal(f.owner.diagnostics.shaderBytes, bytes);
+  material.colorNode = saved;
+  assert.equal(f.owner.compile(material, object, context), second, 'failed replacement preserves the prior cache entry');
+  f.owner.release(first);
+  material.colorNode = N.vec3(.125, .25, .5);
+  const replaced = f.owner.compile(material, object, context);
+  assert.notEqual(replaced.fragment, second.fragment);
+  assert.equal(f.owner.diagnostics.programs, 1);
+  assert.equal(f.owner.diagnostics.shaderBytes, 2 * (replaced.vertex.length + replaced.fragment.length));
+  material.dispose();
+  assert.equal(f.owner.diagnostics.programs, 0); assert.equal(f.owner.diagnostics.shaderBytes, 0);
+});
+
+test('native shader source interning distinguishes either stage and leaves same-pair replacements charged', t => {
+  const f = rig(t), pairBytes = d => 2 * (d.vertex.length + d.fragment.length);
+  f.material.positionNode = N.positionLocal; f.material.colorNode = N.vec3(.125, .25, .5);
+  const first = f.compile(); f.material.needsUpdate = true;
+  const replacement = f.compile();
+  assert.notEqual(first, replacement); assert.equal(first.vertex, replacement.vertex); assert.equal(first.fragment, replacement.fragment);
+  assert.equal(f.owner.diagnostics.programs, 1); assert.equal(f.owner.diagnostics.shaderBytes, pairBytes(first));
+  const material = f.material.clone(), object = new THREE.Mesh(new THREE.PlaneGeometry(), material);
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  const context = {...f.context, object, material};
+  material.positionNode = N.positionLocal.mul(2);
+  const vertexVariant = f.owner.compile(material, object, context);
+  assert.notEqual(vertexVariant.vertex, replacement.vertex); assert.equal(vertexVariant.fragment, replacement.fragment);
+  assert.equal(f.owner.diagnostics.shaderBytes, pairBytes(replacement) + pairBytes(vertexVariant));
+  material.colorNode = N.vec3(.75, .5, .25);
+  const fragmentVariant = f.owner.compile(material, object, context);
+  assert.equal(vertexVariant.vertex, fragmentVariant.vertex); assert.notEqual(vertexVariant.fragment, fragmentVariant.fragment);
+  assert.equal(f.owner.diagnostics.shaderBytes, pairBytes(replacement) + pairBytes(fragmentVariant));
+  object.geometry.dispose();
+  assert.equal(f.owner.diagnostics.programs, 1); assert.equal(f.owner.diagnostics.shaderBytes, pairBytes(replacement));
+  f.owner.dispose(); assert.equal(f.owner.diagnostics.shaderBytes, 0);
+});
+
+test('4000 H1-shaped Toon objects fit the existing shader budget without sharing material state', t => {
+  const f = rig(t), light = new THREE.DirectionalLight(0xffffff, 3);
+  light.position.set(1, 2, 3); f.scene.add(light); f.scene.updateMatrixWorld();
+  const geometries = [new THREE.BoxGeometry(), new THREE.PlaneGeometry(), new THREE.SphereGeometry(1, 8, 6)];
+  const descriptors = [], objects = [], materials = [];
+  t.after(() => { for (const geometry of geometries) geometry.dispose(); for (const material of materials) material.dispose(); });
+  for (let i = 0; i < 4000; i++) {
+    const material = new THREE.MeshToonNodeMaterial({color: new THREE.Color(i / 4000, .25, 1 - i / 4000)});
+    const object = new THREE.Mesh(geometries[i % geometries.length], material);
+    object.position.x = i % 20; object.updateMatrixWorld();
+    descriptors.push(f.owner.compile(material, object, {...f.context, material, object, lights: [light]}));
+    materials.push(material); objects.push(object);
+  }
+  const first = descriptors[0], last = descriptors.at(-1);
+  assert.equal(f.owner.diagnostics.programs, 4000); assert.equal(f.owner.diagnostics.maxShaderBytes, 16 * 1024 * 1024);
+  assert.equal(new Set(descriptors.map(d => d.key)).size, 4000);
+  assert.ok(descriptors.every(d => d.vertex === first.vertex && d.fragment === first.fragment));
+  assert.equal(f.owner.diagnostics.shaderBytes, 2 * (first.vertex.length + first.fragment.length));
+  const a = f.owner.captureDraw(first, {...f.context, object: objects[0], material: materials[0], lights: [light]});
+  const b = f.owner.captureDraw(last, {...f.context, object: objects.at(-1), material: materials.at(-1), lights: [light]});
+  assert.notDeepEqual(a.uniforms, b.uniforms, 'H1 colors remain per-object values');
+  f.owner.dispose(); assert.equal(f.owner.diagnostics.programs, 0); assert.equal(f.owner.diagnostics.shaderBytes, 0);
+});

@@ -103,7 +103,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     [three.MeshNormalMaterial, three.MeshNormalNodeMaterial], [three.MeshMatcapMaterial, three.MeshMatcapNodeMaterial],
     [three.ShadowMaterial, three.ShadowNodeMaterial]
   ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
+  // Share immutable source text only. Each render object keeps its own builder,
+  // observer and bindings, since source nodes may close over its live values.
+  const shaderPairs = new Map();
   let disposed = false, shaderBytes = 0, serial = 0;
+  function retainShaders(pair) {
+    if (pair.references++ !== 0) return;
+    let fragments = shaderPairs.get(pair.vertex);
+    if (!fragments) shaderPairs.set(pair.vertex, fragments = new Map());
+    fragments.set(pair.fragment, pair); shaderBytes += pair.bytes;
+  }
+  function releaseShaders(pair) {
+    if (--pair.references !== 0) return;
+    const fragments = shaderPairs.get(pair.vertex);
+    fragments.delete(pair.fragment);
+    if (fragments.size === 0) shaderPairs.delete(pair.vertex);
+    shaderBytes -= pair.bytes;
+  }
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
   const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
   // Basic uses an empty source lighting context for AO and its PI-scaled light
@@ -899,7 +915,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function retire(entry) {
     if (!entries.delete(entry)) return;
     for (const record of nodeStates.get(entry.descriptor)?.bundleLeases ?? []) releaseBundleGeometry(record);
-    shaderBytes -= entry.bytes;
+    releaseShaders(entry.shaders);
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
     if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
@@ -1051,13 +1067,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (node) generated.push({name: attribute.name, attribute: source});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
-    const vertex = builder.vertexShader, fragment = builder.fragmentShader, bytes = 2 * (vertex.length + fragment.length);
-    if (bytes > maxShaderBytes - shaderBytes + (previous?.bytes ?? 0)) fail('LIMIT', 'Native node shader byte budget exceeded');
+    const vertex = builder.vertexShader, fragment = builder.fragmentShader;
+    const shared = shaderPairs.get(vertex)?.get(fragment);
+    const shaders = shared ?? {vertex, fragment, bytes: 2 * (vertex.length + fragment.length), references: 0};
+    // A replacement can reclaim a pair only when no other live program uses
+    // it. A failed build must leave both the prior descriptor and budget live.
+    const reclaim = previous?.shaders.references === 1 && previous.shaders !== shaders ? previous.shaders.bytes : 0;
+    if (!shared && shaders.bytes > maxShaderBytes - shaderBytes + reclaim)
+      fail('LIMIT', 'Native node shader byte budget exceeded');
+    builder.vertexShader = shaders.vertex; builder.fragmentShader = shaders.fragment;
     const outputStruct = builder.structs.fragment.find(struct => struct.output === true);
     const colorCount = outputStruct?.members.length ?? 1;
     if (colorCount > (renderer.getRenderTarget?.()?.textures.length ?? 1))
       fail('MRT', 'Native fragment outputs exceed the current color attachments');
-    const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment, colorCount,
+    const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`,
+      vertex: shaders.vertex, fragment: shaders.fragment, colorCount,
       wireframe: preparedMaterial.wireframe === true,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
@@ -1107,15 +1131,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
-    const entry = {key, passId, descriptor, builder, material, object, geometry: object.geometry, bytes, pmremNodes, pmremSignature: pmremKey,
+    const entry = {key, passId, descriptor, builder, material, object, geometry: object.geometry, shaders, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
+    // Acquire before retiring to preserve an unchanged pair's cache identity.
+    retainShaders(shaders);
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(), nextPasses = passes ?? new Map();
     nextPasses.set(passId, entry); next.set(material, nextPasses); cache.set(object, next);
-    entries.add(entry); shaderBytes += bytes;
+    entries.add(entry);
     material.addEventListener('dispose', entry.onDispose); object.geometry.addEventListener('dispose', entry.onDispose);
     return descriptor;
   }
