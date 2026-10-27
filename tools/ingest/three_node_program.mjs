@@ -584,7 +584,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       texture.isDataTexture === true && !array && !volume && !texture.isCubeTexture && !target;
     if (integerType && ((!storage && !integerData) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
       fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage or source 2D DataTexture inputs with NoColorSpace');
-    if (!depth && !integerType && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+    const packedTarget = target && three.UnsignedInt101111Type !== undefined &&
+      texture.type === three.UnsignedInt101111Type && texture.format === three.RGBFormat;
+    if (!depth && !integerType && (!packedTarget && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
     if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')

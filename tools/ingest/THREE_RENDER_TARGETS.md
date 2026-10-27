@@ -49,9 +49,10 @@ await renderer.readRenderTargetPixelsAsync(
 
 The selected attachment determines the result's precision: RGBA8 uses
 `Uint8Array`, RGBA16F preserves raw half-float bits in `Uint16Array`, and
-R/RG/RGBA32F uses one/two/four `Float32Array` components per pixel. Reads use base
-mip zero regardless of the active render mip or cube face. The native cube
-profile remains single-sample with no generated mips; source
+R/RG/RGBA32F uses one/two/four `Float32Array` components per pixel. R8 returns
+one `Uint8Array` value per texel; packed R11G11B10 returns one original
+`Uint32Array` word per texel. Reads use base mip zero regardless of the active
+render mip or cube face. The native cube profile remains single-sample; source
 `WebGLCubeRenderTarget`, array and 3D targets retain their existing explicit
 admission limits.
 
@@ -77,6 +78,18 @@ ordering and disposal boundaries with other native target operations. The
 renderer caches private linear framebuffers separately for each output target;
 automatic private resizing preserves accepted generations. Public target
 disposal or replacement invalidates pending operations as before.
+
+Native targets also admit linear single-channel R8 (`RedFormat` with
+`UnsignedByteType`) and packed HDR RGB (`RGBFormat` with
+`UnsignedInt101111Type`). These are the two source attachments used by SSGI.
+Packed HDR rendering requires `rg11b10ufloat-renderable` on the supplied device.
+Sampling, mip generation, four-sample resolves, uploads, copies and readback
+preserve each format. Storage costs one/four bytes per texel respectively;
+render-attachment limits use the separate WebGPU costs and component alignment.
+The AO-then-GI MRT therefore costs twelve attachment bytes per sample while its
+single-sample storage uses five bytes per pixel. A Chromium 151/SwiftShader
+differential matched all 340 texels/packed words across both formats, four mip
+levels and single/four-sample rendering, with no GPU errors.
 
 A paired Chromium 151.0.7922.34 / SwiftShader browser check matched the pinned
 renderer exactly for six cube-face readbacks, six directional samples, the

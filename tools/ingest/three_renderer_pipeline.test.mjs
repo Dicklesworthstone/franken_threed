@@ -9,6 +9,7 @@ import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {bloom} from '../../upstream/three.js/examples/jsm/tsl/display/BloomNode.js';
 import {gaussianBlur} from '../../upstream/three.js/examples/jsm/tsl/display/GaussianBlurNode.js';
+import {ssgi} from '../../upstream/three.js/examples/jsm/tsl/display/SSGINode.js';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
@@ -54,6 +55,84 @@ function fixture(t, options = {}) {
   const mesh = new T.Mesh(new T.PlaneGeometry(2, 2), material); scene.add(mesh);
   return {renderer, device, canvas, configurations, scene, camera, material, mesh};
 }
+
+function ssgiPipeline(t, f, {normal = true, compose = true} = {}) {
+  const pass = N.pass(f.scene, f.camera);
+  if (normal) pass.setMRT(N.mrt({output: N.output, normal: N.normalView}));
+  const color = pass.getTextureNode(), effect = ssgi(color, pass.getTextureNode('depth'),
+    normal ? pass.getTextureNode('normal') : null, f.camera);
+  const pipeline = new T.RenderPipeline(f.renderer, compose
+    ? N.vec4(color.rgb.mul(effect.r).add(effect.getGINode().rgb), 1) : effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  return {pass, effect, pipeline};
+}
+
+for (const normal of [true, false]) test(`source SSGI renders native compact MRT outputs with ${normal ? 'MRT' : 'depth-derived'} normals`, async t => {
+  const f = fixture(t); f.device.features = new Set(['rg11b10ufloat-renderable']); await f.renderer.init();
+  let updates = 0; f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(.25, .5, .75); });
+  const {effect, pipeline} = ssgiPipeline(t, f, {normal});
+  pipeline.render(); await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 3); assert.equal(updates, 1);
+  const gi = draws.find(draw => draw.pipeline.fragment.targets[0].format === 'r8unorm');
+  assert.deepEqual(gi.pipeline.fragment.targets.map(target => target.format), ['r8unorm', 'rg11b10ufloat']);
+  const entry = f.renderer._targets.capture(effect._ssgiRenderTarget);
+  assert.equal(entry.shape.bytes, 64 * 48 * 5, 'storage uses one AO byte and one packed HDR word per pixel');
+  assert.equal(entry.shape.depthFormat, null);
+  assert.ok(textures(gi).some(view => view.texture.format === 'depth24plus'));
+  assert.ok(textures(draws.at(-1)).some(view => view.texture.format === 'rg11b10ufloat'));
+  assert.equal(f.device.textureWrites.length, 0, 'scene, AO and GI images stay on GPU');
+  pipeline.render(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 4); assert.equal(updates, 1);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued native SSGI preserves changing uniforms and source temporal sample phases', async t => {
+  const f = fixture(t); f.device.features = new Set(['rg11b10ufloat-renderable']); await f.renderer.init();
+  const {effect, pipeline} = ssgiPipeline(t, f);
+  effect.radius.setName('ssgiRadius'); effect.giIntensity.setName('ssgiGI');
+  effect._temporalDirection.setName('ssgiDirection'); effect._temporalOffset.setName('ssgiOffset');
+  const captured = [];
+  for (const [radius, intensity, temporal] of [[2.125, 3.375, true], [4.625, 5.875, true], [7.125, 8.375, false]]) {
+    effect.radius.value = radius; effect.giIntensity.value = intensity; effect.useTemporalFiltering = temporal;
+    f.renderer._nodes.nodeFrame.update(); pipeline.render();
+    captured.push([radius, intensity, effect._temporalDirection.value, effect._temporalOffset.value]);
+  }
+  await drain(f.renderer);
+  const effects = nativeDraws(f.device).filter(draw => draw.pipeline.fragment.targets[0].format === 'r8unorm');
+  assert.equal(effects.length, 3); assert.equal(nativeDraws(f.device).length, 9);
+  for (let i = 0; i < effects.length; i++) {
+    const words = uniformWords(effects[i]);
+    for (const value of captured[i]) assert.ok(words.includes(Math.fround(value)));
+    for (const other of captured.filter((_, index) => index !== i)) assert.ok(!words.includes(other[0]) && !words.includes(other[1]));
+  }
+  assert.notDeepEqual(captured[0].slice(2), captured[1].slice(2));
+  assert.deepEqual(captured[2].slice(2), [1, 1]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued native SSGI keeps accepted AO and GI generations across source resize', async t => {
+  const f = fixture(t); f.device.features = new Set(['rg11b10ufloat-renderable']); await f.renderer.init();
+  const output = new T.RenderTarget(80, 60, {type: T.HalfFloatType, depthBuffer: false});
+  t.after(() => output.dispose()); f.renderer.setOutputRenderTarget(output);
+  const {effect, pipeline} = ssgiPipeline(t, f);
+  pipeline.render(); f.renderer.setSize(40, 24, false); f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  await drain(f.renderer);
+  const consumers = nativeDraws(f.device).filter(draw => textures(draw).some(view => view.texture.format === 'rg11b10ufloat'));
+  assert.equal(consumers.length, 2);
+  assert.deepEqual(consumers.map(draw => textures(draw).filter(view => ['r8unorm', 'rg11b10ufloat'].includes(view.texture.format))
+    .map(view => [view.texture.width, view.texture.height])), [[[64, 48], [64, 48]], [[40, 24], [40, 24]]]);
+  assert.deepEqual([effect._ssgiRenderTarget.width, effect._ssgiRenderTarget.height], [40, 24]);
+  assert.equal(f.renderer.getOutputRenderTarget(), output); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native SSGI requires the real packed HDR renderable feature before any scene update', async t => {
+  const f = fixture(t); f.device.features = new Set(); await f.renderer.init();
+  let updates = 0; f.material.colorNode.onRenderUpdate(() => { updates++; return new T.Color(1, 0, 0); });
+  const {pipeline} = ssgiPipeline(t, f); t.mock.method(console, 'error', () => {});
+  assert.throws(() => pipeline.render(), {code: 'GPU_TARGET_FEATURE'});
+  assert.equal(updates, 0); assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.ok(f.device.textures.every(texture => texture.format !== 'rg11b10ufloat'));
+});
 
 for (const [name, makeEffect, count] of [['bloom', bloom, 14], ['Gaussian blur', gaussianBlur, 4]])
   test(`retained native ${name} executes its real source passes and shares their native textures`, async t => {

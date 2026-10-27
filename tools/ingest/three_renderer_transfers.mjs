@@ -311,8 +311,9 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // Native mapping writes into its own bounded result. The caller's array is
     // published only after every producer fence and the final generation check,
     // preserving it when cancellation occurs after mapping has already finished.
-    const Type = depth || format.endsWith('32float') ? Float32Array : format === 'rgba16float' ? Uint16Array : Uint8Array;
-    const components = depth || format === 'r32float' ? 1 : format === 'rg32float' ? 2 : 4;
+    const Type = depth || format.endsWith('32float') ? Float32Array : format === 'rgba16float' ? Uint16Array
+      : format === 'rg11b10ufloat' ? Uint32Array : Uint8Array;
+    const components = depth || ['r32float', 'r8unorm', 'rg11b10ufloat'].includes(format) ? 1 : format === 'rg32float' ? 2 : 4;
     const elements = width * height * components, bytes = elements * Type.BYTES_PER_ELEMENT, output = value.output;
     if (!Number.isSafeInteger(elements) || !Number.isSafeInteger(bytes))
       throw new GpuTargetReadbackError('BUDGET', 'Readback output exceeds safe integer precision');

@@ -1071,6 +1071,44 @@ horizontal/vertical intermediates and Float32 readbacks, with zero validation
 errors on the same Chromium/SwiftShader environment. Focused recording tests
 also cover queued Float32 resize/parameter snapshots and capability refusal.
 
+## Native screen-space global illumination
+
+The pinned `SSGINode` executes its original hemisphere sampling, occlusion
+bitfields, depth reconstruction and indirect-light shader through the native
+renderer. Its two outputs retain their source formats: AO in `r8unorm` and GI
+in packed `rg11b10ufloat`. The latter requires the enabled device feature
+`rg11b10ufloat-renderable`; there is no substitute format or reduced-quality
+shader. Normals may come from a scene MRT output or be reconstructed from depth.
+
+```js
+import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
+
+const scenePass = TSL.pass(scene, camera);
+scenePass.setMRT(TSL.mrt({ output: TSL.output, normal: TSL.normalView }));
+const color = scenePass.getTextureNode();
+const indirect = ssgi(color, scenePass.getTextureNode('depth'),
+  scenePass.getTextureNode('normal'), camera);
+const result = TSL.vec4(color.rgb.mul(indirect.r).add(indirect.getGINode().rgb), 1);
+const pipeline = new THREE.RenderPipeline(renderer, result);
+```
+
+The source effect owns its sample count, radius, thickness, intensity and
+temporal sampling controls. FRAME updates run once per logical frame. Queued
+passes retain their parameter values and both AO/GI generations across an
+automatic resize; intermediate images stay on the GPU. Source temporal sampling
+changes the sample pattern. It does not itself accumulate history: the addon
+expects a temporal resolve when enabled, or a separate denoiser when disabled.
+
+Chromium 151/SwiftShader matched the pinned source exactly for eight frames of
+an HDR room scene, using both MRT normals and depth-derived normals, moving
+geometry, changed radius/intensity and a resize. The comparison covered 6,848
+AO bytes, 6,848 packed GI words, 27,392 final RGBA16F channel words and 27,392
+scene-color channel words. AO and GI were spatially varied and final RGB exceeded
+one. There were no GPU, page or console errors and no numerical tolerance.
+Both runs used the same identity-swizzle adapter and logical frame clock;
+source readback padding was excluded. This is rendering correctness evidence,
+not a performance result or a full temporal-effects closure claim.
+
 ## Native clipping groups
 
 Source `ClippingGroup` planes apply to native built-in and node-material meshes,
