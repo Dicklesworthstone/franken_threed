@@ -6,7 +6,7 @@
 import {hasThreeNodeProgram, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
-import {inspectThreeLightingContext} from './three_node_passes.mjs';
+import {inspectThreeLightingContext, inspectThreeNativeCamera} from './three_node_passes.mjs';
 import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 import {inspectThreeNativeBatch, captureThreeNativeBatch} from './three_node_batch.mjs';
 import {updateThreeCameraProjection} from './three_pass_snapshot.mjs';
@@ -145,7 +145,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // classes then fail at the compiler instead of creating a second shadow map.
   const nativeShadowScene = !shadowPass && renderer?.shadowMap?.enabled === true &&
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
-      (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
+      ((object.isPointLight === true || object.isLight === true && renderer.shadowMap.type === three.VSMShadowMap) &&
+        object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
           nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
@@ -166,7 +167,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // The retained source selector, rather than the ordinary fixed route,
       // owns every renderable in a shadow pass, including excluded noncasters.
       objects.add(object);
-      if (object.castShadow !== true) continue;
+      if (object.castShadow !== true && !(object.receiveShadow && renderer.shadowMap.type === three.VSMShadowMap)) continue;
     }
     if (excludedObjects.has(object)) continue;
     const bundle = bundleMembers.get(object);
@@ -178,14 +179,21 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (shadowPass && originals.some(original => original && original.allowOverride !== true))
       fail('SHADOW', 'Native shadow casters currently require the source shadow override material');
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
-    if (!bundle && !instancedGeometry && !batch && !effective.some(nativeMaterial)) continue;
+    // A Mesh can use the source billboard shader too (for particle instances).
+    // Ordinary Sprite objects without authored nodes retain the fixed path.
+    const spriteMesh = object.isMesh === true && effective.some(material =>
+      material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true);
+    if (!bundle && !instancedGeometry && !batch && !spriteMesh && !effective.some(nativeMaterial)) continue;
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
     // unsupported classes still fail the complete preflight below.
-    if (!(object instanceof three.Mesh) || object.intersectsFrustum !==
-        (object.isSkinnedMesh ? three.SkinnedMesh.prototype.intersectsFrustum : three.Mesh.prototype.intersectsFrustum))
-      fail('OBJECT', 'Native node scenes require ordinary meshes with their source frustum implementation');
+    const sprite = object instanceof three.Sprite && object.isSprite === true;
+    if (!(object instanceof three.Mesh || sprite) || object.intersectsFrustum !==
+        (sprite ? three.Sprite.prototype : object.isSkinnedMesh ? three.SkinnedMesh.prototype : three.Mesh.prototype).intersectsFrustum)
+      fail('OBJECT', 'Native node scenes require source meshes or sprites with their source frustum implementation');
+    if (sprite && Array.isArray(object.material))
+      fail('MATERIAL', 'Source sprites require one material');
     if (batch) inspectThreeNativeBatch(three, object, fail);
     if (typeof object.onBeforeRender !== 'function' || typeof object.onAfterRender !== 'function')
       fail('HOOK', 'Native object render callbacks must be callable');
@@ -270,8 +278,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
-  if (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera)
-    fail('CAMERA', 'Native node scenes require an ordinary camera');
+  inspectThreeNativeCamera(three, camera);
+  if (camera.isArrayCamera && (bundleSelections.length || [...pairs.keys()].some(object => object.isBatchedMesh)))
+    fail('CAMERA', 'Native ArrayCamera bundles and BatchedMesh require additional per-view command ordering');
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
@@ -308,7 +317,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   let fixedDrawCandidates = false, expandedDraws = 0;
   {
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    const frustum = new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
+    const frustum = camera.isArrayCamera ? new three.FrustumArray().setFromArrayCamera(camera) :
+      new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
     const center = new three.Vector4();
     const visible = [{object: root, groupOrder: 0}];
     const append = (object, state, original, material, group, groupOrder, z, background = false) => {
@@ -326,7 +336,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const listMaterial = Object.freeze({id: original.id, transparent: transparent(original), transmission: original.transmission ?? 0});
       const packet = {binding, object, geometry, material, listMaterial,
         group: group ? Object.freeze({...group}) : null, groupOrder, z, renderOrder: object.renderOrder,
-        first, count: Math.max(0, end - first), frontFaceCW: object.matrixWorld.determinant() < 0,
+        first, count: Math.max(0, end - first), frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0,
         nodeRangeCaptured: true, nodeUniforms: null, background, sourceMaterial: original, sourceGroup: group,
         transmissionDoublePass: transmissive(original) && original.side === three.DoubleSide && original.forceSinglePass === false,
         ...(shadowPass ? {shadowBindings: variants} : {colorBindings: variants})};
@@ -357,9 +367,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           const state = pairs.get(object), {geometry} = state;
           let z = 0;
           if (sortObjects) {
-            const bounds = object.boundingSphere !== undefined ? object : geometry;
-            if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
-            z = center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projection).z;
+            if (object.isSprite) z = center.setFromMatrixPosition(object.matrixWorld).applyMatrix4(projection).z;
+            else {
+              const bounds = object.boundingSphere !== undefined ? object : geometry;
+              if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
+              z = center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projection).z;
+            }
           }
           if (state.array) for (const group of geometry.groups)
             append(object, state, state.originals[group.materialIndex], state.effective[group.materialIndex], group, groupOrder, z);
@@ -417,8 +430,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       fail('LIMIT', 'Native scene capture exceeds its pending uniform and attribute byte budget');
   };
   const prepareEnvironment = (selectedBindings, first) => {
-    first.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, first.object.matrixWorld);
-    first.object.normalMatrix.getNormalMatrix(first.object.modelViewMatrix);
+    if (!camera.isArrayCamera || !camera.cameras.length) {
+      first.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, first.object.matrixWorld);
+      first.object.normalMatrix.getNormalMatrix(first.object.modelViewMatrix);
+    }
     programs.preparePMREM(selectedBindings.map(binding => binding.nodeProgram),
       {...frameContext, object: first.object, material: first.material},
       capturedDraws.length === 0 && (first.background || !fixedDrawCandidates));
@@ -485,7 +500,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       textureUses.push(marker.lease); copies.push(marker);
     };
     const run = () => {
-      if (!draw.bundleWarm) {
+      if (!draw.bundleWarm && (!camera.isArrayCamera || !camera.cameras.length)) {
         draw.object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, draw.object.matrixWorld);
         draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
       }
@@ -551,7 +566,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.first = Math.min(extent, Math.max(range.start, group?.start ?? 0));
         const end = Math.min(extent, range.start + range.count, group ? group.start + group.count : Infinity);
         draw.count = Math.max(0, end - draw.first);
-        draw.frontFaceCW = draw.object.matrixWorld.determinant() < 0;
+        draw.frontFaceCW = draw.object.isMesh === true && draw.object.matrixWorld.determinant() < 0;
       }
       // Lease each post-update texture before after() or the next logical draw
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
@@ -616,6 +631,27 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         {wireframe: draw.binding.nodeProgram.wireframe === true, indexCount: captured.wireframeIndexCount});
       if (batchDraws === null && capturedDraws.length >= maxDraws)
         fail('LIMIT', 'Native source draw list exceeds its capacity');
+      // WebGPUBackend.draw selects views after node/binding updates, before
+      // updateAfter and the object's after hook. Nodes still see the parent and
+      // run once per source material side, even when no child layer matches.
+      draw.nodeViews = null;
+      if (camera.isArrayCamera && camera.cameras.length) {
+        inspectThreeNativeCamera(three, camera);
+        draw.nodeViews = Object.freeze(camera.cameras.flatMap((child, index) => {
+          if (!draw.object.layers.test(child.layers)) return [];
+          const viewport = child.viewport ? ['x', 'y', 'z', 'w'].map(key => child.viewport[key]) : null;
+          if (viewport?.some(value => !Number.isFinite(value) || value < 0))
+            fail('CAMERA', 'Native ArrayCamera viewports require nonnegative finite components');
+          const uniforms = draw.nodeUniforms.slice(), location = draw.binding.nodeProgram.cameraIndex;
+          if (location) {
+            const packet = uniforms[location.group].slice();
+            new DataView(packet.buffer, packet.byteOffset, packet.byteLength).setUint32(location.offset, index, true);
+            uniforms[location.group] = packet; bytes += packet.byteLength;
+            if (bytes > maxUniformBytes) fail('LIMIT', 'Native camera-index captures exceed the pending byte budget');
+          }
+          return [Object.freeze({index, viewport: viewport ? Object.freeze(viewport) : null, uniforms: Object.freeze(uniforms)})];
+        }));
+      }
       copies = afterCopies;
       programs.after(draw.binding.nodeProgram, updateContext);
       draw.nodeFramebufferCopies = Object.freeze(beforeCopies);

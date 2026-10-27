@@ -105,16 +105,19 @@ test('logarithmic orthographic draws use source fragment depth and respect mater
   assert.match(second, /frag_depth/); assert.match(second, /0\.375/);
 });
 
-test('ArrayCamera node draws keep their explicit admission boundary without submitting a wrong depth mode', async t => {
+test('native ArrayCamera views preserve reversed projections, culling and depth comparisons', async t => {
   const f = fixture(t, {reversedDepthBuffer: true}), a = f.camera;
   a.viewport = new T.Vector4(0, 0, 32, 64);
   const b = new T.PerspectiveCamera(45, .5, .25, 2048); b.position.z = 3; b.viewport = new T.Vector4(32, 0, 32, 64);
+  a.updateMatrixWorld(); b.updateMatrixWorld();
   const camera = new T.ArrayCamera([a, b]);
-  await f.renderer.init();
-  assert.throws(() => f.renderer.render(f.scene, camera), {code: 'THREE_NODE_PROGRAM_CAMERA'});
+  await f.renderer.init(); f.renderer.render(f.scene, camera); await drain(f.renderer);
   assert.ok([camera, a, b].every(value => value.reversedDepth && value.coordinateSystem === T.WebGPUCoordinateSystem));
-  assert.equal(nativeDraws(f.device).length, 0);
-  assert.equal(f.renderer._pending.length, 0);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 2);
+  assert.ok(draws.every(draw => draw.pipeline.depthStencil.depthCompare === 'greater-equal'));
+  assert.ok(draws.every(draw => draw.pipeline.vertex.module.code.includes('cameraProjectionMatrices')));
+  assert.equal(f.device.passes[0].desc.depthStencilAttachment.depthClearValue, 0);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('source scene passes sample reversed depth through the native output graph', async t => {

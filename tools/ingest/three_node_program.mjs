@@ -2,7 +2,8 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid/skinned/morphed meshes, InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
+ * The profile is rigid/skinned/morphed meshes, source sprite billboards,
+ * InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
@@ -13,15 +14,15 @@
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
- * Source Fog/FogExp2 and directional/spot/point Basic/PCF shadows retain their
- * native material composition. The registered SunLight cascade lifecycle
- * retain source shadow nodes and ShadowMaterial receivers. Single-output source
+ * Source Fog/FogExp2 and directional/spot/point Basic/PCF/VSM shadows retain
+ * native material composition, including source Point/Sun VSM fallbacks.
+ * Registered SunLight cascades retain source nodes and ShadowMaterial receivers. Single-output source
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
  * Named MRT outputs share native attachments and retain source graph construction.
  * ClippingGroup planes retain source union/intersection and alpha-to-coverage
  * composition. Physical transmission and dispersion retain source framebuffer
  * nodes and require the renderer's ordered scene-color copy owner. Writable/atomic
- * storage and VSM shadows fail explicitly.
+ * storage fails explicitly. VSM retains the source moment and blur passes.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -30,7 +31,7 @@
 import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
-  updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
+  updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
@@ -44,6 +45,7 @@ export class ThreeNodeProgramError extends Error {
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode']);
+const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode', 'envNode']);
@@ -53,7 +55,7 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
   'transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']);
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
-const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
+const GRAPH_SLOTS = [...SLOTS, ...SPRITE_SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
 // These source material accessors lower to ordinary 2D texture bindings. AO and
 // light maps additionally retain their exact source material lighting nodes.
 // Environment maps use their separate source PMREM identity and context below.
@@ -103,7 +105,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
     [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial],
     [three.MeshNormalMaterial, three.MeshNormalNodeMaterial], [three.MeshMatcapMaterial, three.MeshMatcapNodeMaterial],
-    [three.ShadowMaterial, three.ShadowNodeMaterial]
+    [three.ShadowMaterial, three.ShadowNodeMaterial], [three.SpriteMaterial, three.SpriteNodeMaterial]
   ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
   // Share immutable source text only. Each render object keeps its own builder,
   // observer and bindings, since source nodes may close over its live values.
@@ -446,11 +448,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('LIGHTS', 'Native lit graph projected maps and custom light color nodes are not admitted');
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
-          ![three.BasicShadowMap, three.PCFShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
+          ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
           shadow.filterNode != null || shadow.shadowNode != null ||
           ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
-        fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF maps');
+        fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF/VSM maps');
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
         id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true];
@@ -684,6 +686,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return JSON.stringify([maps, material.normalMapType,
       textureSignature(maps.map(key => ({value: material[key]})))]);
   }
+  // Sprite shader construction branches on attenuation and the presence of
+  // an anchor reference. Values of center/rotation/scale stay live uniforms.
+  function spriteSignature(material, object) {
+    return Object.getPrototypeOf(material) === three.SpriteNodeMaterial.prototype
+      ? JSON.stringify([material.sizeAttenuation, object.center?.isVector2 === true]) : null;
+  }
   function transmissionSignature(material) {
     if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
     return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
@@ -737,11 +745,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     material = prepareMaterial(material);
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
-        ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow or unlit base NodeMaterial');
+        ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
-      physical = prototype === three.MeshPhysicalNodeMaterial.prototype;
+      physical = prototype === three.MeshPhysicalNodeMaterial.prototype, sprite = prototype === three.SpriteNodeMaterial.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     sourceLights(material, context);
@@ -749,16 +757,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
-    if (!(object instanceof three.Mesh) ||
+    if (!(object instanceof three.Mesh || object instanceof three.Sprite) ||
         !(object.geometry instanceof three.BufferGeometry) ||
         object.geometry.isInstancedBufferGeometry && !(object.geometry instanceof three.InstancedBufferGeometry))
-      fail('OBJECT', 'Native node graphs require source meshes, BatchedMesh, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
+      fail('OBJECT', 'Native node graphs require source sprites, meshes, BatchedMesh, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
     inspectInstances(object);
     inspectThreeNativeBatch(three, object, fail);
     inspectSkinning(object);
     inspectMorphs(object);
-    if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera))
-      fail('CAMERA', 'Native node graphs require an ordinary camera');
+    if (camera) inspectThreeNativeCamera(three, camera);
     sourceFog(material, context);
     inspectThreeNodeClipping(three, context, maxNodes, fail);
     if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
@@ -789,7 +796,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
         inspectTexture(value);
       }
-      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
+      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(sprite && SPRITE_SLOTS.has(key)) && !(lit && LIT_SLOTS.has(key)) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
@@ -912,8 +919,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
+      spriteSignature(material, object),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
+      camera?.isArrayCamera === true ? [camera.id, camera.cameras.length] : null,
       instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object, effects),
       inspectThreeLightingContext(three, renderer.contextNode),
@@ -1119,8 +1128,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const colorCount = outputStruct?.members.length ?? 1;
     if (colorCount > (renderer.getRenderTarget?.()?.textures.length ?? 1))
       fail('MRT', 'Native fragment outputs exceed the current color attachments');
+    let cameraIndex = null;
+    if (context.camera?.isArrayCamera && context.camera.cameras.length) {
+      const index = groups.findIndex(group => group.name === 'cameraIndex');
+      if (index !== -1) {
+        const group = groups[index], binding = bindings[index].bindings[0], uniform = binding?.uniforms?.[0];
+        // The source backend replaces this dedicated group with one uint index
+        // per child. Preserve its layout without changing the public TSL node.
+        if (group.entries.length !== 1 || group.uniforms.length !== 1 || binding.uniforms.length !== 1 ||
+            uniform.nodeUniform.type !== 'uint' || uniform.nodeUniform.node.name !== 'u_cameraIndex')
+          fail('CAMERA', 'Native ArrayCamera requires the source camera-index uniform group');
+        cameraIndex = Object.freeze({group: index, offset: group.uniforms[0].offset + uniform.offset * 4});
+      }
+    }
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`,
       vertex: shaders.vertex, fragment: shaders.fragment, colorCount,
+      cameraIndex,
       wireframe: preparedMaterial.wireframe === true,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
@@ -1163,6 +1186,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
+      spriteSignature: spriteSignature(preparedMaterial, object),
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
@@ -1176,6 +1200,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
+    // Source shared UniformArray bindings survive graph reconstruction, notably
+    // an ArrayCamera view-count change. A newly validated layout owns a fresh
+    // allocation; accepted older draws already retain their immutable packets.
+    for (const group of groups) for (const member of group.uniforms) {
+      const binding = bindings[group.index].bindings[member.binding], history = uniformBuffers.get(binding);
+      if (history && history.bytes.byteLength !== member.byteLength) uniformBuffers.delete(binding);
+    }
     // Acquire before retiring to preserve an unchanged pair's cache identity.
     retainShaders(shaders);
     if (previous) retire(previous);
@@ -1469,6 +1500,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkCapture(state, context) {
     const object = context.object ?? state.object;
     checkWireframe(state);
+    if (spriteSignature(prepareMaterial(state.material), object) !== state.spriteSignature)
+      fail('CHANGED', 'Native sprite attenuation or center reference changed; compile the billboard graph again');
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);

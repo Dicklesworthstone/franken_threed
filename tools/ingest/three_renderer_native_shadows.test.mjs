@@ -666,3 +666,186 @@ test('explicit compileComputeAsync keeps the source clock and replacement animat
   assert.equal(clock.pending, 1, 'settling compilation does not install a second host callback');
   f.renderer.dispose(); assert.equal(clock.pending, 0);
 });
+
+
+for (const kind of ['directional', 'spot']) test(`native VSM ${kind} shadows render source casters and both moment blur passes`, async t => {
+  const f = fixture(t);
+  f.renderer.shadowMap.type = T.VSMShadowMap;
+  if (kind === 'spot') {
+    f.scene.remove(f.light);
+    f.light = new T.SpotLight(0xffffff, 30);
+    f.light.position.set(-3, 4, 5); f.light.castShadow = true;
+    f.light.shadow.mapSize.set(32, 16); f.light.shadow.camera.far = 30;
+    f.scene.add(f.light, f.light.target);
+  }
+  f.light.shadow.radius = 2; f.light.shadow.blurSamples = 6;
+  f.receiver.frustumCulled = false;
+  const callbacks = [];
+  f.receiver.onBeforeShadow = () => callbacks.push('receiver');
+  f.caster.onBeforeShadow = () => callbacks.push('caster');
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.device.submissions.length, 0, 'compilation prepares but never runs the source shadow passes');
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(callbacks.sort(), ['caster', 'receiver'], 'VSM includes receive-only objects in the source shadow pass');
+  const shadows = targetPasses(f.device).filter(pass => pass.draws.length);
+  assert.equal(shadows.length, 1); assert.equal(shadows[0].draws.length, 2);
+  assert.ok(shadows[0].draws.every(draw => draw.pipeline.primitive.cullMode === 'back'),
+    'VSM preserves original FrontSide instead of flipping it like depth comparison shadows');
+  assert.equal(f.light.shadow.map.depthTexture.compareFunction, null);
+  const draws = nativeDraws(f.device);
+  const vertical = draws.find(draw => shader(draw).includes('meanVertical'));
+  const horizontal = draws.find(draw => shader(draw).includes('meanHorizontal'));
+  assert.ok(vertical); assert.ok(horizontal);
+  assert.equal(vertical.pipeline.fragment.targets[0].format, 'rg16float');
+  assert.equal(horizontal.pipeline.fragment.targets[0].format, 'rg16float');
+  const depth = shadows[0].desc.depthStencilAttachment.view.texture;
+  assert.ok(textureResources(vertical).some(resource => resource.texture === depth));
+  const verticalPass = f.device.passes.find(pass => pass.draws.some(draw => shader(draw).includes('meanVertical')));
+  const horizontalPass = f.device.passes.find(pass => pass.draws.some(draw => shader(draw).includes('meanHorizontal')));
+  assert.ok(textureResources(horizontal).some(resource => resource.texture === verticalPass.desc.colorAttachments[0].view.texture));
+  const receiver = receiverDraws(f.device).at(-1);
+  assert.ok(textureResources(receiver).some(resource => resource.texture === horizontalPass.desc.colorAttachments[0].view.texture));
+  assert.ok(f.device.passes.indexOf(shadows[0]) < f.device.passes.indexOf(verticalPass));
+  assert.ok(f.device.passes.indexOf(verticalPass) < f.device.passes.indexOf(horizontalPass));
+  assert.ok(uniformValues(vertical).includes(6)); assert.ok(uniformValues(vertical).includes(2));
+  f.light.shadow.autoUpdate = false;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).filter(draw => shader(draw).includes('meanVertical')).length, 1,
+    'frozen shadows keep their previous moment maps without replaying blur passes');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+
+test('queued VSM resizes retain each depth and moment generation with independent blur parameters', async t => {
+  const f = fixture(t); f.renderer.shadowMap.type = T.VSMShadowMap; f.receiver.frustumCulled = false;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  const sizes = [[32, 16], [64, 32], [32, 16]], radii = [.375, 1.625, 2.875], samples = [3, 5, 7];
+  for (let index = 0; index < sizes.length; index++) {
+    f.light.shadow.mapSize.set(...sizes[index]); f.light.shadow.radius = radii[index];
+    f.light.shadow.blurSamples = samples[index]; f.renderer._nodes.nodeFrame.update();
+    f.renderer.render(f.scene, f.camera);
+  }
+  assert.equal(f.renderer._targets.size, 10, 'nine shadow generations plus the retained presentation target');
+  f.light.shadow.mapSize.set(128, 64); f.light.shadow.radius = 99; f.light.shadow.blurSamples = 99;
+  await drain(f.renderer); await f.renderer.waitForGPU();
+  const vertical = nativeDraws(f.device).filter(draw => shader(draw).includes('meanVertical'));
+  const horizontal = nativeDraws(f.device).filter(draw => shader(draw).includes('meanHorizontal'));
+  const receivers = receiverDraws(f.device).filter(draw =>
+    textureResources(draw).some(resource => resource.texture.format === 'rg16float'));
+  const verticalPasses = f.device.passes.filter(pass => pass.draws.some(draw => shader(draw).includes('meanVertical')));
+  const horizontalPasses = f.device.passes.filter(pass => pass.draws.some(draw => shader(draw).includes('meanHorizontal')));
+  assert.equal(vertical.length, 3); assert.equal(horizontal.length, 3); assert.equal(receivers.length, 3);
+  const depths = vertical.map(draw => textureResources(draw).find(resource => resource.texture.format.startsWith('depth')).texture);
+  const verticalMaps = verticalPasses.map(pass => pass.desc.colorAttachments[0].view.texture);
+  const horizontalMaps = horizontalPasses.map(pass => pass.desc.colorAttachments[0].view.texture);
+  const commands = f.device.submissions.flat(2);
+  for (const generations of [depths, verticalMaps, horizontalMaps]) {
+    assert.deepEqual(generations.map(texture => [texture.width, texture.height]), sizes);
+    assert.equal(new Set(generations).size, 3, 'returning to an earlier size does not reuse its queued allocation');
+    assert.ok(generations.slice(0, 2).every(texture => texture.destroyed));
+    assert.notEqual(generations[2].destroyed, true);
+  }
+  for (let index = 0; index < sizes.length; index++) {
+    assert.ok(textureResources(horizontal[index]).some(resource => resource.texture === verticalMaps[index]));
+    assert.ok(textureResources(receivers[index]).some(resource => resource.texture === horizontalMaps[index]));
+    for (const draw of [vertical[index], horizontal[index]]) {
+      const values = uniformValues(draw);
+      assert.ok(values.includes(radii[index])); assert.ok(values.includes(samples[index]));
+      assert.ok(sizes[index].every(size => values.includes(size)));
+      assert.equal(values.includes(99), false, 'later edits cannot replace accepted blur uniforms');
+    }
+    const depthPass = commands.find(pass => pass.desc.depthStencilAttachment?.view?.texture === depths[index] && pass.draws.length);
+    const receiverPass = commands.find(pass => pass.draws?.some(draw =>
+      textureResources(draw).some(resource => resource.texture === horizontalMaps[index])));
+    assert.ok(commands.indexOf(depthPass) < commands.indexOf(verticalPasses[index]));
+    assert.ok(commands.indexOf(verticalPasses[index]) < commands.indexOf(horizontalPasses[index]));
+    assert.ok(commands.indexOf(horizontalPasses[index]) < commands.indexOf(receiverPass));
+  }
+  assert.equal(f.renderer._targets.size, 4, 'only current shadow maps and the presentation target remain');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 3);
+});
+
+test('explicit VSM moment disposal invalidates queued readers outside the source resize scope', async t => {
+  const f = fixture(t); f.renderer.shadowMap.type = T.VSMShadowMap;
+  const moments = new Set(), setTarget = f.renderer.setRenderTarget;
+  f.renderer.setRenderTarget = function (target, ...args) {
+    if (target?.texture.format === T.RGFormat) moments.add(target);
+    return setTarget.call(this, target, ...args);
+  };
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera);
+  f.light.shadow.mapSize.set(64, 32); f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.equal(moments.size, 2);
+  [...moments][1].dispose();
+  await assert.rejects(drain(f.renderer), {code: 'THREE_TARGET_STALE'});
+  assert.equal(f.renderer.info.f3d.presentedRenders, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native point shadows under VSM retain source cube comparison without moment passes', async t => {
+  const f = pointFixture(t); f.renderer.shadowMap.type = T.VSMShadowMap; f.receiver.frustumCulled = false;
+  const faces = []; f.receiver.onBeforeShadow = () => faces.push(f.renderer.getActiveCubeFace());
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(faces, [0, 1, 2, 3, 4, 5], 'global VSM includes receive-only objects on all six source faces');
+  const passes = targetPasses(f.device, 16, 16).filter(pass => pass.draws.length);
+  assert.equal(passes.length, 6); assert.ok(passes.every(pass => pass.draws.length === 2));
+  assert.deepEqual(passes.map(pass => pass.desc.depthStencilAttachment.view.baseArrayLayer), faces);
+  const depth = passes[0].desc.depthStencilAttachment.view.texture;
+  assert.ok(passes.every(pass => pass.desc.depthStencilAttachment.view.texture === depth));
+  const receiver = receiverDraws(f.device).at(-1);
+  assert.match(shader(receiver), /texture_depth_cube/); assert.match(shader(receiver), /textureSampleCompare/);
+  assert.ok(textureResources(receiver).some(resource => resource.texture === depth && resource.dimension === 'cube'));
+  assert.equal(nativeDraws(f.device).some(draw => /meanVertical|meanHorizontal/.test(shader(draw))), false);
+  assert.equal(f.device.passes.some(pass => pass.desc.colorAttachments?.some(attachment =>
+    attachment.view?.texture.format === 'rg16float')), false, 'the DFG lookup is sampled but no moment target is rendered');
+  assert.equal(f.renderer.shadowMap.type, T.VSMShadowMap); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native SunLight under VSM retains the source PCF cascade fallback without blurring the atlas', async t => {
+  const f = fixture(t); f.scene.remove(f.light, f.light.target);
+  f.renderer.shadowMap.type = T.VSMShadowMap; f.receiver.frustumCulled = false;
+  const sun = new SunLight(0xffffff, 2); sun.position.set(-4, 10, 8); sun.castShadow = true;
+  sun.shadow.mapSize.set(32, 16); sun.shadow.camera.far = 20;
+  f.scene.add(sun); f.renderer.library.addLight(SunLightNode, SunLight);
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const passes = targetPasses(f.device, 64, 16), cascades = passes.filter(pass => pass.draws.length);
+  assert.equal(cascades.length, 2); assert.ok(cascades.every(pass => pass.draws.length === 2));
+  assert.equal(passes.filter(pass => pass.desc.depthStencilAttachment.depthLoadOp === 'clear').length, 1);
+  const depth = cascades[0].desc.depthStencilAttachment.view.texture;
+  assert.equal(cascades[1].desc.depthStencilAttachment.view.texture, depth);
+  const receiver = receiverDraws(f.device).at(-1);
+  assert.match(shader(receiver), /textureSampleCompare/);
+  assert.ok(textureResources(receiver).some(resource => resource.texture === depth));
+  assert.equal(nativeDraws(f.device).some(draw => /meanVertical|meanHorizontal/.test(shader(draw))), false);
+  assert.equal(f.device.passes.some(pass => pass.desc.colorAttachments?.some(attachment =>
+    attachment.view?.texture.format === 'rg16float')), false, 'the DFG lookup is sampled but no moment target is rendered');
+  assert.equal(f.renderer.shadowMap.type, T.VSMShadowMap); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('ordinary VSM materials select one native shadow owner and preserve explicit shadowSide', async t => {
+  const f = fixture(t); f.renderer.shadowMap.type = T.VSMShadowMap; f.receiver.frustumCulled = false;
+  f.receiver.material = new T.MeshStandardMaterial({color: 0x706050});
+  f.caster.material = new T.MeshBasicMaterial({color: 0xc07040, shadowSide: T.BackSide});
+  f.noncaster.material = new T.MeshBasicMaterial({color: 0x4070c0});
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const shadow = targetPasses(f.device).find(pass => pass.draws.length);
+  assert.equal(shadow.draws.length, 2);
+  assert.equal(shadow.draws.filter(draw => {
+    const {frontFace, cullMode} = draw.pipeline.primitive;
+    return frontFace === 'cw' && cullMode === 'back' || frontFace === 'ccw' && cullMode === 'front';
+  }).length, 1, 'explicit BackSide casts from the opposite side of the default FrontSide receiver');
+  const horizontal = f.device.passes.find(pass => pass.draws.some(draw => shader(draw).includes('meanHorizontal')));
+  assert.ok(horizontal);
+  const moments = horizontal.desc.colorAttachments[0].view.texture;
+  const receivers = nativeDraws(f.device).filter(draw => textureResources(draw).some(resource => resource.texture === moments));
+  assert.equal(receivers.length, 1, 'the ordinary Standard material samples the same native moment allocation');
+  const visible = f.device.passes.find(pass => pass.draws.some(draw =>
+    textureResources(draw).some(resource => resource.texture === moments)));
+  assert.equal(visible.draws.length, 3);
+  assert.ok(visible.draws.every(draw => draw.pipeline.vertex.entryPoint === 'main'),
+    'all ordinary objects share the native shadow owner without a second fixed shadow pass');
+  assert.equal(f.renderer.info.f3d.presentedRenders, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

@@ -328,7 +328,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       if(object.isMesh){
         if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
-        if(!programRoute()&&colorMaterials(object).some(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
+        if(!programRoute()&&!capturedNodeObject(object)&&colorMaterials(object).some(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
           fail('MATERIAL','Native sprite materials currently require a Sprite object');
         if((object.isBatchedMesh&&!programRoute()&&!capturedNodeObject(object))||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
@@ -369,9 +369,11 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           if(!(object instanceof three.Sprite)||object.intersectsFrustum!==three.Sprite.prototype.intersectsFrustum)
             fail('OBJECT','Expected a source Sprite without custom frustum tests');
-          if(Array.isArray(sourceMaterial(object))||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
-            fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
-          threeSpriteCount(object);
+          if(!capturedNodeObject(object)){
+            if(Array.isArray(sourceMaterial(object))||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
+              fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
+            threeSpriteCount(object);
+          }
           geometryAdmission(object.geometry,object);
         }
       }
@@ -1421,7 +1423,7 @@ export async function createGpuThreeScene(device,scene,{
     return camera.cameras.map(child=>{
       checkCamera(child);if(child.isArrayCamera)fail('CAMERA','Nested ArrayCamera views are not admitted');
       const projected=new three.Matrix4().multiplyMatrices(child.projectionMatrix,child.matrixWorldInverse);
-      const childFrustum=new three.Frustum().setFromProjectionMatrix(projected,child.coordinateSystem,false);
+      const childFrustum=new three.Frustum().setFromProjectionMatrix(projected,child.coordinateSystem,child.reversedDepth);
       const viewProjection=projected.elements.slice();
       if(child.coordinateSystem===three.WebGLCoordinateSystem&&profile.clipSpace!=='webgpu')
         for(let c=0;c<4;c++)viewProjection[c*4+2]=0.5*(projected.elements[c*4+2]+projected.elements[c*4+3]);
@@ -1441,7 +1443,7 @@ export async function createGpuThreeScene(device,scene,{
       return {camera:child,frustum:childFrustum,viewProjection,viewport,
         lighting:{...(camera.isOrthographicCamera?{viewDirection:[child.matrixWorld.elements[8],child.matrixWorld.elements[9],child.matrixWorld.elements[10]]}:
           {cameraPosition:position(child)}),viewMatrix:child.matrixWorldInverse.elements.slice()},
-        fog:fogEnabled?fogApi.threeFogDescriptor(sourceFog(),shadingCamera,three):null,
+        fog:fogEnabled&&!nativeLightMode?fogApi.threeFogDescriptor(sourceFog(),shadingCamera,three):null,
         // Pinned Background inserts a default-layer mesh after parent culling.
         background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(backgroundScene(),child):null};
     });
@@ -1638,7 +1640,8 @@ export async function createGpuThreeScene(device,scene,{
       const copiesAtDraw = copies => {
         if(copies?.length)framebufferCopies.push({index:draws.length,copies});
       };
-      if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program?threeSpriteCount(item.object):1)*(arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
+      if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1)*
+          (item.nodeProgram?item.nodeViews?.length??1:arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
         fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
@@ -1685,6 +1688,7 @@ export async function createGpuThreeScene(device,scene,{
           if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
           copiesAtDraw(item.nodeFramebufferCopies);
+          drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews});
           draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           copiesAtDraw(item.nodeFramebufferAfterCopies);
@@ -1821,7 +1825,7 @@ export async function createGpuThreeScene(device,scene,{
           prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
         }
       }
-      if(arrayViews?.length){
+      if(arrayViews?.length||passNodeFrame?.draws.some(draw=>draw.nodeViews!==null&&draw.nodeViews!==undefined)){
         // One attachment clear precedes every view. A pass per ordered view span
         // keeps camera/lighting uniforms immutable until its immediate submit,
         // including overlapping viewports and transparent double-sided draws.
@@ -1835,33 +1839,50 @@ export async function createGpuThreeScene(device,scene,{
             scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});
           backgrounds++;live();
         }
+        let nextCopy=0;
+        const copyAt=index=>{
+          while(framebufferCopies[nextCopy]?.index===index){
+            const source=typeof options.framebuffer==='function'?options.framebuffer():options.framebuffer;
+            if(!source)fail('FRAME','Native framebuffer copies require the borrowed resolved color texture');
+            const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
+            for(const marker of framebufferCopies[nextCopy++].copies)
+              passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source);
+            device.queue.submit([encoder.finish()]);live();
+          }
+        };
         for(let i=0;i<draws.length;){
-          const {object,material}=drawObjects[i];
-          const repetitions=object.isSprite?threeSpriteCount(object):1;
-          for(const view of arrayViews){
-          if(!object.layers.test(view.camera.layers))continue;
-          activeViewport=view.viewport??activeViewport;
+          copyAt(i);
+          const {object,material,native,views:nativeViews}=drawObjects[i];
+          const repetitions=object.isSprite&&!native?threeSpriteCount(object):1;
+          const views=native?(nativeViews??[{viewport:null,uniforms:draws[i].nodeUniforms}]):arrayViews;
+          for(const view of views){
+          if(!native&&!object.layers.test(view.camera.layers))continue;
+          const viewport=native&&view.viewport?[...view.viewport.map(n=>Math.floor(n*(arrayProfile.pixelRatio??1))),
+            frame.viewport?.[4]??0,frame.viewport?.[5]??1]:view.viewport;
+          activeViewport=viewport??activeViewport;
           if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
           // NodeBuilder selects perspective attenuation from the ArrayCamera;
           // its per-view matrix uniform still comes from the current child.
-          const draw=object.isSprite?{...draws[i],worldMatrix:threeSpriteWorldMatrix(three,object,material,view.camera,
+          const draw=native?{...draws[i],nodeUniforms:view.uniforms}:object.isSprite?{...draws[i],worldMatrix:threeSpriteWorldMatrix(three,object,material,view.camera,
             {perspective:camera.isPerspectiveCamera===true})}:draws[i];
           // Source draws every instance in this view before advancing views;
           // overlapping translucent viewports make that order observable.
           for(let instance=0;instance<repetitions;instance++){
-            renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
-              lighting:{...view.lighting,lights:lighting.lights},draws:[draw],...(fogEnabled?{fog:view.fog}:{})});
+            renderer.render({...loaded,viewport:activeViewport,viewProjection:native?prepared.viewProjection:view.viewProjection,
+              lighting:native?lighting:{...view.lighting,lights:lighting.lights},draws:[draw],...(fogEnabled?{fog:native?null:view.fog}:{})});
             geometrySubmitted=true;logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
           }
           }
           i+=repetitions;
         }
+        copyAt(draws.length);
         // The initial clear resolves before the background writes. If no view
         // submits geometry afterwards, publish the final multisample image now.
         if(backgrounds&&!geometrySubmitted&&prepared.resolveTarget){
           renderer.render({...loaded,draws:[]});passes+=renderer.colorPassCount??1;live();
         }
-        logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length,0);
+        logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+(item.nodeProgram?
+          item.instanceCount===0?0:item.nodeViews?.length??1:arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length),0);
         backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
       }else{
       if(backgroundFrame){

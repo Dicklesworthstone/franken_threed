@@ -151,9 +151,9 @@ direction and radiance.
 Constructor, registration and direct-light graph changes participate in program
 selection. Changing the registered node class of a previously used light is
 refused because the source retains its analytic node by light identity; a fresh
-light can use the new registration. Shadows, projected maps and custom light
-color nodes remain explicitly refused. In particular, this enables H7's direct
-SunLight illumination without claiming its cascaded-shadow path is complete.
+light can use the new registration. Projected maps and custom light color
+nodes remain explicitly refused. The registered SunLight also retains its source
+two-cascade shadow atlas through the native shadow owner described below.
 
 Unassigned slots retain their source material color, emissive, specular and
 shininess behavior. Both material arrays and scene overrides supply the effective
@@ -210,7 +210,9 @@ retains the existing stale-use rejection contract.
 
 This path uses the existing owned WebGPU renderer and texture owners, with no
 readback or retained renderer submission. Depth framebuffer copies, the
-WebGL-authored copy route and ArrayCamera transmission remain unimplemented.
+WebGL-authored copy route remain unimplemented. Native ArrayCamera copies preserve
+their source draw boundaries; physical transmission pixel parity across views
+remains unverified.
 Distinct scene overrides retain both the original transmissive back/front phases
 and the effective override's alpha side expansion, including four physical draws.
 These are remaining compatibility tasks, not permanent exclusions.
@@ -604,14 +606,89 @@ the public clear-depth accessor, all eight reversed comparison functions,
 frustum conventions, shadows and scene-pass depth sampling retain their source
 behavior. Queued calls keep their accepted projection, near/far, clear value and
 depth uniforms. Existing perspective panorama/cube background rays also accept
-reversed projection. ArrayCamera node graphs, XR and depth modes on the
-WebGL-authored renderer facade retain their existing explicit boundaries.
+reversed projection. Ordinary native ArrayCamera views share these conventions.
+XR and depth modes on the WebGL-authored renderer facade retain their existing
+explicit boundaries.
 
 `three_renderer_depth_modes.test.mjs` checks source camera/raster oracles and
 actual captured GPU commands. `tests/e2e/webgpu_renderer/depth_modes.mjs` compares
 four queued frames per case against an independent pinned source run and source
 repeat, including full RGBA bytes and float32 depth words. Software Vulkan
 correctness does not establish hardware performance.
+
+## Native sprites
+
+Source SpriteNodeMaterial and authored SpriteMaterial graphs render on both
+Sprite and Mesh objects with the pinned billboard vertex shader, including
+positionNode, scaleNode, rotationNode, center, live rotation, size attenuation,
+maps and fog. A Mesh using ordinary SpriteMaterial selects this native path
+without authored slots. Sprite sorting uses the source object's origin, and
+negative sprite scale retains the source billboard winding.
+
+Sprite.count, Mesh.count and InstancedBufferGeometry.instanceCount remain
+instanced GPU draw counts. Queued renders retain independent uniforms, instance
+counts and marked instanced attribute histories. Structural attenuation and
+anchor-presence changes rebuild the source graph. Ten source-builder and
+recording-device regressions cover these behaviors; the four object/material
+combinations produce exact source vertex and fragment WGSL. These tests do not
+establish browser pixel parity or a performance gain.
+
+## Native source shadows
+
+Directional and spot VSM shadows now run the pinned ShadowNode depth pass,
+vertical moment blur and horizontal moment blur through the native command
+owner. The two moment targets use native RG16F storage, and receivers sample the
+actual horizontal output allocation. Ordinary materials select the same native
+shadow owner automatically. VSM includes receive-only objects in its source
+shadow list and preserves each material's side unless shadowSide overrides it.
+
+Private source map resizes retain all accepted depth and moment generations.
+Queued frames keep their own map dimensions, radius and blurSamples; returning
+to an earlier size creates another generation. Retired maps are released after
+their readers drain. Explicit application disposal remains an invalidation.
+Source autoUpdate, needsUpdate, shadow callbacks and compile-without-rendering
+semantics remain in force.
+
+Point lights under global VSM keep the source six-face cube comparison filter
+and do not create moment passes. Registered SunLight keeps the source two-tile
+PCF atlas fallback and warning; its source vsmPass is empty. This does not add
+variance filtering to the SunLight atlas. Transmitted shadows and custom shadow
+filter/replacement nodes remain outside the admitted profile.
+
+Seven focused recording-device cases cover directional and spot moments,
+queued resize/uniform history, explicit disposal, ordinary-material routing,
+side overrides and the Point/Sun fallbacks. Native VSM browser pixels have not
+been compared with the pinned reference.
+
+## Native ArrayCamera views
+
+Ordinary native WebGPU `ArrayCamera` scenes accept up to 256 perspective or
+orthographic child views. The source parent selects layers, union-frustum
+visibility and list order. Each physical material side then draws its matching
+children in source order. Object callbacks receive the original parent, and
+`NodeFrame` before/current/after updates keep their logical FRAME, RENDER and
+OBJECT frequencies; adding views does not repeat updates.
+
+The retained builder emits the source camera matrix arrays. Every submitted
+view owns a camera-index uniform packet, while queued renders retain accepted
+matrix bytes, child-layer selection and viewport values. Viewport inheritance,
+canvas DPR, physical render-target coordinates, depth ranges and reversed
+projection remain intact. An empty camera array retains the pinned non-culled
+parent-camera fallback; a nonempty array with no matching child still runs its
+source node lifecycle without submitting a geometry draw. View-count changes
+construct a new uniform layout without invalidating earlier accepted packets.
+
+The same route supports native `PassNode` scene output, ordinary/native mixed
+lists, and native instanced sprites. Framebuffer copy effects remain before or
+after the complete group of child views belonging to their source draw. Native
+array `BundleGroup` and `BatchedMesh` command ordering still require separate
+work and fail explicitly, as do XR, multiview and nested camera arrays.
+WebGL-authored ArrayCamera rendering keeps its existing boundary.
+
+`three_renderer_native_arrays.test.mjs` uses the pinned `renderObject` and
+`WebGPUBackend.draw` as an ordering oracle and inspects actual submitted uniform
+bytes and commands. These checks establish the tested execution behavior, not
+browser rasterization parity or a performance result.
 
 ## InstancedBufferGeometry
 
@@ -743,16 +820,17 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
-Light-probe grids and other custom light models,
-shadows, projected light maps and custom `lightsNode` graphs remain missing.
+Light-probe grids and other custom light models, transmitted shadows,
+custom shadow filter/replacement nodes, projected light maps and custom
+`lightsNode` graphs remain missing.
 Depth/comparison, array, volume, compressed, storage, video and unfilterable
 or integer texture graphs beyond the admitted 32-bit data/storage profiles still
 require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions, clipping/shadows,
+The profile excludes shader context extensions and unregistered shadow lifecycles,
 alpha hashing and alpha-to-coverage; skinned or morph meshes,
-including per-instance morph textures; ArrayCamera and XR views;
+including per-instance morph textures; XR/multiview and native ArrayCamera bundles or BatchedMesh;
 object render hooks outside the source lifecycle profile above and effectful
 attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
@@ -1040,7 +1118,7 @@ updates. The unchanged pinned `PassNode` can set `opaque = false` or
 renderer controls. These controls are covered by recording-device tests of the
 actual facade and pinned PassNode, including callback-driven selection changes,
 queued captures, backgrounds and output conversion. They do not establish new
-browser pixel parity or native TSL ArrayCamera support.
+browser pixel parity. Native ArrayCamera execution has its separate checks above.
 
 ## Native scene passes and previous-frame color
 

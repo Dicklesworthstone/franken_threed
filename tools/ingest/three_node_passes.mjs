@@ -10,6 +10,17 @@ const nativePasses = new WeakMap();
 const lightingHooks = new WeakMap();
 let lightingHookSerial = 0;
 
+/** Ordinary array views share their parent's source list and node lifecycle.
+ * XR/multiview need different attachment and binding ownership. */
+export function inspectThreeNativeCamera(three, camera, code = 'CAMERA') {
+  if (!(camera instanceof three.Camera) || camera.isMultiViewCamera)
+    fail('Native camera capture requires an ordinary source camera or ArrayCamera', code);
+  if (camera.isArrayCamera && (!Array.isArray(camera.cameras) || camera.cameras.length > 256 ||
+      camera.cameras.some(child => !(child instanceof three.Camera) || child.isArrayCamera || child.isMultiViewCamera ||
+        !child.isPerspectiveCamera && !child.isOrthographicCamera)))
+    fail('Native ArrayCamera views require at most 256 ordinary perspective or orthographic children', code);
+}
+
 /** Source AO/GI contexts participate in material lighting, before BRDF and
  * output composition. Keep the original hooks for the retained builder; do
  * not evaluate them during admission or substitute a final-color operation.
@@ -142,9 +153,8 @@ export function inspectThreeNativePass(three, renderer, node) {
         .some(key => node[key] !== three.Node.prototype[key]) ||
       node.updateBeforeType !== 'frame' || node.updateType !== 'none' || node.updateAfterType !== 'none')
     fail('Native scene passes require the pinned PassNode lifecycle');
-  if (!(node.scene instanceof three.Scene) || !(node.camera instanceof three.Camera) ||
-      node.camera.isArrayCamera || node.camera.isMultiViewCamera)
-    fail('Native scene passes require an ordinary source scene and camera');
+  if (!(node.scene instanceof three.Scene)) fail('Native scene passes require an ordinary source scene');
+  inspectThreeNativeCamera(three, node.camera, 'PASS');
   if (node.scope !== three.PassNode.COLOR && node.scope !== three.PassNode.DEPTH)
     fail('Native scene passes require color or depth output');
   if (!node.renderTarget?.textures?.length || node.renderTarget.texture !== node._textures.output ||

@@ -894,11 +894,6 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'ArrayCamera on the WebGL-authored route is not admitted');
         if (!Array.isArray(camera.cameras) || camera.cameras.length > 256 || camera.isMultiViewCamera)
           fail('UNSUPPORTED', 'Expected an ordinary ArrayCamera with at most 256 views');
-        if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
-        updateThreeCameraProjection(THREE, this, camera);
-        if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-        camera = captureThreeArrayCamera(THREE, camera);
-        matricesUpdated = true;
         // Source WebGPU viewports are logical canvas units, physical target units.
         frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
           targetSize: target ? [Math.max(1, Math.floor(target.width / 2 ** mipLevel)), Math.max(1, Math.floor(target.height / 2 ** mipLevel))] : this._bufferSize()};
@@ -912,10 +907,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (nodeFrame) matricesUpdated = true;
       // Native callbacks retain the original camera in _captureNodeFrame.
       // Fixed draws can wait on pipeline/texture preparation; capture their
-      // ordinary camera only after the source matrix and node updates finish.
-      if (native && !nodeCaptureDeferred && captureCameras && !camera.isArrayCamera) {
+      // camera only after the source matrix and node updates finish. Array
+      // callbacks and camera-array nodes must receive the original parent.
+      if (native && !nodeCaptureDeferred && captureCameras) {
         if (!matricesUpdated) this._updateNativeMatrices(scene, camera);
-        camera = captureThreeCamera(THREE, camera); matricesUpdated = true;
+        camera = camera.isArrayCamera ? captureThreeArrayCamera(THREE, camera) : captureThreeCamera(THREE, camera);
+        matricesUpdated = true;
       }
       let materialFrame = null;
       if (native && !nodeCaptureDeferred) {
@@ -1317,9 +1314,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           try {
             request.nodeFrame = this._captureNodeFrame(request);
             request.matricesUpdated ||= !!request.nodeFrame;
-            if (request.captureCameras && !request.camera.isArrayCamera) {
+            if (request.captureCameras) {
               if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
-              request.camera = captureThreeCamera(THREE, request.camera); request.matricesUpdated = true;
+              request.camera = request.camera.isArrayCamera ? captureThreeArrayCamera(THREE, request.camera) :
+                captureThreeCamera(THREE, request.camera);
+              request.matricesUpdated = true;
             }
             request.materialFrame = this._captureMaterialFrame(request);
           } catch (error) {

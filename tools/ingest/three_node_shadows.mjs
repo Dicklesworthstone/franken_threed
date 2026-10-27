@@ -25,8 +25,8 @@ export function registerThreeNativeShadow(three, renderer, node) {
       !(node.shadow instanceof three.LightShadow) || !point && node.shadow.isPointLightShadow ||
       ordinary && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
     reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
-  if (![three.BasicShadowMap, three.PCFShadowMap].includes(renderer.shadowMap?.type) || renderer.shadowMap.transmitted)
-    reject('Native shadow maps currently require Basic or PCF filtering without transmitted shadows');
+  if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type) || renderer.shadowMap.transmitted)
+    reject('Native shadow maps require Basic, PCF or VSM filtering without transmitted shadows');
   if (node.shadow.filterNode != null || node.shadow.shadowNode != null && node.shadow.shadowNode !== node)
     reject('Custom shadow filter and shadow replacement nodes require an explicit native adapter');
   const passSource = point ? three.PointShadowNode.prototype : source;
@@ -77,11 +77,17 @@ export function updateThreeNativeShadow(three, renderer, node, frame) {
   const name = scene.name, state = three.RendererUtils.saveRendererAndSceneState(renderer, scene);
   try {
     const extents = node.shadow.getFrameExtents(), point = node instanceof three.PointShadowNode;
-    return renderer._targets?.withNativeShadowResize
+    const updateMap = () => renderer._targets?.withNativeShadowResize
       ? renderer._targets.withNativeShadowResize(node.shadowMap,
         node.shadow.mapSize.width * (point ? 1 : extents.x),
         point ? node.shadow.mapSize.width : node.shadow.mapSize.height * extents.y, update)
       : update();
+    // Source VSM resizes both private moment targets before its two blur draws.
+    // Keep earlier queued generations alive through those source-owned resizes;
+    // an explicit application disposal still invalidates its accepted readers.
+    const moments = [node.vsmShadowMapVertical, node.vsmShadowMapHorizontal].filter(Boolean);
+    return moments.length && renderer._targets?.withNativeEffectTargets
+      ? renderer._targets.withNativeEffectTargets(moments, updateMap) : updateMap();
   }
   catch (error) {
     camera.layers.mask = layers; scene.name = name;
@@ -112,8 +118,8 @@ export function withThreeShadowMaterial(three, renderer, material, original, run
       (original.transmissionNode && original.transmissionNode.isNode) ||
       (original.backdropNode && original.backdropNode.isNode);
     const {colorNode, depthNode, positionNode} = renderer._getShadowNodes(original);
-    material.side = original.shadowSide !== null ? original.shadowSide :
-      original.side === three.FrontSide ? three.BackSide : original.side === three.BackSide ? three.FrontSide : three.DoubleSide;
+    material.side = original.shadowSide !== null ? original.shadowSide : renderer.shadowMap.type === three.VSMShadowMap
+      ? original.side : original.side === three.FrontSide ? three.BackSide : original.side === three.BackSide ? three.FrontSide : three.DoubleSide;
     if (colorNode !== null) material.colorNode = colorNode;
     if (depthNode !== null) material.depthNode = depthNode;
     if (positionNode !== null) material.positionNode = positionNode;
