@@ -251,3 +251,42 @@ test('queued bundle preparation ignores newly added invalid children and live re
   assert.deepEqual(gpuDraws(f.device).map(draw => draw.args[0]), [6, 6]);
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+test('4000 Toon bundle objects render through shared native pipelines across static and dynamic frames', async t => {
+  const f = await gpuFixture(t), geometries = [new T.BoxGeometry(), new T.PlaneGeometry(), new T.SphereGeometry(1, 8, 6)];
+  const light = new T.DirectionalLight(0xffffff, 3); light.position.set(1, 2, 3); f.scene.add(light);
+  const objects = [];
+  for (let i = 0; i < 4000; i++) {
+    const material = new T.MeshToonNodeMaterial({color: new T.Color(i / 4000, .25, 1 - i / 4000)});
+    const object = new T.Mesh(geometries[i % geometries.length], material);
+    object.frustumCulled = false; objects.push(object); f.group.add(object);
+  }
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(gpuDraws(f.device).length, 4000);
+  const pipelines = f.device.pipelines.filter(pipeline => pipeline.vertex.entryPoint === 'main');
+  assert.equal(pipelines.length, 2);
+  const {programs, shaderBytes, maxShaderBytes} = f.renderer._nodeProgramSupport.diagnostics;
+  assert.equal(programs, 4000); assert.equal(maxShaderBytes, 16 * 1024 * 1024);
+  assert.ok(shaderBytes < 64 * 1024, 'the complete draw path retains one WGSL pair');
+  const objectBytes = draw => [...draw.groups.values()].flatMap(({group, offsets}) => {
+    const uniforms = group.layout.entries.filter(entry => entry.buffer?.type === 'uniform').sort((a, b) => a.binding - b.binding);
+    return uniforms.flatMap((entry, index) => {
+      const resource = group.entries.find(member => member.binding === entry.binding).resource;
+      const bytes = draw.contents.get(resource.buffer);
+      return [...new Float32Array(bytes.buffer, bytes.byteOffset + (resource.offset ?? 0) + (offsets[index] ?? 0), resource.size / 4)];
+    });
+  });
+  const cold = gpuDraws(f.device), original = objectBytes(cold[0]);
+  assert.notDeepEqual(original, objectBytes(cold.at(-1)), 'shared pipelines retain all source material colors');
+  for (const object of objects) object.position.x = 2;
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const warm = gpuDraws(f.device);
+  assert.equal(warm.length, 8000); assert.deepEqual(objectBytes(warm[4000]), original);
+  f.group.static = false;
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const dynamic = gpuDraws(f.device);
+  assert.equal(dynamic.length, 12000); assert.notDeepEqual(objectBytes(dynamic[8000]), original);
+  assert.equal(f.device.pipelines.filter(pipeline => pipeline.vertex.entryPoint === 'main').length, 2);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  t.diagnostic(JSON.stringify({objects: 4000, submittedDraws: 12000, nativePipelines: 2, shaderBytes, maxShaderBytes}));
+});

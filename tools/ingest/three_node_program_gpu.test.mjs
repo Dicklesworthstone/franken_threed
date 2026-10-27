@@ -6,8 +6,8 @@ import {createThreeNodeProgramMeshes} from './three_node_program_gpu.mjs';
 import {createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
 const fail = (code, message) => { throw Object.assign(Error(message), {code}); };
 function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22, sampleCount = 1,
-  configureGeometry = () => {}} = {}) {
-  const buffers = [], bindGroups = [], pipelines = [], writes = [];
+  depthFormat = 'depth24plus', configureGeometry = () => {}} = {}) {
+  const buffers = [], bindGroups = [], pipelines = [], writes = [], shaderModules = [], pipelineLayouts = [];
   let resolveLost, releasePipelines = null, pipelineGate = Promise.resolve(), pipelineError = null, scopeError = null;
   const device = {features: new Set(), limits: {maxBufferSize, maxUniformBufferBindingSize: 65536,
     minUniformBufferOffsetAlignment: 256, maxBindGroups: 4}, lost: new Promise(resolve => { resolveLost = resolve; }),
@@ -18,7 +18,9 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
         getMappedRange() { return this.bytes.buffer; }, unmap() {}, destroy() { this.dead = true; }};
       buffers.push(buffer); return buffer;
     },
-    createBindGroupLayout: d => d, createPipelineLayout: d => d, createShaderModule: d => d,
+    createBindGroupLayout: d => d,
+    createPipelineLayout(d) { pipelineLayouts.push(d); return d; },
+    createShaderModule(d) { shaderModules.push(d); return d; },
     createBindGroup(descriptor) { bindGroups.push(descriptor); return descriptor; },
     async createRenderPipelineAsync(descriptor) {
       pipelines.push(descriptor); await pipelineGate; if (pipelineError) throw pipelineError; return descriptor;
@@ -42,7 +44,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
   const attributes = [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}];
   configureGeometry(source, attributes);
   const gpu = createGpuProgramGeometry(device, source, attributes);
-  const owner = createThreeNodeProgramMeshes({device, format: 'rgba8unorm', depthFormat: 'depth24plus',
+  const owner = createThreeNodeProgramMeshes({device, format: 'rgba8unorm', depthFormat,
     sampleCount, maxDraws, label: 'native-node-test', fail, scoped, maxUniformBytes, maxBindGroups});
   const raster = {blend: null, frontFace: 'ccw', cullMode: 'back', writeMask: 15,
     depthWriteEnabled: true, depthCompare: 'less-equal'};
@@ -54,7 +56,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
     const command = {}; owner.stage(record, {nodeUniforms, ...input}, command); return command;
   };
   t.after(() => { releasePipelines?.(); owner.dispose(); gpu.dispose(); assert.ok(buffers.every(b => b.dead)); });
-  return {device, source, gpu, owner, raster, program, add, stage, buffers, bindGroups, pipelines, writes,
+  return {device, source, gpu, owner, raster, program, add, stage, buffers, bindGroups, pipelines, writes, shaderModules, pipelineLayouts,
     lose: resolveLost,
     holdPipelines() { pipelineGate = new Promise(resolve => { releasePipelines = resolve; }); return releasePipelines; },
     errors({pipeline = null, scope = null} = {}) { pipelineError = pipeline; scopeError = scope; }};
@@ -556,4 +558,135 @@ test('native instance streams admit InstancedBufferGeometry while retaining thei
   f.source.isInstancedBufferGeometry = true; f.gpu.update();
   assert.throws(() => f.stage(record, [1], {instanceCount: 1}), {code: 'ANIMATION_RENDER_GEOMETRY'});
   assert.equal(f.owner.uniformDiagnostics.draws, 0);
+});
+
+test('four thousand independent native records retain one compatible GPU program', async t => {
+  const f = rig(t, {maxDraws: 4000}), records = [];
+  for (let i = 0; i < 4000; i++) records.push(await f.add([16]));
+  assert.equal(new Set(records).size, 4000);
+  assert.equal(new Set(records.map(record => record.pipelines.normal)).size, 1);
+  assert.equal(f.pipelines.length, 2); assert.equal(f.shaderModules.length, 2); assert.equal(f.pipelineLayouts.length, 1);
+  const first = f.stage(records[0], [17]), last = f.stage(records[3999], [31]); f.owner.write();
+  assert.ok(packet(first, 0).every(value => value === 17));
+  assert.ok(packet(last, 0).every(value => value === 31));
+  assert.notEqual(first.nodeProgram.groups[0].offset, last.nodeProgram.groups[0].offset);
+});
+
+test('shared native programs retain distinct geometry allocations and sampled draw histories', async t => {
+  const f = rig(t), otherSource = {...f.source, attributes: {position: {...f.source.attributes.position,
+    array: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0])}}, index: {...f.source.index, array: new Uint16Array([2, 1, 0])}};
+  const otherGpu = createGpuProgramGeometry(f.device, otherSource,
+    [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}]);
+  t.after(() => otherGpu.dispose());
+  const a = await f.add([], {nodeProgram: texturedProgram(f)});
+  const b = await f.owner.add(otherGpu, {nodeProgram: texturedProgram(f), raster: f.raster});
+  assert.equal(a.pipelines.normal, b.pipelines.normal); assert.equal(a.bindGroupLayouts, b.bindGroupLayouts);
+  const resources = sampled(), first = f.stage(a, [11], {nodeResources: resources});
+  const second = f.stage(b, [23], {nodeResources: resources}); f.owner.prepare(); f.owner.write();
+  assert.notEqual(first.vertexBuffers[0], second.vertexBuffers[0]);
+  assert.notEqual(first.indexBuffer, second.indexBuffer);
+  assert.equal(first.nodeProgram.groups[0].group, second.nodeProgram.groups[0].group);
+  assert.ok(packet(first, 0).every(value => value === 11));
+  assert.ok(packet(second, 0).every(value => value === 23)); otherGpu.dispose();
+});
+
+test('native pipeline keys normalize binding order but distinguish shader and pipeline state', async t => {
+  const f = rig(t, {sampleCount: 4}), base = await f.add([], {nodeProgram: texturedProgram(f)});
+  const reordered = texturedProgram(f); reordered.groups[0].entries.reverse();
+  assert.equal((await f.add([], {nodeProgram: reordered})).pipelines.normal, base.pipelines.normal);
+  const changes = [
+    (p, r) => { p.vertex += '\n// vertex variant'; },
+    (p, r) => { p.fragment += '\n// fragment variant'; },
+    (p, r) => { p.groups[0].entries[0].visibility = 1; },
+    (p, r) => { p.groups[0].entries[1].texture.sampleType = 'unfilterable-float'; },
+    (p, r) => { r.cullMode = 'none'; },
+    (p, r) => { r.frontFace = 'cw'; },
+    (p, r) => { r.writeMask = 7; },
+    (p, r) => { r.depthWriteEnabled = false; },
+    (p, r) => { r.depthCompare = 'greater'; },
+    (p, r) => { r.depthBias = 1; },
+    (p, r) => { r.blend = {color: {srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha'}}; },
+    (p, r) => { r.alphaToCoverageEnabled = true; },
+  ];
+  for (const change of changes) {
+    const program = texturedProgram(f), raster = {...f.raster}; change(program, raster);
+    const record = await f.add([], {nodeProgram: program, raster});
+    assert.notEqual(record.pipelines.normal, base.pipelines.normal);
+  }
+  assert.notEqual((await f.add([], {nodeProgram: texturedProgram(f), topology: 'lines'})).pipelines.normal, base.pipelines.normal);
+  assert.equal(f.pipelines.length, 2 * (changes.length + 2));
+});
+
+test('native pipeline sharing compares vertex layouts rather than geometry identity', async t => {
+  const f = rig(t), first = await f.add([16]), source = {...f.source, attributes: {position: {
+    isInterleavedBufferAttribute: true, itemSize: 3, count: 3, offset: 0, normalized: false,
+    data: {array: new Float32Array(12), stride: 4, version: 0, updateRanges: [], clearUpdateRanges() {}, onUploadCallback() {}},
+  }}};
+  const gpu = createGpuProgramGeometry(f.device, source,
+    [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}]);
+  t.after(() => gpu.dispose());
+  const other = await f.owner.add(gpu, {nodeProgram: f.program([16]), raster: f.raster});
+  assert.notEqual(first.pipelines.normal, other.pipelines.normal);
+  assert.deepEqual([first, other].map(record => record.pipelines.normal.vertex.buffers[0].arrayStride), [12, 16]); gpu.dispose();
+});
+
+test('draw capacities, blend constants and stencil references do not split compatible native pipelines', async t => {
+  const f = rig(t, {depthFormat: 'depth24plus-stencil8'});
+  const raster = {...f.raster, blend: {color: {srcFactor: 'constant', dstFactor: 'one-minus-constant'}},
+    blendConstant: [1, 0, 0, 1], stencil: {front: {passOp: 'replace'}}, stencilReference: 3};
+  const a = await f.add([], {nodeProgram: {...f.program([16]), instanceCapacity: 1}, raster});
+  const b = await f.add([], {nodeProgram: {...f.program([16]), instanceCapacity: 5},
+    raster: {...raster, blendConstant: [0, 0, 1, 1], stencilReference: 7}});
+  assert.equal(a.pipelines.normal, b.pipelines.normal); assert.equal(f.pipelines.length, 2);
+  assert.throws(() => f.stage(a, [1], {instanceCount: 2}), {code: 'ANIMATION_RENDER_VALUE'});
+  const first = f.stage(a, [1], {count: 1}), second = f.stage(b, [2], {count: 3, instanceCount: 5});
+  assert.deepEqual([first.count, second.count, second.instanceCount], [1, 3, 5]);
+  assert.deepEqual([first.blendConstant, second.blendConstant], [[1, 0, 0, 1], [0, 0, 1, 1]]);
+  assert.deepEqual([first.stencilReference, second.stencilReference], [3, 7]);
+  const other = await f.add([16], {raster: {...raster, stencil: {front: {passOp: 'invert'}}}});
+  assert.notEqual(other.pipelines.normal, a.pipelines.normal);
+});
+
+test('shared layouts retain each UBO member offset in the resource group identity', async t => {
+  const f = rig(t), programA = multiUniformProgram(f), programB = multiUniformProgram(f);
+  programB.groups[0].uniforms[0].offset = 512; programB.groups[0].byteLength = 544;
+  const a = await f.add([], {nodeProgram: programA}), b = await f.add([], {nodeProgram: programB});
+  assert.equal(a.pipelines.normal, b.pipelines.normal); assert.equal(a.bindGroupLayouts, b.bindGroupLayouts);
+  const bytesA = new Uint8Array(288), bytesB = new Uint8Array(544);
+  bytesA.fill(11, 0, 16); bytesA.fill(13, 256);
+  bytesB.fill(17, 0, 16); bytesB.fill(19, 512);
+  const first = f.stage(a, [], {nodeUniforms: [bytesA]}), second = f.stage(b, [], {nodeUniforms: [bytesB]});
+  f.owner.prepare(); f.owner.write();
+  assert.notEqual(first.nodeProgram.groups[0].group, second.nodeProgram.groups[0].group);
+  for (const [command, value1, value5] of [[first, 11, 13], [second, 17, 19]]) {
+    assert.ok(uniformBytes(command, 1).every(value => value === value1));
+    assert.ok(uniformBytes(command, 5).every(value => value === value5));
+  }
+});
+
+test('concurrent registrations share pipeline preparation and evict a failed program before retry', async t => {
+  const f = rig(t), release = f.holdPipelines(), failure = Error('shared pipeline failure');
+  f.errors({pipeline: failure});
+  const results = Promise.allSettled([f.add([]), f.add([]), f.add([])]);
+  for (let i = 0; i < 16; i++) await Promise.resolve();
+  assert.equal(f.pipelines.length, 2); assert.equal(f.shaderModules.length, 2); release();
+  for (const result of await results) { assert.equal(result.status, 'rejected'); assert.equal(result.reason, failure); }
+  f.errors(); const a = await f.add([]), b = await f.add([]);
+  assert.equal(a.pipelines.normal, b.pipelines.normal); assert.equal(f.pipelines.length, 4);
+});
+
+test('removing one shared record preserves peers while the final removal releases its cache entry', async t => {
+  const f = rig(t), program = texturedProgram(f), a = await f.add([], {nodeProgram: program});
+  const b = await f.add([], {nodeProgram: program}), resources = sampled();
+  const first = f.stage(a, [11], {nodeResources: resources}); f.owner.prepare();
+  f.owner.remove(a); f.owner.remove(a);
+  const second = f.stage(b, [17], {nodeResources: resources}); f.owner.prepare(); f.owner.write();
+  assert.equal(second.nodeProgram.groups[0].group, first.nodeProgram.groups[0].group);
+  assert.ok(packet(second, 0).every(value => value === 17));
+  assert.equal((await f.add([], {nodeProgram: program})).pipelines.normal, b.pipelines.normal);
+  f.owner.remove(b);
+  const c = await f.add([32]); const d = await f.add([32]);
+  f.owner.remove(c); f.owner.remove(d);
+  const before = f.pipelines.length, replacement = await f.add([32]);
+  assert.notEqual(replacement.pipelines.normal, c.pipelines.normal); assert.equal(f.pipelines.length, before + 2);
 });

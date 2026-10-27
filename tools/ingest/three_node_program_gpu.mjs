@@ -27,6 +27,9 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     limit('Invalid native node program uniform budget');
   const perGroupBytes = Math.floor(maxUniformBytes / maxBindGroups / 4) * 4;
   const arenas = new Map(), records = new Set(), resourceGroups = new Map(), resourceIds = new WeakMap();
+  // Immutable GPU programs are shared; resource bindings, draw ranges and
+  // uniform histories remain owned by each record and logical draw.
+  const pipelineEntries = new Map();
   const maxResourceGroups = maxDraws * maxBindGroups;
   let pendingGroups = [], stagedDraws = 0, nextResourceId = 0;
   if (!Array.isArray(colorFormats) || (colorFormats[0] ?? null) !== format)
@@ -42,7 +45,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (stoppedError) return;
     stoppedError = reason; rejectStopped(reason);
     for (const record of records) record.disposed = true;
-    pendingGroups = []; resourceGroups.clear();
+    pendingGroups = []; resourceGroups.clear(); pipelineEntries.clear();
     records.clear(); for (const arena of arenas.values()) arena.dispose(); arenas.clear();
   }
   function live() { if (stoppedError) throw stoppedError; }
@@ -91,19 +94,20 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
           fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform bindings require exact dynamic buffer ranges');
         if (size > (device.limits.maxUniformBufferBindingSize ?? 65536))
           limit('Native node uniform binding exceeds the device binding size limit');
-        const uniform = {...base, buffer: {...entry.buffer}};
+        const uniform = {...base, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: size}};
         uniformEntries.push(uniform); return uniform;
       }
       if (entry.sampler) {
         if (!['filtering', 'non-filtering', 'comparison'].includes(entry.sampler.type))
           fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampler layout');
-        return {...base, sampler: {...entry.sampler}};
+        return {...base, sampler: {type: entry.sampler.type}};
       }
       if (!['float', 'unfilterable-float', 'depth', 'sint', 'uint'].includes(entry.texture.sampleType) ||
           !['1d', '2d', '2d-array', 'cube', 'cube-array', '3d'].includes(entry.texture.viewDimension) ||
           typeof entry.texture.multisampled !== 'boolean')
         fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampled texture layout');
-      return {...base, texture: {...entry.texture}};
+      return {...base, texture: {sampleType: entry.texture.sampleType,
+        viewDimension: entry.texture.viewDimension, multisampled: entry.texture.multisampled}};
     });
     const planned = group.uniforms === undefined
       ? uniformEntries.map(entry => ({binding: entry.binding, offset: 0, byteLength})) : group.uniforms;
@@ -128,6 +132,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     }
     if (end !== byteLength) fail('ANIMATION_RENDER_OPTIONS', 'Native node uniform packet length must end at its final binding');
     uniforms.sort((a, b) => a.binding - b.binding);
+    entries.sort((a, b) => a.binding - b.binding);
     const arena = uniforms.length ? arenaAt(index) : null;
     arena?.checkPacketSize(byteLength);
     return {index, byteLength, arena, uniforms: Object.freeze(uniforms), entries,
@@ -175,6 +180,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     for (const pending of pendingGroups) {
       const {record, index, packet, resources, output} = pending, layout = record.bindGroupLayouts[index];
       const key = [identity(layout), packet ? identity(packet.resource.buffer) : 0,
+        ...record.groups[index].uniforms.map(member => `uniform:${member.binding}:${member.offset}:${member.byteLength}`),
         ...resources.map(entry => {
           const resource = entry.resource;
           return record.groups[index].resources.find(value => value.binding === entry.binding).buffer
@@ -188,13 +194,18 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
           entries.push({binding: uniform.binding, resource: {buffer: packet.resource.buffer,
             offset: uniform.offset, size: uniform.byteLength}});
         entries.sort((a, b) => a.binding - b.binding);
-        cached = {record, group: device.createBindGroup({label: `${label}/node-resources`, layout, entries})};
+        cached = {pipelineEntry: record.pipelineEntry, group: device.createBindGroup({label: `${label}/node-resources`, layout, entries})};
       }
       resourceGroups.set(key, cached);
       if (resourceGroups.size > maxResourceGroups) resourceGroups.delete(resourceGroups.keys().next().value);
       output.group = cached.group;
     }
     pendingGroups = [];
+  }
+  function releasePipeline(entry) {
+    if (--entry.refs !== 0) return;
+    if (pipelineEntries.get(entry.key) === entry) pipelineEntries.delete(entry.key);
+    for (const [key, value] of resourceGroups) if (value.pipelineEntry === entry) resourceGroups.delete(key);
   }
   async function add(gpu, {nodeProgram, raster, topology = 'triangles'}) {
     live();
@@ -255,35 +266,60 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     for (const group of groups) uniformBindings.push(group.arena ? await (group.arenaLayout
       ? group.arena.register(group.byteLength) : group.arena.registerPacket(group.byteLength)) : null);
     live();
-    let bindGroupLayouts;
-    const issued = scoped(device, () => {
-      bindGroupLayouts = groups.map((group, index) => group.arenaLayout ? uniformBindings[index].layout
-        : device.createBindGroupLayout({label: `${label}/node-group-${index}`, entries: group.entries}));
-      const layout = device.createPipelineLayout({label, bindGroupLayouts});
-      const vertexModule = device.createShaderModule({label: `${label}/node-vertex`, code: vertex});
-      const fragmentModule = device.createShaderModule({label: `${label}/node-fragment`, code: fragment});
-      const stencil = hasAnimationStencil(depthFormat) ? state.stencil : {};
-      const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
-        vertex: {module: vertexModule, entryPoint: 'main', buffers: layouts},
-        fragment: {module: fragmentModule, entryPoint: 'main', targets: colorFormats.map((format, index) => ({format,
-          ...(colorStates[index].blend ? {blend: colorStates[index].blend} : {}),
-          writeMask: index < colorCount ? state.writeMask : 0}))},
-        primitive: {topology: topology === 'lines' ? 'line-list' : 'triangle-list', cullMode: state.cullMode, frontFace},
-        ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
-          depthCompare: state.depthCompare, ...state.bias,
-          ...stencil}} : {}),
-        multisample: {count: sampleCount, alphaToCoverageEnabled: state.alphaToCoverageEnabled}});
-      const ready = Promise.all([pipeline(state.frontFace), pipeline(state.frontFace === 'ccw' ? 'cw' : 'ccw')]);
-      ready.catch(() => {}); return ready;
-    });
-    let pipelines;
-    try {
-      const ready = Promise.all([issued.value, issued.errors]);
-      [pipelines] = await Promise.race([ready, stopped]);
-      if (issued.error) throw issued.error;
-      live();
-    } catch (error) { issued.errors.catch(() => {}); throw error; }
-    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature, geometryInstanced, instanceCapacity,
+    const pipelineState = {
+      targets: colorFormats.map((format, index) => ({format,
+        ...(colorStates[index].blend ? {blend: colorStates[index].blend} : {}),
+        writeMask: index < colorCount ? state.writeMask : 0})),
+      primitive: {topology: topology === 'lines' ? 'line-list' : 'triangle-list', cullMode: state.cullMode, frontFace: state.frontFace},
+      ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
+        depthCompare: state.depthCompare, ...state.bias, ...(hasAnimationStencil(depthFormat) ? state.stencil : {})}} : {}),
+      multisample: {count: sampleCount, alphaToCoverageEnabled: state.alphaToCoverageEnabled},
+    };
+    // All descriptors are captured/normalized above. The device and attachment
+    // profile are fixed for this owner; dynamic values and buffer identities do
+    // not enter the program key. Arena layouts keep their existing fast path.
+    const key = JSON.stringify([vertex, fragment, groups.map(group => [group.entries, group.arenaLayout]), layouts, pipelineState]);
+    let pipelineEntry = pipelineEntries.get(key);
+    if (pipelineEntry) pipelineEntry.refs++;
+    else {
+      pipelineEntry = {key, refs: 1, ready: null};
+      pipelineEntries.set(key, pipelineEntry);
+      pipelineEntry.ready = (async () => {
+        let issued;
+        try {
+          let bindGroupLayouts;
+          issued = scoped(device, () => {
+            bindGroupLayouts = groups.map((group, index) => group.arenaLayout ? uniformBindings[index].layout
+              : device.createBindGroupLayout({label: `${label}/node-group-${index}`, entries: group.entries}));
+            const layout = device.createPipelineLayout({label, bindGroupLayouts});
+            const vertexModule = device.createShaderModule({label: `${label}/node-vertex`, code: vertex});
+            const fragmentModule = device.createShaderModule({label: `${label}/node-fragment`, code: fragment});
+            const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
+              vertex: {module: vertexModule, entryPoint: 'main', buffers: layouts},
+              fragment: {module: fragmentModule, entryPoint: 'main', targets: pipelineState.targets},
+              primitive: {...pipelineState.primitive, frontFace},
+              ...(pipelineState.depthStencil ? {depthStencil: pipelineState.depthStencil} : {}),
+              multisample: pipelineState.multisample});
+            const ready = Promise.all([pipeline(state.frontFace), pipeline(state.frontFace === 'ccw' ? 'cw' : 'ccw')]);
+            ready.catch(() => {}); return ready;
+          });
+          const [pipelines] = await Promise.race([Promise.all([issued.value, issued.errors]), stopped]);
+          if (issued.error) throw issued.error;
+          live();
+          return {pipelines, bindGroupLayouts};
+        } catch (error) {
+          issued?.errors.catch(() => {});
+          if (pipelineEntries.get(key) === pipelineEntry) pipelineEntries.delete(key);
+          throw error;
+        }
+      })();
+      pipelineEntry.ready.catch(() => {});
+    }
+    let prepared;
+    try { prepared = await Promise.race([pipelineEntry.ready, stopped]); live(); }
+    catch (error) { releasePipeline(pipelineEntry); throw error; }
+    const {pipelines, bindGroupLayouts} = prepared;
+    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, pipelineEntry, geometrySignature, geometryInstanced, instanceCapacity,
       resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},
       blended: !!state.blend, alphaMode: state.blend ? 'BLEND' : 'OPAQUE',
@@ -342,9 +378,8 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     begin() { live(); pendingGroups = []; stagedDraws = 0; for (const arena of arenas.values()) arena.begin(); },
     write() { live(); for (const arena of arenas.values()) arena.write(); },
     remove(record) {
-      if (records.delete(record)) record.disposed = true;
+      if (records.delete(record)) { record.disposed = true; releasePipeline(record.pipelineEntry); }
       pendingGroups = pendingGroups.filter(pending => pending.record !== record);
-      for (const [key, value] of resourceGroups) if (value.record === record) resourceGroups.delete(key);
     },
     dispose() { stop(error('ANIMATION_RENDER_DISPOSED', 'Native node graphics owner is disposed')); },
     get uniformDiagnostics() {
