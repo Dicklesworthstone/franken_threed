@@ -378,6 +378,81 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   renderer.dispose();
 });
 
+test('WebGL animation preserves procedural updates across cold preparation and resumes before GPU completion', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), host = animationHost(c.canvas);
+  const Renderer = createWebGLRendererClass(TC), renderer = new Renderer({canvas: c.canvas, device});
+  const scene = new TC.Scene(), mesh = new TC.Mesh(new TC.BoxGeometry(), new TC.MeshPhongMaterial());
+  const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+  scene.add(mesh, new TC.AmbientLight(0xffffff));
+  let releasePipeline, pipelineStarted, finishGPU;
+  const gate = new Promise(resolve => { releasePipeline = resolve; });
+  const started = new Promise(resolve => { pipelineStarted = resolve; });
+  device.completion = new Promise(resolve => { finishGPU = resolve; });
+  t.after(() => { releasePipeline(); finishGPU(); renderer.dispose(); });
+  const createPipeline = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = async descriptor => { pipelineStarted(); await gate; return createPipeline(descriptor); };
+  const frames = [];
+  const update = time => {
+    frames.push(time); mesh.position.x = frames.length * .125;
+    mesh.geometry.attributes.position.array[0] = frames.length * .25;
+    mesh.geometry.attributes.position.needsUpdate = true;
+    renderer.render(scene, camera);
+  };
+  assert.equal(renderer.setAnimationLoop(update), undefined, 'WebGL loop installation stays synchronous');
+  host.step(16); await started;
+  const version = mesh.geometry.attributes.position.version;
+  assert.equal(renderer._pending.length, 1); assert.equal(c.acquired(), 0);
+  host.step(32);
+  assert.equal(host.scheduled.size, 0); assert.deepEqual(frames, [16]);
+  assert.equal(mesh.position.x, .125); assert.equal(mesh.geometry.attributes.position.version, version);
+  assert.equal(renderer._pending.length, 1, 'no extra mutable H2-style geometry frame was accepted');
+  renderer.setAnimationLoop(update); host.step(48);
+  assert.equal(host.scheduled.size, 0, 'replacement with the same function also suspends safely');
+  releasePipeline(); await flush(renderer);
+  assert.equal(c.acquired(), 1); assert.equal(host.scheduled.size, 1, 'one fresh RAF, with GPU execution still pending');
+  host.step(64);
+  assert.deepEqual(frames, [16, 64]); assert.equal(c.acquired(), 2); assert.equal(mesh.position.x, .25);
+  renderer.setAnimationLoop(null); assert.equal(host.scheduled.size, 0);
+});
+
+test('WebGL animation replacement, stop, disposal and failed preparation do not revive stale callbacks', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  for (const action of ['replace', 'stop', 'dispose', 'fail']) {
+    const device = recordingDevice(), c = canvasFixture(), host = animationHost(c.canvas);
+    const Renderer = createWebGLRendererClass(TC), renderer = new Renderer({canvas: c.canvas, device});
+    const scene = new TC.Scene(); scene.add(new TC.Mesh(new TC.BoxGeometry(), new TC.MeshBasicMaterial()));
+    const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+    let releasePipeline, pipelineStarted;
+    const gate = new Promise(resolve => { releasePipeline = resolve; });
+    const started = new Promise(resolve => { pipelineStarted = resolve; });
+    const failure = new Error('WebGL cold pipeline failed');
+    const createPipeline = device.createRenderPipelineAsync.bind(device);
+    device.createRenderPipelineAsync = async descriptor => {
+      pipelineStarted(); await gate; if (action === 'fail') throw failure; return createPipeline(descriptor);
+    };
+    t.after(() => { releasePipeline(); renderer.dispose(); });
+    const frames = [];
+    renderer.setAnimationLoop(time => { frames.push(time); renderer.render(scene, camera); });
+    host.step(16); await started; host.step(32);
+    const pending = renderer._drain;
+    if (action === 'replace') renderer.setAnimationLoop(time => { frames.push(time * 10); renderer.render(scene, camera); });
+    if (action === 'stop') renderer.setAnimationLoop(null);
+    if (action === 'dispose') renderer.dispose();
+    releasePipeline(); await pending.catch(() => {});
+    if (action === 'stop' || action === 'dispose') {
+      assert.equal(host.scheduled.size, 0, action); assert.deepEqual(frames, [16]);
+    } else if (action === 'replace') {
+      assert.equal(host.scheduled.size, 1); host.step(48); assert.deepEqual(frames, [16, 480]);
+    } else {
+      assert.equal(host.scheduled.size, 1);
+      assert.throws(() => host.step(48), /WebGL cold pipeline failed/);
+      assert.equal(host.scheduled.size, 1, 'failure stays observable without silently killing the loop');
+    }
+    renderer.dispose(); assert.equal(host.scheduled.size, 0);
+  }
+});
+
 
 test('source RenderTarget rendering and subsequent material sampling share owned GPU residency', async () => {
   const {renderer, acquired} = await create();

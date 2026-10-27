@@ -20,7 +20,7 @@
  *   as soon as preparation completes. Application callbacks are never skipped
  *   or replayed. `info.f3d.deferredRenders` counts such requests. Await
  *   `compileAsync(scene, camera)` to prepare ahead of the first frame.
- *   Native animation callbacks wait for deferred command submission before
+ *   Animation callbacks on both renderer surfaces wait for deferred submission before
  *   starting another frame; this bounds cold-start work without waiting for
  *   GPU completion or discarding accepted render/compute requests.
  * - Admission failures discovered during deferred preparation are thrown from
@@ -1470,16 +1470,38 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         return;
       }
       if (this._animationHandle !== null) { host.cancelAnimationFrame?.(this._animationHandle); this._animationHandle = null; }
+      // Replacing/stopping the WebGL loop also invalidates a suspended resume,
+      // even when the caller reuses the same callback function.
+      this._animationWaiting = null;
       if (this._inspector.isRunning) this._inspector.finish();
       this._animationCallback = callback;
       if (callback === null || this._disposed) return;
+      const schedule = () => {
+        if (this._animationCallback === callback && !this._disposed)
+          this._animationHandle = host.requestAnimationFrame(tick);
+      };
       const tick = time => {
         if (this._animationCallback !== callback || this._disposed) return;
-        this._animationHandle = host.requestAnimationFrame(tick);
+        this._animationHandle = null;
+        if (this._drain && this._pending.some(request =>
+          request.animationBarrier === true || !request.transfer && !request.readback)) {
+          // Source WebGL render/compile work finishes synchronously before the
+          // next RAF can update procedural geometry. Preserve that boundary
+          // while our device and pipelines prepare asynchronously; accepted
+          // draws stay queued, without advancing another simulation frame.
+          const waiting = this._animationWaiting = {};
+          const resume = () => {
+            if (this._animationWaiting !== waiting) return;
+            this._animationWaiting = null; schedule();
+          };
+          this._drain.then(resume, resume);
+          return;
+        }
+        schedule();
         this._advanceAnimationFrame();
         callback(time, null);
       };
-      this._animationHandle = host.requestAnimationFrame(tick);
+      schedule();
     }
     _advanceAnimationFrame() {
       // Source Animation order: finish the previous inspected frame, then begin.
