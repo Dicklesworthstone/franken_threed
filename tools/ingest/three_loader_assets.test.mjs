@@ -7,6 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
+import { packHtml } from "./pack_html.mjs";
 import { findThreeLoaderRequests } from "./three_loader_assets.mjs";
 
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
@@ -241,7 +242,7 @@ test("built FileLoader and GLTFLoader fetch original document-base URLs and exte
   }
 });
 
-test("configured source codec bytes and glTF sidecars retain document paths and prepared embedded resources", async () => {
+test("configured source codec bytes and glTF sidecars retain document paths through build and standalone packing", async () => {
   const codecFiles = Object.fromEntries([
     ...["draco_wasm_wrapper.js", "draco_decoder.wasm", "draco_decoder.js"].map(name => ["draco", name]),
     ...["basis_transcoder.js", "basis_transcoder.wasm"].map(name => ["basis", name]),
@@ -265,12 +266,13 @@ test("configured source codec bytes and glTF sidecars retain document paths and 
       "modules/app.mjs": `import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
       import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
       import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
-      import { MeshoptDecoder } from ${JSON.stringify(rootUrl + "examples/jsm/libs/meshopt_decoder.module.js")};
+      ${prepareStandaloneLoaders ? "" : `import { MeshoptDecoder } from ${JSON.stringify(rootUrl + "examples/jsm/libs/meshopt_decoder.module.js")};`}
       export async function load(renderer) {
         const draco = new DRACOLoader().setDecoderPath('${prefix}codecs/draco/').setDecoderConfig({type:'js'});
         const ktx = new KTX2Loader(); ktx.setTranscoderPath('${prefix}codecs/basis/'); ktx.detectSupport(renderer);
         const loader = new GLTFLoader(); loader.setDRACOLoader(draco); loader.setKTX2Loader(ktx);
-        loader.setMeshoptDecoder(MeshoptDecoder).setPath('${prefix}models/').setResourcePath('${prefix}shared/');
+        ${prepareStandaloneLoaders ? "" : "loader.setMeshoptDecoder(MeshoptDecoder);"}
+        loader.setPath('${prefix}models/').setResourcePath('${prefix}shared/');
         return loader.loadAsync('scene.gltf');
       }`,
       ...resources,
@@ -285,6 +287,12 @@ test("configured source codec bytes and glTF sidecars retain document paths and 
     for (const [name, bytes] of Object.entries(resources)) {
       assert.ok(helper.includes(bytes.toString("base64")), `${name} enters the existing embedded resource resolver`);
     }
+    const packed = path.join(root, "packed.html");
+    packHtml(path.join(built.outDir, built.htmlFile), packed);
+    const html = fs.readFileSync(packed, "utf8");
+    const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+    const embedded = Object.values(imports).map(url => Buffer.from(url.split(",")[1].split("#")[0], "base64").toString());
+    assert.ok(embedded.includes(helper), "the exact native codec-worker/resource runtime survives packing");
   }
 });
 

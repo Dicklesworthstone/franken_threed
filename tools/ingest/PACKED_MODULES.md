@@ -109,6 +109,36 @@ of the final HTML size check. Open URL expressions, opaque host mutation,
 location reflection and document classic-script Worker construction remain
 outside this standalone route.
 
+## Retained Draco and KTX2 loader workers
+
+Application builds retain finite glTF model and sidecar discovery through
+`setDRACOLoader`, `setKTX2Loader` and `setMeshoptDecoder`. Authored finite Draco
+decoder paths and Basis transcoder paths include their JavaScript and Wasm
+resources at the original document-relative URLs. The pinned module-relative
+defaults keep their existing `new URL(..., import.meta.url)` closure. Unproved
+managers, escaping receivers and dynamic resource paths retain the host route.
+
+With `prepareStandaloneLoaders`, the existing embedded resource resolver also
+supports the retained Draco and KTX2 Blob workers. Exact pinned source-module
+hashes identify their constructor sites before bundling. A small host function
+forwards the original native Worker constructor and its arguments; the source
+still creates the Blob payload, transfers Wasm bytes, schedules decoding,
+maintains its worker pool and disposes workers and Blob URLs. The packer admits
+that exact generated helper body. A matching filename or export name does not
+admit a changed helper or arbitrary application Worker URL.
+
+Document-module Worker and URL checks use lexical bindings, so GLTFLoader's
+unrelated local `URL` alias does not shadow a module-level codec asset URL.
+Actual call-site shadows and global host writes still fail closure. Classic
+worker realm checks retain their existing conservative behavior.
+
+A Chromium offline run loaded real Draco-compressed geometry through both
+retained JS and Wasm decoders and transcoded an ETC1S KTX2 texture. The packed
+HTML ran after its source and emitted directories were made unavailable, using
+three native Blob workers, zero application HTTP requests and no page errors.
+This establishes that source decoder path; it does not replace the retained
+loader or establish a decoder speedup.
+
 ## Validation and boundaries
 
 ```sh

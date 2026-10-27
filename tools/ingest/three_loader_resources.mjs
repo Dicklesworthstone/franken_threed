@@ -1,8 +1,9 @@
 /** A finite embedded resource route for the pinned Three.js loader host calls.
  * Logical URLs stay in the upstream loader: its manager, caches, deduplication,
- * glTF resource bases and callbacks are unchanged. Only the final Request,
- * image.src or bitmap fetch receives an embedded response URL. No global host
- * function or LoadingManager is replaced. Unknown URLs retain their host route.
+ * glTF resource bases and callbacks are unchanged. The final Request, image.src
+ * or bitmap fetch receives an embedded response URL; exact source codec-worker
+ * sites forward to the native constructor. No global host function or
+ * LoadingManager is replaced. Unknown URLs retain their host route.
  */
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -12,16 +13,19 @@ import * as walk from "acorn-walk";
 export const LOADER_RESOURCES_IMPORT = "f3d:standalone-loader-resources";
 export const LOADER_RESOURCES_FILE = "f3d-loader-resources.mjs";
 const RESOLVE = "__f3dResolveLoaderResource";
+const CREATE_WORKER = "__f3dCreateLoaderWorker";
 const ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
 // Exact modules from r186 source commit 148ef33ecb6d2502ff796d4554abd1549c95d519.
-// The surrounding lexical scope is part of the fingerprint: a custom Request
-// or fetch binding must not receive transformed arguments just because a loader
+// The surrounding lexical scope is part of the fingerprint: a custom Request,
+// fetch or Worker binding must not receive a host hook just because a loader
 // class body happens to be unchanged.
 const MODULES = new Map([
   ["build/three.core.js", "9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6"],
   ["src/loaders/FileLoader.js", "e3f730f2fdefdd4e9285883fb2eb7ca40e13d58ea96e969a669d3eaacd7d0c03"],
   ["src/loaders/ImageLoader.js", "0507db81b6214afd32f4c781e08acd88005ab4988f93de583f34ded571f1fbcc"],
   ["src/loaders/ImageBitmapLoader.js", "466fc2172c6d1c8d4ee40dc041785a783e09bbef79c3017a945024b8d2166c30"],
+  ["examples/jsm/loaders/DRACOLoader.js", "fdafdf4aa11bbc65d89adb338efd844bedf94073702f9049240ff1f1ea48ad5f"],
+  ["examples/jsm/loaders/KTX2Loader.js", "3a3233ce3409443076d3414b78832e1405fcfac5ecb34d367365fd0781127d6c"],
 ]);
 const CLASSES = new Set(["FileLoader", "ImageLoader", "ImageBitmapLoader"]);
 const hash = value => createHash("sha256").update(value).digest("hex");
@@ -35,9 +39,29 @@ export function threeLoaderResourceEdits(source, ast, id, packageRootUrl) {
   const root = packageRootUrl ? canonical(packageRootUrl).replace(/\/?$/, "/") : ROOT;
   const module = canonical(id);
   if (!module.startsWith(root) || hash(source) !== MODULES.get(module.slice(root.length))) return [];
-  const edits = [];
+  const edits = [], imports = new Set();
   for (const node of ast.body) {
-    if (node.type !== "ClassDeclaration" || !CLASSES.has(node.id?.name)) continue;
+    if (node.type !== "ClassDeclaration") continue;
+    if (["DRACOLoader", "KTX2Loader"].includes(node.id?.name)) {
+      const sites = [];
+      walk.simple(node.body, {
+        NewExpression(value) {
+          if (value.callee.type === "Identifier" && value.callee.name === "Worker" &&
+              value.arguments.length === 1 && value.arguments[0].type === "MemberExpression" &&
+              !value.arguments[0].computed && value.arguments[0].object.type === "ThisExpression" &&
+              value.arguments[0].property.name === "workerSourceURL") sites.push(value);
+        },
+      });
+      if (sites.length !== 1) throw new Error(`Pinned ${node.id.name} has an unexpected worker constructor shape`);
+      // Keep the source-created Blob, decoder payload, transferable Wasm bytes,
+      // worker pool and disposal. Only the native constructor crosses this
+      // source-verified host boundary, before bundling erases module identity.
+      edits.push({ type: "replace", pos: sites[0].start, end: sites[0].end,
+        text: `${CREATE_WORKER}(Worker, this.workerSourceURL)`, priority: 2 });
+      imports.add(`createThreeLoaderWorker as ${CREATE_WORKER}`);
+      continue;
+    }
+    if (!CLASSES.has(node.id?.name)) continue;
     const load = node.body.body.find(method => method.key?.name === "load");
     const sites = [];
     const url = value => value?.type === "Identifier" && value.name === "url";
@@ -59,9 +83,10 @@ export function threeLoaderResourceEdits(source, ast, id, packageRootUrl) {
     if (sites.length !== 1) throw new Error(`Pinned ${node.id.name} has an unexpected resource request shape`);
     edits.push({ type: "replace", pos: sites[0].start, end: sites[0].end,
       text: `${RESOLVE}(url)`, priority: 2 });
+    imports.add(`resolveThreeLoaderResource as ${RESOLVE}`);
   }
   if (edits.length) edits.push({ type: "insert", pos: 0, priority: 0,
-    text: `import { resolveThreeLoaderResource as ${RESOLVE} } from ${JSON.stringify(LOADER_RESOURCES_IMPORT)};\n` });
+    text: `import { ${[...imports].join(", ")} } from ${JSON.stringify(LOADER_RESOURCES_IMPORT)};\n` });
   return edits;
 }
 
@@ -93,6 +118,10 @@ export function createThreeLoaderResourceModule(assets, { logicalURLs = null, ma
       entries.push([url, data]);
     }
   }
+  return resourceModule(entries);
+}
+
+function resourceModule(entries) {
   return `// Finite source-identified loader assets; unknown URLs retain their network route.
 const resources = new Map(${JSON.stringify(entries)});
 const resourceRoot = typeof document === 'undefined' ? null : new URL('./', document.URL).href;
@@ -107,5 +136,27 @@ export function resolveThreeLoaderResource(url) {
   const embedded = resources.get(key);
   return embedded === undefined ? url : embedded + requested.hash;
 }
+// Host boundary emitted for exact pinned codec-loader constructor edits. Source
+// owns its Blob worker body, messages, transfer lists, pools and URL lifetime.
+// Passing the constructor first preserves its lookup before URL/options effects.
+export function createThreeLoaderWorker(Worker, ...args) {
+  return new Worker(...args);
+}
 `;
+}
+
+/** The packer may retain the native Blob-worker host call only in this exact
+ * emitted runtime. A matching filename, export name or comment is insufficient;
+ * extra statements, shadowed hosts and changed function bodies are refused.
+ */
+export function isThreeLoaderResourceModule(source, ast) {
+  const declaration = ast.body[0]?.declarations?.[0];
+  const entriesNode = declaration?.init?.arguments?.[0];
+  if (declaration?.id?.name !== "resources" || entriesNode?.type !== "ArrayExpression") return false;
+  try {
+    const entries = JSON.parse(source.slice(entriesNode.start, entriesNode.end));
+    if (!Array.isArray(entries) || entries.some(entry => !Array.isArray(entry) || entry.length !== 2 ||
+        typeof entry[0] !== "string" || typeof entry[1] !== "string" || !entry[1].startsWith("data:"))) return false;
+    return source === resourceModule(entries);
+  } catch { return false; }
 }

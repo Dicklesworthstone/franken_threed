@@ -98,6 +98,37 @@ test("resolves string Worker URLs from the document, and new URL from its source
   assert.ok(sources.includes("export const answer=7;"));
 });
 
+test("unrelated local host names do not shadow bundled document worker and asset constructors", () => {
+  const f = fixture({ "asset.bin": Buffer.from([1, 2, 3]) }, `
+    export function imageLoader() { const URL = self.URL || self.webkitURL; return URL; }
+    export function local(Worker, URL) { Worker = other; URL = other; return [Worker, URL]; }
+    export function initializer(value = new URL('./asset.bin', import.meta.url)) { var URL; return value; }
+    { const Worker = custom; }
+    export const asset = new URL('./asset.bin', import.meta.url);
+    export const start = () => new Worker(new URL('./worker.mjs', import.meta.url), {type:'module'});`);
+  const result = f.pack();
+  assert.equal(result.workerCount, 1);
+  assert.equal(result.assetCount, 1);
+});
+
+test("actual lexical host shadows and global host writes still refuse document worker and asset closure", () => {
+  for (const main of [
+    `export function start(URL) { return new Worker(new URL('./worker.mjs', import.meta.url)); }`,
+    `export function start() { return new Worker('./worker.mjs'); var Worker; }`,
+    `for (const URL of values) { new URL('./worker.mjs', import.meta.url); }`,
+    `try { run(); } catch ({URL}) { new URL('./worker.mjs', import.meta.url); }`,
+    `function modify() { globalThis.URL = replacement; } new URL('./worker.mjs', import.meta.url);`,
+    `function modify() { URL = replacement; } new URL('./worker.mjs', import.meta.url);`,
+    `function modify() { self.Worker = replacement; } new Worker('./worker.mjs');`,
+    `function modify(value = (URL = replacement)) { var URL; } modify(); new URL('./worker.mjs', import.meta.url);`,
+    `function modify(value = () => Worker = replacement) { var Worker; value(); } modify(); new Worker('./worker.mjs');`,
+    `switch (URL = replacement) { default: let URL; } new URL('./worker.mjs', import.meta.url);`,
+    `switch (Worker = replacement) { default: let Worker; } new Worker('./worker.mjs');`,
+  ]) {
+    assert.throws(() => fixture({}, main).pack(), { code: "WORKER_BINDING" });
+  }
+});
+
 test("does not import document import-map rules into worker resolution", () => {
   const f = fixture({
     "index.html": `<script type="importmap">{"imports":{"dependency":"./dep.mjs"}}</script><script type="module" src="app.mjs"></script>`,

@@ -9,7 +9,7 @@ import { Worker } from "node:worker_threads";
 import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
-import { createThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
+import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
 const gltf = new URL("../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js", import.meta.url);
@@ -160,6 +160,76 @@ test("host-call transformation requires both pinned module identity and exact so
   assert.deepEqual(changed, [], "a modified implementation keeps its authored host route");
   const shadowed = "const Request = globalThis.customRequest;\n" + source;
   assert.deepEqual(threeLoaderResourceEdits(shadowed, parse(shadowed, { ecmaVersion: "latest", sourceType: "module" }), core.href), []);
+});
+
+test("only exact pinned Draco and KTX2 source constructors gain the native worker host hook", () => {
+  for (const name of ["DRACOLoader", "KTX2Loader"]) {
+    const url = new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url);
+    const source = fs.readFileSync(url, "utf8"), ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    const edits = threeLoaderResourceEdits(source, ast, url.href);
+    const replacements = edits.filter(edit => edit.type === "replace");
+    assert.equal(replacements.length, 1);
+    assert.equal(source.slice(replacements[0].pos, replacements[0].end), "new Worker( this.workerSourceURL )");
+    assert.equal(replacements[0].text, "__f3dCreateLoaderWorker(Worker, this.workerSourceURL)");
+    assert.match(edits.find(edit => edit.type === "insert").text, /createThreeLoaderWorker/);
+    assert.deepEqual(threeLoaderResourceEdits(source, ast, `file:///unrelated/${name}.js`), []);
+    for (const changed of [source + "\n// custom module\n", "const Worker = globalThis.CustomWorker;\n" + source]) {
+      assert.deepEqual(threeLoaderResourceEdits(changed, parse(changed, { ecmaVersion: "latest", sourceType: "module" }), url.href), []);
+    }
+    assert.equal(fs.readFileSync(url, "utf8"), source, "the codec, Blob creation and worker lifecycle stay in pinned source");
+  }
+});
+
+test("the generated codec-worker host hook forwards native construction, options, result identity and exceptions", async () => {
+  const source = createThreeLoaderResourceModule(new Map());
+  assert.equal(isThreeLoaderResourceModule(source, parse(source, { ecmaVersion: "latest", sourceType: "module" })), true);
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "Worker"), calls = [], rejected = {};
+  class NativeWorkerHost {
+    constructor(...args) {
+      if (args[0] === rejected) throw new TypeError("native constructor failure");
+      calls.push({ args, target: new.target, worker: this });
+    }
+  }
+  Object.defineProperty(globalThis, "Worker", { configurable: true, writable: true, value: NativeWorkerHost });
+  try {
+    const { createThreeLoaderWorker } = await import(data(source));
+    const url = new URL("blob:https://example.test/source-codec"), options = { name: "original", type: "classic" };
+    const worker = createThreeLoaderWorker(globalThis.Worker, url, options);
+    assert.ok(worker instanceof NativeWorkerHost);
+    assert.equal(calls[0].worker, worker);
+    assert.equal(calls[0].target, NativeWorkerHost);
+    assert.equal(calls[0].args[0], url);
+    assert.equal(calls[0].args[1], options);
+    const changing = { get url() { globalThis.Worker = class Replacement {}; return url; } };
+    assert.ok(createThreeLoaderWorker(globalThis.Worker, changing.url) instanceof NativeWorkerHost,
+      "constructor lookup precedes URL getter side effects, as in the original new Worker expression");
+    assert.throws(() => createThreeLoaderWorker(NativeWorkerHost, rejected), /native constructor failure/);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "Worker", previous);
+    else delete globalThis.Worker;
+  }
+});
+
+test("packing accepts the exact emitted worker runtime and refuses lookalikes or arbitrary application workers", () => {
+  const source = createThreeLoaderResourceModule(new Map());
+  const main = `import {createThreeLoaderWorker} from './f3d-loader-resources.mjs';export {createThreeLoaderWorker};`;
+  const f = fixture({ "index.html": '<script type="module" src="app.mjs"></script>', "app.mjs": main,
+    "f3d-loader-resources.mjs": source });
+  packHtml(f.entry, f.packed);
+  assert.ok(fs.readFileSync(f.packed, "utf8").includes("f3d-packed/"));
+  for (const changed of [
+    source.replace("new Worker(...args)", "new Worker(globalThis.target)"),
+    "const Worker = globalThis.CustomWorker;\n" + source,
+    source + "\nnew Worker(globalThis.target);\n",
+  ]) {
+    assert.equal(isThreeLoaderResourceModule(changed, parse(changed, { ecmaVersion: "latest", sourceType: "module" })), false);
+    const f = fixture({ "index.html": '<script type="module" src="app.mjs"></script>', "app.mjs": main,
+      "f3d-loader-resources.mjs": changed });
+    assert.throws(() => packHtml(f.entry, f.packed), error => ["WORKER_URL", "WORKER_BINDING"].includes(error.code));
+  }
+  const arbitrary = fixture({ "index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": main + "\nnew Worker(globalThis.target);", "f3d-loader-resources.mjs": source });
+  assert.throws(() => packHtml(arbitrary.entry, arbitrary.packed), { code: "WORKER_URL" });
 });
 
 test("CLI build plus pack enables embedded loaders while ordinary application builds stay unchanged", async () => {

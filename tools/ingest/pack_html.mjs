@@ -18,6 +18,7 @@ import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { embedGltfAssets } from "./pack_gltf.mjs";
 import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
+import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -538,6 +539,18 @@ export function packHtml(
     const workerSites = [],
       names = new Set(),
       bindings = new Set();
+    const sourceLoaderRuntime = !worker && sourceType === "module" && isThreeLoaderResourceModule(source, ast);
+    const ancestorsByNode = new WeakMap(), scopedBindings = new WeakMap(), hostWrites = new Set(), writes = [];
+    const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+    const scopeTypes = new Set(["Program", "BlockStatement", "StaticBlock", "SwitchStatement", "CatchClause",
+      "ForStatement", "ForInStatement", "ForOfStatement", "ClassDeclaration", "ClassExpression", ...functions]);
+    const scopeFor = (ancestors, variable = false) => {
+      const scope = [...ancestors].reverse().find(node => variable
+        ? node.type === "Program" || node.type === "StaticBlock" || functions.has(node.type) : scopeTypes.has(node.type));
+      // Body vars are hoisted through body blocks, but are not visible while
+      // default parameters (or closures created there) are evaluated.
+      return variable && functions.has(scope?.type) ? scope.body : scope;
+    };
     const literal = (node) =>
       node?.type === "Literal" && typeof node.value === "string"
         ? node.value
@@ -577,21 +590,44 @@ export function packHtml(
       // effects and unsupported extra keys that the native importer rejects.
       return "json";
     }
-    function bind(node) {
+    function bind(node, target = bindings) {
       if (!node) return;
-      if (node.type === "Identifier") bindings.add(node.name);
-      else if (node.type === "RestElement") bind(node.argument);
-      else if (node.type === "AssignmentPattern") bind(node.left);
-      else if (node.type === "ArrayPattern") node.elements.forEach(bind);
+      if (node.type === "Identifier") target.add(node.name);
+      else if (node.type === "RestElement") bind(node.argument, target);
+      else if (node.type === "AssignmentPattern") bind(node.left, target);
+      else if (node.type === "ArrayPattern") node.elements.forEach(value => bind(value, target));
       else if (node.type === "ObjectPattern")
-        node.properties.forEach((p) => bind(p.type === "RestElement" ? p.argument : p.value));
+        node.properties.forEach((p) => bind(p.type === "RestElement" ? p.argument : p.value, target));
       else if (node.type === "MemberExpression" && node.object.type === "Identifier" &&
           ["globalThis", "self", "window"].includes(node.object.name)) {
         const name = node.computed ? literal(node.property) : node.property.name;
-        if (name !== null) bindings.add(name);
-        else ["Worker", "URL", "Blob", "fetch", "importScripts"].forEach((n) => bindings.add(n));
+        if (name !== null) target.add(name);
+        else ["Worker", "URL", "Blob", "fetch", "importScripts"].forEach((n) => target.add(n));
       }
     }
+    function bindIn(scope, pattern) {
+      if (!scopedBindings.has(scope)) scopedBindings.set(scope, new Set());
+      bind(pattern, scopedBindings.get(scope));
+    }
+    const locallyBound = (node, name) => {
+      const ancestors = ancestorsByNode.get(node) ?? [];
+      return ancestors.some((scope, index) => scopedBindings.get(scope)?.has(name) &&
+        // A switch discriminant runs before entering the case lexical scope.
+        !(scope.type === "SwitchStatement" && ancestors[index + 1] === scope.discriminant));
+    };
+    function recordHostWrite(node) {
+      if (!node) return;
+      if (node.type === "Identifier") { if (!locallyBound(node, node.name)) hostWrites.add(node.name); }
+      else if (node.type === "MemberExpression") bind(node, hostWrites);
+      else if (node.type === "RestElement") recordHostWrite(node.argument);
+      else if (node.type === "AssignmentPattern") recordHostWrite(node.left);
+      else if (node.type === "ArrayPattern") node.elements.forEach(recordHostWrite);
+      else if (node.type === "ObjectPattern") node.properties.forEach(p => recordHostWrite(p.type === "RestElement" ? p.argument : p.value));
+    }
+    // Bundled addons may contain an unrelated local `URL` (GLTFLoader does).
+    // Resolve document-module host uses in their lexical scope. Keep classic
+    // worker realm checks conservative across scripts and imported modules.
+    const boundAt = (node, name) => worker ? bindings.has(name) : hostWrites.has(name) || locallyBound(node, name);
     function writtenHost(node) {
       // Module locals are isolated; direct writes to a classic realm's host
       // globals are not. Track writes even in ESM helpers of that realm.
@@ -609,21 +645,32 @@ export function packHtml(
       else if (node.type === "RestElement") writtenHost(node.argument);
       else if (node.type === "AssignmentPattern") writtenHost(node.left);
     }
-    walk.full(ast, (node) => {
+    walk.fullAncestor(ast, (node, _state, ancestors) => {
+      ancestorsByNode.set(node, ancestors.slice());
+      const parents = ancestors.slice(0, -1);
       if (node.type === "Identifier") names.add(node.name);
-      if (node.type === "VariableDeclarator") bind(node.id);
-      if (/^(FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(node.type)) {
+      if (node.type === "VariableDeclarator") {
         bind(node.id);
-        node.params.forEach(bind);
+        bindIn(scopeFor(parents, parents.at(-1)?.kind === "var"), node.id);
       }
-      if (node.type === "ClassDeclaration" || node.type === "ClassExpression") bind(node.id);
-      if (/^Import.*Specifier$/.test(node.type)) bind(node.local);
-      if (node.type === "CatchClause") bind(node.param);
-      if (node.type === "AssignmentExpression") { bind(node.left); writtenHost(node.left); }
+      if (functions.has(node.type)) {
+        bind(node.id);
+        node.params.forEach(parameter => { bind(parameter); bindIn(node, parameter); });
+        if (node.id) bindIn(node, node.id);
+        if (node.type === "FunctionDeclaration") bindIn(scopeFor(parents), node.id);
+      }
+      if (node.type === "ClassDeclaration" || node.type === "ClassExpression") {
+        bind(node.id);
+        if (node.id) bindIn(node, node.id);
+        if (node.type === "ClassDeclaration") bindIn(scopeFor(parents), node.id);
+      }
+      if (/^Import.*Specifier$/.test(node.type)) { bind(node.local); bindIn(ast, node.local); }
+      if (node.type === "CatchClause") { bind(node.param); bindIn(node, node.param); }
+      if (node.type === "AssignmentExpression") { bind(node.left); writtenHost(node.left); writes.push(node.left); }
       if (node.type === "UpdateExpression" || (node.type === "UnaryExpression" && node.operator === "delete")) {
-        bind(node.argument); writtenHost(node.argument);
+        bind(node.argument); writtenHost(node.argument); writes.push(node.argument);
       }
-      if (node.type === "ForInStatement" || node.type === "ForOfStatement") { bind(node.left); writtenHost(node.left); }
+      if (node.type === "ForInStatement" || node.type === "ForOfStatement") { bind(node.left); writtenHost(node.left); writes.push(node.left); }
       if (
         node.type === "NewExpression" &&
         node.callee.type === "Identifier" &&
@@ -638,6 +685,7 @@ export function packHtml(
       )
         fail("WORKER_LOCATION", "Worker location observation requires the normal build");
     });
+    writes.forEach(recordHostWrite);
     if (worker && sourceType === "script") {
       for (const name of names) worker.names.add(name);
       for (const name of bindings) worker.bindings.add(name);
@@ -668,7 +716,7 @@ export function packHtml(
         rewriteURLs(node.alternate, origin, emit, code, depth + 1, budget);
       } else if (node.type === "NewExpression" && node.callee.type === "Identifier" && node.callee.name === "URL") {
         const [ref, base] = node.arguments;
-        if (bindings.has("URL") || node.arguments.length !== 2 ||
+        if (boundAt(node, "URL") || node.arguments.length !== 2 ||
             base?.type !== "MemberExpression" || base.computed ||
             base.object.type !== "MetaProperty" || base.property.name !== "url")
           fail(code, `${from}: expected an unshadowed module-relative URL`);
@@ -679,12 +727,16 @@ export function packHtml(
       } else fail(code, `${from}: URL must have finite literal results`);
     }
     for (const site of workerSites) {
+      // This exact emitted module is the host boundary for hash-proven source
+      // codec sites. Retain native construction of their source-created Blob
+      // URLs; never infer this permission from an import/export or class name.
+      if (sourceLoaderRuntime) continue;
       if (!worker && sourceType !== "module")
         fail(
           "WORKER_PARENT",
           "Dedicated workers must be constructed by an emitted document module",
         );
-      if (bindings.has("Worker") || bindings.has("URL"))
+      if (boundAt(site, "Worker") || boundAt(site, "URL"))
         fail("WORKER_BINDING", "Shadowed Worker/URL bindings require the normal build");
       if (site.arguments.length < 1 || site.arguments.length > 2)
         fail("WORKER_OPTIONS", "Worker requires a static URL and optional static type");
@@ -747,7 +799,7 @@ export function packHtml(
       }
       if (node.type === "NewExpression" && node.callee.type === "Identifier" && node.callee.name === "URL") {
         const [ref, base] = node.arguments;
-        if (bindings.has("URL") || node.arguments.length !== 2 ||
+        if (boundAt(node, "URL") || node.arguments.length !== 2 ||
             base?.type !== "MemberExpression" || base.computed ||
             base.object.type !== "MetaProperty" || base.property.name !== "url")
           fail("IMPORT_URL", `${from}: imports need an unshadowed module-relative URL`);
@@ -845,7 +897,7 @@ export function packHtml(
         const value = literal(ref);
         if (value === null || node.arguments.length !== 2)
           fail("DYNAMIC_ASSET", `${from}: asset URL is not a static literal`);
-        if (bindings.has("URL")) fail("WORKER_BINDING", `${from}: shadowed asset URL constructor`);
+        if (boundAt(node, "URL")) fail("WORKER_BINDING", `${from}: shadowed asset URL constructor`);
         uses("URL");
         allowedMeta.add(origin.object);
         add(node, `new URL(${JSON.stringify(assetFor(local(value, from)))})`);
