@@ -4,7 +4,7 @@
  * Publication is after compute upload (including compileComputeAsync). Native
  * buffer usages must include VERTEX as well as STORAGE from creation onward;
  * index borrowers additionally require INDEX usage. */
-const devices = new WeakMap();
+const devices = new WeakMap(), vertexViews = new WeakMap();
 export class ComputeAttributeError extends Error {
   constructor(code, message) {
     super(`COMPUTE_ATTRIBUTE_${code}: ${message}`);
@@ -126,11 +126,40 @@ export function captureComputeStorage(device, attribute) {
     whenIdle: () => current().whenIdle()});
 }
 
+/** Private geometry view of a captured storage generation. Only this module
+ * installs its proof; ordinary objects cannot supply a foreign GPUBuffer. The
+ * view identity stays stable across frames so geometry caches remain bounded.
+ * Its captured proof is immutable even when a later frame installs a new one. */
+export function captureComputeAttributeView(device, source, view) {
+  const lease = captureComputeStorage(device, source);
+  const shape = {array: source.array, itemSize: source.itemSize, count: source.count, version: source.version,
+    isStorageBufferAttribute: source.isStorageBufferAttribute === true,
+    isStorageInstancedBufferAttribute: source.isStorageInstancedBufferAttribute === true,
+    isInstancedBufferAttribute: source.isInstancedBufferAttribute === true,
+    normalized: false, meshPerAttribute: 1};
+  const scalar = shape.array.constructor, byteLength = shape.array.byteLength;
+  return Object.freeze({install() {
+    Object.assign(view, shape);
+    vertexViews.set(view, {device, lease, scalar, byteLength, stride: shape.itemSize, count: shape.count});
+  }});
+}
+
 /** Only buffers published by the compute owner on this device are admitted.
  * needsUpdate remains a compute upload request: execute/precompile that kernel
  * before drawing a newer host version. Never upload stale CPU simulation state
  * from the geometry owner, and never infer current GPU bounds from that array. */
 export function computeAttributeSnapshot(device, attribute, {index = false, integer = false} = {}) {
+  const view = vertexViews.get(attribute);
+  if (view) {
+    if (view.device !== device) fail('OWNER', 'Captured vertex storage belongs to another device');
+    if (index) fail('FORMAT', 'Captured node vertex streams cannot be used as indices');
+    if (integer ? ![Int32Array, Uint32Array].includes(view.scalar) : view.scalar !== Float32Array)
+      fail('FORMAT', 'Captured storage signedness must match its vertex shader input');
+    const resource = view.lease.resolve();
+    return Object.freeze({buffer: resource.buffer, arrayStride: view.stride * 4, count: view.count,
+      byteLength: view.byteLength, scalar: view.scalar, indexFormat: null,
+      assertCurrent: view.lease.assertCurrent, whenIdle: view.lease.whenIdle});
+  }
   const table = devices.get(device), entry = table?.get(attribute);
   if (!isComputeAttribute(attribute) || !entry)
     fail('UNPREPARED', 'Compute or compileComputeAsync must upload this storage attribute on the drawing device first');

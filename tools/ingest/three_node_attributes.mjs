@@ -4,6 +4,29 @@
  * the existing geometry uploader private owners containing that history. A
  * queued render can install its bytes without rewriting application attributes.
  */
+export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
+  if (!(attribute instanceof three.BufferAttribute) ||
+      !(attribute.isStorageBufferAttribute === true || attribute.isStorageInstancedBufferAttribute === true) ||
+      attribute.isIndirectStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized ||
+      ![Float32Array, Int32Array, Uint32Array].includes(attribute.array?.constructor) ||
+      !(attribute.array.buffer instanceof ArrayBuffer) || attribute.array.buffer.resizable ||
+      !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
+      !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
+      attribute.array.length !== attribute.itemSize * attribute.count ||
+      !Number.isSafeInteger(attribute.version) || attribute.version < 0 ||
+      attribute.isInstancedBufferAttribute && attribute.meshPerAttribute !== 1)
+    reject('ATTRIBUTE', 'Native storage vertex inputs require source 32-bit scalar/vector attributes and instance divisor one');
+  if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
+    reject('HOOK', 'Native storage vertex inputs require the source upload callback');
+  // Source storage vec3 values acquire their fourth alignment word on upload.
+  // This canonical signature is stable across that source-visible normalization.
+  const stride = attribute.itemSize === 3 ? 4 : attribute.itemSize;
+  return {gpu: true, owner: attribute, array: attribute.array, interleaved: false,
+    instanced: attribute.isInstancedBufferAttribute === true, stride, offset: 0,
+    signature: JSON.stringify([attribute.array.constructor.name, attribute.count, stride,
+      attribute.isInstancedBufferAttribute === true, attribute.meshPerAttribute])};
+}
+
 export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, fail} = {}) {
   const reject = (code, message) => {
     if (fail) return fail(code, message);
@@ -14,6 +37,8 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Native attribute histories are disposed'); };
   function shape(attribute) {
+    if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute)
+      return inspectThreeNodeStorageAttribute(three, attribute, reject);
     const interleaved = attribute?.isInterleavedBufferAttribute === true;
     const owner = interleaved ? attribute.data : attribute, array = owner?.array;
     if (!(array instanceof Float32Array) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
@@ -42,10 +67,11 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     const sources = attributes.map(({name, attribute}) => ({name, attribute, ...shape(attribute)}));
     const ordinaryOwners = new Set(Object.values(geometry.attributes).map(attribute =>
       attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
-    if (sources.some(source => ordinaryOwners.has(source.owner)))
+    if (sources.some(source => !source.gpu && ordinaryOwners.has(source.owner)))
       reject('ATTRIBUTE', 'Native generated streams cannot also be ordinary geometry sources');
     const newOwners = new Map();
     for (const source of sources) {
+      if (source.gpu) continue;
       const previous = owners.get(source.owner);
       if (previous && previous.bytes !== source.array.byteLength)
         reject('CHANGED', 'Replace a generated attribute when changing its resident storage size');
@@ -70,8 +96,15 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
       geometryState = {owned, onDispose}; geometries.set(geometry, geometryState);
       geometry.addEventListener('dispose', onDispose);
     }
-    const privateOwners = new Map(), mapped = {};
+    const privateOwners = new Map(), mapped = {}, gpuSources = [];
     for (const source of sources) {
+      if (source.gpu) {
+        // Metadata view only: the storage owner supplies the actual vertex
+        // allocation. Do not clone or upload the source CPU simulation array.
+        const view = Object.create(source.attribute);
+        mapped[source.name] = view; gpuSources.push({...source, view});
+        continue;
+      }
       let record = owners.get(source.owner);
       if (!record) {
         record = {bytes: source.array.byteLength, geometries: new Set(), snapshot: null, version: -1, renderId: null};
@@ -97,7 +130,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     const view = {geometry, get attributes() { return {...geometry.attributes, ...mapped}; }, get index() { return geometry.index; },
       get drawRange() { return geometry.drawRange; }, morphAttributes: geometry.morphAttributes,
       isInstancedBufferGeometry: geometry.isInstancedBufferGeometry === true};
-    views.set(descriptor, {sources, privateOwners, view});
+    views.set(descriptor, {sources, privateOwners, gpuSources, view});
     return view;
   }
   function stateOf(descriptor) {
@@ -121,8 +154,11 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     }
     return state;
   }
-  function capture(descriptor, renderId) {
+  function capture(descriptor, renderId, captureVertexAttribute = null) {
     const state = validate(descriptor);
+    if (state.gpuSources.length && typeof captureVertexAttribute !== 'function')
+      reject('ATTRIBUTE', 'Native storage vertex streams require the renderer storage owner');
+    const vertexPackets = state.gpuSources.map(source => captureVertexAttribute(source.attribute, source.view));
     if (!Number.isSafeInteger(renderId) || renderId < 0) reject('ATTRIBUTE', 'Native attribute capture requires a logical render id');
     let bytes = 0;
     const selected = [];
@@ -144,6 +180,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     }
     return Object.freeze({bytes, install() {
       live();
+      for (const packet of vertexPackets) packet.install();
       for (const {target, data} of selected) if (target.installed !== data) {
         target.owner.array = data; target.owner.needsUpdate = true; target.installed = data;
       }
@@ -157,6 +194,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   }
   return Object.freeze({register, capture, release, validate(descriptor) { validate(descriptor); },
     geometry: descriptor => stateOf(descriptor).view,
+    storage: descriptor => stateOf(descriptor).gpuSources.map(source => source.attribute),
     byteLength: descriptor => [...stateOf(descriptor).privateOwners.values()].reduce((sum, target) => sum + target.record.bytes, 0),
     dispose() {
       if (disposed) return;

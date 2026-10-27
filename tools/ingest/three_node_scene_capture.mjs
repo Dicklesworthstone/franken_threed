@@ -406,7 +406,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           if (typeof getTextures !== 'function') fail('SOURCE', 'Native sampled graphs require the renderer texture owner');
           textureOwner ??= textureInputs();
         }
-        if (programs.storage(binding.nodeProgram).length) {
+        if (programs.storage(binding.nodeProgram).length || programs.vertexStorage?.(binding.nodeProgram).length) {
           if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage graphs require the renderer storage owner');
           storageOwner ??= storageInputs();
         }
@@ -466,7 +466,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     return prepared;
   };
   const frameContext = {...context, ...frameStamp};
-  const textureUses = [], storageUses = [], bundleGeometries = [], chargedGeometry = new Set();
+  const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set();
+  const captureVertexAttribute = (attribute, view) => {
+    const lease = storageOwner.capture(attribute);
+    // Retain first so any subsequent proof/capture failure releases the upload.
+    storageUses.push(lease); vertexStorageUses.push(lease);
+    return storageOwner.vertexAttribute(lease, view);
+  };
   const capturedDraws = [];
   let recordTexture = () => {};
   const captureDraw = draw => {
@@ -488,7 +494,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.object.normalMatrix.getNormalMatrix(draw.object.modelViewMatrix);
       }
       const updateContext = {...frameContext, scene: draw.bundleScene ?? root, object: draw.object, material: draw.material,
-        clippingContext: draw.binding.clippingContext,
+        captureVertexAttribute, clippingContext: draw.binding.clippingContext,
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1},
@@ -722,15 +728,19 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, bundleGeometries: Object.freeze(bundleGeometries),
     sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([...compiledBindings]), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
-      if (uniforms) return;
-      // compileAsync uploads visible geometry even though this preparation
-      // profile runs no application updates. Establish that initial resident
-      // history at preparation, so later unmarked edits remain stale. Inactive
-      // objects have no binding and do not acquire a source upload history.
-      preparedAttributes ??= [...preparationBindings].map(binding => withBinding(binding, () => programs.captureAttributes?.(
-        binding.nodeProgram, {...frameContext, object: binding.object, material: binding.material}))).filter(Boolean);
-      for (const attributes of preparedAttributes) attributes.install();
+      if (!uniforms) {
+        // compileAsync uploads visible geometry without application updates.
+        // Storage views retain allocation identity, never a CPU simulation copy.
+        preparedAttributes ??= [...preparationBindings].map(binding => withBinding(binding, () => programs.captureAttributes?.(
+          binding.nodeProgram, {...frameContext, object: binding.object, material: binding.material, captureVertexAttribute}))).filter(Boolean);
+        for (const attributes of preparedAttributes) attributes.install();
+      }
+      // Pipeline preparation needs actual vertex buffers. Publish these captured
+      // versions at the FIFO preparation boundary; unchanged versions preserve
+      // compute-authored bytes. Submission retains the same storage leases.
+      if (vertexStorageUses.length) storageOwner.withReads(vertexStorageUses, () => {});
     },
     installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
-    textureOwner, textureUses: Object.freeze(textureUses), storageOwner, storageUses: Object.freeze(storageUses)});
+    textureOwner, textureUses: Object.freeze(textureUses), storageOwner,
+    get storageUses() { return Object.freeze(storageUses.slice()); }});
 }

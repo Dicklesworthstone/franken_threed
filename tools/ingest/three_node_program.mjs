@@ -27,7 +27,7 @@
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
-import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
@@ -161,6 +161,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return id;
   }
   function inspectAttributeInput(node, object) {
+    if (node.value?.isStorageBufferAttribute || node.value?.isStorageInstancedBufferAttribute) {
+      inspectThreeNodeStorageAttribute(three, node.value, fail);
+      if (node.attribute !== node.value || node.bufferOffset !== 0 || node.bufferStride !== 0)
+        fail('ATTRIBUTE', 'Native storage vertex inputs require the source scalar/vector attribute without interleaved conversion');
+      return;
+    }
     if (node.value instanceof Float32Array) return;
     const inputs = object?.isInstancedMesh ? [object.instanceMatrix, object.instanceColor].filter(Boolean) : [];
     const value = node.value;
@@ -185,10 +191,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       inspectAttributeInput(node, object);
       const attribute = node.attribute, owner = attribute?.isInterleavedBufferAttribute ? attribute.data : attribute;
       const array = owner?.array, inputArray = ArrayBuffer.isView(node.value) ? node.value : node.value?.array;
+      if (owner?.isStorageBufferAttribute || owner?.isStorageInstancedBufferAttribute) {
+        const shape = inspectThreeNodeStorageAttribute(three, owner, fail);
+        return [node.id, node.nodeType, node.bufferType, node.bufferStride, node.bufferOffset, node.instanced, node.usage,
+          sourceId(node.value), sourceId(attribute), shape.signature];
+      }
       if (!attribute || !array || inputArray !== array)
         fail('CHANGED', 'Native buffer attribute nodes must retain their source backing array; replace the node or instance attribute');
-      if (owner.isStorageBufferAttribute || owner.isStorageInstancedBufferAttribute || owner.isIndirectStorageBufferAttribute)
-        fail('ATTRIBUTE', 'Compute-backed attribute conversion requires shared GPU residency, not a CPU attribute snapshot');
       return [node.id, node.nodeType, node.bufferType, node.bufferStride, node.bufferOffset, node.instanced, node.usage,
         sourceId(node.value), sourceId(attribute), sourceId(owner), sourceId(array), array.length, array.byteLength,
         attribute.count, attribute.itemSize, attribute.normalized, attribute.gpuType, attribute.isInterleavedBufferAttribute,
@@ -1085,7 +1094,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const scalar = vector?.[1] === 'u' || vector?.[3] === 'uint' ? 'uint'
         : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
       const node = attribute.node, source = node?.attribute ?? object.geometry.attributes[attribute.name];
-      if (!components || !source || source.itemSize !== components ||
+      const storage = source?.isStorageBufferAttribute || source?.isStorageInstancedBufferAttribute;
+      const padded = storage && source.itemSize === 4 && components === 3;
+      if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
       if (node) generated.push({name: attribute.name, attribute: source});
@@ -1392,8 +1403,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (state.descriptor.wireframe !== (state.material.wireframe === true))
       fail('CHANGED', 'Native wireframe topology changed; compile the graph again');
   }
-  function captureGeometry(state, renderId) {
-    const generated = state.generated ? generatedAttributes.capture(state.descriptor, renderId) : null;
+  function captureGeometry(state, renderId, captureVertexAttribute) {
+    const generated = state.generated ? generatedAttributes.capture(state.descriptor, renderId, captureVertexAttribute) : null;
     const wireframe = state.descriptor.wireframe ? wireframes.capture(state.descriptor, renderId) : null;
     if (!wireframe) return generated;
     return Object.freeze({bytes: wireframe.bytes + (generated?.bytes ?? 0), indexCount: wireframe.indexCount,
@@ -1489,7 +1500,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
-      const attributes = captureGeometry(state, frame.renderId);
+      const attributes = captureGeometry(state, frame.renderId, context.captureVertexAttribute);
       // Bundle commands retain this upload generation even when updateNodes
       // subsequently mutates the source geometry. The scene owner owns the
       // geometry/lease snapshot; compilation and shared refresh never invoke it.
@@ -1552,10 +1563,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     captureAttributes(descriptor, context = {}) {
       const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state);
       checkWireframe(state);
-      return captureGeometry(state, context.renderId ?? renderer.info.calls);
+      return captureGeometry(state, context.renderId ?? renderer.info.calls, context.captureVertexAttribute);
     },
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
+    vertexStorage(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.storage(descriptor) : []; },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
       for (const record of bundleGeometryRecords) releaseBundleGeometry(record);

@@ -1,0 +1,175 @@
+/** Source TSL storage attributes through the native renderer and shared compute
+ * allocation. The recording device checks queue-visible bytes and ownership;
+ * it deliberately does not evaluate WGSL or claim image parity. */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {createWebGPURendererClass} from './three_renderer.mjs';
+import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {captureComputeStorage, captureComputeAttributeView, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
+const Renderer = createWebGPURendererClass(T), N = T.TSL;
+function fixture(t) {
+  const device = geometryDevice();
+  device.limits.maxTextureDimension2D = 8192; device.limits.maxBindingsPerBindGroup = 1000;
+  device.createTexture = desc => ({dimension:'2d', depthOrArrayLayers:1, sampleCount:1, ...desc,
+    width:desc.size.width ?? desc.size[0], height:desc.size.height ?? desc.size[1],
+    createView(options = {}) { return {texture:this, ...options}; }, destroy() { this.destroyed = true; }});
+  device.createSampler = desc => ({...desc});
+  let configured;
+  const canvas = {width:64, height:64, style:{}, getContext:() => ({configure(value) { configured = value; },
+    unconfigure() {}, getCurrentTexture:() => device.createTexture({size:[64,64], format:configured.format, usage:16})})};
+  device.computePasses = [];
+  device.createComputePipeline = descriptor => ({...descriptor, getBindGroupLayout:index => ({index})});
+  device.createComputePipelineAsync = descriptor => Promise.resolve(device.createComputePipeline(descriptor));
+  const create = device.createCommandEncoder.bind(device), submit = device.queue.submit.bind(device.queue);
+  device.createCommandEncoder = descriptor => {
+    const encoder = create(descriptor), passes = [];
+    return {...encoder, beginComputePass(desc) {
+      const pass = {desc, draws:[], groups:new Map(), dispatches:[]}; passes.push(pass); device.computePasses.push(pass);
+      return {setPipeline(pipeline) { pass.pipeline = pipeline; }, setBindGroup(index, group) { pass.groups.set(index, group); },
+        dispatchWorkgroups(...size) { pass.dispatches.push(size); }, end() {}};
+    }, finish() { return [...encoder.finish(), ...passes]; }};
+  };
+  device.queue.submit = commands => {
+    for (const passes of commands) for (const pass of passes)
+      if (pass.dispatches?.length) device.onCompute?.(pass);
+    submit(commands);
+  };
+  const renderer = new Renderer({canvas, device}); t.after(() => renderer.dispose());
+  const scene = new T.Scene(), camera = new T.PerspectiveCamera(50,1,.1,30); camera.position.z = 4;
+  const material = new T.MeshBasicNodeMaterial(), mesh = new T.Mesh(new T.PlaneGeometry(), material);
+  mesh.frustumCulled = false; scene.add(mesh);
+  return {renderer, device, scene, camera, material, mesh};
+}
+const drain = async renderer => { while (renderer._drain) await renderer._drain; };
+const draws = device => device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'main');
+const shaderStorage = draw => [...draw.groups.values()].flatMap(({group}) => group.entries)
+  .map(entry => entry.resource?.buffer).filter(buffer => buffer?.usage & 128);
+const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.entries)
+  .map(entry => entry.resource?.buffer).filter(buffer => buffer?.usage & 128);
+const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
+const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
+
+test('padded instanced .toAttribute shares the compute and shader storage allocation after compileAsync', async t => {
+  const f = fixture(t), positions = N.instancedArray(3, 'vec3'), attribute = positions.value;
+  f.mesh.count = 3;
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  f.material.colorNode = positions.element(0).abs();
+  await f.renderer.compileAsync(f.scene, f.camera);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  assert.equal(attribute.itemSize, 4); assert.equal(buffer.size, 48);
+  assert.equal(buffer.usage & (128 | 32), 128 | 32);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  f.device.onCompute = pass => {
+    assert.equal(computeStorage(pass)[0], buffer);
+    // Simulate the queued device producer, leaving the source CPU array zero.
+    new Float32Array(buffer.data).set([.25,.5,.75,0,1,2,3,0,4,5,6,0]);
+  };
+  await f.renderer.compute(kernel(positions));
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 2);
+  for (const draw of selected) {
+    assert.ok([...draw.streams.values()].includes(buffer));
+    assert.ok(shaderStorage(draw).includes(buffer));
+    assert.deepEqual(words(draw, buffer), [.25,.5,.75,0,1,2,3,0,4,5,6,0]);
+    const slot = [...draw.streams].find(([, value]) => value === buffer)[0];
+    assert.equal(draw.pipeline.vertex.buffers[slot].arrayStride, 16);
+    assert.equal(draw.pipeline.vertex.buffers[slot].stepMode, 'instance');
+    assert.equal(draw.pipeline.vertex.buffers[slot].attributes[0].format, 'float32x3');
+    assert.equal(draw.args[1], 3);
+  }
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1,
+    'compile, compute, and render retain one host upload and never restore CPU zeros');
+  assert.equal(f.device.buffers.filter(candidate => candidate.label === 'f3d-compute-buffer' && candidate.usage & 128).length, 1);
+  assert.ok(attribute.array.every(value => value === 0)); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a queued .toAttribute draw before compute retains producer order without pinning buffer bytes', async t => {
+  const f = fixture(t), positions = N.instancedArray(2, 'vec3');
+  positions.value.array.fill(.125); f.mesh.count = 2;
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  f.material.colorNode = positions.element(0);
+  f.device.onCompute = pass => new Float32Array(computeStorage(pass)[0].data).fill(.875);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  const computation = f.renderer.compute(kernel(positions));
+  f.renderer.render(f.scene, f.camera);
+  positions.value.array.fill(99);
+  await Promise.all([computation, drain(f.renderer)]);
+  const selected = draws(f.device); assert.equal(selected.length, 2);
+  const buffer = captureComputeStorage(f.device, positions.value).resolve().buffer;
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.125, .875]);
+  assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer) && shaderStorage(draw).includes(buffer)));
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  assert.equal(f.device.computePasses.length, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('integer per-vertex .toAttribute retains queued host versions and shared storage identity', async t => {
+  const f = fixture(t), values = N.attributeArray(4, 'ivec4'), attribute = values.value;
+  for (let i = 0; i < 4; i++) attribute.array.set([-3,4,5,6], i * 4);
+  f.material.positionNode = N.positionLocal.add(values.toAttribute().xyz.toFloat().mul(.01));
+  f.material.colorNode = values.element(0).xyz.toFloat().abs().mul(.1);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  for (let i = 0; i < 4; i++) attribute.array.set([-7,8,9,10], i * 4);
+  attribute.needsUpdate = true; f.renderer.render(f.scene, f.camera); attribute.array.fill(99);
+  await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 2);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Int32Array).slice(0,4)), [[-3,4,5,6],[-7,8,9,10]]);
+  for (const draw of selected) {
+    const slot = [...draw.streams].find(([, value]) => value === buffer)[0];
+    assert.equal(draw.pipeline.vertex.buffers[slot].stepMode, 'vertex');
+    assert.equal(draw.pipeline.vertex.buffers[slot].attributes[0].format, 'sint32x4');
+    assert.ok(shaderStorage(draw).includes(buffer));
+  }
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 2);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('accepted storage vertex views keep their shape when the source is resized before preparation', async t => {
+  const f = fixture(t), positions = N.instancedArray(2, 'vec3'), attribute = positions.value;
+  attribute.array.set([1,2,3,4,5,6]); f.mesh.count = 2;
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  attribute.array = new Float32Array(40).fill(99); attribute.count = 10; attribute.itemSize = 4; attribute.needsUpdate = true;
+  f.mesh.count = 10;
+  await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 1);
+  const buffer = [...selected[0].streams.values()].find(value => value.usage & 128);
+  assert.equal(buffer.size, 32); assert.deepEqual(words(selected[0], buffer), [1,2,3,0,4,5,6,0]);
+  assert.equal(selected[0].args[1], 2); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('accepted storage vertex reads survive source disposal and refuse a foreign device', async t => {
+  const f = fixture(t), positions = N.instancedArray(1, 'vec3');
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  f.mesh.geometry.dispose(); f.material.dispose();
+  await drain(f.renderer);
+  assert.equal(draws(f.device).length, 1);
+  const buffer = captureComputeStorage(f.device, positions.value).resolve().buffer;
+  assert.equal(buffer.destroyed, false);
+  const view = Object.create(positions.value);
+  captureComputeAttributeView(f.device, positions.value, view).install();
+  assert.equal(computeAttributeSnapshot(f.device, view).buffer, buffer);
+  assert.throws(() => computeAttributeSnapshot(geometryDevice(), view), {code:'COMPUTE_ATTRIBUTE_OWNER'});
+  f.renderer.dispose(); assert.equal(buffer.destroyed, true);
+  assert.throws(() => computeAttributeSnapshot(f.device, view), /DISPOSED/);
+});
+
+test('renderer disposal cancels accepted storage vertex draws and preparation failure releases captured versions', async t => {
+  const f = fixture(t), positions = N.instancedArray(2, 'vec3');
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); f.renderer.dispose();
+  await drain(f.renderer);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(draws(f.device).length, 0);
+  assert.ok(f.device.buffers.filter(buffer => buffer.label === 'f3d-compute-buffer').every(buffer => buffer.destroyed));
+  const g = fixture(t), other = N.instancedArray(2, 'vec3');
+  g.material.positionNode = N.positionLocal.add(other.toAttribute());
+  await g.renderer.init();
+  g.device.createRenderPipelineAsync = () => Promise.reject(new Error('storage vertex pipeline rejected'));
+  g.renderer.render(g.scene, g.camera);
+  await assert.rejects(drain(g.renderer), /storage vertex pipeline rejected/);
+  assert.equal(g.renderer._nodeCaptureBytes, 0); assert.equal(g.device.submissions.length, 0);
+});

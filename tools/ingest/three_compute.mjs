@@ -11,6 +11,7 @@
  * readback or CPU upload is introduced. Sampled image/canvas inputs retain
  * private call-time pixels through the same source texture owner. */
 import {createGpuCompute} from './gpu_compute.mjs';
+import {captureComputeAttributeView} from './gpu_compute_attributes.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
 import {createGpuThreeTextures} from './three_textures.mjs';
@@ -166,6 +167,10 @@ function createThreeCompute(renderer, three) {
       return lease;
     },
     validate: validateReads,
+    vertexAttribute(lease, view) {
+      const record = readRecord(lease);
+      return captureComputeAttributeView(device, record.key, view);
+    },
     withReads(leases, run) {
       const records = [...validateReads(leases)];
       if (issuing || capturingReads) fail('REENTRY', 'Cannot submit native storage during capture or upload');
