@@ -1,9 +1,10 @@
 # Budgeted general numeric control (ABI v8)
 
-The numeric compiler can now lower `for`, `while`, and `do…while` loops in
-closed numeric functions to import-free Wasm. This includes nonzero and reverse
-ranges, dynamic steps, mutable induction variables, loops inside branches,
-mixed nested loops, scalar-only functions, and zero-argument numeric functions.
+The numeric compiler can now lower `for`, `while`, `do…while`, and typed-array
+`for…of` loops in closed numeric functions to import-free Wasm. This includes
+nonzero and reverse ranges, dynamic steps, mutable induction variables, loops
+inside branches, mixed nested loops, scalar-only functions, and zero-argument
+numeric functions.
 These are native loops, not source unrolling or a fixed library of kernels.
 
 ## Application and package entry points
@@ -80,6 +81,33 @@ alias default. Mixed-type writable overlaps retain JavaScript. Shared,
 resizable, detached, proxy, and unsupported typed-array inputs remain subject
 to the existing guards; no new coercions or user getters are introduced.
 
+## Typed-array value iteration
+
+`for (const value of values)` and `for (let value of values)` run natively in
+closed functions, numeric helpers and extracted callback loops. Automatic
+discovery recognizes a parameter used only as an iterable; no indexed access or
+manual ABI annotation is required. All admitted Number-valued typed-array
+layouts retain their existing storage and alias guards.
+
+The iterable is evaluated once at loop entry, including a conditional or borrowed
+`subarray` view. Rebinding its source variable does not retarget the loop, while
+writes through an overlapping view remain visible to subsequent element reads.
+The loop binding keeps its lexical scope and TDZ. Its scalar value can be
+reassigned only for `let`; each yielded element consumes one shared work credit.
+Nested helpers, `continue`, `break` and early returns use the same source-ordered
+control and transactional publication as indexed loops.
+
+Artifacts record `Symbol.iterator` in `typedArrayMethods`. Descriptor checks
+preserve the native iterator method, shared iterator `next` and prototype chain,
+and the absence of inherited `return` hooks. Checks run before lazy initialization
+and packing, including after memory growth. A changed protocol invokes the
+original JavaScript without reading a getter or calling a close hook speculatively.
+Initialization checks apply to every artifact because host ABI validation also
+uses native array iteration; repeated per-call checks apply to artifacts that
+require `Symbol.iterator`. Custom iterables, ordinary arrays, async iteration,
+destructuring and assignment into an existing loop binding remain on the original
+path.
+
 ## Scope and evidence
 
 v8 has one appended intrinsic length per array parameter, in declaration order,
@@ -99,7 +127,8 @@ Run the direct compiler/runtime and application/package integration tests:
 
 ```sh
 node --test tools/ingest/numeric_general_control.test.mjs \
-  tools/ingest/numeric_general_control_integration.test.mjs
+  tools/ingest/numeric_general_control_integration.test.mjs \
+  tools/ingest/numeric_for_of.test.mjs
 ```
 
 The tests execute native Wasm, compare results to original JavaScript, exercise

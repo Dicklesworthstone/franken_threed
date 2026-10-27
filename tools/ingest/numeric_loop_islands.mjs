@@ -11,7 +11,7 @@ import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
 import {discoverNumericArrayParameters, isNumericBulkCall} from './numeric_loop_discovery.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
-const LOOPS = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement']);
+const LOOPS = new Set(['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement']);
 const bulkStatement = node => node.type === 'ExpressionStatement' && isNumericBulkCall(node.expression);
 const numericWork = node => LOOPS.has(node.type) || bulkStatement(node);
 const span = node => ({start:node.start, end:node.end,

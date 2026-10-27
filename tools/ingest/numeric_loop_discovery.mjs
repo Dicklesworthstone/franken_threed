@@ -21,7 +21,7 @@ export function hasNumericLoop(body, immutableHelpers = null, includeBulk = fals
     const node = pending.pop();
     if (!node || visited.has(node)) continue;
     visited.add(node);
-    if (['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(node.type)) return true;
+    if (['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement'].includes(node.type)) return true;
     if (includeBulk && isNumericBulkCall(node.type === 'ExpressionStatement' ? node.expression : node)) return true;
     if (immutableHelpers) {
       // Never treat a nested declaration/callback/class as source execution.
@@ -92,6 +92,8 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right);
       if (node.type === 'MemberExpression' && node.object.type === 'Identifier')
         record.required.add(node.object.name);
+      if (node.type === 'ForOfStatement')
+        for (const name of references(node.right)) record.required.add(name);
       // set's source may never be subscripted elsewhere, including through
       // aliases and reordered helper parameters. Treat it as a required view.
       if (isNumericBulkCall(node) && node.callee.property.name === 'set')

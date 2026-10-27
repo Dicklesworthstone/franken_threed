@@ -14,7 +14,7 @@
  */
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
-import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
@@ -273,21 +273,41 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         control.recordLoop(node, loopDepth, fn.id.name);
         // The initializer's TDZ covers ALL its declarations. Its bindings live
         // through test/body/update, but a body's shadow cannot leak into update.
-        const initial = node.init?.type === 'VariableDeclaration'
-          ? block([node.init], depth + 1, true).bytes : effects(node.init, depth + 1);
-        const predicate = node.test ? condition(node.test) : [0x41, 1];
+        let initial, predicate, beforeBody = [], update;
+        if (node.type === 'ForOfStatement') {
+          const declaration = node.left, binding = declaration?.declarations?.[0];
+          if (node.await || declaration?.type !== 'VariableDeclaration' ||
+              !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 ||
+              binding.id.type !== 'Identifier' || binding.init)
+            fail('Helper value iteration requires one lexical binding and a closed typed-array view', node);
+          environment.set(binding.id.name, null);
+          const reference = arrayReferences.declare(node.right, false);
+          if (!reference) fail('Helper value iteration requires a closed typed-array view', node.right);
+          const iterator = createArrayValueIteration(reference.binding, allocateLocal);
+          const local = allocateLocal();
+          environment.set(binding.id.name, {index:local, mutable:declaration.kind === 'let'});
+          control.methods.add('Symbol.iterator');
+          initial = [...reference.bytes, ...iterator.initial];
+          predicate = iterator.predicate;
+          beforeBody = [...iterator.value, ...set(local)];
+          update = iterator.update;
+        } else {
+          initial = node.init?.type === 'VariableDeclaration'
+            ? block([node.init], depth + 1, true).bytes : effects(node.init, depth + 1);
+          predicate = node.test ? condition(node.test) : [0x41, 1];
+        }
         const parentDepth = controlDepth;
         loopControls.push({ breakDepth: parentDepth, continueDepth: parentDepth + 2 });
         controlDepth += 3;
         let body;
         try { body = block(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1); }
         finally { controlDepth = parentDepth; loopControls.pop(); }
-        const update = effects(node.update, depth + 1);
+        update ??= effects(node.update, depth + 1);
         const postTest = node.type === 'DoWhileStatement';
         const test = [...predicate, 0x45, 0x0d, 1];
         return {
           bytes: [...initial, 0x02, 0x40, 0x03, 0x40,
-            ...(postTest ? [] : test), ...control.enterLoop(),
+            ...(postTest ? [] : test), ...control.enterLoop(), ...beforeBody,
             0x02, 0x40, ...body.bytes, 0x0b, ...update,
             ...(postTest ? test : []), 0x0c, 0, 0x0b, 0x0b],
           // Conservatively allow a loop to exit. A numeric return after the
@@ -358,7 +378,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             if (alternate) bytes.push(0x05, ...alternate.bytes);
             bytes.push(0x0b);
             advance([...consequent.completions, ...(alternate?.completions ?? ['normal'])]);
-          } else if (control && ['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
+          } else if (control && ['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
             const nested = compileLoop(statement, depth);
             bytes.push(...nested.bytes);
             advance(nested.completions);

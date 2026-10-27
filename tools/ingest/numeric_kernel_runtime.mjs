@@ -38,7 +38,7 @@ const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
-const ARRAY_METHOD_NAMES = Object.freeze(['copyWithin', 'fill', 'set', 'subarray']);
+const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray']);
 const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
@@ -72,11 +72,40 @@ const speciesKey = Symbol.species;
 const typedSpecies = descriptor(typedConstructor, speciesKey)?.get;
 const nativeSpecies = typeof typedSpecies === 'function' &&
   apply(functionSource, typedSpecies, []) === 'function get [Symbol.species]() { [native code] }';
+const iteratorKey = Symbol.iterator;
 const arrayMethods = new Map(ARRAY_METHOD_NAMES.map(name => {
-  const value = dataValue(typedPrototype, name);
+  const value = dataValue(typedPrototype, name === 'Symbol.iterator' ? iteratorKey : name);
+  const nativeName = name === 'Symbol.iterator' ? 'values' : name;
   return [name, typeof value === 'function' &&
-    apply(functionSource, value, []) === `function ${name}() { [native code] }` ? value : null];
+    apply(functionSource, value, []) === `function ${nativeName}() { [native code] }` ? value : null];
 }));
+const iteratorMethod = arrayMethods.get('Symbol.iterator');
+const iteratorPrototype = iteratorMethod && prototype(apply(iteratorMethod, new F64Array(0), []));
+const iteratorNext = iteratorPrototype && dataValue(iteratorPrototype, 'next');
+const nativeIteratorNext = typeof iteratorNext === 'function' &&
+  apply(functionSource, iteratorNext, []) === 'function next() { [native code] }';
+const arrayIterator = dataValue(Array.prototype, iteratorKey);
+const nativeArrayIterator = typeof arrayIterator === 'function' &&
+  apply(functionSource, arrayIterator, []) === 'function values() { [native code] }';
+const iteratorParents = [];
+for (let current = iteratorPrototype; current; current = prototype(current))
+  iteratorParents.push({object:current, parent:prototype(current)});
+
+/** Descriptor-only preflight, including IteratorClose's inherited return hook.
+ * Typed-array and ordinary array iterators share their next prototype. Check
+ * before lazy initialization/argument packing so bookkeeping never invokes a
+ * changed next/return hook before falling back to the source loop.
+ */
+export function numericArrayIterationIntact() {
+  if (!nativeIteratorNext || !nativeArrayIterator ||
+      dataValue(Array.prototype, iteratorKey) !== arrayIterator ||
+      dataValue(iteratorPrototype, 'next') !== iteratorNext) return false;
+  for (let i = 0; i < iteratorParents.length; i++) {
+    const entry = iteratorParents[i];
+    if (prototype(entry.object) !== entry.parent || descriptor(entry.object, 'return')) return false;
+  }
+  return true;
+}
 const bufferLength = descriptor(ArrayBuffer.prototype, 'byteLength').get;
 const resizable = descriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const immutable = descriptor(ArrayBuffer.prototype, 'immutable')?.get;
@@ -165,6 +194,10 @@ function readManifest(module, wasm) {
   let manifest;
   try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(sections[0])); }
   catch (cause) { throw new NumericKernelGuardError('KERNEL_ABI_MISMATCH', 'Invalid ABI metadata', { cause }); }
+  // A host Wasm constructor/custom-section policy hook may have changed the
+  // shared iterator since entry. Manifest Set validation must not invoke it.
+  if (!numericArrayIterationIntact())
+    refuse('KERNEL_ARRAY_ITERATOR', 'The native array iterator protocol has changed');
   const guardedArrays = manifest?.numericSemantics === ARRAY_METHOD_SEMANTICS;
   if (guardedArrays ? ![8, 9].includes(manifest.version) || manifest.kind !== 'closed-numeric-control' ||
       !Array.isArray(manifest.typedArrayMethods) || !manifest.typedArrayMethods.length ||
@@ -280,8 +313,9 @@ function arrayInfo(value, param, checkLength, methods = []) {
     refuse('KERNEL_MUTABLE_LENGTH', `${name}.length no longer has intrinsic semantics`);
   }
   for (const name of methods) {
-    if (!arrayMethods.get(name) || descriptor(value, name) || descriptor(ArrayType.prototype, name) ||
-        prototype(ArrayType.prototype) !== typedPrototype || dataValue(typedPrototype, name) !== arrayMethods.get(name)) {
+    const key = name === 'Symbol.iterator' ? iteratorKey : name;
+    if (!arrayMethods.get(name) || descriptor(value, key) || descriptor(ArrayType.prototype, key) ||
+        prototype(ArrayType.prototype) !== typedPrototype || dataValue(typedPrototype, key) !== arrayMethods.get(name)) {
       refuse('KERNEL_ARRAY_METHOD', `${name} no longer has intrinsic typed-array semantics`);
     }
     if (name === 'subarray' && (!nativeSpecies || descriptor(value, 'constructor') ||
@@ -400,6 +434,10 @@ export function instantiateNumericKernel(bytes, {
       maxMemoryBytes < PAGE_BYTES || maxMemoryBytes > MAX_BYTES)) {
     throw new RangeError('maxMemoryBytes must be between 65536 and 1073741824');
   }
+  // Initialization itself uses native Array iteration. Automatic dispatch
+  // performs this same preflight before constructing its byte array.
+  if (!numericArrayIterationIntact())
+    refuse('KERNEL_ARRAY_ITERATOR', 'The native array iterator protocol has changed');
   const wasm = globalThis.WebAssembly;
   if (!wasm) refuse('KERNEL_WASM_UNAVAILABLE', 'WebAssembly is unavailable in this host');
   const module = new wasm.Module(bytes);
@@ -425,6 +463,12 @@ export function instantiateNumericKernel(bytes, {
   if (memory.buffer.byteLength > limit) refuse('KERNEL_MEMORY_LIMIT', 'Initial Wasm memory exceeds the configured limit');
   let disposed = false;
   const stats = { wasmCalls: 0, fallbackCalls: 0, copiedBytes: 0, lastGuardFailure: null };
+
+  const requiresArrayIteration = manifest.typedArrayMethods?.includes('Symbol.iterator') === true;
+  function checkArrayIteration() {
+    if (requiresArrayIteration && !numericArrayIterationIntact())
+      refuse('KERNEL_ARRAY_ITERATOR', 'The native array iterator protocol has changed');
+  }
 
   function checkMath() {
     if (!manifest.mathIntrinsics) return;
@@ -509,6 +553,7 @@ export function instantiateNumericKernel(bytes, {
     }
     const currentPages = memory.buffer.byteLength / PAGE_BYTES;
     if (pages > currentPages) memory.grow(pages - currentPages);
+    checkArrayIteration();
     // Acquire every view AFTER possible memory.grow; never retain detached views.
     const scratchBuffer = memory.buffer;
     for (const record of records) values[record.index] = record.ptr;
@@ -539,12 +584,14 @@ export function instantiateNumericKernel(bytes, {
     let prepared;
     let result;
     try {
+      checkArrayIteration();
       checkMath();
       prepared = prepare(args);
       for (const copy of prepared.inputs) apply(typedSet, copy.target, copy.args);
       // Revalidate after preparation (including a possible host memory.grow).
       // The import-free Wasm call cannot rebind Math before publication.
       checkMath();
+      checkArrayIteration();
       if (manifest.typedArrayMethods) for (let i = 0; i < manifest.parameters.length; i++) {
         const param = manifest.parameters[i];
         if (param.type !== 'f64') arrayInfo(args[i], param, boundSet.has(i), manifest.typedArrayMethods);

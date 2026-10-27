@@ -13,7 +13,7 @@
  */
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
-import { createArrayReferenceCompiler, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -277,7 +277,7 @@ export function compileNumericKernel(source, {
       if (controlLoops.length >= 64) fail('General control exceeds the 64-loop limit', node);
       this.checkDepth(depth, node);
       controlLoops.push(Object.freeze({
-        kind: node.type === 'CallExpression' ? `typed-array-${node.callee.property.name}` : node.type === 'DoWhileStatement' ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
+        kind: node.type === 'CallExpression' ? `typed-array-${node.callee.property.name}` : node.type === 'ForOfStatement' ? 'for-of' : node.type === 'DoWhileStatement' ? 'do-while' : node.type === 'WhileStatement' ? 'while' : 'for',
         depth, ...(functionName ? { functionName } : {}),
         sourceSpan: Object.freeze({ start: node.start, end: node.end,
           line: node.loc?.start.line, column: node.loc?.start.column }),
@@ -528,13 +528,35 @@ export function compileNumericKernel(source, {
       // The entire for initializer has a lexical TDZ; these bindings remain
       // visible in the test, body and update, but never leak after the loop.
       // Per-iteration environments need no heap identity: captures are refused.
-      const initial = node.init?.type === 'VariableDeclaration'
-        ? compileBlock([node.init], false, depth + 1, true)
-        : compileEffects(node.init, depth + 1);
-      const predicate = node.test ? condition(node.test) : [0x41, 1];
+      let initial, predicate, beforeBody = [], update;
+      if (node.type === 'ForOfStatement') {
+        const declaration = node.left, binding = declaration?.declarations?.[0];
+        if (node.await || declaration?.type !== 'VariableDeclaration' ||
+            !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 ||
+            binding.id.type !== 'Identifier' || binding.init || params.has(binding.id.name))
+          fail('Value iteration requires one fresh lexical binding and a closed typed-array view', node);
+        // for-of's binding is in TDZ even while its iterable is evaluated.
+        temporaries.set(binding.id.name, null);
+        const reference = arrayReferences.declare(node.right, false);
+        if (!reference) fail('Value iteration requires a closed typed-array view', node.right);
+        const iterator = createArrayValueIteration(reference.binding, () => temporaryBase + temporaryCount++);
+        const local = temporaryBase + temporaryCount++;
+        temporaries.set(binding.id.name, local);
+        if (declaration.kind === 'let') mutableLocals.add(local);
+        control.methods.add('Symbol.iterator');
+        initial = [...reference.bytes, ...iterator.initial];
+        predicate = iterator.predicate;
+        beforeBody = [...iterator.value, ...set(local)];
+        update = iterator.update;
+      } else {
+        initial = node.init?.type === 'VariableDeclaration'
+          ? compileBlock([node.init], false, depth + 1, true)
+          : compileEffects(node.init, depth + 1);
+        predicate = node.test ? condition(node.test) : [0x41, 1];
+      }
       if (!sharedLoopBudget && generalFuel === null) generalFuel = temporaryBase + temporaryCount++;
       const body = compileLoopBody(node.body.type === 'BlockStatement' ? node.body.body : [node.body], depth + 1);
-      const update = compileEffects(node.update, depth + 1);
+      update ??= compileEffects(node.update, depth + 1);
       const test = [...predicate, 0x45, 0x0d, 1];
       // Every loop, including outer loops and skipped-body continues, shares
       // one exact f64 body-entry counter. A false pre-test spends no credit.
@@ -542,7 +564,7 @@ export function compileNumericKernel(source, {
       // Budget exhaustion aborts the transaction, never truncates the program.
       return [...initial, 0x02, 0x40, 0x03, 0x40,
         ...(postTest ? [] : test),
-        ...control.enterLoop(),
+        ...control.enterLoop(), ...beforeBody,
         ...body, ...update, ...(postTest ? test : []),
         0x0c, 0, 0x0b, 0x0b];
     } finally { generalDepth--; temporaries = parentScope; }
@@ -661,7 +683,7 @@ export function compileNumericKernel(source, {
           continue;
         }
         if (generalControl && statement.type === 'EmptyStatement') continue;
-        if (generalControl && ['ForStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
+        if (generalControl && ['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement'].includes(statement.type)) {
           bytes.push(...compileGeneralLoop(statement, depth));
           continue;
         }

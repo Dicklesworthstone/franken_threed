@@ -3,7 +3,7 @@
  * its own ESM scope so application bindings cannot shadow the runtime's native
  * globals. No Wasm is instantiated until an admitted target is actually called.
  */
-import { instantiateNumericKernel } from "./numeric_kernel_runtime.mjs";
+import { instantiateNumericKernel, numericArrayIterationIntact } from "./numeric_kernel_runtime.mjs";
 
 const apply = Reflect.apply;
 const hasOwn = Object.hasOwn;
@@ -67,7 +67,7 @@ export function createNumericDispatch(
     ) {
       throw new TypeError("Invalid numeric dispatch alternative ABI");
     }
-    return state(target, variant.bytes, [...variant.parameterTypes], resolveMath, preserveAliasing);
+    return state(target, variant.bytes, variant.parameterTypes.slice(), resolveMath, preserveAliasing);
   });
   const token = Object.freeze({});
   const primary = state(target, bytes, null, resolveMath, preserveAliasing);
@@ -103,6 +103,12 @@ export function dispatchNumericCall(token, callee, args) {
     root.variants.find((variant) => matches(variant.parameterTypes, args)) ?? root.primary;
   root.selected = record;
   if (!record.attempted) {
+    // A patched shared iterator must not run while constructing the byte array
+    // or reading the manifest. Leave registration retryable after restoration.
+    if (!numericArrayIterationIntact()) {
+      record.retainedCalls++;
+      return apply(callee, undefined, args);
+    }
     // Set before initialization: host policy hooks may reenter the application.
     record.attempted = true;
     try {
@@ -170,7 +176,7 @@ const sharedTargets = new WeakMap();
  * reset an already initialized kernel or switch budgets with evaluation order.
  */
 export function registerNumericDispatch(...args) {
-  const token = createNumericDispatch(...args);
+  const token = apply(createNumericDispatch, undefined, args);
   const target = args[0];
   if (!sharedTargets.has(target)) sharedTargets.set(target, token);
   return token;

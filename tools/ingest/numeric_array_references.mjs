@@ -21,6 +21,26 @@ const number = value => {
 export const arrayPointer = array => [...get(array.index), ...(array.reference ? [0xab] : [])];
 export const arrayLength = array => [...get(array.lengthIndex), ...(array.reference ? [0xab] : [])];
 
+/** Value iteration over a private borrowed reference captured at loop entry.
+ * Only the index advances: reassigning the source variable cannot retarget the
+ * iterator, while writes to its staged storage remain visible on later steps.
+ * The host guards the native iterator protocol before any speculative work.
+ */
+export function createArrayValueIteration(array, allocateLocal) {
+  const index = allocateLocal();
+  const integer = INTEGER_ARRAY_LAYOUTS[array.type];
+  const alignment = integer?.alignment ?? (array.type === 'f64[]' ? 3 : 2);
+  array.mark({read:true});
+  return {
+    initial: [...number(0), ...set(index)],
+    predicate: [...get(index), ...arrayLength(array), 0xb8, 0x63],
+    value: [...arrayPointer(array), ...get(index), 0xab, 0x41, alignment, 0x74, 0x6a,
+      ...(integer ? [integer.load, alignment, 0, integer.signed ? 0xb7 : 0xb8]
+        : array.type === 'f32[]' ? [0x2a, 2, 0, 0xbb] : [0x2b, 3, 0])],
+    update: [...get(index), ...number(1), 0xa0, ...set(index)],
+  };
+}
+
 /** Compiler-private, per-function reference/effect graph. The caller resolves
  * real lexical bindings (including TDZ), supplies scalar predicates, and refuses
  * all reference escape/coercion. A fixed storage layout is required per local;
