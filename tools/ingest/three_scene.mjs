@@ -106,6 +106,7 @@ export async function createGpuThreeScene(device,scene,{
   };
   const colorMaterials=o=>sourceMaterials(o).filter(m=>colorPhaseEnabled(m)||shadowEnabled&&o.castShadow).map(colorMaterial).map(materialState);
   const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
+  const bundledNodeObject=o=>passNodeFrame?.bundleObjects?.has(o)===true;
   const capturedNodeLight=o=>passNodeFrame?.nativeLights?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
@@ -304,12 +305,15 @@ export async function createGpuThreeScene(device,scene,{
       const object=stack.pop();
       if(!(object instanceof three.Object3D)||seen.has(object)||!Array.isArray(object.children))fail('GRAPH','Expected an acyclic source hierarchy');
       seen.add(object);nodes.push(object);if(nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
+      // Accepted bundle packets own this entire subtree, including children
+      // removed or added while asynchronous pipeline preparation was pending.
+      if(bundledNodeObject(object))continue;
       if(object.children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
       for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
       // Source projection skips hidden objects before touching render hooks,
       // materials or geometry. Keep hierarchy/capacity validation, while the
       // accepted native capture retains inherited visibility through any await.
-      if(excludedNodeObject(object))continue;
+      if(excludedNodeObject(object)||bundledNodeObject(object))continue;
       // Suppressed color lists retain hierarchy traversal and shadow casters,
       // but acquire no color material, geometry or upload work for this pass.
       if(sourceMaterial(object)&&!sourceMaterials(object).some(colorPhaseEnabled)&&!(shadowEnabled&&object.castShadow))continue;
@@ -371,7 +375,7 @@ export async function createGpuThreeScene(device,scene,{
         }
       }
     }
-    const activeNodes=nodes.filter(object=>!excludedNodeObject(object));
+    const activeNodes=nodes.filter(object=>!excludedNodeObject(object)&&!bundledNodeObject(object));
     // Captured native programs own their light selection and uniform bytes.
     // Fixed or mixed scenes still use the ordinary fixed-light admission below.
     nativeLightMode=!!passNodeFrame&&activeNodes.every(object=>!drawable(object)||capturedNodeObject(object));
@@ -1553,7 +1557,7 @@ export async function createGpuThreeScene(device,scene,{
         const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
         projectionOrder.set(object,visited);
-        if(excludedNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
+        if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
         if(object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
@@ -1592,13 +1596,15 @@ export async function createGpuThreeScene(device,scene,{
       if(shadowFrame?.update)for(const object of casterObjects)
         if(!object.frustumCulled||shadowFrame.frustum===null||object.intersectsFrustum(shadowFrame.frustum))append(object,0,0,true);
       let nativeBackground = null;
+      const bundleTail = [];
       if(passNodeFrame)for(const packet of passNodeFrame.draws){
         const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
         const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&
           e.programSource===(packet.binding.programGeometry??packet.binding.geometry)&&same(e.structural,desc.structural));
         if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
         const draw={...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true};
-        if(packet.background)nativeBackground=draw;
+        if(packet.nodeBundle)bundleTail.push(draw);
+        else if(packet.background)nativeBackground=draw;
         else (packet.transmissionBack?transmissionBacks:packet.listMaterial.transparent?transparent:opaque).push(draw);
       }
       if(sorting){
@@ -1623,7 +1629,7 @@ export async function createGpuThreeScene(device,scene,{
         if(bindings.some(e=>!e))fail('PREPARE','Call prepare() after changing the source background');
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
-      const items=[...opaque,...transmissive,...transmissionBacks,...transparent],draws=[],drawObjects=[],framebufferCopies=[];
+      const items=[...opaque,...transmissive,...transmissionBacks,...transparent,...bundleTail],draws=[],drawObjects=[],framebufferCopies=[];
       const copiesAtDraw = copies => {
         if(copies?.length)framebufferCopies.push({index:draws.length,copies});
       };

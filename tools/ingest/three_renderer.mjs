@@ -46,6 +46,7 @@ import {withThreeCompute} from './three_compute.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {inspectThreeMRT} from './three_node_passes.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createThreeNodeBundles} from './three_node_bundles.mjs';
 import {assertThreeNativeTargetWrite, captureThreeShadowMaterialState} from './three_node_shadows.mjs';
 import {createThreeNodeBackgrounds} from './three_node_background.mjs';
 import {createThreeSceneRaster} from './three_scene_raster.mjs';
@@ -112,6 +113,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // A queued native render owns its visibility selection. Hidden source
       // objects must not force material admission during later preparation.
       if (nodeFrame?.excludedObjects?.has(object)) return;
+      for (let ancestor = object; ancestor; ancestor = ancestor.parent)
+        if (nodeFrame?.bundleObjects?.has(ancestor)) return;
       const material = materialFrame?.objects.has(object) ? materialFrame.objects.get(object) : object.material;
       const list = Array.isArray(material) ? material : material ? [material] : [];
       if (list.some(m => state(m)?.clippingPlanes?.length)) clipping = true;
@@ -306,6 +309,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._passSnapshots = createThreePassSnapshots(THREE);
       this._nodeProgramSupport = null;
       this._nodeBackgrounds = null;
+      this._nodeBundles = null;
+      this._nodeCaptureDepth = 0;
       this._nodeCaptureBytes = 0;
       this._materialCaptureValues = 0;
       this._nodeRaster = new Map();
@@ -441,6 +446,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeBackgrounds?.dispose(); this._nodeBackgrounds = null;
       this._nodeProgramSupport?.dispose();
       this._nodeProgramSupport = null;
+      this._nodeBundles?.dispose(); this._nodeBundles = null;
       this._canvasTarget?.dispose();
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
@@ -1013,6 +1019,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const previousOutput = outputTransform ? {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
         outputColorSpace: this.outputColorSpace} : null;
       let captured;
+      const bundleDepth = this._nodeCaptureDepth++;
       try {
         // Direct default output and clear() output quads leave the source's
         // public selector null, although their GPU destination is a target.
@@ -1026,6 +1033,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           this._renderTarget = THREE.Renderer.prototype._getFrameBufferTarget.call(this);
         }
         captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId,
+          bundles: this._nodeBundles ??= createThreeNodeBundles(THREE, {maxEntries: maxDraws, fail}),
+          bundleDepth,
           getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
           getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
           withFramebufferCopies: (record, run) => {
@@ -1036,6 +1045,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
           maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
       } finally {
+        this._nodeCaptureDepth--;
         this._renderTarget = previousTarget; this._mrt = previousMRT;
         if (previousOutput) Object.assign(this, previousOutput);
       }
@@ -1059,6 +1069,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const captured = request.nodeFrame;
         for (const lease of captured.textureUses) captured.textureOwner.release(lease);
         for (const lease of captured.storageUses) captured.storageOwner.release(lease);
+        for (const lease of captured.bundleGeometries ?? []) lease.release();
         this._nodeCaptureBytes -= captured.bytes; request.nodeFrame = null;
       }
       request.releaseDestination?.(); request.releaseDestination = null;
