@@ -29,6 +29,9 @@
  * R/RG/RGBA32F storage stays full precision. Its mipmaps use textureLoad-based
  * 2D bilinear reduction without requiring optional float32 filtering. Float32
  * targets currently admit one sample only; no precision fallback is inferred.
+ * R8 normalized and packed R11G11B10 unsigned-float attachments retain their
+ * one/four-byte storage. The packed format requires rg11b10ufloat-renderable;
+ * readback and uploads use its original Uint32 words without unpacking them.
  * readPixels() submits a bounded copy immediately and returns tightly packed
  * typed color data. mipLevel selects an allocated color level, with bounds and
  * default extents in that level. Pending reads are cancelled on disposal or failure.
@@ -82,6 +85,7 @@ export class GpuRenderTargetError extends Error {
 }
 const fail = (code, message) => { throw new GpuRenderTargetError(code, message); };
 const COLOR_BYTES = new Map([
+  ['r8unorm', 1], ['rg11b10ufloat', 4],
   ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
   ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
@@ -91,15 +95,18 @@ const COLOR_BYTES = new Map([
 export function inspectGpuRenderTargetColors(device, formats) {
   if (!Array.isArray(formats) || !formats.length || formats.some(format => !COLOR_BYTES.has(format)))
     fail('FORMAT', 'Expected supported color attachment formats');
+  if (formats.includes('rg11b10ufloat') && device?.features?.has?.('rg11b10ufloat-renderable') !== true)
+    fail('FEATURE', 'rg11b10ufloat-renderable must be enabled on the supplied device');
   if (formats.length > 1) {
     const count = device?.limits?.maxColorAttachments, limit = device?.limits?.maxColorAttachmentBytesPerSample;
     if (!Number.isSafeInteger(count) || !Number.isSafeInteger(limit))
       fail('DEVICE', 'MRT requires the device color attachment limits');
-    // WebGPU assigns normalized RGBA8/BGRA8 an eight-byte render cost despite
-    // their four-byte storage footprint. Component alignment is 1, 2 or 4.
+    // WebGPU assigns normalized RGBA8/BGRA8 and packed R11G11B10 an eight-byte
+    // render cost despite their four-byte storage footprint. R8 costs one byte;
+    // packed R11G11B10 requires four-byte component alignment.
     const bytes = formats.reduce((total, format) => {
-      const alignment = format.includes('32float') ? 4 : format === 'rgba16float' ? 2 : 1;
-      const cost = format.includes('8unorm') ? 8 : COLOR_BYTES.get(format);
+      const alignment = format.includes('32float') || format === 'rg11b10ufloat' ? 4 : format === 'rgba16float' ? 2 : 1;
+      const cost = format === 'rg11b10ufloat' || format.includes('8unorm') && format !== 'r8unorm' ? 8 : COLOR_BYTES.get(format);
       return Math.ceil(total / alignment) * alignment + cost;
     }, 0);
     if (formats.length > count || bytes > limit)

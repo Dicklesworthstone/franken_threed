@@ -6,7 +6,7 @@ import {targetDevice, targetThree} from './target_residency_fixture.mjs';
 export const transferThree = {...targetThree, FloatType: 1015, RedFormat: 1028, RGFormat: 1030,
   NearestMipmapNearestFilter: 1004, NearestMipmapLinearFilter: 1005,
   LinearMipmapNearestFilter: 1007, LinearMipmapLinearFilter: 1008};
-const bytesPerPixel = format => ({rgba16float: 8, rgba32float: 16, rg32float: 8}[format] ?? 4);
+const bytesPerPixel = format => ({r8unorm: 1, rgba16float: 8, rgba32float: 16, rg32float: 8}[format] ?? 4);
 export function transferDevice() {
   const f = targetDevice(), createTexture = f.device.createTexture, createEncoder = f.device.createCommandEncoder;
   const submit = f.device.queue.submit;

@@ -10,6 +10,8 @@
  * output type, component count, channel conversion and shared byte charge.
  * Scalar/vector
  * targets return one/two components per pixel, without inventing RGBA channels.
+ * Packed R11G11B10 returns its original Uint32 words, one per texel, while R8
+ * returns one Uint8 value per texel. Neither format is expanded or converted.
  * maxBytes bounds each staging buffer. maxInFlightBytes bounds shared per-device
  * staging plus internally allocated output for all unfinished reads. At most 64
  * reads may be in flight per device; budget failures are retryable after drain.
@@ -24,6 +26,7 @@ export class GpuTargetReadbackError extends Error {
 }
 const fail = (code, message) => { throw new GpuTargetReadbackError(code, message); };
 const FORMATS = new Map([
+  ['r8unorm', [Uint8Array, 1, false]], ['rg11b10ufloat', [Uint32Array, 1, false]],
   ['rgba8unorm', [Uint8Array, 4, false]], ['rgba8unorm-srgb', [Uint8Array, 4, false]],
   ['bgra8unorm', [Uint8Array, 4, true]], ['bgra8unorm-srgb', [Uint8Array, 4, true]],
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
@@ -101,7 +104,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
   if (typeof flipY !== 'boolean' || ![maxBytes, maxInFlightBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Invalid readback options');
   const layout = FORMATS.get(format);
-  if (!layout) fail('FORMAT', 'Readback requires RGBA/BGRA8, RGBA16F, or R/RG/RGBA32F color storage');
+  if (!layout) fail('FORMAT', 'Readback requires R8, RGBA/BGRA8, R11G11B10F, RGBA16F or R/RG/RGBA32F color storage');
   const [Type, components, bgra] = layout;
   const rowBytes = width * components * Type.BYTES_PER_ELEMENT, bytesPerRow = Math.ceil(rowBytes / 256) * 256;
   const size = bytesPerRow * height, elements = width * height * components;

@@ -8,6 +8,8 @@
  * addresses one 2D face, never the whole cube or an implicit active face.
  * colorIndex/sourceColorIndex select independent MRT attachments, defaulting to
  * zero. Their formats, not the primary attachment, determine layouts and budgets.
+ * R8 uses one byte per texel; R11G11B10 uses one Uint32 packed word per texel.
+ * Neither upload nor copy introduces a floating-point conversion of those bits.
  */
 export class GpuTargetTransferError extends Error {
   constructor(code, message) {
@@ -17,6 +19,7 @@ export class GpuTargetTransferError extends Error {
 }
 const fail = (code, message) => { throw new GpuTargetTransferError(code, message); };
 const FORMATS = new Map([
+  ['r8unorm', [Uint8Array, 1, false]], ['rg11b10ufloat', [Uint32Array, 1, false]],
   ['rgba8unorm', [Uint8Array, 4, false]], ['rgba8unorm-srgb', [Uint8Array, 4, false]],
   ['bgra8unorm', [Uint8Array, 4, true]], ['bgra8unorm-srgb', [Uint8Array, 4, true]],
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
@@ -48,7 +51,7 @@ export function gpuTargetColorFormat(shape, colorIndex = 0, reject = fail) {
 }
 function layout(shape, colorIndex = 0) {
   const value = FORMATS.get(gpuTargetColorFormat(shape, colorIndex));
-  if (!value) fail('FORMAT', 'Expected RGBA/BGRA8, RGBA16F or R/RG/RGBA32F color storage');
+  if (!value) fail('FORMAT', 'Expected R8, RGBA/BGRA8, R11G11B10F, RGBA16F or R/RG/RGBA32F color storage');
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
 }

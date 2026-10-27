@@ -7,7 +7,7 @@
  */
 const FLOAT32 = new Set(['r32float', 'rg32float', 'rgba32float']);
 const FORMATS = new Set([null, 'rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm',
-  'bgra8unorm-srgb', 'rg16float', 'rgba16float', ...FLOAT32]);
+  'bgra8unorm-srgb', 'r8unorm', 'rg11b10ufloat', 'rg16float', 'rgba16float', ...FLOAT32]);
 const UNBLENDED = Object.freeze([false]);
 const BOTH = Object.freeze([false, true]);
 
@@ -15,6 +15,8 @@ const BOTH = Object.freeze([false, true]);
 export function createAnimationColorTargetProfile(device, {format, sampleCount}, reject) {
   if (!FORMATS.has(format) || ![1, 4].includes(sampleCount))
     reject('Unsupported color attachment configuration');
+  if (format === 'rg11b10ufloat' && device.features?.has?.('rg11b10ufloat-renderable') !== true)
+    reject('rg11b10ufloat color targets require rg11b10ufloat-renderable on the supplied device');
   const float32 = FLOAT32.has(format);
   if (float32 && sampleCount !== 1)
     reject('Float32 color targets currently require one sample');
