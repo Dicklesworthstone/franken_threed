@@ -1460,11 +1460,15 @@ export async function createGpuThreeScene(device,scene,{
       const sorting=passNodeFrame?.sortObjects??sortObjects;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
-      if(Object.hasOwn(frame,'targetSize')){const {targetSize,...rest}=frame;frame=rest;}
       programViewportSize=frame.viewportSize??null;
-      if(Object.hasOwn(frame,'viewportSize')){const {viewportSize,...rest}=frame;frame=rest;}
       const arrayProfile=frame.arrayCamera??{};
-      if(Object.hasOwn(frame,'arrayCamera')){const {arrayCamera,...rest}=frame;frame=rest;}
+      if(['targetSize','viewportSize','arrayCamera'].some(key=>Object.hasOwn(frame,key))){
+        // Keep canvas attachment getters lazy until preparation checks pass.
+        // Spreading here acquires an image even when this draw must be deferred.
+        const descriptors=Object.getOwnPropertyDescriptors(frame);
+        delete descriptors.targetSize;delete descriptors.viewportSize;delete descriptors.arrayCamera;
+        frame=Object.defineProperties({},descriptors);
+      }
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
       const clippingFrame=clippingState();
       frameTextures=new Set();frameSkeletons=new Set();

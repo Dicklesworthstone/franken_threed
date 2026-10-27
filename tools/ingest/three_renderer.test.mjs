@@ -378,6 +378,37 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   renderer.dispose();
 });
 
+test('WebGL material and procedural geometry changes do not acquire unused canvas images', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+  const renderer = new Renderer({canvas: c.canvas, device});
+  const materials = [new TC.MeshBasicMaterial(), new TC.MeshPhongMaterial(), new TC.ShaderMaterial({
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'void main() { gl_FragColor = vec4(0.2, 0.6, 0.9, 1.0); }',
+  })];
+  const geometries = [new TC.BoxGeometry(), new TC.PlaneGeometry(1, 1, 3, 3)];
+  const scene = new TC.Scene(), mesh = new TC.Mesh(geometries[0], materials[0]);
+  const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+  scene.add(mesh, new TC.AmbientLight());
+  t.after(() => { renderer.dispose(); for (const value of [...materials, ...geometries]) value.dispose(); });
+  await renderer.init(); renderer.render(scene, camera); await flush(renderer);
+  assert.equal(c.acquired(), 1); assert.equal(device.submissions.length, 1);
+  for (const change of [() => { mesh.material = materials[1]; }, () => { mesh.material = materials[2]; },
+    () => { mesh.geometry = geometries[1]; }]) {
+    const acquired = c.acquired(), submissions = device.submissions.length;
+    change(); renderer.render(scene, camera);
+    assert.equal(renderer._pending.length, 1, 'the changed source draw needs preparation');
+    assert.equal(device.submissions.length, submissions);
+    assert.equal(c.acquired(), acquired, 'deferred draws must leave the presented image untouched');
+    await flush(renderer);
+    assert.equal(device.submissions.length, submissions + 1);
+    assert.equal(c.acquired(), acquired + 1, 'acquire once, when the prepared draw is submitted');
+    renderer.render(scene, camera);
+    assert.equal(device.submissions.length, submissions + 2, 'the warmed draw remains synchronous');
+    assert.equal(c.acquired(), acquired + 2);
+  }
+});
+
 test('WebGL animation preserves procedural updates across cold preparation and resumes before GPU completion', async t => {
   const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
   const device = recordingDevice(), c = canvasFixture(), host = animationHost(c.canvas);
