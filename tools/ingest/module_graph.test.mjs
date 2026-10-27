@@ -169,7 +169,7 @@ test("Positive: Ingest real H1 (webgpu_performance_renderbundle.html) with 0 unr
     `Expected cycles to be detected, found ${graph.cycles.length}`,
   );
 
-  // Verify Settings.js nonliteral dynamic import classification
+  // Package the verified builtin registry, retaining mutable runtime imports.
   const settingsModEntry = Object.entries(graph.modules).find(([url]) =>
     url.endsWith("Settings.js"),
   );
@@ -177,9 +177,14 @@ test("Positive: Ingest real H1 (webgpu_performance_renderbundle.html) with 0 unr
   const [settingsUrl, settingsMod] = settingsModEntry;
   assert.equal(settingsMod.dynamic_imports.length, 1, "Settings.js must have 1 dynamic import");
   const dyn = settingsMod.dynamic_imports[0];
-  assert.equal(dyn.classification, "nonliteral");
+  assert.equal(dyn.classification, "finite_set");
   assert.equal(dyn.unresolved, true);
-  assert.equal(dyn.resolved_id, null);
+  assert.equal(dyn.runtime_fallback, true);
+  assert.equal(dyn.claims_closure, false);
+  assert.deepEqual(dyn.resolved_ids, [
+    new URL('../extensions/color-grading/ColorGrading.js', settingsUrl).href,
+    new URL('../extensions/tsl-graph/TSLGraphEditor.js', settingsUrl).href,
+  ]);
   const dynSpan = dyn.source_span || dyn.sourceSpan;
   assert.equal(dynSpan.start.line, 285);
 });

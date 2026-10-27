@@ -398,6 +398,8 @@ export function f3dRollupPlugin(options = {}) {
 
       if (ast) {
         const classifyImport = createDynamicImportClassifier(ast);
+        const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
+          .map(request => [request.source_span.start.offset, request]));
         if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith("file:")) {
           const loaderEdits = threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
           if (loaderEdits.length) { edits.push(...loaderEdits); loaderResourceCalls = true; }
@@ -415,7 +417,7 @@ export function f3dRollupPlugin(options = {}) {
         walk.simple(ast, {
           ImportExpression: (node) => {
             if (!node.source) return;
-            const classified = classifyImport(node.source);
+            const classified = inspectorImports.get(node.start) ?? classifyImport(node.source);
             const moduleType = classifyImportType(node);
             const candidates = classified.classification === "literal" && (moduleType === "json" || node.options)
               ? [classified.specifier] : classified.classification === "finite_set" ? classified.candidates : null;
@@ -473,17 +475,18 @@ export function f3dRollupPlugin(options = {}) {
 
               const prefix = `(s => ${chain}s)(`;
               const suffix = `)`;
+              const argument = classified.url_argument_span ?? node.source;
 
               // Composable insertions wrapping the argument preserve child edits inside the argument
               edits.push({
                 type: "insert",
-                pos: node.source.start,
+                pos: argument.start,
                 priority: 1,
                 text: prefix,
               });
               edits.push({
                 type: "insert",
-                pos: node.source.end,
+                pos: argument.end,
                 priority: 3,
                 text: suffix,
               });

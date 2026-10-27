@@ -8,6 +8,7 @@
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { IngestionParseError } from "./types.mjs";
+import { verifiedInspectorExtensionImports } from "./inspector_extension_imports.mjs";
 
 /**
  * @typedef {Object} SourceLocationPoint
@@ -1266,15 +1267,16 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
   const classifyImport = createDynamicImportClassifier(ast);
+  const inspectorImports = verifiedInspectorExtensionImports(code, ast);
   const rendererResources = analyzeRendererResourceEscapes(ast, offsets, consumerContract);
   walk.ancestor(ast, {
     ImportExpression(node) {
-      const classified = classifyImport(node.source);
+      const classified = inspectorImports.get(node.start) ?? classifyImport(node.source);
       const span = toSourceSpan(node, offsets);
       dynamicImports.push({
         ...classified,
         module_type: classifyImportType(node),
-        unresolved: classified.classification === "nonliteral",
+        unresolved: classified.classification === "nonliteral" || classified.runtime_fallback === true,
         source_span: span,
         sourceSpan: span,
       });

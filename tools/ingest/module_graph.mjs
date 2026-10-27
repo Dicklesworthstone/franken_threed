@@ -382,9 +382,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
           resolvedTargets,
           resolved_ids: resolvedTargets.map((t) => t.resolved_id).filter(Boolean),
           resolvedIds: resolvedTargets.map((t) => t.resolvedId).filter(Boolean),
-          unresolved: !allResolved,
-          claims_closure: allResolved,
-          claimsClosure: allResolved,
+          ...(dyn.runtime_fallback ? {runtime_fallback: true, url_argument_span: dyn.url_argument_span} : {}),
+          unresolved: !allResolved || dyn.runtime_fallback === true,
+          claims_closure: allResolved && dyn.runtime_fallback !== true,
+          claimsClosure: allResolved && dyn.runtime_fallback !== true,
           source_span: dyn.sourceSpan,
           sourceSpan: dyn.sourceSpan,
         });
