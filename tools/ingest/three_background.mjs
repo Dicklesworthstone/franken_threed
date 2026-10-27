@@ -68,7 +68,8 @@ export function inspectThreeBackgroundState(scene) {
  * source matrices are untouched. The caller updates camera world/projection state
  * first (the scene bridge already does so). Camera translation is excluded;
  * inverse authored background rotation applies AFTER camera world rotation.
- * Both WebGL [-1,1] and WebGPU [0,1] projection matrices admit clip z=0.5.
+ * Both WebGL [-1,1] and WebGPU [0,1] projection matrices, including reversed
+ * depth, admit clip z=0.5. Only ray direction survives normalization.
  * Source camera inverse caches, camera transforms and Euler objects are untouched.
  */
 export function threeBackgroundFrame(scene, camera, three) {
@@ -88,9 +89,9 @@ export function threeBackgroundFrame(scene, camera, three) {
     return captured;
   }
   if (three?.REVISION !== '186' || typeof three.Matrix4 !== 'function' || typeof three.Camera !== 'function' ||
-      !(camera instanceof three.Camera) || !camera.isPerspectiveCamera || camera.isOrthographicCamera || camera.isArrayCamera || camera.reversedDepth ||
+      !(camera instanceof three.Camera) || !camera.isPerspectiveCamera || camera.isOrthographicCamera || camera.isArrayCamera ||
       ![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))
-    fail('CAMERA', 'Directional backgrounds require one non-reversed source perspective camera');
+    fail('CAMERA', 'Directional backgrounds require one source perspective camera');
   const projection = camera.projectionMatrix?.elements, world = camera.matrixWorld?.elements;
   if (projection?.length !== 16 || world?.length !== 16 ||
       Array.from(projection).some(v => typeof v !== 'number' || !Number.isFinite(Math.fround(v))) ||

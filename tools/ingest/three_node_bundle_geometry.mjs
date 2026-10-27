@@ -2,6 +2,8 @@
  * immutable after capture; queued packets never install into a newer view.
  * Baselines and retained views share array generations, charged once per copy.
  */
+import {snapshotComputeAttributeView} from './gpu_compute_attributes.mjs';
+
 export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 1024, fail} = {}) {
   const reject = (code, message) => {
     if (fail) return fail(code, message);
@@ -25,14 +27,20 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
   function inspect(attribute) {
     const interleaved = attribute?.isInterleavedBufferAttribute === true;
     const owner = interleaved ? attribute.data : attribute, array = owner?.array;
+    if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute ||
+        owner?.isStorageBufferAttribute || owner?.isStorageInstancedBufferAttribute) {
+      const view = !interleaved && snapshotComputeAttributeView(attribute);
+      if (!view) reject('ATTRIBUTE', 'GPU storage attributes require their live storage owner');
+      return {gpu: true, attribute: view, owner: attribute,
+        shape: [view.count, view.itemSize, view.itemSize, 0, false, view.gpuType,
+          false, view.isInstancedBufferAttribute === true, false, 1]};
+    }
     if (!ArrayBuffer.isView(array) || array instanceof DataView || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
         !Number.isSafeInteger(owner.version) || owner.version < 0 ||
         !Number.isSafeInteger(attribute.count) || attribute.count < 0 ||
         !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 16)
       reject('ATTRIBUTE', 'Bundle geometry requires fixed CPU buffer attributes');
     try { new Uint8Array(array.buffer, 0, 0); } catch { reject('ATTRIBUTE', 'Bundle attribute storage is detached'); }
-    if (attribute.isStorageBufferAttribute || attribute.isStorageInstancedBufferAttribute || owner.isStorageBufferAttribute || owner.isStorageInstancedBufferAttribute)
-      reject('ATTRIBUTE', 'GPU storage attributes require their live storage owner');
     const stride = interleaved ? owner.stride : attribute.itemSize, offset = interleaved ? attribute.offset : 0;
     if (!Number.isSafeInteger(stride) || stride < attribute.itemSize || !Number.isSafeInteger(offset) || offset < 0 ||
         offset + attribute.itemSize > stride || attribute.count && (attribute.count - 1) * stride + offset + attribute.itemSize > array.length)
@@ -53,7 +61,9 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       reject('GEOMETRY', 'Bundle geometry capture needs attributes and a logical render id');
     const selection = Object.entries(geometry.attributes).map(([name, attribute]) => ({name, ...inspect(attribute)}));
     if (geometry.index) selection.push({name: null, ...inspect(geometry.index)});
-    const unique = new Map(selection.map(source => [source.owner, source]));
+    if (selection.some(source => source.gpu && source.name === null))
+      reject('ATTRIBUTE', 'Captured node storage views are vertex inputs, not indices');
+    const unique = new Map(selection.filter(source => !source.gpu).map(source => [source.owner, source]));
     let addedBytes = 0;
     for (const source of unique.values()) {
       const record = owners.get(source.owner);
@@ -103,7 +113,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       geometries.set(geometry, state); source.addEventListener?.('dispose', state.onDispose);
     }
     for (const owner of unique.keys()) { state.owned.add(owner); owners.get(owner).geometries.add(state); }
-    const selected = selection.map(source => ({...source, generation: owners.get(source.owner).generation}));
+    const selected = selection.map(source => ({...source, generation: source.gpu ? source.attribute : owners.get(source.owner).generation}));
     const range = geometry.drawRange ?? {start: 0, count: Infinity};
     const key = JSON.stringify([selection.map(source => [source.name, ...source.shape]), range.start, range.count,
       geometry.isInstancedBufferGeometry === true]);
@@ -111,6 +121,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         source.generation === state.latest.selected[i].generation)) return lease(state.latest);
     const privateOwners = new Map(), attributes = {}; let index = null;
     for (const source of selected) {
+      if (source.gpu) { attributes[source.name] = source.attribute; continue; }
       let owner = privateOwners.get(source.owner);
       if (!owner) {
         const array = source.generation.array, divisor = source.owner.meshPerAttribute ?? 1;
@@ -126,7 +137,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       if (source.interleaved && source.attribute.gpuType !== undefined) attribute.gpuType = source.attribute.gpuType;
       if (source.name === null) index = attribute; else attributes[source.name] = attribute;
     }
-    const generations = new Set(selected.map(source => source.generation));
+    const generations = new Set(selected.filter(source => !source.gpu).map(source => source.generation));
     for (const generation of generations) keep(generation);
     const view = {refs: 1, key, selected, generations,
       bytes: [...generations].reduce((sum, generation) => sum + generation.array.byteLength, 0),

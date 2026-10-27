@@ -2,7 +2,7 @@
  * camera fitting and update frequency; the facade captures every resulting pass
  * for its own submission. No upstream renderer or backend is constructed here.
  */
-const renderFunctions = new WeakMap(), captures = new WeakMap(), computePrerequisites = new WeakSet();
+const renderFunctions = new WeakMap(), captures = new WeakMap(), computePrerequisites = new WeakSet(), objectHooks = new WeakSet();
 const reject = message => {
   const error = new Error(`THREE_NODE_PROGRAM_SHADOW: ${message}`);
   error.name = 'ThreeNodeProgramError'; error.code = 'THREE_NODE_PROGRAM_SHADOW'; throw error;
@@ -145,6 +145,25 @@ export function markThreeNativeDrawCaptured(renderer) {
   if (scope) scope.draws++;
 }
 
+/** Object callbacks execute synchronously around their accepted draw. Nested
+ * GPU writes need a split parent pass; do not silently enqueue them before an
+ * already captured parent draw. The retained renderObject lifecycle calls its
+ * draw handler between callbacks, where registered node effects remain legal.
+ */
+export function withThreeNativeObjectHooks(renderer, run, active = true) {
+  const previous = objectHooks.has(renderer);
+  if (active) objectHooks.add(renderer); else objectHooks.delete(renderer);
+  try { return run(); }
+  finally { if (previous) objectHooks.add(renderer); else objectHooks.delete(renderer); }
+}
+
+const assertOutsideObjectHook = renderer => {
+  if (objectHooks.has(renderer)) {
+    const error = new Error('THREE_NODE_PROGRAM_REENTRY: Native object render callbacks cannot issue nested GPU writes before a separate pass boundary');
+    error.name = 'ThreeNodeProgramError'; error.code = 'THREE_NODE_PROGRAM_REENTRY'; throw error;
+  }
+};
+
 export function withThreeNativeComputePrerequisites(renderer, run) {
   const previous = computePrerequisites.has(renderer);
   computePrerequisites.add(renderer);
@@ -153,18 +172,21 @@ export function withThreeNativeComputePrerequisites(renderer, run) {
 }
 
 export function assertThreeNativeTargetWrite(renderer, target) {
+  assertOutsideObjectHook(renderer);
   if (target == null) return;
   const attachments = [...(target.textures ?? [target.texture]), target.depthTexture].filter(Boolean);
   for (const texture of attachments) assertThreeNativeTextureWrite(renderer, texture);
 }
 
 export function assertThreeNativeTextureWrite(renderer, texture) {
+  assertOutsideObjectHook(renderer);
   for (const {textures} of captures.get(renderer) ?? [])
     if (textures.has(texture))
       reject('A nested write cannot overwrite a texture sampled by an earlier draw in its pending parent pass');
 }
 
 export function assertThreeNativeComputeOutsideCapture(renderer) {
+  assertOutsideObjectHook(renderer);
   const stack = captures.get(renderer);
   if (stack && (!computePrerequisites.has(renderer) || stack.some(scope => scope.draws || scope.textures.size))) {
     const error = new Error('THREE_COMPUTE_REENTRY: Compute inside native draw capture requires a separate submission boundary; compute before rendering the scene');

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createThreeNodeBundles} from './three_node_bundles.mjs';
 import {withThreeNativeCapture, assertThreeNativeTargetWrite, assertThreeNativeComputeOutsideCapture,
   withThreeNativeComputePrerequisites, markThreeNativeDrawCaptured} from './three_node_shadows.mjs';
 import {createGpuCompute} from './gpu_compute.mjs';
@@ -18,12 +19,14 @@ function rig(t) {
     backend: {hasFeature: () => false}, hasFeature: () => false, getRenderTarget: () => null,
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: frame}, info: {calls: 3}};
   const owner = createThreeNodePrograms({three: THREE, renderer}); t.after(() => owner.dispose());
+  const bundles = createThreeNodeBundles(THREE); t.after(() => bundles.dispose());
   const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(60, 1, .1, 100); camera.position.z = 5;
   const material = () => { const m = new THREE.MeshBasicNodeMaterial(); m.colorNode = N.vec3(.25, .5, .75); return m; };
   const mesh = (m = material(), parent = scene) => { const o = new THREE.Mesh(new THREE.PlaneGeometry(), m); parent.add(o); return o; };
   const capture = (options = {}) => captureThreeNodeScene(THREE, scene, camera, {
-    getPrograms: () => owner, renderer, raster: m => Object.freeze({side: m.side, depthWrite: m.depthWrite}), ...options});
-  return {owner, frame, renderer, scene, camera, material, mesh, capture};
+    getPrograms: () => owner, renderer, ...(options.overrideMaterial ? {bundles} : {}),
+    raster: m => Object.freeze({side: m.side, depthWrite: m.depthWrite}), ...options});
+  return {owner, frame, renderer, scene, camera, material, mesh, capture, bundles};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
 const planeValues = context => Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
@@ -424,7 +427,7 @@ test('active invalid graphs, unsupported material groups and effectful upload/ob
     f => { f.mesh().geometry.index.onUpload(() => {}); },
     f => { const o = f.mesh(); const data = new THREE.InterleavedBuffer(new Float32Array(12), 3); data.onUpload(() => {});
       o.geometry.setAttribute('position', new THREE.InterleavedBufferAttribute(data, 3, 0)); },
-    f => { f.mesh().onBeforeRender = () => {}; },
+    f => { f.mesh().onBeforeRender = null; },
     f => { f.mesh().intersectsFrustum = () => true; },
   ];
   for (const bad of cases) {
@@ -469,8 +472,122 @@ test('equivalent overrides preserve source allowOverride, original visibility an
   original.visible = false;
   assert.deepEqual(f.capture({overrideMaterial: override}).draws.map(draw => draw.object), [b]);
   original.visible = true; original.positionNode = N.positionLocal.add(N.vec3(1, 0, 0));
-  assert.throws(() => f.capture({overrideMaterial: override}), {code: 'THREE_NODE_PROGRAM_EFFECT'});
+  const inherited = f.capture({overrideMaterial: override});
+  assert.ok(inherited.draws[0].binding.nodeProgram.vertex.includes('positionLocal'));
+  assert.notEqual(inherited.draws[0].binding.nodeProgram, captured.draws[0].binding.nodeProgram);
   assert.equal(override.positionNode, null); assert.equal(a.material, original);
+});
+
+test('native object callbacks surround source node updates with current uniforms and matrices per draw', t => {
+  const f = rig(t), events = [], material = f.material(), tint = N.uniform(new THREE.Color());
+  material.colorNode = tint;
+  tint.updateBeforeType = 'object'; tint.updateBefore = frame => { events.push(['node-before', frame.object]); };
+  tint.updateAfterType = 'object'; tint.updateAfter = frame => { events.push(['node-after', frame.object]); };
+  const a = f.mesh(material), b = f.mesh(material);
+  for (const [object, color, x] of [[a, [.125, .25, .375], -.75], [b, [.625, .75, .875], .75]]) {
+    object.onBeforeRender = function(renderer, scene, camera, geometry, sourceMaterial, group) {
+      assert.equal(this, object); assert.equal(renderer, f.renderer); assert.equal(scene, f.scene);
+      assert.equal(camera, f.camera); assert.equal(geometry, object.geometry); assert.equal(sourceMaterial, material); assert.equal(group, null);
+      tint.value.setRGB(...color); this.matrixWorld.elements[12] = x; events.push(['before', this]);
+    };
+    object.onAfterRender = function() { events.push(['after', this]); tint.value.setRGB(0, 0, 0); };
+  }
+  const captured = f.capture({bundles: f.bundles});
+  assert.deepEqual(events, [['before', a], ['node-before', a], ['node-after', a], ['after', a],
+    ['before', b], ['node-before', b], ['node-after', b], ['after', b]]);
+  assert.ok(floats(captured.draws[0].nodeUniforms).includes(.125));
+  assert.ok(floats(captured.draws[1].nodeUniforms).includes(.875));
+  assert.ok(floats(captured.draws[0].nodeUniforms).includes(-.75));
+  assert.ok(floats(captured.draws[1].nodeUniforms).includes(.75));
+  assert.equal(tint.value.r, 0);
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('native object callbacks run once around both alpha sides and prepare graphs after the before callback', t => {
+  const f = rig(t), material = f.material(), object = f.mesh(material), events = [];
+  material.transparent = true; material.side = THREE.DoubleSide;
+  material.colorNode = N.texture(new THREE.Texture()); // replaced before source construction
+  object.onBeforeRender = () => {
+    events.push(['before', material.side]);
+    const tint = N.uniform(.375).onObjectUpdate(() => { events.push(['node', material.side]); return .375; });
+    material.colorNode = N.vec3(tint);
+  };
+  object.onAfterRender = () => { events.push(['after', material.side]); };
+  const captured = f.capture({bundles: f.bundles});
+  assert.deepEqual(events, [['before', THREE.DoubleSide], ['node', THREE.BackSide],
+    ['node', THREE.FrontSide], ['after', THREE.DoubleSide]]);
+  assert.deepEqual(captured.draws.map(draw => draw.binding.raster.side), [THREE.BackSide, THREE.FrontSide]);
+  assert.ok(captured.draws.every(draw => floats(draw.nodeUniforms).includes(.375)));
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('compile-only native callbacks retain source order without running node updates or repeating preparation effects', t => {
+  const f = rig(t), material = f.material(), a = f.mesh(material), b = f.mesh(material), events = [];
+  let updates = 0; material.colorNode = N.uniform(.25).onObjectUpdate(() => { updates++; return .25; });
+  for (const object of [a, b]) {
+    object.onBeforeRender = function() { events.push(['before', this]); };
+    object.onAfterRender = function() { events.push(['after', this]); };
+  }
+  const prepared = f.capture({bundles: f.bundles, uniforms: false});
+  assert.deepEqual(events, [['before', a], ['after', a], ['before', b], ['after', b]]);
+  assert.equal(updates, 0); assert.equal(prepared.draws.length, 0); assert.equal(prepared.bindings.length, 2);
+  prepared.prepareAttributes(); assert.equal(events.length, 4); assert.equal(updates, 0);
+});
+
+test('native callbacks capture live draw ranges and preserve requested attribute histories through after edits', t => {
+  const f = rig(t), object = f.mesh(), geometry = object.geometry, position = geometry.attributes.position;
+  const initial = position.array.slice(); let phase = 0;
+  const first = f.capture({bundles: f.bundles});
+  position.array.fill(9); // remains GPU-stale without an upload request
+  object.onBeforeRender = () => {
+    geometry.setDrawRange(phase ? 3 : 0, 3);
+    if (phase) { position.array.fill(.25); position.needsUpdate = true; }
+  };
+  object.onAfterRender = () => { position.array.fill(7); geometry.setDrawRange(0, 0); };
+  f.renderer.info.calls++;
+  const second = f.capture({bundles: f.bundles});
+  assert.deepEqual(second.draws.map(draw => [draw.first, draw.count]), [[0, 3]]);
+  assert.deepEqual(second.draws[0].binding.programGeometry.attributes.position.array, initial);
+  phase = 1; f.renderer.info.calls++;
+  const third = f.capture({bundles: f.bundles});
+  assert.deepEqual(third.draws.map(draw => [draw.first, draw.count]), [[3, 3]]);
+  assert.ok(third.draws[0].binding.programGeometry.attributes.position.array.every(value => value === .25));
+  assert.deepEqual(first.draws[0].binding.programGeometry.attributes.position.array, initial);
+  for (const captured of [first, second, third]) for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('native callbacks keep thrown source effects, omit later callbacks, and leave the capture guard usable', t => {
+  const f = rig(t), a = f.mesh(), b = f.mesh(), failure = new Error('authored callback failed'), events = [];
+  a.onBeforeRender = () => { a.userData.value = 17; events.push('before'); throw failure; };
+  a.onAfterRender = () => { events.push('after'); };
+  b.onBeforeRender = () => { events.push('later'); };
+  assert.throws(() => f.capture({bundles: f.bundles}), error => error === failure);
+  assert.deepEqual(events, ['before']); assert.equal(a.userData.value, 17);
+  assert.doesNotThrow(() => assertThreeNativeTargetWrite(f.renderer, null));
+  a.onBeforeRender = () => { assertThreeNativeTargetWrite(f.renderer, null); };
+  assert.throws(() => f.capture({bundles: f.bundles}), {code: 'THREE_NODE_PROGRAM_REENTRY'});
+  assert.doesNotThrow(() => assertThreeNativeTargetWrite(f.renderer, null));
+});
+
+test('mixed fixed/native object callback lists refuse before source effects and legacy material callbacks remain inert', t => {
+  const f = rig(t), object = f.mesh(), fixed = f.mesh(new THREE.MeshBasicMaterial()); let callbacks = 0;
+  object.onBeforeRender = () => { callbacks++; };
+  assert.throws(() => f.capture({bundles: f.bundles}), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(callbacks, 0);
+  fixed.visible = false; object.material.onBeforeRender = () => { assert.fail('WebGPU source does not call material.onBeforeRender'); };
+  const captured = f.capture({bundles: f.bundles}); assert.equal(callbacks, 1);
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('native callbacks change the live scene override for subsequent source list items', t => {
+  const f = rig(t), first = f.mesh(), second = f.mesh(), replacement = f.material(), observed = [];
+  replacement.colorNode = N.uniform(new THREE.Color(.875, .625, .375));
+  first.onAfterRender = () => { f.scene.overrideMaterial = replacement; };
+  second.onBeforeRender = () => { observed.push(f.scene.overrideMaterial); };
+  const captured = f.capture({bundles: f.bundles});
+  assert.deepEqual(captured.draws.map(draw => draw.material), [first.material, replacement]);
+  assert.deepEqual(observed, [replacement]); assert.equal(f.scene.overrideMaterial, replacement);
+  assert.ok(floats(captured.draws[1].nodeUniforms).includes(.875));
+  for (const lease of captured.bundleGeometries) lease.release();
 });
 test('capture freezes the render context across callbacks that mutate renderer counters', t => {
   const f = rig(t), seen = [], m = f.material();

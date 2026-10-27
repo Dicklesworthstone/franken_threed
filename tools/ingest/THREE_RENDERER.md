@@ -184,7 +184,7 @@ scene/object/material render hooks retain their existing explicit rejection.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping, logarithmic/reversed depth, non-sRGB
+  XR, custom tone mapping, logarithmic/reversed depth on the WebGL-authored facade, non-sRGB
   output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.

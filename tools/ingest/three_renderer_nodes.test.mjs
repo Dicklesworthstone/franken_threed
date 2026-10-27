@@ -119,6 +119,70 @@ test('two unprepared render calls keep independent native uniforms until actual 
   assert.ok(draws.every(d=>d.pipeline.fragment.entryPoint==='main'));
 });
 
+test('native object callbacks retain queued colors, source side multiplicity and immutable geometry submissions',async t=>{
+  const f=fixture(t),events=[],other=new T.Mesh(f.mesh.geometry,f.material);
+  f.scene.add(other);f.material.transparent=true;f.material.side=T.DoubleSide;
+  f.mesh.frustumCulled=other.frustumCulled=false;
+  const position=f.mesh.geometry.attributes.position;let phase=0;
+  for(const [object,index] of [[f.mesh,0],[other,1]]){
+    object.onBeforeRender=function(renderer,scene,camera,geometry,material,group){
+      assert.equal(this,object);assert.equal(renderer,f.renderer);assert.equal(scene,f.scene);assert.equal(camera,f.camera);
+      assert.equal(geometry,f.mesh.geometry);assert.equal(material,f.material);assert.equal(group,null);
+      events.push(['before',phase,index,material.side]);
+      const red=phase===0?(index===0?.125:.625):(index===0?.25:.75);
+      f.tint.value.setRGB(red,.375,.875);
+      position.array[0]=red;position.needsUpdate=true;
+    };
+    object.onAfterRender=function(renderer,scene,camera,geometry,material){
+      events.push(['after',phase,index,material.side]);f.tint.value.setRGB(0,0,0);position.array[0]=99;
+    };
+  }
+  f.material.onBeforeRender=()=>assert.fail('material callback is inert on the pinned WebGPU route');
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  phase=1;f.renderer.render(f.scene,f.camera);
+  assert.deepEqual(events,[
+    ['before',0,0,T.DoubleSide],['after',0,0,T.DoubleSide],['before',0,1,T.DoubleSide],['after',0,1,T.DoubleSide],
+    ['before',1,0,T.DoubleSide],['after',1,0,T.DoubleSide],['before',1,1,T.DoubleSide],['after',1,1,T.DoubleSide]]);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,8);
+  for(const [index,red] of [.125,.125,.625,.625,.25,.25,.75,.75].entries())
+    assert.ok(containsColor(draws[index],[red,.375,.875]),`captured color ${index}`);
+  const firstPosition=draw=>{
+    const buffer=draw.streams.get(0),bytes=draw.contents.get(buffer);
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];
+  };
+  assert.deepEqual(draws.map(firstPosition),[.125,.125,.125,.125,.25,.25,.25,.25],
+    'the source uploads a shared geometry once per logical render, before its later callbacks');
+  assert.equal(position.array[0],99);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native object callbacks preserve prior upload history when hooks are added after preparation',async t=>{
+  const f=fixture(t);await f.renderer.compileAsync(f.scene,f.camera);
+  const position=f.mesh.geometry.attributes.position,original=position.array.slice();let calls=0;
+  position.array.fill(7);
+  f.mesh.onBeforeRender=()=>{calls++;f.tint.value.setRGB(.25,.5,.75);};
+  f.mesh.onAfterRender=()=>{position.array.fill(9);};
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draw=nativeDraws(f.device)[0],buffer=draw.streams.get(0),bytes=draw.contents.get(buffer);
+  assert.deepEqual(new Float32Array(bytes.buffer,bytes.byteOffset,original.length),original);
+  assert.equal(calls,1);assert.ok(containsColor(draw,[.25,.5,.75]));
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native callback reentrant GPU rendering fails before a nested submission and releases the call scope',async t=>{
+  const f=fixture(t);await f.renderer.init();
+  const inner=new T.Scene(),innerMaterial=new T.MeshBasicNodeMaterial();innerMaterial.colorNode=T.TSL.vec3(.25);
+  inner.add(new T.Mesh(new T.PlaneGeometry(),innerMaterial));
+  let before=0,after=0;
+  f.mesh.onBeforeRender=()=>{before++;f.renderer.render(inner,f.camera);};
+  f.mesh.onAfterRender=()=>{after++;};
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_REENTRY'});
+  assert.equal(before,1);assert.equal(after,0);assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length,1);assert.equal(after,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('transparent native DoubleSide renders submit ordered side pipelines with independent queued uniforms',async t=>{
   const f=fixture(t);f.material.transparent=true;f.material.side=T.DoubleSide;f.mesh.scale.x=-1;
   f.material.colorNode=T.TSL.normalView.mul(.25).add(.35).mul(f.tint);

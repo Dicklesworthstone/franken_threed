@@ -173,3 +173,30 @@ test('renderer disposal cancels accepted storage vertex draws and preparation fa
   await assert.rejects(drain(g.renderer), /storage vertex pipeline rejected/);
   assert.equal(g.renderer._nodeCaptureBytes, 0); assert.equal(g.device.submissions.length, 0);
 });
+
+
+test('warm bundles retain storage-only vertex leases and observe later GPU producers', async t => {
+  const f = fixture(t), positions = N.instancedArray(2, 'vec3'), group = new T.BundleGroup();
+  positions.value.array.fill(.125); f.mesh.count = 2;
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  group.add(f.mesh); f.scene.add(group);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const buffer = captureComputeStorage(f.device, positions.value).resolve().buffer;
+  const encoded = f.device.bundleEncoders.length;
+  assert.ok(encoded > 0);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.device.onCompute = pass => {
+    assert.equal(computeStorage(pass)[0], buffer);
+    new Float32Array(buffer.data).fill(.875);
+  };
+  await f.renderer.compute(kernel(positions));
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 3);
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.125, .125, .875]);
+  assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer)));
+  assert.equal(f.device.bundleEncoders.length, encoded, 'warm source bundles reuse their GPU vertex commands');
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1,
+    'warm bundles never overwrite computed vertices with their source CPU array');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

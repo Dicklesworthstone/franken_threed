@@ -36,7 +36,7 @@ import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
-import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground} from './three_pass_snapshot.mjs';
+import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
@@ -421,7 +421,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     async _init() {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
-      if (this.logarithmicDepthBuffer || this.reversedDepthBuffer) fail('UNSUPPORTED', 'Logarithmic and reversed depth buffers are not admitted');
+      if (this._shaderEncodedOutput && (this.logarithmicDepthBuffer || this.reversedDepthBuffer))
+        fail('UNSUPPORTED', 'Logarithmic and reversed depth require the native WebGPU renderer');
       if (this.stencil && !this.depth) fail('UNSUPPORTED', 'Stencil framebuffers currently require a depth attachment');
       const p = this._parameters;
       if (p.outputType !== undefined && p.outputType !== THREE.UnsignedByteType)
@@ -599,7 +600,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     setClearColor(color, alpha = 1) { this._clearColor.set(color); this._clearAlpha = alpha; }
     getClearAlpha() { return this._clearAlpha; }
     setClearAlpha(alpha) { this._clearAlpha = alpha; }
-    getClearDepth() { return this._clearDepth; }
+    getClearDepth() { return this.reversedDepthBuffer === true ? 1 - this._clearDepth : this._clearDepth; }
     setClearDepth(depth) { this._clearDepth = depth; }
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
@@ -772,7 +773,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         frame.clearColor = premultiply ? [...encoded.map(c => c * a), a] : [...encoded, 1];
       }
       Object.assign(frame, {
-        clearDepth: this._clearDepth,
+        clearDepth: this.getClearDepth(),
       });
       // Use the actual depth attachment: a target-owned depth-only texture can
       // override stencilBuffer:true. A stencil clear never clears color/depth.
@@ -894,14 +895,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (!Array.isArray(camera.cameras) || camera.cameras.length > 256 || camera.isMultiViewCamera)
           fail('UNSUPPORTED', 'Expected an ordinary ArrayCamera with at most 256 views');
         if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
-        // Pinned Renderer._updateCamera changes the public projection convention
-        // for all children only when the parent convention changes.
-        if (camera.coordinateSystem !== this.coordinateSystem) {
-          camera.coordinateSystem = this.coordinateSystem;
-          for (const child of camera.cameras) child.coordinateSystem = this.coordinateSystem;
-          camera.updateProjectionMatrix();
-          for (const child of camera.cameras) child.updateProjectionMatrix();
-        }
+        updateThreeCameraProjection(THREE, this, camera);
         if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
         camera = captureThreeArrayCamera(THREE, camera);
         matricesUpdated = true;
@@ -946,9 +940,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _updateNativeMatrices(scene, camera) {
       if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
-      if (camera.coordinateSystem !== this.coordinateSystem) {
-        camera.coordinateSystem = this.coordinateSystem; camera.updateProjectionMatrix();
-      }
+      updateThreeCameraProjection(THREE, this, camera);
       if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
     }
     _renderFrame(scene, camera, clearOnly = null) {
@@ -1064,8 +1056,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
-      let raster = this._nodeRaster.get(stencilAttachment);
-      if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
+      let sourceRaster = this._nodeRaster.get(stencilAttachment);
+      if (!sourceRaster) { sourceRaster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, sourceRaster); }
+      const reversedDepthBuffer = this.reversedDepthBuffer === true;
+      const raster = (material, options) => sourceRaster(material, {...options, reversedDepthBuffer});
       const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
       // Pre-init requests can be captured after a PassNode restored the public
       // renderer state. Build and update against that request's source context.

@@ -69,7 +69,7 @@ for(const order of ['XYZ','YXZ','ZXY','ZYX','YZX','XZY'])test('camera/world and 
 });
 for(const [name,edit,suffix] of [
   ['orthographic',h=>{h.camera.isPerspectiveCamera=false;h.camera.isOrthographicCamera=true;},'CAMERA'],
-  ['reversed depth',h=>{h.camera.reversedDepth=true;},'CAMERA'],['array camera',h=>{h.camera.isArrayCamera=true;},'CAMERA'],
+  ['nonfinite projection',h=>{h.camera.projectionMatrix.elements[0]=NaN;},'CAMERA'],['array camera',h=>{h.camera.isArrayCamera=true;},'CAMERA'],
   ['singular projection',h=>{h.camera.projectionMatrix.elements.fill(0);},'CAMERA'],
   ['projective world',h=>{h.camera.matrixWorld.elements[3]=1;},'CAMERA'],
   ['blur',h=>{h.scene.backgroundBlurriness=.5;},'PROFILE'],['nonfinite rotation',h=>{h.scene.backgroundRotation.x=NaN;},'VALUE'],

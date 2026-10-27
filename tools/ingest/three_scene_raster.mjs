@@ -6,10 +6,13 @@ const FACTORS=[['ZeroFactor','zero'],['OneFactor','one'],['SrcColorFactor','src'
   ['ConstantColorFactor','constant'],['ConstantAlphaFactor','constant'],['OneMinusConstantColorFactor','one-minus-constant'],['OneMinusConstantAlphaFactor','one-minus-constant']];
 const EQUATIONS=[['AddEquation','add'],['SubtractEquation','subtract'],['ReverseSubtractEquation','reverse-subtract'],['MinEquation','min'],['MaxEquation','max']];
 const DEPTH=['never','always','less','less-equal','equal','greater-equal','greater','not-equal'];
+// Pinned ReversedDepthFuncs complements every source comparison, including
+// Never/Always and Equal/NotEqual; preserve that public backend contract.
+const REVERSED_DEPTH=['always','never','greater','greater-equal','not-equal','less-equal','less','equal'];
 export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
   const factors=new Map(FACTORS.map(([k,v])=>[three[k],v])),equations=new Map(EQUATIONS.map(([k,v])=>[three[k],v]));
   const finite=(n,key)=>{if(typeof n!=='number'||!Number.isFinite(n))fail('VALUE',`Invalid ${key}`);return n;};
-  function describe(m,topology='triangles'){
+  function describe(m,topology='triangles',complete=false){
     const options={},values={};
     const blended=m.blending!==three.NoBlending&&(m.blending!==three.NormalBlending||m.transparent!==false);
     const premultiplied=m.premultipliedAlpha===true;
@@ -39,8 +42,10 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
       Object.assign(options,{depthBias:m.polygonOffsetUnits,depthBiasSlopeScale:m.polygonOffsetFactor,depthBiasClamp:0});
     }
     // The core renderer supplies ordinary straight-alpha NormalBlending.
-    if(m.blending===three.NormalBlending&&!premultiplied)delete options.blend;
-    else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
+    if(!complete){
+      if(m.blending===three.NormalBlending&&!premultiplied)delete options.blend;
+      else if(m.blending===three.NormalBlending&&!m.transparent)options.blend=null;
+    }
     if(stencilAttachment){
       const {stencil,stencilReference}=threeProgramStencil(three,m,fail,{webgpu:true});
       if(stencil){options.stencil=stencil;values.stencilReference=stencilReference;}
@@ -49,19 +54,21 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
   }
   // Native programs need the complete pipeline state rather than the core's
   // compact material defaults. Both routes use the same blend/bias/stencil map.
-  describe.program=(m,{mrt=null,textures=null,topology='triangles'}={})=>{
+  describe.program=(m,{mrt=null,textures=null,topology='triangles',reversedDepthBuffer=false}={})=>{
     if(![three.FrontSide,three.BackSide,three.DoubleSide].includes(m.side)||!DEPTH[m.depthFunc])
       fail('MATERIAL','Unsupported native side/depth state');
     for(const key of ['transparent','depthWrite','depthTest','colorWrite','alphaToCoverage'])
       // Renderer.renderObject's inherited OR expression ends in a nullable
-      // node slot for opaque shadow casters. Preserve that exact source field;
-      // raster selection interprets it as falsy without changing the material.
-      if(typeof m[key]!=='boolean'&&!(key==='transparent'&&m.isShadowPassMaterial===true&&m[key]==null))
+      // node slot for any opaque override, including Inspector overdraw.
+      // Keep that field: source pipeline blending uses !== false, while source
+      // list sorting and double-sided expansion use their separate checks.
+      if(typeof m[key]!=='boolean'&&!(key==='transparent'&&m[key]==null))
         fail('MATERIAL',`Expected boolean ${key}`);
-    const {options,values}=describe(m,topology),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
+    const {options,values}=describe(m,topology,true),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
       alpha:{operation:'add',srcFactor:'one',dstFactor:'one-minus-src-alpha'}};
-    const state={...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,
-      writeMask:m.colorWrite?15:0,depthWriteEnabled:m.depthWrite,depthCompare:m.depthTest?DEPTH[m.depthFunc]:'always',
+    const state={...options,...values,blend:options.blend,
+      writeMask:m.colorWrite?15:0,depthWriteEnabled:m.depthWrite,
+      depthCompare:m.depthTest?(reversedDepthBuffer?REVERSED_DEPTH:DEPTH)[m.depthFunc]:'always',
       alphaToCoverageEnabled:m.alphaToCoverage,
       frontFace:m.side===three.BackSide?'cw':'ccw',cullMode:m.side===three.DoubleSide?'none':'back'};
     if(mrt&&textures){

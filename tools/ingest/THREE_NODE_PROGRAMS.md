@@ -58,7 +58,7 @@ snapshot, not a deep snapshot of the entire mutable scene.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
-`outputNode`. Ordinary source node arithmetic, functions and custom scalar/vector
+`outputNode` and `depthNode`. Ordinary source node arithmetic, functions and custom scalar/vector
 float attributes compile through the pinned builder. Native scalar, integer,
 boolean, vector and matrix uniforms retain their source group ordering and
 padding. Clip-space vertex and fragment graphs with no uniform groups also work.
@@ -211,8 +211,8 @@ retains the existing stale-use rejection contract.
 This path uses the existing owned WebGPU renderer and texture owners, with no
 readback or retained renderer submission. Depth framebuffer copies, the
 WebGL-authored copy route and ArrayCamera transmission remain unimplemented.
-A distinct scene override on a transmissive DoubleSide original also requires
-further original/effective-material pass expansion and fails before updates.
+Distinct scene overrides retain both the original transmissive back/front phases
+and the effective override's alpha side expansion, including four physical draws.
 These are remaining compatibility tasks, not permanent exclusions.
 
 Fourteen public-copy facade cases cover source/destination selection, all three
@@ -473,8 +473,9 @@ that mesh takes the node path.
 Each initialized logical render synchronously selects native draws and captures owned
 uniform byte packets before asynchronous pipeline preparation. Selection follows
 source visibility, layers, LOD, geometry groups, frustum culling, render order and
-WebGPU depth sorting. All reachable node bindings, including hidden objects, are
-admitted before any node update callback. The source camera receives its WebGPU
+WebGPU depth sorting. Active callback-free bindings are admitted before node
+updates; object callbacks and overrides construct their effective programs at
+the source draw boundary. Hidden objects remain inactive. The source camera receives its WebGPU
 projection convention before graph construction. Source object and material
 identities reach the builder and callbacks.
 
@@ -552,7 +553,7 @@ updates preserve unrequested bytes and consume the ranges. Each logical render
 retains immutable data even if later calls mutate or poison the public arrays.
 Source histories survive program replacement and retire on geometry/renderer
 disposal. `compileAsync()` establishes the initial upload history for visible
-generated streams at preparation without running application callbacks; hidden
+generated streams at preparation without running node update callbacks; hidden
 objects do not acquire that history until their first visible use. Replacing a
 program waits for submitted work before retiring its old GPU geometry owner.
 
@@ -565,20 +566,52 @@ source setting.
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
 the compiler cache, and subsequent graph or structural changes select a new
-program. Ordinary geometry arrays and attribute versions retain the existing
-bridge's live upload contract; generated streams use the captured histories
-above. This is not a deep snapshot of an entire mutable scene.
+program. The facade also captures ordinary CPU geometry through the existing
+immutable geometry owner at the source upload boundary. Shared geometry uploads
+once per logical render; unmarked edits and untouched partial ranges stay stale,
+including when a render callback is added after initial compilation. This is not
+a deep snapshot of an entire mutable scene.
 GPU geometry uses the existing owner, while native uniform groups receive
 independent aligned slices. Later arena growth leaves earlier groups and bytes
 valid. Disposed or lost owners cannot publish pending pipelines, including
 programs with no uniform groups. Pending captured bytes share the facade's
 bounded budget and are released when the request finishes.
 
-Scene overrides respect each original material's `allowOverride`. The first
-profile admits an override only when the source-inherited position node, alpha,
-displacement and transparency state already matches the override. Other cases
-fail explicitly before callbacks, without temporarily changing a shared source
-material. Original material visibility and render-list partitioning still apply.
+Native object callbacks and scene overrides execute the pinned
+`Renderer.renderObject` lifecycle with an owned draw handler. `onBeforeRender`
+runs before effective shader construction, both alpha sides receive their node
+updates, and `onAfterRender` runs once after that pair. Source identities,
+material groups, `allowOverride`, original visibility and list partitioning stay
+intact. Position, alpha, displacement and transparency inheritance uses source
+code, including its successful restoration and intentionally retained alpha and
+transparency fields. A callback changing `scene.overrideMaterial` affects later
+list items. `compileAsync()` runs object hooks without node updates; warm bundles
+do not replay object hooks or override inheritance. Material `onBeforeRender`
+remains inert, as it is in the pinned WebGPU renderer.
+
+This callback path currently requires a source Scene with wholly native mesh
+draws. Mixed fixed/native hook lists, callback replacement of selected geometry,
+custom BatchedMesh hooks and recursive GPU writes still require additional
+capture boundaries and fail explicitly. Callback exceptions retain earlier
+source mutations and do not replay updates or run later after-callbacks.
+
+## Logarithmic and reversed depth
+
+Native perspective and orthographic mesh scenes accept `logarithmicDepthBuffer`
+and `reversedDepthBuffer`. The pinned node builder supplies fragment-depth
+expressions and custom `depthNode` precedence. Source camera projection changes,
+the public clear-depth accessor, all eight reversed comparison functions,
+frustum conventions, shadows and scene-pass depth sampling retain their source
+behavior. Queued calls keep their accepted projection, near/far, clear value and
+depth uniforms. Existing perspective panorama/cube background rays also accept
+reversed projection. ArrayCamera node graphs, XR and depth modes on the
+WebGL-authored renderer facade retain their existing explicit boundaries.
+
+`three_renderer_depth_modes.test.mjs` checks source camera/raster oracles and
+actual captured GPU commands. `tests/e2e/webgpu_renderer/depth_modes.mjs` compares
+four queued frames per case against an independent pinned source run and source
+repeat, including full RGBA bytes and float32 depth words. Software Vulkan
+correctness does not establish hardware performance.
 
 ## InstancedBufferGeometry
 
@@ -593,8 +626,8 @@ the renderer does not infer a count or silently clamp it to an attribute capacit
 The native r186 backend uses instance step mode without applying the WebGL
 `meshPerAttribute` divisor. This path preserves that behavior; the WebGL-authored
 program path retains its divisor expansion. Existing geometry upload versions
-and partial ranges preserve GPU-stale bytes outside requested updates. This does
-not add per-call snapshots of arbitrary geometry arrays.
+and partial ranges preserve GPU-stale bytes outside requested updates. Native CPU
+geometry snapshots preserve those accepted histories across queued calls.
 
 ## BatchedMesh
 
@@ -673,8 +706,9 @@ texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows,
 alpha hashing and alpha-to-coverage; skinned or morph meshes,
-including per-instance morph textures; ArrayCamera, reversed depth and XR views;
-custom object/material render hooks and effectful attribute upload callbacks.
+including per-instance morph textures; ArrayCamera and XR views;
+object render hooks outside the source lifecycle profile above and effectful
+attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
 front-side draws, matching the pinned renderer's source order. Each side owns a
 retained program and captured uniforms; object updates run for each draw while

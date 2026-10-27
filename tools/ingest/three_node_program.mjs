@@ -43,7 +43,7 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode', 'envNode']);
@@ -53,7 +53,7 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
   'transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']);
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
-const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS, 'depthNode'];
+const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
 // These source material accessors lower to ordinary 2D texture bindings. AO and
 // light maps additionally retain their exact source material lighting nodes.
 // Environment maps use their separate source PMREM identity and context below.
@@ -756,8 +756,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspectThreeNativeBatch(three, object, fail);
     inspectSkinning(object);
     inspectMorphs(object);
-    if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
-      fail('CAMERA', 'Native node graphs require an ordinary non-reversed camera');
+    if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera))
+      fail('CAMERA', 'Native node graphs require an ordinary camera');
     sourceFog(material, context);
     inspectThreeNodeClipping(three, context, maxNodes, fail);
     if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
@@ -770,8 +770,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
     inspectThreeLightingContext(three, renderer.contextNode);
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
+    // The pinned WebGPU renderer invokes object hooks only. Material's legacy
+    // onBeforeRender callback is inert on this source route, including when set.
     if (sourceMaterial.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
-        sourceMaterial.onBeforeRender !== three.Material.prototype.onBeforeRender ||
         sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
           ? three.NodeMaterial.prototype.customProgramCacheKey : three.Material.prototype.customProgramCacheKey))
       fail('HOOK', 'Custom material shader/render hooks are not admitted');
@@ -790,7 +791,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
-          !SHADOW_SLOTS.has(key) && !(key === 'depthNode' && material.isShadowPassMaterial === true) &&
+          !SHADOW_SLOTS.has(key) &&
           !(key === 'contextNode' && pipelineContext !== null))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }

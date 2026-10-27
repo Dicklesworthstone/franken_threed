@@ -4,7 +4,7 @@
  * Publication is after compute upload (including compileComputeAsync). Native
  * buffer usages must include VERTEX as well as STORAGE from creation onward;
  * index borrowers additionally require INDEX usage. */
-const devices = new WeakMap(), vertexViews = new WeakMap();
+const devices = new WeakMap(), vertexViews = new WeakMap(), immutableVertexViews = new WeakMap();
 export class ComputeAttributeError extends Error {
   constructor(code, message) {
     super(`COMPUTE_ATTRIBUTE_${code}: ${message}`);
@@ -121,9 +121,15 @@ export function captureComputeStorage(device, attribute) {
     return entry;
   }
   return Object.freeze({version, byteLength,
+    get ownerIdentity() { return resolved?.identity ?? initial?.identity; },
     resolve: () => current().resource,
     assertCurrent() { current(); },
-    whenIdle: () => current().whenIdle()});
+    whenIdle() {
+      // Retiring a geometry waits for the allocation it already used. A later
+      // FIFO upload may legitimately advance that buffer's content version.
+      const allocation = resolved ?? current(); allocation.live();
+      return allocation.whenIdle();
+    }});
 }
 
 /** Private geometry view of a captured storage generation. Only this module
@@ -136,12 +142,30 @@ export function captureComputeAttributeView(device, source, view) {
     isStorageBufferAttribute: source.isStorageBufferAttribute === true,
     isStorageInstancedBufferAttribute: source.isStorageInstancedBufferAttribute === true,
     isInstancedBufferAttribute: source.isInstancedBufferAttribute === true,
-    normalized: false, meshPerAttribute: 1};
+    normalized: false, meshPerAttribute: 1, gpuType: source.gpuType, usage: source.usage};
   const scalar = shape.array.constructor, byteLength = shape.array.byteLength;
+  const proof = Object.freeze({device, source, lease, shape: Object.freeze(shape),
+    scalar, byteLength, stride: shape.itemSize, count: shape.count});
   return Object.freeze({install() {
     Object.assign(view, shape);
-    vertexViews.set(view, {device, lease, scalar, byteLength, stride: shape.itemSize, count: shape.count});
+    vertexViews.set(view, proof);
   }});
+}
+
+/** Preserve the proof currently installed in a generated vertex view. A later
+ * queued draw can install another source version in that same mutable view;
+ * immutable geometry must keep this version while borrowing its GPU buffer.
+ * This copies metadata only and never resolves, uploads or reads GPU contents.
+ */
+export function snapshotComputeAttributeView(view) {
+  const proof = vertexViews.get(view);
+  if (!proof) return null;
+  const previous = immutableVertexViews.get(view), old = previous?.proof;
+  if (old && old.device === proof.device && old.source === proof.source && old.lease.ownerIdentity === proof.lease.ownerIdentity &&
+      Object.keys(proof.shape).every(key => old.shape[key] === proof.shape[key])) return previous.view;
+  const snapshot = Object.freeze(Object.assign(Object.create(Object.getPrototypeOf(view)), proof.shape));
+  vertexViews.set(snapshot, proof); immutableVertexViews.set(view, {view: snapshot, proof});
+  return snapshot;
 }
 
 /** Only buffers published by the compute owner on this device are admitted.

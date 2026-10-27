@@ -4,6 +4,8 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodeBundleGeometry} from './three_node_bundle_geometry.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {createComputeAttributeOwner, captureComputeAttributeView, computeAttributeSnapshot,
+  snapshotComputeAttributeView} from './gpu_compute_attributes.mjs';
 
 const positionProgram = [{name: 'position', location: 0, locations: 1, components: 3, scalar: 'float'}];
 function geometry() {
@@ -137,7 +139,7 @@ test('source disposal forwards residency events while accepted data survives and
   assert.throws(() => owner.capture(source, 3), {code: 'THREE_NODE_BUNDLE_GEOMETRY_DISPOSED'});
 });
 
-test('invalid ranges, mutable storage layouts and GPU storage inputs fail before publishing new histories', t => {
+test('invalid ranges, mutable storage layouts and unproven GPU storage inputs fail before publishing new histories', t => {
   const owner = histories(t), source = geometry(), first = owner.capture(source, 1), attribute = source.attributes.position;
   attribute.addUpdateRange(8, 2); attribute.needsUpdate = true;
   assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
@@ -147,4 +149,67 @@ test('invalid ranges, mutable storage layouts and GPU storage inputs fail before
   const storage = geometry(); storage.attributes.position.isStorageBufferAttribute = true;
   assert.throws(() => owner.capture(storage, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
   assert.equal(first.geometry.attributes.position.count, 3); first.release();
+});
+
+test('immutable geometry retains captured GPU versions without copying simulation arrays or changing CPU histories', async t => {
+  const owner = histories(t), source = geometry(), device = geometryDevice();
+  const storage = new T.StorageInstancedBufferAttribute(new Float32Array([1,2,3,0,4,5,6,0]), 4);
+  const publication = createComputeAttributeOwner(device); t.after(() => publication.dispose());
+  const buffer = device.createBuffer({size: storage.array.byteLength, usage: 128 | 32});
+  let waits = 0;
+  const publish = () => publication.publish(storage, buffer, storage.array, storage.version,
+    () => {}, () => { waits++; return Promise.resolve(); });
+  publish();
+  const mutableView = Object.create(storage);
+  captureComputeAttributeView(device, storage, mutableView).install();
+  const program = {geometry: source, attributes: {...source.attributes, offsets: mutableView}, drawRange: source.drawRange};
+  const first = owner.capture(program, 1), firstView = first.geometry.attributes.offsets;
+  assert.notEqual(firstView, mutableView); assert.ok(Object.isFrozen(firstView));
+  assert.equal(firstView.array, storage.array, 'GPU metadata retains the source identity without a CPU clone');
+  assert.equal(first.bytes, 36); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  const firstGpu = computeAttributeSnapshot(device, firstView);
+  assert.equal(firstGpu.buffer, buffer); assert.equal(firstGpu.arrayStride, 16);
+
+  storage.array.fill(7); storage.needsUpdate = true;
+  captureComputeAttributeView(device, storage, mutableView).install();
+  const second = owner.capture(program, 2), secondView = second.geometry.attributes.offsets;
+  assert.notEqual(second.geometry, first.geometry); assert.notEqual(secondView, firstView);
+  assert.equal(firstView.version, 0); assert.equal(secondView.version, 1);
+  assert.equal(first.geometry.attributes.position.array, second.geometry.attributes.position.array);
+  assert.equal(owner.diagnostics.allocatedBytes, 36, 'storage bytes do not consume the CPU snapshot budget');
+  assert.throws(() => computeAttributeSnapshot(device, secondView), {code: 'COMPUTE_ATTRIBUTE_UNPREPARED'});
+  assert.equal(computeAttributeSnapshot(device, firstView).buffer, buffer);
+  publish();
+  assert.equal(computeAttributeSnapshot(device, secondView).buffer, buffer);
+  assert.throws(() => firstGpu.assertCurrent(), {code: 'COMPUTE_ATTRIBUTE_UNPREPARED'});
+  await firstGpu.whenIdle(); assert.equal(waits, 1, 'retirement waits the old allocation without reading an obsolete content version');
+  captureComputeAttributeView(device, storage, mutableView).install();
+  const warm = owner.capture(program, 3);
+  assert.equal(warm.geometry, second.geometry, 'unchanged storage proofs preserve native geometry cache identity');
+  assert.equal(device.writes.length, 0, 'metadata capture never uploads CPU simulation arrays');
+  for (const frame of [first, second, warm]) frame.release();
+});
+
+test('GPU view proofs retain accepted shape and cannot be forged or used as indices', t => {
+  const owner = histories(t), source = geometry(), device = geometryDevice();
+  const storage = new T.StorageBufferAttribute(new Uint32Array([1,2,3,4,5,6,7,8]), 4);
+  const publication = createComputeAttributeOwner(device); t.after(() => publication.dispose());
+  const buffer = device.createBuffer({size: storage.array.byteLength, usage: 128 | 32});
+  publication.publish(storage, buffer, storage.array, 0, () => {}, () => Promise.resolve());
+  const view = Object.create(storage), forged = Object.create(storage);
+  captureComputeAttributeView(device, storage, view).install();
+  Object.assign(forged, view);
+  assert.equal(snapshotComputeAttributeView(forged), null);
+  source.setAttribute('indicesAsVertex', forged);
+  assert.throws(() => owner.capture(source, 1), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
+  assert.equal(owner.diagnostics.allocatedBytes, 0);
+  source.setAttribute('indicesAsVertex', view);
+  view.count = 99; view.itemSize = 1; view.array = new Uint32Array(99);
+  const accepted = owner.capture(source, 1), captured = accepted.geometry.attributes.indicesAsVertex;
+  assert.equal(captured.count, 2); assert.equal(captured.itemSize, 4); assert.equal(captured.array, storage.array);
+  assert.equal(computeAttributeSnapshot(device, captured, {integer: true}).buffer, buffer);
+  assert.throws(() => computeAttributeSnapshot(geometryDevice(), captured, {integer: true}), {code: 'COMPUTE_ATTRIBUTE_OWNER'});
+  source.setIndex(view);
+  assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
+  assert.equal(owner.diagnostics.allocatedBytes, 36); accepted.release();
 });

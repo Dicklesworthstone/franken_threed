@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
+import {createThreeNodeBundles} from './three_node_bundles.mjs';
 
 const N = THREE.TSL;
 function rig(t) {
@@ -184,8 +185,9 @@ test('physical and authored transmission share source front/back copies with a v
   assert.ok(f.created.every(copy => copy.mipmaps && copy.width === 32 && copy.height === 16));
   assert.equal(first.material.side, THREE.DoubleSide); assert.equal(second.material.side, THREE.DoubleSide);
 });
-test('distinct transmissive DoubleSide overrides reject before replacing the source four-pass expansion', t => {
+test('distinct transmissive DoubleSide overrides preserve the source four-pass expansion', t => {
   const f = rig(t), object = f.mesh('glass');
+  const bundles = createThreeNodeBundles(THREE); t.after(() => bundles.dispose());
   object.material = new THREE.MeshPhysicalMaterial({transmission: .75, side: THREE.DoubleSide});
   const override = new THREE.MeshPhysicalNodeMaterial({transparent: true, side: THREE.DoubleSide});
   let updates = 0;
@@ -194,8 +196,9 @@ test('distinct transmissive DoubleSide overrides reject before replacing the sou
   const expected = [];
   sourceTransparents([object], f.scene, f.camera, (_object, side) => expected.push(side));
   assert.deepEqual(expected, [THREE.BackSide, THREE.FrontSide, THREE.BackSide, THREE.FrontSide]);
-  assert.throws(() => f.capture({overrideMaterial: override}), error =>
-    error.code === 'THREE_NODE_PROGRAM_EFFECT' && /original and effective pass expansion/.test(error.message));
-  assert.equal(updates, 0); assert.equal(f.created.length, 0);
+  const captured = f.capture({overrideMaterial: override, bundles});
+  assert.deepEqual(captured.draws.map(draw => draw.binding.raster.side), expected);
+  assert.equal(updates, 4); assert.equal(f.created.length, 0);
+  for (const lease of captured.bundleGeometries) lease.release();
   assert.equal(object.material.side, THREE.DoubleSide); assert.equal(override.side, THREE.DoubleSide);
 });

@@ -27,13 +27,36 @@ const MATH = ['Vector2', 'Vector3', 'Vector4', 'Matrix3', 'Matrix4', 'Color', 'Q
 const TEXTURE_STATE = ['version', 'format', 'type', 'colorSpace', 'mapping', 'channel', 'wrapS', 'wrapT', 'magFilter', 'minFilter',
   'anisotropy', 'flipY', 'premultiplyAlpha', 'generateMipmaps', 'rotation', 'matrixAutoUpdate'];
 
+/** The projection portion of pinned Renderer._updateCamera. Reversal is a
+ * source-visible, one-way camera transition, including ArrayCamera children.
+ * Matrix-world updates stay at the caller's existing source-order boundary. */
+export function updateThreeCameraProjection(T, renderer, camera) {
+  let changed = false;
+  if (renderer?.reversedDepthBuffer === true && camera.reversedDepth !== true) {
+    camera._reversedDepth = true;
+    if (camera.isArrayCamera) for (const child of camera.cameras) child._reversedDepth = true;
+    changed = true;
+  }
+  const coordinateSystem = renderer?.coordinateSystem ?? T.WebGPUCoordinateSystem;
+  if (camera.coordinateSystem !== coordinateSystem) {
+    camera.coordinateSystem = coordinateSystem;
+    if (camera.isArrayCamera) for (const child of camera.cameras) child.coordinateSystem = coordinateSystem;
+    changed = true;
+  }
+  if (changed) {
+    if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its projection');
+    camera.updateProjectionMatrix();
+    if (camera.isArrayCamera) for (const child of camera.cameras) child.updateProjectionMatrix();
+  }
+}
+
 /** Native callbacks observe the source camera before this private execution
  * view is captured. Queued fixed draws then keep that call's projection, pose,
  * layers and viewport without invoking source clone/copy hooks. */
 export function captureThreeCamera(T, source, array = false) {
   if (!(source instanceof T.Camera) || (!source.isPerspectiveCamera && !source.isOrthographicCamera) ||
-      (!array && source.isArrayCamera) || source.isMultiViewCamera || source.reversedDepth)
-    fail('CAMERA', 'Native camera views require non-reversed perspective or orthographic cameras');
+      (!array && source.isArrayCamera) || source.isMultiViewCamera)
+    fail('CAMERA', 'Native camera views require perspective or orthographic cameras');
   const result = view(source);
   for (const key of ['id', 'uuid', 'name', 'type', 'isCamera', 'isPerspectiveCamera', 'isOrthographicCamera',
     'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth'])

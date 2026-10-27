@@ -467,7 +467,7 @@ test('an effect update failure restores its temporary renderer controls and reta
   t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
   pipeline.render(); await drain(f.renderer);
   f.renderer.autoClear = false; f.renderer.autoClearColor = false; f.renderer.autoClearStencil = false;
-  effect._hMaterial.onBeforeRender = () => {}; f.renderer._nodes.nodeFrame.update();
+  effect._hMaterial.onBeforeCompile = () => {}; f.renderer._nodes.nodeFrame.update();
   assert.throws(() => pipeline.render(), /Custom material shader\/render hooks/);
   assert.equal(f.renderer.autoClear, false); assert.equal(f.renderer.autoClearColor, false);
   assert.equal(f.renderer.autoClearStencil, false); assert.equal(f.renderer.getRenderTarget(), null);

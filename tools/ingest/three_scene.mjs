@@ -322,9 +322,9 @@ export async function createGpuThreeScene(device,scene,{
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
         const list=colorMaterials(object);
-        if(!(capturedNodeObject(object)&&object.isBatchedMesh)&&(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m))))
+        if(!capturedNodeObject(object)&&(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m))))
           fail('HOOK','Custom render callbacks are not admitted by this source bridge');
-        programHooked.add(object);
+        if(!capturedNodeObject(object))programHooked.add(object);
       }
       if(object.isMesh){
         if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
@@ -1393,8 +1393,8 @@ export async function createGpuThreeScene(device,scene,{
     }finally{busy=false;preparing=false;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;}
   }
   function checkCamera(camera){
-    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||camera.reversedDepth)
-      fail('CAMERA','Supply a non-reversed perspective or orthographic source camera');
+    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||(camera.reversedDepth&&!nativeLightMode))
+      fail('CAMERA','Supply a perspective or orthographic source camera; reversed depth requires a complete native draw capture');
     if(![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))fail('CAMERA','Unknown source clip convention');
   }
   function cameraFrame(camera,matricesUpdated=false){
@@ -1404,7 +1404,7 @@ export async function createGpuThreeScene(device,scene,{
       if(camera.parent===null&&camera.matrixWorldAutoUpdate===true)camera.updateMatrixWorld();
     }
     vp.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
-    frustum.setFromProjectionMatrix(vp,camera.coordinateSystem,false);clip.copy(vp);
+    frustum.setFromProjectionMatrix(vp,camera.coordinateSystem,camera.reversedDepth);clip.copy(vp);
     if(camera.coordinateSystem===three.WebGLCoordinateSystem)
       for(let c=0;c<4;c++)clip.elements[c*4+2]=0.5*(vp.elements[c*4+2]+vp.elements[c*4+3]);
     return camera.isOrthographicCamera?{viewDirection:[camera.matrixWorld.elements[8],camera.matrixWorld.elements[9],camera.matrixWorld.elements[10]]}:
@@ -1498,7 +1498,7 @@ export async function createGpuThreeScene(device,scene,{
       // An empty ArrayCamera has no culling frustums, but upstream's draw path
       // falls back to the parent camera for objects with frustumCulled=false.
       const singleCamera=arrayViews?.length===0?Object.assign(Object.create(camera),{isArrayCamera:false}):camera;
-      const fogFrame=fogEnabled&&!arrayViews?.length?fogApi.threeFogDescriptor(sourceFog(),singleCamera,three):null;
+      const fogFrame=fogEnabled&&!nativeLightMode&&!arrayViews?.length?fogApi.threeFogDescriptor(sourceFog(),singleCamera,three):null;
       const backgroundFrame=!arrayViews?.length?backgroundOwner?.capture(backgroundScene(),singleCamera)??null:null;
       const lightSources=[],casterObjects=[],casterItems=[],shadowDraws=[];
       const opaque=[],transmissive=[],transparent=[],transmissionBacks=[],stack=[{object:root,groupOrder:0}],descriptions=new Map(),projectionOrder=new Map();

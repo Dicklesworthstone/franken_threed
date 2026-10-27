@@ -5,10 +5,11 @@
  */
 import {hasThreeNodeProgram, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
-  withThreeNativeCapture, markThreeNativeDrawCaptured} from './three_node_shadows.mjs';
+  withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
 import {inspectThreeLightingContext} from './three_node_passes.mjs';
 import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 import {inspectThreeNativeBatch, captureThreeNativeBatch} from './three_node_batch.mjs';
+import {updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const integer = value => Number.isSafeInteger(value) && value >= 0;
@@ -57,7 +58,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       !hasThreeNodeProgram(backgroundMesh.material)))
     fail('BACKGROUND', 'Native backgrounds require a separate childless mesh with one authored node material');
   const shadowPass = getThreeNativeShadowPass(renderer, overrideMaterial);
-  const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root];
+  const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root], hookedObjects = new Set();
+  let nativeOverrides = false;
   const phaseBindings = {opaque: new Set(), transparent: new Set()}, compiledBindings = new Set();
   // The source inserts a private background object into the render list. Admit
   // and prepare it without adding it to, or updating through, the user's root.
@@ -147,7 +149,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
-  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene
+  // The source builder owns fragment depth and camera conventions. A fixed
+  // color shader must never silently render a logarithmic or reversed scene.
+  const nativeDepthScene = renderer?.logarithmicDepthBuffer === true || renderer?.reversedDepthBuffer === true;
+  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -168,24 +173,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (shadowPass && originals.some(original => original && original.allowOverride !== true))
       fail('SHADOW', 'Native shadow casters currently require the source shadow override material');
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
-    for (let i = 0; i < originals.length; i++) {
-      const original = originals[i], material = effective[i];
-      if (shadowPass || original === material || (!nativeMaterial(original) && !nativeMaterial(material) && !instancedGeometry && !batch)) continue;
-      // _renderTransparents changes the original's side before renderObject
-      // installs a distinct override. That override can expand each original
-      // pass again. This capture profile must not silently replace those source
-      // passes with the effective material's two ordinary color variants.
-      if (transmissive(original) && original.side === three.DoubleSide && original.forceSinglePass === false)
-        fail('EFFECT', 'Transmissive DoubleSide overrides require capture of the original and effective pass expansion');
-      // r186 renderObject inherits these values before applying an override.
-      // The first profile admits the already-equivalent state without mutating
-      // a shared override material or changing its callback identity.
-      if ((original.positionNode?.isNode && original.positionNode !== material.positionNode) ||
-          ['alphaTest', 'alphaMap', 'displacementMap', 'displacementScale', 'displacementBias'].some(key => original[key] !== material[key]) ||
-          transparent(original) !== material.transparent)
-        fail('EFFECT', 'Native node material overrides require matching inherited position, alpha, displacement and transparency state');
-    }
     if (!bundle && !instancedGeometry && !batch && !effective.some(nativeMaterial)) continue;
+    if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
     // unsupported classes still fail the complete preflight below.
@@ -193,8 +182,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         (object.isSkinnedMesh ? three.SkinnedMesh.prototype.intersectsFrustum : three.Mesh.prototype.intersectsFrustum))
       fail('OBJECT', 'Native node scenes require ordinary meshes with their source frustum implementation');
     if (batch) inspectThreeNativeBatch(three, object, fail);
-    if (object.onBeforeRender !== (batch ? three.BatchedMesh.prototype : three.Object3D.prototype).onBeforeRender || object.onAfterRender !== three.Object3D.prototype.onAfterRender)
-      fail('HOOK', 'Native node object render hooks are not admitted');
+    if (typeof object.onBeforeRender !== 'function' || typeof object.onAfterRender !== 'function')
+      fail('HOOK', 'Native object render callbacks must be callable');
+    if (object.onBeforeRender !== (batch ? three.BatchedMesh.prototype : three.Object3D.prototype).onBeforeRender ||
+        object.onAfterRender !== three.Object3D.prototype.onAfterRender) hookedObjects.add(object);
     const geometry = object.geometry;
     if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
       fail('GEOMETRY', 'Native node meshes require bounded source BufferGeometry groups');
@@ -257,16 +248,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       bindings.push(draw.binding); compiledBindings.add(draw.binding);
       objects.add(draw.object); bundleObjects.add(draw.object);
     }
+  const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides;
+  if (nativeLifecycle && (root.isScene !== true || !bundles))
+    fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {
     if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null) return null;
     phases.opaque = listEnabled('opaque'); phases.transparent = listEnabled('transparent'); phases.output = phases.opaque;
     // The facade marks every captured pass as having updated source matrices,
     // including an empty pass. Hidden skins still participate in CPU animation.
     updateMatrices();
-    if (camera.coordinateSystem !== three.WebGPUCoordinateSystem) {
-      if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
-      camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
-    }
+    updateThreeCameraProjection(three, renderer, camera);
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
@@ -274,8 +265,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
-  if (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth || renderer?.reversedDepthBuffer)
-    fail('CAMERA', 'Native node scenes require an ordinary non-reversed camera');
+  if (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera)
+    fail('CAMERA', 'Native node scenes require an ordinary camera');
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
@@ -303,10 +294,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   updateMatrices();
   if (backgroundMesh?.matrixWorldAutoUpdate === true) backgroundMesh.updateMatrixWorld();
-  if (camera.coordinateSystem !== three.WebGPUCoordinateSystem) {
-    if (typeof camera.updateProjectionMatrix !== 'function') fail('CAMERA', 'The source camera cannot update its WebGPU projection');
-    camera.coordinateSystem = three.WebGPUCoordinateSystem; camera.updateProjectionMatrix();
-  }
+  updateThreeCameraProjection(three, renderer, camera);
   const clippingContexts = nativeClippingScene ? captureThreeNodeClipping(three, {root, camera, hierarchy, visibility,
     shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, fail}) : null;
   for (const binding of bindings) if (binding.nodeProgram === null)
@@ -335,6 +323,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         group: group ? Object.freeze({...group}) : null, groupOrder, z, renderOrder: object.renderOrder,
         first, count: Math.max(0, end - first), frontFaceCW: object.matrixWorld.determinant() < 0,
         nodeRangeCaptured: true, nodeUniforms: null, background, sourceMaterial: original, sourceGroup: group,
+        transmissionDoublePass: transmissive(original) && original.side === three.DoubleSide && original.forceSinglePass === false,
         ...(shadowPass ? {shadowBindings: variants} : {colorBindings: variants})};
       const selection = bundleMembers.get(object);
       if (selection) {
@@ -356,7 +345,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         // Fixed draws are selected and merged by the core after this native
         // capture. Their order can precede draws[0], including when sorting is
         // disabled, so that native prefix is not a whole-scene boundary.
-        else if (uniforms && !objects.has(object) && object.material &&
+        else if ((uniforms || nativeLifecycle) && !objects.has(object) && object.material &&
             (Array.isArray(object.material) ? object.material : [object.material]).some(material => material?.visible))
           fixedDrawCandidates = true;
         else if (pairs.has(object) && (!object.frustumCulled || object.intersectsFrustum(frustum))) {
@@ -383,6 +372,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     draws.push(...backgroundDraws, ...opaque, ...translucent);
   }
+  if (nativeLifecycle && fixedDrawCandidates)
+    fail('HOOK', 'Object callbacks in mixed fixed/native lists require one shared source draw capture');
   // The source projects lights for compileAsync as well as rendering. Keep the
   // selected source objects (including LOD visibility), not packed radiance;
   // its shared LightsNode/NodeFrame own light uniforms and update frequencies.
@@ -438,15 +429,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const deferred = new Set();
     for (const draw of selected)
       for (const binding of draw.shadowBindings ?? draw.colorBindings) {
-        preparationBindings.add(binding);
-        if (uniforms && draw.object.isBatchedMesh) deferred.add(binding);
+        if (!nativeLifecycle || draw.background) preparationBindings.add(binding);
+        if (nativeLifecycle && !draw.background || uniforms && draw.object.isBatchedMesh) deferred.add(binding);
       }
     for (const binding of selectedBindings)
-      withBinding(binding, () => programs.inspect(binding.material, binding.object, context));
+      if (!nativeLifecycle || !deferred.has(binding)) withBinding(binding, () => programs.inspect(binding.material, binding.object, context));
     const readyBindings = selectedBindings.filter(binding => !deferred.has(binding));
     compileBindings(readyBindings);
     if (!uniforms) return;
-    const readyDraws = selected.filter(draw => !draw.object.isBatchedMesh);
+    const readyDraws = selected.filter(draw => (!nativeLifecycle || draw.background) && !draw.object.isBatchedMesh);
     for (const draw of readyDraws) chargeBindings(draw.shadowBindings ?? draw.colorBindings);
     if (readyDraws.length) prepareEnvironment(readyBindings, readyDraws[0]);
   };
@@ -456,7 +447,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // an earlier queued draw must keep its own immutable program and resources.
   const prepareBatchBindings = (draw, selectedBindings) => {
     if (draw.object.geometry !== draw.geometry)
-      fail('CHANGED', 'A batch callback replaced its selected geometry; prepare the scene again');
+      fail('CHANGED', 'An object callback replaced its selected geometry; prepare the scene again');
     const prepared = selectedBindings.map(binding => ({...binding, nodeProgram: null, raster: null}));
     for (const binding of prepared)
       withBinding(binding, () => programs.inspect(binding.material, binding.object, context));
@@ -466,7 +457,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     return prepared;
   };
   const frameContext = {...context, ...frameStamp};
-  const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set();
+  const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
   const captureVertexAttribute = (attribute, view) => {
     const lease = storageOwner.capture(attribute);
     // Retain first so any subsequent proof/capture failure releases the upload.
@@ -497,8 +488,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         captureVertexAttribute, clippingContext: draw.binding.clippingContext,
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
-            height: destination?.height ?? renderer.domElement?.height ?? 1},
-          captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
+            height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
+        ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
       if (draw.nodeBundle) updateContext.refreshType = programs.refresh(draw.binding.nodeProgram, updateContext);
       // ShadowNode recursively renders here. Keep the complete source before
       // sequence outside this draw's resource transaction, without hoisting it
@@ -507,15 +498,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (beforeDone) programs.before(draw.binding.nodeProgram, updateContext);
       const capture = () => {
       markThreeNativeDrawCaptured(renderer);
+      const vertexStart = vertexStorageUses.length;
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
-      if (draw.nodeBundle) {
-        draw.bundleGeometry = captured.bundleGeometry.retain();
+      if (captured.bundleGeometry) {
+        draw.bundleGeometry = draw.nodeBundle ? captured.bundleGeometry.retain() : captured.bundleGeometry;
         bundleGeometries.push(draw.bundleGeometry);
         if (!chargedGeometry.has(draw.bundleGeometry.geometry)) {
           chargedGeometry.add(draw.bundleGeometry.geometry); bytes += draw.bundleGeometry.bytes;
-          if (bytes > maxUniformBytes) fail('LIMIT', 'Native bundle geometry exceeds the pending capture byte budget');
+          if (bytes > maxUniformBytes) fail('LIMIT', 'Native geometry exceeds the pending capture byte budget');
         }
       }
       const capturedGeometry = draw.bundleGeometry?.geometry ?? captured.programGeometry;
@@ -538,6 +530,18 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           group ? (group.start + group.count) * 2 : Infinity);
         draw.count = Math.max(0, end - draw.first);
       }
+      if (draw.hookCapture && !draw.binding.nodeProgram.wireframe && !draw.object.isBatchedMesh) {
+        const range = draw.sourceRange, group = draw.sourceGroup;
+        const geometry = capturedGeometry ?? draw.geometry;
+        const extent = geometry.index?.count ?? geometry.attributes.position?.count;
+        if (!integer(extent) || !integer(range?.start) || !(range.count === Infinity || integer(range.count)) ||
+            group && (!integer(group.start) || !(group.count === Infinity || integer(group.count))))
+          fail('GEOMETRY', 'Native callback draw ranges must fit nonnegative source ranges');
+        draw.first = Math.min(extent, Math.max(range.start, group?.start ?? 0));
+        const end = Math.min(extent, range.start + range.count, group ? group.start + group.count : Infinity);
+        draw.count = Math.max(0, end - draw.first);
+        draw.frontFaceCW = draw.object.matrixWorld.determinant() < 0;
+      }
       // Lease each post-update texture before after() or the next logical draw
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
       // target leases hold generation metadata and observe contents in the FIFO.
@@ -549,7 +553,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         textureOwner ??= draw.bundleTextureOwner; storageOwner ??= draw.bundleStorageOwner;
         for (const binding of draw.nodeTextures) textureUses.push(textureOwner.retain(binding.lease));
         for (const binding of draw.nodeStorage) storageUses.push(storageOwner.retain(binding.lease));
+        for (const lease of draw.nodeVertexStorage ?? []) {
+          storageUses.push(storageOwner.retain(lease)); vertexStorageUses.push(lease);
+        }
       } else {
+      draw.nodeVertexStorage = Object.freeze(vertexStorageUses.slice(vertexStart));
       draw.nodeTextures = Object.freeze(captured.textures.map(binding => {
         const lease = textureOwner.captureBinding(binding);
         textureUses.push(lease);
@@ -609,12 +617,44 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const capturePhase = (selected, phase, bundled = false) => {
     // Source compileAsync runs the object callback, but no NodeFrame updates.
     // Render capture runs it in draw order below, before a DoubleSide split.
-    if (!uniforms) for (const draw of selected) if (draw.object.isBatchedMesh)
+    if (!uniforms && !nativeLifecycle) for (const draw of selected) if (draw.object.isBatchedMesh)
       draw.object.onBeforeRender(renderer, root, camera, draw.geometry, draw.sourceMaterial, draw.sourceGroup);
     preparePhase(selected, phase, bundled);
-    if (!uniforms) return;
+    if (!uniforms && !nativeLifecycle) return;
+    const captureSource = (draw, transmissionBack = false) => {
+      const previous = renderer._handleObjectFunction;
+      renderer._handleObjectFunction = (object, material, scene, selectedCamera, _lights, group, clippingContext, passId = null) =>
+        withThreeNativeObjectHooks(renderer, () => {
+          if (object !== draw.object || scene !== root || selectedCamera !== camera || group !== draw.sourceGroup)
+            fail('HOOK', 'An object callback changed its source draw selection');
+          if (object.geometry !== draw.geometry)
+            fail('CHANGED', 'An object callback replaced its selected geometry; prepare the scene again');
+          const binding = {...draw.binding, material, nodeProgram: null, raster: null, passId,
+            clippingContext: clippingContext ?? draw.binding.clippingContext,
+            ...(shadowPass ? {original: draw.sourceMaterial, shadowSide: material.side} : {colorSide: material.side}),
+            ...(draw.nodeBundle ? {bundleToken: bundles.token(draw.bundleSelection.entry, object, material, passId)} : {})};
+          if (!uniforms) {
+            // Source compileAsync first queues every render-object selection,
+            // including before/after callbacks, then constructs the pipelines.
+            deferredHookBindings.push(binding); preparationBindings.add(binding); return;
+          }
+          const current = {...draw, material};
+          const prepared = prepareBatchBindings(current, [binding])[0];
+          captureDraw({...current, binding: prepared, hookCapture: true, transmissionBack});
+        }, false);
+      try {
+        withThreeNativeObjectHooks(renderer, () => {
+          if (shadowPass) shadowPass.renderObject(draw.object, root, camera, draw.geometry,
+            draw.sourceMaterial, draw.sourceGroup, null, draw.binding.clippingContext, transmissionBack ? 'backSide' : null);
+          else three.Renderer.prototype.renderObject.call(renderer, draw.object, root, camera, draw.geometry,
+            draw.sourceMaterial, draw.sourceGroup, null, draw.binding.clippingContext, transmissionBack ? 'backSide' : null);
+        });
+      } finally { renderer._handleObjectFunction = previous; }
+    };
     if (!shadowPass) {
       const captureColor = (draw, side = null, transmissionBack = false) => {
+        if (nativeLifecycle && !draw.background) return captureSource(draw, transmissionBack);
+        if (!uniforms) return;
         let selectedBindings;
         if (draw.object.isBatchedMesh) {
           draw.object.onBeforeRender(renderer, root, camera, draw.geometry, draw.sourceMaterial, draw.sourceGroup);
@@ -631,24 +671,25 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           withBinding(binding, () => captureDraw({...draw, binding, transmissionBack}));
       };
       const transparentDraws = selected.filter(draw => !draw.background && draw.listMaterial.transparent);
-      const doublePassDraws = transparentDraws.filter(draw => draw.binding.transmissionDoublePass);
+      const doublePassDraws = transparentDraws.filter(draw => draw.transmissionDoublePass);
       for (const draw of selected) if (draw.background || !draw.listMaterial.transparent) captureColor(draw);
       // r186 _renderTransparents renders all transmissive back faces before
       // the complete transparent list. Every participating material already
       // has the selected side when any of that phase's node callbacks run.
-      const sides = new Map(doublePassDraws.map(draw => [draw.material, draw.material.side]));
+      const sides = new Map(doublePassDraws.map(draw => [draw.sourceMaterial, draw.sourceMaterial.side]));
       try {
         for (const material of sides.keys()) material.side = three.BackSide;
         for (const draw of doublePassDraws) captureColor(draw, three.BackSide, true);
         for (const material of sides.keys()) material.side = three.FrontSide;
         for (const draw of transparentDraws)
-          captureColor(draw, draw.binding.transmissionDoublePass ? three.FrontSide : null);
+          captureColor(draw, draw.transmissionDoublePass ? three.FrontSide : null);
       } finally {
         for (const [material, side] of sides) material.side = side;
       }
       return;
     }
     for (const draw of selected) {
+      if (nativeLifecycle) { captureSource(draw); continue; }
       // Execute the pinned caster selector and Renderer.renderObject lifecycle
       // once per source list item. Its temporary shared override remains live
       // through native uniform/resource capture and is restored by the source.
@@ -701,6 +742,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // Capture this later decision separately from the accepted scene list.
     phases.output = listEnabled('opaque');
   };
+  // A deferred request starts with its accepted selector, then source callbacks
+  // may change it for this and subsequent draws. Never reinstall it per object.
+  const previousOverride = root.overrideMaterial;
+  const installOverride = nativeLifecycle && previousOverride !== overrideMaterial;
+  if (installOverride) root.overrideMaterial = overrideMaterial;
   try {
     withThreeNativeCapture(renderer, record => {
       recordTexture = record;
@@ -709,6 +755,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (fixedDrawCandidates) markThreeNativeDrawCaptured(renderer);
       capture();
       if (!uniforms) {
+        compileBindings(deferredHookBindings);
         const captureStorage = () => storageOwner ? storageOwner.captureDispatch(() => {}) : undefined;
         if (textureOwner) textureOwner.captureDispatch(captureStorage);
         else captureStorage();
@@ -722,17 +769,34 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (const lease of storageUses) storageOwner.release(lease);
     for (const lease of bundleGeometries) lease.release();
     throw error;
+  } finally {
+    if (installOverride && root.overrideMaterial === overrideMaterial) root.overrideMaterial = previousOverride;
   }
   draws.splice(0, draws.length, ...capturedDraws);
-  let preparedAttributes = null;
-  return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, bundleGeometries: Object.freeze(bundleGeometries),
-    sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([...compiledBindings]), draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
+  let preparedAttributes = null, preparedBindings = null;
+  const acceptedBindings = Object.freeze([...compiledBindings]);
+  return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
+    get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
+    sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases),
+    get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (!uniforms) {
-        // compileAsync uploads visible geometry without application updates.
-        // Storage views retain allocation identity, never a CPU simulation copy.
-        preparedAttributes ??= [...preparationBindings].map(binding => withBinding(binding, () => programs.captureAttributes?.(
-          binding.nodeProgram, {...frameContext, object: binding.object, material: binding.material, captureVertexAttribute}))).filter(Boolean);
+        // compileAsync uploads visible geometry without node updates. Preserve
+        // immutable CPU histories and the storage owner's captured GPU views.
+        if (preparedAttributes === null) {
+          preparedAttributes = []; const ready = [];
+          for (const binding of preparationBindings) withBinding(binding, () => {
+            const attributes = programs.captureAttributes?.(binding.nodeProgram,
+              {...frameContext, object: binding.object, material: binding.material, captureVertexAttribute});
+            if (attributes) { preparedAttributes.push(attributes); attributes.install(); }
+            if (bundles) {
+              const lease = bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
+              bundleGeometries.push(lease);
+              ready.push(Object.freeze({...binding, programGeometry: lease.geometry}));
+            } else ready.push(binding);
+          });
+          preparedBindings = Object.freeze(ready);
+        }
         for (const attributes of preparedAttributes) attributes.install();
       }
       // Pipeline preparation needs actual vertex buffers. Publish these captured

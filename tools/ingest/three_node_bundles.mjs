@@ -39,6 +39,7 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
   function releaseDraw(draw) {
     for (const binding of draw.nodeTextures) draw.bundleTextureOwner.release(binding.lease);
     for (const binding of draw.nodeStorage) draw.bundleStorageOwner.release(binding.lease);
+    for (const lease of draw.nodeVertexStorage ?? []) draw.bundleStorageOwner.release(lease);
     draw.bundleGeometry?.release();
   }
   return Object.freeze({resources,
@@ -85,6 +86,10 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
           for (const binding of draw.nodeStorage) {
             draw.bundleStorageOwner.retain(binding.lease);
             undo.push(() => draw.bundleStorageOwner.release(binding.lease));
+          }
+          for (const vertexLease of draw.nodeVertexStorage ?? []) {
+            draw.bundleStorageOwner.retain(vertexLease);
+            undo.push(() => draw.bundleStorageOwner.release(vertexLease));
           }
           retained.push(Object.freeze({...draw, bundleGeometry: lease}));
         }

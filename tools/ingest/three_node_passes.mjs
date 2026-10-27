@@ -143,8 +143,8 @@ export function inspectThreeNativePass(three, renderer, node) {
       node.updateBeforeType !== 'frame' || node.updateType !== 'none' || node.updateAfterType !== 'none')
     fail('Native scene passes require the pinned PassNode lifecycle');
   if (!(node.scene instanceof three.Scene) || !(node.camera instanceof three.Camera) ||
-      node.camera.isArrayCamera || node.camera.isMultiViewCamera || node.camera.reversedDepth)
-    fail('Native scene passes require an ordinary source scene and non-reversed camera');
+      node.camera.isArrayCamera || node.camera.isMultiViewCamera)
+    fail('Native scene passes require an ordinary source scene and camera');
   if (node.scope !== three.PassNode.COLOR && node.scope !== three.PassNode.DEPTH)
     fail('Native scene passes require color or depth output');
   if (!node.renderTarget?.textures?.length || node.renderTarget.texture !== node._textures.output ||
