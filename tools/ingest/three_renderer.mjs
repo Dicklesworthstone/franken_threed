@@ -97,6 +97,23 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
+  // A retained addon may replace the exported renderer prototype's init before
+  // construction (r186 Inspector Settings does this to select WebGL). Preserve
+  // that method on a genuine source renderer, before allocating any native
+  // state or acquiring a canvas context. Only instances constructed here may
+  // dispatch the captured native init back into the retained implementation.
+  const retainedInitReceivers = new WeakSet();
+  const exactInit = exactBackend?.prototype?.init;
+  const overriddenInitPrototype = receiver => {
+    const prototype = Object.getPrototypeOf(receiver);
+    for (let current = prototype; current !== null; current = Object.getPrototypeOf(current)) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, 'init');
+      // Do not invoke an accessor early. Its ordinary getter must run only
+      // when the application reads init on the constructed source instance.
+      if (descriptor) return descriptor.value === nativeInit ? null : prototype;
+    }
+    return prototype;
+  };
 
   /** Cheap, per-frame profile of scene-level features that select bridge options. */
   function sceneKey(renderer, scene, backgroundState) {
@@ -225,6 +242,26 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   class WebGPURenderer {
     constructor(parameters = {}) {
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
+      const sourcePrototype = exactBackend && overriddenInitPrototype(this);
+      if (sourcePrototype) {
+        if (typeof exactInit !== 'function') fail('ROUTE', 'An overridden init requires an exact backend with its source init method');
+        const retained = new exactBackend(parameters);
+        retainedInitReceivers.add(retained);
+        // Keep prototype changes live: Settings can restore the captured init
+        // after constructing this instance. An application assignment still
+        // creates its ordinary own method, just as inherited writable init did.
+        if (!Object.hasOwn(retained, 'init')) {
+          const bridge = Object.create(Object.getPrototypeOf(retained), {
+            init: {
+              configurable: true,
+              get() { return Reflect.get(sourcePrototype, 'init', this); },
+              set(value) { Object.defineProperty(this, 'init', {value, configurable: true, writable: true, enumerable: true}); },
+            },
+          });
+          Object.setPrototypeOf(retained, bridge);
+        }
+        return retained;
+      }
       for (const key of Object.keys(parameters)) if (!(this._parameterNames?.() ?? PARAMETERS).has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       const {
         canvas = null, antialias = false, alpha = true, depth = true, stencil = false, samples = 0,
@@ -375,6 +412,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     get backend() { this._backend.device = this._session?.device ?? null; return this._backend; }
 
     init() {
+      if (retainedInitReceivers.has(this)) return exactInit.call(this);
       if (this._initPromise) return this._initPromise;
       this._initPromise = this._init();
       return this._initPromise;
@@ -1448,6 +1486,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       else this._drain.finally(() => this._release()).catch(() => {});
     }
   }
+  const nativeInit = WebGPURenderer.prototype.init;
   return withThreeCompute(WebGPURenderer, THREE);
 }
 
