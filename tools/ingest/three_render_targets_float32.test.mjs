@@ -92,8 +92,8 @@ for (const [format, native] of formats) test(`${native}: incompatible formats fa
   const f = fixture();
   for (const options of [{samples: 4}, {colorSpace: T.SRGBColorSpace}, {internalFormat: 'RGBA32F'}, {format: 9999}])
     assert.throws(() => f.owner.capture(target(format, options)), {code: 'THREE_TARGET_UNSUPPORTED'});
-  if (format !== T.RGBAFormat) for (const type of [T.UnsignedByteType, T.HalfFloatType])
-    assert.throws(() => f.owner.capture(target(format, {type})), {code: 'THREE_TARGET_UNSUPPORTED'});
+  if (format === T.RGFormat)
+    assert.throws(() => f.owner.capture(target(format, {type: T.UnsignedByteType})), {code: 'THREE_TARGET_UNSUPPORTED'});
   assert.equal(f.calls.textures.length, 0); f.owner.dispose();
 });
 

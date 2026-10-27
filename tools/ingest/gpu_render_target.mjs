@@ -85,7 +85,7 @@ export class GpuRenderTargetError extends Error {
 }
 const fail = (code, message) => { throw new GpuRenderTargetError(code, message); };
 const COLOR_BYTES = new Map([
-  ['r8unorm', 1], ['rg11b10ufloat', 4],
+  ['r8unorm', 1], ['r16float', 2], ['rg16float', 4], ['rg11b10ufloat', 4],
   ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
   ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
@@ -105,7 +105,7 @@ export function inspectGpuRenderTargetColors(device, formats) {
     // render cost despite their four-byte storage footprint. R8 costs one byte;
     // packed R11G11B10 requires four-byte component alignment.
     const bytes = formats.reduce((total, format) => {
-      const alignment = format.includes('32float') || format === 'rg11b10ufloat' ? 4 : format === 'rgba16float' ? 2 : 1;
+      const alignment = format.includes('32float') || format === 'rg11b10ufloat' ? 4 : format.endsWith('16float') ? 2 : 1;
       const cost = format === 'rg11b10ufloat' || format.includes('8unorm') && format !== 'r8unorm' ? 8 : COLOR_BYTES.get(format);
       return Math.ceil(total / alignment) * alignment + cost;
     }, 0);

@@ -6,6 +6,7 @@ import {transferDevice, deferred} from './fixtures/target_transfer_fixture.mjs';
 const cases = [
   ['rgba8unorm', Uint8Array, 4], ['rgba8unorm-srgb', Uint8Array, 4],
   ['bgra8unorm', Uint8Array, 4], ['bgra8unorm-srgb', Uint8Array, 4],
+  ['r16float', Uint16Array, 1], ['rg16float', Uint16Array, 2],
   ['rgba16float', Uint16Array, 4], ['r32float', Float32Array, 1],
   ['rg32float', Float32Array, 2], ['rgba32float', Float32Array, 4],
 ];

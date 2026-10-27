@@ -22,6 +22,7 @@ const FORMATS = new Map([
   ['r8unorm', [Uint8Array, 1, false]], ['rg11b10ufloat', [Uint32Array, 1, false]],
   ['rgba8unorm', [Uint8Array, 4, false]], ['rgba8unorm-srgb', [Uint8Array, 4, false]],
   ['bgra8unorm', [Uint8Array, 4, true]], ['bgra8unorm-srgb', [Uint8Array, 4, true]],
+  ['r16float', [Uint16Array, 1, false]], ['rg16float', [Uint16Array, 2, false]],
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
   ['r32float', [Float32Array, 1, false]], ['rg32float', [Float32Array, 2, false]],
 ]);
@@ -51,7 +52,7 @@ export function gpuTargetColorFormat(shape, colorIndex = 0, reject = fail) {
 }
 function layout(shape, colorIndex = 0) {
   const value = FORMATS.get(gpuTargetColorFormat(shape, colorIndex));
-  if (!value) fail('FORMAT', 'Expected R8, RGBA/BGRA8, R11G11B10F, RGBA16F or R/RG/RGBA32F color storage');
+  if (!value) fail('FORMAT', 'Expected R8, RGBA/BGRA8, R11G11B10F or R/RG/RGBA16F/32F color storage');
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
 }

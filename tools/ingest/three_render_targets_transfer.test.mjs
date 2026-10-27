@@ -5,6 +5,7 @@ import {createThreeRenderTargets} from './three_render_targets.mjs';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
 import {transferDevice, transferThree as T, deferred} from './fixtures/target_transfer_fixture.mjs';
 const cases = [[T.UnsignedByteType, T.RGBAFormat, Uint8Array, 4], [T.HalfFloatType, T.RGBAFormat, Uint16Array, 4],
+  [T.HalfFloatType, T.RedFormat, Uint16Array, 1], [T.HalfFloatType, T.RGFormat, Uint16Array, 2],
   [T.FloatType, T.RedFormat, Float32Array, 1], [T.FloatType, T.RGFormat, Float32Array, 2], [T.FloatType, T.RGBAFormat, Float32Array, 4]];
 const make = (type = T.UnsignedByteType, format = T.RGBAFormat, options = {}) => new T.RenderTarget(5, 4,
   {type, format, magFilter: T.NearestFilter, minFilter: T.NearestFilter, ...options});

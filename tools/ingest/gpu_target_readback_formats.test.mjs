@@ -11,6 +11,7 @@ const deferred = () => {
 const layouts = new Map([
   ['rgba8unorm', [Uint8Array, 4]], ['rgba8unorm-srgb', [Uint8Array, 4]],
   ['bgra8unorm', [Uint8Array, 4]], ['bgra8unorm-srgb', [Uint8Array, 4]],
+  ['r16float', [Uint16Array, 1]], ['rg16float', [Uint16Array, 2]],
   ['rgba16float', [Uint16Array, 4]], ['rgba32float', [Float32Array, 4]],
   ['r32float', [Float32Array, 1]], ['rg32float', [Float32Array, 2]],
 ]);
@@ -84,11 +85,12 @@ test('float32 values are never quantized to half floats, including signed zero',
   values.forEach((value, index) => assert.ok(Object.is(result[index], value)));
 });
 
-test('half-float bit patterns, including NaN encodings, are unchanged', async () => {
-  const f = fixture('rgba16float'), bits = [0x7c01, 0xfc00, 0x8000, 0x0001];
-  f.controls.fill = (_x, _y, c) => bits[c];
-  assert.deepEqual([...await readGpuTargetPixels(f.session, pixel)], bits);
-});
+for (const [format, components] of [['r16float', 1], ['rg16float', 2], ['rgba16float', 4]])
+  test(`${format}: half-float bit patterns, including NaN encodings, are unchanged`, async () => {
+    const f = fixture(format), bits = [0x7c01, 0xfc00, 0x8000, 0x0001];
+    f.controls.fill = (x, _y, c) => bits[x * components + c];
+    assert.deepEqual([...await readGpuTargetPixels(f.session, {...pixel, width: 4 / components})], bits);
+  });
 
 test('BGRA swizzle composes with bottom-left origin, reversed rows and an output subarray', async () => {
   const f = fixture('bgra8unorm'), backing = new Uint8Array(40).fill(211), output = backing.subarray(4, 36);

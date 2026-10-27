@@ -113,14 +113,16 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (![0, 1, 4].includes(target.samples)) fail('UNSUPPORTED', 'Target samples must be zero, one or four');
   if (target.samples === 4 && target.resolveColorBuffer === false) fail('UNSUPPORTED', 'MSAA targets must resolve their color');
   const float32 = three.FloatType !== undefined && texture.type === three.FloatType;
-  const floatFormat = texture.format === three.RGBAFormat ? 'rgba32float'
-    : three.RedFormat !== undefined && texture.format === three.RedFormat ? 'r32float'
-    : three.RGFormat !== undefined && texture.format === three.RGFormat ? 'rg32float' : null;
+  const halfFloat = three.HalfFloatType !== undefined && texture.type === three.HalfFloatType;
+  const floatChannels = texture.format === three.RGBAFormat ? 'rgba'
+    : three.RedFormat !== undefined && texture.format === three.RedFormat ? 'r'
+    : three.RGFormat !== undefined && texture.format === three.RGFormat ? 'rg' : null;
+  const floatFormat = floatChannels && (float32 || halfFloat) ? `${floatChannels}${float32 ? 32 : 16}float` : null;
   const red8 = three.RedFormat !== undefined && texture.format === three.RedFormat && texture.type === three.UnsignedByteType;
   const packedHDR = three.UnsignedInt101111Type !== undefined && texture.type === three.UnsignedInt101111Type &&
     texture.format === three.RGBFormat;
-  if (texture.internalFormat != null || (texture.format !== three.RGBAFormat && !(float32 && floatFormat) && !red8 && !packedHDR))
-    fail('UNSUPPORTED', 'Targets require RGBA, R8, packed RGB11F or FloatType R/RG, with no internal format override');
+  if (texture.internalFormat != null || (texture.format !== three.RGBAFormat && !floatFormat && !red8 && !packedHDR))
+    fail('UNSUPPORTED', 'Targets require RGBA, R8, packed RGB11F or HalfFloatType/FloatType R/RG, with no internal format override');
   if (typeof texture.generateMipmaps !== 'boolean') fail('UNSUPPORTED', 'generateMipmaps must be boolean');
   const linear = texture.colorSpace === three.NoColorSpace || texture.colorSpace === three.LinearSRGBColorSpace;
   let format;
@@ -129,9 +131,8 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   else if (texture.format === three.RGBAFormat && texture.type === three.UnsignedByteType &&
       (linear || texture.colorSpace === three.SRGBColorSpace))
     format = linear ? 'rgba8unorm' : 'rgba8unorm-srgb';
-  else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
-  else if (float32 && linear) format = floatFormat;
-  else fail('UNSUPPORTED', 'Target color must be RGBA8, linear R8/RGB11F/RGBA16F or linear R/RG/RGBA32F');
+  else if (floatFormat && linear) format = floatFormat;
+  else fail('UNSUPPORTED', 'Target color must be RGBA8, linear R8/RGB11F or linear R/RG/RGBA16F/32F');
   if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
   const depthAttachment = target.depthBuffer === true || target.stencilBuffer === true;
@@ -187,7 +188,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       : generateMipmaps ? maximumMipLevels : 1;
   if (!positive(mipLevelCount) || mipLevelCount > maximumMipLevels)
     fail('SIZE', 'Invalid target mip count for its extent');
-  const texelBytes = format === 'r8unorm' ? 1 : format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
+  const texelBytes = format === 'r8unorm' ? 1 : format === 'r16float' ? 2 : format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
   const layers = cube ? 6 : 1, baseColorBytes = width * height * texelBytes * layers;
   let colorBytes = baseColorBytes, w = width, h = height;
   for (let level = 1; level < mipLevelCount; level++) {

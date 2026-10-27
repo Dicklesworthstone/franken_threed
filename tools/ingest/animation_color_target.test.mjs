@@ -4,7 +4,7 @@ import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {createProgramMeshes} from './animation_program_mesh.mjs';
 
 const FLOAT32 = ['r32float', 'rg32float', 'rgba32float'];
-const LEGACY = ['rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb', 'rgba16float'];
+const LEGACY = ['rgba8unorm', 'rgba8unorm-srgb', 'bgra8unorm', 'bgra8unorm-srgb', 'r16float', 'rg16float', 'rgba16float'];
 const BLEND = Object.freeze({color: {srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha'},
   alpha: {srcFactor: 'one', dstFactor: 'one-minus-src-alpha'}});
 function reject(message) { throw Object.assign(new Error(message), {code: 'ANIMATION_RENDER_OPTIONS'}); }
