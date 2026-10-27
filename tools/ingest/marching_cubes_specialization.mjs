@@ -12,6 +12,8 @@ const MARCHING_CUBES_PIN='148ef33ecb6d2502ff796d4554abd1549c95d519';
 export const MARCHING_CUBES_SOURCE_BLOB='29a405be3eae30a7e2b1ff04827068921d31d5dc';
 export const EVENT_DISPATCHER_SOURCE_BLOB='ac793ea9081486b1b1e834c9df2480d18fb90e0c';
 export const COLOR_SOURCE_BLOB='f42d664478a6952dd1889eebc9a16736a2c614ab';
+const MATERIAL_SOURCE_BLOB='fe5bca948033d5f3fa5f8125d9ea2752430acde7';
+const SHADER_MATERIAL_SOURCE_BLOB='f557ef1aa2250b4c721c0dda132406b897ecc3ae';
 // Checked-in pinned build, also recorded in evidence/01.1/build_sha256.txt.
 const CORE_BUILD_SHA256='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 export function sourceBlob(source) {
@@ -109,9 +111,12 @@ export function specializeMarchingCubesBase(source,{
   const hash=sourceBlob(source),defaultPin=expectedBlob===EVENT_DISPATCHER_SOURCE_BLOB;
   const core=defaultPin && createHash('sha256').update(source).digest('hex')===CORE_BUILD_SHA256;
   const colorSource=defaultPin && hash===COLOR_SOURCE_BLOB;
-  if (hash!==expectedBlob && !core && !colorSource) return {changed:false,code:source};
-  const ast=parse(source),register=fresh(source,'register'),edits=[],registeredClasses=[];
-  if (!colorSource) {
+  const materialSource=defaultPin && hash===MATERIAL_SOURCE_BLOB;
+  const shaderSource=defaultPin && hash===SHADER_MATERIAL_SOURCE_BLOB;
+  if (hash!==expectedBlob && !core && !colorSource && !materialSource && !shaderSource) return {changed:false,code:source};
+  const ast=parse(source),register=fresh(source,'register'),registerPrototype=fresh(source,'material_prototype');
+  const edits=[],registeredClasses=[],registeredPrototypes=[];
+  if (!colorSource && !materialSource && !shaderSource) {
     const base=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name==='EventDispatcher');
     if (!base || base.superClass || base.body.body.some(node=>node.kind==='constructor')) throw new TypeError('Expected verified default base constructor');
     edits.push({at:base.body.start+1,text:`\nconstructor() { ${register}(this); }\n`});
@@ -126,9 +131,24 @@ export function specializeMarchingCubesBase(source,{
     edits.push({at:ctor.body.start+1,text:`\n${register}(this);\n`});
     registeredClasses.push('Color');
   }
+  const prototypeClasses=core?['EventDispatcher','Material','ShaderMaterial']:
+    materialSource?['Material']:shaderSource?['ShaderMaterial']:
+      defaultPin && hash===EVENT_DISPATCHER_SOURCE_BLOB?['EventDispatcher']:[];
+  for(const name of prototypeClasses) {
+    const declaration=ast.body.find(node=>node.type==='ClassDeclaration' && node.id?.name===name);
+    if(!declaration)throw new TypeError('Missing verified material prototype '+name);
+    // A class definition creates an ordinary prototype even when its imported
+    // superclass is different. The runtime validates every parent independently.
+    // Static registration precedes any caller receiving the class or instance.
+    edits.push({at:declaration.body.start+1,text:`\nstatic { ${registerPrototype}(this.prototype); }\n`});
+    registeredPrototypes.push(name);
+  }
   let code=source;
   for (const edit of edits.sort((a,b)=>b.at-a.at)) code=code.slice(0,edit.at)+edit.text+code.slice(edit.at);
-  const header=`import { registerMarchingCubesObject as ${register} } from ${JSON.stringify(runtimeModule)};\n`;
-  return {changed:true,registeredClasses,code:header+code,header,
+  const imports=[];
+  if(registeredClasses.length)imports.push(`registerMarchingCubesObject as ${register}`);
+  if(registeredPrototypes.length)imports.push(`registerMarchingCubesMaterialPrototype as ${registerPrototype}`);
+  const header=`import { ${imports.join(', ')} } from ${JSON.stringify(runtimeModule)};\n`;
+  return {changed:true,registeredClasses,registeredPrototypes,code:header+code,header,
     edits:edits.map(edit=>({start:edit.at,end:edit.at,text:edit.text}))};
 }

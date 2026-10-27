@@ -3,5 +3,6 @@
  * This is compiler-private ownership metadata, not a public Three.js facade.
  */
 const objects = new WeakSet();
-export const registerNumericObject = object => { objects.add(object); };
-export const isNumericObject = object => objects.has(object);
+const add = WeakSet.prototype.add, has = WeakSet.prototype.has, apply = Reflect.apply;
+export const registerNumericObject = object => { apply(add, objects, [object]); };
+export const isNumericObject = object => apply(has, objects, [object]);

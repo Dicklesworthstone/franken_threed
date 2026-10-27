@@ -12,6 +12,11 @@
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
 import {registerNumericObject,isNumericObject} from './numeric_objects.mjs';
 const apply=Reflect.apply, descriptor=Object.getOwnPropertyDescriptor, hasOwn=Object.hasOwn;
+const prototype=Object.getPrototypeOf,setHas=WeakSet.prototype.has,setAdd=WeakSet.prototype.add;
+const materialPrototypes=new WeakSet();
+// The primordial object is an ordinary identity, not an application's chain.
+// Inspect its live flatShading descriptor too; inherited getters must retain JS.
+apply(setAdd,materialPrototypes,[Object.prototype]);
 const isInteger=Number.isInteger, U8=Uint8Array, decode=globalThis.atob, charCodeAt=String.prototype.charCodeAt;
 const empty=new Float32Array(0);
 // Do not invoke replacement platform getters/constructors during admission.
@@ -41,6 +46,26 @@ const names=['size','size2','size3','halfsize','delta','yd','zd','isolation','fi
 
 /** Called only by verified base constructors (EventDispatcher/Color) with fresh `this`. */
 export function registerMarchingCubesObject(object) { registerNumericObject(object); }
+
+/** Emitted in static blocks of exact source class definitions. Their freshly
+ * created prototype is ordinary; callers never nominate a prototype by name. */
+export function registerMarchingCubesMaterialPrototype(object) { apply(setAdd,materialPrototypes,[object]); }
+
+/** Strict-true source semantics, including an absent inherited property.
+ * The instance witness permits its own descriptor/prototype access. Every next
+ * prototype must have its own compiler witness BEFORE it is inspected, so a
+ * reparented unknown object or Proxy retains the source without extra traps. */
+function flatShading(material) {
+  if(!objects.has(material))return null;
+  let current=material;
+  while(current!==null) {
+    const d=descriptor(current,'flatShading');
+    if(d)return hasOwn(d,'value')?{flat:d.value===true?1:0}:null;
+    current=prototype(current);
+    if(current!==null && !apply(setHas,materialPrototypes,[current]))return null;
+  }
+  return {flat:0};
+}
 
 /** No binary decoding or Wasm allocation until the first admitted update. */
 export function createMarchingCubesDispatch(base64,edgeTable,triTable) {
@@ -78,13 +103,12 @@ function snapshot(object) {
       typeof values.isolation!=='number' || typeof values.enableUvs!=='boolean' || typeof values.enableColors!=='boolean') return null;
   // WeakSet.has never invokes a Proxy's traps. Only a compiler registration of
   // the real constructed identity authorizes own-descriptor inspection.
-  if (!objects.has(values.material)) return null;
-  const shading=own(values.material,'flatShading');
+  const shading=flatShading(values.material);
   if (!shading) return null;
   let uvs=null,colors=null;
   if (values.enableUvs) {const d=own(object,'uvArray');if (!d) return null;uvs=d.value;}
   if (values.enableColors) {const d=own(object,'colorArray');if (!d) return null;colors=d.value;}
-  return {values,uvs:uvs??empty,colors:colors??empty,flat:shading.value===true ? 1 : 0};
+  return {values,uvs:uvs??empty,colors:colors??empty,flat:shading.flat};
 }
 
 /**

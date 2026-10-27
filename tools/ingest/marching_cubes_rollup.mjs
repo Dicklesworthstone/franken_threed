@@ -51,7 +51,8 @@ export function marchingCubesRollupPlugin(options={}) {
         if (result.changed) return {code:result.code,map:null};
       }
       const edits=[],headers=[];let tail='';
-      if (code.includes('class EventDispatcher') || code.includes('class Color')) {
+      if (code.includes('class EventDispatcher') || code.includes('class Color') ||
+          code.includes('class Material') || code.includes('class ShaderMaterial')) {
         const base=specializeMarchingCubesBase(code,{runtimeModule:ADAPTER});
         if (base.changed) {
           if (base.registeredClasses.includes('EventDispatcher')) registrations++;
