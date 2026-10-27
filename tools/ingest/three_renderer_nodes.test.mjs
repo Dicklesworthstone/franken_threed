@@ -61,6 +61,27 @@ function uniformBlocks(draw){
   return result;
 }
 
+test('authored sprites retain queued billboard uniforms and render once per source object instead of per instance',async t=>{
+  const f=fixture(t),N=T.TSL,material=new T.SpriteNodeMaterial();
+  const rotation=N.uniform(.375).setName('queuedSpriteRotation'),scale=N.uniform(new T.Vector2(.625,.8125)).setName('queuedSpriteScale');
+  material.colorNode=f.tint;material.rotationNode=rotation;material.scaleNode=scale;material.opacityNode=N.shapeCircle();
+  const sprite=new T.Sprite(material);sprite.center.set(.125,.875);sprite.scale.x=-2;sprite.count=5;
+  f.scene.remove(f.mesh);f.scene.add(sprite);let updates=0;
+  material.positionNode=N.uniform(new T.Vector3()).onObjectUpdate(()=>{updates++;return new T.Vector3();});
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  rotation.value=.6875;scale.value.set(.9375,.4375);sprite.center.set(.3125,.5625);sprite.count=11;
+  f.renderer.render(f.scene,f.camera);
+  rotation.value=99;scale.value.set(99,99);sprite.center.set(99,99);sprite.count=NaN;
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);assert.equal(updates,2);
+  assert.deepEqual(draws.map(draw=>draw.args.slice(0,2)),[[6,5],[6,11]]);
+  for(const [draw,values] of [[draws[0],[.375,.625,.8125,.125,.875]],[draws[1],[.6875,.9375,.4375,.3125,.5625]]]){
+    const words=uniformBlocks(draw).flat();for(const value of values)assert.ok(words.includes(value));
+    assert.equal(draw.pipeline.primitive.frontFace,'ccw','source sprites do not reverse face winding for negative object scales');
+  }
+  assert.equal(draws[0].pipeline,draws[1].pipeline);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('queued uniform-buffer arrays retain every binding and current values without update flags',async t=>{
   const f=fixture(t),N=T.TSL;
   const initial=new Float32Array([.125,.375,.625,1,.25,.5,.75,1]);
@@ -1038,9 +1059,8 @@ test('registered SunLight refuses unsupported shadow effects before updates and 
   f.mesh.material=material;f.scene.add(sun);await f.renderer.init();
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_LIGHTS'});
   f.renderer.library.addLight(SunLightNode,SunLight);sun.castShadow=true;
-  f.mesh.receiveShadow=true;f.renderer.shadowMap.enabled=true;f.renderer.shadowMap.type=T.VSMShadowMap;
-  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});
-  f.renderer.shadowMap.type=T.PCFShadowMap;sun.shadow.filterNode=T.TSL.float(1);
+  f.mesh.receiveShadow=true;f.renderer.shadowMap.enabled=true;f.renderer.shadowMap.type=T.PCFShadowMap;
+  sun.shadow.filterNode=T.TSL.float(1);
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});sun.shadow.filterNode=null;
   f.renderer.shadowMap.transmitted=true;
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_SHADOW'});

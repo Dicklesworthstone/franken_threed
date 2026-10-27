@@ -105,6 +105,27 @@ function recordCompute(device) {
   };
 }
 
+test('authored sprite casters retain the pinned modern shadow selector and material override', async t => {
+  const f = fixture(t), material = new T.SpriteNodeMaterial(), events = [];
+  const position = N.uniform(new T.Vector3(.125, .25, .375)).setName('sourceSpriteShadowPosition');
+  material.positionNode = position; material.colorNode = N.vec3(.25, .5, .75);
+  material.rotationNode = N.uniform(.5); material.scaleNode = N.uniform(.75);
+  const sprite = new T.Sprite(material); sprite.castShadow = true; sprite.frustumCulled = false; sprite.count = 2;
+  sprite.scale.x = -1; f.scene.add(sprite);
+  sprite.onBeforeShadow = (...args) => events.push(['before', ...args]);
+  sprite.onAfterShadow = (...args) => events.push(['after', ...args]);
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const passes = targetPasses(f.device).filter(pass => pass.draws.length);
+  const shadow = passes.flatMap(pass => pass.draws).filter(draw => draw.pipeline.vertex.module.code.includes('sourceSpriteShadowPosition'));
+  assert.equal(shadow.length, 1); assert.deepEqual(shadow[0].args.slice(0, 2), [6, 2]);
+  assert.equal(shadow[0].pipeline.primitive.frontFace, 'cw',
+    'the BackSide shadow override flips winding; sprite negative scale does not flip it a second time');
+  assert.deepEqual(events.map(event => event[0]), ['before', 'after']);
+  assert.ok(events.every(event => event[1] === f.renderer && event[2] === sprite && event[5] === sprite.geometry));
+  assert.equal(sprite.material, material); assert.equal(f.scene.overrideMaterial, null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 function animationHost(renderer) {
   const callbacks = new Map(); let serial = 0;
   renderer.domElement.ownerDocument = {defaultView: {

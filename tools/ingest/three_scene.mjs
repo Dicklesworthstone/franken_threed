@@ -369,6 +369,8 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           if(!(object instanceof three.Sprite)||object.intersectsFrustum!==three.Sprite.prototype.intersectsFrustum)
             fail('OBJECT','Expected a source Sprite without custom frustum tests');
+          // Captured native draws already validated their source material and
+          // effective override (including the renderer's shadow-pass material).
           if(!capturedNodeObject(object)){
             if(Array.isArray(sourceMaterial(object))||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
               fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');

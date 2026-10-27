@@ -28,6 +28,55 @@ function rig(t, options = {}) {
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
 
+for (const Material of [THREE.SpriteMaterial, THREE.SpriteNodeMaterial])
+for (const perspective of [false, true]) test(`${Material.name} retains authored sprite WGSL and live billboard uniforms with perspective=${perspective}`, t => {
+  const f = rig(t), material = new Material(), object = new THREE.Sprite(material);
+  const camera = perspective ? f.camera : new THREE.OrthographicCamera(-2, 2, 2, -2, .1, 100);
+  camera.position.z = 4; camera.coordinateSystem = THREE.WebGPUCoordinateSystem;
+  camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+  object.center.set(.125, .875); object.scale.set(-2, 3, 1); object.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
+  const rotation = N.uniform(.375).setName('spriteRotation'), scale = N.uniform(new THREE.Vector2(.625, .8125)).setName('spriteScale');
+  material.colorNode = N.vec3(.25, .5, .75); material.opacityNode = N.shapeCircle();
+  material.rotationNode = rotation; material.scaleNode = scale; material.sizeAttenuation = false;
+  const context = {...f.context, object, material, camera};
+  const descriptor = f.owner.compile(material, object, context), source = new THREE.WGSLNodeBuilder(object, f.renderer);
+  source.scene = f.scene; source.camera = camera; source.build();
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  assert.match(descriptor.vertex, /spriteRotation/); assert.match(descriptor.vertex, /spriteScale/);
+  const first = f.owner.capture(descriptor, context), saved = first.map(bytes => bytes.slice());
+  assert.ok(floats(first).includes(.375)); assert.ok(floats(first).includes(.625)); assert.ok(floats(first).includes(.8125));
+  rotation.value = .6875; scale.value.set(.9375, .4375); object.center.set(.3125, .5625);
+  assert.equal(f.owner.compile(material, object, context), descriptor, 'live sprite inputs retain their source program');
+  const second = f.owner.capture(descriptor, {...context, renderId: 2});
+  for (const value of [.6875, .9375, .4375, .3125, .5625]) assert.ok(floats(second).includes(value));
+  assert.deepEqual(first, saved, 'accepted billboard uniforms are immutable');
+  material.scaleNode = scale.mul(2);
+  const replacement = f.owner.compile(material, object, context);
+  assert.notEqual(replacement, descriptor); assert.notEqual(replacement.vertex, descriptor.vertex);
+});
+
+test('sprite graph admission traverses scale and rotation before authored updates', t => {
+  const f = rig(t), material = new THREE.SpriteNodeMaterial(), object = new THREE.Sprite(material);
+  let updates = 0;
+  material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  const storage = N.storage(new THREE.StorageBufferAttribute(1, 4), 'vec4', 1);
+  for (const slot of ['scaleNode', 'rotationNode']) {
+    material[slot] = N.Fn(() => { storage.element(0).assign(N.vec4(1)); return N.float(1); })();
+    assert.throws(() => f.owner.compile(material, object, {...f.context, object, material}), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+    material[slot] = null;
+  }
+  assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+});
+
+test('sprite program keys do not observe unrelated mesh center accessors', t => {
+  const f = rig(t);
+  Object.defineProperty(f.object, 'center', {get() { throw new Error('Unused mesh center was observed'); }});
+  const descriptor = f.compile();
+  assert.equal(f.compile(), descriptor);
+  assert.ok(f.owner.capture(descriptor, f.context).length > 0);
+});
+
 for (const Class of [THREE.MeshLambertNodeMaterial, THREE.MeshPhongNodeMaterial,
   THREE.MeshStandardNodeMaterial, THREE.MeshPhysicalNodeMaterial, THREE.MeshStandardMaterial]) {
   for (const transparent of [false, true]) test(`${Class.name} retains source GI/AO context composition with transparent=${transparent}`, t => {

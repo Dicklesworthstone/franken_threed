@@ -31,6 +31,43 @@ function rig(t) {
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
 const planeValues = context => Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
   [key, (context?.[key] ?? []).map(plane => plane.toArray())]));
+
+test('native authored sprites sort by source origin, retain count and do not reverse winding under negative scale', t => {
+  const f = rig(t), material = new THREE.SpriteNodeMaterial(); material.colorNode = N.vec3(.25, .5, .75);
+  const near = new THREE.Sprite(material), far = new THREE.Sprite(material);
+  // Shared sprite geometry is application-owned. Distinct bounds must not
+  // replace the source sprite-origin ordering or its dedicated frustum test.
+  near.geometry = near.geometry.clone(); far.geometry = far.geometry.clone();
+  near.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, -20), 1);
+  far.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 20), 1);
+  near.position.z = 1; far.position.z = -1; far.scale.x = -2;
+  near.count = 3; far.count = 200000; f.scene.add(near, far);
+  const captured = f.capture();
+  assert.deepEqual(captured.draws.map(draw => draw.object), [far, near]);
+  assert.deepEqual(captured.draws.map(draw => draw.instanceCount), [200000, 3]);
+  assert.ok(captured.draws.every(draw => !draw.frontFaceCW && draw.count === 6));
+  near.count = 7; far.count = 0;
+  assert.deepEqual(captured.draws.map(draw => draw.instanceCount), [200000, 3]);
+  far.position.x = 100; f.renderer.info.calls++;
+  assert.deepEqual(f.capture().draws.map(draw => draw.object), [near], 'source sprite culling ignores geometry sphere edits');
+});
+
+test('native sprite scale and rotation updates keep source frequencies and capture count before after-updates', t => {
+  const f = rig(t), material = new THREE.SpriteNodeMaterial(), counts = {frame: 0, render: 0, object: 0};
+  material.scaleNode = N.uniform(.5).onFrameUpdate(() => { counts.frame++; return .5; });
+  material.rotationNode = N.uniform(.25).onRenderUpdate(() => { counts.render++; return .25; });
+  const opacity = N.uniform(.75).onObjectUpdate(frame => { counts.object++; frame.object.count = counts.object; return .75; });
+  opacity.updateAfterType = 'object'; opacity.updateAfter = frame => { frame.object.count = 99; };
+  material.opacityNode = opacity;
+  const first = new THREE.Sprite(material), second = new THREE.Sprite(material); f.scene.add(first, second);
+  f.capture({uniforms: false}); assert.deepEqual(counts, {frame: 0, render: 0, object: 0});
+  const capture = f.capture(); assert.deepEqual(counts, {frame: 1, render: 1, object: 2});
+  assert.deepEqual(capture.draws.map(draw => draw.instanceCount), [1, 2]);
+  assert.deepEqual([first.count, second.count], [99, 99]);
+  f.renderer.info.calls++; f.capture(); assert.deepEqual(counts, {frame: 1, render: 2, object: 4});
+  f.frame.frameId++; f.renderer.info.calls++; f.capture(); assert.deepEqual(counts, {frame: 2, render: 3, object: 6});
+});
+
 test('nested native ClippingGroups match source camera projection, union/intersection and layer inheritance', t => {
   const f = rig(t), outer = new THREE.ClippingGroup(), inner = new THREE.ClippingGroup(), excluded = new THREE.ClippingGroup();
   outer.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), .25)];

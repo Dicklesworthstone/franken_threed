@@ -1,8 +1,8 @@
 # Native TSL graphics programs
 
 The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
-meshes, CPU- or storage-backed `InstancedMesh` objects, `InstancedBufferGeometry`
-and `BatchedMesh`. It retains the exact r186
+meshes, authored `Sprite` objects, CPU- or storage-backed `InstancedMesh` objects,
+`InstancedBufferGeometry` and `BatchedMesh`. It retains the exact r186
 `WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
 uniform buffers, command encoding and submission. The path does not construct an
@@ -13,7 +13,7 @@ acceleration or a Rust implementation of node evaluation.
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 `MeshPhongMaterial`, `MeshStandardMaterial`, `MeshPhysicalMaterial`,
-`MeshNormalMaterial` and `MeshMatcapMaterial` can also
+`MeshNormalMaterial`, `MeshMatcapMaterial` and `SpriteMaterial` can also
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
@@ -405,7 +405,7 @@ compute-produced values. Nested, boolean and atomic struct members are not yet
 admitted; a three-word struct is also refused because the source storage uploader
 treats that stride as a padded vec3.
 
-Ordinary meshes support `Mesh.count` with TSL `instanceIndex`, including
+Ordinary meshes and native sprites support source `count` with TSL `instanceIndex`, including
 compute-driven scalar/vector and structured particle positions. Each logical
 draw captures the count after before/current node updates and resource capture,
 before after-updates. Queued preparation cannot replace it with a later live
@@ -591,7 +591,7 @@ list items. `compileAsync()` runs object hooks without node updates; warm bundle
 do not replay object hooks or override inheritance. Material `onBeforeRender`
 remains inert, as it is in the pinned WebGPU renderer.
 
-This callback path currently requires a source Scene with wholly native mesh
+This callback path currently requires a source Scene with wholly native mesh or sprite
 draws. Mixed fixed/native hook lists, callback replacement of selected geometry,
 custom BatchedMesh hooks and recursive GPU writes still require additional
 capture boundaries and fail explicitly. Callback exceptions retain earlier
@@ -632,6 +632,20 @@ anchor-presence changes rebuild the source graph. Ten source-builder and
 recording-device regressions cover these behaviors; the four object/material
 combinations produce exact source vertex and fragment WGSL. These tests do not
 establish browser pixel parity or a performance gain.
+
+Compute-produced positions through `instancedArray(...).toAttribute()` and
+read-only storage bindings share the compute-owned GPU allocation without CPU
+readback or stale uploads. A recording-device case renders 200,000 instances in
+one draw. Converted SpriteMaterial views retain the source version after property
+copying, so size-attenuation setters do not spuriously invalidate queued programs.
+
+The separate `tests/e2e/webgpu_renderer/sprites.mjs` comparison establishes exact
+RGBA8 pixels against the pinned renderer for perspective, orthographic, live-node
+updates and compute-driven instancing at seven checkpoints per case. Chromium
+156.0.8078.73 / SwiftShader reported no GPU validation errors. This checks the
+direct native renderer route; it does not establish automatic construction routing,
+ArrayCamera or shadow pixel parity, or physical-device performance. See
+[THREE_SPRITES.md](THREE_SPRITES.md) for source culling semantics and route boundaries.
 
 ## Native source shadows
 

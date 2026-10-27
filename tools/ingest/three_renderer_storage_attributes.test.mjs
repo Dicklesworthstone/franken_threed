@@ -50,6 +50,43 @@ const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.
 const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
 const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
 
+test('compute-authored sprites draw their full source count from one shared instanced allocation', async t => {
+  const f = fixture(t), positions = N.instancedArray(200000, 'vec3');
+  const material = new T.SpriteNodeMaterial();
+  material.positionNode = positions.toAttribute(); material.colorNode = positions.element(N.instanceIndex).abs();
+  material.scaleNode = N.uniform(.125); material.rotationNode = N.uniform(.25); material.opacityNode = N.shapeCircle();
+  material.alphaToCoverage = true;
+  const sprite = new T.Sprite(material); sprite.count = 200000; sprite.frustumCulled = false;
+  f.scene.remove(f.mesh); f.scene.add(sprite);
+  await f.renderer.init();
+  f.device.onCompute = pass => {
+    const buffer = computeStorage(pass)[0];
+    new Float32Array(buffer.data).set([.25,.5,.75,0]);
+  };
+  await f.renderer.compute(kernel(positions));
+  const buffer = captureComputeStorage(f.device, positions.value).resolve().buffer;
+  f.renderer.render(f.scene, f.camera);
+  sprite.count = 3; f.renderer.render(f.scene, f.camera);
+  sprite.count = 0; f.renderer.render(f.scene, f.camera);
+  // Preparation may run after the caller edits the object again. Neither its
+  // count nor CPU zeros may replace the accepted native instance/storage state.
+  sprite.count = NaN;
+  await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 2);
+  assert.deepEqual(selected.map(draw => draw.args.slice(0, 2)), [[6, 200000], [6, 3]]);
+  for (const draw of selected) {
+    assert.ok([...draw.streams.values()].includes(buffer)); assert.ok(shaderStorage(draw).includes(buffer));
+    assert.deepEqual(words(draw, buffer).slice(0, 4), [.25, .5, .75, 0]);
+    assert.equal(draw.pipeline.primitive.topology, 'triangle-list');
+    const slot = [...draw.streams].find(([, value]) => value === buffer)[0];
+    assert.equal(draw.pipeline.vertex.buffers[slot].stepMode, 'instance');
+  }
+  assert.ok(positions.value.array.every(value => value === 0));
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  assert.equal(f.device.buffers.filter(candidate => candidate.label === 'f3d-compute-buffer' && candidate.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.info.f3d.presentedRenders, 3);
+});
+
 test('padded instanced .toAttribute shares the compute and shader storage allocation after compileAsync', async t => {
   const f = fixture(t), positions = N.instancedArray(3, 'vec3'), attribute = positions.value;
   f.mesh.count = 3;

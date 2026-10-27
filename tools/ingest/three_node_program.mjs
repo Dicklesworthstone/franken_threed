@@ -152,6 +152,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (record.defaults.has(key)) record.view[key] = record.defaults.get(key);
       else delete record.view[key];
     }
+    // Native setters such as SpriteNodeMaterial.sizeAttenuation can advance
+    // this private view while copying. The original material owns invalidation.
+    record.view.version = material.version;
     record.keys = keys;
     return record.view;
   }
