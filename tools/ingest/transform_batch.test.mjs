@@ -12,7 +12,7 @@ import {BundleGroup as ReferenceBundleGroup} from '../../upstream/three.js/build
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 async function fixture(options={}) {
   const entry='\0transform-batch-fixture',plugin=marchingCubesRollupPlugin(options);
-  const source='export {Object3D,Group,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
+  const source='export {Object3D,Group,Scene,Bone,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
     JSON.stringify(path.join(upstream,'build/three.core.js'))+';export {BundleGroup} from '+
     JSON.stringify(path.join(upstream,'build/three.webgpu.js'))+';'+
     'export {transformBatchDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-transform-batch-adapter')+';'+
@@ -47,13 +47,102 @@ function same(actual,expected){
 function configureManual(parent){
   parent.matrixAutoUpdate=false;parent.matrixWorldNeedsUpdate=false;fill(parent.matrix,4);fill(parent.matrixWorld,8);
 }
+function subtree(api){
+  const root=new api.Scene(),left=new api.Group(),right=new api.Object3D();
+  left.add(new api.Mesh(new api.BufferGeometry(),new api.MeshBasicMaterial()),new api.Bone());
+  left.children[1].add(new api.Object3D());right.add(new api.Group());root.add(left,right);
+  let index=0;
+  root.traverse(node=>{
+    const i=index++;node.position.set(i/3,1-i/7,-2);node.rotation.set(i/11,0.7,-i/13);
+    node.scale.set(i===3?0:-2,0.4+i/9,1.3);
+  });
+  return root;
+}
 
 test('only exact pinned built-core source admits the source-derived child transaction',()=>{
   const source=fs.readFileSync(path.join(upstream,'build/three.core.js'),'utf8');
   assert.equal(specializeTransformBatch(source+'\n// changed').changed,false);
   assert.equal(specializeTransformBatch(fs.readFileSync(path.join(upstream,'src/core/Object3D.js'),'utf8')).changed,false);
   assert.equal(native.report.compiledModules,1);assert.equal(native.report.accelerationClaim,false);
-  assert.equal(native.report.modules[0].sourceDerived,true);assert.equal(native.report.modules[0].wasmBytes,6217);
+  assert.equal(native.report.modules[0].sourceDerived,true);
+  assert.equal(native.report.modules[0].scope,'guarded-ordinary-subtrees');
+  assert.ok(native.report.modules[0].wasmBytes>0);
+});
+
+test('nested Groups, Meshes and Bones propagate current parent matrices in one source-derived transaction',()=>{
+  const {api}=native,actual=subtree(api),expected=subtree(reference),identities=[];
+  actual.traverse(node=>identities.push([node,node.matrix,node.matrix.elements,node.matrixWorld,node.matrixWorld.elements,
+    node.position,node.quaternion,node.scale]));
+  for(let frame=0;frame<3;frame++){
+    for(const root of [actual,expected]){
+      root.children[0].rotation.y+=0.2;root.children[0].children[1].position.x-=0.3;
+      root.updateMatrixWorld();
+    }
+    same(actual,expected);
+    assert.deepEqual(api.diagnostics(actual),{wasmCalls:frame+1,objects:6*(frame+1),fallbackCalls:0,lastFailure:null});
+  }
+  for(const [node,matrix,elements,world,worldElements,position,quaternion,scale]of identities){
+    assert.equal(node.matrix,matrix);assert.equal(matrix.elements,elements);
+    assert.equal(node.matrixWorld,world);assert.equal(world.elements,worldElements);
+    assert.equal(node.position,position);assert.equal(node.quaternion,quaternion);assert.equal(node.scale,scale);
+    if(node!==actual)assert.equal(api.diagnostics(node).wasmCalls,0);
+  }
+});
+
+test('mixed subtree flags keep inherited force local even when an ancestor world matrix is manual',()=>{
+  const {api}=native;
+  for(let seed=0;seed<24;seed++)for(const force of [undefined,false,true]){
+    const actual=subtree(api),expected=subtree(reference);
+    for(const root of [actual,expected]){
+      configureManual(root);
+      let index=0;
+      root.traverse(node=>{
+        if(node===root)return;
+        const flags=(seed+index*5)%8;
+        node.matrixAutoUpdate=!!(flags&1);node.matrixWorldAutoUpdate=!!(flags&2);node.matrixWorldNeedsUpdate=!!(flags&4);
+        fill(node.matrix,seed+index);fill(node.matrixWorld,seed+index+11);index++;
+      });
+    }
+    actual.updateMatrixWorld(force);expected.updateMatrixWorld(force);same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,1);
+  }
+  const actual=subtree(api),expected=subtree(reference);
+  for(const root of [actual,expected]){
+    let index=0;
+    root.traverse(node=>{configureManual(node);fill(node.matrixWorld,++index);});
+    root.children[0].matrixWorldNeedsUpdate=true;root.children[0].matrixWorldAutoUpdate=false;
+  }
+  const staleParent=[...actual.children[0].matrixWorld.elements],cleanSibling=[...actual.children[1].matrixWorld.elements];
+  actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
+  assert.deepEqual(actual.children[0].matrixWorld.elements,staleParent);
+  assert.deepEqual(actual.children[1].matrixWorld.elements,cleanSibling);
+  assert.equal(api.diagnostics(actual).wasmCalls,1);
+});
+
+test('a single-child chain is batched and add/remove/reparent edits rebuild source traversal on the next call',()=>{
+  const {api}=native,actual=new api.Group(),expected=new reference.Group();
+  for(const [root,types]of [[actual,api],[expected,reference]]){
+    let parent=root;
+    for(let i=0;i<64;i++){
+      const child=new types.Group();child.position.set(i/3,1,-1);child.rotation.y=i/31;
+      parent.add(child);parent=child;
+    }
+  }
+  actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
+  assert.deepEqual(api.diagnostics(actual),{wasmCalls:1,objects:64,fallbackCalls:0,lastFailure:null});
+  const a=subtree(api),b=subtree(reference);
+  const operations=[
+    (root,types)=>root.children[1].add(new types.Object3D()),
+    root=>root.children[1].add(root.children[0].children[0]),
+    root=>root.children[0].remove(root.children[0].children[0]),
+    (root,types)=>root.children[0].add(new types.Group()),
+  ];
+  let frames=0,objects=0;
+  for(const edit of operations){
+    edit(a,api);edit(b,reference);a.updateMatrixWorld();b.updateMatrixWorld();same(a,b);
+    a.traverse(node=>{if(node!==a)objects++;});
+    assert.deepEqual(api.diagnostics(a),{wasmCalls:++frames,objects,fallbackCalls:0,lastFailure:null});
+  }
 });
 
 test('H1 BundleGroup with 4000 Mesh children and one InstancedMesh updates all 4001 leaves in one Wasm call per frame',()=>{
@@ -171,6 +260,53 @@ test('observable methods, getters and proxy allocations retain the complete orig
   }
 });
 
+test('deep observable hooks refuse the ancestor transaction before effects and retain original DFS observations',()=>{
+  const {api}=native;
+  const cases=[
+    (root,trace)=>{
+      const child=root.children[0].children[1].children[0],method=child.updateMatrixWorld;
+      child.updateMatrixWorld=function(force){
+        trace.push(['deep',force,...root.children[0].children[0].matrixWorld.elements]);
+        root.children[1].position.x+=2;return method.call(this,force);
+      };
+    },
+    (root,trace)=>{
+      const child=root.children[1].children[0],value=child.matrix;
+      Object.defineProperty(child,'matrix',{get(){trace.push(['matrix',...root.children[0].matrixWorld.elements]);return value;}});
+    },
+    (root,trace)=>{
+      const branch=root.children[0].children[1],child=branch.children[0];
+      branch.children[0]=new Proxy(child,{
+        get(target,key,receiver){trace.push('get:'+String(key));return Reflect.get(target,key,receiver);},
+        getOwnPropertyDescriptor(target,key){trace.push('descriptor:'+String(key));return Reflect.getOwnPropertyDescriptor(target,key);},
+      });
+    },
+  ];
+  for(const prepare of cases){
+    const actual=subtree(api),expected=subtree(reference),a=[],b=[];
+    prepare(actual,a);prepare(expected,b);actual.updateMatrixWorld();expected.updateMatrixWorld();
+    assert.deepEqual(a,b);assert.equal(api.diagnostics(actual).wasmCalls,0);
+    same(actual,expected);
+  }
+});
+
+test('deep and cross-branch aliases, invalid topology and pivots keep the original subtree execution',()=>{
+  const {api}=native;
+  const cases=[
+    root=>{root.children[1].children[0].matrixWorld=root.children[0].children[0].matrixWorld;},
+    root=>{root.children[0].children[1].children[0].matrix.elements=root.children[0].matrix.elements;},
+    root=>{Object.defineProperty(root.children[1].children[0],'scale',{value:root.children[0].children[0].scale});},
+    root=>{root.children[0].children[1].children[0].parent=null;},
+    root=>{root.children[1].children[0]=root.children[0].children[0];},
+    (root,types)=>{root.children[0].children[1].pivot=new types.Vector3(1,2,-3);},
+  ];
+  for(const prepare of cases){
+    const actual=subtree(api),expected=subtree(reference);prepare(actual,api);prepare(expected,reference);
+    actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,0);
+  }
+});
+
 test('parent/sibling matrix and TRS aliases, duplicate children and wrong parents reject bulk execution',()=>{
   const {api}=native;
   const cases=[
@@ -196,6 +332,20 @@ test('kernel budget failure and read-only output preserve original writes and ex
   assert.equal(limited.api.diagnostics(actual).wasmCalls,0);assert.equal(limited.api.diagnostics(actual).fallbackCalls,1);
   const broken=group(native.api),refBroken=group(reference);
   for(const parent of [broken,refBroken])Object.defineProperty(parent.children[1].matrix.elements,'5',{writable:false});
+  assert.throws(()=>broken.updateMatrixWorld(),TypeError);assert.throws(()=>refBroken.updateMatrixWorld(),TypeError);
+  same(broken,refBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
+});
+
+test('subtree budget exhaustion and a late unwritable descendant preserve source publication and exceptions',()=>{
+  const actual=subtree(limited.api),expected=subtree(reference),trace=[];
+  const original=actual.updateMatrix;
+  actual.updateMatrix=function(){trace.push('owner');return original.call(this);};
+  actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
+  assert.deepEqual(trace,['owner']);
+  assert.deepEqual(limited.api.diagnostics(actual),{
+    wasmCalls:0,objects:0,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
+  const broken=subtree(native.api),refBroken=subtree(reference);
+  for(const root of [broken,refBroken])Object.defineProperty(root.children[1].children[0].matrix.elements,'5',{writable:false});
   assert.throws(()=>broken.updateMatrixWorld(),TypeError);assert.throws(()=>refBroken.updateMatrixWorld(),TypeError);
   same(broken,refBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
 });

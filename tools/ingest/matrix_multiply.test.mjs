@@ -15,13 +15,14 @@ async function fixture(core) {
   const entry='\0matrix-multiply-fixture',plugin=marchingCubesRollupPlugin();
   const source=(core?'export {'+Object.keys(exports).join(',')+'} from '+JSON.stringify(path.join(upstream,'build/three.core.js'))+';':
     Object.entries(exports).map(([name,file])=>'export {'+name+'} from '+JSON.stringify(path.join(upstream,'src',file))+';').join('\n'))+
-    'export {matrixMultiplyDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-matrix-multiply-adapter')+';';
+    'export {matrixMultiplyDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-matrix-multiply-adapter')+';'+
+    'export {transformBatchDiagnostics as transformDiagnostics} from '+JSON.stringify('\0f3d-transform-batch-adapter')+';';
   const bundle=await rollup({input:entry,plugins:[{name:'matrix-fixture',
     resolveId(id){return id===entry?id:null;},load(id){return id===entry?source:null;}},plugin]});
   try {
     const result=await bundle.generate({format:'es'});
     const api=await import('data:text/javascript;base64,'+Buffer.from(result.output[0].code).toString('base64'));
-    return {api,report:plugin.api.getMatrixMultiplicationReport()};
+    return {api,core,report:plugin.api.getMatrixMultiplicationReport()};
   }finally{await bundle.close();}
 }
 let fixtures;
@@ -73,8 +74,8 @@ test('multiply and premultiply preserve f64 operator order including nonfinite v
   }
 });
 
-test('retained Object3D hierarchy updates execute the native multiply and expose current world matrices',()=>{
-  for(const {api}of fixtures) {
+test('retained Object3D hierarchy updates execute native matrix or subtree kernels and expose current world matrices',()=>{
+  for(const {api,core}of fixtures) {
     const scene=new api.Object3D(),parent=new api.Object3D(),child=new api.Object3D();
     const refScene=new reference.Object3D(),refParent=new reference.Object3D(),refChild=new reference.Object3D();
     scene.add(parent);parent.add(child);refScene.add(refParent);refParent.add(refChild);
@@ -84,8 +85,10 @@ test('retained Object3D hierarchy updates execute the native multiply and expose
       scene.updateMatrixWorld(true);refScene.updateMatrixWorld(true);
       assert.deepEqual(child.matrixWorld.elements,refChild.matrixWorld.elements);
     }
-    assert.equal(api.diagnostics(parent.matrixWorld).wasmCalls,24);
-    assert.equal(api.diagnostics(child.matrixWorld).wasmCalls,24);
+    assert.equal(api.diagnostics(parent.matrixWorld).wasmCalls,core?0:24);
+    assert.equal(api.diagnostics(child.matrixWorld).wasmCalls,core?0:24);
+    assert.equal(api.transformDiagnostics(scene).wasmCalls,core?24:0);
+    if(core)assert.equal(api.transformDiagnostics(scene).objects,48);
   }
 });
 

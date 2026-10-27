@@ -1,4 +1,4 @@
-/** One source-derived numeric transaction for the pinned Object3D child loop. */
+/** One source-derived numeric transaction for a pinned Object3D descendant loop. */
 import {createHash} from 'node:crypto';
 import * as walk from 'acorn-walk';
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
@@ -6,7 +6,9 @@ import {compileNumericKernel} from './numeric_kernel.mjs';
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const fresh=(source,name)=>{let value='__f3d_transforms_'+name;while(source.includes(value))value+='_';return value;};
 const slots={matrixAutoUpdate:0,matrixWorldAutoUpdate:1,matrixWorldNeedsUpdate:2};
-export const TRANSFORM_BATCH_STRIDE=45;
+// TRS/flags and local/world matrices occupy the first 45 values. The parent
+// row (-1 for the already-updated owner) and outgoing force complete each row.
+export const TRANSFORM_BATCH_STRIDE=47;
 
 /** Only the complete pinned core establishes every constructor/method below.
  * Other module arrangements continue through their original source methods. */
@@ -17,6 +19,7 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   const loop=world.body.body.find(node=>node.type==='ForStatement');
   const compose=normalMethod(matrix,'compose').body.body,multiply=normalMethod(matrix,'multiplyMatrices').body.body;
   const base=fresh(source,'offset'),childForce=fresh(source,'force');
+  const parentIndex=fresh(source,'parent'),parentBase=fresh(source,'parent_offset');
   function rewrite(node,member,{force=false,booleans=false}={}) {
     const edits=[];
     walk.full(node,value=>{
@@ -32,8 +35,10 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   const arithmetic=(nodes,arrays,fields)=>nodes.map(node=>rewrite(node,value=>{
     const name=value.object.name;
     if(value.computed && Object.hasOwn(arrays,name)) {
-      const [array,offset]=arrays[name],index=value.property.value;
+      const index=value.property.value;
       if(!Number.isInteger(index))throw new TypeError('Pinned transform index changed');
+      if(typeof arrays[name]==='function')return arrays[name](index);
+      const [array,offset]=arrays[name];
       return array+'['+(offset===null?String(index):base+'+'+(offset+index))+']';
     }
     if(!value.computed && Object.hasOwn(fields,name)) {
@@ -45,13 +50,15 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   })).join('\n');
   const composition=arithmetic(compose.slice(1,-1),{te:['state',13]},
     {position:{x:3,y:4,z:5},quaternion:{_x:6,_y:7,_z:8,_w:9},scale:{x:10,y:11,z:12}});
-  const multiplication=arithmetic(multiply.slice(3,-1),{ae:['parent',null],be:['state',13],te:['state',29]},{});
+  const multiplication=arithmetic(multiply.slice(3,-1),{
+    ae:index=>'('+parentIndex+'<0?parent['+index+']:state['+parentBase+'+'+(29+index)+'])',
+    be:['state',13],te:['state',29]},{});
   const expression=node=>rewrite(node,value=>value.object.type==='ThisExpression' && Object.hasOwn(slots,value.property.name)
     ?slot(slots[value.property.name]):null,{force:true,booleans:true});
   function statement(node) {
     if(node.type==='BlockStatement')return '{'+node.body.map(statement).join('\n')+'}';
     if(node.type==='IfStatement') {
-      // Every admitted child has this ordinary parent and no pivot.
+      // Every admitted descendant has a guarded ordinary parent and no pivot.
       if(node.test.left?.object?.type==='ThisExpression' && node.test.left.property.name==='parent')return statement(node.alternate);
       return 'if('+expression(node.test)+')'+statement(node.consequent)+(node.alternate?'else '+statement(node.alternate):'');
     }
@@ -69,13 +76,15 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   const index=loop.init.declarations[0].id.name;
   const header=source.slice(loop.start,loop.body.start).replace('children.length','count');
   const kernelSource='function updateTransformChildren(state,parent,count,force){'+header+'{const '+base+'='+index+'*'+TRANSFORM_BATCH_STRIDE+
-    ';let '+childForce+'=force;'+world.body.body.slice(0,2).map(statement).join('\n')+'}}';
+    ';const '+parentIndex+'='+slot(45)+';const '+parentBase+'='+parentIndex+'*'+TRANSFORM_BATCH_STRIDE+
+    ';let '+childForce+'='+parentIndex+'<0?force:state['+parentBase+'+46];'+
+    world.body.body.slice(0,2).map(statement).join('\n')+'\n'+slot(46)+'='+childForce+';}}';
   const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64[]','f64','f64'],generalControl:true,
-    maxMemoryPages,maxIterations,sourceName:'pinned Object3D.updateMatrixWorld child batch'});
+    maxMemoryPages,maxIterations,sourceName:'pinned Object3D.updateMatrixWorld subtree batch'});
   const token=fresh(source,'token'),create=fresh(source,'create'),register=fresh(source,'register');
   const objectAllocation=fresh(source,'object'),numericAllocation=fresh(source,'numeric'),arrayAllocation=fresh(source,'children');
   const attempt=fresh(source,'try_batch'),edits=[];
-  for(const name of ['Object3D','Mesh','InstancedMesh','Matrix4']) {
+  for(const name of ['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4']) {
     const cls=classes.get(name);
     edits.push({start:cls.end,end:cls.end,text:'\n'+register+'('+token+','+JSON.stringify(name)+','+name+');\n'});
   }
@@ -93,6 +102,6 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
     ',registerTransformObject as '+objectAllocation+',registerTransformNumeric as '+numericAllocation+
     ',registerTransformChildren as '+arrayAllocation+',tryTransformBatch as '+attempt+'} from '+JSON.stringify(runtimeModule)+';\n'+
     'var '+token+'='+create+'('+JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+','+TRANSFORM_BATCH_STRIDE+','+maxMemoryPages+');\n',
-    report:{upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',sourceDerived:true,scope:'guarded-direct-leaf-children',
+    report:{upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',sourceDerived:true,scope:'guarded-ordinary-subtrees',
       compiledMethods:['Object3D.updateMatrixWorld'],wasmBytes:artifact.wasm.length,accelerationClaim:false}};
 }
