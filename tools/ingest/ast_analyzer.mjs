@@ -586,6 +586,303 @@ const OPAQUE_GL_METHODS = new Set([
 ]);
 
 /**
+ * A renderer's route must be chosen before an opaque consumer can observe it.
+ * Track lexical aliases monotonically: reassignment cannot prove that an earlier
+ * consumer lost its reference. Containers, returns and unknown calls are escape
+ * boundaries, not invitations to guess what another component will do.
+ *
+ * This is deliberately an intramodule proof. A renderer passed to an imported
+ * helper, including through a returned factory, retains its upstream owner until
+ * an interprocedural proof can close that edge. No source code is evaluated.
+ */
+function analyzeRendererResourceEscapes(ast, offsets) {
+  const RENDERER = 1, CANVAS = 2, WEBGL = 4, WEBGPU = 8, NAMESPACE = 16, DOM = 32;
+  const CONSTRUCTOR = WEBGL | WEBGPU, RESOURCE = RENDERER | CANVAS | CONSTRUCTOR | NAMESPACE;
+  const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+  const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
+    "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
+  const classes = new Set(["ClassDeclaration", "ClassExpression"]);
+  const scopes = new WeakMap(), enclosing = new WeakMap(), parents = new WeakMap();
+  const nodes = [], globals = new Map(), escapes = [], reported = new WeakSet();
+  const ctorKind = name => name === "WebGLRenderer" ? WEBGL : name === "WebGPURenderer" ? WEBGPU : 0;
+  const declare = (scope, names) => {
+    if (!scopes.has(scope)) scopes.set(scope, new Map());
+    const bindings = scopes.get(scope);
+    for (const name of names) if (!bindings.has(name)) bindings.set(name, {kind: 0, local: true});
+  };
+  walk.fullAncestor(ast, (node, _state, ancestors) => {
+    nodes.push(node);
+    const chain = ancestors.slice(0, -1);
+    parents.set(node, chain.at(-1));
+    const containing = predicate => chain.findLast(predicate);
+    if (node.type === "Identifier") {
+      enclosing.set(node, chain.filter((parent, index) =>
+        (lexical.has(parent.type) || classes.has(parent.type)) &&
+        !(parent.type === "SwitchStatement" && ancestors[index + 1] === parent.discriminant)));
+    } else if (node.type === "VariableDeclaration") {
+      let scope = containing(parent => node.kind === "var"
+        ? functions.has(parent.type) || parent.type === "Program" || parent.type === "StaticBlock"
+        : lexical.has(parent.type));
+      if (node.kind === "var" && functions.has(scope.type)) scope = scope.body;
+      for (const declaration of node.declarations) declare(scope, collectPatternIdentifiers(declaration.id));
+    } else if (node.type === "ImportDeclaration") {
+      declare(ast, node.specifiers.map(spec => spec.local.name));
+      for (const spec of node.specifiers) {
+        if (spec.type === "ImportSpecifier") scopes.get(ast).get(spec.local.name).kind |=
+          ctorKind(spec.imported.name ?? spec.imported.value);
+        // An import map or intermediate reexport may expose the replaced
+        // renderer constructor under any namespace name. Reading an ordinary
+        // named member remains local; handing out the whole namespace does not.
+        else if (spec.type === "ImportNamespaceSpecifier") scopes.get(ast).get(spec.local.name).kind |= NAMESPACE;
+      }
+    } else if (functions.has(node.type)) {
+      for (const parameter of node.params) declare(node, collectPatternIdentifiers(parameter));
+      if (node.id) {
+        declare(node, [node.id.name]);
+        if (node.type === "FunctionDeclaration") declare(containing(parent => lexical.has(parent.type)), [node.id.name]);
+      }
+    } else if (node.type === "CatchClause") {
+      declare(node, collectPatternIdentifiers(node.param));
+    } else if (classes.has(node.type) && node.id) {
+      declare(node, [node.id.name]);
+      if (node.type === "ClassDeclaration") declare(containing(parent => lexical.has(parent.type)), [node.id.name]);
+    }
+  });
+  const binding = node => {
+    const chain = enclosing.get(node) ?? [ast];
+    for (let index = chain.length - 1; index >= 0; index--) {
+      const found = scopes.get(chain[index])?.get(node.name);
+      if (found) return found;
+    }
+    if (!globals.has(node.name)) globals.set(node.name, {kind: ctorKind(node.name), local: false});
+    return globals.get(node.name);
+  };
+  const report = (node, reason) => {
+    if (reported.has(node)) return;
+    reported.add(node);
+    const span = toSourceSpan(node, offsets);
+    escapes.push({type: "renderer_resource_escape", reason, source_span: span, sourceSpan: span});
+  };
+  const propertyKind = (object, names) => {
+    if (!names) return 0;
+    let result = names.reduce((kind, name) => kind | ctorKind(name), 0);
+    if (object & RENDERER && names.some(name => name === "domElement")) result |= CANVAS;
+    if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
+    return result;
+  };
+  let values = new WeakMap();
+  const kind = (node, depth = 0) => {
+    if (!node) return 0;
+    if (depth > 64) { report(node, "alias-expression-limit"); return RESOURCE; }
+    if (values.has(node)) return values.get(node);
+    const child = value => kind(value, depth + 1);
+    let value = 0;
+    switch (node.type) {
+      case "Identifier": {
+        const cell = binding(node);
+        value = cell.kind | (!cell.local && node.name === "document" ? DOM : 0);
+        break;
+      }
+      case "NewExpression": value = child(node.callee) & CONSTRUCTOR ? RENDERER : 0; break;
+      case "MemberExpression": value = propertyKind(child(node.object), staticPropertyNames(node)); break;
+      case "ChainExpression": case "AwaitExpression": value = child(node.expression ?? node.argument); break;
+      case "SequenceExpression": value = child(node.expressions.at(-1)); break;
+      case "ConditionalExpression": value = child(node.consequent) | child(node.alternate); break;
+      case "LogicalExpression": value = child(node.left) | child(node.right); break;
+      case "AssignmentExpression": value = child(node.right); break;
+      case "CallExpression": {
+        const callee = node.callee;
+        if (callee.type === "MemberExpression" && child(callee.object) & DOM &&
+            staticPropertyNames(callee)?.every(name => ["createElement", "createElementNS", "getElementById", "querySelector"].includes(name))) value = DOM;
+        if (callee.type === "MemberExpression" && child(callee.object) & RENDERER &&
+            staticPropertyNames(callee)?.every(name => name === "setMRT")) value = RENDERER;
+        break;
+      }
+    }
+    values.set(node, value);
+    return value;
+  };
+  let changed = false;
+  const mark = (node, value) => {
+    if (!node || node.type !== "Identifier") return;
+    const cell = binding(node), next = cell.kind | value;
+    if (next !== cell.kind) { cell.kind = next; changed = true; }
+  };
+  const assign = (pattern, value) => {
+    if (pattern.type === "Identifier") mark(pattern, value);
+    else if (pattern.type === "ObjectPattern") {
+      for (const property of pattern.properties) {
+        if (property.type === "Property" && property.value.type === "Identifier")
+          mark(property.value, propertyKind(value, staticPropertyNames(property)));
+      }
+    }
+  };
+  // A bounded fixpoint covers aliases assigned before their source declaration,
+  // closures and later reassignments without simulating application control flow.
+  for (let iteration = 0; iteration < 64; iteration++) {
+    changed = false;
+    values = new WeakMap();
+    for (const node of nodes) {
+      if (node.type === "VariableDeclarator") assign(node.id, kind(node.init));
+      else if (node.type === "AssignmentExpression") assign(node.left, kind(node.right));
+      else if (node.type === "NewExpression" && kind(node.callee) & CONSTRUCTOR) {
+        const canvas = sourceOptionValue(node.arguments[0], "canvas");
+        if (canvas?.type === "Identifier") mark(canvas, CANVAS);
+        if (node.callee.type === "MemberExpression" && node.callee.object.type === "Identifier")
+          mark(node.callee.object, NAMESPACE);
+      }
+    }
+    if (!changed) break;
+    if (iteration === 63) report(ast, "alias-analysis-limit");
+  }
+  values = new WeakMap();
+  // A known DOM receiver does not establish a native host operation after the
+  // source replaces that operation. Unknown keys are conservative as well.
+  const replacedDomMethods = new Set();
+  let unknownDomWrite = false;
+  for (const node of nodes) {
+    const target = node.type === "AssignmentExpression" ? node.left :
+      node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete" ? node.argument : null;
+    if (target?.type !== "MemberExpression") continue;
+    const names = staticPropertyNames(target);
+    if (names) for (const name of names) replacedDomMethods.add(name);
+    else if (kind(target.object) & DOM) unknownDomWrite = true;
+  }
+  const origins = new Map();
+  for (const node of nodes) {
+    const target = node.type === "VariableDeclarator" ? node.id :
+      node.type === "AssignmentExpression" ? node.left : null;
+    const source = node.type === "VariableDeclarator" ? node.init : node.right;
+    if (target?.type !== "Identifier" || !source) continue;
+    const cell = binding(target);
+    if (!origins.has(cell)) origins.set(cell, []);
+    origins.get(cell).push(source);
+  }
+  const hostMethods = new Set(["createElement", "createElementNS", "getElementById", "querySelector"]);
+  const closedDomValue = (node, visiting = new Set(), depth = 0) => {
+    if (!node || depth > 64) return false;
+    const visit = value => closedDomValue(value, visiting, depth + 1);
+    if (node.type === "Identifier") {
+      const cell = binding(node);
+      if (!cell.local) return node.name === "document";
+      if (visiting.has(cell) || !origins.has(cell)) return false;
+      visiting.add(cell);
+      const result = origins.get(cell).every(visit);
+      visiting.delete(cell);
+      return result;
+    }
+    if (node.type === "ChainExpression") return visit(node.expression);
+    if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
+    if (node.type === "ConditionalExpression") return visit(node.consequent) && visit(node.alternate);
+    if (node.type === "MemberExpression") {
+      const names = staticPropertyNames(node);
+      if (!names) return false;
+      if (kind(node.object) & RENDERER && names.every(name => name === "domElement")) return true;
+      return names.every(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name)) && visit(node.object);
+    }
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression")
+      return !unknownDomWrite && staticPropertyNames(node.callee)?.every(name =>
+        hostMethods.has(name) && !replacedDomMethods.has(name)) && visit(node.callee.object);
+    return node.type === "NewExpression" && node.callee.type === "Identifier" &&
+      node.callee.name === "OffscreenCanvas" && !binding(node.callee).local;
+  };
+  const isCanvasAttachment = (call, argument) => {
+    const callee = call.callee;
+    return (kind(argument) & RESOURCE) === CANVAS && callee.type === "MemberExpression" &&
+      closedDomValue(callee.object) && !unknownDomWrite &&
+      staticPropertyNames(callee)?.every(name => !replacedDomMethods.has(name) &&
+        ["appendChild", "append", "prepend", "insertBefore", "replaceChild"].includes(name));
+  };
+  const nativeState = new Set(["backend", "state", "properties", "context", "extensions", "xr", "constructor", "__proto__"]);
+  const publicMethods = new Set([
+    "init", "render", "renderAsync", "compile", "compileAsync", "compute", "computeAsync", "dispose",
+    "setAnimationLoop", "setSize", "setPixelRatio", "setDrawingBufferSize", "getSize", "getPixelRatio",
+    "getDrawingBufferSize", "getClearColor", "getClearAlpha", "setClearColor", "setClearAlpha", "clear",
+    "clearColor", "clearDepth", "clearStencil", "setRenderTarget", "getRenderTarget", "getActiveCubeFace",
+    "getActiveMipmapLevel", "setViewport", "getViewport", "setScissor", "getScissor", "setScissorTest",
+    "getScissorTest", "setOpaqueSort", "setTransparentSort", "readRenderTargetPixelsAsync",
+    "copyTextureToTexture", "copyFramebufferToTexture", "initTexture", "initRenderTarget", "hasFeature",
+    "hasFeatureAsync", "hasInitialized", "getMaxAnisotropy", "clearAsync", "clearColorAsync",
+    "clearDepthAsync", "clearStencilAsync", "getClearDepth", "setClearDepth", "getClearStencil",
+    "setClearStencil", "getCanvasTarget", "getOutputRenderTarget", "setOutputRenderTarget",
+    "getOutputBufferType", "getMRT", "setMRT", "writeRenderTargetPixelsAsync", "copyRenderTargetPixelsAsync",
+    "waitForGPU", "getAnimationLoop", "getCurrentViewport",
+  ]);
+  const hasRenderer = nodes.some(node => node.type === "NewExpression" && kind(node) & RENDERER);
+  for (const node of nodes) {
+    if (node.type === "CallExpression" || node.type === "NewExpression") {
+      if (node.type === "NewExpression" && kind(node.callee) & CONSTRUCTOR) {
+        const canvas = sourceOptionValue(node.arguments[0], "canvas");
+        if (canvas === null || canvas &&
+            !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
+          report(node, "opaque-canvas-input");
+      }
+      if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
+          kind(node.callee.object) & RENDERER &&
+          !staticPropertyNames(node.callee)?.every(name => publicMethods.has(name)))
+        report(node, "opaque-renderer-method");
+      if (hasRenderer && node.callee.type === "Identifier" && node.callee.name === "eval")
+        report(node, "opaque-eval");
+      for (const argument of node.arguments) {
+        const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
+        if (value & RESOURCE && !isCanvasAttachment(node, argument)) report(node, "opaque-call-argument");
+      }
+    } else if (node.type === "AssignmentExpression") {
+      if (kind(node.right) & RESOURCE &&
+          (node.left.type !== "Identifier" || !binding(node.left).local)) report(node, "external-store");
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & RENDERER &&
+          staticPropertyNames(node.left)?.some(name => publicMethods.has(name)))
+        report(node, "renderer-method-replacement");
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & CONSTRUCTOR)
+        report(node, "renderer-constructor-mutation");
+    } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" ||
+        node.type === "ArrowFunctionExpression" && node.body.type !== "BlockStatement") {
+      if (kind(node.argument ?? node.body) & RESOURCE) report(node, "returned-resource");
+    } else if (node.type === "ExportNamedDeclaration") {
+      if (node.declaration?.type === "VariableDeclaration") {
+        for (const declaration of node.declaration.declarations)
+          if ((kind(declaration.init) | kind(declaration.id)) & RESOURCE) report(node, "exported-resource");
+      }
+      for (const spec of node.specifiers)
+        if (kind(spec.local) & RESOURCE) report(node, "exported-resource");
+    } else if (node.type === "ExportDefaultDeclaration") {
+      if (kind(node.declaration) & RESOURCE) report(node, "exported-resource");
+    } else if (node.type === "ExportAllDeclaration") {
+      report(node, "reexported-namespace");
+    } else if (node.type === "MemberExpression" && kind(node.object) & RESOURCE) {
+      const names = staticPropertyNames(node);
+      if (!names) report(node, "unresolved-resource-member");
+      else if (kind(node.object) & RENDERER && names.some(name => nativeState.has(name)))
+        report(node, "native-renderer-state");
+      else if (kind(node.object) & CONSTRUCTOR && names.some(name => name === "prototype"))
+        report(node, "renderer-prototype-access");
+    } else if (node.type === "VariableDeclarator" && node.id.type !== "Identifier" && kind(node.init) & RESOURCE) {
+      if (!(node.id.type === "ObjectPattern" && node.id.properties.every(property =>
+          property.type === "Property" && property.value.type === "Identifier" &&
+          staticPropertyNames(property)?.every(name => name === "domElement" || ctorKind(name)))))
+        report(node, "destructured-resource");
+    } else if (node.type === "Property" && kind(node.value) & RESOURCE && parents.get(node)?.type !== "ObjectPattern") {
+      // A local canvas in a literal constructor options object is a declared
+      // renderer input. Every other container is beyond this alias proof.
+      const object = parents.get(node), owner = parents.get(object);
+      if (!(node.kind === "init" && staticPropertyNames(node)?.every(name => name === "canvas") &&
+          kind(node.value) & CANVAS && owner?.type === "NewExpression" &&
+          owner.arguments[0] === object && kind(owner.callee) & CONSTRUCTOR)) report(node, "resource-container");
+    } else if (node.type === "ArrayExpression") {
+      if (node.elements.some(element => kind(element?.argument ?? element) & RESOURCE)) report(node, "resource-container");
+    } else if (node.type === "SpreadElement" && kind(node.argument) & RESOURCE) report(node, "resource-container");
+    else if (classes.has(node.type) && kind(node.superClass) & CONSTRUCTOR) report(node, "renderer-subclass");
+  }
+  return {
+    escapes,
+    constructorName(node) {
+      const value = kind(node) & CONSTRUCTOR;
+      return value === WEBGL ? "WebGLRenderer" : value === WEBGPU ? "WebGPURenderer" : null;
+    },
+  };
+}
+
+/**
  * Verifies that a node is strictly an import.meta.url property access:
  * noncomputed .url or computed literal ['url'] / [`url`].
  * Strictly rejects new.target.url, variable computed keys like import.meta[url], etc.
@@ -840,6 +1137,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
   const classifyImport = createDynamicImportClassifier(ast);
+  const rendererResources = analyzeRendererResourceEscapes(ast, offsets);
   walk.ancestor(ast, {
     ImportExpression(node) {
       const classified = classifyImport(node.source);
@@ -941,10 +1239,10 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       }
 
       // 2. Check for Renderer construction: new THREE.WebGLRenderer, new WebGPURenderer, etc.
-      let constructorName = null;
-      if (node.callee.type === "Identifier") {
+      let constructorName = rendererResources.constructorName(node.callee);
+      if (!constructorName && node.callee.type === "Identifier") {
         constructorName = node.callee.name;
-      } else {
+      } else if (!constructorName) {
         const names = staticPropertyNames(node.callee);
         if (names?.length === 1) constructorName = names[0];
       }
@@ -1042,6 +1340,11 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
       }
     },
   });
+
+  if (rendererResources.escapes.length) {
+    hasOpaqueGLEscapes = true;
+    escapes.push(...rendererResources.escapes);
+  }
 
   // Calculate live bindings:
   // Any exported binding whose declaration is 'let' or 'var', or that is mutated anywhere in the module

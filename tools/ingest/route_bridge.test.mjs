@@ -775,7 +775,7 @@ test("Positive: real module graph with external data import routes WebGPURendere
     `import { val } from 'data:text/javascript,export const val = 1;';
 export function init() {
   const renderer = new WebGPURenderer();
-  return renderer;
+  return renderer.getPixelRatio();
 }
 `,
   );

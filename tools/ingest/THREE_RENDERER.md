@@ -20,6 +20,19 @@ module re-exports the upstream namespace (every other class keeps its upstream
 identity) and replaces only `WebGPURenderer`. Otherwise the build is unchanged
 and the printed/returned `rendererRoute.reason` says why.
 
+Construction routing follows local renderer and canvas aliases before choosing
+an owner. Exports, external stores, returned renderer factories, unknown consumers,
+dynamic member selection, native renderer state and custom subclasses retain the
+upstream component. Unknown constructor options or externally supplied canvas
+identities also stay upstream. Closed renderer calls, local aliases, locally
+created DOM canvases and ordinary DOM attachment remain eligible. This is a
+conservative intramodule analysis; it does not yet prove resource ownership
+through imported helpers. In particular, the unmodified H1 and H2 examples pass
+their canvas to `OrbitControls` and currently retain upstream rendering. A pinned
+addon name alone does not establish that its publicly exposed canvas stays
+closed. Direct new-backend tests establish renderer functionality separately
+from automatic application routing.
+
 ## Supported surface
 
 `new WebGPURenderer({canvas, antialias, alpha, depth, samples, powerPreference,
