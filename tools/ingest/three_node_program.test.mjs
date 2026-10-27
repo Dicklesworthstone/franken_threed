@@ -889,6 +889,31 @@ test('compatible byte/half-float texture replacement reuses shaders and captures
   assert.deepEqual(contexts, [f.object, f.object]);
   f.owner.textures(d); assert.equal(contexts.length, 2);
 });
+test('filterable Float32 replacements retain the validated color layout without changing precision', t => {
+  const f = rig(t), a = dataTexture(), b = dataTexture({type: THREE.FloatType}), sampled = N.texture(a);
+  f.renderer.hasFeature = name => name === 'float32-filterable';
+  f.material.colorNode = sampled;
+  const d = f.compile(), first = f.owner.captureDraw(d, f.context);
+  sampled.value = b;
+  assert.equal(f.compile(), d);
+  const second = f.owner.captureDraw(d, {...f.context, renderId: 2});
+  assert.ok(first.textures.every(binding => binding.texture === a));
+  assert.ok(second.textures.every(binding => binding.texture === b && binding.texture.type === THREE.FloatType));
+  for (const group of d.groups) for (const entry of group.entries) if (entry.texture)
+    assert.equal(entry.texture.sampleType, 'float');
+  f.renderer._getSampledTextureInputs = () => ({layoutOf: () => ({texture:
+    {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}})});
+  assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_TEXTURE'});
+});
+test('unfilterable Float32 replacements still require a distinct native program layout', t => {
+  const f = rig(t), a = dataTexture({linear: false}), b = dataTexture({linear: false, type: THREE.FloatType});
+  const sampled = N.texture(a); f.material.colorNode = sampled;
+  const first = f.compile(); sampled.value = b;
+  assert.throws(() => f.owner.captureDraw(first, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const next = f.compile(); assert.notEqual(next, first);
+  assert.ok(next.groups.some(group => group.entries.some(entry => entry.texture?.sampleType === 'unfilterable-float')));
+  assert.match(next.fragment, /textureLoad/);
+});
 test('texture aliases, sampling mode and UV channels invalidate structural programs', t => {
   const f = rig(t), a = dataTexture(), b = dataTexture(), left = N.texture(a), right = N.texture(a);
   f.material.colorNode = left.add(right);

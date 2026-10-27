@@ -167,6 +167,45 @@ test('ordinary native material graphs can consume a retained Gaussian blur witho
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+test('native Gaussian blur preserves Float32 intermediates and queued resized parameter snapshots', async t => {
+  const f = fixture(t); f.device.features = new Set(['float32-filterable']);
+  const destination = new T.RenderTarget(64, 48, {type: T.FloatType, depthBuffer: false});
+  const input = new T.DataTexture(new Float32Array(8 * 4 * 4).fill(.12345679), 8, 4, T.RGBAFormat, T.FloatType);
+  input.minFilter = input.magFilter = T.LinearFilter; input.needsUpdate = true;
+  const direction = N.uniform(new T.Vector2(2, .5)).setName('floatBlurDirection');
+  const effect = gaussianBlur(N.texture(input), direction, 2, {premultipliedAlpha: true, resolutionScale: .5});
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); input.dispose(); destination.dispose(); });
+  f.renderer.setOutputRenderTarget(destination); await f.renderer.init();
+  pipeline.render();
+  direction.value.set(.25, 1.5); effect.resolutionScale = 1;
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 6);
+  assert.deepEqual(draws.map(draw => draw.pipeline.fragment.targets[0].format), Array(6).fill('rgba32float'));
+  assert.deepEqual([draws[2], draws[5]].map(draw => textures(draw)[0].texture.width), [4, 8]);
+  for (const target of [effect._horizontalRT, effect._verticalRT]) {
+    assert.equal(target.texture.type, T.FloatType);
+    assert.equal(f.renderer._targets.capture(target).shape.format, 'rgba32float');
+  }
+  for (const [index, expected] of [[0, [2, .5]], [1, [2, .5]], [3, [.25, 1.5]], [4, [.25, 1.5]]]) {
+    const words = uniformWords(draws[index]);
+    assert.ok(expected.every(value => words.includes(value)), 'each source blur pass keeps its queued direction');
+  }
+  assert.equal(f.device.textureWrites.length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native Float32 Gaussian blur refuses missing float filtering without lowering its precision', async t => {
+  const f = fixture(t); f.device.features = new Set(); await f.renderer.init();
+  const input = new T.DataTexture(new Float32Array(4 * 4 * 4), 4, 4, T.RGBAFormat, T.FloatType);
+  input.minFilter = input.magFilter = T.LinearFilter; input.needsUpdate = true;
+  const effect = gaussianBlur(N.texture(input)), pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); input.dispose(); });
+  assert.throws(() => pipeline.render(), /float32-filterable/);
+  assert.equal(nativeDraws(f.device).length, 0); assert.equal(f.device.textureWrites.length, 0);
+  assert.equal(input.type, T.FloatType); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('compileAsync builds the retained effect graph without executing its frame passes', async t => {
   const f = fixture(t), input = new T.DataTexture(new Uint8Array(4 * 4 * 4), 4, 4);
   input.needsUpdate = true; const effect = gaussianBlur(N.texture(input));

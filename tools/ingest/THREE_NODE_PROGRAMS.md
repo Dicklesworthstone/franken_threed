@@ -1040,6 +1040,14 @@ zero dimension while preserving the source target dimensions and zero viewport.
 That backing allocation is charged to the budget, and queued resizes through
 zero retain the same generation-lifetime rules.
 
+Gaussian blur preserves the source input's byte, half-float or Float32 precision.
+Float32 inputs require the device's `float32-filterable` feature; both blur
+intermediates then remain RGBA32F. For a Float32 scene pass, construct the renderer
+with `outputBufferType: THREE.FloatType`, which is the type selected by the pinned
+`PassNode.setup()`. The validated floating-point binding layout can survive an
+effect's first output-type selection; unfilterable Float32, integer and depth
+layouts remain distinct. Missing Float32 filtering is rejected explicitly.
+
 This surface requires ordinary frame-update effects with directly owned 2D
 targets and stable attachment formats during queued resizes. It does not admit
 arbitrary application-created material contexts or view-offset histories, and
@@ -1055,6 +1063,13 @@ used the same identity-swizzle adapter; there were no GPU validation errors and
 no numeric tolerance. The comparison explicitly unpacked the pinned source's
 padded readback rows; this establishes image-content parity, not equality of the
 returned readback array layout. Native readbacks remain tightly packed.
+
+A separate Float32 differential matched all 3,072 channel values exactly for
+scene-pass Gaussian, original color plus Bloom(Gaussian), and premultiplied
+Gaussian with half resolution and a custom direction. It verified RGBA32F
+horizontal/vertical intermediates and Float32 readbacks, with zero validation
+errors on the same Chromium/SwiftShader environment. Focused recording tests
+also cover queued Float32 resize/parameter snapshots and capability refusal.
 
 ## Native clipping groups
 

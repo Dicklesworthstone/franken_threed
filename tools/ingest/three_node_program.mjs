@@ -620,20 +620,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return value;
   }
   function textureSignature(nodes, references = null) {
-    const aliases = new Map(), checked = new Set();
+    const aliases = new Map(), checked = new Map();
     return JSON.stringify(nodes.map(node => {
       const texture = references ? textureValue(node, references) : node.value;
       inspectIntegerRead(node, texture);
-      if (!checked.has(texture)) { inspectTexture(texture); checked.add(texture); }
+      if (!checked.has(texture)) checked.set(texture, inspectTexture(texture));
       // The pinned builder aliases uniforms by texture UUID. Keep that alias
       // partition, not the identities themselves, in the structural signature:
       // replacing one compatible sampled image must not rebuild the shader.
       if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
-      // Source byte and half-float colors have identical f32 sample/filter
-      // shaders. Effects can choose their output precision in updateBefore,
-      // after consumer construction. The image owner still validates formats
-      // and generations; float32 and integer layouts remain separate here.
-      const type = [three.UnsignedByteType, three.HalfFloatType].includes(texture.type) ? 'float-color' : texture.type;
+      // Validated filterable colors share the source f32 sample/filter shader
+      // and native binding layout, including FloatType when the device enables
+      // float32-filterable. Effects choose precision in updateBefore, after
+      // consumer construction. Keep unfilterable, integer and depth types
+      // separate; the image owner still validates exact formats/generations.
+      const type = checked.get(texture).sampleType === 'float' ? 'float-color' : texture.type;
       return [aliases.get(texture.uuid), type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
