@@ -15,6 +15,7 @@ import { nativeFogScenarios } from './scenarios_native_fog.js';
 import { nativeMRTScenarios } from './scenarios_native_mrt.js';
 import { nativeClippingScenarios } from './scenarios_native_clipping.js';
 import { nativeHistoryScenarios } from './scenarios_native_history.js';
+import { nativeInstancedGeometryScenarios } from './scenarios_native_instanced_geometry.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
@@ -25,6 +26,7 @@ export const scenarios = {
   ...nativeMRTScenarios,
   ...nativeClippingScenarios,
   ...nativeHistoryScenarios,
+  ...nativeInstancedGeometryScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

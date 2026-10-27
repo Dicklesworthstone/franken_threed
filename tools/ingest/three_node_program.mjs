@@ -2,7 +2,7 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid/skinned/morphed meshes and CPU/storage-backed InstancedMesh objects, unlit
+ * The profile is rigid/skinned/morphed meshes, InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
@@ -699,8 +699,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
     if (!(object instanceof three.Mesh) || object.isBatchedMesh ||
-        !(object.geometry instanceof three.BufferGeometry) || object.geometry.isInstancedBufferGeometry)
-      fail('OBJECT', 'Native node graphs require source meshes or CPU/storage-backed InstancedMesh objects');
+        !(object.geometry instanceof three.BufferGeometry) ||
+        object.geometry.isInstancedBufferGeometry && !(object.geometry instanceof three.InstancedBufferGeometry))
+      fail('OBJECT', 'Native node graphs require source meshes, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
     inspectInstances(object);
     inspectSkinning(object);
     inspectMorphs(object);
@@ -853,14 +854,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
-      object.geometry.id, camera?.isPerspectiveCamera === true, object.receiveShadow === true,
+      object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
+      camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
-        a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset]),
+        a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset,
+        a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
       lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
       Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
@@ -1012,7 +1015,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
       const node = attribute.node, source = node?.attribute ?? object.geometry.attributes[attribute.name];
       if (!components || !source || source.itemSize !== components ||
-          (node ? !(node instanceof three.BufferAttributeNode) : source.isInstancedBufferAttribute || source.data?.isInstancedInterleavedBuffer))
+          node && !(node instanceof three.BufferAttributeNode))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
       if (node) generated.push({name: attribute.name, attribute: source});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});

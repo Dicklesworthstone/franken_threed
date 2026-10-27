@@ -197,5 +197,15 @@ Native authored graphs also support ordinary `Mesh.count` and TSL
 `instanceIndex`. Counts are captured after source node updates and retained
 across queued pipeline preparation. Zero instances preserve update callbacks
 while omitting GPU draws and source draw-call increments. This connects
-scalar/vector compute storage to instanced particle geometry; struct storage and
-the separate `InstancedMesh`/`InstancedBufferGeometry` surfaces remain pending.
+scalar/vector compute storage to instanced particle geometry. CPU/storage-backed
+`InstancedMesh` and ordinary `InstancedBufferGeometry` have their own native paths.
+
+Native `InstancedBufferGeometry` accepts separate or interleaved per-instance
+attributes with ordinary built-in or authored node materials. Its explicit finite
+`geometry.instanceCount` takes precedence over `Mesh.count` and is captured after
+node updates for each accepted render. Zero-count draws still run source updates.
+As in pinned r186 WebGPU, instance streams advance once per instance regardless
+of `meshPerAttribute`; WebGL-authored programs retain their separate divisor
+semantics. Consumed stream capacities are checked without silently reducing the
+requested count. Attribute bytes retain the existing versioned upload contract,
+including partial updates and GPU-stale bytes outside requested ranges.

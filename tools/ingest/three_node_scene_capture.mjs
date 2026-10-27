@@ -112,6 +112,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeShadowScene = !shadowPass && renderer?.shadowMap?.enabled === true &&
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
+        object.geometry?.isInstancedBufferGeometry === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
           nativeFeatures(material) || nativeLightMaterial(material) || nativeEnvironmentMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
@@ -130,6 +131,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       objects.add(object);
       if (object.castShadow !== true) continue;
     }
+    const instancedGeometry = object.geometry?.isInstancedBufferGeometry === true;
     const originals = Array.isArray(object.material) ? object.material.slice() : [object.material];
     if (originals.length > maxNodes) fail('LIMIT', 'Native scene material array exceeds its budget');
     if (shadowPass && originals.some(original => original && original.allowOverride !== true))
@@ -137,7 +139,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
     for (let i = 0; i < originals.length; i++) {
       const original = originals[i], material = effective[i];
-      if (shadowPass || original === material || (!nativeMaterial(original) && !nativeMaterial(material))) continue;
+      if (shadowPass || original === material || (!nativeMaterial(original) && !nativeMaterial(material) && !instancedGeometry)) continue;
       // _renderTransparents changes the original's side before renderObject
       // installs a distinct override. That override can expand each original
       // pass again. This capture profile must not silently replace those source
@@ -152,7 +154,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           transparent(original) !== material.transparent)
         fail('EFFECT', 'Native node material overrides require matching inherited position, alpha, displacement and transparency state');
     }
-    if (!effective.some(nativeMaterial)) continue;
+    if (!instancedGeometry && !effective.some(nativeMaterial)) continue;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
     // unsupported classes still fail the complete preflight below.
@@ -429,11 +431,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         storageUses.push(lease);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
-      // r186 reads Mesh.count after node/binding updates and before after-updates.
+      // r186 reads geometry.instanceCount before Mesh.count, after node/binding
+      // updates and before after-updates. It does not infer a count from the
+      // first instance attribute or clamp it to an attribute's capacity.
       // Capture it here even for zero instances: callbacks still ran, while the
       // backend will omit the empty draw. Later queued calls cannot replace it.
-      const requestedInstances = draw.object.count;
-      draw.instanceCount = requestedInstances === undefined ? 1 : Math.max(0, requestedInstances);
+      const requestedInstances = draw.geometry.isInstancedBufferGeometry === true
+        ? draw.geometry.instanceCount : draw.object.count;
+      draw.instanceCount = draw.geometry.isInstancedBufferGeometry === true
+        ? requestedInstances : requestedInstances === undefined ? 1 : Math.max(0, requestedInstances);
       if (!integer(draw.instanceCount) || draw.instanceCount > 0xffffffff)
         fail('OBJECT', 'Native node instance counts must fit a nonnegative 32-bit integer');
       if (draw.binding.nodeProgram.instanceCapacity !== undefined &&

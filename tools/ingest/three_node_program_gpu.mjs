@@ -246,9 +246,9 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       ...snapshotAnimationRaster({...raster, blendConstant: undefined}, {format, depthFormat}), usesConstant,
       blendConstant});
     const geometry = programGeometrySnapshot(gpu, device);
-    if (geometry.channels.missing.length || geometry.instanced)
-      fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete attributes on ordinary BufferGeometry');
-    const geometrySignature = geometry.signature, layouts = geometry.layouts;
+    if (geometry.channels.missing.length)
+      fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete source geometry attributes');
+    const geometrySignature = geometry.signature, geometryInstanced = geometry.instanced, layouts = geometry.layouts;
     // Capture all source-facing values before registrations or pipeline work
     // can yield. Older program records/groups survive arena growth unchanged.
     const uniformBindings = [];
@@ -283,7 +283,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       if (issued.error) throw issued.error;
       live();
     } catch (error) { issued.errors.catch(() => {}); throw error; }
-    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature, instanceCapacity,
+    const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, geometrySignature, geometryInstanced, instanceCapacity,
       resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},
       blended: !!state.blend, alphaMode: state.blend ? 'BLEND' : 'OPAQUE',
@@ -308,7 +308,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one owned uniform byte packet per native group');
     const resources = snapshotResources(record, input);
     const geometry = programGeometrySnapshot(record.gpu, device);
-    if (geometry.signature !== record.geometrySignature || geometry.instanced)
+    if (geometry.signature !== record.geometrySignature || geometry.instanced !== record.geometryInstanced)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout changed; register it again');
     const instanceCount = input.instanceCount ?? 1;
     if (instanceCount > Math.min(record.instanceCapacity, geometry.instanceCapacity ?? Infinity))

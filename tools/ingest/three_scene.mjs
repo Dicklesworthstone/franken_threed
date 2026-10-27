@@ -268,7 +268,7 @@ export async function createGpuThreeScene(device,scene,{
   function geometryAdmission(g,object){
     const list=colorMaterials(object);
     const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
-    if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs))fail('GEOMETRY','Expected source BufferGeometry');
+    if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs&&!capturedNodeObject(object)))fail('GEOMETRY','Expected source BufferGeometry');
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
     if(g.isInstancedBufferGeometry)programGeometries_.add(g);
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.

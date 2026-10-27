@@ -491,7 +491,10 @@ function describeProgram(program, attributeTypes) {
       const borrowed = isComputeAttribute(owner) ? computeAttributeSnapshot(device, owner, {integer: intType}) : null;
       const conversion = borrowed ? null : intType ? integerConversionOf(source.kind, a.scalar) : conversionOf(source.kind, attribute.normalized === true, attribute.isFloat16BufferAttribute === true);
       const perInstance = attribute.isInstancedBufferAttribute === true || owner.isInstancedInterleavedBuffer === true;
-      const divisor = perInstance ? integer(owner.meshPerAttribute ?? attribute.meshPerAttribute, 1, 0xffffffff, 'meshPerAttribute') : 1;
+      // The pinned WebGPU backend uses instance step mode directly and ignores
+      // meshPerAttribute. Repetition belongs only to the WebGL program route.
+      const divisor = perInstance && attributeTypes !== 'webgpu'
+        ? integer(owner.meshPerAttribute ?? attribute.meshPerAttribute, 1, 0xffffffff, 'meshPerAttribute') : 1;
       const itemSize = integer(attribute.itemSize, 1, 16, 'item size');
       if (borrowed && divisor !== 1) fail('FORMAT', 'Shared program attributes require instance divisor one');
       if (borrowed && intType && ((a.scalar === 'uint' && borrowed.scalar !== Uint32Array) || (a.scalar === 'int' && borrowed.scalar !== Int32Array)))

@@ -575,6 +575,22 @@ displacement and transparency state already matches the override. Other cases
 fail explicitly before callbacks, without temporarily changing a shared source
 material. Original material visibility and render-list partitioning still apply.
 
+## InstancedBufferGeometry
+
+Ordinary meshes using `InstancedBufferGeometry` select native programs even with
+an ordinary built-in material. Authored TSL attributes accept separate instance
+streams and `InstancedInterleavedBuffer` layouts. The source's finite explicit
+`geometry.instanceCount` wins over `Mesh.count`; it is captured after node updates
+and before after-updates, including zero-count requests. Later queued renders
+cannot replace that accepted count. Each shader-consumed stream must cover it;
+the renderer does not infer a count or silently clamp it to an attribute capacity.
+
+The native r186 backend uses instance step mode without applying the WebGL
+`meshPerAttribute` divisor. This path preserves that behavior; the WebGL-authored
+program path retains its divisor expansion. Existing geometry upload versions
+and partial ranges preserve GPU-stale bytes outside requested updates. This does
+not add per-call snapshots of arbitrary geometry arrays.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
@@ -588,7 +604,7 @@ or integer texture graphs still require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows,
-wireframe, alpha hashing and alpha-to-coverage; `InstancedBufferGeometry`, skinned, batched or morph meshes,
+wireframe, alpha hashing and alpha-to-coverage; skinned, batched or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and

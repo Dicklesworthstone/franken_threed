@@ -543,11 +543,15 @@ test('captured object capacities survive descriptor edits while uncapped Mesh.co
   assert.equal(f.stage(empty, [3], {instanceCount: 0}).instanceCount, 0);
 });
 
-test('generated instance streams do not admit InstancedBufferGeometry or later geometry flag changes', async t => {
+test('native instance streams admit InstancedBufferGeometry while retaining their captured geometry kind', async t => {
   const f = generatedInstanceRig(t);
   f.source.isInstancedBufferGeometry = true; f.gpu.update();
-  await assert.rejects(f.add([16]), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  const instanced = await f.add([16]);
+  assert.equal(f.stage(instanced, [1], {instanceCount: 2}).instanceCount, 2);
+  assert.throws(() => f.stage(instanced, [1], {instanceCount: 3}), {code: 'ANIMATION_RENDER_VALUE'});
   f.source.isInstancedBufferGeometry = false; f.gpu.update();
+  assert.throws(() => f.stage(instanced, [1], {instanceCount: 1}), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  f.owner.begin();
   const record = await f.add([16]);
   f.source.isInstancedBufferGeometry = true; f.gpu.update();
   assert.throws(() => f.stage(record, [1], {instanceCount: 1}), {code: 'ANIMATION_RENDER_GEOMETRY'});
