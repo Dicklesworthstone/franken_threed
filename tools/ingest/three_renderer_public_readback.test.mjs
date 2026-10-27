@@ -7,10 +7,12 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {mrtTransferDevice, deferred, bytes, layouts} from './fixtures/mrt_transfer_fixture.mjs';
 
-function fixture(t, {gl = false, maxTransfers} = {}) {
+function fixture(t, {gl = false, maxTransfers, maxTransferBytes} = {}) {
   const f = mrtTransferDevice(), init = deferred();
-  const Base = (gl ? createWebGLRendererClass : createWebGPURendererClass)(T,
-    maxTransfers === undefined ? {} : {maxTransfers});
+  const Base = (gl ? createWebGLRendererClass : createWebGPURendererClass)(T, {
+    ...(maxTransfers === undefined ? {} : {maxTransfers}),
+    ...(maxTransferBytes === undefined ? {} : {maxTransferBytes}),
+  });
   // Target-only execution needs no canvas negotiation. Everything after this
   // browser initialization boundary remains the production implementation.
   class Renderer extends Base {
@@ -148,4 +150,95 @@ test('resizing a queued target invalidates the selected generation before submis
   await assert.rejects(read, {code: 'THREE_TARGET_STALE'});
   await f.ready(); await f.drain();
   assert.equal(f.reads.length, 0); assert.equal(f.calls.buffers.length, 0);
+});
+
+test('caller output is published only after producer completion without blocking later submissions', async t => {
+  const f = fixture(t, {gl: true}), r = f.r, source = target(['rgba8unorm'], true); await f.ready();
+  const before = payload('rgba8unorm'), after = payload('rgba8unorm', 12, 35);
+  await r.writeRenderTargetPixelsAsync(source, before);
+  f.controls.completion = deferred();
+  const output = new Uint8Array(before.length + 4).fill(211);
+  const read = r.readRenderTargetPixelsAsync(source, 0, 0, 4, 3, output);
+  const write = r.writeRenderTargetPixelsAsync(source, after);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.uploads.length, 2, 'mapping/completion cannot block a later write submission');
+  assert.equal(f.calls.buffers[0].destroyed, 1, 'mapping has completed and staging was released');
+  assert.ok(output.every(value => value === 211));
+  f.controls.completion.resolve();
+  assert.equal(await read, output); await write;
+  assert.deepEqual(output.subarray(0, before.length), before);
+  assert.ok(output.subarray(before.length).every(value => value === 211));
+});
+
+for (const failure of ['target disposal', 'renderer disposal', 'completion error'])
+  test(`${failure} after mapping leaves the caller buffer unchanged`, async t => {
+    const f = fixture(t, {gl: true}), r = f.r, source = target(['rgba8unorm'], true); await f.ready();
+    await r.writeRenderTargetPixelsAsync(source, payload('rgba8unorm'));
+    f.controls.completion = deferred();
+    const output = new Uint8Array(48).fill(211);
+    const read = r.readRenderTargetPixelsAsync(source, 0, 0, 4, 3, output);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.calls.buffers[0].destroyed, 1);
+    assert.ok(output.every(value => value === 211));
+    const expected = failure === 'target disposal' ? {code: 'THREE_TARGET_STALE'}
+      : failure === 'renderer disposal' ? {code: 'F3D_RENDERER_DISPOSED'} : /producer completion failed/;
+    const rejected = assert.rejects(read, expected);
+    if (failure === 'target disposal') source.dispose();
+    else if (failure === 'renderer disposal') r.dispose();
+    else f.controls.completion.reject(new Error('producer completion failed'));
+    await rejected;
+    assert.ok(output.every(value => value === 211));
+    assert.equal(r._transfers.allocatedBytes, 0);
+    f.controls.completion.resolve();
+  });
+
+test('explicit caller cancellation after mapping also prevents output publication', async t => {
+  const f = fixture(t), r = f.r, source = target(['rgba8unorm']); await f.ready();
+  await r.writeRenderTargetPixelsAsync(source, payload('rgba8unorm'));
+  f.controls.completion = deferred();
+  const controller = new AbortController(), reason = new Error('cancelled after map'), output = new Uint8Array(48).fill(211);
+  const read = r.readRenderTargetMipPixelsAsync(source, 0, {output, signal: controller.signal});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.buffers[0].destroyed, 1);
+  const rejected = assert.rejects(read, error => error === reason); controller.abort(reason); await rejected;
+  assert.ok(output.every(value => value === 211)); assert.equal(r._transfers.allocatedBytes, 0);
+  f.controls.completion.resolve();
+});
+
+test('private mapped output remains charged until publication or cancellation', async t => {
+  const f = fixture(t, {maxTransferBytes: 16}), r = f.r, source = target(['rgba8unorm']); await f.ready();
+  f.controls.completion = deferred();
+  const read = r.readRenderTargetPixelsAsync(source, 0, 0, 2, 2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.calls.buffers[0].destroyed, 1); assert.equal(r._transfers.allocatedBytes, 16);
+  await assert.rejects(r.readRenderTargetPixelsAsync(source, 0, 0, 1, 1), {code: 'F3D_RENDERER_LIMIT'});
+  f.controls.completion.resolve(); assert.equal((await read).length, 16);
+  assert.equal(r._transfers.allocatedBytes, 0);
+  assert.equal((await r.readRenderTargetPixelsAsync(source, 0, 0, 1, 1)).length, 4);
+});
+
+test('source mutation during completion and caller-buffer detachment cannot publish stale output', async t => {
+  for (const detach of [false, true]) {
+    const f = fixture(t, {gl: true}), r = f.r, source = target(['rgba8unorm'], true); await f.ready();
+    await r.writeRenderTargetPixelsAsync(source, payload('rgba8unorm'));
+    f.controls.completion = deferred();
+    const output = new Uint8Array(48).fill(211);
+    const read = r.readRenderTargetPixelsAsync(source, 0, 0, 4, 3, output);
+    await new Promise(resolve => setImmediate(resolve));
+    let transferred;
+    if (detach) transferred = structuredClone(output.buffer, {transfer: [output.buffer]});
+    else source.width++;
+    const rejected = assert.rejects(read, {code: detach ? 'GPU_READBACK_OUTPUT' : 'THREE_TARGET_STALE'});
+    f.controls.completion.resolve(); await rejected;
+    assert.ok((detach ? new Uint8Array(transferred) : output).every(value => value === 211));
+    assert.equal(r._transfers.allocatedBytes, 0);
+  }
+});
+
+test('invalid caller output fails before target allocation or FIFO admission', async t => {
+  const f = fixture(t, {gl: true}), source = target(['rgba16float'], true);
+  for (const output of [new Uint8Array(96), new Uint16Array(47), new DataView(new ArrayBuffer(96))])
+    await assert.rejects(f.r.readRenderTargetPixelsAsync(source, 0, 0, 4, 3, output), {code: 'GPU_READBACK_OUTPUT'});
+  assert.equal(f.calls.textures.length, 0); assert.equal(f.calls.buffers.length, 0);
+  assert.equal(f.r._pending.length, 0); assert.equal(f.r._transfers.allocatedBytes, 0);
 });

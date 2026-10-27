@@ -23,6 +23,7 @@
  */
 import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetColorFormat} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
+import {GpuTargetReadbackError} from './gpu_target_readback.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 
 export function createThreeRendererTransfers(renderer, ErrorType, {
@@ -85,7 +86,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       if (signal.aborted) { state.reject(stopped(signal)); break; }
     }
   }
-  function schedule(entries, signal, bytes, makeAction, readback = false) {
+  function schedule(entries, signal, bytes, makeAction, readback = false, publish = null) {
     live();
     const signals = [...new Set([renderer._targetLifetime.signal, ...entries.map(entry => entry.lifetime.signal), signal].filter(Boolean))];
     for (const current of signals) if (current.aborted) throw stopped(current);
@@ -94,10 +95,10 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     let resolve, reject;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     const cancellation = readback ? new AbortController() : null;
-    const state = {signals, action: null, done: false, promise, reject: null};
+    const state = {signals, action: null, value: null, publish, done: false, promise, reject: null};
     const finish = (error, result, failed = false) => {
       if (state.done) return;
-      state.done = true; state.action = null;
+      state.done = true; state.action = state.value = state.publish = null;
       active.delete(state); allocatedBytes -= bytes; unwatch(state);
       if (failed) reject(error); else resolve(result);
     };
@@ -130,10 +131,25 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
             Promise.resolve(result).catch(() => {});
             if (!readback) fail('TRANSFER', 'Target transfer submission must be synchronous');
           }
-          const completion = Promise.all([result, ...entries.flatMap(entry => [entry.validation, entry.storage?.whenIdle()])]);
+          // Mapping can finish before the producer's validation/completion.
+          // Keep private bytes in cancellable state, not in Promise.all's
+          // results: a stalled fence must not retain them after cancellation
+          // has released this request's byte reservation.
+          const ready = readback ? Promise.resolve(result).then(value => { if (!state.done) state.value = value; }) : result;
+          const completion = Promise.all([ready, ...entries.flatMap(entry => [entry.validation, entry.storage?.whenIdle()])]);
           return completion.then(([value]) => value);
         },
-        resolve(result) { Promise.resolve(result).then(value => finish(null, value), state.reject); },
+        resolve(result) { Promise.resolve(result).then(value => {
+          if (state.done) return;
+          try {
+            if (readback) {
+              for (const current of signals) if (current.aborted) throw stopped(current);
+              for (const entry of entries) renderer._targets.assertCurrent(entry);
+              value = state.publish ? state.publish(state.value) : state.value;
+            }
+            finish(null, value);
+          } catch (error) { state.reject(error); }
+        }, state.reject); },
         reject: state.reject,
       };
       // Same fast path as readback: no await is allowed before submission.
@@ -268,7 +284,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     for (const name of Object.keys(value))
       if (!allowed.includes(name)) fail('OPTIONS', `Unknown renderer readback option: ${name}`);
     const colorIndex = value.colorIndex === undefined ? 0 : value.colorIndex;
-    if (!depth) gpuTargetColorFormat(entry.shape, colorIndex, fail);
+    const format = depth ? null : gpuTargetColorFormat(entry.shape, colorIndex, fail);
     // Never infer a cube layer from mutable renderer state, even for an empty
     // read. Validate before queueing or allocating native storage/staging.
     const face = value.face === undefined && !entry.shape.cube ? 0 : value.face;
@@ -292,12 +308,31 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       if (!Number.isSafeInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= entry.shape.sampleCount)
         fail('UNSUPPORTED', 'Depth readback requires an explicit in-range sampleIndex for multisampled targets');
     }
-    const captured = Object.freeze({...value, x, y, width, height, mipLevel, face, ...(depth ? {} : {colorIndex})});
-    return schedule([entry], signal, 0, combinedSignal => () => {
+    // Native mapping writes into its own bounded result. The caller's array is
+    // published only after every producer fence and the final generation check,
+    // preserving it when cancellation occurs after mapping has already finished.
+    const Type = depth || format.endsWith('32float') ? Float32Array : format === 'rgba16float' ? Uint16Array : Uint8Array;
+    const components = depth || format === 'r32float' ? 1 : format === 'rg32float' ? 2 : 4;
+    const elements = width * height * components, bytes = elements * Type.BYTES_PER_ELEMENT, output = value.output;
+    if (!Number.isSafeInteger(elements) || !Number.isSafeInteger(bytes))
+      throw new GpuTargetReadbackError('BUDGET', 'Readback output exceeds safe integer precision');
+    const validateOutput = () => {
+      if (output !== undefined && (!(output instanceof Type) || output.length < elements))
+        throw new GpuTargetReadbackError('OUTPUT', 'Output array has the wrong component type or insufficient capacity');
+    };
+    validateOutput();
+    const captured = Object.freeze({...value, output: undefined, x, y, width, height, mipLevel, face, ...(depth ? {} : {colorIndex})});
+    return schedule([entry], signal, bytes, combinedSignal => () => {
       renderer._targets.ensure(entry);
       return depth ? entry.storage.readDepthPixels({...captured, signal: combinedSignal})
         : entry.storage.readPixels({...captured, signal: combinedSignal});
-    }, true);
+    }, true, output === undefined ? null : result => {
+      // A caller may detach or resize its buffer while the copy is pending.
+      validateOutput();
+      new Uint8Array(output.buffer, output.byteOffset, bytes)
+        .set(new Uint8Array(result.buffer, result.byteOffset, bytes));
+      return output;
+    });
   }
   const deferred = error => { if (!renderer._disposed) renderer._deferredError ??= error; };
   const promised = operation => (...args) => {
