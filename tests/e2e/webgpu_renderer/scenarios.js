@@ -17,6 +17,7 @@ import { nativeClippingScenarios } from './scenarios_native_clipping.js';
 import { nativeHistoryScenarios } from './scenarios_native_history.js';
 import { nativeInstancedGeometryScenarios } from './scenarios_native_instanced_geometry.js';
 import { nativeBatchScenarios } from './scenarios_native_batches.js';
+import { nativeWireframeScenarios } from './scenarios_native_wireframe.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
@@ -29,6 +30,7 @@ export const scenarios = {
   ...nativeHistoryScenarios,
   ...nativeInstancedGeometryScenarios,
   ...nativeBatchScenarios,
+  ...nativeWireframeScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

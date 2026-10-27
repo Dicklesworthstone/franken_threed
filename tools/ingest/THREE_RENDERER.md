@@ -234,3 +234,13 @@ commands and render bundles use the source draw ordinal as WebGPU
 geometry draw ranges do not replace batch ranges, and expanded draws stay
 within the configured scene budget. See `THREE_NODE_PROGRAMS.md` for allocation
 changes and the bounded lifecycle profile.
+
+Native mesh materials also support wireframe rendering, including node-authored
+deformation, instancing and batches. The renderer uses the pinned triangle-edge
+generation rules and a line-list pipeline. Edge versions and draw ranges remain
+independent across queued calls and across groups within one submission; source
+node update order, index update requests and disposal retain their meaning.
+Ordinary Basic/Toon/Lambert/Phong/Standard/Physical wireframe materials enter this
+path automatically. Normal and Matcap source-library conversions also work in
+native programs, preserving mixed scenes that share the native shadow owner.
+Other existing material routes keep their prior selection.

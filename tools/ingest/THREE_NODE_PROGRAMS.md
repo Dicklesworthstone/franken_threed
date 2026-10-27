@@ -12,7 +12,8 @@ acceleration or a Rust implementation of node evaluation.
 ## Implemented graph surface
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
-`MeshPhongMaterial`, `MeshStandardMaterial` and `MeshPhysicalMaterial` can also
+`MeshPhongMaterial`, `MeshStandardMaterial`, `MeshPhysicalMaterial`,
+`MeshNormalMaterial` and `MeshMatcapMaterial` can also
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
@@ -624,6 +625,36 @@ and replaced object lifecycle hooks remain outside this profile; `customSort`
 itself is supported. This supplies the pinned WebGPU subdraw loop, without a
 claim of hardware multidraw acceleration or measured speedup.
 
+## Native wireframes
+
+Native mesh programs support `material.wireframe`, including ordinary Basic,
+Toon, Lambert, Phong, Standard and Physical materials, authored vertex graphs,
+instanced geometry, `InstancedMesh` and `BatchedMesh`. The retained source shader
+runs over a native line-list pipeline and the pinned derived triangle-edge
+index. Source range/group bounds are doubled before intersecting the captured
+edge extent. Batched ranges already include their source multiplier and are
+preserved directly. Polygon offset remains disabled for line primitives.
+
+Edge histories follow the source index identity and version, or position
+identity and version for nonindexed geometry. Rebuilding reads the entire CPU
+array, independently of original index upload ranges, and leaves those ranges
+untouched. Capture occurs after before-updates and before ordinary node updates.
+Queued renders and multiple groups in one submission retain independent edge
+generations; unchanged versions reuse their resident view. Generated instance
+attributes compose with those views. `compileAsync` establishes initial edge
+history, while source disposal invalidates it. Geometry layout or wireframe
+topology changes rebuild the program; changes during node updates that invalidate
+the accepted layout fail before publication. This profile uses source-width
+WebGPU lines and makes no line-width emulation or performance claim.
+
+Normal and Matcap materials have native source-library conversions so mixed
+wireframe/shadow scenes retain their other material families. The exact pinned
+builders supply normal mapping, authored `normalNode` overrides, Matcap texture
+coordinates, texture color conversion and the source Matcap fallback. Adding or
+removing a Matcap map rebuilds the graph; compatible replacements preserve each
+captured texture binding. Fog checks use the converted source defaults without
+mutating the original material.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
@@ -638,7 +669,7 @@ require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows,
-wireframe, alpha hashing and alpha-to-coverage; skinned or morph meshes,
+alpha hashing and alpha-to-coverage; skinned or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and

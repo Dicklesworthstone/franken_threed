@@ -18,6 +18,9 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
+  material.wireframe === true &&
+    ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
+      material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) ||
   material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
   ((material.isMeshStandardMaterial === true || material.isMeshStandardNodeMaterial === true ||
     material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && material.envMap != null) ||
@@ -352,7 +355,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         binding.nodeProgram = programs.compile(binding.material, binding.object, context);
         // Retain generated streams while this accepted render waits for submit.
         binding.programGeometry = programs.geometry?.(binding.nodeProgram) ?? binding.geometry;
-        binding.raster = raster(binding.material, {mrt, textures: destination?.textures ?? null});
+        binding.raster = raster(binding.material, {mrt, textures: destination?.textures ?? null,
+          topology: binding.nodeProgram.wireframe ? 'lines' : 'triangles'});
         if (shadowPass) binding.shadowState = Object.freeze(captureThreeShadowMaterialState(binding.material));
         Object.freeze(binding);
         if (programs.textures(binding.nodeProgram).length) {
@@ -422,6 +426,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const capturedDraws = [];
   let recordTexture = () => {};
   const captureDraw = draw => {
+    // RenderObject receives the geometry's current range before this physical
+    // pass's node lifecycle. A preceding pass may replace the range object.
+    draw.sourceRange = draw.geometry.drawRange;
     const beforeCopies = [], afterCopies = [];
     let copies = beforeCopies;
     const recordCopy = marker => {
@@ -445,6 +452,25 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
+      if (captured.programGeometry) {
+        // Distinct edge versions used by the same program in one render need
+        // distinct GPU index residencies, not consecutive writes before submit.
+        const previous = draw.binding;
+        draw.binding = Object.freeze({...previous, programGeometry: captured.programGeometry});
+        compiledBindings.delete(previous); compiledBindings.add(draw.binding);
+      }
+      if (draw.binding.nodeProgram.wireframe && !draw.object.isBatchedMesh) {
+        // The source doubles range/group bounds, then clips against the actual
+        // derived index. Node updates may edit the selected range object.
+        const range = draw.sourceRange, group = draw.sourceGroup, extent = captured.wireframeIndexCount;
+        if (!integer(extent) || !integer(range?.start) || !(range.count === Infinity || integer(range.count)) ||
+            group && (!integer(group.start) || !(group.count === Infinity || integer(group.count))))
+          fail('GEOMETRY', 'Native wireframe ranges require bounded source draw and group ranges');
+        draw.first = Math.min(extent, Math.max(range.start, group?.start ?? 0) * 2);
+        const end = Math.min(extent, (range.start + range.count) * 2,
+          group ? (group.start + group.count) * 2 : Infinity);
+        draw.count = Math.max(0, end - draw.first);
+      }
       // Lease each post-update texture before after() or the next logical draw
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
       // target leases hold generation metadata and observe contents in the FIFO.
@@ -475,7 +501,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (draw.binding.nodeProgram.instanceCapacity !== undefined &&
           draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
         fail('OBJECT', 'Native node instance count exceeds its captured matrix or color capacity');
-      const batchDraws = captureThreeNativeBatch(draw.object, maxDraws - capturedDraws.length, fail, draw.instanceCount);
+      const batchDraws = captureThreeNativeBatch(draw.object, maxDraws - capturedDraws.length, fail, draw.instanceCount,
+        {wireframe: draw.binding.nodeProgram.wireframe === true, indexCount: captured.wireframeIndexCount});
       if (batchDraws === null && capturedDraws.length >= maxDraws)
         fail('LIMIT', 'Native source draw list exceeds its capacity');
       copies = afterCopies;

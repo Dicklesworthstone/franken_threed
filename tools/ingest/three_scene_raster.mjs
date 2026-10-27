@@ -49,7 +49,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
   }
   // Native programs need the complete pipeline state rather than the core's
   // compact material defaults. Both routes use the same blend/bias/stencil map.
-  describe.program=(m,{mrt=null,textures=null}={})=>{
+  describe.program=(m,{mrt=null,textures=null,topology='triangles'}={})=>{
     if(![three.FrontSide,three.BackSide,three.DoubleSide].includes(m.side)||!DEPTH[m.depthFunc])
       fail('MATERIAL','Unsupported native side/depth state');
     for(const key of ['transparent','depthWrite','depthTest','colorWrite','alphaToCoverage'])
@@ -58,7 +58,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
       // raster selection interprets it as falsy without changing the material.
       if(typeof m[key]!=='boolean'&&!(key==='transparent'&&m.isShadowPassMaterial===true&&m[key]==null))
         fail('MATERIAL',`Expected boolean ${key}`);
-    const {options,values}=describe(m),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
+    const {options,values}=describe(m,topology),normal={color:{operation:'add',srcFactor:'src-alpha',dstFactor:'one-minus-src-alpha'},
       alpha:{operation:'add',srcFactor:'one',dstFactor:'one-minus-src-alpha'}};
     const state={...options,...values,blend:options.blend===undefined?(m.transparent?normal:null):options.blend,
       writeMask:m.colorWrite?15:0,depthWriteEnabled:m.depthWrite,depthCompare:m.depthTest?DEPTH[m.depthFunc]:'always',
@@ -70,7 +70,7 @@ export function createThreeSceneRaster(three,{stencilAttachment=false,fail}={}){
       state.colorBlends=textures.map(texture=>{
         const mode=mrt.getBlendMode(texture.name);
         if(mode.blending===three.MaterialBlending)return state.blend;
-        const mapped=describe({...m,...mode,transparent:true,premultipliedAlpha:mode.premultipliedAlpha===true});
+        const mapped=describe({...m,...mode,transparent:true,premultipliedAlpha:mode.premultipliedAlpha===true},topology);
         return mapped.options.blend===undefined?normal:mapped.options.blend;
       });
       // WebGPUBackend advances this pass state for CustomBlending materials

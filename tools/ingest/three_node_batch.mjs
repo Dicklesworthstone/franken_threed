@@ -28,7 +28,7 @@ export function inspectThreeNativeBatch(three, object, fail) {
   return textures.map(texture => texture?.id ?? null).join('/');
 }
 
-export function captureThreeNativeBatch(object, remainingDraws, fail, instanceCount) {
+export function captureThreeNativeBatch(object, remainingDraws, fail, instanceCount, {wireframe = false, indexCount} = {}) {
   if (object.isBatchedMesh !== true) return null;
   if (remainingDraws < 1) fail('LIMIT', 'Native batch subdraws exceed the captured scene draw budget');
   // RenderObject gates a batch on object.count, then the backend issues one
@@ -39,9 +39,12 @@ export function captureThreeNativeBatch(object, remainingDraws, fail, instanceCo
       !Number.isSafeInteger(count) || count < 0 || count > starts.length || count > counts.length)
     fail('OBJECT', 'Native batch draw arrays require bounded source subdraw counts');
   if (Math.max(1, count) > remainingDraws) fail('LIMIT', 'Native batch subdraws exceed the captured scene draw budget');
-  const index = object.geometry.index, extent = index?.count ?? object.geometry.attributes.position?.count;
-  const divisor = index ? object._multiDrawBytesPerElement : 1;
-  if (!Number.isSafeInteger(extent) || extent < 0 || index && ![2, 4].includes(divisor))
+  const index = object.geometry.index, indexed = wireframe || index !== null;
+  const extent = wireframe ? indexCount : index?.count ?? object.geometry.attributes.position?.count;
+  // Source selection already doubled wireframe ranges. Even nonindexed batches
+  // now draw the derived edge index; preserve the source callback's byte stride.
+  const divisor = indexed ? object._multiDrawBytesPerElement : 1;
+  if (!Number.isSafeInteger(extent) || extent < 0 || indexed && !(wireframe ? [1, 2, 4] : [2, 4]).includes(divisor))
     fail('GEOMETRY', 'Native batch ranges require a valid source vertex/index extent and index stride');
   const draws = [];
   for (let ordinal = 0; ordinal < count; ordinal++) {

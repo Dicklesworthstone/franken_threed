@@ -1020,8 +1020,9 @@ export async function createGpuThreeScene(device,scene,{
   }
   function nodeDescription(binding){
     const {nodeProgram,raster,material}=binding;
-    return {nodeProgram,options:{nodeProgram,raster,topology:'triangles'},values:{},clipped:null,
-      structural:[trackMaterial(material),'native-node',nodeProgram.key,JSON.stringify(raster)]};
+    const topology=nodeProgram.wireframe?'lines':'triangles';
+    return {nodeProgram,options:{nodeProgram,raster,topology},values:{},clipped:null,
+      structural:[trackMaterial(material),'native-node',nodeProgram.key,topology,JSON.stringify(raster)]};
   }
   function desired(nodes){
     const clippingFrame=clippingState();
@@ -1085,7 +1086,7 @@ export async function createGpuThreeScene(device,scene,{
     textureScan=new Set();
     try{desired(graph());return textureScan;}finally{textureScan=null;}
   }
-  function sameDesired(a,b){return a.length===b.length&&a.every((item,i)=>item.key===b[i].key&&item.geometry===b[i].geometry&&item.deformationSource===b[i].deformationSource&&item.instanceSignature===b[i].instanceSignature&&item.material===b[i].material&&same(item.desc.structural,b[i].desc.structural));}
+  function sameDesired(a,b){return a.length===b.length&&a.every((item,i)=>item.key===b[i].key&&item.geometry===b[i].geometry&&item.programSource===b[i].programSource&&item.deformationSource===b[i].deformationSource&&item.instanceSignature===b[i].instanceSignature&&item.material===b[i].material&&same(item.desc.structural,b[i].desc.structural));}
   function publish(next){
     for(const entry of entries)if(!next.includes(entry))entry.mesh.dispose();
     entries=next;lookup=new Map();const used=new Set(next.filter(e=>!e.deformation).map(e=>e.geometry)),usedInstances=new Set(next.map(e=>e.instanceSource)),usedMaterials=new Set();
@@ -1167,7 +1168,7 @@ export async function createGpuThreeScene(device,scene,{
           if(!entry){
             const mesh=await Promise.race([renderer.addMesh(gpu,item.desc.options),stopped]);
             entry={key:item.key,geometry:item.geometry,instanceSource:null,instanceSignature:null,material:item.material,structural:item.desc.structural,
-              topology:item.desc.options.topology,signature,deformation:null,mesh,programGeometry:gpu,nodeProgram:native};created.push(entry);live();
+              topology:item.desc.options.topology,signature,deformation:null,mesh,programGeometry:gpu,programSource:item.programSource,nodeProgram:native};created.push(entry);live();
           }
           next.push(entry);
           continue;
@@ -1593,7 +1594,8 @@ export async function createGpuThreeScene(device,scene,{
       let nativeBackground = null;
       if(passNodeFrame)for(const packet of passNodeFrame.draws){
         const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
-        const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&same(e.structural,desc.structural));
+        const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&
+          e.programSource===(packet.binding.programGeometry??packet.binding.geometry)&&same(e.structural,desc.structural));
         if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
         const draw={...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true};
         if(packet.background)nativeBackground=draw;

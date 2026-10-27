@@ -101,6 +101,8 @@ const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps
   "native_tsl_cpu_instanced_mesh",
   "native_tsl_instanced_geometry_indexed", "native_tsl_instanced_geometry_interleaved", "native_tsl_instanced_geometry_targets",
   "native_batches_indexed", "native_batches_nonindexed_updates", "native_batches_targets", "native_batches_shadows",
+  "native_wireframe_materials", "native_wireframe_targets", "native_wireframe_instances",
+  "native_wireframe_mixed_shadows",
   "native_tsl_shadows", "native_tsl_shadows_basic",
   "native_tsl_shadows_sun", "native_tsl_shadows_spot",
   "native_tsl_shadows_point", "native_tsl_shadows_point_basic",

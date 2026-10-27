@@ -33,6 +33,7 @@ import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePa
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
+import {createThreeNodeWireframes} from './three_node_wireframe.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -55,7 +56,7 @@ const GRAPH_SLOTS = [...SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, 
 // These source material accessors lower to ordinary 2D texture bindings. AO and
 // light maps additionally retain their exact source material lighting nodes.
 // Environment maps use their separate source PMREM identity and context below.
-const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
+const MATERIAL_MAPS = new Set(['map', 'alphaMap', 'matcap', 'emissiveMap', 'normalMap', 'bumpMap', 'displacementMap',
   'specularMap', 'specularIntensityMap', 'specularColorMap', 'roughnessMap', 'metalnessMap', 'gradientMap',
   'clearcoatMap', 'clearcoatRoughnessMap', 'clearcoatNormalMap', 'sheenColorMap', 'sheenRoughnessMap',
   'iridescenceMap', 'iridescenceThicknessMap', 'anisotropyMap', 'retroreflectivityMap', 'aoMap', 'lightMap',
@@ -81,6 +82,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const effects = createThreeNodeEffects(three, renderer, {fail});
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
+  const normalPrototypes = [three.MeshNormalNodeMaterial.prototype, three.MeshMatcapNodeMaterial.prototype];
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
@@ -90,12 +92,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   let lightClassSerial = 0;
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
   const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
+  const wireframes = createThreeNodeWireframes(three, {maxBytes: maxAttributeBytes, fail});
   const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
   const materialViews = new WeakMap();
   const sourceMaterialClasses = new Map([
     [three.MeshBasicMaterial, three.MeshBasicNodeMaterial], [three.MeshToonMaterial, three.MeshToonNodeMaterial],
     [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
     [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial],
+    [three.MeshNormalMaterial, three.MeshNormalNodeMaterial], [three.MeshMatcapMaterial, three.MeshMatcapNodeMaterial],
     [three.ShadowMaterial, three.ShadowNodeMaterial]
   ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
   let disposed = false, shaderBytes = 0, serial = 0;
@@ -696,8 +700,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     material = prepareMaterial(material);
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
-        ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Toon, Lambert, Phong, Standard, Physical, Shadow or unlit base NodeMaterial');
+        ![three.MeshBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
       physical = prototype === three.MeshPhysicalNodeMaterial.prototype;
@@ -722,8 +726,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspectThreeNodeClipping(three, context, maxNodes, fail);
     if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
       fail('EFFECT', 'Native WebGPU clipping uses source ClippingGroup objects, not legacy material or renderer planes');
-    if (material.wireframe || material.alphaHash)
-      fail('RASTER', 'Native node graph wireframe and hashed alpha are not admitted');
+    if (material.alphaHash)
+      fail('RASTER', 'Native node graph hashed alpha is not admitted');
     if (typeof material.alphaToCoverage !== 'boolean')
       fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
@@ -749,6 +753,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         inspectTexture(value);
       }
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(lit && LIT_SLOTS.has(key)) &&
+          !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) && !(key === 'depthNode' && material.isShadowPassMaterial === true) &&
           !(key === 'contextNode' && pipelineContext !== null))
@@ -866,6 +871,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // builder nodes which close over a particular source object.
     return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
+      material.wireframe === true ? [object.geometry.index?.array.length ?? null,
+        object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
@@ -890,6 +897,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
     if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
+    if (entry.descriptor.wireframe) wireframes.release(entry.descriptor);
     const materials = cache.get(entry.object), passes = materials?.get(entry.material);
     if (passes?.get(entry.passId) === entry) {
       passes.delete(entry.passId);
@@ -949,7 +957,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertMorphs(object, morphSignature);
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
-    if (fogSignature(material, context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
+    if (fogSignature(prepareMaterial(material), context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
@@ -1044,6 +1052,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (colorCount > (renderer.getRenderTarget?.()?.textures.length ?? 1))
       fail('MRT', 'Native fragment outputs exceed the current color attachments');
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`, vertex, fragment, colorCount,
+      wireframe: preparedMaterial.wireframe === true,
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
     // Node.build() deduplicates unsized storage by attribute before addNode().
@@ -1079,6 +1088,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('CHANGED', 'Source instance construction retained a different CPU array; replace the instance attribute');
     }
     if (generated.length) generatedAttributes.register(descriptor, object.geometry, generated);
+    if (descriptor.wireframe) wireframes.register(descriptor, object.geometry,
+      generated.length ? generatedAttributes.geometry(descriptor) : object.geometry);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
@@ -1240,7 +1251,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
   }
   function checkFog(state, context) {
-    if (fogSignature(state.material, {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
+    if (fogSignature(prepareMaterial(state.material), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, kind or material enable flag changed; compile the graph again');
   }
   function checkEnvironment(state, context) {
@@ -1264,8 +1275,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (inspectThreeNativeBatch(three, object, fail) !== signature)
       fail('CHANGED', 'Native batch texture identities changed; compile the source batching graph again');
   }
+  function checkWireframe(state) {
+    if (state.descriptor.wireframe !== (state.material.wireframe === true))
+      fail('CHANGED', 'Native wireframe topology changed; compile the graph again');
+  }
+  function captureGeometry(state, renderId) {
+    const generated = state.generated ? generatedAttributes.capture(state.descriptor, renderId) : null;
+    const wireframe = state.descriptor.wireframe ? wireframes.capture(state.descriptor, renderId) : null;
+    if (!wireframe) return generated;
+    return Object.freeze({bytes: wireframe.bytes + (generated?.bytes ?? 0), indexCount: wireframe.indexCount,
+      geometry: wireframe.geometry,
+      install() { generated?.install(); wireframe.install(); }});
+  }
   function checkCapture(state, context) {
     const object = context.object ?? state.object;
+    checkWireframe(state);
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
@@ -1321,9 +1345,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkEnvironment(state, context);
       checkTransmission(state);
       checkAttributes(state);
+      checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
-      const attributes = state.generated ? generatedAttributes.capture(descriptor, frame.renderId) : null;
+      const attributes = captureGeometry(state, frame.renderId);
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);
         checkPMREM(state);
@@ -1341,6 +1366,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkEnvironment(state, context);
       checkTransmission(state);
       checkClipping(state, context);
+      checkWireframe(state);
       const textures = readTextures(state);
       const storage = readStorage(state);
       const uniforms = state.bindings.map((group, index) => {
@@ -1354,7 +1380,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      return {uniforms, textures, storage, attributes};
+      return {uniforms, textures, storage, attributes,
+        ...(descriptor.wireframe ? {wireframeIndexCount: attributes.indexCount, programGeometry: attributes.geometry} : {})};
     });
   }
   function capture(descriptor, context = {}) { return captureDraw(descriptor, context).uniforms; }
@@ -1363,16 +1390,19 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
   const api = Object.freeze({inspect, compile, preparePMREM, before, capture, captureDraw, after,
-    geometry(descriptor) { const state = stateOf(descriptor); return state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
-    attributeBytes(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.byteLength(descriptor) : 0; },
+    geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
+      : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
+    attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)
+      + (descriptor.wireframe ? wireframes.byteLength(descriptor) : 0); },
     captureAttributes(descriptor, context = {}) {
       const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state);
-      return state.generated ? generatedAttributes.capture(descriptor, context.renderId ?? renderer.info.calls) : null;
+      checkWireframe(state);
+      return captureGeometry(state, context.renderId ?? renderer.info.calls);
     },
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
-    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); effects.dispose(); },
+    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); wireframes.dispose(); effects.dispose(); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});
   return api;
 }

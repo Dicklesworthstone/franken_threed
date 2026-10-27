@@ -206,7 +206,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (nodeProgram.instanceCapacity !== undefined &&
         (!Number.isSafeInteger(instanceCapacity) || instanceCapacity < 0 || instanceCapacity > 0xffffffff))
       fail('ANIMATION_RENDER_OPTIONS', 'Native node instance capacity must be a nonnegative 32-bit integer');
-    if (topology !== 'triangles') fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics currently draw triangle meshes');
+    if (!['triangles', 'lines'].includes(topology)) fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics require triangle or line-list primitives');
     const groups = nodeProgram.groups.map(groupDescriptor);
     if (groups.reduce((count, group) => count + group.uniforms.length, 0) >
         (device.limits.maxDynamicUniformBuffersPerPipelineLayout ?? 8))
@@ -268,7 +268,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
         fragment: {module: fragmentModule, entryPoint: 'main', targets: colorFormats.map((format, index) => ({format,
           ...(colorStates[index].blend ? {blend: colorStates[index].blend} : {}),
           writeMask: index < colorCount ? state.writeMask : 0}))},
-        primitive: {topology: 'triangle-list', cullMode: state.cullMode, frontFace},
+        primitive: {topology: topology === 'lines' ? 'line-list' : 'triangle-list', cullMode: state.cullMode, frontFace},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
           depthCompare: state.depthCompare, ...state.bias,
           ...stencil}} : {}),
