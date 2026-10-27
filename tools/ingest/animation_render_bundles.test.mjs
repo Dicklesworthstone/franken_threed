@@ -110,6 +110,27 @@ test('direct and bundled native draws encode every dynamic offset and own their 
   assert.deepEqual([cache.diagnostics.builds, cache.diagnostics.reuses], [2, 1]);
 });
 
+test('native batch ordinals reach indexed and nonindexed draws and invalidate recorded bundles', () => {
+  for (const indexed of [false, true]) {
+    const device = bundleDevice(), config = parameters(), cache = createAnimationRenderBundleCache(device, config);
+    const command = draw({first: 6, count: 12, firstInstance: 3, instanceCount: 1,
+      nodeProgram: {groups: [{group: {}, offset: null}]},
+      ...(indexed ? {indexBuffer: {}, indexFormat: 'uint16'} : {})});
+    const pass = device.pass(), expected = id => indexed ? [12, 1, 6, 0, id] : [12, 1, 6, id];
+    encodeAnimationDraws(pass, [command], 1, config);
+    assert.deepEqual(pass.record.draws[0].args, expected(3));
+    cache.execute(pass, [command], 1); const first = pass.record.executions[0][0];
+    command.firstInstance = 1; cache.execute(pass, [command], 1);
+    assert.deepEqual(pass.record.draws.at(-1).args, expected(1));
+    assert.deepEqual(first.draws[0].args, expected(3));
+    command.firstInstance = 3; cache.execute(pass, [command], 1);
+    assert.equal(pass.record.executions.at(-1)[0], first);
+    delete command.firstInstance; encodeAnimationDraws(pass, [command], 1, config);
+    assert.deepEqual(pass.record.draws.at(-1).args, expected(0));
+    assert.deepEqual([cache.diagnostics.builds, cache.diagnostics.reuses], [2, 1]);
+  }
+});
+
 test('instancing preserves native calls, firstInstance and BLEND order', () => {
   const device = bundleDevice(), cache = createAnimationRenderBundleCache(device, {...parameters(),instancing:true});
   const a=draw({indexBuffer:{},indexFormat:'uint16'}), b={...a,record:{...a.record,alphaMode:'BLEND'}};

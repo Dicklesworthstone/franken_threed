@@ -1,7 +1,8 @@
 # Native TSL graphics programs
 
 The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
-meshes and CPU- or storage-backed `InstancedMesh` objects. It retains the exact r186
+meshes, CPU- or storage-backed `InstancedMesh` objects, `InstancedBufferGeometry`
+and `BatchedMesh`. It retains the exact r186
 `WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
 uniform buffers, command encoding and submission. The path does not construct an
@@ -591,6 +592,38 @@ program path retains its divisor expansion. Existing geometry upload versions
 and partial ranges preserve GPU-stale bytes outside requested updates. This does
 not add per-call snapshots of arbitrary geometry arrays.
 
+## BatchedMesh
+
+Pinned `BatchedMesh` objects select native programs with ordinary built-in or
+authored node materials. Indexed and nonindexed batches execute their source
+subdraw ranges, including heterogeneous geometry. The source callback owns
+instance visibility, deleted/reused IDs, per-instance frustum culling, opaque
+and transparent sorting, and `customSort`. The source batch shader reads matrix,
+optional color and unsigned-integer indirect-index textures. Each WebGPU
+`firstInstance` is the subdraw ordinal; the indirect texture resolves the actual
+instance ID. An ordinary geometry draw range does not clip these source ranges.
+
+One source material pass captures uniforms, textures and draw ranges once, then
+shares that immutable resource history across its subdraws. Queued renders keep
+independent matrix/color uploads, indirect IDs and ranges. Ordinary transparent
+`DoubleSide` materials run node updates for each physical side, while the object
+selection callback runs once before that split. Compilation follows the source
+callback, so first colors and changed material sides from `customSort` reach
+the shader and raster state. `compileAsync` runs source selection without running
+ordinary node updates. Shadow casters use the same native shadow owner and the
+pinned shadow callback sequence.
+
+Texture allocation identities participate in program keys: introducing the
+first color or resizing instance capacity rebuilds the source batching graph.
+Replacing those allocations during node updates refuses the capture before GPU
+publication. Empty batches and zero object counts retain source updates without
+issuing GPU draws. Subdraw expansion, texture layouts and ranges remain bounded
+by the existing admission and pending-capture budgets. Native direct commands
+and render bundles both retain the draw ordinal. Custom BatchedMesh subclasses
+and replaced object lifecycle hooks remain outside this profile; `customSort`
+itself is supported. This supplies the pinned WebGPU subdraw loop, without a
+claim of hardware multidraw acceleration or measured speedup.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
@@ -600,11 +633,12 @@ graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models,
 shadows, projected light maps and custom `lightsNode` graphs remain missing.
 Depth/comparison, array, volume, compressed, storage, video and unfilterable
-or integer texture graphs still require additional native profiles. Sampled
+or integer texture graphs beyond the admitted 32-bit data/storage profiles still
+require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions, fog/clipping/shadows,
-wireframe, alpha hashing and alpha-to-coverage; skinned, batched or morph meshes,
+wireframe, alpha hashing and alpha-to-coverage; skinned or morph meshes,
 including per-instance morph textures; ArrayCamera, reversed depth and XR views;
 custom object/material render hooks and effectful attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and

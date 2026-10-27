@@ -49,8 +49,8 @@ export function encodeAnimationDraws(encoder, commands, length, {
       for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
       if (command.indexBuffer) {
         encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-        encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
-      } else encoder.draw(count, command.instanceCount, first, 0);
+        encoder.drawIndexed(count, command.instanceCount, first, 0, command.firstInstance ?? 0);
+      } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
       calls++; i++;
       continue;
     }

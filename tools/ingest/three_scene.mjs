@@ -317,7 +317,7 @@ export async function createGpuThreeScene(device,scene,{
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
         const list=colorMaterials(object);
-        if(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m)))
+        if(!(capturedNodeObject(object)&&object.isBatchedMesh)&&(!programRoute()||!(object.isMesh||object.isLine||object.isPoints)||!list.every(m=>!m||programCapable(m))))
           fail('HOOK','Custom render callbacks are not admitted by this source bridge');
         programHooked.add(object);
       }
@@ -325,11 +325,11 @@ export async function createGpuThreeScene(device,scene,{
         if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
         if(!programRoute()&&colorMaterials(object).some(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
           fail('MATERIAL','Native sprite materials currently require a Sprite object');
-        if((object.isBatchedMesh&&!programRoute())||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
+        if((object.isBatchedMesh&&!programRoute()&&!capturedNodeObject(object))||object.intersectsFrustum!==(object.isSkinnedMesh?three.SkinnedMesh?.prototype.intersectsFrustum:three.Mesh.prototype.intersectsFrustum))
           fail('OBJECT','Use the explicit animation/instance path for this mesh family');
         // BatchedMesh (WebGL surface): its ShaderLib program with r186's
         // no-WEBGL_multi_draw path, one draw per multi-draw entry.
-        if(object.isBatchedMesh){
+        if(object.isBatchedMesh&&!capturedNodeObject(object)){
           if(object.castShadow)fail('SHADOW','BatchedMesh shadow casters are not admitted yet');
           programDeformed.add(object);
         }
@@ -1672,7 +1672,7 @@ export async function createGpuThreeScene(device,scene,{
           if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
           copiesAtDraw(item.nodeFramebufferCopies);
-          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
+          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           copiesAtDraw(item.nodeFramebufferAfterCopies);
           continue;

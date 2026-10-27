@@ -31,6 +31,7 @@ import {createThreeNodeAttributes} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
+import {inspectThreeNativeBatch} from './three_node_batch.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -573,8 +574,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
               typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
       fail('TEXTURE', 'Native cube sampling requires six source data/image faces or a registered native cube target with reflection or refraction mapping');
     const integerType = integerTextureType(texture);
-    if (integerType && (!storage || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
-      fail('TEXTURE', 'Native integer graphics inputs require unnormalized GPU-authored storage with NoColorSpace');
+    const integerData = integerType && typeof three.DataTexture === 'function' && texture instanceof three.DataTexture &&
+      texture.isDataTexture === true && !array && !volume && !texture.isCubeTexture && !target;
+    if (integerType && ((!storage && !integerData) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
+      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage or source 2D DataTexture inputs with NoColorSpace');
     if (!depth && !integerType && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
@@ -592,7 +595,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || framebuffer || target && viewDimension === 'cube') && !layout?.texture)
+    if ((storage || integerData || framebuffer || target && viewDimension === 'cube') && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
@@ -698,11 +701,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
-    if (!(object instanceof three.Mesh) || object.isBatchedMesh ||
+    if (!(object instanceof three.Mesh) ||
         !(object.geometry instanceof three.BufferGeometry) ||
         object.geometry.isInstancedBufferGeometry && !(object.geometry instanceof three.InstancedBufferGeometry))
-      fail('OBJECT', 'Native node graphs require source meshes, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
+      fail('OBJECT', 'Native node graphs require source meshes, BatchedMesh, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
     inspectInstances(object);
+    inspectThreeNativeBatch(three, object, fail);
     inspectSkinning(object);
     inspectMorphs(object);
     if (camera && (!(camera instanceof three.Camera) || camera.isArrayCamera || camera.isMultiViewCamera || camera.reversedDepth))
@@ -856,7 +860,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.depthWrite, material.depthTest, material.lights, clippingKey,
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
-      instanceSignature, skinSignature, morphSignature, fogKey, materialMapSignature(material),
+      instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
@@ -887,6 +891,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
     const lightKey = lightSignature(lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
+    const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object);
     const fogKey = fogSignature(preparedMaterial, context);
@@ -928,6 +933,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
     }
     assertInstances(object, instanceSignature);
+    assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
@@ -1066,7 +1072,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
-      instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
+      instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
@@ -1243,6 +1249,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         (state.material.alphaToCoverage && renderer.currentSamples > 1) !== state.clippingSamples)
       fail('CHANGED', 'Native clipping layout or coverage mode changed; compile the graph again');
   }
+  function assertBatch(object, signature) {
+    if (inspectThreeNativeBatch(three, object, fail) !== signature)
+      fail('CHANGED', 'Native batch texture identities changed; compile the source batching graph again');
+  }
   function checkCapture(state, context) {
     const object = context.object ?? state.object;
     checkPipelineContext(state, object);
@@ -1259,6 +1269,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       readTextures(state, true);
     checkLights(state);
     assertInstances(object, state.instanceSignature);
+    assertBatch(object, state.batchSignature);
     assertSkinning(object, state.skinSignature);
     assertMorphs(object, state.morphSignature);
     checkPMREM(state);
@@ -1291,6 +1302,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => {
       if (!context.beforeDone) runBefore(state);
       assertInstances(object, state.instanceSignature);
+      assertBatch(object, state.batchSignature);
       assertSkinning(object, state.skinSignature);
       assertMorphs(object, state.morphSignature);
       checkFog(state, context);
@@ -1305,6 +1317,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         checkPMREM(state);
       }
       assertInstances(object, state.instanceSignature);
+      assertBatch(object, state.batchSignature);
       assertSkinning(object, state.skinSignature);
       assertMorphs(object, state.morphSignature);
       checkLights(state);

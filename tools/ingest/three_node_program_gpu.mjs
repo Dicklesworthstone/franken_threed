@@ -297,6 +297,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (stagedDraws >= maxDraws) limit('Native node draw capacity exhausted for this frame');
     if (['first', 'count'].some(key => input[key] !== undefined && (!Number.isSafeInteger(input[key]) || input[key] < 0)) ||
         (input.instanceCount !== undefined && (!Number.isSafeInteger(input.instanceCount) || input.instanceCount < 0 || input.instanceCount > 0xffffffff)) ||
+        (input.firstInstance !== undefined && (!Number.isSafeInteger(input.firstInstance) || input.firstInstance < 0 || input.firstInstance > 0xffffffff)) ||
         (input.frontFaceCW !== undefined && typeof input.frontFaceCW !== 'boolean') ||
         (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== 'boolean') ||
         (input.nodeRangeCaptured === true && (input.first === undefined || input.count === undefined)))
@@ -310,8 +311,9 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const geometry = programGeometrySnapshot(record.gpu, device);
     if (geometry.signature !== record.geometrySignature || geometry.instanced !== record.geometryInstanced)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout changed; register it again');
-    const instanceCount = input.instanceCount ?? 1;
-    if (instanceCount > Math.min(record.instanceCapacity, geometry.instanceCapacity ?? Infinity))
+    const instanceCount = input.instanceCount ?? 1, firstInstance = input.firstInstance ?? 0;
+    if (instanceCount + firstInstance > 0x100000000 ||
+        instanceCount + firstInstance > Math.min(record.instanceCapacity, geometry.instanceCapacity ?? Infinity))
       fail('ANIMATION_RENDER_VALUE', 'Native node instance count exceeds the captured object or vertex stream capacity');
     const extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
     // A facade request already selected its source range synchronously. Later
@@ -333,7 +335,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
       nodeProgram: {groups}, vertexBuffers: geometry.vertexBuffers,
       indexBuffer: geometry.indexBuffer, indexFormat: geometry.indexFormat,
-      instanceCount, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
+      instanceCount, firstInstance, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
     return geometry;
   }
   return Object.freeze({add, stage, prepare,

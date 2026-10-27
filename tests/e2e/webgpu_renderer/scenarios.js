@@ -16,6 +16,7 @@ import { nativeMRTScenarios } from './scenarios_native_mrt.js';
 import { nativeClippingScenarios } from './scenarios_native_clipping.js';
 import { nativeHistoryScenarios } from './scenarios_native_history.js';
 import { nativeInstancedGeometryScenarios } from './scenarios_native_instanced_geometry.js';
+import { nativeBatchScenarios } from './scenarios_native_batches.js';
 export const scenarios = {
   ...nativeTSLScenarios,
   ...nativeShadowScenarios,
@@ -27,6 +28,7 @@ export const scenarios = {
   ...nativeClippingScenarios,
   ...nativeHistoryScenarios,
   ...nativeInstancedGeometryScenarios,
+  ...nativeBatchScenarios,
   ...matcapScenarios,
   ...renderMipScenarios,
   ...spriteScenarios,

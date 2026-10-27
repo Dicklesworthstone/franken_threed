@@ -53,7 +53,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
   const sourcePool = () => { live(); return pool ??= poolFactory({imageSnapshots}); };
   const isStorage = binding => binding?.texture?.isStorageTexture === true;
-  function describe(binding) {
+  function describe(binding, {initialize = false} = {}) {
     live();
     const t = binding?.texture;
     if (!t || !(t.isTexture || t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
@@ -62,7 +62,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       fail('SOURCE', 'Compute sampled inputs require ready source data, decoded images or canvases');
     if (binding.store) fail('ACCESS', 'Source textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
-    const shape = sourcePool().inspect(t);
+    const shape = sourcePool().inspect(t, {initialize});
     if (!shape.data && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(image => decodedImage(image) || mutableImage(image))))
       fail('SOURCE', 'Compute image inputs require ImageData, ImageBitmap, HTML images or canvases');
     updatePlan(t, shape);
@@ -153,7 +153,10 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (isStorage(binding)) return storage.layout(storage.captureBinding(binding));
     if (isTarget(binding)) return targets().layoutOf(binding);
     if (isFramebuffer(binding)) return framebuffers().layoutOf(binding);
-    return inputLayout(binding, describe(binding));
+    // Shader preparation needs storage metadata before the source requests its
+    // first upload (BatchedMesh prepares its indirect IDs at onBeforeRender).
+    // Capture still validates readiness and owns only the requested versions.
+    return inputLayout(binding, describe(binding, {initialize: true}));
   }
   function syncPool() {
     if (resolving) { poolDirty = true; return; }

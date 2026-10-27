@@ -209,3 +209,16 @@ of `meshPerAttribute`; WebGL-authored programs retain their separate divisor
 semantics. Consumed stream capacities are checked without silently reducing the
 requested count. Attribute bytes retain the existing versioned upload contract,
 including partial updates and GPU-stale bytes outside requested ranges.
+
+Native `BatchedMesh` also selects this path with ordinary or authored node
+materials. It executes indexed/nonindexed source subdraws with per-instance
+matrices and colors, visibility, ID reuse, source culling/sorting and `customSort`.
+Each accepted render retains its source indirect IDs, texture versions and draw
+ranges. The source callback precedes shader construction and transparent side
+expansion; node updates run once per physical material pass, rather than once
+per subdraw. Native shadows share the same batch data and shadow owner. Direct
+commands and render bundles use the source draw ordinal as WebGPU
+`firstInstance`. Empty batches retain callbacks without issuing draws. Source
+geometry draw ranges do not replace batch ranges, and expanded draws stay
+within the configured scene budget. See `THREE_NODE_PROGRAMS.md` for allocation
+changes and the bounded lifecycle profile.
