@@ -111,6 +111,37 @@ submits the copy before the second draw without waiting for buffer mapping.
 Target reconfiguration/disposal invalidates queued uses; renderer disposal also
 cancels pending readbacks.
 
+## Native cube color inputs
+
+The native `CubeRenderTarget` profile supports linear RGBA8 color with one sample
+and mip zero. `CubeCamera.update()` renders all six faces through the new backend;
+its color can then feed `TSL.cubeTexture()` graphs or ordinary Standard/Physical
+material environments. The source PMREM generator filters rendered cube faces
+into its HDR atlas before the material's consumer draw.
+
+```js
+const cubeTarget = new THREE.CubeRenderTarget(256, {generateMipmaps: false});
+const captureCamera = new THREE.CubeCamera(0.1, 100, cubeTarget);
+captureCamera.update(renderer, environmentScene);
+scene.environment = cubeTarget.texture;
+renderer.render(scene, camera);
+```
+
+Selecting or rendering the target registers its exact texture privately. The
+pinned constructor's null `texture.renderTarget` pointer remains unchanged.
+Native graphics and compute bindings borrow the same six-layer GPU color image;
+they neither upload the empty source face descriptors nor create a 2D sampling
+replica. Samplers and resource generations are captured at the call boundary,
+while contents are observed at each ordered submission. Repeated cube captures
+and consumers can therefore share the image without losing intervening draws.
+Sampling the active destination, disposal and replaced target textures retain
+the existing feedback and stale-generation checks. HDR cube attachments,
+generated cube mips and source cube resizing remain separate gaps.
+
+`node tools/ingest/three_node_cube_targets.test.mjs` checks source CubeCamera
+execution, exact source-generated WGSL, shared graphics/compute color bindings,
+PMREM composition, queue order, budgets and invalidation with a recording device.
+
 ## Reused fullscreen shader passes
 
 On the WebGL-compatible surface, callback-free `Mesh` roots with a source

@@ -21,8 +21,8 @@
  * Native point shadows use six square cube faces. Rendering selects one face,
  * while native depth sampling borrows all six layers without a UV replica.
  * Cube targets admit one sample and mip zero. Explicit face-aware color/depth
- * transfers and native readbacks share this owner; cube color sampling and
- * source resize remain unsupported.
+ * transfers, native readbacks and six-layer native color sampling share this
+ * owner. Source cube resize remains unsupported.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * Source FloatType R/RG/RGBA attachments retain full precision through storage,
@@ -256,6 +256,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     fail('OPTIONS', 'Invalid target owner options');
   const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), nativeResizes = new WeakMap();
   const historyGroups = new Map(), historyEntries = new Set(), nativePasses = new WeakMap();
+  // r186 CubeRenderTarget replaces its color texture without assigning that
+  // texture's renderTarget pointer. Selecting/rendering a target registers its
+  // exact color identity privately; native sampling must never patch the public
+  // texture or mistake its six empty face descriptors for CPU upload sources.
+  const cubeColorTargets = new WeakMap();
   const allEntries = () => new Set([...entries.values(), ...historyEntries, ...preserved]);
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
@@ -356,6 +361,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function capture(target) {
     live();
     const shape = inspectThreeRenderTarget(target, three);
+    if (shape.cube) {
+      const owner = cubeColorTargets.get(shape.texture);
+      if (owner && owner !== target && owner.texture === shape.texture)
+        fail('SOURCE', 'A cube color texture cannot belong to two registered render targets');
+      cubeColorTargets.set(shape.texture, target);
+    }
     const device = getDevice();
     if (device && shape.textures.length > 1) gpuTargets.inspectGpuRenderTargetColors(device, shape.colorFormats);
     // Source registration outlives an allocation group: PassNode.setSize()
@@ -669,7 +680,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   // r186 assigns renderTarget on DepthTexture without setting the color-only
   // isRenderTargetTexture flag. Never mutate source texture flags to route it.
-  const targetTexture = texture => (texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true) && texture.renderTarget != null;
+  const textureTarget = texture => (texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true)
+    ? texture.renderTarget ?? (texture.isCubeTexture === true ? cubeColorTargets.get(texture) : null) ?? null : null;
+  const targetTexture = texture => textureTarget(texture) !== null;
   // The existing scene bridge accepts a Map of externally owned bindings. Its
   // has/get calls always resolve the current target generation, so stale views
   // trigger the bridge's normal re-preparation boundary before submission.
@@ -679,8 +692,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       has(texture) { return targetTexture(texture) || retained.has(texture); }
       get(texture) {
         if (!targetTexture(texture)) return retained.get(texture);
-        if (texture.renderTarget === destination) fail('FEEDBACK', 'A render pass cannot sample its own color or depth target');
-        const entry = capture(texture.renderTarget);
+        const target = textureTarget(texture);
+        if (target === destination) fail('FEEDBACK', 'A render pass cannot sample its own color or depth target');
+        const entry = capture(target);
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
         if (entry.shape.texture !== texture) fail('UNSUPPORTED', 'Additional MRT attachments require native texture bindings');
@@ -733,9 +747,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // metadata; GPU contents are observed at the consumer's FIFO submission.
     captureNativeTexture(texture, {comparison = false} = {}) {
       live();
-      if (!targetTexture(texture))
+      if (!targetTexture(texture)) {
+        if (texture?.isCubeTexture === true && texture.isRenderTargetTexture === true)
+          fail('SOURCE', 'Select or render the CubeRenderTarget before sampling its color texture');
         fail('SOURCE', 'Expected a target-owned color or depth texture for native sampling');
-      let entry = capture(texture.renderTarget);
+      }
+      let entry = capture(textureTarget(texture));
       const group = entry.historyGroup, device = getDevice();
       if (group && !texture.isDepthTexture && !entry.shape.textures.includes(texture)) {
         const index = group.pairs.findIndex(pair => pair.includes(texture));
@@ -748,7 +765,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const depth = texture.isDepthTexture === true, colorIndex = depth ? -1 : entry.shape.textures.indexOf(texture);
       if (depth ? entry.shape.depthTexture !== texture : colorIndex < 0)
         fail('STALE', 'Texture no longer belongs to its source target');
-      if (entry.shape.cube && !depth) fail('UNSUPPORTED', 'Cube target color sampling is not admitted');
       if (!device) fail('DEVICE', 'Initialize the renderer before capturing native target inputs');
       if (comparison && (!depth || texture.compareFunction == null))
         fail('SAMPLER', 'Comparison sampling requires a source depth texture with compareFunction');

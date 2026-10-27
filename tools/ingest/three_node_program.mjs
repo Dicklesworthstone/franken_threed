@@ -7,7 +7,8 @@
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
  * source bone palettes, authored typed uniform arrays and multiple uniform blocks per source group,
- * sampled 2D/data-array/cube textures, GPU-authored 2D/array/3D storage inputs,
+ * sampled 2D/data-array/cube textures, native cube render-target color,
+ * GPU-authored 2D/array/3D storage inputs,
  * target-owned depth comparisons and read-only
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
@@ -514,6 +515,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
     const framebuffer = texture?.isFramebufferTexture === true;
+    const target = texture?.isRenderTargetTexture === true;
     const array = texture?.isDataArrayTexture === true || storage && texture.isArrayTexture === true;
     const volume = storage && texture.is3DTexture === true;
     if (!(texture instanceof three.Texture) ||
@@ -549,15 +551,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isCubeTexture && (!(texture instanceof three.CubeDepthTexture) || texture.isCubeDepthTexture !== true)))
       fail('TEXTURE', 'Native depth sampling requires an attached source DepthTexture or CubeDepthTexture');
     const viewDimension = volume ? '3d' : texture.isCubeTexture === true ? 'cube' : array ? '2d-array' : '2d';
-    if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) || texture.isRenderTargetTexture ||
+    if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
-        !Array.isArray(texture.image) || texture.image.length !== 6 || texture.image.some(face =>
+        !Array.isArray(texture.image) || texture.image.length !== 6 || (target
+          ? typeof renderer._getSampledTextureInputs !== 'function' : texture.image.some(face =>
           !(face instanceof three.DataTexture && face.isDataTexture === true &&
             ArrayBuffer.isView(face.image?.data) && !(face.image.data instanceof DataView)) &&
           !(typeof renderer._getSampledTextureInputs === 'function' &&
             ['ImageData', 'ImageBitmap', 'HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas'].some(name =>
-              typeof globalThis[name] === 'function' && face instanceof globalThis[name])))))
-      fail('TEXTURE', 'Native cube sampling requires six source data or decoded image faces with reflection or refraction mapping');
+              typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
+      fail('TEXTURE', 'Native cube sampling requires six source data/image faces or a registered native cube target with reflection or refraction mapping');
     if (!depth && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
@@ -575,7 +578,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || framebuffer) && !layout?.texture) fail('TEXTURE', 'Missing shared GPU texture sampling layout');
+    if ((storage || framebuffer || target && viewDimension === 'cube') && !layout?.texture)
+      fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
       fail('TEXTURE', 'Native graphics texture bindings must match the source dimension and sample count');
