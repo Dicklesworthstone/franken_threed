@@ -216,21 +216,52 @@ test('public native cube sampling rejects destination feedback before a consumer
   assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('public native compute can read the same rendered cube through source WGSL texture bindings', async t => {
+test('source color CubeTextureNode retains its render-context requirement in compute', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const target = new THREE.CubeRenderTarget(8); f.renderer.setRenderTarget(target);
+  f.renderer.setRenderTarget(null);
+  const readCube = N.wgslFn('fn readRenderedCube(image: texture_cube<f32>, imageSampler: sampler) -> vec4<f32> { return textureSampleLevel(image, imageSampler, vec3<f32>(1.0, 0.0, 0.0), 0.0); }');
+  const output = N.storage(new THREE.StorageBufferAttribute(1, 4), 'vec4', 1);
+  const image = N.cubeTexture(target.texture, N.vec3(1, 0, 0));
+  const kernel = N.Fn(() => { output.element(0).assign(readCube({image, imageSampler: N.sampler(image)})); })().compute(1);
+  const builder = new THREE.WGSLNodeBuilder(null, f.renderer); builder.compute = kernel; builder.build();
+  const frame = new THREE.NodeFrame(); frame.renderer = f.renderer;
+  // r186 Nodes.getNodeFrameForCompute() clears scene/material. The color node's
+  // materialEnvRotation callback requires those even when only a WGSL texture
+  // reference is used. Do not hide that source limitation behind a 2D node.
+  const expected = {name: 'TypeError', message: /reading 'environment'/};
+  assert.throws(() => { for (const node of builder.updateNodes) frame.updateNode(node); }, expected);
+  assert.throws(() => f.renderer.compute(kernel), expected);
+  assert.equal(f.device.events.filter(event => event.compute).length, 0);
+});
+
+test('an app-authored source cube node feeds rendered faces into native compute with the exact source WGSL', async t => {
   const f = fixture(t); await f.renderer.init();
   const target = new THREE.CubeRenderTarget(8), p = producer(target);
   p.camera.update(f.renderer, p.scene);
   const readCube = N.wgslFn('fn readRenderedCube(image: texture_cube<f32>, imageSampler: sampler) -> vec4<f32> { return textureSampleLevel(image, imageSampler, vec3<f32>(1.0, 0.0, 0.0), 0.0); }');
   const output = N.storage(new THREE.StorageBufferAttribute(1, 4), 'vec4', 1);
-  // A raw texture argument leaves coordinates to the authored WGSL function.
-  // CubeTextureNode's material/environment rotation needs a render context and
-  // is not part of this source compute graph.
-  const image = N.texture(target.texture, N.vec2(0)).setUpdateMatrix(false);
+  // Use the pinned source extension pattern from
+  // examples/jsm/lighting/vxgi/VXGIVolume.js: PlainCubeTextureNode. Compute has
+  // no scene/material for environment rotation. This is an application node,
+  // passed unchanged to the source builder and the candidate renderer.
+  class PlainCubeTextureNode extends THREE.CubeTextureNode {
+    setupUV(builder, uvNode) {
+      if (this.value.isDepthTexture === true) return N.vec3(uvNode.x, uvNode.y.negate(), uvNode.z);
+      return N.vec3(uvNode.x.negate(), uvNode.yz);
+    }
+  }
+  const image = N.nodeObject(new PlainCubeTextureNode(target.texture, N.vec3(1, 0, 0)));
   const kernel = N.Fn(() => { output.element(0).assign(readCube({image, imageSampler: N.sampler(image)})); })().compute(1);
+  const builder = new THREE.WGSLNodeBuilder(null, f.renderer); builder.compute = kernel; builder.build();
+  const frame = new THREE.NodeFrame(); frame.renderer = f.renderer;
+  for (const node of builder.updateNodes) frame.updateNode(node);
   f.renderer.compute(kernel); await f.renderer.waitForGPU();
   const dispatches = f.device.events.filter(event => event.compute); assert.equal(dispatches.length, 1);
   const view = cubeView(dispatches[0]); assert.ok(view); assert.equal(view.texture.depthOrArrayLayers, 6);
-  assert.match(dispatches[0].pipeline.compute.module.code, /texture_cube<f32>/);
+  assert.equal(dispatches[0].pipeline.compute.module.code, builder.computeShader);
+  assert.match(builder.computeShader, /var \w+\s*:\s*texture_cube<f32>/);
+  assert.doesNotMatch(builder.computeShader, /texture_2d<f32>/);
   assert.equal(f.device.passes.filter(pass => pass.desc.colorAttachments[0].view.texture === view.texture).length, 6);
   assert.equal(f.device.textureWrites.filter(write => write.texture === view.texture).length, 0);
   assert.equal(target.texture.renderTarget, null);

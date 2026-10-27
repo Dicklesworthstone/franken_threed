@@ -31,7 +31,7 @@ const litMaterial = material => material?.isMaterial === true && material.lights
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
   maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null,
-  withFramebufferCopies = null, renderLists = null} = {}) {
+  withFramebufferCopies = null, renderLists = null, renderId = renderer?.info?.calls} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const sortObjects = renderer?.sortObjects === true;
@@ -239,7 +239,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Preserve this logical render's clock before any builder advances info.calls.
   const frame = renderer._nodes.nodeFrame;
   const frameStamp = {frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
-    renderId: renderer.info.calls};
+    renderId};
   let programs = null;
   const context = {scene: root, camera, lights: Object.freeze([]),
     lightingEnabled: renderer.lighting?.enabled !== false};

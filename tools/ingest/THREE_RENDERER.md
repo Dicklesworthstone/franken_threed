@@ -39,8 +39,26 @@ from automatic application routing.
 requiredLimits, requiredFeatures, device})`, `init()`, `render()` (throws the source
 error before `init()`), `renderAsync()`, `compileAsync()`, `setAnimationLoop()`,
 `setSize()`, `setPixelRatio()`, `setDrawingBufferSize()`, size getters, clear
-color/alpha/depth, `autoClear*`, `toneMapping` (fixed at `init()`),
+color/alpha/depth, `autoClear*`, `toneMapping`,
 `toneMappingExposure`, `shadowMap.enabled`, `info`, `dispose()`.
+
+Native `setOutputRenderTarget(target)` / `getOutputRenderTarget()` select a
+single-color 2D target for final output. Working-linear output renders directly;
+tone mapping or color conversion first renders into the pinned source's private
+linear framebuffer, then executes its retained TSL output graph on the same new
+WebGPU owner. Target dimensions, viewport, scissor, attachment precision and MSAA
+come from the selected target. An explicit unrelated `setRenderTarget()` takes
+precedence. Queued output passes keep their own target generations, tone operator,
+exposure and render-frequency updates; `compileAsync()` prepares both passes.
+
+Selection follows the pinned source, including its asymmetries: a converted
+render leaves the effective output target selected by `getRenderTarget()`; direct
+working-linear output keeps a null active selection. With a null active selection,
+`clear()` clears the private framebuffer and draws its output when conversion is
+needed, but otherwise clears the canvas. An explicit target clear never performs
+the output transform. Cube, array, multiview and multiple-color output targets,
+and output targets on the WebGL-authored facade, remain unsupported. See
+[THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for target profiles and lifetime.
 
 Scene content is whatever `three_scene.mjs` admits: Mesh/InstancedMesh/skinned and
 morphed meshes; Sprite; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is

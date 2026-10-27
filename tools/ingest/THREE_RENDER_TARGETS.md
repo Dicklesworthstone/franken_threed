@@ -67,7 +67,35 @@ reuse the existing bounded per-device staging budget.
 Single-color 2D RGBA8 (linear or sRGB) and linear RGBA16F targets; optional private
 depth storage; zero/one or four samples with color resolve; physical-pixel target
 viewport/scissor; nearest/linear filtering and source wrap/anisotropy settings.
-Canvas pixel ratio and tone mapping do not change offscreen attachments.
+Canvas pixel ratio does not change offscreen attachment dimensions. Ordinary
+explicit render targets retain working-linear output; a native target selected
+with `setOutputRenderTarget()` instead receives the renderer's final output
+transform through the pinned source TSL graph. This output-target route accepts
+one admitted 2D color attachment, including its existing precision, depth and
+MSAA profiles. It shares the render FIFO, captured sampling leases, transfer
+ordering and disposal boundaries with other native target operations. The
+renderer caches private linear framebuffers separately for each output target;
+automatic private resizing preserves accepted generations. Public target
+disposal or replacement invalidates pending operations as before.
+
+A paired Chromium 151.0.7922.34 / SwiftShader browser check matched the pinned
+renderer exactly for six cube-face readbacks, six directional samples, the
+source-supported cube compute result, and output pixels for linear, sRGB, ACES,
+linear tone mapping, sRGB target textures, four-sample MSAA and a converted clear.
+Both runs reported no WebGPU validation errors. This browser predates r186's
+identity-string texture-view swizzle descriptor; both runs used the same adapter
+that removes only `swizzle: 'rgba'`. These are checked-pixel correctness results,
+not physical-device performance or complete rendering equivalence.
+
+The converted-clear browser case uses a depthless output target. The pinned
+source recursively calls `clearDepth()` / `clear()` / `_renderOutput()` when its
+first converted clear reaches a fresh depth-bearing default output target; the
+observed source result is a stack overflow. This source failure is not evidence
+of candidate pixel equivalence for that condition.
+A further browser probe of the first canvas-depth clear with automatic clearing
+disabled failed in the reference with a lost WebGPU instance during readback on
+this software-GPU configuration. Its selector, FIFO and depth-state behavior is
+covered by the recording-device tests; this probe is not counted as a pixel pass.
 
 Native `WebGPURenderer` accepts `setRenderTarget(target, 0, mipLevel)` for
 allocated single-sample color levels. Authored `texture.mipmaps` descriptors
@@ -138,9 +166,20 @@ Sampling the active destination, disposal and replaced target textures retain
 the existing feedback and stale-generation checks. HDR cube attachments,
 generated cube mips and source cube resizing remain separate gaps.
 
+Plain source `TSL.cubeTexture()` color nodes require a scene/material for their
+environment rotation and cannot run in the pinned source's context-free compute
+updates. Compute applications can use the source's own `PlainCubeTextureNode`
+extension pattern from `examples/jsm/lighting/vxgi/VXGIVolume.js`: extend
+`CubeTextureNode` and define `setupUV()` without material environment rotation.
+That application-authored node retains the correct cube binding type and can be
+passed to a `wgslFn` cube texture argument unchanged on both renderers. Passing a
+cube image through a 2D `TSL.texture()` node is not a valid substitute.
+
 `node tools/ingest/three_node_cube_targets.test.mjs` checks source CubeCamera
-execution, exact source-generated WGSL, shared graphics/compute color bindings,
-PMREM composition, queue order, budgets and invalidation with a recording device.
+execution, exact source-generated WGSL, shared graphics/compute color bindings
+with that explicit source node extension, the plain color node's compute-context
+limitation, PMREM composition, queue order, budgets and invalidation with a
+recording device.
 
 ## Reused fullscreen shader passes
 
