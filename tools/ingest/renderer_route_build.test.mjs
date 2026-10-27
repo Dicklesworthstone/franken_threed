@@ -155,7 +155,7 @@ export const gl = document.createElement('canvas').getContext('webgl2');`);
   assert.equal(n.rendererRoute.reason, "no-webgpu-renderer-construction");
 });
 
-test("H1 retains its upstream owner while its controls receive an unclosed canvas reference", async () => {
+test("H1 retains its upstream owner for the Inspector's native backend prototype mutation", async () => {
   const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h1_"));
   const entry = path.resolve(upstreamBuild, "../examples/webgpu_performance_renderbundle.html");
   const result = await buildApplication(entry, path.join(out, "out"), { routeWebGPURenderer: true });
@@ -204,12 +204,53 @@ test("served capability reads (getMaxAnisotropy) do not veto the WebGL route", a
   assert.equal(r.rendererRoute.routed, true);
 });
 
-test("H2 retains its native canvas contract while the controls ownership edge is unresolved", async () => {
+test("H2 routes through the new backend after its verified controls ownership edge closes", async () => {
   const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h2_"));
   const entry = path.resolve(upstreamBuild, "../examples/webgl_marchingcubes.html");
   const result = await buildApplication(entry, path.join(out, "out"), { routeWebGLRenderer: true });
-  assert.equal(result.rendererRoute.routed, false);
-  assert.equal(result.rendererRoute.decisions[0].route, "exact-backend");
+  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.decisions[0].route, "general-webgpu");
+  assert.deepEqual(result.rendererRoute.substitutedModules, [pathToFileURL(path.join(upstreamBuild, "three.module.js")).href]);
+  assert.ok(result.chunks.some(chunk => chunk.fileName.startsWith("f3d-renderer-runtime-")));
+});
+
+test("a bundled closed-controls application executes retained camera controls with the new renderer", async () => {
+  const controlsUrl = pathToFileURL(path.resolve(upstreamBuild, "../examples/jsm/controls/OrbitControls.js")).href;
+  const a = app(`import * as THREE from 'three/webgpu';
+import {OrbitControls as Navigation} from ${JSON.stringify(controlsUrl)};
+const renderer = new THREE.WebGPURenderer();
+const camera = new THREE.PerspectiveCamera(); camera.position.z = 5;
+const controls = new Navigation(camera, renderer.domElement);
+controls.rotateLeft(.25);
+export const isF3DRenderer = renderer.isF3DRenderer;
+export const sourceControls = controls instanceof Navigation;
+export const sameCamera = controls.object === camera;
+export const cameraX = camera.position.x;
+export const dispose = () => { controls.dispose(); renderer.dispose(); };
+`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  const listeners = new Map();
+  const document = {addEventListener() {}, removeEventListener() {}};
+  const canvas = {width: 320, height: 160, clientWidth: 320, clientHeight: 160, style: {}, ownerDocument: document,
+    getRootNode: () => document,
+    addEventListener(name, callback) { listeners.set(name, callback); },
+    removeEventListener(name, callback) { if (listeners.get(name) === callback) listeners.delete(name); },
+  };
+  document.createElementNS = () => canvas;
+  const previous = globalThis.document; globalThis.document = document;
+  let emitted;
+  try {
+    emitted = await import(pathToFileURL(path.join(a.out, "main.js")).href);
+    assert.equal(emitted.isF3DRenderer, true);
+    assert.equal(emitted.sourceControls, true);
+    assert.equal(emitted.sameCamera, true);
+    assert.ok(Math.abs(emitted.cameraX) > .5, "the actual retained controls changed the source camera");
+    assert.ok(listeners.has("pointerdown"));
+  } finally {
+    emitted?.dispose(); globalThis.document = previous;
+  }
+  assert.equal(listeners.size, 0, "the retained controls disconnect their native listeners");
 });
 
 test("opaque renderer consumers receive the actual retained upstream object", async () => {

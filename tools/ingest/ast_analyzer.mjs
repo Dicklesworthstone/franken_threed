@@ -591,13 +591,17 @@ const OPAQUE_GL_METHODS = new Set([
  * consumer lost its reference. Containers, returns and unknown calls are escape
  * boundaries, not invitations to guess what another component will do.
  *
- * This is deliberately an intramodule proof. A renderer passed to an imported
- * helper, including through a returned factory, retains its upstream owner until
- * an interprocedural proof can close that edge. No source code is evaluated.
+ * Imported consumers remain opaque unless the graph verified their source and
+ * dependency contract. Even then their returned resource carriers remain in
+ * this alias proof. No source code is evaluated.
  */
-function analyzeRendererResourceEscapes(ast, offsets) {
+function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const RENDERER = 1, CANVAS = 2, WEBGL = 4, WEBGPU = 8, NAMESPACE = 16, DOM = 32;
-  const CONSTRUCTOR = WEBGL | WEBGPU, RESOURCE = RENDERER | CANVAS | CONSTRUCTOR | NAMESPACE;
+  const ORBIT_CTOR = 64, CONTROLS = 128, BASE_CTOR = 256, ORBIT_NAMESPACE = 512, BASE_NAMESPACE = 1024;
+  const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | ORBIT_CTOR | BASE_CTOR;
+  const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS;
+  const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
+    role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
     "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
@@ -624,16 +628,30 @@ function analyzeRendererResourceEscapes(ast, offsets) {
         ? functions.has(parent.type) || parent.type === "Program" || parent.type === "StaticBlock"
         : lexical.has(parent.type));
       if (node.kind === "var" && functions.has(scope.type)) scope = scope.body;
-      for (const declaration of node.declarations) declare(scope, collectPatternIdentifiers(declaration.id));
+      for (const declaration of node.declarations) {
+        const names = collectPatternIdentifiers(declaration.id);
+        declare(scope, names);
+        // Parameter/var aliasing is outside the retained-consumer proof. A
+        // monotonic resource bit alone does not establish a closed call target.
+        if (node.kind !== "var") for (const name of names) scopes.get(scope).get(name).consumerVariable = true;
+      }
     } else if (node.type === "ImportDeclaration") {
       declare(ast, node.specifiers.map(spec => spec.local.name));
       for (const spec of node.specifiers) {
-        if (spec.type === "ImportSpecifier") scopes.get(ast).get(spec.local.name).kind |=
-          ctorKind(spec.imported.name ?? spec.imported.value);
+        if (spec.type === "ImportSpecifier") {
+          const cell = scopes.get(ast).get(spec.local.name);
+          cell.consumerSource = consumerKind(consumerContract?.bindings.get(spec.local.name));
+          cell.kind |= ctorKind(spec.imported.name ?? spec.imported.value) | cell.consumerSource;
+        }
         // An import map or intermediate reexport may expose the replaced
         // renderer constructor under any namespace name. Reading an ordinary
         // named member remains local; handing out the whole namespace does not.
-        else if (spec.type === "ImportNamespaceSpecifier") scopes.get(ast).get(spec.local.name).kind |= NAMESPACE;
+        else if (spec.type === "ImportNamespaceSpecifier") {
+          const role = consumerContract?.namespaces.get(spec.local.name);
+          const cell = scopes.get(ast).get(spec.local.name);
+          cell.consumerSource = role === "orbit" ? ORBIT_NAMESPACE : role === "base" ? BASE_NAMESPACE : 0;
+          cell.kind |= NAMESPACE | cell.consumerSource;
+        }
       }
     } else if (functions.has(node.type)) {
       for (const parameter of node.params) declare(node, collectPatternIdentifiers(parameter));
@@ -666,7 +684,9 @@ function analyzeRendererResourceEscapes(ast, offsets) {
   const propertyKind = (object, names) => {
     if (!names) return 0;
     let result = names.reduce((kind, name) => kind | ctorKind(name), 0);
-    if (object & RENDERER && names.some(name => name === "domElement")) result |= CANVAS;
+    if (object & ORBIT_NAMESPACE && names.includes("OrbitControls")) result |= ORBIT_CTOR;
+    if (object & BASE_NAMESPACE && names.some(name => name === "Controls" || name === "EventDispatcher")) result |= BASE_CTOR;
+    if (object & (RENDERER | CONTROLS) && names.some(name => name === "domElement")) result |= CANVAS;
     if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
     return result;
   };
@@ -683,7 +703,11 @@ function analyzeRendererResourceEscapes(ast, offsets) {
         value = cell.kind | (!cell.local && node.name === "document" ? DOM : 0);
         break;
       }
-      case "NewExpression": value = child(node.callee) & CONSTRUCTOR ? RENDERER : 0; break;
+      case "NewExpression": {
+        const constructor = child(node.callee);
+        value = (constructor & CONSTRUCTOR ? RENDERER : 0) | (constructor & ORBIT_CTOR ? CONTROLS : 0);
+        break;
+      }
       case "MemberExpression": value = propertyKind(child(node.object), staticPropertyNames(node)); break;
       case "ChainExpression": case "AwaitExpression": value = child(node.expression ?? node.argument); break;
       case "SequenceExpression": value = child(node.expressions.at(-1)); break;
@@ -730,6 +754,11 @@ function analyzeRendererResourceEscapes(ast, offsets) {
         if (canvas?.type === "Identifier") mark(canvas, CANVAS);
         if (node.callee.type === "MemberExpression" && node.callee.object.type === "Identifier")
           mark(node.callee.object, NAMESPACE);
+      } else if (node.type === "NewExpression" && kind(node.callee) & ORBIT_CTOR) {
+        mark(node.arguments[1], CANVAS);
+      } else if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
+          kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
+        mark(node.arguments[0], CANVAS);
       }
     }
     if (!changed) break;
@@ -759,6 +788,32 @@ function analyzeRendererResourceEscapes(ast, offsets) {
     origins.get(cell).push(source);
   }
   const hostMethods = new Set(["createElement", "createElementNS", "getElementById", "querySelector"]);
+  const closedConsumerValue = (node, expected, visiting = new Set(), depth = 0) => {
+    if (!node || depth > 64) return false;
+    const visit = (value, role = expected) => closedConsumerValue(value, role, visiting, depth + 1);
+    if (node.type === "Identifier") {
+      const cell = binding(node);
+      if (!origins.has(cell)) return Boolean(cell.consumerSource & expected);
+      if (!cell.consumerVariable || visiting.has(cell)) return false;
+      visiting.add(cell);
+      const result = origins.get(cell).every(value => visit(value));
+      visiting.delete(cell);
+      return result;
+    }
+    if (node.type === "ChainExpression") return visit(node.expression);
+    if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
+    if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
+      return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
+    if (node.type === "NewExpression") return expected === CONTROLS ? visit(node.callee, ORBIT_CTOR) :
+      expected === RENDERER && visit(node.callee, CONSTRUCTOR);
+    if (node.type === "MemberExpression") {
+      const names = staticPropertyNames(node);
+      if (!names) return false;
+      if (expected === ORBIT_CTOR) return names.every(name => name === "OrbitControls") && visit(node.object, ORBIT_NAMESPACE);
+      if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
+    }
+    return false;
+  };
   const closedDomValue = (node, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = value => closedDomValue(value, visiting, depth + 1);
@@ -777,7 +832,10 @@ function analyzeRendererResourceEscapes(ast, offsets) {
     if (node.type === "MemberExpression") {
       const names = staticPropertyNames(node);
       if (!names) return false;
-      if (kind(node.object) & RENDERER && names.every(name => name === "domElement")) return true;
+      if (names.every(name => name === "domElement")) {
+        if (kind(node.object) & RENDERER && (!consumerContract || closedConsumerValue(node.object, RENDERER))) return true;
+        if (kind(node.object) & CONTROLS && closedConsumerValue(node.object, CONTROLS)) return true;
+      }
       return names.every(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name)) && visit(node.object);
     }
     if (node.type === "CallExpression" && node.callee.type === "MemberExpression")
@@ -794,6 +852,25 @@ function analyzeRendererResourceEscapes(ast, offsets) {
         ["appendChild", "append", "prepend", "insertBefore", "replaceChild"].includes(name));
   };
   const nativeState = new Set(["backend", "state", "properties", "context", "extensions", "xr", "constructor", "__proto__"]);
+  // These retained methods never hand their receiver to an application callback
+  // unless event registration or a hook was changed; those exits stay opaque.
+  const controlsMethods = new Set(["connect", "disconnect", "dispose", "update", "saveState", "reset",
+    "getPolarAngle", "getAzimuthalAngle", "getDistance", "pan", "dollyIn", "dollyOut", "rotateLeft", "rotateUp"]);
+  const controlsSettings = new Set(["enabled", "state", "autoRotate", "autoRotateSpeed", "enableDamping", "dampingFactor",
+    "minDistance", "maxDistance", "minZoom", "maxZoom", "minPolarAngle", "maxPolarAngle", "minAzimuthAngle", "maxAzimuthAngle",
+    "minTargetRadius", "maxTargetRadius", "enableZoom", "zoomSpeed", "zoomToCursor", "enableRotate", "rotateSpeed",
+    "enablePan", "panSpeed", "keyPanSpeed", "keyRotateSpeed", "screenSpacePanning"]);
+  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches"]);
+  const reflection = new Set(["prototype", "__proto__", "constructor", "getPrototypeOf", "setPrototypeOf",
+    "defineProperty", "defineProperties", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
+    "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "eval", "Function", "Reflect"]);
+  const controlsHostMethods = new Set(["addEventListener", "removeEventListener", "setPointerCapture", "releasePointerCapture",
+    "getRootNode", "getBoundingClientRect", ...hostMethods, "appendChild", "append", "prepend", "insertBefore", "replaceChild"]);
+  const isControlsCanvasInput = (call, argument, index) => (kind(argument) & RESOURCE) === CANVAS &&
+    !call.arguments.some(value => value.type === "SpreadElement") && closedDomValue(argument) &&
+    (call.type === "NewExpression" && closedConsumerValue(call.callee, ORBIT_CTOR) && index === 1 ||
+      call.type === "CallExpression" && call.callee.type === "MemberExpression" && closedConsumerValue(call.callee.object, CONTROLS) &&
+      staticPropertyNames(call.callee)?.every(name => name === "connect") && index === 0);
   const publicMethods = new Set([
     "init", "render", "renderAsync", "compile", "compileAsync", "compute", "computeAsync", "dispose",
     "setAnimationLoop", "setSize", "setPixelRatio", "setDrawingBufferSize", "getSize", "getPixelRatio",
@@ -810,6 +887,23 @@ function analyzeRendererResourceEscapes(ast, offsets) {
   ]);
   const hasRenderer = nodes.some(node => node.type === "NewExpression" && kind(node) & RENDERER);
   for (const node of nodes) {
+    // A retained component contract also depends on its inherited methods and
+    // host methods. Keep reflective mutation/code generation outside this slice,
+    // including in a different application module from the constructor call.
+    if (consumerContract && (node.type === "MemberExpression" && staticPropertyNames(node)?.some(name => reflection.has(name)) ||
+        node.type === "Identifier" && ["eval", "Function", "Reflect"].includes(node.name) && !binding(node).local))
+      report(node, "controls-contract-reflection");
+    if (consumerContract) {
+      const write = node.type === "AssignmentExpression" ? node.left :
+        node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete" ? node.argument : null;
+      if (write?.type === "MemberExpression") {
+        const names = staticPropertyNames(write);
+        if (names?.some(name => controlsHostMethods.has(name)) || !names && kind(write.object) & (DOM | CANVAS))
+          report(node, "controls-host-method-mutation");
+        if (kind(write.object) & CANVAS && !names?.every(name => ["width", "height", "id", "className", "tabIndex", "style"].includes(name)))
+          report(node, "opaque-canvas-write");
+      }
+    }
     if (node.type === "CallExpression" || node.type === "NewExpression") {
       if (node.type === "NewExpression" && kind(node.callee) & CONSTRUCTOR) {
         const canvas = sourceOptionValue(node.arguments[0], "canvas");
@@ -817,15 +911,31 @@ function analyzeRendererResourceEscapes(ast, offsets) {
             !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
           report(node, "opaque-canvas-input");
       }
+      if (node.type === "NewExpression" && kind(node.callee) & ORBIT_CTOR) {
+        const canvas = node.arguments[1];
+        if (!closedConsumerValue(node.callee, ORBIT_CTOR) || node.arguments.some(value => value.type === "SpreadElement"))
+          report(node, "unclosed-controls-constructor");
+        if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
+          report(node, "opaque-controls-canvas-input");
+      }
       if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
           kind(node.callee.object) & RENDERER &&
           !staticPropertyNames(node.callee)?.every(name => publicMethods.has(name)))
         report(node, "opaque-renderer-method");
+      if (node.type === "CallExpression" && node.callee.type === "MemberExpression") {
+        if (kind(node.callee.object) & CONTROLS && (!closedConsumerValue(node.callee.object, CONTROLS) ||
+            !staticPropertyNames(node.callee)?.every(name => controlsMethods.has(name))))
+          report(node, "opaque-controls-method");
+        // DOM event callbacks receive the canvas as this/event.target. They are
+        // not closed merely because the canvas came from a verified controls.
+        if (consumerContract && kind(node.callee.object) & CANVAS) report(node, "opaque-canvas-method");
+      }
       if (hasRenderer && node.callee.type === "Identifier" && node.callee.name === "eval")
         report(node, "opaque-eval");
-      for (const argument of node.arguments) {
+      for (const [index, argument] of node.arguments.entries()) {
         const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
-        if (value & RESOURCE && !isCanvasAttachment(node, argument)) report(node, "opaque-call-argument");
+        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index))
+          report(node, "opaque-call-argument");
       }
     } else if (node.type === "AssignmentExpression") {
       if (kind(node.right) & RESOURCE &&
@@ -833,12 +943,28 @@ function analyzeRendererResourceEscapes(ast, offsets) {
       if (node.left.type === "MemberExpression" && kind(node.left.object) & RENDERER &&
           staticPropertyNames(node.left)?.some(name => publicMethods.has(name)))
         report(node, "renderer-method-replacement");
-      if (node.left.type === "MemberExpression" && kind(node.left.object) & CONSTRUCTOR)
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & ALL_CONSTRUCTORS)
         report(node, "renderer-constructor-mutation");
-    } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" ||
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & CONTROLS &&
+          !staticPropertyNames(node.left)?.every(name => controlsSettings.has(name))) report(node, "controls-member-write");
+    } else if ((node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete") &&
+        node.argument.type === "MemberExpression" && kind(node.argument.object) & CONTROLS) {
+      report(node, "controls-member-write");
+    } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" || node.type === "ThrowStatement" ||
         node.type === "ArrowFunctionExpression" && node.body.type !== "BlockStatement") {
-      if (kind(node.argument ?? node.body) & RESOURCE) report(node, "returned-resource");
+      if (kind(node.argument ?? node.body) & RESOURCE) report(node, node.type === "ThrowStatement" ? "thrown-resource" : "returned-resource");
+    } else if (node.type === "AssignmentPattern" && kind(node.right) & RESOURCE) {
+      report(node, "resource-default-value");
+    } else if (node.type === "PropertyDefinition" && kind(node.value) & RESOURCE) {
+      report(node, "resource-container");
+    } else if (node.type === "TaggedTemplateExpression" && node.quasi.expressions.some(value => kind(value) & RESOURCE)) {
+      report(node, "opaque-call-argument");
+    } else if (consumerContract && node.type === "BinaryExpression" && node.operator === "instanceof" && kind(node.left) & RESOURCE &&
+        !closedConsumerValue(node.right, kind(node.left) & CONTROLS ? ORBIT_CTOR : CONSTRUCTOR)) {
+      report(node, "opaque-instance-check");
     } else if (node.type === "ExportNamedDeclaration") {
+      if (node.source && node.specifiers.some(spec =>
+        consumerContract?.reexports.has(`${node.source.value}\0${spec.local.name}`))) report(node, "exported-resource");
       if (node.declaration?.type === "VariableDeclaration") {
         for (const declaration of node.declaration.declarations)
           if ((kind(declaration.init) | kind(declaration.id)) & RESOURCE) report(node, "exported-resource");
@@ -854,8 +980,11 @@ function analyzeRendererResourceEscapes(ast, offsets) {
       if (!names) report(node, "unresolved-resource-member");
       else if (kind(node.object) & RENDERER && names.some(name => nativeState.has(name)))
         report(node, "native-renderer-state");
-      else if (kind(node.object) & CONSTRUCTOR && names.some(name => name === "prototype"))
+      else if (kind(node.object) & ALL_CONSTRUCTORS && names.some(name => name === "prototype"))
         report(node, "renderer-prototype-access");
+      else if (kind(node.object) & CONTROLS && !names.every(name => controlsSettings.has(name) || controlsViews.has(name) ||
+          controlsMethods.has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
+        report(node, "opaque-controls-member");
     } else if (node.type === "VariableDeclarator" && node.id.type !== "Identifier" && kind(node.init) & RESOURCE) {
       if (!(node.id.type === "ObjectPattern" && node.id.properties.every(property =>
           property.type === "Property" && property.value.type === "Identifier" &&
@@ -871,7 +1000,7 @@ function analyzeRendererResourceEscapes(ast, offsets) {
     } else if (node.type === "ArrayExpression") {
       if (node.elements.some(element => kind(element?.argument ?? element) & RESOURCE)) report(node, "resource-container");
     } else if (node.type === "SpreadElement" && kind(node.argument) & RESOURCE) report(node, "resource-container");
-    else if (classes.has(node.type) && kind(node.superClass) & CONSTRUCTOR) report(node, "renderer-subclass");
+    else if (classes.has(node.type) && kind(node.superClass) & ALL_CONSTRUCTORS) report(node, "renderer-subclass");
   }
   return {
     escapes,
@@ -926,7 +1055,7 @@ function isImportMetaUrl(node) {
  * @param {Object} [offsets] - Line/column offsets for inline scripts
  * @returns {Object} Structured module AST analysis
  */
-export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
+export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract = null) {
   let ast;
   try {
     ast = acorn.parse(code, {
@@ -1137,7 +1266,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}) {
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
   const classifyImport = createDynamicImportClassifier(ast);
-  const rendererResources = analyzeRendererResourceEscapes(ast, offsets);
+  const rendererResources = analyzeRendererResourceEscapes(ast, offsets, consumerContract);
   walk.ancestor(ast, {
     ImportExpression(node) {
       const classified = classifyImport(node.source);

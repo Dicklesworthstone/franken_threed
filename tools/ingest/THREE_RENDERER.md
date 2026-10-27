@@ -25,13 +25,25 @@ an owner. Exports, external stores, returned renderer factories, unknown consume
 dynamic member selection, native renderer state and custom subclasses retain the
 upstream component. Unknown constructor options or externally supplied canvas
 identities also stay upstream. Closed renderer calls, local aliases, locally
-created DOM canvases and ordinary DOM attachment remain eligible. This is a
-conservative intramodule analysis; it does not yet prove resource ownership
-through imported helpers. In particular, the unmodified H1 and H2 examples pass
-their canvas to `OrbitControls` and currently retain upstream rendering. A pinned
-addon name alone does not establish that its publicly exposed canvas stays
-closed. Direct new-backend tests establish renderer functionality separately
-from automatic application routing.
+created DOM canvases and ordinary DOM attachment remain eligible. General
+imported helpers remain opaque.
+
+The graph can prove a bounded retained `OrbitControls` contract by verifying the
+exact addon, resolved Three build and core bytes. The returned controls instance
+continues to carry the canvas reference through local aliases and `domElement`;
+it is not an exemption for arbitrary consumers. Closed updates, camera-control
+methods, configuration and disposal remain eligible. Exports, unknown consumers,
+event callbacks, private hooks, method replacement, reflection and unproved
+constructor/receiver origins retain the upstream owner. Changed source bytes,
+redirected base classes and unresolved code invalidate the proof. The original
+H2 application is consequently eligible with `--route-webgl-renderer`, retaining
+its actual OrbitControls and camera identities while using the new GPU backend.
+
+H1 still retains the exact renderer: its Inspector Settings component replaces
+`WebGPURenderer.prototype.init` to select a real WebGL backend from persisted
+settings. Closing its controls edge does not close that native contract.
+Direct new-backend tests establish renderer functionality separately from
+automatic application routing and do not establish an H1 acceleration claim.
 
 ## Supported surface
 

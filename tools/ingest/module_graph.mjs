@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { analyzeModuleAst } from "./ast_analyzer.mjs";
+import { verifiedRendererConsumerContracts } from "./renderer_consumer_contracts.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
@@ -108,6 +109,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
   // Map of canonical URL -> ModuleNode
   const modules = new Map();
+  // Keep source text only for the graph-local proof pass; it is never emitted.
+  const sourceInputs = new Map();
   // Map of sha256 -> Array of canonical URLs with identical bytes
   const contentHashMap = new Map();
   // Set of canonical external URLs (http:, https:, data:)
@@ -207,6 +210,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // Native JSON is data, not executable JavaScript. Keep even invalid lazy
     // input unparsed: its rejection belongs to the original import() boundary.
     const analysis = analyzeModuleAst(moduleType === "json" ? "" : sourceCode, sourceUrl, item.offsets || {});
+    if (moduleType !== "json") sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
     if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
     // Every source-bearing export is also a static module request. Keep it in
@@ -501,6 +505,17 @@ export async function buildModuleGraph(entryPath, options = {}) {
         dyn.claimsClosure = allClosed;
       }
     }
+  }
+
+  // Only a verified dependency closure can close an imported canvas consumer.
+  // Reanalyze its callers with the retained-instance contract; all other escape
+  // facts and source spans are recomputed, never suppressed graph-wide.
+  for (const [id, contract] of verifiedRendererConsumerContracts(modules, {externalModules})) {
+    const input = sourceInputs.get(id);
+    if (!input) continue;
+    const analysis = analyzeModuleAst(input.code, input.sourceUrl, input.offsets, contract);
+    const node = modules.get(id);
+    node.routing_facts = node.routingFacts = analysis.routing_facts;
   }
 
   // Build adjacency map for cycle detection
