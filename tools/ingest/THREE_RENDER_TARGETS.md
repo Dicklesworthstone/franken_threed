@@ -91,6 +91,22 @@ single-sample storage uses five bytes per pixel. A Chromium 151/SwiftShader
 differential matched all 340 texels/packed words across both formats, four mip
 levels and single/four-sample rendering, with no GPU errors.
 
+An explicit `DepthTexture` remains allocated when `depthBuffer: false` disables
+its use as a render attachment. Copies and later sampling can therefore retain
+TRAA's depth history while color rendering leaves it unchanged. Clear calls,
+pipeline depth/stencil state and render-pass attachments all follow the enabled
+attachment flags; storage budgets include the history depth. Sampling that same
+target's depth while rendering its color still encounters the existing feedback
+restriction; TRAA uses separate resolve and history targets.
+
+Ordinary detached 2D `DepthTexture` inputs also have native, zero-initialized
+storage at source version zero. `UnsignedIntType` uses `depth24plus` and
+`FloatType` uses `depth32float`. Graphics and compute share this owner, including
+captured sampler state, versioned generations, resource limits and cancellation.
+No CPU color upload or invented source render target supplies the initial depth.
+Recognized automatic target resizing preserves accepted transfer generations
+until their validation, GPU completion and readback publication finish.
+
 A paired Chromium 151.0.7922.34 / SwiftShader browser check matched the pinned
 renderer exactly for six cube-face readbacks, six directional samples, the
 source-supported cube compute result, and output pixels for linear, sRGB, ACES,

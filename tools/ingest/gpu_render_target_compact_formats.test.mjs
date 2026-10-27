@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createGpuRenderTarget, inspectGpuRenderTargetColors} from './gpu_render_target.mjs';
 import {transferDevice, deferred} from './fixtures/target_transfer_fixture.mjs';
+import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {createWebGPURendererClass} from './three_renderer.mjs';
 
 // Byte movement and descriptor recording; this fixture does not execute WGSL.
 const formats = [['r8unorm', Uint8Array], ['rg11b10ufloat', Uint32Array]];
@@ -13,6 +15,35 @@ function fixture() {
 }
 const make = (f, options = {}) => createGpuRenderTarget(f.device,
   {width: 5, height: 4, depthFormat: null, copyDestination: true, ...options});
+
+for (const [format, Type] of formats) test(`${format}: public queued uploads, copies and readbacks preserve component words`, async t => {
+  const f = fixture(), gate = deferred(), Base = createWebGPURendererClass(T);
+  class Renderer extends Base {
+    async _init() { await gate.promise; this._device = f.device; this._initialized = true; return this; }
+  }
+  const renderer = new Renderer({canvas: {width: 5, height: 4, style: {}}});
+  const options = {depthBuffer: false, format: Type === Uint32Array ? T.RGBFormat : T.RedFormat,
+    type: Type === Uint32Array ? T.UnsignedInt101111Type : T.UnsignedByteType};
+  const source = new T.RenderTarget(5, 4, options), destination = new T.RenderTarget(5, 4, options);
+  t.after(async () => {
+    gate.resolve(); renderer.dispose();
+    while (renderer._drain) await renderer._drain.catch(() => {});
+    source.dispose(); destination.dispose();
+  });
+  const input = Type.from({length: 20}, (_, i) => Type === Uint32Array
+    ? [0, 0xffffffff, 0x7c0f87ff, 0x80000000, 0x12345678][i % 5] : i * 13);
+  const expected = input.slice();
+  const write = renderer.writeRenderTargetPixelsAsync(source, input);
+  const copy = renderer.copyTextureToTextureAsync(source.texture, destination.texture);
+  const read = renderer.readRenderTargetPixelsAsync(destination, 0, 0, 5, 4);
+  input.fill(0); gate.resolve();
+  await Promise.all([write, copy]);
+  const actual = await read; assert.ok(actual instanceof Type); assert.deepEqual(actual, expected);
+  assert.equal(f.calls.colorCopies[0].source.texture.format, format);
+  assert.equal(renderer._targets.capture(source).references, 0);
+  assert.equal(renderer._targets.capture(destination).references, 0);
+  assert.equal(renderer.info.f3d.pendingTransfers, 0);
+});
 
 for (const [format, Type] of formats) for (const flipY of [false, true])
   test(`${format}: cropped transfers preserve raw texels and padded rows, flipY=${flipY}`, async () => {

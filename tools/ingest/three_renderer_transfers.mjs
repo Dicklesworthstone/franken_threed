@@ -96,10 +96,12 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     const cancellation = readback ? new AbortController() : null;
     const state = {signals, action: null, value: null, publish, done: false, promise, reject: null};
+    const releaseEntries = [];
     const finish = (error, result, failed = false) => {
       if (state.done) return;
       state.done = true; state.action = state.value = state.publish = null;
       active.delete(state); allocatedBytes -= bytes; unwatch(state);
+      for (const release of releaseEntries.splice(0)) release();
       if (failed) reject(error); else resolve(result);
     };
     state.reject = error => {
@@ -112,6 +114,11 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // wrappers. The returned promise still rejects for an awaiting caller.
     promise.catch(() => {});
     try {
+      // Source effects can resize again before an accepted copy or readback
+      // submits. Its generation must outlive the preceding render's leases,
+      // including validation and publication. Explicit disposal still aborts
+      // the same lifetime signal and releases every transfer lease here.
+      for (const entry of new Set(entries)) releaseEntries.push(renderer._targets.retainGeneration(entry));
       watch(state);
       if (state.done) return promise;
       state.action = makeAction(cancellation?.signal);
@@ -178,7 +185,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         const plan = inspectGpuTargetWrite(entry.shape, data, value);
         assertThreeNativeTextureWrite(renderer, (target.textures ?? [target.texture])[plan.colorIndex]);
         // Pick built-in constructors, not a caller-controlled data.constructor.
-        const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint16Array ? Uint16Array : Uint8Array;
+        const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint32Array ? Uint32Array
+          : data instanceof Uint16Array ? Uint16Array : Uint8Array;
         const uploadOptions = Object.freeze({...value, colorIndex: plan.colorIndex, width: plan.size.width, height: plan.size.height,
           offset: 0, bytesPerRow: plan.rowBytes});
         return schedule([entry], signal, plan.packedBytes, () => {

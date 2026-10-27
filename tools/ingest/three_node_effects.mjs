@@ -5,7 +5,7 @@
 export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} = {}) {
   if (typeof fail !== 'function' || !Number.isSafeInteger(maxTargets) || maxTargets < 1)
     throw new TypeError('Expected native effect limits and an admission error factory');
-  let producers = new WeakMap(), sharedContexts = new WeakMap(), contextSerial = 0;
+  let producers = new WeakMap(), sharedContexts = new WeakMap(), pipelineStates = new WeakMap(), contextSerial = 0;
   // PassTextureNode is intentionally not a public namespace export. Its
   // retained TSL factory supplies the exact constructor/prototype identity.
   let passTexturePrototype;
@@ -68,8 +68,26 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
       // Keep the exact object returned by the retained builder. Contexts
       // invented by an application never acquire this construction provenance.
       sharedContexts.set(value, {id: ++contextSerial, entries: Object.entries(value)});
+      const state = value.renderPipelineState;
+      if (state?.viewOffsetOwner != null) {
+        const previous = pipelineStates.get(state);
+        if (previous && previous !== state.viewOffsetOwner)
+          fail('PASS', 'A source pipeline cannot replace its captured view-offset owner');
+        pipelineStates.set(state, state.viewOffsetOwner);
+      }
       return value;
     };
+  }
+
+  function inspectPipelineState(state) {
+    const owner = state?.viewOffsetOwner, captured = state && pipelineStates.get(state);
+    if (owner === null && captured === undefined) return;
+    // The effect claims this shared state while constructing its source graph,
+    // before its PassTextureNode registers the producer. Runtime inspection
+    // requires both relationships; assigning a lookalike context is insufficient.
+    if (!owner || owner !== captured || !producers.has(owner))
+      fail('PASS', 'Native view offsets require the captured texture producer and source pipeline state');
+    inspectProducer(owner);
   }
 
   function contextKey(context) {
@@ -80,8 +98,7 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
         Object.keys(context.value).length !== record.entries.length ||
         record.entries.some(([key, value]) => context.value[key] !== value))
       fail('PASS', 'A generated shared context must retain its source construction values');
-    if (context.value.renderPipelineState && context.value.renderPipelineState.viewOffsetOwner !== null)
-      fail('PASS', 'Native effect contexts do not yet admit view-offset histories');
+    if (context.value.renderPipelineState) inspectPipelineState(context.value.renderPipelineState);
     return JSON.stringify(['source-shared-context', context.uuid, record.id]);
   }
 
@@ -103,8 +120,8 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
   }
 
   return {
-    inspectTexture, installBuilder, contextKey,
+    inspectTexture, installBuilder, contextKey, inspectPipelineState,
     owns: node => producers.has(node), update,
-    dispose() { producers = new WeakMap(); sharedContexts = new WeakMap(); },
+    dispose() { producers = new WeakMap(); sharedContexts = new WeakMap(); pipelineStates = new WeakMap(); },
   };
 }

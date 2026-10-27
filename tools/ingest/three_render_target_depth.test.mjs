@@ -3,6 +3,7 @@ import test from 'node:test';
 import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
 import {targetThree} from './fixtures/target_residency_fixture.mjs';
 import {gpuTargetMipmapFixture} from './fixtures/animation/gpu_target_mipmap_fixture.mjs';
+import {depthDevice} from './tests/depth_transfer_test_fixture.mjs';
 
 // Minimal source boundary, with r186 DepthTexture defaults and RenderTarget's
 // actual association rule. DepthTexture deliberately lacks the color-only flag.
@@ -37,6 +38,78 @@ function fixture(options = {}, source = {}) {
 }
 const gone = f => { for (const t of f.textures) assert.equal(t.destroyed, 1); };
 const passes = f => f.submissions.flatMap(commands => commands.flatMap(c => c.passes));
+
+for (const [type, format] of [[T.UnsignedIntType, 'depth24plus'], [T.FloatType, 'depth32float']])
+  test(`unattached ${format} history remains allocated and sampled while color clears leave it clean`, async () => {
+    const f = fixture({}, {depthBuffer: false}), {owner, target, depth} = f;
+    depth.type = type;
+    const entry = owner.capture(target);
+    assert.equal(entry.shape.depthAttachment, false); assert.equal(entry.shape.depthFormat, format);
+    assert.equal(entry.shape.bytes, 35 * 8); assert.equal(f.textures.length, 0);
+    const binding = owner.bindingsFor().get(depth), native = passes(f)[0].group.entries[0].resource.texture;
+    assert.equal(native.format, format); assert.equal(entry.depthDirty, false);
+    assert.equal(entry.depthCopies, 1); assert.equal(owner.allocatedBytes, 35 * 12);
+    owner.render(entry, frame => {
+      assert.equal(Object.hasOwn(frame, 'depthView'), false, 'history storage is not a color-pass attachment');
+      const encoder = f.device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({colorAttachments: [{view: frame.colorView, loadOp: 'clear',
+        storeOp: 'store', clearValue: {r: 1, g: 0, b: 0, a: 1}}]});
+      pass.end(); f.device.queue.submit([encoder.finish()]);
+    });
+    assert.equal(passes(f).at(-1).descriptor.depthStencilAttachment, undefined);
+    assert.equal(entry.depthDirty, false);
+    assert.equal(owner.bindingsFor().get(depth).view, binding.view); assert.equal(entry.depthCopies, 1);
+    let sampled;
+    entry.storage.withDepthTexture(texture => { sampled = texture; });
+    assert.equal(sampled, native, 'color rendering retains the same depth-history storage');
+    await owner.whenIdle(); owner.dispose(); gone(f);
+  });
+
+test('copying into unattached history refreshes only its depth replica and survives subsequent color writes', async () => {
+  const f = depthDevice(), owner = createThreeRenderTargets(T, {getDevice: () => f.device});
+  const source = new T.RenderTarget(4, 3, {depthTexture: new T.DepthTexture(4, 3, T.FloatType)});
+  const history = new T.RenderTarget(4, 3, {depthBuffer: false, depthTexture: new T.DepthTexture(4, 3, T.FloatType)});
+  const a = owner.capture(source), b = owner.capture(history), values = Float32Array.from({length: 12}, (_, index) => (index + 1) / 16);
+  owner.render(a, frame => frame.depthView.texture.data.set(values));
+  const bindings = owner.bindingsFor(), color = bindings.get(history.texture), depth = bindings.get(history.depthTexture);
+  const colorCopies = b.copies, depthCopies = b.depthCopies;
+  assert.ok(depth.view.texture.data.every(value => value === 0));
+  owner.copyDepth(a, b);
+  assert.equal(b.dirty, false); assert.equal(b.depthDirty, true);
+  assert.equal(bindings.get(history.texture).view, color.view); assert.equal(b.copies, colorCopies);
+  assert.equal(bindings.get(history.depthTexture).view, depth.view); assert.equal(b.depthCopies, depthCopies + 1);
+  const flipped = [2, 1, 0].flatMap(row => Array.from(values.subarray(row * 4, row * 4 + 4)));
+  assert.deepEqual(Array.from(depth.view.texture.data), flipped);
+  owner.render(b, frame => {
+    assert.equal(Object.hasOwn(frame, 'depthView'), false);
+    frame.colorView.texture.data.fill(.875);
+  });
+  assert.equal(b.depthDirty, false); bindings.get(history.depthTexture);
+  assert.equal(b.depthCopies, depthCopies + 1);
+  b.storage.withDepthTexture(texture => assert.deepEqual(texture.data, values));
+  assert.deepEqual(Array.from(depth.view.texture.data), flipped);
+  await owner.whenIdle(); owner.dispose(); assert.ok(f.textures.every(texture => texture.destroyed));
+});
+
+test('unattached history retains queued depth storage across a source effect resize', async () => {
+  const f = fixture({}, {depthBuffer: false}), {owner, target, depth} = f;
+  const first = owner.ensure(owner.capture(target)), release = owner.retainGeneration(first);
+  let original;
+  first.storage.withDepthTexture(texture => { original = texture; });
+  owner.withNativeEffectTargets([target], () => target.setSize(3, 2));
+  assert.equal(owner.assertCurrent(first), first);
+  const next = owner.ensure(owner.capture(target));
+  assert.notEqual(first, next); assert.equal(first.shape.depthAttachment, false); assert.equal(next.shape.depthAttachment, false);
+  assert.deepEqual([first.shape.width, first.shape.height, next.shape.width, next.shape.height], [7, 5, 3, 2]);
+  const captured = owner.captureNativeTexture(depth);
+  owner.withNativeTexture(captured, texture => {
+    assert.equal(texture.width, 3); assert.equal(texture.height, 2); assert.notEqual(texture, original);
+  });
+  owner.render(first, frame => { assert.equal(Object.hasOwn(frame, 'depthView'), false); assert.equal(frame.colorView.texture.width, 7); });
+  first.storage.withDepthTexture(texture => assert.equal(texture, original));
+  release(); await owner.whenIdle(); assert.equal(original.destroyed, 1);
+  assert.equal(next.alive, true); owner.dispose(); gone(f);
+});
 
 for (const samples of [0, 1]) for (const [type, format] of [[T.UnsignedIntType, 'depth24plus'], [T.FloatType, 'depth32float']])
   test(`source ${format}, samples=${samples}: samples the rendered depth as full-precision UV-oriented R32F`, async () => {
@@ -249,7 +322,7 @@ test('shared-depth ownership is refused rather than rendering into an unrelated 
 });
 
 test('unsupported depth profiles fail before allocating native attachments or mirrors', () => {
-  const edits = [t => t.depthBuffer = false, t => t.useArrayDepthTexture = true,
+  const edits = [t => t.useArrayDepthTexture = true,
     t => t.depthTexture.type = T.UnsignedShortType, t => t.depthTexture.type = 999,
     t => t.depthTexture.format = T.DepthStencilFormat, t => t.depthTexture.compareFunction = 999,
     t => t.depthTexture.generateMipmaps = true, t => t.depthTexture.mipmaps = [{}],

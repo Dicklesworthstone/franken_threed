@@ -17,6 +17,7 @@ import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
 import {createThreeComputeTargets} from './three_compute_targets.mjs';
 import {createThreeFramebufferTextures} from './three_framebuffer_textures.mjs';
+import {createThreeDepthTextures} from './three_depth_textures.mjs';
 import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
 import {assertThreeNativeComputeOutsideCapture, assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 
@@ -539,7 +540,9 @@ export function withThreeCompute(Base, THREE) {
         targetFactory: () => createThreeComputeTargets({targets: this._targets, device: this._device,
           signal: this._targetLifetime.signal}),
         framebufferFactory: () => createThreeFramebufferTextures({three: THREE, device: this._device,
-          getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal})});
+          getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal}),
+        depthFactory: () => createThreeDepthTextures({three: THREE, device: this._device,
+          signal: this._targetLifetime.signal})});
     }
     /** Graphics leases share compute's authoritative allocation and upload
      * history. An unchanged host version never overwrites GPU-produced bytes. */

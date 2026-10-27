@@ -77,6 +77,7 @@ async function rig() {
     ['./three_storage_textures.mjs', synthetic({createThreeStorageTextures: () => storage, inspectThreeStorageTexture: () => ({})})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures: () => pool})],
     ['./three_framebuffer_textures.mjs', synthetic({createThreeFramebufferTextures() { throw new Error('No framebuffer textures in this fixture'); }})],
+    ['./three_depth_textures.mjs', synthetic({createThreeDepthTextures() { throw new Error('No detached depth textures in this fixture'); }})],
     ['./three_compute_targets.mjs', new vm.SourceTextModule(await readFile(new URL('./three_compute_targets.mjs', import.meta.url), 'utf8'), {context})],
     ['./three_compute_textures.mjs', new vm.SourceTextModule(await readFile(new URL('./three_compute_textures.mjs', import.meta.url), 'utf8'), {context})],
   ]);

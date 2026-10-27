@@ -134,12 +134,13 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   else fail('UNSUPPORTED', 'Target color must be RGBA8, linear R8/RGB11F/RGBA16F or linear R/RG/RGBA32F');
   if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
+  const depthAttachment = target.depthBuffer === true || target.stencilBuffer === true;
   let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
   if (depthTexture !== null) {
     if (typeof three.DepthTexture !== 'function' || !(depthTexture instanceof three.DepthTexture) ||
         depthTexture.isDepthTexture !== true || depthTexture.renderTarget !== target)
       fail('SOURCE', 'Expected the target-owned source DepthTexture; shared depth attachments are not admitted');
-    if (!target.depthBuffer || target.useArrayDepthTexture || depthTexture.isArrayTexture ||
+    if (target.useArrayDepthTexture || depthTexture.isArrayTexture ||
         (!cube && depthTexture.isCubeTexture) || (depthTexture.image?.depth ?? 1) !== 1)
       fail('UNSUPPORTED', 'Source depth sampling requires a depth attachment of the target dimension');
     if (cube) {
@@ -196,11 +197,11 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
     (depthFormat ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * layers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
-  return {width, height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
+  return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     cube, layers, viewDimension: cube ? 'cube' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
     depthTexture, depthSampleBytes: depthTexture ? width * height * 4 * layers : 0,
-    key: `${cube ? `cube/${width}/${height}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
+    key: `${cube ? `cube/${width}/${height}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
@@ -990,12 +991,19 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const allocatedBefore = entry.storage.allocatedBytes;
       entry.busy = true; entry.dirty = true;
       // Higher private depth levels never modify the source's level-zero depth.
-      if (mipLevel === 0) entry.depthDirty = true;
+      if (mipLevel === 0 && entry.shape.depthAttachment) entry.depthDirty = true;
       const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots}) : entry.storage.withFrame;
       try {
         const result = withFrame((frame, texture, handles) => {
           if (group) group.frame = {handles, writes: new Set(entry.shape.textures)};
-          try { const result = callback(frame, texture); assertCurrent(entry); return result; }
+          try {
+            // Source targets can own a depth texture solely for history copies.
+            // Allocate and sample it normally, but a color render must neither
+            // attach nor clear/write it when depthBuffer is disabled.
+            const {depthView, ...colorFrame} = frame;
+            const result = callback(entry.shape.depthAttachment ? frame : colorFrame, texture);
+            assertCurrent(entry); return result;
+          }
           finally { if (group) group.frame = null; }
         }, {mipLevel, face});
         // Finish the source render before filtering. Sampling and manual clear

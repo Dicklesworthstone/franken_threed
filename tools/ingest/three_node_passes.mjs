@@ -73,9 +73,11 @@ export function inspectThreePipelineContext(three, renderer, material, object, e
   const data = context.value, keys = new Set(['renderPipeline', 'renderPipelineState',
     'onBeforePipelineCallbacks', 'onAfterPipelineCallbacks', 'toneMapping', 'outputColorSpace']);
   if (Object.keys(data).some(key => !keys.has(key)) ||
-      !Array.isArray(data.onBeforePipelineCallbacks) || !Array.isArray(data.onAfterPipelineCallbacks) ||
-      data.renderPipelineState?.viewOffsetOwner !== null)
-    fail('Native pipeline contexts do not admit custom context fields or view-offset history');
+      !Array.isArray(data.onBeforePipelineCallbacks) || !Array.isArray(data.onAfterPipelineCallbacks))
+    fail('Native pipeline contexts do not admit custom context fields');
+  if (effects?.inspectPipelineState) effects.inspectPipelineState(data.renderPipelineState);
+  else if (data.renderPipelineState?.viewOffsetOwner !== null)
+    fail('Native view offsets require the source texture-producer adapter');
   if (pipeline.outputColorTransform === true) {
     if (data.toneMapping !== undefined || data.outputColorSpace !== undefined)
       fail('The automatic source output transform must retain its source context');

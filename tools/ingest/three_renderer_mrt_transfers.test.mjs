@@ -210,16 +210,17 @@ for (const edit of ['replace', 'reorder', 'format', 'dispose-secondary', 'resize
     f.ready(); await Promise.all(refused); assert.equal(f.uploads.length, 0); assert.equal(f.reads.length, 0); f.close();
   });
 
-test('automatic source resize preserves the selected queued generation while its lease remains held', async () => {
+test('automatic source resize retains a queued transfer generation through readback publication', async () => {
   const f = fixture({initialized: true}), r = f.renderer, source = target(), entry = f.owner.capture(source);
-  const release = f.owner.retainGeneration(entry), input = payload('rgba16float');
+  const input = payload('rgba16float');
   await r.writeRenderTargetPixelsAsync(source, input, {colorIndex: 1});
   r._preparing = true; const pending = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
   f.owner.withNativePassResize(source, 8, 6, () => source.setSize(8, 6));
-  r._preparing = null; f.drain(); assert.deepEqual(bytes(await pending), bytes(input));
+  await flush(); assert.equal(entry.alive, true, 'the queued read owns its generation without an external lease');
   const next = f.owner.capture(source); assert.notEqual(entry, next); f.owner.ensure(next);
   assert.equal(next.storage.width, 8); assert.equal(entry.storage.width, 4);
-  release(); await f.owner.whenIdle(); assert.equal(entry.alive, false); f.close();
+  r._preparing = null; f.drain(); assert.deepEqual(bytes(await pending), bytes(input));
+  await f.owner.whenIdle(); assert.equal(entry.alive, false); assert.equal(entry.references, 0); f.close();
 });
 
 test('request and upload-byte budgets remain shared across primary and secondary attachments', async () => {

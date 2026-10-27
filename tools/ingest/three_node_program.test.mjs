@@ -947,7 +947,6 @@ test('callback texture edits cannot silently retain an incompatible compiled lay
 test('unsupported texture families, actual borrowed layouts and device binding limits refuse explicitly', t => {
   const f = rig(t);
   const values = [new THREE.CubeTexture(), new THREE.Data3DTexture(new Uint8Array(4), 1, 1, 1),
-    new THREE.DepthTexture(1, 1),
     new THREE.StorageTexture(1, 1), dataTexture({type: THREE.FloatType})];
   const integral = dataTexture(); integral.type = THREE.UnsignedIntType; integral.format = THREE.RGBAIntegerFormat; values.push(integral);
   const video = dataTexture(); video.isVideoTexture = true; values.push(video);
@@ -959,6 +958,35 @@ test('unsupported texture families, actual borrowed layouts and device binding l
   f.renderer._device = {limits: {maxSampledTexturesPerShaderStage: 1}};
   f.material.colorNode = N.texture(a).add(N.texture(dataTexture()));
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
+});
+test('detached depth graphs retain source WGSL and read-only sampling modes', t => {
+  for (const [type, mode] of [[THREE.UnsignedIntType, 'sample'], [THREE.UnsignedIntType, 'load'],
+    [THREE.UnsignedIntType, 'compare'], [THREE.FloatType, 'load']]) {
+    const f = rig(t), depth = new THREE.DepthTexture(4, 4, type);
+    if (mode !== 'load') depth.minFilter = depth.magFilter = THREE.LinearFilter;
+    const layout = {sampleType: 'depth', viewDimension: '2d', multisampled: false};
+    f.renderer.hasCompatibility = name => name === THREE.Compatibility.TEXTURE_COMPARE;
+    f.renderer._getSampledTextureInputs = () => ({layoutOf: binding => {
+      assert.equal(binding.texture, depth); return {texture: layout};
+    }});
+    if (mode === 'compare') depth.compareFunction = THREE.LessEqualCompare;
+    const sampled = N.texture(depth, N.uv());
+    f.material.colorNode = N.vec3(mode === 'load' ? N.textureLoad(depth, N.ivec2(0))
+      : mode === 'compare' ? sampled.compare(.5) : sampled.level(0));
+    const d = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    source.scene = f.scene; source.camera = f.camera; source.build();
+    assert.equal(d.fragment, source.fragmentShader);
+    assert.match(d.fragment, /texture_depth_2d/);
+    assert.match(d.fragment, mode === 'load' ? /textureLoad/ : mode === 'compare' ? /textureSampleCompare/ : /textureSampleLevel/);
+    const captured = f.owner.captureDraw(d, f.context).textures;
+    assert.equal(captured.length, mode === 'load' ? 1 : 2);
+    assert.ok(captured.every(binding => binding.texture === depth && binding.store === false && binding.comparison === (mode === 'compare')));
+    const entries = d.groups.flatMap(group => group.entries);
+    assert.deepEqual(entries.filter(entry => entry.texture).map(entry => entry.texture), [layout]);
+    assert.deepEqual(entries.filter(entry => entry.sampler).map(entry => entry.sampler.type),
+      mode === 'load' ? [] : [mode === 'compare' ? 'comparison' : 'non-filtering']);
+    assert.equal(depth.renderTarget, null); assert.equal(depth.version, 0);
+  }
 });
 test('native storage preserves source stage aliases and forces read-only graphics bindings', t => {
   const f = rig(t), attribute = new THREE.StorageBufferAttribute(4, 4), storage = N.storage(attribute, 'vec3', 4);
@@ -1434,7 +1462,6 @@ test('renderer MRT context has no effect on the source canvas output', t => {
   assert.equal(f.compile(), d); f.owner.captureDraw(d, f.context);
 });
 for (const [name, change, code] of [
-  ['depth texture graph', f => { f.material.colorNode = N.texture(new THREE.DepthTexture(1, 1)); }, 'TEXTURE'],
   ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
   ['compute-backed buffer attribute graph', f => { f.material.colorNode = N.bufferAttribute(new THREE.StorageBufferAttribute(4, 3)); }, 'ATTRIBUTE'],
   ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],

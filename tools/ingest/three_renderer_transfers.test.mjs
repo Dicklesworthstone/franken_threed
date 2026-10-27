@@ -42,13 +42,18 @@ function fixture({gl = false, three = T, device = null, ...limits} = {}) {
       if (disposed) throw Error('owner disposed');
       let e = entries.get(t);
       if (!e) {
-        e = {target: t, shape: {...t}, alive: true, lifetime: new AbortController(), validation: Promise.resolve(), storage: null};
+        e = {target: t, shape: {...t}, alive: true, references: 0, lifetime: new AbortController(), validation: Promise.resolve(), storage: null};
         entries.set(t, e);
       }
       return e;
     },
     assertCurrent(e) {
       if (disposed || !e.alive || e.shape.width !== e.target.width || e.shape.height !== e.target.height || e.shape.format !== e.target.format) throw stale();
+    },
+    retainGeneration(e) {
+      this.assertCurrent(e); e.references++;
+      let held = true;
+      return () => { if (held) { held = false; e.references--; } };
     },
     ensure(e) { this.assertCurrent(e); e.storage ??= {whenIdle: () => controls.fence?.promise ?? Promise.resolve()}; },
     writePixels(e, data, options) {
@@ -340,9 +345,11 @@ test('initialized upload submits synchronously; completion does not block later 
   assert.equal(f.calls.length, 1); assert.equal(r._pending.length, 0);
   const second = r.writeRenderTargetPixelsAsync(t, new Uint8Array(t.bytes.length).fill(6));
   assert.equal(f.calls.length, 2); counts(r, 2, t.bytes.length * 2);
+  assert.equal(f.owner.capture(t).references, 2, 'each transfer retains the generation through its completion fence');
   let complete = false; const idle = r.waitForGPU().then(() => { complete = true; });
   await flush(); assert.equal(complete, false);
-  gate.resolve(); await Promise.all([first, second, idle]); counts(r, 0, 0); r.dispose();
+  gate.resolve(); await Promise.all([first, second, idle]); counts(r, 0, 0);
+  assert.equal(f.owner.capture(t).references, 0); r.dispose();
 });
 
 test('copy regions, mip level, target identity and explicit origin override are captured', async () => {
@@ -381,11 +388,14 @@ for (const which of ['caller', 'source', 'destination', 'renderer'])
   test(`${which} disposal/cancellation rejects queued copies without awaiting init`, async () => {
     const f = fixture(), r = f.renderer, a = target(), b = target(), controller = new AbortController();
     const pending = r.copyRenderTargetPixelsAsync(a, b, {signal: controller.signal});
+    const leases = [f.entries.get(a), f.entries.get(b)];
+    assert.deepEqual(leases.map(e => e.references), [1, 1]);
     if (which === 'caller') controller.abort(Error('cancelled'));
     if (which === 'source') f.owner.retire(a);
     if (which === 'destination') f.owner.retire(b);
     if (which === 'renderer') r.dispose();
     await assert.rejects(pending); counts(r, 0, 0); assert.equal(f.calls.length, 0);
+    assert.deepEqual(leases.map(e => e.references), [0, 0], 'cancellation releases both captured generations');
     f.init.resolve(); await f.drain().catch(() => {}); assert.equal(f.calls.length, 0); r.dispose();
   });
 
@@ -439,7 +449,8 @@ test('a transfer submission exception rejects its promise without dropping subse
   const pending = r.writeRenderTargetPixelsAsync(a, new Uint8Array(24));
   const copy = r.copyRenderTargetPixelsAsync(a, b);
   await f.ready(); await assert.rejects(pending, /upload failed/); await copy;
-  assert.deepEqual(f.calls.map(c => c.kind), ['copy']); counts(r, 0, 0); r.dispose();
+  assert.deepEqual(f.calls.map(c => c.kind), ['copy']); counts(r, 0, 0);
+  assert.deepEqual([f.entries.get(a).references, f.entries.get(b).references], [0, 0]); r.dispose();
 });
 
 test('invalid options and unsupported transfers fail before GPU work or queue admission', async () => {

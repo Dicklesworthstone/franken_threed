@@ -10,6 +10,7 @@ import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {bloom} from '../../upstream/three.js/examples/jsm/tsl/display/BloomNode.js';
 import {gaussianBlur} from '../../upstream/three.js/examples/jsm/tsl/display/GaussianBlurNode.js';
 import {ssgi} from '../../upstream/three.js/examples/jsm/tsl/display/SSGINode.js';
+import {traa} from '../../upstream/three.js/examples/jsm/tsl/display/TRAANode.js';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
@@ -42,6 +43,18 @@ function fixture(t, options = {}) {
   };
   device.createSampler = descriptor => ({...descriptor});
   device.queue.writeTexture = (destination, data) => { device.textureWrites.push({destination, data}); };
+  device.createRenderPipeline = descriptor => {
+    device.pipelines.push(descriptor); return {...descriptor, getBindGroupLayout: () => ({})};
+  };
+  device.textureCopies = [];
+  const createEncoder = device.createCommandEncoder;
+  device.createCommandEncoder = () => {
+    const encoder = createEncoder();
+    encoder.copyTextureToTexture = (source, destination, size) => {
+      device.textureCopies.push({source, destination, size});
+    };
+    return encoder;
+  };
   let configuration;
   const configurations = [], canvas = {width: 64, height: 48, style: {}, getContext: () => ({
     configure(value) { configurations.push(value); configuration = value; }, unconfigure() {},
@@ -55,6 +68,104 @@ function fixture(t, options = {}) {
   const mesh = new T.Mesh(new T.PlaneGeometry(2, 2), material); scene.add(mesh);
   return {renderer, device, canvas, configurations, scene, camera, material, mesh};
 }
+
+function traaPipeline(t, f) {
+  const pass = N.pass(f.scene, f.camera);
+  pass.setMRT(N.mrt({output: N.output, velocity: N.velocity}));
+  const effect = traa(pass.getTextureNode(), pass.getTextureNode('depth'), pass.getTextureNode('velocity'), f.camera);
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  return {pass, effect, pipeline};
+}
+
+test('native TRAA retains source first-frame depth, jitter, velocity and GPU history copies', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const {pass, effect, pipeline} = traaPipeline(t, f), initialDepth = effect._previousDepthNode.value;
+  const jitter = [];
+  f.material.colorNode.onRenderUpdate(() => {
+    assert.equal(f.camera.view.enabled, true);
+    jitter.push([f.camera.view.offsetX, f.camera.view.offsetY]);
+    return new T.Color(.25, .5, .75);
+  });
+  const sizes = [], previousDepth = [];
+  for (let frame = 0; frame < 3; frame++) {
+    f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+    sizes.push([effect._historyRenderTarget.width, effect._historyRenderTarget.height]);
+    previousDepth.push(effect._previousDepthNode.value);
+    assert.equal(f.camera.view.enabled, false); assert.equal(effect._jitterIndex, frame + 1);
+    assert.equal(f.renderer.getRenderTarget(), null);
+  }
+  assert.deepEqual(sizes, [[1, 1], [64, 48], [64, 48]]);
+  assert.equal(previousDepth[0], initialDepth);
+  assert.ok(previousDepth.slice(1).every(depth => depth === effect._historyRenderTarget.depthTexture));
+  assert.equal(initialDepth.renderTarget, null); assert.equal(initialDepth.version, 0);
+  assert.equal(new Set(jitter.map(JSON.stringify)).size, 3);
+  assert.equal(pipeline._contextData.renderPipelineState.viewOffsetOwner, effect);
+  assert.equal(pipeline._contextData.onBeforePipelineCallbacks.length, 1);
+  assert.equal(pipeline._contextData.onAfterPipelineCallbacks.length, 1);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 9);
+  const sceneDraws = draws.filter(draw => draw.pipeline.fragment.targets.length === 2);
+  assert.equal(sceneDraws.length, 3);
+  assert.deepEqual(pass.renderTarget.textures.map(texture => texture.name), ['output', 'velocity']);
+  const resolve = draws.filter(draw => textures(draw).some(view => view.texture.format === 'depth24plus'));
+  assert.equal(resolve.length, 3);
+  assert.ok(textures(resolve[0]).some(view => view.texture.label === 'f3d-detached-depth'));
+  assert.ok(textures(resolve[1]).some(view => view.texture.label === 'f3d-detached-depth'));
+  assert.ok(!textures(resolve[2]).some(view => view.texture.label === 'f3d-detached-depth'));
+  assert.ok(resolve.every(draw => draw.pipeline.depthStencil === undefined));
+  assert.equal(f.device.textureCopies.length, 4, 'resolve copies plus the source restart copy');
+  const depthCopies = commands(f.device).filter(pass => pass.desc.colorAttachments.length === 0);
+  assert.equal(depthCopies.length, 2);
+  assert.ok(depthCopies.every(pass => pass.desc.depthStencilAttachment.depthLoadOp === 'load'));
+  assert.equal(effect._historyRenderTarget.depthBuffer, false);
+  assert.equal(f.renderer._targets.capture(effect._historyRenderTarget).shape.depthAttachment, false);
+  assert.equal(f.device.textureWrites.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued TRAA preserves source history lag and accepted images across resize', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const output = new T.RenderTarget(80, 60, {type: T.HalfFloatType, depthBuffer: false});
+  t.after(() => output.dispose()); f.renderer.setOutputRenderTarget(output);
+  const {effect, pipeline} = traaPipeline(t, f), sizes = [];
+  for (let frame = 0; frame < 4; frame++) {
+    if (frame === 2) f.renderer.setSize(32, 24, false);
+    f.mesh.position.x = frame * .125;
+    f.renderer._nodes.nodeFrame.update(); pipeline.render();
+    sizes.push([effect._historyRenderTarget.width, effect._historyRenderTarget.height]);
+  }
+  await drain(f.renderer);
+  await f.renderer.waitForGPU();
+  assert.equal(f.renderer._deferredError, null);
+  assert.deepEqual(sizes, [[1, 1], [64, 48], [64, 48], [32, 24]]);
+  const draws = nativeDraws(f.device), resolve = draws.filter(draw =>
+    textures(draw).some(view => view.texture.format === 'depth24plus'));
+  assert.equal(draws.length, 12); assert.equal(resolve.length, 4);
+  const resolvePasses = commands(f.device).filter(pass => pass.draws.some(draw => resolve.some(value => value.pipeline === draw.pipeline)));
+  assert.deepEqual(resolvePasses.map(pass => {
+    const texture = pass.desc.colorAttachments[0].view.texture; return [texture.width, texture.height];
+  }), sizes);
+  assert.deepEqual(f.device.textureCopies.map(copy => [copy.destination.texture.width, copy.destination.texture.height]),
+    [[1, 1], [64, 48], [64, 48], [64, 48], [32, 24], [32, 24]]);
+  assert.equal(commands(f.device).filter(pass => pass.desc.colorAttachments.length === 0).length, 2,
+    'depth copies occur only when history and drawing buffer sizes agree');
+  assert.equal(effect._jitterIndex, 4); assert.equal(f.camera.view.enabled, false);
+  assert.equal(f.renderer.getOutputRenderTarget(), output); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native TRAA rebuilds its source pipeline context without duplicating jitter callbacks', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const {effect, pipeline} = traaPipeline(t, f);
+  pipeline.render(); await drain(f.renderer);
+  const first = pipeline._contextData;
+  pipeline.needsUpdate = true; f.renderer._nodes.nodeFrame.update();
+  pipeline.render(); await drain(f.renderer);
+  assert.notEqual(pipeline._contextData, first);
+  assert.equal(pipeline._contextData.renderPipelineState.viewOffsetOwner, effect);
+  assert.equal(pipeline._contextData.onBeforePipelineCallbacks.length, 1);
+  assert.equal(pipeline._contextData.onAfterPipelineCallbacks.length, 1);
+  assert.equal(effect._jitterIndex, 2); assert.equal(f.camera.view.enabled, false);
+  assert.equal(nativeDraws(f.device).length, 6); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
 
 function ssgiPipeline(t, f, {normal = true, compose = true} = {}) {
   const pass = N.pass(f.scene, f.camera);

@@ -564,10 +564,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       inputs.prepareFramebuffer(texture, renderer.getRenderTarget()?.texture.type ?? three.UnsignedByteType);
     }
     const depth = texture.isDepthTexture === true;
-    if (depth && (!(texture instanceof three.DepthTexture) || !(texture.renderTarget instanceof three.RenderTarget) ||
-        texture.renderTarget.depthTexture !== texture ||
-        texture.isCubeTexture && (!(texture instanceof three.CubeDepthTexture) || texture.isCubeDepthTexture !== true)))
-      fail('TEXTURE', 'Native depth sampling requires an attached source DepthTexture or CubeDepthTexture');
+    if (depth && (!(texture instanceof three.DepthTexture) || texture.renderTarget != null &&
+        (!(texture.renderTarget instanceof three.RenderTarget) || texture.renderTarget.depthTexture !== texture) ||
+        texture.isCubeTexture && (!(texture instanceof three.CubeDepthTexture) || texture.isCubeDepthTexture !== true ||
+          texture.renderTarget == null)))
+      fail('TEXTURE', 'Native depth sampling requires a source DepthTexture or attached CubeDepthTexture');
     const viewDimension = volume ? '3d' : texture.isCubeTexture === true ? 'cube' : array ? '2d-array' : '2d';
     if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||

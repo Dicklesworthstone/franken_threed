@@ -528,8 +528,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._initialized === false && !this._deferUntilInitialized)
         throw new Error('THREE.Renderer: .clear() called before the backend is initialized. Use "await renderer.init();" before using this method.');
       const targetShape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
-      const hasDepth = targetShape ? targetShape.depthFormat !== null : this.depth;
-      const hasStencil = targetShape ? targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
+      const hasDepth = targetShape ? targetShape.depthAttachment && targetShape.depthFormat !== null : this.depth;
+      const hasStencil = targetShape ? targetShape.depthAttachment && targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
       if (!color && !(depth && hasDepth) && !(stencil && hasStencil)) return;
       this._clearScene ??= new THREE.Scene();
       this._clearCamera ??= new THREE.PerspectiveCamera();
@@ -724,7 +724,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       });
       // Use the actual depth attachment: a target-owned depth-only texture can
       // override stencilBuffer:true. A stencil clear never clears color/depth.
-      const stencilAttachment = target ? targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
+      const stencilAttachment = target ? targetShape.depthAttachment && targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
       if (stencilAttachment) {
         const clearStencil = clearOnly ? clearOnly.stencil : clear && this.autoClearStencil;
         frame.stencilLoadOp = clearStencil ? 'clear' : 'load';
@@ -1003,7 +1003,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId,
       sourceTarget = destination === this ? null : destination.target}) {
       const target = destination === this ? null : destination.target;
-      const stencilAttachment = target ? destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
+      const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let raster = this._nodeRaster.get(stencilAttachment);
       if (!raster) { raster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, raster); }
       const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
@@ -1296,7 +1296,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           captured?.installAttributes?.();
           if (destination !== this) {
             this._targets.ensure(destination);
-            if (!destination._dispatcher) createDispatcher(this, destination)(this._device, destination.storage.rendererOptions, {signal: destination.lifetime.signal});
+            if (!destination._dispatcher) createDispatcher(this, destination)(this._device,
+              {...destination.storage.rendererOptions, depthFormat: destination.shape.depthAttachment ? destination.shape.depthFormat : null},
+              {signal: destination.lifetime.signal});
             await destination._dispatcher.prepare();
             this._targets.assertCurrent(destination);
           } else {

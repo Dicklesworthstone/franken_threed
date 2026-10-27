@@ -995,8 +995,10 @@ against the renderer's existing target budgets.
 The admitted history surface is 2D mip-zero color with one or four samples.
 Create the source current/previous texture-node pair; calling only
 `getPreviousTexture()` does not establish the source's complete swap lifecycle.
-Depth history, cube/mip histories, XR/view-offset histories and complete
-TRAA/SSGI addon effects are outside this surface. The focused owner and renderer
+This PassNode swap surface remains color-only; depth, cube/mip and XR histories
+are outside it. The separate SSGI and TRAA addon paths are described below;
+TRAA copies its own depth history rather than using `getPreviousTexture()`.
+The focused owner and renderer
 tests cover swaps, feedback, queued resize, late activation, stable graph setup
 and transfer ordering. Browser scenarios are `native_pipeline_history`,
 `native_pipeline_history_resize` and `native_pipeline_history_accumulation`;
@@ -1108,6 +1110,54 @@ one. There were no GPU, page or console errors and no numerical tolerance.
 Both runs used the same identity-swizzle adapter and logical frame clock;
 source readback padding was excluded. This is rendering correctness evidence,
 not a performance result or a full temporal-effects closure claim.
+
+## Native temporal reprojection antialiasing
+
+The pinned `TRAANode` now executes its original reprojection, velocity handling,
+depth rejection, variance clipping and subpixel correction through the native
+renderer. Its source pipeline callbacks apply camera jitter and clear the view
+offset after rendering. The original builder records the effect's ownership of
+that pipeline state; subsequent captures require the same registered texture
+producer. Rebuilding the source pipeline establishes a fresh context without
+duplicating its callbacks.
+
+```js
+import { traa } from 'three/addons/tsl/display/TRAANode.js';
+
+const scenePass = TSL.pass(scene, camera);
+scenePass.setMRT(TSL.mrt({ output: TSL.output, velocity: TSL.velocity }));
+const result = traa(scenePass.getTextureNode(), scenePass.getTextureNode('depth'),
+  scenePass.getTextureNode('velocity'), camera);
+const pipeline = new THREE.RenderPipeline(renderer, result);
+```
+
+Use this source effect with MSAA disabled. It currently follows the native
+ordinary-camera, non-reversed-depth scene-pass surface; XR remains outside it.
+The source first samples a standalone, zero-initialized `DepthTexture`. Its
+later depth history belongs to a target with `depthBuffer: false`: storage is
+allocated for copies and sampling, while color rendering has no depth attachment
+and cannot clear or overwrite that history. Half-float color history and depth
+copies stay on the GPU.
+
+History sizing follows the source beauty target at the time of the effect
+update. For the checked scene-pass graph this preserves the initial 1×1 resolve
+and the one-frame history-size delay after resizing. Depth copies occur only
+when history and drawing-buffer extents agree. Queued draws, copies and reads
+retain their accepted generations through submission and completion, including
+when several logical frames and resizes are queued before preparation finishes.
+Explicit target disposal still invalidates pending uses.
+
+A paired Chromium 151/SwiftShader differential matched all 27,392 RGBA16F
+channel words over eight frames of warmup, moving geometry, resizing and a
+camera cut. Jitter index, camera projection, restored view state, history size
+and previous-depth identity also matched on every frame. A second eight-frame
+run composed SSGI AO/GI with the beauty output, passed that expression through
+the source `convertToTexture()`/`RTTNode`, and applied TRAA. All 27,392 final
+channel words matched again, with an observable SSGI contribution. Both
+comparisons had zero GPU, page or console errors and used the same
+identity-swizzle adapter and frame clock as the SSGI comparison above. These
+are general WebGPU correctness checks, not hardware performance measurements
+or closure of every temporal effect.
 
 ## Native clipping groups
 
