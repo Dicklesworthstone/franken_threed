@@ -8,7 +8,7 @@
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
  * source bone palettes, authored typed uniform arrays and multiple uniform blocks per source group,
  * sampled 2D/data-array/cube textures, native cube render-target color,
- * GPU-authored 2D/array/3D storage inputs,
+ * GPU-authored 2D/array/3D storage inputs, including lossless signed/unsigned texel loads,
  * target-owned depth comparisons and read-only
  * scalar/vector/mat4 or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
@@ -512,6 +512,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!node) { node = three.TSL.texture(texture); environmentNodes.set(texture, node); }
     return node;
   }
+  const integerTextureType = texture => texture?.isDepthTexture === true ? null : three.IntType !== undefined && texture?.type === three.IntType ? 'sint'
+    : three.UnsignedIntType !== undefined && texture?.type === three.UnsignedIntType ? 'uint' : null;
+  function inspectIntegerRead(node, texture = node.value) {
+    if (!integerTextureType(texture)) return;
+    // Integer IDs and bitfields must stay integer shader values. The source
+    // textureLoad/texture3DLoad factories select this sampler-free path; no
+    // normalized coordinates, interpolation or implicit float conversion.
+    if (node.sampler !== false || node.compareNode != null || node.isSampleCompare?.() === true ||
+        node.biasNode != null || node.gradNode != null || node.gatherNode != null)
+      fail('TEXTURE', 'Native integer graphics inputs require sampler-free texel loads without comparison, bias, gradients or gather');
+  }
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
     const framebuffer = texture?.isFramebufferTexture === true;
@@ -561,13 +572,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
             ['ImageData', 'ImageBitmap', 'HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas'].some(name =>
               typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
       fail('TEXTURE', 'Native cube sampling requires six source data/image faces or a registered native cube target with reflection or refraction mapping');
-    if (!depth && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+    const integerType = integerTextureType(texture);
+    if (integerType && (!storage || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
+      fail('TEXTURE', 'Native integer graphics inputs require unnormalized GPU-authored storage with NoColorSpace');
+    if (!depth && !integerType && (![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
     if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')
       fail('SOURCE', 'Native depth comparison requires source renderer compatibility metadata');
-    const sampleType = depth ? 'depth' : texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
-      ? 'unfilterable-float' : 'float';
+    const sampleType = integerType ?? (depth ? 'depth' : texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
+      ? 'unfilterable-float' : 'float');
     if (sampleType === 'unfilterable-float' &&
         (texture.magFilter !== three.NearestFilter ||
          ![three.NearestFilter, three.NearestMipmapNearestFilter].includes(texture.minFilter)))
@@ -600,6 +614,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const aliases = new Map(), checked = new Set();
     return JSON.stringify(nodes.map(node => {
       const texture = references ? textureValue(node, references) : node.value;
+      inspectIntegerRead(node, texture);
       if (!checked.has(texture)) { inspectTexture(texture); checked.add(texture); }
       // The pinned builder aliases uniforms by texture UUID. Keep that alias
       // partition, not the identities themselves, in the structural signature:
@@ -715,6 +730,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         // sourceEnvironment validates only the selected, active PBR input.
         if (key === 'envMap' && standard) continue;
         if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
+        if (integerTextureType(value))
+          fail('TEXTURE', 'Native integer inputs require authored texel loads, not floating-point material map slots');
         if (value.isCubeTexture || value.is3DTexture || value.isData3DTexture || value.isStorageTexture && value.isArrayTexture)
           fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
         inspectTexture(value);
@@ -779,6 +796,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (boundTextures === null || boundTextures.has(node.value)) {
         if ((node.isTexture3DNode === true) !== (node.value?.is3DTexture === true))
           fail('TEXTURE', 'Native volume samples require matching Texture3DNode and Storage3DTexture dimensions');
+        inspectIntegerRead(node);
         const layout = inspectTexture(node.value);
         if (layout.multisampled && (node.isSampleCompare?.() === true || node.biasNode != null ||
             node.gradNode != null || node.gatherNode != null || node.sampler !== false && node.levelNode != null &&
@@ -973,6 +991,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           fail('BINDING', 'Native graphics groups require uniform blocks or ordinary sampled 2D, array, cube or 3D texture bindings');
         const textureLayout = inspectTexture(binding.textureNode.value);
         const sampled = binding.isSampledTexture === true, counts = sampled ? sampledCounts : samplerCounts;
+        if (!sampled && integerTextureType(binding.textureNode.value))
+          fail('BINDING', 'Native integer texel loads must not acquire a sampler binding');
         const limit = renderer._device?.limits?.[sampled ? 'maxSampledTexturesPerShaderStage' : 'maxSamplersPerShaderStage'] ?? 16;
         for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
           if (++counts[stage] > limit) fail('LIMIT', 'Native node texture bindings exceed per-stage device limits');
@@ -1046,6 +1066,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       instanceSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
+      integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
@@ -1228,6 +1249,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkClipping(state, context);
     updateThreeNodeClipping(state.builder.clippingContext, context);
     checkMaterialMaps(state);
+    // Catch stale signedness, aliases and newly sampled integer reads before
+    // observable callbacks. Live material references are read without updates;
+    // readTextures also revalidates mutations made by the actual node updates.
+    if (state.integerTextures || state.textureNodes.some(node => integerTextureType(textureValue(node, state.textureReferences))))
+      readTextures(state, true);
     checkLights(state);
     assertInstances(object, state.instanceSignature);
     assertSkinning(object, state.skinSignature);
