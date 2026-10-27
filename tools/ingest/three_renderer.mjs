@@ -31,6 +31,7 @@
  *   silently rendering something else.
  */
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
+import {createThreeRendererCanvases} from './three_renderer_canvas.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
@@ -278,7 +279,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.isRenderer = true;
       this.isWebGPURenderer = true;
       this.isF3DRenderer = true;
-      this.domElement = canvas ?? THREE.createCanvasElement();
+      this._canvases = createThreeRendererCanvases(THREE, this, canvas ?? THREE.createCanvasElement(), fail);
       this.autoClear = true;
       this.autoClearColor = true;
       this.autoClearDepth = true;
@@ -386,7 +387,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // GPU timestamps: hasTimestamp stays false and no timing is reported.
       this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: false, hasTimestamp: false,
         capabilities: {getUniformBufferLimit: () => this._device.limits.maxUniformBufferBindingSize},
-        hasTimestampQuery: () => false, getTimestampUID: () => null, delete() {}};
+        hasTimestampQuery: () => false, getTimestampUID: () => null, delete: target => this._canvases.forget(target)};
       // The source frame clock (Animation advances it once per loop tick).
       this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};
       this._inspector = typeof THREE.InspectorBase === 'function' ? new THREE.InspectorBase() : inspectorStub();
@@ -398,9 +399,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._inspector.setRenderer(this);
     }
     get inspector() { return this._inspector; }
-    hasFeature(name) { return !!this._session?.device?.features?.has(name); }
+    hasFeature(name) { return !!this._device?.features?.has(name); }
     async hasFeatureAsync(name) { await this.init(); return this.hasFeature(name); }
 
+    get domElement() { return this._canvasTarget.domElement; }
     get initialized() { return this._initialized; }
     hasInitialized() { return this._initialized; }
     get coordinateSystem() { return THREE.WebGPUCoordinateSystem; }
@@ -409,7 +411,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     get currentColorSpace() { return this.isOutputTarget ? this.outputColorSpace : THREE.LinearSRGBColorSpace; }
     get needsFrameBufferTarget() { return this.currentToneMapping !== NoToneMapping || this.currentColorSpace !== THREE.LinearSRGBColorSpace; }
     get currentSamples() { return this._renderTarget ? this._renderTarget.samples : this.needsFrameBufferTarget ? 0 : this.samples; }
-    get backend() { this._backend.device = this._session?.device ?? null; return this._backend; }
+    get backend() { this._backend.device = this._device; return this._backend; }
 
     init() {
       if (retainedInitReceivers.has(this)) return exactInit.call(this);
@@ -451,23 +453,29 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     /** Native tone mapping and output color conversion use the source's linear
      * framebuffer target. Preserve working-linear scene color from the first
      * render, including when no tone mapping is selected. */
-    async _createSession(hdr, srgbView = this._canvasSrgbView(this.outputColorSpace, hdr)) {
+    async _createSession(hdr, srgbView = this._canvasSrgbView(this.outputColorSpace, hdr),
+      canvasTarget = this.getCanvasTarget(), canvasSize = this._bufferSize(), canvas = canvasTarget.domElement) {
+      const release = this._canvases.retain(canvasTarget, canvas);
+      this._canvases.activate(canvasTarget, canvas);
+      try {
       const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
       const depthFormat = this.depth ? (this.stencil ? 'depth24plus-stencil8' : 'depth24plus') : null;
-      const [width, height] = this._bufferSize();
+      const [width, height] = canvasSize;
       const common = {device: this._device};
       const format = this._preferredFormat ? {format: this._preferredFormat} : {};
       this._hdr = hdr;
       this._srgbView = srgbView;
       this._dispatcher = null;
       this._session = hdr
-        ? await createGpuHdrCanvasRenderer(this.domElement, createDispatcher(this), {...common,
+        ? await createGpuHdrCanvasRenderer(canvas, createDispatcher(this), {...common,
           target: {width, height, ...format, srgbView, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
           renderTarget: {depthFormat, sampleCount, format: this._outputBufferFormat()},
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
-        : await createGpuCanvasRenderer(this.domElement, createDispatcher(this), {...common, lazyAttachments: true,
+        : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...format, srgbView,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
+      this._canvases.save();
+      } finally { release(); }
     }
     _release() {
       for (const cache of this._outputQuads.values()) cache.dispose();
@@ -477,8 +485,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       for (const target of this._frameBufferTargets?.keys() ?? [])
         if (target !== this._canvasTarget) target.dispose();
       this._targets.dispose();
-      this._session?.dispose();
-      this._session = null;
+      this._canvases.dispose();
       this._wanted.clear();
       this._passSnapshots.dispose();
       this._nodeBackgrounds?.dispose(); this._nodeBackgrounds = null;
@@ -519,8 +526,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _resize() {
       const [w, h] = this._bufferSize();
-      if (this._session) this._session.resize(w, h);
-      else { this.domElement.width = w; this.domElement.height = h; }
+      this._canvases.resize(this.getCanvasTarget(), w, h);
     }
 
     // ---- size and clear state (source-equivalent semantics) ----
@@ -598,14 +604,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getClearStencil() { return this._clearStencil; }
     setClearStencil(stencil) { this._clearStencil = stencil; }
     getRenderTarget() { return this._renderTarget; }
-    getCanvasTarget() {
-      // ViewportTextureNode keys its source-owned images by this real, stable
-      // CanvasTarget. Synchronize its read state without resizing the canvas
-      // while a render request is being captured.
-      const target = this._canvasTarget ??= new THREE.CanvasTarget(this.domElement);
-      target._width = this._width; target._height = this._height; target._pixelRatio = this._pixelRatio;
-      target._viewport.copy(this._viewport); target._scissor.copy(this._scissor); target._scissorTest = this._scissorTest;
-      return target;
+    getCanvasTarget() { return this._canvasTarget; }
+    setCanvasTarget(target) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      this._canvases.select(target);
     }
     _framebufferFormat() {
       const internal = this._frameBufferTargets?.get(this._canvasTarget);
@@ -636,6 +638,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const source = !this._nodeFramebufferCopyRecorder && this._renderTarget
         ? this._targets.capture(this._renderTarget) : null;
       const [width, height] = source ? [source.shape.width, source.shape.height] : this._bufferSize();
+      const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement;
       if (!this._nodeFramebufferCopyRecorder &&
           (region[0] + region[2] > width || region[1] + region[3] > height))
         fail('COPY', 'Framebuffer copy rectangle exceeds the selected source');
@@ -645,13 +648,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
         catch (error) { textures.release(lease); throw error; }
       } else {
-        let releaseSource = null, released = false;
+        let releaseSource = null, releaseCanvas = null, released = false;
         const release = () => {
           if (released) return; released = true;
-          textures.release(lease); releaseSource?.();
+          textures.release(lease); releaseSource?.(); releaseCanvas?.();
         };
         try {
           releaseSource = source ? this._targets.retainGeneration(source) : null;
+          releaseCanvas = source ? null : this._canvases.retain(canvasTarget, canvas);
           const hdr = !source && this._wantsHdr(this._toneMapping());
           const srgbView = this._canvasSrgbView(this.outputColorSpace, hdr);
           const copy = () => {
@@ -671,16 +675,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           const request = {framebufferCopy: true, releaseFramebuffer: release, issue: () => {
             // Invalid destinations must not acquire or replace presentation.
             textures.validateDispatch([lease]);
-            if (!source && (hdr !== this._hdr || srgbView !== this._srgbView)) {
-              this._session.dispose();
-              return this._createSession(hdr, srgbView).then(copy);
+            if (!source) {
+              this._canvases.activate(canvasTarget, canvas);
+              if (!this._session || hdr !== this._hdr || srgbView !== this._srgbView) {
+                this._session?.dispose();
+                return this._createSession(hdr, srgbView, canvasTarget, [width, height], canvas).then(copy);
+              }
+              this._session.resize(width, height);
             }
             return copy();
           }};
           // Public void calls share the render FIFO. An already prepared copy
           // submits now; pending renders keep their original producer boundary.
           if (!this._drain && !this._preparing && !this._pending.length &&
-              (source || hdr === this._hdr && srgbView === this._srgbView)) {
+              (source || this._canvases.matches(canvasTarget, width, height, canvas) && hdr === this._hdr && srgbView === this._srgbView)) {
             try { request.issue(); } finally { this._releaseRequest(request); }
           } else this._enqueue(request);
         } catch (error) { release(); throw error; }
@@ -865,6 +873,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
+      const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement, canvasSize = this._bufferSize();
       const renderId = this.info.calls;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target, {initialize: !this._shaderEncodedOutput}) : this;
@@ -919,14 +928,21 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         try { materialFrame = this._captureMaterialFrame({scene, nodeFrame, overrideMaterial}); }
         catch (error) { this._releaseRequest({nodeFrame}); throw error; }
       }
-      return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
-        nodeCaptureDeferred, captureCameras, backgroundState, materialFrame, renderId, sourceTarget,
-        generateCubeMipmaps: !this._shaderEncodedOutput && !clearOnly && target?.isCubeRenderTarget === true && target.texture.generateMipmaps,
-        linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
-        hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
-        programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
-          outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height},
-        releaseDestination: destination === this ? null : this._targets.retainGeneration(destination)};
+      // Captures already own source resource leases. Publish each additional
+      // lease immediately so a later acquisition failure can release all of it.
+      const request = {snapshot, nodeFrame, materialFrame};
+      try {
+        Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
+          nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize,
+          generateCubeMipmaps: !this._shaderEncodedOutput && !clearOnly && target?.isCubeRenderTarget === true && target.texture.generateMipmaps,
+          linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
+          hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
+          programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+            outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height}});
+        request.releaseDestination = destination === this ? null : this._targets.retainGeneration(destination);
+        request.releaseCanvas = this._canvases.retain(canvasTarget, canvas);
+        return request;
+      } catch (error) { this._releaseRequest(request); throw error; }
     }
     _updateNativeMatrices(scene, camera) {
       if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
@@ -1045,7 +1061,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
     }
     _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId,
-      sourceTarget = destination === this ? null : destination.target}) {
+      canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let raster = this._nodeRaster.get(stencilAttachment);
@@ -1053,7 +1069,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
       // Pre-init requests can be captured after a PassNode restored the public
       // renderer state. Build and update against that request's source context.
-      const previousTarget = this._renderTarget, previousMRT = this._mrt;
+      const previousTarget = this._renderTarget, previousMRT = this._mrt, previousCanvas = this.getCanvasTarget();
+      const restoreCanvas = canvasTarget !== previousCanvas;
       const previousOutput = outputTransform ? {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
         outputColorSpace: this.outputColorSpace} : null;
       let captured;
@@ -1063,6 +1080,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // public selector null, although their GPU destination is a target.
         // ScreenNode therefore observes the canvas size on those source paths.
         this._renderTarget = sourceTarget; this._mrt = mrt;
+        if (restoreCanvas) this._canvases.select(canvasTarget);
         if (outputTransform) Object.assign(this, outputTransform);
         if (destination === this && this.needsFrameBufferTarget) {
           // Retain source target construction/identity for node observations;
@@ -1085,6 +1103,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       } finally {
         this._nodeCaptureDepth--;
         this._renderTarget = previousTarget; this._mrt = previousMRT;
+        if (restoreCanvas) this._canvases.select(previousCanvas);
         if (previousOutput) Object.assign(this, previousOutput);
       }
       if (captured) this._nodeCaptureBytes += captured.bytes;
@@ -1111,13 +1130,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._nodeCaptureBytes -= captured.bytes; request.nodeFrame = null;
       }
       request.releaseDestination?.(); request.releaseDestination = null;
+      request.releaseCanvas?.(); request.releaseCanvas = null;
     }
     _dispatchRequest(request) {
       const {scene, destination, snapshot} = request;
       destination._wanted.set(scene, request.key);
       const entry = destination._dispatcher?.entry(scene);
       if (this._drain || this._preparing || (destination === this &&
-          (request.hdr !== this._hdr || request.srgbView !== this._srgbView)) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
+          (!this._canvases.matches(request.canvasTarget, ...request.canvasSize, request.canvas) ||
+            request.hdr !== this._hdr || request.srgbView !== this._srgbView)) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
       try {
         const captured = request.nodeFrame;
@@ -1351,6 +1372,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             await destination._dispatcher.prepare();
             this._targets.assertCurrent(destination);
           } else {
+            const canvasTarget = request?.canvasTarget ?? this.getCanvasTarget(), canvasSize = request?.canvasSize ?? this._bufferSize();
+            const canvas = request?.canvas ?? canvasTarget.domElement;
+            this._canvases.activate(canvasTarget, canvas);
             const tone = request ? TONE_MAPPINGS.get(request.programFrame.toneMapping) : this._toneMapping();
             const selectOutput = () => {
               const hdr = this._wantsHdr(tone, request?.programFrame.outputColorSpace ?? this.outputColorSpace);
@@ -1368,7 +1392,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             };
             const hdr = selectOutput(), srgbView = this._shaderEncodedOutput ? hdr : request?.srgbView ?? this._canvasSrgbView();
             if (request) request.srgbView = srgbView;
-            if (hdr !== this._hdr || srgbView !== this._srgbView) { this._session.dispose(); await this._createSession(hdr, srgbView); }
+            if (!this._session || hdr !== this._hdr || srgbView !== this._srgbView) {
+              this._session?.dispose(); await this._createSession(hdr, srgbView, canvasTarget, canvasSize, canvas);
+            } else this._session.resize(...canvasSize);
             this._rebuild = false;
             try { await this._session.prepare(); }
             catch (error) {
@@ -1377,7 +1403,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               this._session.dispose();
               const fallbackHdr = selectOutput();
               if (request && this._shaderEncodedOutput) request.srgbView = fallbackHdr;
-              await this._createSession(fallbackHdr, this._shaderEncodedOutput ? fallbackHdr : srgbView);
+              await this._createSession(fallbackHdr, this._shaderEncodedOutput ? fallbackHdr : srgbView, canvasTarget, canvasSize, canvas);
               this._rebuild = false;
               await this._session.prepare();
             }
@@ -1392,7 +1418,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async waitForGPU() {
       while (this._drain) await this._drain;
       if (this._preparing) await this._preparing;
-      if (this._session) await this._session.whenIdle();
+      await this._canvases.whenIdle();
       await this._transfers.whenIdle();
       await this._targets.whenIdle();
     }
