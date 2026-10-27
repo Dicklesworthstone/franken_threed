@@ -7,6 +7,7 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
+import {withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
 const Renderer=createWebGPURendererClass(T);
 function fixture(t){
@@ -604,6 +605,63 @@ test('storage-only node callbacks cannot enqueue compute inside the draw capture
   assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_COMPUTE_REENTRY'});
   assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
   assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.device.computePasses.length,0);
+});
+
+for (const initialized of [false,true])
+test(`effect compute prerequisites retain FIFO storage versions with initialized=${initialized}`,async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),storage=T.TSL.storage(attribute,'vec4',4),kernel=storageKernel(storage);
+  const values=[.125,.625];let updates=0;
+  f.tint.updateBeforeType='object';
+  f.tint.updateBefore=()=>withThreeNativeComputePrerequisites(f.renderer,()=>{
+    attribute.array.fill(values[updates++]);attribute.needsUpdate=true;
+    f.renderer.compute(kernel);
+  });
+  f.material.fragmentNode=storage.element(0).mul(f.tint);
+  if(initialized)await f.renderer.init();
+  const first=f.renderer.renderAsync(f.scene,f.camera),second=f.renderer.renderAsync(f.scene,f.camera);
+  await Promise.all([first,second,drain(f.renderer)]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);assert.equal(updates,2);
+  assert.equal(f.device.computePasses.length,2);
+  assert.deepEqual(draws.map(draw=>storageWords(draw)[0][0]),values);
+  const order=f.device.submissions.flat(2).flatMap(pass=>
+    pass.dispatches?['compute']:pass.draws.some(draw=>draw.pipeline.vertex.entryPoint==='main')?['render']:[]);
+  assert.deepEqual(order,['compute','render','compute','render']);
+  assert.equal(f.renderer._nodeCaptureBytes,0);await f.renderer.waitForGPU();
+});
+
+for(const kind of ['native','fixed','cold bundle','warm bundle'])
+test(`effect compute refuses a possible earlier ${kind} draw before writing storage`,async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),storage=T.TSL.storage(attribute,'vec4',4),kernel=storageKernel(storage);
+  const material=kind==='fixed'?new T.MeshBasicMaterial():new T.MeshBasicNodeMaterial();
+  const earlier=new T.Mesh(new T.PlaneGeometry(),material);earlier.renderOrder=-1;
+  if(kind.endsWith('bundle')) { const group=new T.BundleGroup();group.add(earlier);f.scene.add(group); }
+  else f.scene.add(earlier);
+  let active=kind!=='warm bundle';
+  f.tint.updateBeforeType='object';
+  f.tint.updateBefore=()=>{if(active)withThreeNativeComputePrerequisites(f.renderer,()=>f.renderer.compute(kernel));};
+  await f.renderer.init();
+  if(!active) { f.renderer.render(f.scene,f.camera);await drain(f.renderer);active=true;f.renderer._nodes.nodeFrame.update(); }
+  const writes=f.device.writes.length,submissions=f.device.submissions.length;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_COMPUTE_REENTRY'});
+  assert.equal(f.device.computePasses.length,0);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.device.writes.length,writes);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+for(const initialized of [false,true])
+test(`accepted effect compute survives a later failed parent with initialized=${initialized}`,async t=>{
+  const f=fixture(t);recordCompute(f.device);
+  const attribute=new T.StorageBufferAttribute(4,4),kernel=storageKernel(T.TSL.storage(attribute,'vec4',4));
+  f.tint.updateBeforeType='object';
+  f.tint.updateBefore=()=>withThreeNativeComputePrerequisites(f.renderer,()=>{
+    f.renderer.compute(kernel);
+    throw new Error('effect capture failed');
+  });
+  if(initialized)await f.renderer.init();
+  await assert.rejects(f.renderer.renderAsync(f.scene,f.camera),/effect capture failed/);
+  assert.equal(f.device.computePasses.length,1);assert.equal(nativeDraws(f.device).length,0);
+  assert.equal(f.device.submissions.length,1);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 function storageInstances(f,count=4){

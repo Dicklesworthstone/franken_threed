@@ -78,6 +78,49 @@ function traaPipeline(t, f) {
   return {pass, effect, pipeline};
 }
 
+for (const Class of [T.MeshStandardMaterial, T.MeshBasicMaterial]) test(`pass lighting contexts route ordinary ${Class.name} through source lighting and retain queued inputs`, async t => {
+  const f = fixture(t); f.mesh.material = new Class(); await f.renderer.init();
+  const ao = N.uniform(.125).setName('passContextAO'), gi = N.uniform(new T.Vector3(.25, .5, .75)).setName('passContextGI');
+  const originalContext = N.builtinAOContext(N.uniform(.625).setName('rendererContextAO'));
+  f.renderer.contextNode = originalContext;
+  const pass = N.pass(f.scene, f.camera); pass.contextNode = N.builtinGIContext(ao, gi);
+  const pipeline = new T.RenderPipeline(f.renderer, pass);
+  t.after(() => { pipeline.dispose(); pass.dispose(); });
+  for (const value of [.125, .375, .875]) {
+    ao.value = value; f.renderer._nodes.nodeFrame.update(); pipeline.render();
+    assert.equal(f.renderer.contextNode, originalContext, 'source pass restores the outer context immediately');
+  }
+  ao.value = .0625; await drain(f.renderer);
+  const draws = nativeDraws(f.device).filter(draw => shader(draw).includes('passContextAO'));
+  assert.equal(draws.length, 3, 'ordinary materials select the native source graph without authored slots');
+  for (const [index, value] of [.125, .375, .875].entries()) {
+    assert.ok(uniformWords(draws[index]).includes(value));
+    assert.doesNotMatch(shader(draws[index]), /rendererContextAO/);
+  }
+  assert.equal(draws[0].pipeline, draws[2].pipeline);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.getRenderTarget(), null);
+});
+
+test('pass lighting contexts preserve the source versioned merge cache', async t => {
+  const f = fixture(t); f.mesh.material = new T.MeshStandardMaterial(); await f.renderer.init();
+  const original = f.renderer.contextNode, pass = N.pass(f.scene, f.camera);
+  pass.contextNode = N.builtinAOContext(N.uniform(.125).setName('firstPassAO'));
+  const pipeline = new T.RenderPipeline(f.renderer, pass);
+  t.after(() => { pipeline.dispose(); pass.dispose(); });
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  const cached = pass._contextNodeCache.context;
+  pass.contextNode = N.builtinAOContext(N.uniform(.875).setName('nextPassAO'));
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  assert.equal(pass._contextNodeCache.context, cached, 'source reuses the merged context until pass version advances');
+  pass.needsUpdate = true;
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  assert.notEqual(pass._contextNodeCache.context, cached);
+  const draws = nativeDraws(f.device).filter(draw => /firstPassAO|nextPassAO/.test(shader(draw)));
+  assert.equal(draws.length, 3);
+  assert.deepEqual(draws.map(draw => shader(draw).includes('nextPassAO')), [false, false, true]);
+  assert.equal(f.renderer.contextNode, original); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('native TRAA retains source first-frame depth, jitter, velocity and GPU history copies', async t => {
   const f = fixture(t); await f.renderer.init();
   const {pass, effect, pipeline} = traaPipeline(t, f), initialDepth = effect._previousDepthNode.value;

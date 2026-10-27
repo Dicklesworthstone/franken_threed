@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
-import {withThreeNativeCapture, assertThreeNativeTargetWrite, assertThreeNativeComputeOutsideCapture} from './three_node_shadows.mjs';
+import {withThreeNativeCapture, assertThreeNativeTargetWrite, assertThreeNativeComputeOutsideCapture,
+  withThreeNativeComputePrerequisites, markThreeNativeDrawCaptured} from './three_node_shadows.mjs';
 import {createGpuCompute} from './gpu_compute.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -591,6 +592,46 @@ test('compute reentry stays refused until the complete native capture unwinds', 
     assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
     withThreeNativeCapture(renderer, () =>
       assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'}));
+    assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
+  });
+  assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
+});
+
+test('registered effect compute precedes the first draw and cannot change an earlier parent read', () => {
+  const renderer = {};
+  withThreeNativeCapture(renderer, () => {
+    withThreeNativeComputePrerequisites(renderer, () => {
+      assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
+      withThreeNativeCapture(renderer, () => {
+        assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
+        markThreeNativeDrawCaptured(renderer);
+        assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
+      });
+      assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer), 'submitted child draws do not occupy the parent prefix');
+      markThreeNativeDrawCaptured(renderer);
+      assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
+      withThreeNativeCapture(renderer, () =>
+        assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'}));
+    });
+  });
+  withThreeNativeCapture(renderer, record => {
+    record(new THREE.Texture());
+    withThreeNativeComputePrerequisites(renderer, () =>
+      assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'}));
+  });
+});
+
+test('effect compute permission restores after nested scopes and failure', () => {
+  const renderer = {}, other = {};
+  withThreeNativeCapture(renderer, () => {
+    assert.throws(() => withThreeNativeComputePrerequisites(renderer, () => {
+      withThreeNativeComputePrerequisites(renderer, () =>
+        assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer)));
+      assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));
+      withThreeNativeCapture(other, () =>
+        assert.throws(() => assertThreeNativeComputeOutsideCapture(other), {code: 'THREE_COMPUTE_REENTRY'}));
+      throw new Error('effect failed');
+    }), /effect failed/);
     assert.throws(() => assertThreeNativeComputeOutsideCapture(renderer), {code: 'THREE_COMPUTE_REENTRY'});
   });
   assert.doesNotThrow(() => assertThreeNativeComputeOutsideCapture(renderer));

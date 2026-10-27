@@ -2,7 +2,7 @@
  * camera fitting and update frequency; the facade captures every resulting pass
  * for its own submission. No upstream renderer or backend is constructed here.
  */
-const renderFunctions = new WeakMap(), captures = new WeakMap();
+const renderFunctions = new WeakMap(), captures = new WeakMap(), computePrerequisites = new WeakSet();
 const reject = message => {
   const error = new Error(`THREE_NODE_PROGRAM_SHADOW: ${message}`);
   error.name = 'ThreeNodeProgramError'; error.code = 'THREE_NODE_PROGRAM_SHADOW'; throw error;
@@ -130,9 +130,26 @@ export function withThreeShadowMaterial(three, renderer, material, original, run
 export function withThreeNativeCapture(renderer, run) {
   let stack = captures.get(renderer);
   if (!stack) captures.set(renderer, stack = []);
-  const textures = new Set(); stack.push(textures);
-  try { return run(texture => textures.add(texture)); }
+  const scope = {textures: new Set(), draws: 0}; stack.push(scope);
+  try { return run(texture => scope.textures.add(texture)); }
   finally { stack.pop(); if (!stack.length) captures.delete(renderer); }
+}
+
+/** A source effect may compute its inputs before this pass's first draw. Its
+ * nested passes already join the renderer FIFO before their pending parent.
+ * Mark only the current pass: completed child captures do not become earlier
+ * parent draws, but every still-active ancestor must remain free of reads.
+ */
+export function markThreeNativeDrawCaptured(renderer) {
+  const scope = captures.get(renderer)?.at(-1);
+  if (scope) scope.draws++;
+}
+
+export function withThreeNativeComputePrerequisites(renderer, run) {
+  const previous = computePrerequisites.has(renderer);
+  computePrerequisites.add(renderer);
+  try { return run(); }
+  finally { if (!previous) computePrerequisites.delete(renderer); }
 }
 
 export function assertThreeNativeTargetWrite(renderer, target) {
@@ -142,13 +159,14 @@ export function assertThreeNativeTargetWrite(renderer, target) {
 }
 
 export function assertThreeNativeTextureWrite(renderer, texture) {
-  for (const textures of captures.get(renderer) ?? [])
+  for (const {textures} of captures.get(renderer) ?? [])
     if (textures.has(texture))
       reject('A nested write cannot overwrite a texture sampled by an earlier draw in its pending parent pass');
 }
 
 export function assertThreeNativeComputeOutsideCapture(renderer) {
-  if (captures.has(renderer)) {
+  const stack = captures.get(renderer);
+  if (stack && (!computePrerequisites.has(renderer) || stack.some(scope => scope.draws || scope.textures.size))) {
     const error = new Error('THREE_COMPUTE_REENTRY: Compute inside native draw capture requires a separate submission boundary; compute before rendering the scene');
     error.name = 'ThreeComputeError'; error.code = 'THREE_COMPUTE_REENTRY'; throw error;
   }

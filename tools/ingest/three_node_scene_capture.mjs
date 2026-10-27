@@ -5,7 +5,8 @@
  */
 import {hasThreeNodeProgram, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
-  withThreeNativeCapture} from './three_node_shadows.mjs';
+  withThreeNativeCapture, markThreeNativeDrawCaptured} from './three_node_shadows.mjs';
+import {inspectThreeLightingContext} from './three_node_passes.mjs';
 import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 import {inspectThreeNativeBatch, captureThreeNativeBatch} from './three_node_batch.mjs';
 
@@ -47,6 +48,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Native PBR owns node/cube environments. Fixed companions and inactive
   // lighting must not acquire the legacy panorama owner for these inputs.
   const sceneEnvironmentNode = root?.environmentNode?.isNode === true || root?.environment?.isCubeTexture === true;
+  const lightingContext = inspectThreeLightingContext(three, renderer?.contextNode);
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
       !hasThreeNodeProgram(backgroundMesh.material)))
@@ -115,6 +117,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Non-PBR lighting models have no rectangular-light contribution, but their
   // source light node still constructs its LTC inputs and runs its lifecycle.
   const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene) && litMaterial(material);
+  // Basic uses a source lighting model for AO and baked light as well. Even an
+  // otherwise fixed material must reach that model when the pass supplies AO.
+  const nativeContextMaterial = material => lightingContext !== null && material?.lights !== false &&
+    (litMaterial(material) || material?.isMeshBasicMaterial === true || material?.isMeshBasicNodeMaterial === true);
   // Authored scene nodes and cube environments use the source PBR graph.
   // Material environments take precedence, while unused scene inputs stay inert.
   const nativeEnvironmentMaterial = material => (root.environmentNode?.isNode === true || root.environment?.isCubeTexture === true) &&
@@ -131,14 +137,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       (object.isPointLight === true && object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          nativeFeatures(material) || nativeLightMaterial(material) || nativeEnvironmentMaterial(material) ||
+          nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
   const nativeClippingScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.isClippingGroup && object.enabled && object.layers.test(camera.layers) && (!shadowPass || object.clipShadows));
   const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene
-    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeEnvironmentMaterial(material);
+    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -490,6 +496,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const beforeDone = typeof programs.before === 'function';
       if (beforeDone) programs.before(draw.binding.nodeProgram, updateContext);
       const capture = () => {
+      markThreeNativeDrawCaptured(renderer);
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
@@ -687,6 +694,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   try {
     withThreeNativeCapture(renderer, record => {
       recordTexture = record;
+      // Fixed companions may sort before these native draws. Their reads are
+      // not captured here, so this mixed pass cannot prove a compute prefix.
+      if (fixedDrawCandidates) markThreeNativeDrawCaptured(renderer);
       capture();
       if (!uniforms) {
         const captureStorage = () => storageOwner ? storageOwner.captureDispatch(() => {}) : undefined;

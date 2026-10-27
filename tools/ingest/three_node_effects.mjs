@@ -2,6 +2,8 @@
  * materials and passes; the renderer owns execution and target generations.
  * This protocol does not select effects by class name or replace their shaders.
  */
+import {withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
+
 export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} = {}) {
   if (typeof fail !== 'function' || !Number.isSafeInteger(maxTargets) || maxTargets < 1)
     throw new TypeError('Expected native effect limits and an admission error factory');
@@ -104,7 +106,7 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
 
   function update(node, frame) {
     const record = inspectProducer(node);
-    const run = () => frame.updateBeforeNode(node);
+    const run = () => withThreeNativeComputePrerequisites(renderer, () => frame.updateBeforeNode(node));
     if (frame.updateBeforeMap.get(node)?.frameId === frame.frameId) return run();
     if (typeof renderer._targets?.withNativeEffectTargets !== 'function')
       fail('PASS', 'Native effects require the renderer target-generation owner');

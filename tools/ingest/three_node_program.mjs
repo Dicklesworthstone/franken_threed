@@ -29,7 +29,8 @@
  */
 import {createThreeNodeAttributes} from './three_node_attributes.mjs';
 import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
-import {inspectThreePipelineContext, inspectThreeNativePass, updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
+import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
+  updateThreeNativePass, inspectThreeMRT} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
@@ -753,8 +754,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
-    if (Object.keys(renderer.contextNode?.getFlowContextData?.() ?? {}).length)
-      fail('GRAPH', 'Custom renderer node contexts require an explicit graphics context adapter');
+    inspectThreeLightingContext(three, renderer.contextNode);
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
     if (sourceMaterial.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
         sourceMaterial.onBeforeRender !== three.Material.prototype.onBeforeRender ||
@@ -813,7 +813,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? prototype === three.BasicLightMapNode.prototype && node.lightMapNode === three.TSL.materialLightMap
       : prototype === three.IrradianceNode.prototype && node.node === three.TSL.materialLightMap;
   }
-  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null) {
+  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isPassTextureNode === true) {
@@ -877,7 +877,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     }
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
-      const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) ||
+      const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) || contextLightings?.has(node) ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
         checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
@@ -900,6 +900,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material),
       inspectThreePipelineContext(three, renderer, material, object, effects),
+      inspectThreeLightingContext(three, renderer.contextNode),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
@@ -934,6 +935,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
+    const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const fogKey = fogSignature(preparedMaterial, context);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
@@ -977,6 +979,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
     assertMorphs(object, morphSignature);
+    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== rendererContextSignature)
+      fail('CHANGED', 'Native lighting context changed during source graph construction');
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     if (fogSignature(prepareMaterial(material), context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
@@ -993,10 +997,25 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const bindings = builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
+    // AO/GI hooks add material lighting inside the retained source context.
+    // Admit those exact generated nodes, not unrelated authored light graphs.
+    const contextLightings = new Set();
+    for (const node of builder.nodes) if (Object.getPrototypeOf(node) === three.LightingContextNode.prototype && node.node === lightsNode) {
+      for (const lighting of node.materialLightings) {
+        if (typeof builder.context.getAO === 'function' && Object.getPrototypeOf(lighting) === three.AONode.prototype &&
+            lighting.aoNode === three.TSL.ambientOcclusion ||
+            typeof builder.context.getGI === 'function' && Object.getPrototypeOf(lighting) === three.IrradianceNode.prototype)
+          contextLightings.add(lighting);
+      }
+    }
     for (const node of builder.nodes) {
-      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial);
+      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
     }
+    // Producer inspection above registers source-owned pipeline state created
+    // during setup (including TRAA's view-offset owner).
+    if (inspectThreePipelineContext(three, renderer, material, object, effects) !== pipelineSignature)
+      fail('CHANGED', 'Native material context changed during source graph construction');
     if (bindings.length > Math.min(maxBindGroups, renderer._device?.limits?.maxBindGroups ?? 4))
       fail('LIMIT', 'Native node graph exceeds its bind group budget');
     let uniformBytes = 0, uniformCount = 0;
@@ -1124,7 +1143,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
-      instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, fogSignature: fogKey, mrtSignature: mrtKey,
+      instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
+      fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
@@ -1331,6 +1351,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return history.bytes;
   }
   function checkPipelineContext(state, object = state.object) {
+    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature)
+      fail('CHANGED', 'Native renderer lighting context changed; compile the material graph again');
     if (inspectThreePipelineContext(three, renderer, state.material, object, effects) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');
     if ((inspectThreeMRT(three, renderer, state.material)?.key ?? null) !== state.mrtSignature)
@@ -1450,6 +1472,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       let bundleGeometry = null;
       try {
       if (!context.beforeDone) runBefore(state);
+      checkPipelineContext(state, object);
       assertInstances(object, state.instanceSignature);
       assertBatch(object, state.batchSignature);
       assertSkinning(object, state.skinSignature);

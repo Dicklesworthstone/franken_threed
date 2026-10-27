@@ -523,8 +523,11 @@ cannot overwrite resident GPU results. Vertex and fragment aliases borrow one
 allocation, and `compileAsync()` performs no storage upload or node update.
 
 Storage capture has its own transaction, nested with texture capture when both
-are used, so a node callback cannot insert compute into a partially captured
-render. Leases release their captured bytes on success and failure; the compute
+are used. Registered source texture producers may run compute prerequisites
+before the first draw or texture read in every active parent capture. Completed
+child passes already precede their parent in the FIFO. Ordinary callbacks and
+compute after an earlier parent draw still require a separate submission boundary.
+Leases release their captured bytes on success and failure; the compute
 owner retains GPU lifetime. Conflicting host versions of one storage attribute
 within a single logical render are rejected before any storage writes. They
 require additional per-draw storage scheduling; separate logical renders already
@@ -1158,6 +1161,71 @@ comparisons had zero GPU, page or console errors and used the same
 identity-swizzle adapter and frame clock as the SSGI comparison above. These
 are general WebGPU correctness checks, not hardware performance measurements
 or closure of every temporal effect.
+
+## Native voxel global illumination and material lighting contexts
+
+The pinned `VXGINode` and `VXGIVolume` now execute their original voxelization,
+light injection, opacity/radiance mip generation, cached bounce and cone-tracing
+graphs through the native renderer. Storage buffers and 3D textures remain on
+the shared compute/graphics owner. Source effect updates enqueue their compute
+prerequisites before the consuming draw, with no readback or replacement shader.
+
+Renderer, material and scene-pass contexts admit bounded source `ContextNode`
+chains containing `getAO` and `getGI` hooks. The retained builder invokes these
+hooks inside material lighting. In particular, `builtinGIContext` preserves its
+AO clamp, GI normalization, material-AO composition and transparent-material
+bypass. Ordinary Basic and lit mesh materials select the native source builder
+when they consume such a context; authored dummy node slots are unnecessary.
+Material context values retain precedence over renderer values, and scene passes
+retain the source versioned merged-context cache. Hook replacement or context
+version changes require a fresh graph; uniform values remain live per draw.
+Other custom context fields and custom traversal implementations remain refused.
+
+```js
+import { vxgi } from 'three/addons/lighting/vxgi/VXGINode.js';
+import { traa } from 'three/addons/tsl/display/TRAANode.js';
+
+const prePass = TSL.pass(scene, camera);
+prePass.transparent = false;
+prePass.setMRT(TSL.mrt({
+  output: TSL.packNormalToRGB(TSL.normalView), velocity: TSL.velocity,
+}));
+prePass.getTexture('output').type = THREE.UnsignedByteType;
+const normals = TSL.sample(uv => TSL.unpackRGBToNormal(prePass.getTextureNode().sample(uv)));
+const indirect = vxgi(prePass.getTextureNode('depth'), normals, scene, camera, 16);
+const beauty = TSL.pass(scene, camera);
+beauty.contextNode = TSL.builtinGIContext(
+  indirect.getAONode().sample(TSL.screenUV).r,
+  indirect.getGINode().sample(TSL.screenUV).rgb,
+);
+const result = traa(beauty, prePass.getTextureNode('depth'), prePass.getTextureNode('velocity'), camera);
+const pipeline = new THREE.RenderPipeline(renderer, result);
+```
+
+Use MSAA-disabled ordinary cameras for this checked composition. The example's
+resolution is deliberately small; it does not establish the performance of the
+full Sponza scene or a large volume. Preserve the source invalidation controls:
+set `indirect.volume.lightingNeedsUpdate = true` after changing injected lights
+and `indirect.volume.needsUpdate = true` when geometry requires revoxelization.
+Without temporal resolve, set `indirect.useTemporalFiltering = false` for a fixed
+sample pattern. Scene-pass context changes follow the source cache: advance
+`beauty.needsUpdate` when replacing its context graph.
+
+Compute admission requires all still-active parent passes to have no accepted
+draws or texture reads. A mixed fixed/native pass cannot prove this prefix and
+remains refused. Earlier accepted work survives a later parent failure, while
+temporary effect/pass context and renderer controls restore normally. This does
+not allow arbitrary compute callbacks inside a partly captured draw.
+
+`tests/e2e/webgpu_renderer/vxgi.mjs` compares the source and candidate using exact
+HDR readback, independently checking source repeatability first. Four frames of
+spatially separated triangle surfaces cover changed lights and geometry. On
+Chromium 151/SwiftShader, VXGI and VXGI-plus-TRAA each matched all 16,384 final
+RGBA16F channel words, 16,384 GI words and 4,096 AO bytes, with zero GPU, page or
+console errors. GI was nonzero and exceeded one; TRAA jitter indices matched.
+This is correctness evidence, not a hardware-performance claim. Intersecting
+room geometry also executes, but the pinned source's competing voxel triangle-ID
+writes make its GI output non-bitwise-repeatable; it is not an exact GI oracle.
 
 ## Native clipping groups
 

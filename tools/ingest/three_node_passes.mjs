@@ -7,6 +7,50 @@ const fail = (message, code = 'PASS') => {
   error.name = 'ThreeNodeProgramError'; error.code = `THREE_NODE_PROGRAM_${code}`; throw error;
 };
 const nativePasses = new WeakMap();
+const lightingHooks = new WeakMap();
+let lightingHookSerial = 0;
+
+/** Source AO/GI contexts participate in material lighting, before BRDF and
+ * output composition. Keep the original hooks for the retained builder; do
+ * not evaluate them during admission or substitute a final-color operation.
+ * Hook identity and ContextNode.version are structural, uniform values live.
+ */
+export function inspectThreeLightingContext(three, context, code = 'GRAPH') {
+  if (context == null) return null;
+  const seen = new Set(), signature = [];
+  let hasHooks = false;
+  for (let node = context; node !== null;) {
+    const source = three.ContextNode?.prototype;
+    if (!source || Object.getPrototypeOf(node) !== source || seen.has(node) || seen.size >= 64 ||
+        node.getFlowContextData !== source.getFlowContextData ||
+        ['traverse', 'getChildren', '_getChildren'].some(key => node[key] !== three.Node.prototype[key]))
+      fail('Native lighting contexts require a bounded chain of pinned ContextNode values', code);
+    seen.add(node);
+    const descriptors = Object.getOwnPropertyDescriptors(node);
+    const data = descriptors.value?.value, child = descriptors.node?.value;
+    if (!data || ![Object.prototype, null].includes(Object.getPrototypeOf(data)) ||
+        !descriptors.node || !('value' in descriptors.node) || child !== null && child?.isContextNode !== true ||
+        Object.values(descriptors).some(descriptor => !('value' in descriptor)))
+      fail('Native lighting contexts require source data properties and ContextNode children', code);
+    const hooks = [];
+    for (const key of Reflect.ownKeys(data)) {
+      const descriptor = Object.getOwnPropertyDescriptor(data, key);
+      if (!['getAO', 'getGI'].includes(key) || !('value' in descriptor) || typeof descriptor.value !== 'function')
+        fail('Native lighting contexts admit only source-builder getAO and getGI hooks', code);
+      let id = lightingHooks.get(descriptor.value);
+      if (id === undefined) lightingHooks.set(descriptor.value, id = ++lightingHookSerial);
+      hooks.push([key, id]); hasHooks = true;
+    }
+    // The source traverses every public node field. Extra child graphs could
+    // contribute a context not represented by this finite chain's cache key.
+    for (const {property, childNode} of three.Node.prototype._getChildren.call(node))
+      if (property !== 'node' || childNode !== child)
+        fail('Native lighting contexts cannot carry additional context graphs', code);
+    signature.push([node.uuid, node.version, hooks]);
+    node = child;
+  }
+  return hasHooks ? JSON.stringify(['lighting-context', signature]) : null;
+}
 
 /** Capture the source's named output mapping. Uniform values and clear colors
  * stay live; changing graph, attachment order/type or blend layout is structural.
@@ -60,6 +104,8 @@ export function inspectThreePipelineContext(three, renderer, material, object, e
   if (context == null) return null;
   const sharedKey = effects?.contextKey(context);
   if (sharedKey !== undefined && sharedKey !== null) return sharedKey;
+  if (context.value?.renderPipeline === undefined)
+    return inspectThreeLightingContext(three, context, 'PASS') ?? 'empty-lighting-context';
   const pipeline = context.value?.renderPipeline, source = three.RenderPipeline?.prototype;
   const prototype = pipeline && Object.getPrototypeOf(pipeline);
   if (!source || !(pipeline instanceof three.RenderPipeline) ||
@@ -123,8 +169,7 @@ export function inspectThreeNativePass(three, renderer, node) {
   if (Object.keys(node._previousTextureNodes).some(name => node._previousTextures[name] === undefined))
     fail('Native color histories require their source previous textures');
   inspectThreeMRT(three, {getRenderTarget: () => node.renderTarget, getMRT: () => node._mrt, _device: renderer._device});
-  if (node.contextNode !== null)
-    fail('Native scene passes currently require ordinary context');
+  inspectThreeLightingContext(three, node.contextNode, 'PASS');
   if (renderer.xr?.isPresenting)
     fail('Native scene passes do not yet admit XR output');
   if (histories.length) {

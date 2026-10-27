@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms, hasThreeNodeProgram} from './three_node_program.mjs';
 import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
+import {inspectThreeLightingContext} from './three_node_passes.mjs';
 const N = THREE.TSL;
 function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
@@ -26,6 +27,93 @@ function rig(t, options = {}) {
     compile: () => owner.compile(material, object, context)};
 }
 const floats = packets => packets.flatMap(bytes => Array.from(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)));
+
+for (const Class of [THREE.MeshLambertNodeMaterial, THREE.MeshPhongNodeMaterial,
+  THREE.MeshStandardNodeMaterial, THREE.MeshPhysicalNodeMaterial, THREE.MeshStandardMaterial]) {
+  for (const transparent of [false, true]) test(`${Class.name} retains source GI/AO context composition with transparent=${transparent}`, t => {
+    const f = rig(t), material = new Class({transparent}); f.object.material = material;
+    const ao = N.uniform(.375).setName('contextOcclusion'), gi = N.uniform(new THREE.Vector3(.25, .5, .75)).setName('contextIrradiance');
+    f.renderer.contextNode = N.builtinGIContext(ao, gi);
+    if (material.isNodeMaterial) material.aoNode = N.uniform(.625).setName('materialOcclusion');
+    const context = {...f.context, material};
+    const descriptor = f.owner.compile(material, f.object, context);
+    const source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    source.scene = f.scene; source.camera = f.camera; source.lightsNode = N.lights([]); source.build();
+    const canonical = shader => shader.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+    assert.equal(canonical(descriptor.vertex), canonical(source.vertexShader));
+    assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
+    assert.equal(descriptor.fragment.includes('contextIrradiance'), !transparent);
+    assert.equal(descriptor.fragment.includes('contextOcclusion'), !transparent);
+    const first = f.owner.capture(descriptor, context), saved = first.map(bytes => bytes.slice());
+    ao.value = .875; gi.value.set(.125, .625, .875);
+    assert.equal(f.owner.compile(material, f.object, context), descriptor, 'live context inputs retain the shader');
+    const second = f.owner.capture(descriptor, {...context, renderId: 2});
+    assert.deepEqual(first, saved, 'accepted context uniforms remain immutable');
+    if (!transparent) {
+      assert.ok(floats(first).includes(.375)); assert.ok(floats(second).includes(.875));
+    }
+  });
+}
+
+test('lighting context admission never evaluates hooks and rejects structural changes before updates', t => {
+  const f = rig(t); let builds = 0, updates = 0;
+  const material = new THREE.MeshStandardNodeMaterial(); f.object.material = material;
+  const ao = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  const hook = () => { builds++; return ao; };
+  f.renderer.contextNode = N.context({getAO: hook});
+  const context = {...f.context, material};
+  f.owner.inspect(material, f.object, context); assert.equal(builds, 0);
+  let descriptor = f.owner.compile(material, f.object, context);
+  assert.ok(builds > 0); const built = builds;
+  f.owner.capture(descriptor, context); assert.equal(builds, built); assert.equal(updates, 1);
+  for (const change of [
+    () => { f.renderer.contextNode.value.getAO = () => ao.mul(.5); },
+    () => { f.renderer.contextNode.needsUpdate = true; },
+    () => { f.renderer.contextNode = N.builtinAOContext(ao); },
+  ]) {
+    change(); const previousUpdates = updates;
+    assert.throws(() => f.owner.capture(descriptor, {...context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+    assert.equal(updates, previousUpdates);
+    const next = f.owner.compile(material, f.object, context); assert.notEqual(next, descriptor); descriptor = next;
+  }
+});
+
+test('lighting contexts retain nested source precedence and reject arbitrary context traversal', t => {
+  const f = rig(t), ao = N.uniform(.5);
+  const nested = N.builtinAOContext(ao, N.builtinGIContext(ao, N.vec3(.25)));
+  assert.notEqual(inspectThreeLightingContext(THREE, nested), null);
+  assert.equal(inspectThreeLightingContext(THREE, N.context()), null);
+  assert.equal(inspectThreeLightingContext(THREE, N.context(N.context())), null);
+  for (const context of [N.context({getUV: () => N.uv()}), N.context({getAO: ao}),
+    N.builtinAOContext(ao, N.float(1)), N.context(Object.defineProperty({}, 'getAO', {get() { assert.fail('accessor evaluated'); }}))])
+    assert.throws(() => inspectThreeLightingContext(THREE, context), {code: 'THREE_NODE_PROGRAM_GRAPH'});
+  const cycle = N.context(); cycle.node = cycle;
+  assert.throws(() => inspectThreeLightingContext(THREE, cycle), {code: 'THREE_NODE_PROGRAM_GRAPH'});
+  f.renderer.contextNode = N.context(); const descriptor = f.compile();
+  f.renderer.contextNode = N.context(); assert.equal(f.compile(), descriptor, 'neutral source contexts share the graph');
+});
+
+test('material lighting context overrides the source renderer hook without replacing either context', t => {
+  const f = rig(t), material = new THREE.MeshStandardNodeMaterial(); f.object.material = material;
+  const rendererContext = N.builtinAOContext(N.uniform(.25).setName('rendererAO'));
+  const materialContext = N.builtinAOContext(N.uniform(.75).setName('materialAOOverride'));
+  f.renderer.contextNode = rendererContext; material.contextNode = materialContext;
+  const descriptor = f.owner.compile(material, f.object, {...f.context, material});
+  assert.match(descriptor.fragment, /materialAOOverride/); assert.doesNotMatch(descriptor.fragment, /rendererAO/);
+  assert.equal(f.renderer.contextNode, rendererContext); assert.equal(material.contextNode, materialContext);
+});
+
+for (const Class of [THREE.MeshBasicMaterial, THREE.MeshBasicNodeMaterial]) test(`${Class.name} retains source AO context modulation`, t => {
+  const f = rig(t), material = new Class(); f.object.material = material;
+  f.renderer.contextNode = N.builtinAOContext(N.uniform(.375).setName('basicContextAO'));
+  const descriptor = f.owner.compile(material, f.object, {...f.context, material});
+  const source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.lightsNode = N.lights([]); source.build();
+  assert.equal(descriptor.fragment, source.fragmentShader);
+  assert.match(descriptor.fragment, /basicContextAO/);
+  assert.ok(floats(f.owner.capture(descriptor, {...f.context, material})).includes(.375));
+});
+
 function clippingPlanes(descriptor, packets, count) {
   const match = new RegExp(`struct (NodeBuffer_\\d+)Struct \\{\\s*value : array< vec4<f32>, ${count} >`).exec(descriptor.fragment);
   assert.ok(match, 'the retained source clipping uniform array exists');
