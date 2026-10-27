@@ -109,8 +109,8 @@ function member(node, object, property, computed) {
  * not reset it. The counter is private Wasm state, reset by the entry prologue.
  * Calls from predicates, initializers and final returns share the same budget.
  * generalControl opts into ABI v8 and implies both checkedIndexing and
- * structuredLoops. It admits for/while/do-while anywhere in closed numeric
- * control flow, including scalar-only functions, dynamic ranges/steps and
+ * structuredLoops. It admits straight-line numeric bodies and for/while/do-while
+ * anywhere in closed numeric control flow, including scalar-only functions, dynamic ranges/steps and
  * loop-variable assignments. ALL loop bodies share maxIterations credits.
  * Tests, updates, lexical scopes and abrupt completion keep source ordering.
  * No synthetic array bound, index truncation, source unrolling or partial result
@@ -783,9 +783,9 @@ export function compileNumericKernel(source, {
   }
   const result = resultNode ? expression(resultNode.argument) : [];
   arrayReferences.finish();
-  // A selected root may delegate all iteration to reachable closed helpers.
-  // Inspect the final result too: its helper call can contain the only loop.
-  if (generalControl && !controlLoops.length) fail('General control requires at least one loop', fn.body);
+  // Straight-line bodies use the same checked reads, ordered writes and numeric
+  // output rules. Their manifest has zero loops and zero nesting depth; no
+  // synthetic iteration or relaxed object/property admission is introduced.
   if (writes.size === 0 && !resultNode) fail('Kernel must produce an array output or numeric return', loop.body);
   for (const name of minimumLengths.keys()) {
     if (writes.has(name)) fail('Uniform reads must not depend on an array written by the loop', loop.body);

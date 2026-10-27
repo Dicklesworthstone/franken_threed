@@ -29,6 +29,44 @@ function compare(fn, kernel, args) {
 }
 const types = ArrayType => ArrayType === Float32Array ? 'f32[]' : 'f64[]';
 
+test('straight-line scalar branches and helpers execute without fabricated source loops', () => {
+  function f(x, y) { if (x < 0) return x * y; return add(x, y); }
+  const artifact = compile(f, ['f64', 'f64'], {helperSources:new Map([['add','function add(x,y){return x+y;}']])});
+  assert.equal(artifact.manifest.loopCount, 0); assert.equal(artifact.manifest.maxLoopDepth, 0);
+  const kernel = runtime(artifact);
+  for (const [x,y] of [[-2,3],[0,-0],[1,Number.MIN_VALUE],[Infinity,-Infinity],[NaN,1]]) {
+    assert.equal(kernel.run(x,y), x < 0 ? x * y : x + y);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls, 5);
+  for (const mutation of [m=>{m.loopCount=1;},m=>{m.maxLoopDepth=1;},m=>{m.loopCount=-1;}])
+    assert.throws(()=>runtime({wasm:changeManifest(artifact,mutation)}),{code:'KERNEL_ABI_MISMATCH'});
+});
+
+test('straight-line checked array writes preserve f32 storage and same-buffer source order', () => {
+  function f(out,input,offset) { const x=input[0]; out[0]=x/7; out[1]=out[0]+offset; return out[1]; }
+  for (const ArrayType of [Float32Array,Float64Array]) {
+    const artifact=compile(f,[types(ArrayType),types(ArrayType),'f64']);
+    assert.equal(artifact.manifest.loopCount,0);
+    const kernel=runtime(artifact,{preserveAliasing:true});
+    const actual=new ArrayType([1,2,3]),expected=actual.slice();
+    assert.equal(kernel.run(actual,actual,1/3),f(expected,expected,1/3));
+    assert.deepEqual(actual,expected);assert.equal(kernel.diagnostics.wasmCalls,1);
+  }
+});
+
+test('straight-line guard failure publishes no writes before the original function resumes', () => {
+  function f(out,input) { out[0]+=1; out[1]=input[2]; }
+  let calls=0;const kernel=runtime(compile(f,['f64[]','f64[]']),{fallback(...args){calls++;return f(...args);}});
+  const actual=new Float64Array([3,4]),expected=actual.slice(),input=new Float64Array([9]);
+  kernel.run(actual,input);f(expected,input);
+  assert.deepEqual(actual,expected);assert.equal(calls,1);assert.equal(actual[0],4);
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,1);
+  assert.throws(()=>compile('function f(out,object){out[0]=object.x;}', ['f64[]','f64']));
+  assert.throws(()=>compile('function f(out){out[0]=external();}', ['f64[]']));
+  assert.throws(()=>compile('function f(x){const y=x+1;}', ['f64']));
+});
+
+
 for (const ArrayType of [Float32Array, Float64Array]) {
   test(`${ArrayType.name}: dynamic ranges and steps execute partial records without divisibility guesses`, () => {
     function update(out, input, start, end, step) {

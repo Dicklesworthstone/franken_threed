@@ -137,9 +137,10 @@ function indexedManifest(manifest) {
       (generalControl ?
         manifest.controlSemantics !== 'budgeted-source-order-v1' || manifest.loops !== undefined ||
         !Number.isInteger(manifest.maxIterations) || manifest.maxIterations < 1 || manifest.maxIterations > 1000000000 ||
-        !Number.isInteger(manifest.loopCount) || manifest.loopCount < 1 || manifest.loopCount > 64 ||
-        !Number.isInteger(manifest.maxLoopDepth) || manifest.maxLoopDepth < 1 ||
-        manifest.maxLoopDepth > 8 || manifest.maxLoopDepth > manifest.loopCount
+        !Number.isInteger(manifest.loopCount) || manifest.loopCount < 0 || manifest.loopCount > 64 ||
+        !Number.isInteger(manifest.maxLoopDepth) || manifest.maxLoopDepth < 0 ||
+        manifest.maxLoopDepth > 8 || manifest.maxLoopDepth > manifest.loopCount ||
+        ((manifest.loopCount === 0) !== (manifest.maxLoopDepth === 0))
       : !Array.isArray(manifest.loops) || !manifest.loops.length || manifest.loops.length > 16 ||
         manifest.loops.some(pass => !pass || !arrays.includes(pass.boundParameter) ||
           !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16)) ||
