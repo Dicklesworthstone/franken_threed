@@ -245,6 +245,22 @@ for (const [label, main, code] of [
     assert.equal(fs.existsSync(f.output), false);
   });
 
+test("computed qualified worker constructors retain the normal build in document and worker realms", () => {
+  for (const constructor of ['globalThis["Worker"]', 'self[`Worker`]',
+    'globalThis["SharedWorker"]', 'self[`SharedWorker`]']) {
+    const source = `new ${constructor}('./child.js');`;
+    for (const kind of [null, "module", "classic"]) {
+      const f = kind === null ? fixture({}, source) : fixture(
+        { "worker.mjs": source },
+        `new Worker('./worker.mjs', {type:${JSON.stringify(kind)}});`,
+      );
+      assert.throws(() => f.pack(), { code: "WORKER_BINDING" },
+        `${constructor} in ${kind ?? "document"} code must not omit its worker dependency`);
+      assert.equal(fs.existsSync(f.output), false);
+    }
+  }
+});
+
 for (const [label, files, code] of [
   [
     "module cycle",

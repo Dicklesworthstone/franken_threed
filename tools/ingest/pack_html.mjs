@@ -875,7 +875,7 @@ export function packHtml(
         if (workerURLs.has(node) || workerSites.includes(node)) return;
         if (
           node.callee.type === "MemberExpression" &&
-          ["Worker", "SharedWorker"].includes(node.callee.property.name)
+          ["Worker", "SharedWorker"].includes(node.callee.property.name ?? literal(node.callee.property))
         )
           fail("WORKER_BINDING", "Qualified worker constructors require the normal build");
         if (
