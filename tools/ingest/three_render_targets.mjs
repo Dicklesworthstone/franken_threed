@@ -24,7 +24,8 @@
  * Their allocation mip count stays fixed until the source texture version
  * changes; CubeCamera's temporary generation flag cannot replace prior faces.
  * Explicit face-aware transfers, readbacks and six-layer sampling share this
- * owner. Source cube resize remains unsupported.
+ * owner. Cube allocation extents follow the source face descriptors even when
+ * setSize() changes only the logical target and viewport dimensions.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * Source FloatType R/RG/RGBA attachments retain full precision through storage,
@@ -54,12 +55,19 @@ const fail = (code, message) => { throw new ThreeRenderTargetError(code, message
 const positive = n => Number.isSafeInteger(n) && n > 0;
 const extent = n => Number.isSafeInteger(n) && n >= 0;
 
-function inspectCubeFaces(texture, target, kind) {
+function inspectCubeFaces(texture, kind) {
   const faces = texture.image;
   if (!Array.isArray(faces) || faces.length !== 6)
     fail('SOURCE', `Expected six source cube ${kind} face descriptors`);
-  if (faces.some(face => face?.width !== target.width || face?.height !== target.height || (face?.depth ?? 1) !== 1))
-    fail('UNSUPPORTED', 'Cube target face extents must match the target; source cube resizing is not admitted');
+  const width = faces[0]?.width, height = faces[0]?.height;
+  if (!extent(width) || !extent(height) || (width || 1) !== (height || 1) ||
+      faces.some(face => face?.width !== width || face?.height !== height || (face?.depth ?? 1) !== 1))
+    fail('SIZE', 'Cube target face descriptors must have consistent square extents');
+  // RenderTarget.setSize writes width/height onto the image array itself, not
+  // its six elements. Pinned Textures.getSize reads images[0], so a resized
+  // target keeps that face's storage extent and mip count. Its viewport stays
+  // source-owned and can be smaller or larger than the attachment.
+  return {width: width || 1, height: height || 1};
 }
 
 function depthComparison(texture, three) {
@@ -76,12 +84,12 @@ function depthComparison(texture, three) {
 function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const cube = target.isCubeRenderTarget === true;
-  if (!extent(target.width) || !extent(target.height) || cube && (!target.width || !target.height))
-    fail('SIZE', 'Target dimensions must be non-negative integers, or positive integers for cubes');
+  if (!extent(target.width) || !extent(target.height))
+    fail('SIZE', 'Target dimensions must be non-negative integers');
   // Source Textures.getSize allocates one texel for a zero image dimension.
   // Keep the logical target/viewport unchanged: Bloom's final small-image mip
   // can have a zero viewport, while its cleared backing texture is still sampled.
-  const width = target.width || 1, height = target.height || 1;
+  let width = target.width || 1, height = target.height || 1;
   if (target.isWebGLCubeRenderTarget || target.depth !== 1 || target.multiview)
     fail('UNSUPPORTED', 'Only 2D or native cube render targets are admitted');
   if (cube && (typeof three.CubeRenderTarget !== 'function' || !(target instanceof three.CubeRenderTarget)))
@@ -95,10 +103,9 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     if (typeof three.CubeTexture !== 'function' || !(texture instanceof three.CubeTexture) || texture.isCubeTexture !== true ||
         texture.renderTarget != null && texture.renderTarget !== target)
       fail('SOURCE', 'Expected the source cube target color texture');
-    if (target.width !== target.height) fail('SIZE', 'Cube target faces must be square');
     if (![0, 1].includes(target.samples) || target.stencilBuffer || target.useArrayDepthTexture)
       fail('UNSUPPORTED', 'Native cube targets require one sample and no stencil or array depth');
-    inspectCubeFaces(texture, target, 'color');
+    ({width, height} = inspectCubeFaces(texture, 'color'));
   } else if (texture.isCubeTexture || texture.renderTarget !== target)
     fail('SOURCE', 'Expected the target-owned 2D color texture');
   if (target.stencilBuffer && !target.depthBuffer)
@@ -133,7 +140,9 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       if (typeof three.CubeDepthTexture !== 'function' || !(depthTexture instanceof three.CubeDepthTexture) ||
           depthTexture.isCubeDepthTexture !== true || depthTexture.isCubeTexture !== true || depthTexture.mapping !== three.CubeReflectionMapping)
         fail('SOURCE', 'Cube targets require an attached source CubeDepthTexture');
-      inspectCubeFaces(depthTexture, target, 'depth');
+      const depthSize = inspectCubeFaces(depthTexture, 'depth');
+      if (depthSize.width !== width || depthSize.height !== height)
+        fail('SIZE', 'Cube depth and color face extents must match');
     }
     const combined = three.DepthStencilFormat !== undefined && depthTexture.format === three.DepthStencilFormat;
     if (cube && combined) fail('UNSUPPORTED', 'Cube depth/stencil sampling is not admitted');
@@ -185,7 +194,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     cube, layers, viewDimension: cube ? 'cube' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
     depthTexture, depthSampleBytes: depthTexture ? width * height * 4 * layers : 0,
-    key: `${cube ? 'cube/' : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
+    key: `${cube ? `cube/${width}/${height}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
@@ -768,8 +777,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (typeof run !== 'function' || !positive(width) || !positive(height)) fail('OPTIONS', 'Expected a source target resize and synchronous callback');
     if (!target || target.width === width && target.height === height) return run();
     if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
-    if (inspectThreeRenderTarget(target, three).cube)
-      fail('UNSUPPORTED', 'Source cube shadow resizing is not admitted; create a new shadow target at the required size');
+    inspectThreeRenderTarget(target, three);
     nativeResizes.set(target, {width, height, depth: target.depth, event: null, shape: null});
     try { return run(); } finally { nativeResizes.delete(target); }
   }

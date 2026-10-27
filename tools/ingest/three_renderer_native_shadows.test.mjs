@@ -174,7 +174,7 @@ test('failed first renderAsync preserves accepted point faces before rejecting i
   assert.equal(f.scene.overrideMaterial, null); assert.equal(f.renderer.getRenderObjectFunction(), null);
 });
 
-test('point mapSize edits stay dormant on source update skips and reject only an actual resize', async t => {
+test('point mapSize edits stay dormant on source update skips and resize at the next requested refresh', async t => {
   const f = pointFixture(t), faces = [];
   f.caster.onBeforeShadow = () => faces.push(f.renderer.getActiveCubeFace());
   await f.renderer.compileAsync(f.scene, f.camera);
@@ -190,13 +190,38 @@ test('point mapSize edits stay dormant on source update skips and reject only an
   assert.equal(f.renderer.info.f3d.presentedRenders, 3);
   f.light.shadow.needsUpdate = true;
   f.renderer._nodes.nodeFrame.update();
-  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_TARGET_UNSUPPORTED'});
-  assert.equal(map.width, 16); assert.equal(faces.length, 6);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(map.width, 32); assert.equal(faces.length, 12);
+  assert.equal(map.texture.image[0].width, 16, 'r186 changes the viewport but retains its original cube face allocation extent');
+  assert.ok(targetPasses(f.device, 16, 16).slice(-6).every(pass => pass.viewport?.[2] === 32));
+  assert.equal(f.light.shadow.needsUpdate, false);
   assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
   f.light.shadow.mapSize.set(16, 16);
+  f.light.shadow.needsUpdate = true; f.renderer._nodes.nodeFrame.update();
   f.renderer.render(f.scene, f.camera); await drain(f.renderer);
-  assert.equal(faces.length, 12, 'restoring a supported size allows the still-requested explicit refresh');
+  assert.equal(faces.length, 18);
   assert.equal(f.light.shadow.needsUpdate, false);
+});
+
+test('queued point-shadow resizes preserve the six-face generation sampled by each parent draw', async t => {
+  const f = pointFixture(t); await f.renderer.compileAsync(f.scene, f.camera);
+  for (const size of [16, 32, 8]) {
+    f.light.shadow.mapSize.set(size, size); f.renderer._nodes.nodeFrame.update();
+    f.renderer.render(f.scene, f.camera);
+  }
+  await drain(f.renderer);
+  const parents = receiverDraws(f.device), passes = targetPasses(f.device, 16, 16).filter(pass => pass.draws.length);
+  assert.equal(parents.length, 3); assert.equal(passes.length, 18);
+  const depths = [0, 6, 12].map(index => passes[index].desc.depthStencilAttachment.view.texture);
+  assert.equal(new Set(depths).size, 3);
+  for (let frame = 0; frame < 3; frame++) {
+    const owned = passes.slice(frame * 6, frame * 6 + 6);
+    assert.ok(owned.every(pass => pass.desc.depthStencilAttachment.view.texture === depths[frame]));
+    assert.ok(textureResources(parents[frame]).some(view => view.texture === depths[frame]));
+    assert.ok(owned.every(pass => (pass.viewport?.[2] ?? depths[frame].width) === [16, 32, 8][frame]));
+  }
+  assert.equal(f.light.shadow.map.width, 8); assert.equal(f.light.shadow.map.texture.image[0].width, 16);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 for (const type of [T.BasicShadowMap, T.PCFShadowMap]) {

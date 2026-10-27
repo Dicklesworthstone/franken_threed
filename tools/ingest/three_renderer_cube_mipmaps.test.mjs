@@ -111,6 +111,23 @@ test('native cube samplers retain explicit LODs with ordinary linear or nearest 
   }
 });
 
+for (const size of [4, 16]) test(`CubeCamera resize to ${size} preserves source physical face extents and allocated mip levels`, async t => {
+  const f = fixture(t), target = cube(t), p = producer(t, target); await f.renderer.init();
+  f.renderer.initRenderTarget(target); p.camera.update(f.renderer, p.scene); await f.renderer.waitForGPU();
+  const first = f.renderer._targets.capture(target), faces = target.texture.image;
+  target.setSize(size, size); f.renderer.initRenderTarget(target);
+  const resized = f.renderer._targets.capture(target);
+  assert.notEqual(resized, first); assert.equal(first.alive, false);
+  assert.deepEqual([target.width, target.height, target.viewport.z, target.viewport.w], [size, size, size, size]);
+  assert.equal(target.texture.image, faces); assert.ok(faces.every(face => face.width === 8 && face.height === 8));
+  assert.deepEqual([resized.shape.width, resized.shape.height, resized.shape.mipLevelCount], [8, 8, 4]);
+  p.camera.update(f.renderer, p.scene); await f.renderer.waitForGPU();
+  assert.equal(resized.storage.diagnostics.mipGenerations, 1);
+  assert.equal(resized.storage.allocatedBytes, 4080);
+  assert.ok(f.device.textures.filter(texture => texture.depthOrArrayLayers === 6).every(texture => texture.width === 8));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('authored cube levels remain intact and a new texture version selects a fresh allocation policy', async t => {
   const f = fixture(t), target = cube(t, {generateMipmaps: false}), p = producer(t, target);
   target.texture.mipmaps = [{}, {}, {}]; await f.renderer.init();

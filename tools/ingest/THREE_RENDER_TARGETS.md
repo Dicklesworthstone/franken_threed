@@ -195,10 +195,18 @@ renders. A selected nonzero mip acquires a matching private six-face depth image
 charged once to the shared budget and reused on subsequent face draws. Targets
 with an attached sampled `CubeDepthTexture` retain the existing base-level render
 restriction. Public source-shaped pixel reads still select mip zero; the explicit
-mip readback extension above selects higher levels. Plain source cube resizing
-remains outside the profile. Pinned
-`RenderTarget.setSize()` does not update the six cube face descriptors; applications
-can construct a cube target at the required size.
+mip readback extension above selects higher levels.
+
+Cube resizing preserves the pinned source's distinction between logical and
+physical dimensions. `RenderTarget.setSize()` updates the target and viewport,
+but leaves all six face descriptors unchanged. Native allocation and mip counts
+continue to follow those descriptors, as pinned `Textures.getSize()` does; a
+smaller viewport renders into part of the face and a larger one clips to the
+attachment. Construct a new cube target when a different physical resolution is
+required. Dynamic point-shadow `mapSize` updates follow the same source behavior.
+Their recognized source resize preserves earlier queued six-face generations and
+charges each until its final consumer completes. Public `setSize()` and
+`dispose()` still invalidate pending uses of their replaced residency.
 
 ### Automatic cube mip generation
 

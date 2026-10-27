@@ -76,7 +76,7 @@ test('unsupported source cube profiles are rejected before storage or source des
     target => { target.samples = 4; },
     target => { target.texture.mipmaps = [{}, {}, {}, {}]; },
     target => { target.texture.type = THREE.HalfFloatType; target.texture.colorSpace = THREE.SRGBColorSpace; },
-    target => { target.width = 4; },
+    target => { target.texture.image[0].width = 4; },
     target => { target.stencilBuffer = true; },
     target => { target.depthTexture = new THREE.DepthTexture(8, 8); },
     target => { target.depthTexture.format = THREE.DepthStencilFormat; target.depthTexture.type = THREE.UnsignedInt248Type; },
@@ -103,19 +103,24 @@ test('six-layer source cost is enforced before grouped native allocations', () =
   assert.equal(limited.calls.textures.length, 0); limited.owner.dispose();
 });
 
-test('source cube resize refusal preserves accepted storage; public resize invalidates it', () => {
+test('recognized cube resize preserves queued storage at source face extents; public resize invalidates it', () => {
   const f = fixture(), target = cube(), entry = f.owner.capture(target), release = f.owner.retainGeneration(entry);
   f.owner.render(entry, () => {}, {face: 5});
-  let ran = false;
-  assert.throws(() => f.owner.withNativeShadowResize(target, 16, 16, () => {
-    ran = true; target.setSize(16, 16);
-  }), {code: 'THREE_TARGET_UNSUPPORTED'});
-  assert.equal(ran, false); assert.equal(target.width, 8); assert.equal(entry.alive, true);
-  f.owner.render(entry, () => {}, {face: 0});
-  target.setSize(16, 16);
+  f.owner.withNativeShadowResize(target, 16, 16, () => target.setSize(16, 16));
+  assert.equal(target.width, 16); assert.equal(entry.alive, true);
   assert.equal(target.texture.image[0].width, 8, 'the pinned source retains its original face descriptors');
+  assert.equal(target.texture.image.width, 16, 'the array-level logical dimension remains source-owned');
+  const next = f.owner.capture(target);
+  assert.notEqual(next, entry); assert.deepEqual([next.shape.width, next.shape.height], [8, 8]);
+  assert.equal(next.shape.bytes, entry.shape.bytes);
+  f.owner.render(entry, () => {}, {face: 0});
+  f.owner.render(next, () => {}, {face: 1});
+  assert.equal(f.owner.allocatedBytes, entry.shape.bytes * 2, 'retained cube generations charge all six color and depth faces');
+  target.setSize(4, 4);
   assert.throws(() => f.owner.assertCurrent(entry), {code: 'THREE_TARGET_STALE'});
-  assert.throws(() => f.owner.capture(target), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.throws(() => f.owner.assertCurrent(next), {code: 'THREE_TARGET_STALE'});
+  const current = f.owner.capture(target);
+  assert.deepEqual([current.shape.width, current.shape.height], [8, 8]);
   release(); f.owner.dispose();
 });
 
