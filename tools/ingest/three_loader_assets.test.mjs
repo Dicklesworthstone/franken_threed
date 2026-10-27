@@ -266,12 +266,12 @@ test("configured source codec bytes and glTF sidecars retain document paths thro
       "modules/app.mjs": `import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
       import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
       import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
-      ${prepareStandaloneLoaders ? "" : `import { MeshoptDecoder } from ${JSON.stringify(rootUrl + "examples/jsm/libs/meshopt_decoder.module.js")};`}
+      import { MeshoptDecoder } from ${JSON.stringify(rootUrl + "examples/jsm/libs/meshopt_decoder.module.js")};
       export async function load(renderer) {
         const draco = new DRACOLoader().setDecoderPath('${prefix}codecs/draco/').setDecoderConfig({type:'js'});
         const ktx = new KTX2Loader(); ktx.setTranscoderPath('${prefix}codecs/basis/'); ktx.detectSupport(renderer);
         const loader = new GLTFLoader(); loader.setDRACOLoader(draco); loader.setKTX2Loader(ktx);
-        ${prepareStandaloneLoaders ? "" : "loader.setMeshoptDecoder(MeshoptDecoder);"}
+        loader.setMeshoptDecoder(MeshoptDecoder);
         loader.setPath('${prefix}models/').setResourcePath('${prefix}shared/');
         return loader.loadAsync('scene.gltf');
       }`,

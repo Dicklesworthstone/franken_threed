@@ -109,7 +109,7 @@ of the final HTML size check. Open URL expressions, opaque host mutation,
 location reflection and document classic-script Worker construction remain
 outside this standalone route.
 
-## Retained Draco and KTX2 loader workers
+## Retained Draco, KTX2 and Meshopt workers
 
 Application builds retain finite glTF model and sidecar discovery through
 `setDRACOLoader`, `setKTX2Loader` and `setMeshoptDecoder`. Authored finite Draco
@@ -119,13 +119,18 @@ defaults keep their existing `new URL(..., import.meta.url)` closure. Unproved
 managers, escaping receivers and dynamic resource paths retain the host route.
 
 With `prepareStandaloneLoaders`, the existing embedded resource resolver also
-supports the retained Draco and KTX2 Blob workers. Exact pinned source-module
+supports the retained Draco, KTX2 and Meshopt Blob workers. Exact pinned source-module
 hashes identify their constructor sites before bundling. A small host function
 forwards the original native Worker constructor and its arguments; the source
-still creates the Blob payload, transfers Wasm bytes, schedules decoding,
+still creates the Blob payload, supplies the original Wasm bytes, schedules decoding,
 maintains its worker pool and disposes workers and Blob URLs. The packer admits
 that exact generated helper body. A matching filename or export name does not
 admit a changed helper or arbitrary application Worker URL.
+
+The Meshopt decoder keeps its embedded Wasm and source `useWorkers()` behavior.
+Ordinary decoding and explicit worker pools share the same retained decoder;
+worker reuse, transferred input/output buffers and shutdown stay source-owned.
+No external Meshopt decoder-path mapping or alternate decoder is introduced.
 
 Document-module Worker and URL checks use lexical bindings, so GLTFLoader's
 unrelated local `URL` alias does not shadow a module-level codec asset URL.
@@ -138,6 +143,15 @@ HTML ran after its source and emitted directories were made unavailable, using
 three native Blob workers, zero application HTTP requests and no page errors.
 This establishes that source decoder path; it does not replace the retained
 loader or establish a decoder speedup.
+
+An offline Meshopt check compared main-thread decoding and six real worker
+decodes against the existing 48-byte golden output. The source GLTFLoader also
+loaded an `EXT_meshopt_compression` / `KHR_mesh_quantization` model with four
+points and identical backing bytes. Pool growth, reuse, shrinking and
+`useWorkers(0)` shutdown created two native Blob workers in total; both closed,
+and main-thread decoding still worked afterward. With source and build trees
+unavailable, the packed application made no HTTP requests and reported no page
+or console errors.
 
 ## Validation and boundaries
 

@@ -10,6 +10,7 @@ import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
 import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
+import { vertex, vertexExpected } from "../../tests/fixtures/meshopt/vectors.mjs";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
 const gltf = new URL("../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js", import.meta.url);
@@ -77,7 +78,7 @@ async function execute(html) {
   } finally { clearTimeout(timer); await worker.terminate(); }
 }
 
-test("packed source loaders preserve async callbacks, logical manager URLs, cube faces and glTF sidecars without files or HTTP", async () => {
+test("packed source loaders and Meshopt preserve callbacks, manager URLs and decoded data without files or HTTP", async () => {
   const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
   const model = JSON.stringify({ asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }],
     nodes: [{ mesh: 0 }], meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
@@ -88,6 +89,7 @@ test("packed source loaders preserve async callbacks, logical manager URLs, cube
     "index.html": '<script type="module" src="app.mjs"></script>',
     "app.mjs": `import * as THREE from ${JSON.stringify(core.href)};
       import {GLTFLoader} from ${JSON.stringify(gltf.href)}; export {THREE};
+      import {MeshoptDecoder} from ${JSON.stringify(new URL("../../upstream/three.js/examples/jsm/libs/meshopt_decoder.module.js", import.meta.url).href)};
       export async function run(){
         const sequence=[], loader=new THREE.FileLoader().setPath('resources/');
         const first=loader.loadAsync('message%20%23.txt?version=1#text').then(value=>{sequence.push('loaded');return value;});
@@ -99,8 +101,9 @@ test("packed source loaders preserve async callbacks, logical manager URLs, cube
         const bitmap=await new THREE.ImageBitmapLoader().loadAsync('faces/px.png');
         const loaded=await new GLTFLoader().setPath('models/').setResourcePath('shared/').loadAsync('triangle.gltf');
         const raw=await new THREE.FileLoader().loadAsync('models/triangle.gltf');
+        const meshopt=await MeshoptDecoder.decodeGltfBufferAsync(4,12,new Uint8Array(${JSON.stringify([...vertex])}),'ATTRIBUTES');
         return {text,duplicate,sequence,cube:cube.images.length,distinctFaces:new Set(cube.images).size,
-          bitmap:bitmap.byteLength,positions:[...loaded.scene.children[0].geometry.attributes.position.array],raw};
+          bitmap:bitmap.byteLength,positions:[...loaded.scene.children[0].geometry.attributes.position.array],raw,meshopt:[...meshopt]};
       }`,
     "resources/message #.txt": "original file bytes",
     "models/triangle.gltf": model,
@@ -116,7 +119,8 @@ test("packed source loaders preserve async callbacks, logical manager URLs, cube
   const result = await execute(html);
   assert.equal(result.ok, true, result.error);
   assert.deepEqual(result.result, { text: "original file bytes", duplicate: "original file bytes",
-    sequence: ["returned", "loaded"], cube: 6, distinctFaces: 6, bitmap: pixel.length, positions: [...positions], raw: model });
+    sequence: ["returned", "loaded"], cube: 6, distinctFaces: 6, bitmap: pixel.length, positions: [...positions], raw: model,
+    meshopt: [...vertexExpected] });
   assert.equal(result.requests.length, 5, "parallel FileLoader duplicates still issue only one request");
   assert.equal(result.images.length, 6);
   assert.equal(new Set(result.images).size, 6, "separate source resources retain distinct embedded identities");
@@ -162,17 +166,21 @@ test("host-call transformation requires both pinned module identity and exact so
   assert.deepEqual(threeLoaderResourceEdits(shadowed, parse(shadowed, { ecmaVersion: "latest", sourceType: "module" }), core.href), []);
 });
 
-test("only exact pinned Draco and KTX2 source constructors gain the native worker host hook", () => {
-  for (const name of ["DRACOLoader", "KTX2Loader"]) {
-    const url = new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url);
+test("only exact pinned Draco, KTX2 and Meshopt source constructors gain the native worker host hook", () => {
+  for (const [file, argument, original] of [
+    ["loaders/DRACOLoader.js", "this.workerSourceURL", "new Worker( this.workerSourceURL )"],
+    ["loaders/KTX2Loader.js", "this.workerSourceURL", "new Worker( this.workerSourceURL )"],
+    ["libs/meshopt_decoder.module.js", "url", "new Worker(url)"],
+  ]) {
+    const url = new URL(`../../upstream/three.js/examples/jsm/${file}`, import.meta.url);
     const source = fs.readFileSync(url, "utf8"), ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
     const edits = threeLoaderResourceEdits(source, ast, url.href);
     const replacements = edits.filter(edit => edit.type === "replace");
     assert.equal(replacements.length, 1);
-    assert.equal(source.slice(replacements[0].pos, replacements[0].end), "new Worker( this.workerSourceURL )");
-    assert.equal(replacements[0].text, "__f3dCreateLoaderWorker(Worker, this.workerSourceURL)");
+    assert.equal(source.slice(replacements[0].pos, replacements[0].end), original);
+    assert.equal(replacements[0].text, `__f3dCreateLoaderWorker(Worker, ${argument})`);
     assert.match(edits.find(edit => edit.type === "insert").text, /createThreeLoaderWorker/);
-    assert.deepEqual(threeLoaderResourceEdits(source, ast, `file:///unrelated/${name}.js`), []);
+    assert.deepEqual(threeLoaderResourceEdits(source, ast, `file:///unrelated/${file}`), []);
     for (const changed of [source + "\n// custom module\n", "const Worker = globalThis.CustomWorker;\n" + source]) {
       assert.deepEqual(threeLoaderResourceEdits(changed, parse(changed, { ecmaVersion: "latest", sourceType: "module" }), url.href), []);
     }

@@ -26,8 +26,14 @@ const MODULES = new Map([
   ["src/loaders/ImageBitmapLoader.js", "466fc2172c6d1c8d4ee40dc041785a783e09bbef79c3017a945024b8d2166c30"],
   ["examples/jsm/loaders/DRACOLoader.js", "fdafdf4aa11bbc65d89adb338efd844bedf94073702f9049240ff1f1ea48ad5f"],
   ["examples/jsm/loaders/KTX2Loader.js", "3a3233ce3409443076d3414b78832e1405fcfac5ecb34d367365fd0781127d6c"],
+  ["examples/jsm/libs/meshopt_decoder.module.js", "d428e73a000057c6c94bfcedc3412d0c2dc14ca8800e88553aab05113ad2bf19"],
 ]);
 const CLASSES = new Set(["FileLoader", "ImageLoader", "ImageBitmapLoader"]);
+const WORKER_ARGUMENTS = new Map([
+  ["examples/jsm/loaders/DRACOLoader.js", "this.workerSourceURL"],
+  ["examples/jsm/loaders/KTX2Loader.js", "this.workerSourceURL"],
+  ["examples/jsm/libs/meshopt_decoder.module.js", "url"],
+]);
 const hash = value => createHash("sha256").update(value).digest("hex");
 
 /** Return focused AST edits; modified or foreign implementations are untouched. */
@@ -40,27 +46,26 @@ export function threeLoaderResourceEdits(source, ast, id, packageRootUrl) {
   const module = canonical(id);
   if (!module.startsWith(root) || hash(source) !== MODULES.get(module.slice(root.length))) return [];
   const edits = [], imports = new Set();
+  const workerArgument = WORKER_ARGUMENTS.get(module.slice(root.length));
+  if (workerArgument) {
+    const sites = [];
+    walk.simple(ast, {
+      NewExpression(value) {
+        if (value.callee.type === "Identifier" && value.callee.name === "Worker" &&
+            value.arguments.length === 1 &&
+            source.slice(value.arguments[0].start, value.arguments[0].end) === workerArgument) sites.push(value);
+      },
+    });
+    if (sites.length !== 1) throw new Error(`Pinned ${module.slice(root.length)} has an unexpected worker constructor shape`);
+    // Keep source-created Blobs, self-contained decoder payloads, transferred
+    // buffers, pools and disposal. Only native construction crosses this exact
+    // source boundary, before bundling erases module identity.
+    edits.push({ type: "replace", pos: sites[0].start, end: sites[0].end,
+      text: `${CREATE_WORKER}(Worker, ${workerArgument})`, priority: 2 });
+    imports.add(`createThreeLoaderWorker as ${CREATE_WORKER}`);
+  }
   for (const node of ast.body) {
     if (node.type !== "ClassDeclaration") continue;
-    if (["DRACOLoader", "KTX2Loader"].includes(node.id?.name)) {
-      const sites = [];
-      walk.simple(node.body, {
-        NewExpression(value) {
-          if (value.callee.type === "Identifier" && value.callee.name === "Worker" &&
-              value.arguments.length === 1 && value.arguments[0].type === "MemberExpression" &&
-              !value.arguments[0].computed && value.arguments[0].object.type === "ThisExpression" &&
-              value.arguments[0].property.name === "workerSourceURL") sites.push(value);
-        },
-      });
-      if (sites.length !== 1) throw new Error(`Pinned ${node.id.name} has an unexpected worker constructor shape`);
-      // Keep the source-created Blob, decoder payload, transferable Wasm bytes,
-      // worker pool and disposal. Only the native constructor crosses this
-      // source-verified host boundary, before bundling erases module identity.
-      edits.push({ type: "replace", pos: sites[0].start, end: sites[0].end,
-        text: `${CREATE_WORKER}(Worker, this.workerSourceURL)`, priority: 2 });
-      imports.add(`createThreeLoaderWorker as ${CREATE_WORKER}`);
-      continue;
-    }
     if (!CLASSES.has(node.id?.name)) continue;
     const load = node.body.body.find(method => method.key?.name === "load");
     const sites = [];
