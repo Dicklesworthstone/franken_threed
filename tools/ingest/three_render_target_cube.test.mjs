@@ -74,7 +74,6 @@ test('unsupported source cube profiles are rejected before storage or source des
   const f = fixture();
   for (const mutate of [
     target => { target.samples = 4; },
-    target => { target.texture.generateMipmaps = true; },
     target => { target.texture.mipmaps = [{}, {}, {}, {}]; },
     target => { target.texture.type = THREE.HalfFloatType; target.texture.colorSpace = THREE.SRGBColorSpace; },
     target => { target.width = 4; },
@@ -141,7 +140,7 @@ test('cube source transfers, color sampling and float depth replicas fail withou
 test('native cube preflight requires six layers, square faces and the complete six-face budget', () => {
   for (const options of [
     {maxBytes: 8 * 8 * 6 * 8 - 1}, {width: 8, height: 4}, {sampleCount: 4},
-    {generateMipmaps: true}, {mipLevelCount: 5}, {copyDestination: true},
+    {mipLevelCount: 5}, {copyDestination: true},
   ]) {
     const f = fixture(); assert.throws(() => native(f, options), error => /^GPU_TARGET_/.test(error.code));
     assert.equal(f.calls.textures.length, 0); f.owner.dispose();

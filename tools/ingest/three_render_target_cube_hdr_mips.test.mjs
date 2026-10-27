@@ -119,7 +119,7 @@ test('depth-free cube mips allocate only color and unsupported counts/depth comb
   for (const level of [-1, .5, 3])
     assert.throws(() => f.owner.render(entry, () => assert.fail(), {mipLevel: level, face: 0}), {code: 'THREE_TARGET_MIP'});
   assert.throws(() => f.owner.capture(cube(4, 4)), {code: 'THREE_TARGET_SIZE'});
-  assert.throws(() => f.owner.capture(cube(4, 3, {generateMipmaps: true})), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(f.owner.capture(cube(4, 3, {generateMipmaps: true})).shape.mipLevelCount, 3);
   const sampledDepth = cube(); sampledDepth.depthTexture = new T.CubeDepthTexture(4);
   const depthEntry = f.owner.capture(sampledDepth), count = f.calls.textures.length;
   assert.throws(() => f.owner.render(depthEntry, () => assert.fail(), {mipLevel: 1, face: 0}), {code: 'THREE_TARGET_MIP'});
@@ -136,11 +136,11 @@ test('float32 cube filtering remains feature-gated without lowering attachment p
   assert.equal(f.inputs.layout(source).texture.sampleType, 'float'); f.inputs.release(source);
 });
 
-test('source cube mip-count changes invalidate retained views before new storage is allocated', t => {
+test('versioned source cube mip-count changes invalidate retained views before new storage is allocated', t => {
   const f = fixture(t), target = cube(), entry = f.owner.capture(target);
   const held = f.inputs.captureBinding({texture: target.texture, isSampledTexture: true});
   f.owner.render(entry, () => {}, {mipLevel: 2, face: 1});
-  const old = f.calls.textures.slice(); target.texture.mipmaps.pop();
+  const old = f.calls.textures.slice(); target.texture.mipmaps.pop(); target.texture.needsUpdate = true;
   assert.throws(() => f.inputs.withDispatch([held], () => assert.fail()), {code: 'THREE_TARGET_STALE'});
   const replacement = f.owner.capture(target); assert.equal(replacement.shape.mipLevelCount, 2);
   assert.ok(old.every(texture => texture.destroyed === 1)); assert.equal(f.owner.allocatedBytes, 0);

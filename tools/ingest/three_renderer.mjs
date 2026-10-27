@@ -33,7 +33,7 @@
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
-import {createThreeRenderTargets, inspectThreeRenderTarget, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
+import {createThreeRenderTargets, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
@@ -527,7 +527,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (this._initialized === false && !this._deferUntilInitialized)
         throw new Error('THREE.Renderer: .clear() called before the backend is initialized. Use "await renderer.init();" before using this method.');
-      const targetShape = this._renderTarget ? inspectThreeRenderTarget(this._renderTarget, THREE) : null;
+      const targetShape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
       const hasDepth = targetShape ? targetShape.depthFormat !== null : this.depth;
       const hasStencil = targetShape ? targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
       if (!color && !(depth && hasDepth) && !(stencil && hasStencil)) return;
@@ -566,7 +566,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _framebufferFormat() {
       const internal = this._frameBufferTargets?.get(this._canvasTarget);
       if (internal && this._renderTarget === internal) this._nativeFramebufferOutput = true;
-      if (this._renderTarget) return inspectThreeRenderTarget(this._renderTarget, THREE).format;
+      if (this._renderTarget) return this._targets.capture(this._renderTarget).shape.format;
       // Refraction reads working-linear scene color before the final output
       // conversion. Sampling bytes copied from the sRGB presentation view
       // would apply that conversion twice. Select the existing linear scene
@@ -656,6 +656,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getOutputBufferType() { return this._outputBufferType; }
     getMRT() { return this._mrt; }
     setMRT(value) { this._mrt = value; return this; }
+    initRenderTarget(target) {
+      if (this._initialized === false)
+        throw new Error('THREE.Renderer: .initRenderTarget() called before the backend is initialized. Use "await renderer.init();" before using this method.');
+      this._targets.ensure(this._targets.capture(target, {initialize: true}));
+    }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
       if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
         fail('UNSUPPORTED', 'Nonzero target mips on the WebGL-authored route are not admitted');
@@ -687,7 +692,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     // ---- frames ----
     _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel) {
-      const targetShape = target ? inspectThreeRenderTarget(target, THREE) : null;
+      const targetShape = target ? this._targets.capture(target).shape : null;
       const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       if (!target && this.outputColorSpace !== SRGBColorSpace &&
@@ -818,7 +823,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
       const renderId = this.info.calls;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
-      const destination = target ? this._targets.capture(target) : this;
+      const destination = target ? this._targets.capture(target, {initialize: !this._shaderEncodedOutput}) : this;
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
       const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene, backgroundState);
       // RenderPass/normal/depth passes restore this property immediately after
@@ -872,6 +877,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       return {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, snapshot, matricesUpdated, nodeFrame, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
         nodeCaptureDeferred, captureCameras, backgroundState, materialFrame, renderId, sourceTarget,
+        generateCubeMipmaps: !this._shaderEncodedOutput && !clearOnly && target?.isCubeRenderTarget === true && target.texture.generateMipmaps,
         linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
         hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
         programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -1076,7 +1082,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, clearOnly, outputPass = false, initializeOutputDepth = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1101,7 +1107,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const firstDepth = outputPass && sourceTarget !== null && sourceDepth && !copiedDepth &&
               !this._targetDepthInitialized.has(destination);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer), {mipLevel, face});
+            this._targets.render(destination, (attachments, framebuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth) this._targetDepthInitialized.add(destination);

@@ -195,10 +195,55 @@ renders. A selected nonzero mip acquires a matching private six-face depth image
 charged once to the shared budget and reused on subsequent face draws. Targets
 with an attached sampled `CubeDepthTexture` retain the existing base-level render
 restriction. Public source-shaped pixel reads still select mip zero; the explicit
-mip readback extension above selects higher levels. Automatic cube mip generation
-and plain source cube resizing remain outside the profile. Pinned
+mip readback extension above selects higher levels. Plain source cube resizing
+remains outside the profile. Pinned
 `RenderTarget.setSize()` does not update the six cube face descriptors; applications
 can construct a cube target at the required size.
+
+### Automatic cube mip generation
+
+Native cube rendering now applies the pinned cube filtering shader to every face
+of each successive mip level, retaining its face orientation, implicit
+derivatives and sampler behavior. RGBA8/sRGB and RGBA16F are supported; Float32
+cube filtering requires the enabled `float32-filterable` device feature and keeps
+its original attachment precision. The generation flag is captured with each
+accepted source render, so queued CubeCamera updates generate only after the
+sixth face. Manual clears and subsequent sampled borrows do not infer another
+generation from a later public flag change.
+
+Initialize the target while generation is enabled when a full pyramid is needed:
+
+```js
+await renderer.init();
+const cubeTarget = new THREE.CubeRenderTarget(256, {
+  type: THREE.HalfFloatType,
+  generateMipmaps: true,
+  minFilter: THREE.LinearMipmapLinearFilter,
+});
+renderer.initRenderTarget(cubeTarget);
+new THREE.CubeCamera(0.1, 100, cubeTarget).update(renderer, environmentScene);
+```
+
+This explicit initialization matters in pinned r186: a cold CubeCamera disables
+generation before the first face initializes storage, so that source path has
+only one level. `initRenderTarget()` first allocates the complete pyramid. The
+native implementation preserves both behaviors, including the unchanged
+`CubeRenderTarget.fromEquirectangularTexture()` helper and its temporary resource
+disposal. Selection and layout queries alone do not initialize the allocation.
+Once initialized, changing the generation flag or authored mip descriptors does
+not replace the image until its source texture version changes. Native cube
+samplers retain explicit LOD access with ordinary `LinearFilter`/`NearestFilter`,
+using nearest mip selection as the pinned backend does.
+
+`three_renderer_cube_mipmaps.test.mjs` covers source initialization, metadata-only
+selection, ordered captures, mutable flags, clears, budgets, disposal and authored
+levels. Chromium 151/SwiftShader differentials matched 11,232 stored face/mip
+channel values and 2,640 sampled values exactly across six cold/initialized
+CubeCamera and equirectangular cases, including HDR, sRGB and Float32. The 660
+samples cover axes, corners and near-seam directions over five LODs. Both paths
+used identical identity-swizzle and declared cube-view metadata adapters for
+that browser; source readback row padding was unpacked. No numeric tolerance or
+GPU validation errors occurred.
 
 Plain source `TSL.cubeTexture()` color nodes require a scene/material for their
 environment rotation and cannot run in the pinned source's context-free compute

@@ -20,8 +20,10 @@
  * charged and retained until its readers and submitted work have finished.
  * Native point shadows use six square cube faces. Rendering selects one face,
  * while native depth sampling borrows all six layers without a UV replica.
- * Cube targets admit one sample and mip zero. Explicit face-aware color/depth
- * transfers, native readbacks and six-layer native color sampling share this
+ * Cube targets admit one sample, authored levels and source-ordered generation.
+ * Their allocation mip count stays fixed until the source texture version
+ * changes; CubeCamera's temporary generation flag cannot replace prior faces.
+ * Explicit face-aware transfers, readbacks and six-layer sampling share this
  * owner. Source cube resize remains unsupported.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
@@ -71,7 +73,7 @@ function depthComparison(texture, three) {
   return compare;
 }
 
-function inspectThreeRenderTargetColor(target, three, texture) {
+function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const cube = target.isCubeRenderTarget === true;
   if (!extent(target.width) || !extent(target.height) || cube && (!target.width || !target.height))
@@ -117,8 +119,6 @@ function inspectThreeRenderTargetColor(target, three, texture) {
   else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
   else if (float32 && linear) format = floatFormat;
   else fail('UNSUPPORTED', 'Target color must be RGBA8, linear RGBA16F or linear R/RG/RGBA32F');
-  if (cube && texture.generateMipmaps)
-    fail('UNSUPPORTED', 'Native cube targets require authored mip levels with automatic generation disabled');
   if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
   let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
@@ -166,9 +166,11 @@ function inspectThreeRenderTargetColor(target, three, texture) {
   // generation. Uncompressed CubeTexture descriptors omit the base level:
   // Textures.updateTexture adds it separately. Render-target descriptors
   // allocate levels, not uploaded pixels.
-  const mipLevelCount = texture.mipmaps?.length ? texture.mipmaps.length + (cube ? 1 : 0)
-    : generateMipmaps ? maximumMipLevels : 1;
-  if (mipLevelCount > maximumMipLevels) fail('SIZE', 'Too many target mip levels for its extent');
+  const mipLevelCount = cube && cubeMipLevelCount !== null ? cubeMipLevelCount
+    : texture.mipmaps?.length ? texture.mipmaps.length + (cube ? 1 : 0)
+      : generateMipmaps ? maximumMipLevels : 1;
+  if (!positive(mipLevelCount) || mipLevelCount > maximumMipLevels)
+    fail('SIZE', 'Invalid target mip count for its extent');
   const texelBytes = format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
   const layers = cube ? 6 : 1, baseColorBytes = width * height * texelBytes * layers;
   let colorBytes = baseColorBytes, w = width, h = height;
@@ -181,16 +183,17 @@ function inspectThreeRenderTargetColor(target, three, texture) {
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     cube, layers, viewDimension: cube ? 'cube' : '2d',
+    ...(cube ? {sourceVersion: texture.version} : {}),
     depthTexture, depthSampleBytes: depthTexture ? width * height * 4 * layers : 0,
-    key: `${cube ? 'cube/' : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${generateMipmaps}/${mipLevelCount}`};
+    key: `${cube ? 'cube/' : ''}${target.width}/${target.height}/${format}/${depthFormat}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
 }
 
-export function inspectThreeRenderTarget(target, three) {
+export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   if (!Array.isArray(target.textures) || !target.textures.length || target.textures.length > 8 ||
       new Set(target.textures).size !== target.textures.length || target.texture !== target.textures[0])
     fail('SOURCE', 'Expected one to eight distinct target-owned color attachments');
-  const colors = target.textures.map(texture => inspectThreeRenderTargetColor(target, three, texture)), primary = colors[0];
+  const colors = target.textures.map(texture => inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount)), primary = colors[0];
   if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1)))
     fail('UNSUPPORTED', 'Multiple color attachments currently require 2D mip-zero targets');
   const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes * (color.sampleCount === 4 ? 5 : 1), 0);
@@ -365,15 +368,24 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
+    if (entry.shape.cube) entry.cubeInitialized = true;
     let held = true;
     return () => {
       if (!held) return;
       held = false; entry.references--; collect(entry);
     };
   }
-  function capture(target) {
+  function sourceShape(target, entry = entries.get(target)) {
+    // CubeCamera disables generation for faces 0-4, then restores it for face 5.
+    // Pinned Textures.updateTexture preserves the allocation until a version
+    // update. Selection/layout queries alone have not initialized that image.
+    const frozen = entry?.alive && entry.shape.cube && (entry.cubeInitialized || entry.storage) &&
+      entry.shape.texture === target.texture && entry.shape.sourceVersion === target.texture.version;
+    return inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null});
+  }
+  function capture(target, {initialize = false} = {}) {
     live();
-    const shape = inspectThreeRenderTarget(target, three);
+    const shape = sourceShape(target);
     if (shape.cube) {
       const owner = cubeColorTargets.get(shape.texture);
       if (owner && owner !== target && owner.texture === shape.texture)
@@ -403,15 +415,19 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     }
     let entry = entries.get(target);
     if (entry && !sameShape(entry.shape, shape)) { retire(entry); entry = null; }
-    if (entry) return entry;
+    if (entry) {
+      if (initialize && shape.cube) entry.cubeInitialized = true;
+      return entry;
+    }
     entry = createEntry(target, shape);
+    entry.cubeInitialized = initialize && shape.cube;
     entries.set(target, entry);
     return entry;
   }
   function createEntry(target, shape) {
     if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
-      references: 0, sourceShape: null, retirement: null,
+      references: 0, sourceShape: null, retirement: null, cubeInitialized: false,
       dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
@@ -476,7 +492,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     live();
     if (!entry?.alive || entries.get(entry.target) !== entry && !preserved.has(entry) && !historyEntries.has(entry))
       fail('STALE', 'Target was disposed or replaced before its queued use');
-    const shape = inspectThreeRenderTarget(entry.target, three);
+    const shape = sourceShape(entry.target, entry);
     if (entry.historyGroup ? !historyShape(entry.historyGroup, shape, entry.historyGroup.sourceShape ?? entry.historyGroup.shape)
       : !sameShape(shape, preserved.has(entry) ? entry.sourceShape : entry.shape))
       fail('STALE', 'Target configuration changed before its queued use');
@@ -510,7 +526,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       allocatedBytes += needed - group.charged; group.charged = needed;
       entry.storage = group.storage.selectColorSlots(entry.colorSlots);
     } else {
-      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
+      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube ? false : generateMipmaps, mipLevelCount,
         sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube});
       entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     }
@@ -547,6 +563,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(texture, three, shape.mipLevelCount);
+    if (shape.cube) {
+      // Native source samplers retain explicit LOD access even for ordinary
+      // LinearFilter/NearestFilter; only their mip interpolation is nearest.
+      // Cube targets have no WebGL sampling replica with a base-only clamp.
+      descriptor.lodMaxClamp = shape.mipLevelCount - 1;
+      if ([three.NearestFilter, three.LinearFilter].includes(texture.minFilter)) {
+        descriptor.mipmapFilter = 'nearest'; descriptor.maxAnisotropy = 1;
+      }
+    }
     if (!filterable) {
       if (texture.magFilter !== three.NearestFilter ||
           (texture.minFilter !== three.NearestFilter && texture.minFilter !== three.NearestMipmapNearestFilter))
@@ -938,7 +963,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
-    render(entry, callback, {mipLevel = 0, face = 0} = {}) {
+    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
       ensure(entry);
       const group = entry.historyGroup;
@@ -952,11 +977,17 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       // Higher private depth levels never modify the source's level-zero depth.
       if (mipLevel === 0) entry.depthDirty = true;
       const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots}) : entry.storage.withFrame;
-      try { return withFrame((frame, texture, handles) => {
-        if (group) group.frame = {handles, writes: new Set(entry.shape.textures)};
-        try { const result = callback(frame, texture); assertCurrent(entry); return result; }
-        finally { if (group) group.frame = null; }
-      }, {mipLevel, face}); }
+      try {
+        const result = withFrame((frame, texture, handles) => {
+          if (group) group.frame = {handles, writes: new Set(entry.shape.textures)};
+          try { const result = callback(frame, texture); assertCurrent(entry); return result; }
+          finally { if (group) group.frame = null; }
+        }, {mipLevel, face});
+        // Finish the source render before filtering. Sampling and manual clear
+        // do not infer generation from a later mutable public texture flag.
+        if (entry.shape.cube && generateMipmaps) entry.storage.generateMipmaps();
+        return result;
+      }
       finally {
         const delta = entry.storage.allocatedBytes - allocatedBefore;
         entry.charged += delta; allocatedBytes += delta;
