@@ -427,8 +427,35 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (snapshot.released || !snapshot.record.alive)
       fail('STALE', 'Sampled texture was disposed or its captured use was released');
   }
+  function captureShared(snapshot) {
+    live();
+    // A source SHARED refresh keeps its existing sampler/view binding. Another
+    // FULL draw can nevertheless upload new pixels into that same residency
+    // before the render submits. Select only that already accepted history;
+    // unobserved CPU edits and replacement TextureNodes must remain inert.
+    if (!leases.has(snapshot) || snapshot.sampler) return null;
+    validate(snapshot);
+    const previous = snapshot.record, pixels = histories.get(previous.source)?.get(previous.key);
+    if (!pixels || pixels === previous.pixels) return null;
+    let record = [...records].find(value => value.original === previous.original &&
+      value.source === previous.source && value.key === previous.key && value.pixels === pixels);
+    if (!record) {
+      if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
+      const resident = [...records].find(value => value.source === previous.source && value.key === previous.key && value.pixels === pixels);
+      if (!resident) fail('STALE', 'Shared sampled history has no accepted texture residency');
+      // Borrow the accepted immutable descriptor while retaining the frozen
+      // binding's original disposal identity. No pixel copy or upload callback
+      // is made here, and a later queued capture cannot replace this selection.
+      record = {...previous, texture: resident.texture, pixels, sourceVersion: resident.sourceVersion,
+        refs: 0, alive: true, binding: resident.binding};
+      retainPixels(record.source, pixels); records.add(record);
+    }
+    record.refs++;
+    const lease = {record, layout: snapshot.layout, sampler: false, released: false};
+    leases.add(lease); return lease;
+  }
   return {
-    layoutOf, captureBinding,
+    layoutOf, captureBinding, captureShared,
     prepareFramebuffer(texture, type) { live(); framebuffers().prepareFramebuffer(texture, type); },
     captureFramebuffer(texture, options) { live(); return framebuffers().captureFramebuffer(texture, options); },
     encodeFramebufferCopy(snapshot, encoder, source) { live(); return framebuffers().encodeFramebufferCopy(snapshot, encoder, source); },

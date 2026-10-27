@@ -95,6 +95,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
   const wireframes = createThreeNodeWireframes(three, {maxBytes: maxAttributeBytes, fail});
   const bundleGeometryRecords = new Set();
+  const fogResourceRecords = new Set();
   const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
   const materialViews = new WeakMap();
   const sourceMaterialClasses = new Map([
@@ -930,7 +931,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function retire(entry) {
     if (!entries.delete(entry)) return;
-    for (const record of nodeStates.get(entry.descriptor)?.bundleLeases ?? []) releaseBundleGeometry(record);
+    const state = nodeStates.get(entry.descriptor);
+    for (const record of state?.bundleLeases ?? []) releaseBundleGeometry(record);
+    for (const record of state?.fogRecords?.values() ?? []) releaseFogResources(record);
     releaseShaders(entry.shaders);
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
@@ -1191,7 +1194,26 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   // projection. In particular, static is a refresh policy, not a replacement
   // for versioned bundle structure. Use the pinned builder's actual observer.
   function bundleRecord(state, context) {
-    if (context.bundleToken === undefined) return null;
+    if (context.bundleToken === undefined) {
+      // The source observer does not count scene.fogNode as an authored
+      // material slot. Ordinary materials therefore keep their object-group
+      // fog uniforms and resource bindings on SHARED refresh, even though the
+      // fog callbacks still run. Apply that policy only to this scene entrance.
+      if (context.fogRenderContext === undefined || state.builder.observer.hasNode) return null;
+      const records = state.fogRecords ??= new Map(), key = context.fogRenderContext;
+      let record = records.get(key);
+      if (!record) {
+        const renderObject = {object: context.object ?? state.object, geometry: state.geometry, material: state.material,
+          scene: context.scene ?? state.builder.scene, camera: context.camera ?? state.builder.camera,
+          context: context.renderContext ?? {}, bundle: null,
+          lightsNode: state.builder.lightsNode ?? {getBuiltinLights: () => []}};
+        record = {renderObject, packet: null, refreshType: three.RenderObjectRefreshType.FULL, fog: true, resources: null};
+        records.set(key, record);
+      }
+      record.renderObject.camera = context.camera ?? state.builder.camera;
+      record.renderObject.context = context.renderContext ?? record.renderObject.context;
+      return record;
+    }
     const token = context.bundleToken;
     if ((typeof token !== 'object' && typeof token !== 'function') || token === null ||
         context.bundle?.isBundleGroup !== true)
@@ -1229,6 +1251,38 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     record.ownedBundleGeometry?.release?.();
     record.ownedBundleGeometry = null;
     record.leaseSet?.delete(record); bundleGeometryRecords.delete(record);
+  }
+  function releaseFogResources(record) {
+    if (record.resources) {
+      for (const binding of record.resources.textures) record.resources.textureOwner.release(binding.lease);
+      for (const binding of record.resources.storage) record.resources.storageOwner.release(binding.lease);
+      for (const lease of record.resources.vertexStorage ?? []) record.resources.storageOwner.release(lease);
+    }
+    record.resources = null; fogResourceRecords.delete(record);
+  }
+  function retainFogResources(descriptor, context, resources) {
+    const record = bundleRecord(stateOf(descriptor), context);
+    if (!record?.fog) return;
+    const retained = [];
+    try {
+      for (const binding of resources.textures) {
+        resources.textureOwner.retain(binding.lease);
+        retained.push(() => resources.textureOwner.release(binding.lease));
+      }
+      for (const binding of resources.storage) {
+        resources.storageOwner.retain(binding.lease);
+        retained.push(() => resources.storageOwner.release(binding.lease));
+      }
+      for (const lease of resources.vertexStorage ?? []) {
+        resources.storageOwner.retain(lease);
+        retained.push(() => resources.storageOwner.release(lease));
+      }
+    } catch (error) {
+      for (const release of retained.reverse()) release();
+      throw error;
+    }
+    releaseFogResources(record);
+    record.resources = resources; fogResourceRecords.add(record);
   }
   function storeBundlePacket(state, record, packet) {
     const previous = record.ownedBundleGeometry;
@@ -1482,7 +1536,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      return record.packet = {...previous, uniforms, refreshType: kind};
+      return record.packet = {...previous, uniforms, refreshType: kind,
+        ...(record.fog ? {fogResources: record.resources} : {})};
     });
     const object = checkCapture(state, context);
     return withFrame(state, context, () => {
@@ -1556,7 +1611,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bundleRefresh(bundleRecord(state, context), context) === three.RenderObjectRefreshType.NONE) return;
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after,
+  const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
       : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
     attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)
@@ -1572,6 +1627,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
       for (const record of bundleGeometryRecords) releaseBundleGeometry(record);
+      for (const record of fogResourceRecords) releaseFogResources(record);
       generatedAttributes.dispose(); wireframes.dispose(); effects.dispose(); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});
   return api;

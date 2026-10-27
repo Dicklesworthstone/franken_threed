@@ -200,3 +200,48 @@ test('warm bundles retain storage-only vertex leases and observe later GPU produ
     'warm bundles never overwrite computed vertices with their source CPU array');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+test('ordinary SHARED fog retains storage-only vertex leases and later queued GPU producers', async t => {
+  const f = fixture(t), colors = N.attributeArray(4, 'vec3');
+  const captures = [], capture = f.renderer._captureNodeFrame.bind(f.renderer);
+  f.renderer._captureNodeFrame = request => {
+    const packet = capture(request); if (request.scene === f.scene) captures.push(packet); return packet;
+  };
+  colors.value.array.fill(.125);
+  f.scene.fogNode = N.fog(colors.toAttribute(), N.float(.5));
+  assert.equal(f.material.colorNode, null); assert.equal(f.material.positionNode, null);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const first = captures[0], lease = first.storageUses[0];
+  assert.equal(first.storageUses.length, 1);
+  assert.doesNotThrow(() => first.storageOwner.validate([lease]), 'the observer retains the allocation after the first frame releases it');
+  const buffer = captureComputeStorage(f.device, colors.value).resolve().buffer;
+  f.device.onCompute = pass => {
+    assert.equal(computeStorage(pass)[0], buffer);
+    new Float32Array(buffer.data).fill(.875);
+  };
+  await f.renderer.compute(kernel(colors));
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(captures[1].storageUses, [lease]);
+  // A new authored companion needs an asynchronous pipeline, so the third
+  // SHARED draw is still queued when its material retires the observer.
+  const companion = new T.MeshBasicNodeMaterial({fog: false}); companion.colorNode = N.vec3(.2, .3, .4);
+  const extra = new T.Mesh(f.mesh.geometry, companion); extra.frustumCulled = false; f.scene.add(extra);
+  f.renderer.render(f.scene, f.camera);
+  assert.ok(f.renderer._drain, 'new pipeline preparation keeps the accepted draw queued');
+  assert.deepEqual(captures[2].storageUses, [lease]);
+  f.material.dispose();
+  assert.doesNotThrow(() => first.storageOwner.validate([lease]), 'a queued SHARED draw survives observer retirement');
+  await drain(f.renderer);
+  const selected = draws(f.device).filter(draw => draw.pipeline.vertex.buffers.some((layout, slot) =>
+    layout && draw.streams.get(slot) === buffer));
+  assert.equal(selected.length, 3);
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.125, .875, .875]);
+  assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer)));
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1,
+    'SHARED fog reuses the accepted GPU allocation without restoring its CPU array');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.throws(() => first.storageOwner.validate([lease]), {code: 'THREE_COMPUTE_STALE'},
+    'retired observer and completed frames release the allocation lease');
+  f.renderer.dispose(); assert.equal(buffer.destroyed, true);
+});

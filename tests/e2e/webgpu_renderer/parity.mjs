@@ -115,7 +115,7 @@ const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps
   "native_pipeline_history", "native_pipeline_history_resize", "native_pipeline_history_accumulation",
   "native_tsl_morph", "native_tsl_morph_targets", "native_tsl_morph_skinning",
   "native_tsl_morph_instances", "native_tsl_morph_instances_targets",
-  "native_tsl_fog", "native_tsl_fog_pipeline",
+  "native_tsl_fog", "native_tsl_fog_pipeline", "native_tsl_fog_node", "native_tsl_fog_node_texture",
   "native_tsl_textures", "native_tsl_cube_textures", "native_tsl_texture_updates", "native_tsl_target_texture",
   "native_tsl_storage", "native_tsl_storage_compute", "native_tsl_storage_targets",
   "native_tsl_storage_instances", "native_tsl_storage_structs", "native_tsl_storage_fifo",

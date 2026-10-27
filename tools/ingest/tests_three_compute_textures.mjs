@@ -111,6 +111,42 @@ test('CPU edits without an upload version do not change already captured inputs'
   assert.equal(r.owner.resolve(b).pixels[0], 1); assert.equal(uploads(r).length, 1);
   r.owner.release(b); r.owner.dispose();
 });
+test('SHARED bindings select accepted image uploads without reading newer CPU requests', () => {
+  const r = rig(), texture = new Texture(), first = r.owner.captureBinding(sampled(texture));
+  const frozenSampler = r.owner.captureBinding(sampler(texture));
+  texture.image.data[0] = 9; texture.touch();
+  assert.equal(r.owner.captureShared(first), null, 'SHARED alone cannot upload a pending source version');
+  const full = r.owner.captureBinding(sampled(texture));
+  const shared = r.owner.captureShared(first); assert.ok(shared);
+  assert.equal(r.owner.captureShared(frozenSampler), null, 'sampler selection remains frozen');
+  texture.image.data[0] = 77; texture.touch();
+  const later = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.resolve(first).pixels[0], 1);
+  assert.equal(r.owner.resolve(full).pixels[0], 9); assert.equal(r.owner.resolve(shared).pixels[0], 9);
+  assert.equal(r.owner.resolve(later).pixels[0], 77);
+  [first, frozenSampler, full, shared, later].forEach(use => r.owner.release(use)); r.owner.dispose();
+  assert.equal(r.owner.diagnostics.snapshotBytes, 0);
+});
+test('SHARED image aliases preserve the frozen binding disposal identity', () => {
+  const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
+  const first = r.owner.captureBinding(sampled(texture));
+  texture.image.data[0] = 9; alias.touch(); const full = r.owner.captureBinding(sampled(alias));
+  const shared = r.owner.captureShared(first); assert.ok(shared);
+  alias.dispose(); assert.equal(r.owner.resolve(shared).pixels[0], 9);
+  texture.dispose(); assert.throws(() => r.owner.resolve(shared), {code: 'THREE_COMPUTE_TEXTURE_STALE'});
+  [first, full, shared].forEach(use => r.owner.release(use)); r.owner.dispose();
+});
+test('SHARED views ignore uploaded replacements in another source or sampler domain', () => {
+  const r = rig(), texture = new Texture(), first = r.owner.captureBinding(sampled(texture));
+  texture.image.data[0] = 9; texture.touch(); texture.wrapS = 'clamp-to-edge';
+  const changedSampler = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.captureShared(first), null);
+  texture.source = {data: {width: 1, height: 1, data: new Uint8Array([77, 2, 3, 4])}, version: 1, dataReady: true};
+  texture.wrapS = 'repeat'; texture.version++;
+  const changedSource = r.owner.captureBinding(sampled(texture));
+  assert.equal(r.owner.captureShared(first), null); assert.equal(r.owner.resolve(first).pixels[0], 1);
+  [first, changedSampler, changedSource].forEach(use => r.owner.release(use)); r.owner.dispose();
+});
 test('an unused source alias cannot upload pixels through an unchanged texture', () => {
   const r = rig(), texture = new Texture(), alias = new Texture(); alias.source = texture.source;
   const first = r.owner.captureBinding(sampled(texture));

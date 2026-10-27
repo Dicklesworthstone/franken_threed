@@ -58,6 +58,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       !hasThreeNodeProgram(backgroundMesh.material)))
     fail('BACKGROUND', 'Native backgrounds require a separate childless mesh with one authored node material');
   const shadowPass = getThreeNativeShadowPass(renderer, overrideMaterial);
+  // Match source RenderContexts identity for the ordinary-material fog
+  // observer. Target objects with the same attachment state share a context.
+  const fogRenderContext = sceneFogNode && !shadowPass && bundles ? `${destination === null ? 'default' :
+    [destination.textures.length, destination.texture.format, destination.texture.type, destination.samples,
+      destination.depthBuffer, destination.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-${bundleDepth}` : undefined;
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root], hookedObjects = new Set();
   let nativeOverrides = false;
   const phaseBindings = {opaque: new Set(), transparent: new Set()}, compiledBindings = new Set();
@@ -464,7 +469,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     storageUses.push(lease); vertexStorageUses.push(lease);
     return storageOwner.vertexAttribute(lease, view);
   };
-  const capturedDraws = [];
+  const capturedDraws = [], sharedFogResources = [];
   let recordTexture = () => {};
   const captureDraw = draw => {
     // RenderObject receives the geometry's current range before this physical
@@ -486,11 +491,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }
       const updateContext = {...frameContext, scene: draw.bundleScene ?? root, object: draw.object, material: draw.material,
         captureVertexAttribute, clippingContext: draw.binding.clippingContext,
+        ...(fogRenderContext !== undefined && draw.material.fog === true ? {fogRenderContext,
+          renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
+            height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
         ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
-      if (draw.nodeBundle) updateContext.refreshType = programs.refresh(draw.binding.nodeProgram, updateContext);
+      if (draw.nodeBundle || updateContext.fogRenderContext !== undefined)
+        updateContext.refreshType = programs.refresh(draw.binding.nodeProgram, updateContext);
       // ShadowNode recursively renders here. Keep the complete source before
       // sequence outside this draw's resource transaction, without hoisting it
       // ahead of the preceding draw or replaying false-returning callbacks.
@@ -503,7 +512,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
       if (captured.bundleGeometry) {
-        draw.bundleGeometry = draw.nodeBundle ? captured.bundleGeometry.retain() : captured.bundleGeometry;
+        // Bundle and ordinary fog observer records own their packet's lease.
+        // Each accepted render needs an independent lifetime for that view.
+        draw.bundleGeometry = captured.refreshType !== undefined ? captured.bundleGeometry.retain() : captured.bundleGeometry;
         bundleGeometries.push(draw.bundleGeometry);
         if (!chargedGeometry.has(draw.bundleGeometry.geometry)) {
           chargedGeometry.add(draw.bundleGeometry.geometry); bytes += draw.bundleGeometry.bytes;
@@ -549,7 +560,18 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         destination.textures.includes(binding.texture) || destination.depthTexture === binding.texture))
         fail('FEEDBACK', 'A native draw cannot sample its own render target');
       const reuseResources = draw.bundleWarm && captured.refreshType !== three.RenderObjectRefreshType.FULL;
-      if (reuseResources) {
+      if (captured.fogResources) {
+        const resources = captured.fogResources;
+        sharedFogResources.push({resources, descriptor: draw.binding.nodeProgram, context: updateContext});
+        textureOwner ??= resources.textureOwner; storageOwner ??= resources.storageOwner;
+        draw.nodeTextures = resources.textures; draw.nodeStorage = resources.storage;
+        draw.nodeVertexStorage = resources.vertexStorage;
+        for (const binding of draw.nodeTextures) textureUses.push(resources.textureOwner.retain(binding.lease));
+        for (const binding of draw.nodeStorage) storageUses.push(resources.storageOwner.retain(binding.lease));
+        for (const lease of draw.nodeVertexStorage ?? []) {
+          storageUses.push(resources.storageOwner.retain(lease)); vertexStorageUses.push(lease);
+        }
+      } else if (reuseResources) {
         textureOwner ??= draw.bundleTextureOwner; storageOwner ??= draw.bundleStorageOwner;
         for (const binding of draw.nodeTextures) textureUses.push(textureOwner.retain(binding.lease));
         for (const binding of draw.nodeStorage) storageUses.push(storageOwner.retain(binding.lease));
@@ -571,6 +593,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }));
       }
       if (draw.nodeBundle) { draw.bundleTextureOwner = textureOwner; draw.bundleStorageOwner = storageOwner; }
+      if (updateContext.fogRenderContext !== undefined && !captured.fogResources)
+        programs.retainFogResources(draw.binding.nodeProgram, updateContext, Object.freeze({
+          textures: draw.nodeTextures, storage: draw.nodeStorage, vertexStorage: draw.nodeVertexStorage, textureOwner, storageOwner}));
       // r186 reads geometry.instanceCount before Mesh.count, after node/binding
       // updates and before after-updates. It does not infer a count from the
       // first instance attribute or clamp it to an attribute's capacity.
@@ -741,6 +766,33 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // The source output transform renders an opaque quad after scene updates.
     // Capture this later decision separately from the accepted scene list.
     phases.output = listEnabled('opaque');
+    if (sharedFogResources.length) {
+      const refresh = () => {
+        const replacements = new Map();
+        for (const {resources, descriptor, context} of sharedFogResources) {
+          let textures = replacements.get(resources.textures);
+          if (!textures) {
+            textures = Object.freeze(resources.textures.map(binding => {
+              const lease = resources.textureOwner.captureShared?.(binding.lease);
+              if (!lease) return binding;
+              textureUses.push(lease);
+              return Object.freeze({...binding, lease});
+            }));
+            replacements.set(resources.textures, textures);
+          }
+          programs.retainFogResources(descriptor, context, Object.freeze({...resources, textures}));
+        }
+        // Source writes from later FULL draws also reach an earlier SHARED
+        // binding before submission. Freeze that final accepted image here;
+        // a subsequent queued frame must not change these selected pixels.
+        for (let i = 0; i < capturedDraws.length; i++) {
+          const textures = replacements.get(capturedDraws[i].nodeTextures);
+          if (textures) capturedDraws[i] = Object.freeze({...capturedDraws[i], nodeTextures: textures});
+        }
+      };
+      if (textureOwner) textureOwner.captureDispatch(refresh);
+      else refresh();
+    }
   };
   // A deferred request starts with its accepted selector, then source callbacks
   // may change it for this and subsequent draws. Never reinstall it per object.

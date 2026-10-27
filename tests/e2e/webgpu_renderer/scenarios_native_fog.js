@@ -1,6 +1,49 @@
 import { nativeMorphScenarios } from './scenarios_native_morph.js';
 
 export const nativeFogScenarios = {
+  native_tsl_fog_node(T, renderer) {
+    const result = nativeFogScenarios.native_tsl_fog(T, renderer), N = T.TSL;
+    const color = N.uniform(new T.Color(0xa2bbc8)), near = N.uniform(2.5), far = N.uniform(11);
+    const height = N.positionWorld.y.add(1.5).mul(.35).clamp(.15, 1);
+    result.scene.fogNode = N.fog(color, N.rangeFogFactor(near, far).mul(height));
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene && args[1] === result.camera) {
+        frame++;
+        if (frame === 8) { color.value.set(0xc8a9b8); near.value = 1.5; }
+        if (frame === 18) {
+          result.scene.fogNode = N.fog(color, N.rangeFogFactor(near, far).mul(height.oneMinus()));
+        }
+        if (frame === 22) { color.value.set(0x8fbcc8); far.value = 9; }
+      }
+      return render(...args);
+    };
+    return result;
+  },
+  native_tsl_fog_node_texture(T, renderer) {
+    const result = nativeFogScenarios.native_tsl_fog(T, renderer), N = T.TSL;
+    const pixels = new Uint8Array([210, 140, 100, 255, 80, 170, 210, 255,
+      110, 180, 120, 255, 170, 110, 200, 255]);
+    const texture = new T.DataTexture(pixels, 2, 2);
+    texture.colorSpace = T.SRGBColorSpace; texture.needsUpdate = true;
+    const factor = N.uniform(.65);
+    result.scene.fogNode = N.fog(N.texture(texture, N.screenUV).rgb, factor);
+    const render = renderer.render.bind(renderer); let frame = 0;
+    renderer.render = (...args) => {
+      if (args[0] === result.scene && args[1] === result.camera) {
+        frame++;
+        if (frame === 8) {
+          pixels.set([80, 140, 210, 255, 200, 170, 90, 255,
+            190, 100, 170, 255, 90, 190, 160, 255]);
+          texture.needsUpdate = true; factor.value = .8;
+        }
+        if (frame === 18) result.scene.fogNode = null;
+        if (frame === 22) result.scene.fogNode = N.fog(N.texture(texture, N.screenUV).rgb, factor);
+      }
+      return render(...args);
+    };
+    return result;
+  },
   native_tsl_fog(T, renderer) {
     const N = T.TSL, scene = new T.Scene(); scene.background = new T.Color(0x263748);
     scene.fog = new T.Fog(0x98adba, 3.5, 11);

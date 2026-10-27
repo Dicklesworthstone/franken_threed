@@ -691,6 +691,52 @@ removing a Matcap map rebuilds the graph; compatible replacements preserve each
 captured texture binding. Fog checks use the converted source defaults without
 mutating the original material.
 
+## Authored scene fog
+
+Assign a source TSL graph to `scene.fogNode` to compose fog with native material
+output. The authored graph takes precedence over `scene.fog`; clearing it
+restores ordinary `Fog` / `FogExp2` selection. Materials with `fog: false` leave
+the graph inactive. Ordinary admitted mesh materials enter native rendering
+automatically, without adding a material node slot.
+
+Range, density and height fog, world/view-position arithmetic, and sampled
+texture colors use the pinned source builder and the existing native resource
+owners. Graph replacement and structural changes rebuild the program; accepted
+queued draws retain their shader, uniforms and texture selections. Fog composes
+with native lighting and shadows, while shadow-material passes leave fog
+inactive. Unsupported nodes or resource layouts still fail admission.
+
+Use the source render group for fog values that must change on otherwise
+unchanged ordinary materials:
+
+```js
+const fogColor = TSL.uniform(new THREE.Color(0x9ab8c8)).setGroup(TSL.renderGroup);
+const near = TSL.uniform(2).setGroup(TSL.renderGroup);
+const far = TSL.uniform(12).setGroup(TSL.renderGroup);
+const height = TSL.positionWorld.y.add(1.5).mul(0.35).clamp(0.15, 1);
+scene.fogNode = TSL.fog(fogColor, TSL.rangeFogFactor(near, far).mul(height));
+
+fogColor.value.set(0xb8a8ca);
+far.value = 9;
+```
+
+The pinned source observer treats scene nodes differently from authored
+material slots: an unchanged ordinary material receives a `SHARED` refresh.
+Node callbacks still run, but its default object-group uniform bytes and
+texture/sampler binding identities remain at their preceding full refresh.
+Shared groups continue updating. An observed material, geometry or object
+change triggers a full refresh; authored material slots retain the source
+full-refresh policy. The facade preserves this behavior rather than forcing
+extra uploads. If another full draw uploads the same sampled image, shared fog
+bindings see those accepted pixels within that render, even when the uploader
+sorts later. Later queued renders cannot replace those captured pixels.
+
+Focused source-builder tests compare complete WGSL and callback frequencies.
+Facade recording-device tests cover ordinary material selection, graph
+replacement/removal, shared versus object uniforms, inactive fog, source shadow
+ownership and texture versions across queued renders. Sampled-owner tests also
+check shared image histories, sampler domains and disposal identity.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
@@ -704,7 +750,7 @@ or integer texture graphs beyond the admitted 32-bit data/storage profiles still
 require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions, fog/clipping/shadows,
+The profile excludes shader context extensions, clipping/shadows,
 alpha hashing and alpha-to-coverage; skinned or morph meshes,
 including per-instance morph textures; ArrayCamera and XR views;
 object render hooks outside the source lifecycle profile above and effectful
