@@ -93,6 +93,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
   const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
   const wireframes = createThreeNodeWireframes(three, {maxBytes: maxAttributeBytes, fail});
+  const bundleGeometryRecords = new Set();
   const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
   const materialViews = new WeakMap();
   const sourceMaterialClasses = new Map([
@@ -897,6 +898,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function retire(entry) {
     if (!entries.delete(entry)) return;
+    for (const record of nodeStates.get(entry.descriptor)?.bundleLeases ?? []) releaseBundleGeometry(record);
     shaderBytes -= entry.bytes;
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
@@ -1122,6 +1124,60 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (state?.owner !== api) fail('SOURCE', 'Native node descriptor belongs to another preparation owner');
     return state;
   }
+  // Render bundles retain source render objects independently of the next
+  // projection. In particular, static is a refresh policy, not a replacement
+  // for versioned bundle structure. Use the pinned builder's actual observer.
+  function bundleRecord(state, context) {
+    if (context.bundleToken === undefined) return null;
+    const token = context.bundleToken;
+    if ((typeof token !== 'object' && typeof token !== 'function') || token === null ||
+        context.bundle?.isBundleGroup !== true)
+      fail('SOURCE', 'Native bundle refresh requires a stable render-object token and source BundleGroup');
+    const records = state.bundleRecords ??= new WeakMap();
+    let record = records.get(token);
+    if (!record) {
+      const renderObject = {object: context.object ?? state.object, geometry: state.geometry, material: state.material,
+        scene: context.scene ?? state.builder.scene, camera: context.camera ?? state.builder.camera,
+        context: context.renderContext ?? {}, bundle: context.bundle,
+        lightsNode: state.builder.lightsNode ?? {getBuiltinLights: () => []}};
+      record = {renderObject, packet: null, refreshType: three.RenderObjectRefreshType.FULL};
+      records.set(token, record);
+    }
+    if (record.renderObject.bundle !== context.bundle)
+      fail('SOURCE', 'A native bundle render-object token cannot change its group');
+    return record;
+  }
+  function refresh(descriptor, context = {}) {
+    const state = stateOf(descriptor), record = bundleRecord(state, context);
+    if (!record) return three.RenderObjectRefreshType.FULL;
+    return withFrame(state, context, () => record.refreshType =
+      state.builder.observer.needsRefresh(record.renderObject, frame));
+  }
+  function bundleRefresh(record, context) {
+    const kind = context.refreshType ?? record?.refreshType ?? three.RenderObjectRefreshType.FULL;
+    if (kind !== three.RenderObjectRefreshType.NONE && kind !== three.RenderObjectRefreshType.SHARED &&
+        kind !== three.RenderObjectRefreshType.FULL ||
+        !record && kind !== three.RenderObjectRefreshType.FULL ||
+        record && !record.packet && kind !== three.RenderObjectRefreshType.FULL)
+      fail('SOURCE', 'Native bundle refresh requires a previous full capture');
+    return kind;
+  }
+  function releaseBundleGeometry(record) {
+    record.ownedBundleGeometry?.release?.();
+    record.ownedBundleGeometry = null;
+    record.leaseSet?.delete(record); bundleGeometryRecords.delete(record);
+  }
+  function storeBundlePacket(state, record, packet) {
+    const previous = record.ownedBundleGeometry;
+    record.packet = packet; record.ownedBundleGeometry = packet.bundleGeometry ?? null;
+    if (typeof record.ownedBundleGeometry?.release === 'function') {
+      record.leaseSet = state.bundleLeases ??= new Set();
+      record.leaseSet.add(record); bundleGeometryRecords.add(record);
+    } else {
+      record.leaseSet?.delete(record); bundleGeometryRecords.delete(record);
+    }
+    if (previous !== record.ownedBundleGeometry) previous?.release?.();
+  }
   function withFrame(state, context, run) {
     const previous = Object.fromEntries(FRAME_FIELDS.map(key => [key, frame[key]]));
     Object.assign(frame, {renderer, object: context.object ?? state.object, material: context.material ?? state.material,
@@ -1334,12 +1390,39 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
   }
   function before(descriptor, context = {}) {
-    const state = stateOf(descriptor); checkCapture(state, context);
+    const state = stateOf(descriptor), record = bundleRecord(state, context), kind = bundleRefresh(record, context);
+    if (kind === three.RenderObjectRefreshType.NONE) return;
+    if (kind === three.RenderObjectRefreshType.FULL) checkCapture(state, context);
     return withFrame(state, context, () => runBefore(state));
   }
   function captureDraw(descriptor, context = {}) {
-    const state = stateOf(descriptor), object = checkCapture(state, context);
+    const state = stateOf(descriptor), record = bundleRecord(state, context), kind = bundleRefresh(record, context);
+    if (kind !== three.RenderObjectRefreshType.FULL) return withFrame(state, context, () => {
+      // SHARED runs the complete node lifecycle, but only shared uniform
+      // bindings reach the GPU. NONE consumes any shared bytes another source
+      // render object already refreshed without evaluating nodes or bindings.
+      if (kind === three.RenderObjectRefreshType.SHARED) {
+        if (!context.beforeDone) runBefore(state);
+        for (const node of state.builder.updateNodes) { frame.updateNode(node); checkPMREM(state); }
+      }
+      const previous = record.packet;
+      const uniforms = state.bindings.map((group, index) => {
+        const packet = previous.uniforms[index].slice();
+        for (const member of descriptor.groups[index].uniforms) {
+          const binding = group.bindings[member.binding];
+          if (binding.groupNode.shared !== true) continue;
+          const bytes = kind === three.RenderObjectRefreshType.SHARED
+            ? readUniformBuffer(binding, member.byteLength) : uniformBuffers.get(binding)?.bytes;
+          if (bytes) packet.set(bytes, member.offset);
+        }
+        return packet;
+      });
+      return record.packet = {...previous, uniforms, refreshType: kind};
+    });
+    const object = checkCapture(state, context);
     return withFrame(state, context, () => {
+      let bundleGeometry = null;
+      try {
       if (!context.beforeDone) runBefore(state);
       assertInstances(object, state.instanceSignature);
       assertBatch(object, state.batchSignature);
@@ -1353,6 +1436,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
       const attributes = captureGeometry(state, frame.renderId);
+      // Bundle commands retain this upload generation even when updateNodes
+      // subsequently mutates the source geometry. The scene owner owns the
+      // geometry/lease snapshot; compilation and shared refresh never invoke it.
+      bundleGeometry = context.captureGeometry?.(attributes?.geometry ??
+        (state.generated ? generatedAttributes.geometry(descriptor) : state.geometry), attributes);
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);
         checkPMREM(state);
@@ -1384,16 +1472,25 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      return {uniforms, textures, storage, attributes,
+      const packet = {uniforms, textures, storage, attributes,
+        ...(record ? {refreshType: kind} : {}),
+        ...(context.captureGeometry ? {bundleGeometry} : {}),
         ...(descriptor.wireframe ? {wireframeIndexCount: attributes.indexCount, programGeometry: attributes.geometry} : {})};
+      if (record) storeBundlePacket(state, record, packet);
+      return packet;
+      } catch (error) {
+        bundleGeometry?.release?.();
+        throw error;
+      }
     });
   }
   function capture(descriptor, context = {}) { return captureDraw(descriptor, context).uniforms; }
   function after(descriptor, context = {}) {
     const state = stateOf(descriptor);
+    if (bundleRefresh(bundleRecord(state, context), context) === three.RenderObjectRefreshType.NONE) return;
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
-  const api = Object.freeze({inspect, compile, preparePMREM, before, capture, captureDraw, after,
+  const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after,
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
       : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
     attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)
@@ -1406,7 +1503,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
-    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry); generatedAttributes.dispose(); wireframes.dispose(); effects.dispose(); },
+    dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
+      for (const record of bundleGeometryRecords) releaseBundleGeometry(record);
+      generatedAttributes.dispose(); wireframes.dispose(); effects.dispose(); },
     get diagnostics() { return Object.freeze({programs: entries.size, shaderBytes, maxPrograms, maxShaderBytes}); }});
   return api;
 }
