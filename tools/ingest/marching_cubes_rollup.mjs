@@ -4,9 +4,11 @@ import {specializeMarchingCubesModule,specializeMarchingCubesBase} from './march
 import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_normals_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeTransformBatch} from './transform_batch_specialization.mjs';
+import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
+const ATTRIBUTE_TRANSFORMS='\0f3d-geometry-transforms-adapter';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -24,15 +26,15 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
-      if (importer===TRANSFORMS && source==='./matrix_multiply_adapter.mjs') return MATRICES;
-      if ([ADAPTER,NORMALS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
+      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
     load(id) {
@@ -41,11 +43,12 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===NORMALS) return fs.readFileSync(new URL('./geometry_normals_adapter.mjs',import.meta.url),'utf8');
       if (id===MATRICES) return fs.readFileSync(new URL('./matrix_multiply_adapter.mjs',import.meta.url),'utf8');
       if (id===TRANSFORMS) return fs.readFileSync(new URL('./transform_batch_adapter.mjs',import.meta.url),'utf8');
+      if (id===ATTRIBUTE_TRANSFORMS) return fs.readFileSync(new URL('./geometry_transforms_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -80,6 +83,11 @@ export function marchingCubesRollupPlugin(options={}) {
           if(batch.report)transformReports.push({id,...batch.report});
           if(batch.changed){edits.push(...batch.edits);headers.push(batch.header);}
         }
+        if(normalCandidate || code.includes('class Matrix3')) {
+          const attributes=specializeGeometryTransforms(code,{...sources,runtimeModule:ATTRIBUTE_TRANSFORMS,maxMemoryPages,maxIterations});
+          if(attributes.report)attributeReports.push({id,...attributes.report});
+          if(attributes.changed){edits.push(...attributes.edits);headers.push(attributes.header);tail+=attributes.tail;}
+        }
         if(!headers.length)return null;
         let transformed=code;
         for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
@@ -94,6 +102,15 @@ export function marchingCubesRollupPlugin(options={}) {
           return [key,undefined];
         })).then(values=>finish(Object.fromEntries(values)));
       }
+      if(normalCandidate && geometryTransformSourceRole(code)==='attributes') {
+        return this.resolve('../math/Vector3.js',id,{skipSelf:true}).then(resolved=>{
+          let vectorSource;
+          if(resolved && !resolved.external)try {
+            vectorSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
+          }catch{/* An unavailable source retains the attribute methods. */}
+          return finish({vectorSource});
+        });
+      }
       return finish();
     },
     api:{getReport() {return {version:1,maxMemoryPages,maxIterations,compiledAddons:reports.filter(x=>x.route!=='retained-js').length,
@@ -104,6 +121,8 @@ export function marchingCubesRollupPlugin(options={}) {
       getMatrixMultiplicationReport(){return {version:1,accelerationClaim:false,
         compiledModules:matrixReports.length,modules:matrixReports.map(report=>({...report}))};},
       getTransformBatchesReport(){return {version:1,accelerationClaim:false,
-        compiledModules:transformReports.length,modules:transformReports.map(report=>({...report}))};}},
+        compiledModules:transformReports.length,modules:transformReports.map(report=>({...report}))};},
+      getGeometryTransformsReport(){return {version:1,accelerationClaim:false,
+        compiledModules:attributeReports.filter(report=>report.compiledMethods.length).length,modules:attributeReports.map(report=>({...report}))};}},
   };
 }

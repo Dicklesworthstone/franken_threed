@@ -107,3 +107,31 @@ the exact upstream checkout; it does not substitute host doubles for build tests
 The plugin report and runtime diagnostics distinguish compiled source, actual
 Wasm calls and fallback calls. A compiled addon is not a measured acceleration
 claim. Full H2 browser/material/control and performance gates remain open.
+
+## Source-library attribute transforms
+
+The same numeric opt-in also derives `BufferAttribute.applyMatrix4`,
+`applyMatrix3`, `applyNormalMatrix` and `transformDirection` from the exact r186
+BufferAttribute and Vector3 bodies. Ordinary `BufferGeometry.applyMatrix4`
+therefore reaches native bulk position and normal transforms through its
+original public methods. Source-tree imports and the pinned core package share
+this path. `numericSpecialization.libraryKernels.geometryTransforms` reports
+the compiled methods separately from MarchingCubes and generic numeric loops.
+
+The admitted profile is a genuine source-created BufferAttribute or
+Float32BufferAttribute with three unnormalized Float32/Float64 components per
+item and a witnessed Matrix3/Matrix4 with ordinary numeric elements. The
+compiler retains source expression order, perspective division, normalization,
+every Float32 store and the original private scratch vector's final unrounded
+values. Methods, attribute/array identities, synchronous return values,
+`needsUpdate` behavior and geometry bounds remain source-owned. Shared,
+resizable, detached, subclassed or unsupported storage, custom accessors and
+methods, proxies, modified source and failed memory/work budgets retain the
+original loop before any native result is published. Two-component matrix
+transforms, normalized/integer attributes and interleaved attributes remain
+on their ordinary JavaScript path.
+
+Run `node tools/ingest/geometry_transforms.test.mjs` for actual emitted Wasm
+differentials against pinned r186, including normal/position composition through
+BufferGeometry, scratch-vector observations, conservative callbacks and bounded
+execution failure. This remains a copying baseline with no measured speedup.

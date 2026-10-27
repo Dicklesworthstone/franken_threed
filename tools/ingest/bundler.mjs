@@ -778,6 +778,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
         ...numericReport,
         libraryKernels: { marchingCubes: marchingPlugin.api.getReport(),
           geometryNormals: marchingPlugin.api.getGeometryNormalsReport(),
+          geometryTransforms: marchingPlugin.api.getGeometryTransformsReport(),
           matrixMultiplication: marchingPlugin.api.getMatrixMultiplicationReport(),
           transformBatches: marchingPlugin.api.getTransformBatchesReport() },
       };
