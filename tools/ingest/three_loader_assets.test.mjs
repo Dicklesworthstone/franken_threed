@@ -12,6 +12,8 @@ import { findThreeLoaderRequests } from "./three_loader_assets.mjs";
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
 const coreUrl = rootUrl + "build/three.core.js";
 const gltfUrl = rootUrl + "examples/jsm/loaders/GLTFLoader.js";
+const dracoUrl = rootUrl + "examples/jsm/loaders/DRACOLoader.js";
+const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -85,6 +87,85 @@ test("fluent GLTFLoader path and resource settings retain their final values", (
   assert.equal(requests[0].resourcePath, "textures/");
 });
 
+test("configured GLTF loaders retain model roots and source codec paths through fluent and separate setters", () => {
+  const requests = discover(`import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+    import { DRACOLoader as Draco } from ${JSON.stringify(dracoUrl)};
+    import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
+    const draco = new Draco();
+    draco.setDecoderPath('discarded/').setWorkerLimit(2);
+    const ktx = new KTX2Loader().setTranscoderPath('codecs/basis/').detectSupport(renderer);
+    const loader = new GLTFLoader();
+    loader.setDRACOLoader(draco).setKTX2Loader(ktx).setMeshoptDecoder(decoder);
+    draco.setDecoderPath('codecs/draco/');
+    loader.setPath('models/');
+    loader.load('scene.gltf');
+    new GLTFLoader().setMeshoptDecoder(decoder).setPath('other/').loadAsync('scene.glb');`);
+  assert.deepEqual(requests.map(request => request.url), [
+    "models/scene.gltf", "codecs/draco/draco_wasm_wrapper.js", "codecs/draco/draco_decoder.wasm",
+    "codecs/draco/draco_decoder.js", "codecs/basis/basis_transcoder.js", "codecs/basis/basis_transcoder.wasm",
+    "other/scene.glb",
+  ]);
+});
+
+test("Draco packaging includes both source JS and Wasm branches, explicit URL dictionaries and preload", () => {
+  for (const mode of ["js", "wasm"]) {
+    const requests = discover(`import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+      const loader = new DRACOLoader().setDecoderPath('codec-prefix-').setDecoderConfig({type:${JSON.stringify(mode)}});
+      loader.setPath('models/'); loader.loadAsync('mesh.drc'); loader.dispose();`);
+    assert.deepEqual(requests.map(request => request.url), [
+      "models/mesh.drc", "codec-prefix-draco_wasm_wrapper.js", "codec-prefix-draco_decoder.wasm", "codec-prefix-draco_decoder.js",
+    ], "decoder paths use the source setter's literal prefix, not URL directory resolution");
+  }
+  const requests = discover(`import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+    const version = globalThis.next ? 'v2' : 'v1';
+    new DRACOLoader().setDecoderPath({js:'codecs/'+version+'.js',wasm:'codecs/'+version+'.wasm'}).preload();
+    new DRACOLoader().setDecoderPath('').preload();`);
+  assert.deepEqual(requests.map(request => request.url), [
+    "codecs/v2.js", "codecs/v1.js", "codecs/v2.wasm", "codecs/v1.wasm",
+    "draco_wasm_wrapper.js", "draco_decoder.wasm", "draco_decoder.js",
+  ]);
+});
+
+test("direct KTX2 requests and parse-time codecs retain paths while empty KTX2 paths use module defaults", () => {
+  const requests = discover(`import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+    import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+    import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
+    const ktx = new KTX2Loader();
+    ktx.setTranscoderPath('basis/').setWorkerLimit(1).detectSupport(renderer);
+    ktx.setPath('textures/'); ktx.loadAsync('albedo.ktx2'); ktx.dispose();
+    new KTX2Loader().setTranscoderPath('').load('default.ktx2');
+    new GLTFLoader().setDRACOLoader(new DRACOLoader().setDecoderPath('draco/')).parseAsync(data, 'models/');`);
+  assert.deepEqual(requests.map(request => request.url), [
+    "textures/albedo.ktx2", "basis/basis_transcoder.js", "basis/basis_transcoder.wasm", "default.ktx2",
+    "draco/draco_wasm_wrapper.js", "draco/draco_decoder.wasm", "draco/draco_decoder.js",
+  ]);
+});
+
+test("custom managers, unproved receivers, dynamic codec paths and escaping codecs retain their host routes", () => {
+  const requests = discover(`import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+    import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+    import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
+    import { DRACOLoader as Foreign } from 'file:///other/DRACOLoader.js';
+    new Foreign().setDecoderPath('foreign/').load('foreign.drc');
+    new DRACOLoader(manager).setDecoderPath('managed/').load('managed.drc');
+    new GLTFLoader(manager).setDRACOLoader(new DRACOLoader().setDecoderPath('unused/')).load('managed.gltf');
+    const escaped = new DRACOLoader().setDecoderPath('escaped/');
+    arbitrary.setDRACOLoader(escaped); new GLTFLoader().setDRACOLoader(escaped).load('escaped.gltf');
+    const conditional = new DRACOLoader();
+    if (enabled) conditional.setDecoderPath('conditional/');
+    new GLTFLoader().setDRACOLoader(conditional).load('conditional.gltf');
+    new GLTFLoader().setDRACOLoader(new DRACOLoader().setDecoderPath(runtimePath)).load('dynamic.gltf');
+    const dictionary = {js:'aliased.js',wasm:'aliased.wasm'};
+    mutate(dictionary);
+    new GLTFLoader().setDRACOLoader(new DRACOLoader().setDecoderPath(dictionary)).load('dictionary.gltf');
+    const ktx = new KTX2Loader().setTranscoderPath('escaped-basis/');
+    mutate(ktx); new GLTFLoader().setKTX2Loader(ktx).load('basis.gltf');
+    const custom = new GLTFLoader(); custom.register(plugin); custom.load('plugin.gltf');`);
+  assert.deepEqual(requests.map(request => request.url), [
+    "escaped.gltf", "conditional.gltf", "dynamic.gltf", "dictionary.gltf", "basis.gltf",
+  ], "a source GLTF codec setter does not change the model URL, even when the codec itself is unproved");
+});
+
 function fixture(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "f3d-loader-assets-"));
   for (const [name, content] of Object.entries({ "package.json": '{"type":"module"}', ...files })) {
@@ -108,10 +189,15 @@ test("built FileLoader and GLTFLoader fetch original document-base URLs and exte
     "index.html": '<base href="./site/"><link rel="icon" href="resources/message%20%23.txt"><script type="module" src="../modules/app.mjs"></script>',
     "modules/app.mjs": `import { FileLoader } from ${JSON.stringify(coreUrl)};
       import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+      import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+      import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
       export async function load() {
         const loader = new FileLoader(); loader.setPath('resources/');
         const text = await loader.loadAsync('message%20%23.txt?edition=2#part');
-        const gltf = await new GLTFLoader().setPath('models/').setResourcePath('shared/').loadAsync('triangle.gltf?version=3#scene');
+        const draco = new DRACOLoader().setDecoderPath('codecs/draco/');
+        const ktx = new KTX2Loader(); ktx.setTranscoderPath('codecs/basis/');
+        const gltf = await new GLTFLoader().setDRACOLoader(draco).setKTX2Loader(ktx)
+          .setPath('models/').setResourcePath('shared/').loadAsync('triangle.gltf?version=3#scene');
         return { text, positions: [...gltf.scene.children[0].geometry.attributes.position.array] };
       }`,
     "site/resources/message #.txt": "document-relative bytes",
@@ -152,6 +238,53 @@ test("built FileLoader and GLTFLoader fetch original document-base URLs and exte
     if (OriginalProgressEvent === undefined) delete globalThis.ProgressEvent;
     else globalThis.ProgressEvent = OriginalProgressEvent;
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("configured source codec bytes and glTF sidecars retain document paths and prepared embedded resources", async () => {
+  const codecFiles = Object.fromEntries([
+    ...["draco_wasm_wrapper.js", "draco_decoder.wasm", "draco_decoder.js"].map(name => ["draco", name]),
+    ...["basis_transcoder.js", "basis_transcoder.wasm"].map(name => ["basis", name]),
+  ].map(([kind, name]) => [`site/codecs/${kind}/${name}`, fs.readFileSync(new URL(`examples/jsm/libs/${kind}/${name}`, rootUrl))]));
+  const model = JSON.stringify({ asset: { version: "2.0" },
+    buffers: [{ uri: "geometry.bin", byteLength: 4 }], images: [{ uri: "albedo.ktx2" }] });
+  const resources = {
+    ...codecFiles,
+    "site/models/scene.gltf": Buffer.from(model),
+    "site/shared/geometry.bin": Buffer.from([1, 2, 3, 4]),
+    "site/shared/albedo.ktx2": fs.readFileSync(new URL("examples/textures/ktx2/2d_etc1s.ktx2", rootUrl)),
+  };
+  for (const prepareStandaloneLoaders of [false, true]) {
+    // The standalone packer's existing contract excludes base elements. Prove
+    // authored document-base URLs in the networked build and the same bytes at
+    // explicit relative paths in the supported standalone document shape.
+    const prefix = prepareStandaloneLoaders ? "site/" : "";
+    const root = fixture({
+      "index.html": prepareStandaloneLoaders ? '<script type="module" src="modules/app.mjs"></script>'
+        : '<base href="./site/"><script type="module" src="../modules/app.mjs"></script>',
+      "modules/app.mjs": `import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+      import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+      import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
+      import { MeshoptDecoder } from ${JSON.stringify(rootUrl + "examples/jsm/libs/meshopt_decoder.module.js")};
+      export async function load(renderer) {
+        const draco = new DRACOLoader().setDecoderPath('${prefix}codecs/draco/').setDecoderConfig({type:'js'});
+        const ktx = new KTX2Loader(); ktx.setTranscoderPath('${prefix}codecs/basis/'); ktx.detectSupport(renderer);
+        const loader = new GLTFLoader(); loader.setDRACOLoader(draco); loader.setKTX2Loader(ktx);
+        loader.setMeshoptDecoder(MeshoptDecoder).setPath('${prefix}models/').setResourcePath('${prefix}shared/');
+        return loader.loadAsync('scene.gltf');
+      }`,
+      ...resources,
+    });
+    const built = await buildApplication(path.join(root, "index.html"),
+      path.join(root, prepareStandaloneLoaders ? "standalone" : "networked"), { prepareStandaloneLoaders });
+    for (const [name, bytes] of Object.entries(resources)) {
+      assert.deepEqual(fs.readFileSync(path.join(built.outDir, name)), bytes, `authored ${name} is byte-identical`);
+    }
+    if (!prepareStandaloneLoaders) continue;
+    const helper = fs.readFileSync(path.join(built.outDir, "f3d-loader-resources.mjs"), "utf8");
+    for (const [name, bytes] of Object.entries(resources)) {
+      assert.ok(helper.includes(bytes.toString("base64")), `${name} enters the existing embedded resource resolver`);
+    }
   }
 });
 

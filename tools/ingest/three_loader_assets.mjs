@@ -16,6 +16,19 @@ const CORE_LOADERS = new Set([
   "FileLoader", "AudioLoader", "BufferGeometryLoader", "ObjectLoader",
 ]);
 const SETTINGS = new Set(["setPath", "setResourcePath", "setCrossOrigin", "setWithCredentials", "setRequestHeader"]);
+const ADDON_SETTINGS = new Map([
+  ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
+  ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
+  ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
+]);
+const ADDON_USES = new Map([
+  ["GLTFLoader", new Set(["parse", "parseAsync"])],
+  ["DRACOLoader", new Set(["decodeDracoFile", "decodeGeometry"])],
+  ["KTX2Loader", new Set(["parse", "init", "detectSupportAsync"])],
+]);
+const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
+const isSetting = (loader, method) => SETTINGS.has(method) || ADDON_SETTINGS.get(loader)?.has(method);
+const isUse = (loader, method) => ["load", "loadAsync", "dispose"].includes(method) || ADDON_USES.get(loader)?.has(method);
 const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
 const SCOPE_TYPES = new Set([
   "Program", "BlockStatement", "StaticBlock", "SwitchStatement", "CatchClause",
@@ -70,7 +83,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
         if (core && imported === "DefaultLoadingManager") value = { manager: true };
         if ((core && CORE_LOADERS.has(imported)) ||
             (CORE_LOADERS.has(imported) && resolved === root + `src/loaders/${imported}.js`) ||
-            (imported === "GLTFLoader" && resolved === root + "examples/jsm/loaders/GLTFLoader.js")) {
+            (ADDON_SETTINGS.has(imported) && resolved === root + `examples/jsm/loaders/${imported}.js`)) {
           value = { loader: imported };
         }
       }
@@ -197,29 +210,66 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   const statementList = (node) => containing(ancestorsByNode.get(node) ?? [], (parent) => parent.type === "BlockStatement" || parent.type === "Program");
   const receiverSetter = (use, call) => {
     let receiver = use.callee.object;
-    while (receiver?.type === "CallExpression" && SETTINGS.has(memberName(receiver.callee))) {
+    while (receiver?.type === "CallExpression" && ALL_SETTINGS.has(memberName(receiver.callee))) {
       if (receiver === call) return true;
       receiver = receiver.callee.object;
     }
     return false;
+  };
+  // Only inline data dictionaries are inspected. A const object can still be
+  // mutated or aliased; its runtime URL configuration remains source-owned.
+  const decoderDictionary = (node) => {
+    if (node?.type !== "ObjectExpression" || node.properties.length !== 2) return null;
+    const values = new Map();
+    for (const property of node.properties) {
+      if (property.type !== "Property" || property.kind !== "init" || property.method || property.computed) return null;
+      const key = property.key.name ?? property.key.value;
+      if (!["js", "wasm"].includes(key) || values.has(key)) return null;
+      const candidates = finite(property.value);
+      if (!candidates) return null;
+      values.set(key, candidates);
+    }
+    return [...values.values()].flat();
+  };
+  const setting = (value, method, call) => {
+    if (!isSetting(value.loader, method)) return null;
+    if (method === "setPath" || method === "setResourcePath") {
+      const candidates = finite(call.arguments[0]);
+      if (!candidates) return null;
+      value[method === "setPath" ? "paths" : "resourcePaths"] = candidates;
+    } else if (method === "setDRACOLoader" || method === "setKTX2Loader") {
+      value.codecs.set(method, call.arguments[0]);
+    } else if (method === "setDecoderPath") {
+      const prefixes = finite(call.arguments[0]);
+      // The pinned string setter uses LoaderUtils.resolveURL: prefix + name.
+      // Preserve both source JS/Wasm branches; do not bake a host capability or
+      // decoderConfig.type into the artifact. The dictionary has no JS fallback.
+      value.codecUrls = prefixes
+        ? prefixes.flatMap(prefix => ["draco_wasm_wrapper.js", "draco_decoder.wasm", "draco_decoder.js"].map(name => prefix + name))
+        : decoderDictionary(call.arguments[0]);
+      if (!value.codecUrls || value.codecUrls.length > LIMIT) return null;
+    } else if (method === "setTranscoderPath") {
+      const prefixes = finite(call.arguments[0]);
+      if (!prefixes) return null;
+      // Empty selects the module-relative defaults, already emitted by the
+      // ordinary new URL(..., import.meta.url) asset path.
+      value.codecUrls = prefixes.filter(Boolean).flatMap(prefix => ["basis_transcoder.js", "basis_transcoder.wasm"].map(name => prefix + name));
+      if (value.codecUrls.length > LIMIT) return null;
+    }
+    return value;
   };
   const instance = (node, use, active = new Set()) => {
     if (node?.type === "NewExpression") {
       const loader = constructor(node.callee);
       // An application-supplied manager can map a logical URL to an unrelated
       // runtime resource. Keep that authored route without assuming disk files.
-      return loader && node.arguments.length === 0 ? { loader, paths: [""], resourcePaths: [""] } : null;
+      return loader && node.arguments.length === 0
+        ? { loader, paths: [""], resourcePaths: [""], codecs: new Map(), codecUrls: [] } : null;
     }
-    if (node?.type === "CallExpression" && SETTINGS.has(memberName(node.callee))) {
+    if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee))) {
       const value = instance(node.callee.object, use, active);
       if (!value) return null;
-      const setting = memberName(node.callee);
-      if (setting === "setPath" || setting === "setResourcePath") {
-        const candidates = finite(node.arguments[0]);
-        if (!candidates) return null;
-        value[setting === "setPath" ? "paths" : "resourcePaths"] = candidates;
-      }
-      return value;
+      return setting(value, memberName(node.callee), node);
     }
     if (node?.type !== "Identifier") return null;
     const binding = lookup(node.name, node);
@@ -228,10 +278,20 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     if (!value) return null;
     const mutations = [];
     for (const ref of refs.get(binding) ?? []) {
+      // Passing a codec to the pinned GLTFLoader is an understood consumer,
+      // not an arbitrary escape. Its setters retain the same codec object and
+      // do not change its path. Resolve only the receiving loader here, so
+      // inspecting a GLTF/codec relationship cannot recursively inspect itself.
+      const attached = ref.parent;
+      const attachment = memberName(attached?.callee);
+      if (attached?.type === "CallExpression" && attached.arguments[0] === ref.node &&
+          (value.loader === "DRACOLoader" && attachment === "setDRACOLoader" ||
+            value.loader === "KTX2Loader" && attachment === "setKTX2Loader") &&
+          instance(attached.callee.object, attached, new Set(active).add(binding))?.loader === "GLTFLoader") continue;
       const member = ref.parent, call = ref.ancestors.at(-3), method = memberName(member);
       if (member?.object !== ref.node || call?.type !== "CallExpression" || call.callee !== member ||
-          !(method === "load" || method === "loadAsync" || SETTINGS.has(method))) return null;
-      if (SETTINGS.has(method)) {
+          !(isUse(value.loader, method) || isSetting(value.loader, method))) return null;
+      if (isSetting(value.loader, method)) {
         // Standalone straight-line setters dominate subsequent loads in the
         // same statement list. Conditional or escaping mutations stay dynamic.
         if (receiverSetter(use, call)) continue; // Arguments are not part of the receiver chain.
@@ -241,10 +301,10 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
           const member = ref.ancestors[index - 1], next = ref.ancestors[index - 2];
           if (member?.type !== "MemberExpression" || member.object !== outer || next?.type !== "CallExpression" || next.callee !== member) break;
           const name = memberName(member);
-          if (!SETTINGS.has(name) && name !== "load" && name !== "loadAsync") return null;
-          if (SETTINGS.has(name)) settings.push({ call: next, method: name });
+          if (!isSetting(value.loader, name) && !isUse(value.loader, name)) return null;
+          if (isSetting(value.loader, name)) settings.push({ call: next, method: name });
           outer = next; index -= 2;
-          if (!SETTINGS.has(name)) break; // load() does not return the loader.
+          if (!isSetting(value.loader, name)) break; // load() does not return the loader.
         }
         const statement = ref.ancestors[index - 1], list = ref.ancestors[index - 2];
         if (statement?.type !== "ExpressionStatement" || statement.expression !== outer ||
@@ -254,10 +314,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
     mutations.sort((a, b) => a.call.start - b.call.start || a.call.end - b.call.end);
     for (const { call, method } of mutations) {
-      if (method !== "setPath" && method !== "setResourcePath") continue;
-      const candidates = finite(call.arguments[0]);
-      if (!candidates) return null;
-      value[method === "setPath" ? "paths" : "resourcePaths"] = candidates;
+      if (!setting(value, method, call)) return null;
     }
     return value;
   };
@@ -280,13 +337,22 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   };
   const requests = [];
   for (const call of calls) {
-    if (!["load", "loadAsync"].includes(memberName(call.callee))) continue;
+    const method = memberName(call.callee);
+    if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile"].includes(method)) continue;
     const value = instance(call.callee.object, call);
     if (!value) continue;
-    const urls = value.loader === "CubeTextureLoader" ? cubeUrls(call.arguments[0]) : finite(call.arguments[0]);
-    if (!urls || urls.length * value.paths.length * value.resourcePaths.length > LIMIT) continue;
-    for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
-      requests.push({ loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url });
+    if (["load", "loadAsync"].includes(method)) {
+      const urls = value.loader === "CubeTextureLoader" ? cubeUrls(call.arguments[0]) : finite(call.arguments[0]);
+      if (urls && urls.length * value.paths.length * value.resourcePaths.length <= LIMIT) {
+        for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
+          requests.push({ loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url });
+        }
+      }
+    } else if (!isUse(value.loader, method) && !(value.loader === "DRACOLoader" && method === "preload")) continue;
+    const codecs = value.loader === "GLTFLoader"
+      ? [...value.codecs.values()].map(node => instance(node, call)).filter(Boolean) : [value];
+    for (const codec of codecs) for (const url of codec.codecUrls) {
+      requests.push({ loader: codec.loader, url, resourcePath: "", path: "", originalUrl: url });
     }
   }
   return requests;
