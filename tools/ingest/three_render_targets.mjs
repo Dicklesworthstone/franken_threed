@@ -111,8 +111,8 @@ function inspectThreeRenderTargetColor(target, three, texture) {
   else if (texture.type === three.HalfFloatType && linear) format = 'rgba16float';
   else if (float32 && linear) format = floatFormat;
   else fail('UNSUPPORTED', 'Target color must be RGBA8, linear RGBA16F or linear R/RG/RGBA32F');
-  if (cube && (format !== 'rgba8unorm' || texture.generateMipmaps || texture.mipmaps?.length))
-    fail('UNSUPPORTED', 'Native cube targets currently require linear RGBA8 color at mip zero');
+  if (cube && texture.generateMipmaps)
+    fail('UNSUPPORTED', 'Native cube targets require authored mip levels with automatic generation disabled');
   if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
   let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
@@ -157,8 +157,11 @@ function inspectThreeRenderTargetColor(target, three, texture) {
   const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(target.width, target.height)));
   if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
   // Source Textures.getMipLevels uses authored descriptors before automatic
-  // generation. Render-target descriptors allocate levels, not uploaded pixels.
-  const mipLevelCount = texture.mipmaps?.length || (generateMipmaps ? maximumMipLevels : 1);
+  // generation. Uncompressed CubeTexture descriptors omit the base level:
+  // Textures.updateTexture adds it separately. Render-target descriptors
+  // allocate levels, not uploaded pixels.
+  const mipLevelCount = texture.mipmaps?.length ? texture.mipmaps.length + (cube ? 1 : 0)
+    : generateMipmaps ? maximumMipLevels : 1;
   if (mipLevelCount > maximumMipLevels) fail('SIZE', 'Too many target mip levels for its extent');
   const texelBytes = format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
   const layers = cube ? 6 : 1, baseColorBytes = target.width * target.height * texelBytes * layers;

@@ -52,8 +52,10 @@
  * Enable sampleDepth on the source and copyDestination on the destination.
  * Submission is synchronous; whenIdle includes validation and the copy fence.
  * No framebuffer emulation or frame loop.
- * cube:true admits six square single-sample mip-zero attachments. withFrame's
- * face selects one 2D attachment; depth borrowers retain the entire native cube.
+ * cube:true admits six square single-sample attachments, including authored
+ * color mip levels. withFrame's face and mipLevel select one 2D attachment;
+ * private depth is allocated at each selected mip across its six faces. Depth
+ * borrowers retain the entire native base-level cube.
  * readPixels({face}) and readDepthPixels({face}) select one explicit cube face,
  * retaining bounded staging, call-time submission and cancellation on disposal.
  * writePixels(data, {face}) and copyFrom(source, {sourceFace, face}) transfer
@@ -173,8 +175,8 @@ export function createGpuRenderTarget(device, options = {}) {
   if (typeof cube !== 'boolean') fail('OPTIONS', 'cube must be boolean');
   if (multiple && (cube || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1))
     fail('UNSUPPORTED', 'Multiple color attachments currently require 2D mip-zero targets');
-  if (cube && (sampleCount !== 1 || generateMipmaps || requestedMipLevels !== undefined && requestedMipLevels !== 1))
-    fail('UNSUPPORTED', 'Cube targets require one sample and mip zero');
+  if (cube && (sampleCount !== 1 || generateMipmaps))
+    fail('UNSUPPORTED', 'Cube targets require one sample and automatic mip generation disabled');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
     fail('OPTIONS', 'mipLevelCount must be a positive integer');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || typeof label !== 'string')
@@ -405,26 +407,33 @@ export function createGpuRenderTarget(device, options = {}) {
     if (mipLevel > 0 && (sampleCount !== 1 || sampleDepth))
       fail('MIP', 'Nonzero mip rendering requires single-sample color and private depth');
     if (!current || current.frames.has(mipLevel) || depthFormat === null) return 0;
-    return Math.max(1, Math.floor(width / 2 ** mipLevel)) * Math.max(1, Math.floor(height / 2 ** mipLevel)) * DEPTH_BYTES.get(depthFormat);
+    return Math.max(1, Math.floor(width / 2 ** mipLevel)) * Math.max(1, Math.floor(height / 2 ** mipLevel)) * DEPTH_BYTES.get(depthFormat) * layers;
   }
   function frameAt(mipLevel, bytes, face) {
-    if (cube) return current.cubeFrames[face];
-    if (current.frames.has(mipLevel)) return current.frames.get(mipLevel);
+    if (cube && mipLevel === 0) return current.cubeFrames[face];
+    if (current.frames.has(mipLevel)) {
+      const frame = current.frames.get(mipLevel);
+      return cube ? frame[face] : frame;
+    }
     if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     let depth = null;
     try {
       const frame = checked(() => {
-        const colorView = current.color.createView({baseMipLevel: mipLevel, mipLevelCount: 1});
+        const faces = Array.from({length: layers}, (_, index) => cube
+          ? {dimension: '2d', baseArrayLayer: index, arrayLayerCount: 1} : {});
+        const colorViews = faces.map(view => current.color.createView({baseMipLevel: mipLevel, mipLevelCount: 1, ...view}));
         if (depthFormat !== null) {
           depth = device.createTexture({label: `${label} mip ${mipLevel} depth`,
-            size: {width: Math.max(1, Math.floor(width / 2 ** mipLevel)), height: Math.max(1, Math.floor(height / 2 ** mipLevel)), depthOrArrayLayers: 1},
+            size: {width: Math.max(1, Math.floor(width / 2 ** mipLevel)), height: Math.max(1, Math.floor(height / 2 ** mipLevel)), depthOrArrayLayers: layers},
             format: depthFormat, dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 16});
         }
-        return Object.freeze({colorView, ...(depth ? {depthView: depth.createView()} : {})});
+        const frames = faces.map((view, index) => Object.freeze({colorView: colorViews[index],
+          ...(depth ? {depthView: depth.createView(view)} : {})}));
+        return cube ? Object.freeze(frames) : frames[0];
       });
       if (depth) current.mipDepths.set(mipLevel, depth);
       current.frames.set(mipLevel, frame); current.bytes += bytes;
-      return frame;
+      return cube ? frame[face] : frame;
     } catch (error) { depth?.destroy(); throw error; }
   }
   function selectedSlots(colorSlots) {

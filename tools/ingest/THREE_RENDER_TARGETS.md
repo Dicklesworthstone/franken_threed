@@ -141,14 +141,20 @@ cancels pending readbacks.
 
 ## Native cube color inputs
 
-The native `CubeRenderTarget` profile supports linear RGBA8 color with one sample
-and mip zero. `CubeCamera.update()` renders all six faces through the new backend;
-its color can then feed `TSL.cubeTexture()` graphs or ordinary Standard/Physical
-material environments. The source PMREM generator filters rendered cube faces
-into its HDR atlas before the material's consumer draw.
+The native `CubeRenderTarget` profile supports RGBA8 (linear or sRGB), linear
+RGBA16F and linear R/RG/RGBA32F color with one sample. `CubeCamera.update()` renders
+all six faces through the new backend; its color can then feed
+`TSL.cubeTexture()` graphs or ordinary Standard/Physical material environments.
+HDR captures retain their floating-point attachment precision. The source PMREM
+generator filters rendered cube faces into its HDR atlas before the material's
+consumer draw. Float32 sampling retains the existing `float32-filterable`
+capability requirement for linear filtering; nearest filtering remains available.
 
 ```js
-const cubeTarget = new THREE.CubeRenderTarget(256, {generateMipmaps: false});
+const cubeTarget = new THREE.CubeRenderTarget(256, {
+  type: THREE.HalfFloatType,
+  generateMipmaps: false,
+});
 const captureCamera = new THREE.CubeCamera(0.1, 100, cubeTarget);
 captureCamera.update(renderer, environmentScene);
 scene.environment = cubeTarget.texture;
@@ -163,8 +169,36 @@ replica. Samplers and resource generations are captured at the call boundary,
 while contents are observed at each ordered submission. Repeated cube captures
 and consumers can therefore share the image without losing intervening draws.
 Sampling the active destination, disposal and replaced target textures retain
-the existing feedback and stale-generation checks. HDR cube attachments,
-generated cube mips and source cube resizing remain separate gaps.
+the existing feedback and stale-generation checks.
+
+Authored cube mip levels can be rendered and sampled independently with automatic
+generation disabled. In pinned r186, an uncompressed cube's `texture.mipmaps`
+array describes levels **after** the base level, so three entries allocate four
+levels. Render-target descriptors allocate storage; they do not upload images.
+
+```js
+const cubeTarget = new THREE.CubeRenderTarget(8, {
+  type: THREE.HalfFloatType,
+  generateMipmaps: false,
+  minFilter: THREE.LinearMipmapLinearFilter,
+});
+cubeTarget.texture.mipmaps = [{}, {}, {}]; // 8x8, 4x4, 2x2 and 1x1 per face.
+renderer.setRenderTarget(cubeTarget, 5, 2); // -Z face, 2x2 mip.
+renderer.render(scene, camera);
+const halfFloatBits = await renderer.readRenderTargetMipPixelsAsync(
+  cubeTarget, 2, {face: 5},
+);
+```
+
+`CubeCamera.activeMipmapLevel` can also select each authored level before its six
+renders. A selected nonzero mip acquires a matching private six-face depth image,
+charged once to the shared budget and reused on subsequent face draws. Targets
+with an attached sampled `CubeDepthTexture` retain the existing base-level render
+restriction. Public source-shaped pixel reads still select mip zero; the explicit
+mip readback extension above selects higher levels. Automatic cube mip generation
+and plain source cube resizing remain outside the profile. Pinned
+`RenderTarget.setSize()` does not update the six cube face descriptors; applications
+can construct a cube target at the required size.
 
 Plain source `TSL.cubeTexture()` color nodes require a scene/material for their
 environment rotation and cannot run in the pinned source's context-free compute
@@ -180,6 +214,21 @@ execution, exact source-generated WGSL, shared graphics/compute color bindings
 with that explicit source node extension, the plain color node's compute-context
 limitation, PMREM composition, queue order, budgets and invalidation with a
 recording device.
+
+`node tools/ingest/three_render_target_cube_hdr_mips.test.mjs` checks source HDR
+formats and authored mip counts, all face/level attachments, private depth budgets,
+native sampled views, typed readbacks, generation invalidation and CubeCamera
+LOD rendering. Its device fixtures record submissions and copy independent byte
+arrays; they do not execute shaders or establish browser pixel parity.
+
+Chromium 151/SwiftShader checks, with the same identity-swizzle adapter on both
+renderers, matched r186 exactly for depthless RGBA16F/RGBA32F cubes: 12 base-face
+reads and 36 face/LOD samples across three levels, preserving negative values
+(-0.75 to -0.125) and HDR values (2.5 to 3.75), with zero GPU validation errors.
+Candidate-only private-depth checks also passed 36 direct mip reads plus rendering
+and sampling with zero errors. Those depth checks are not source parity evidence:
+pinned r186 attaches a six-layer depth view at nonzero cube mips, causing GPU
+validation errors.
 
 ## Reused fullscreen shader passes
 
