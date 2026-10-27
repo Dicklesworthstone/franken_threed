@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import {specializeMarchingCubesModule,specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
 import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_normals_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
+import {specializeTransformBatch} from './transform_batch_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
-const MATRICES='\0f3d-matrix-multiply-adapter';
+const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -23,13 +24,14 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if (importer===TRANSFORMS && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if ([ADAPTER,NORMALS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
@@ -38,11 +40,12 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===RUNTIME) return fs.readFileSync(new URL('./numeric_kernel_runtime.mjs',import.meta.url),'utf8');
       if (id===NORMALS) return fs.readFileSync(new URL('./geometry_normals_adapter.mjs',import.meta.url),'utf8');
       if (id===MATRICES) return fs.readFileSync(new URL('./matrix_multiply_adapter.mjs',import.meta.url),'utf8');
+      if (id===TRANSFORMS) return fs.readFileSync(new URL('./transform_batch_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -72,6 +75,11 @@ export function marchingCubesRollupPlugin(options={}) {
           if(matrix.report)matrixReports.push({id,...matrix.report});
           if(matrix.changed){edits.push(...matrix.edits);headers.push(matrix.header);tail+=matrix.tail;}
         }
+        if(code.includes('class Object3D')) {
+          const batch=specializeTransformBatch(code,{runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
+          if(batch.report)transformReports.push({id,...batch.report});
+          if(batch.changed){edits.push(...batch.edits);headers.push(batch.header);}
+        }
         if(!headers.length)return null;
         let transformed=code;
         for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
@@ -94,6 +102,8 @@ export function marchingCubesRollupPlugin(options={}) {
       getGeometryNormalsReport(){return {version:1,accelerationClaim:false,
         compiledModules:normalReports.filter(report=>report.compiledMethods.length).length,modules:normalReports.map(report=>({...report}))};},
       getMatrixMultiplicationReport(){return {version:1,accelerationClaim:false,
-        compiledModules:matrixReports.length,modules:matrixReports.map(report=>({...report}))};}},
+        compiledModules:matrixReports.length,modules:matrixReports.map(report=>({...report}))};},
+      getTransformBatchesReport(){return {version:1,accelerationClaim:false,
+        compiledModules:transformReports.length,modules:transformReports.map(report=>({...report}))};}},
   };
 }

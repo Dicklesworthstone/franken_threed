@@ -15,13 +15,16 @@ const wasm=data(host,'WebAssembly'),platform=[],surfaces=[];
 const remember=(object,key)=>platform.push([object,key,descriptor(object,key)]);
 const surface=object=>{const keys=ownKeys(object);surfaces.push([object,prototype(object),keys]);
   for(let i=0;i<keys.length;i++)remember(object,keys[i]);};
-for(const name of ['globalThis','WebAssembly','Array','Object','Number','JSON','Map','Set','TextDecoder','ArrayBuffer'])remember(host,name);
+for(const name of ['globalThis','WebAssembly','Array','Object','Number','JSON','Map','Set','TextDecoder','ArrayBuffer','Error'])remember(host,name);
 for(const [object,keys]of [
   [Array,['isArray',Symbol.species]],[Object,['freeze']],[Number,['isInteger','isSafeInteger']],
   [JSON,['parse']],[Map.prototype,['get','set','has',Symbol.iterator]],
   [Set.prototype,['has','add',Symbol.iterator]],
 ])for(const key of keys)remember(object,key);
 surface(Object.prototype);surface(Array.prototype);surface(U8.prototype);surface(F64.prototype);
+// Budget failures construct NumericKernelGuardError and use instanceof. Keep
+// their inherited name/code setters and Symbol.hasInstance route callback-free.
+surface(Error);surface(Error.prototype);surface(Function.prototype);
 for(const iterator of [[][Symbol.iterator](),new Map()[Symbol.iterator](),new Set()[Symbol.iterator]()])
   remember(prototype(iterator),'next');
 remember(ArrayBuffer.prototype,'byteLength');
@@ -122,4 +125,16 @@ export function tryMatrixMultiply(owner,token,left,right) {
 }
 export function matrixMultiplyDiagnostics(object) {
   return freeze({...apply(mapGet,statistics,[object])??{wasmCalls:0,fallbackCalls:0,lastFailure:null}});
+}
+
+/** Compiler-private shared proof for a larger source-derived transform batch.
+ * Callers validate the platform before borrowing these ordinary numeric cells. */
+export function matrixNumericPlatformIntact(){return platformIntact();}
+export function matrixNumericElements(matrix,writable=false){
+  if(!apply(setHas,owners,[matrix]))return null;
+  const array=data(matrix,'elements');if(!apply(setHas,arrays,[array]))return null;
+  for(let i=0;i<16;i++){
+    const d=own(array,i);if(!d || typeof d.value!=='number' || (writable && !d.writable))return null;
+  }
+  return array;
 }
