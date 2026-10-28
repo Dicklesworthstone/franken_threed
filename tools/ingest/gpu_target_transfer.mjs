@@ -4,8 +4,8 @@
  * half-floats are Uint16 bit patterns and float32 payloads are never converted.
  * Copies are raw GPU copies (including copy-compatible sRGB format pairs), not
  * color-space conversion, blending, resizing or an MSAA destination resolve.
- * Cube endpoints require explicit face/sourceFace indices; every operation
- * addresses one 2D face, never the whole cube or an implicit active face.
+ * Cube/array endpoints require explicit face/sourceFace indices; every
+ * operation addresses one 2D layer, never an implicit active rendering layer.
  * colorIndex/sourceColorIndex select independent MRT attachments, defaulting to
  * zero. Their formats, not the primary attachment, determine layouts and budgets.
  * R8 uses one byte per texel; R11G11B10 uses one Uint32 packed word per texel.
@@ -57,10 +57,12 @@ function layout(shape, colorIndex = 0) {
   return value;
 }
 function transferFace(shape, face, name) {
-  const cube = shape.cube === true;
-  if (face === undefined && !cube) face = 0;
-  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
-    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five` : `${name} must be zero for a 2D target`);
+  const cube = shape.cube === true, layers = cube ? 6 : shape.layers ?? 1;
+  const array = shape.array === true || layers > 1;
+  if (face === undefined && !cube && !array) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
+    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five`
+      : array ? `${name} must explicitly select an allocated array layer` : `${name} must be zero for a 2D target`);
   return face;
 }
 function region(w, h, x, y, width, height) {

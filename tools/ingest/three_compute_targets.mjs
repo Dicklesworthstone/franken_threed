@@ -156,7 +156,8 @@ export function createThreeComputeTargets({targets, device, signal = null,
       let view = views.get(texture);
       if (!view) {
         view = native(() => texture.createView({dimension: source.viewDimension, baseMipLevel: 0, mipLevelCount: source.depth ? 1 : source.entry.shape.mipLevelCount,
-          ...(source.viewDimension === 'cube' ? {baseArrayLayer: 0, arrayLayerCount: 6} : {}),
+          ...(['cube', '2d-array'].includes(source.viewDimension) ? {baseArrayLayer: 0,
+            arrayLayerCount: source.depth ? source.entry.shape.depthLayers ?? source.entry.shape.layers : source.entry.shape.layers} : {}),
           ...(source.depth ? {aspect: 'depth-only'} : {})}));
         views.set(texture, view);
       }

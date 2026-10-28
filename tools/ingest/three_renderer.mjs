@@ -701,7 +701,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (target !== null) {
         if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Custom output targets require the native WebGPU route');
         const shape = this._targets.capture(target).shape;
-        if (target.isCubeRenderTarget || shape.textures.length !== 1)
+        if (target.isCubeRenderTarget || shape.array || shape.textures.length !== 1)
           fail('UNSUPPORTED', 'Custom output targets require one 2D color attachment');
       }
       this._outputRenderTarget = target;

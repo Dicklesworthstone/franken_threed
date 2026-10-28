@@ -174,3 +174,52 @@ test('empty suspended cube depth copies still require faces and submit nothing',
   assert.equal(f.buffers.length, 0); assert.equal(f.textures.length, 0); assert.equal(f.submissions.length, 0);
   source.dispose(); destination.dispose();
 });
+
+
+test('array depth transfers select independent layers and preserve other depth, color and stencil contents', async t => {
+  const f = setup({cube: false, arrayLayers: 3, depthArray: true, depthFormat: 'depth24plus-stencil8'},
+    {cube: false, arrayLayers: 5, depthArray: true, depthFormat: 'depth24plus-stencil8'});
+  t.after(() => { f.source.dispose(); f.destination.dispose(); });
+  const expected = f.b.depth.data.slice(), colors = f.b.color.data.slice();
+  for (let sourceFace = 0; sourceFace < 3; sourceFace++) {
+    const face = 4 - sourceFace;
+    f.destination.copyDepthFrom(f.source, {sourceFace, face});
+    expected.set(f.a.depth.data.subarray(sourceFace * 16, (sourceFace + 1) * 16), face * 16);
+    const pass = f.submissions.at(-1)[0][0];
+    assert.equal(pass.group.entries[0].resource.options.baseArrayLayer, sourceFace);
+    assert.equal(pass.desc.depthStencilAttachment.view.options.baseArrayLayer, face);
+    assert.equal(pass.desc.depthStencilAttachment.stencilReadOnly, true);
+  }
+  assert.deepEqual(f.b.depth.data, expected); assert.deepEqual(f.b.color.data, colors);
+  assert.ok(f.b.depth.stencil.every(value => value === 93));
+  assert.equal(f.pipelines.length, 1);
+  assert.throws(() => f.destination.copyDepthFrom(f.source, {sourceFace: 3, face: 0}), code('FACE'));
+  assert.throws(() => f.destination.copyDepthFrom(f.source, {sourceFace: 0, face: 5}), code('FACE'));
+  assert.deepEqual(await f.destination.readDepthPixels({face: 4}), f.a.depth.data.slice(0, 16));
+  await f.destination.whenIdle(); assert.ok(f.buffers.every(buffer => buffer.destroyCount === 1));
+});
+
+test('array color with shared 2D depth copies only its one depth attachment into an array layer', async t => {
+  const f = setup({cube: false, arrayLayers: 3}, {cube: false, arrayLayers: 3, depthArray: true});
+  t.after(() => { f.source.dispose(); f.destination.dispose(); });
+  f.destination.copyDepthFrom(f.source, {face: 2});
+  assert.deepEqual(await f.destination.readDepthPixels({face: 2}), f.a.depth.data);
+  assert.throws(() => f.destination.copyDepthFrom(f.source, {sourceFace: 2, face: 0}), code('FACE'));
+  await f.destination.whenIdle();
+});
+
+test('a selected private MSAA array depth layer receives every source sample without allocating an illegal MSAA array', async t => {
+  const f = depthDevice(), source = make(f, {cube: false, sampleCount: 4}),
+    destination = make(f, {cube: false, arrayLayers: 3, depthArray: true, sampleCount: 4, sampleDepth: false});
+  t.after(() => { source.dispose(); destination.dispose(); });
+  const input = storage(source).depth; input.data.set(Float32Array.from(input.data, (_, i) => i / 64));
+  const outputs = [];
+  for (let face = 0; face < 3; face++) destination.withFrame(frame => outputs.push(frame.depthView.texture), {face});
+  assert.equal(new Set(outputs).size, 3);
+  assert.ok(outputs.every(texture => texture.depthOrArrayLayers === 1 && texture.sampleCount === 4));
+  destination.copyDepthFrom(source, {face: 2});
+  assert.deepEqual(outputs[2].data, input.data);
+  assert.ok(outputs[0].data.every(value => value === 0)); assert.ok(outputs[1].data.every(value => value === 0));
+  assert.match(f.pipelines[0].desc.fragment.module.code, /@builtin\(sample_index\)/);
+  await destination.whenIdle();
+});

@@ -156,3 +156,53 @@ test('2D read defaults still work and do not silently interpret cube face select
     await assert.rejects(f.target[method]({face: 1}), {code: 'GPU_READBACK_FACE'});
   assert.equal(f.target.failed, false);
 });
+
+
+test('array color and depth reads preserve each selected layer and its call-time contents', async t => {
+  const f = fixture({cube: false, arrayLayers: 3, depthArray: true, width: 4, height: 2});
+  t.after(() => f.target.dispose());
+  for (let face = 0; face < 3; face++) f.paint(face, 31 + face, (face + 1) / 4);
+  const reads = Array.from({length: 3}, (_, face) => [f.target.readPixels({face}), f.target.readDepthPixels({face})]);
+  assert.equal(f.target.diagnostics.pendingReadbacks, 6);
+  f.paint(1, 99, .875); f.finish();
+  for (const [face, pair] of reads.entries()) {
+    const [color, depth] = await Promise.all(pair);
+    assert.deepEqual([...color], Array(32).fill(31 + face));
+    assert.deepEqual([...depth], Array(8).fill((face + 1) / 4));
+  }
+  assert.deepEqual(f.reads.map(read => read.source.origin.z), [0, 1, 2]);
+  assert.deepEqual(f.depthViews.map(view => view.baseArrayLayer), [0, 1, 2]);
+  assert.ok(f.calls.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(f.target.diagnostics.pendingReadbacks, 0);
+  for (const method of ['readPixels', 'readDepthPixels'])
+    for (const face of [undefined, -1, 3, .5]) await assert.rejects(f.target[method]({face}), {code: 'GPU_READBACK_FACE'});
+  assert.equal(f.target.failed, false);
+});
+
+test('array readback resize retains every old layer until submitted-use fences finish', async t => {
+  const f = fixture({cube: false, arrayLayers: 3, depthArray: true, width: 4, height: 2});
+  t.after(() => f.target.dispose()); f.paint(2, 63, .75);
+  const color = f.target.readPixels({face: 2}), depth = f.target.readDepthPixels({face: 2});
+  const old = f.calls.textures.slice(), fence = deferred(); f.controls.completion = fence;
+  f.target.resize(2, 1); f.paint(2, 79, .5); const next = f.target.readPixels({face: 2});
+  assert.ok(old.every(texture => texture.destroyed === 0));
+  assert.equal(f.target.allocatedBytes, (4 * 2 + 2 * 1) * 3 * 8);
+  f.finish(); assert.deepEqual([...await color], Array(32).fill(63));
+  assert.deepEqual([...await depth], Array(8).fill(.75));
+  assert.deepEqual([...await next], Array(8).fill(79));
+  fence.resolve(); await f.target.whenIdle();
+  assert.ok(old.every(texture => texture.destroyed === 1));
+  assert.equal(f.target.allocatedBytes, 2 * 1 * 3 * 8);
+});
+
+test('array color layers retain one shared ordinary depth attachment when per-layer depth was not requested', async t => {
+  const f = fixture({cube: false, arrayLayers: 3, depthArray: false, width: 4, height: 2});
+  t.after(() => f.target.dispose());
+  f.paint(0, 11, .25); f.paint(2, 33, .75);
+  const color = f.target.readPixels({face: 0}), depth = f.target.readDepthPixels(); f.finish();
+  assert.deepEqual([...await color], Array(32).fill(11));
+  assert.deepEqual([...await depth], Array(8).fill(.75));
+  assert.equal(f.depthViews[0].baseArrayLayer, 0);
+  await assert.rejects(f.target.readDepthPixels({face: 2}), {code: 'GPU_READBACK_FACE'});
+  assert.equal(f.target.allocatedBytes, 4 * 2 * (3 * 4 + 4));
+});

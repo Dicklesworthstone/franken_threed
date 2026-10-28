@@ -247,6 +247,16 @@ function createThreeCompute(renderer, three) {
       binding.isSampledTexture || binding.isSampler
         ? textureOwner.layoutOf(textureBinding(binding)) : null)));
   }
+  class NativeComputeNodeBuilder extends three.WGSLNodeBuilder {
+    getUniformFromNode(node, ...args) {
+      // TextureNode asks for its uniform before selecting array coordinates.
+      // Prepare target-owned depth metadata here so even Fn-created textures
+      // use the effective source dimension on their first compute-only use.
+      if (node.value?.isDepthTexture === true && node.value.renderTarget != null)
+        textureOwner.sampleData(node.value);
+      return super.getUniformFromNode(node, ...args);
+    }
+  }
   function program(node) {
     live(); workgroupSize(node);
     if (building.has(node)) fail('REENTRY', 'A compute node cannot initialize or compile itself recursively');
@@ -256,7 +266,7 @@ function createThreeCompute(renderer, three) {
       const key = `${node.version}/${node.workgroupSize.join(',')}`;
       let entry = programs.get(node);
       if (entry?.key === key && entry.textureSignature === textureSignature(entry.groups)) return entry;
-      const builder = new three.WGSLNodeBuilder(null, renderer);
+      const builder = new NativeComputeNodeBuilder(null, renderer);
       builder.compute = node; builder.build();
       const groups = builder.getBindings();
       for (const group of groups) for (const binding of group.bindings) {

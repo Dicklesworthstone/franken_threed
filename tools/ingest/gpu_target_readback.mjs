@@ -3,8 +3,8 @@
  * mipLevel selects an allocated color mip; bounds and omitted extents are local
  * to that mip, including NPOT and 1D tails. No implicit downsampling is performed.
  * BGRA targets return RGBA bytes; float32 targets preserve full precision and
- * half-float values remain their original Uint16 bit patterns. Cube reads require
- * an explicit face (0..5); 2D reads accept only face zero, which is the default.
+ * half-float values remain their original Uint16 bit patterns. Cube/array reads
+ * require an explicit allocated face/layer; ordinary 2D reads default to zero.
  * Selection is captured before submission, independently of the rendering face.
  * colorIndex selects a resolved MRT attachment; its own format controls the
  * output type, component count, channel conversion and shared byte charge.
@@ -37,11 +37,14 @@ const FORMATS = new Map([
 // A cube's active rendering face is not readback state. Require the caller to
 // select it explicitly, including for empty requests, rather than quietly
 // returning +X. A 2D target retains its existing default face-zero behavior.
-function readbackFace(shape, face) {
+function readbackFace(shape, face, depth = false) {
   const cube = shape?.cube === true;
-  if (face === undefined && !cube) face = 0;
-  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
-    fail('FACE', cube ? 'Cube readback requires an explicit face from zero to five' : '2D readback requires face zero');
+  const layers = depth ? shape?.depthLayers ?? (cube ? 6 : shape?.layers ?? 1) : cube ? 6 : shape?.layers ?? 1;
+  const array = (depth ? shape?.depthArray : shape?.array) === true || layers > 1;
+  if (face === undefined && !cube && !array) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
+    fail('FACE', cube ? 'Cube readback requires an explicit face from zero to five'
+      : array ? 'Array readback requires an explicit allocated layer' : '2D readback requires face zero');
   return face;
 }
 
@@ -239,7 +242,7 @@ export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, 
     if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fffffff)
       fail('SOURCE', 'Expected finite integer depth dimensions');
   const shape = session.diagnostics?.target ?? session.diagnostics;
-  face = readbackFace(shape, face);
+  face = readbackFace(shape, face, true);
   if (!DEPTH_FORMATS.has(shape?.depthFormat)) fail('FORMAT', 'Expected a depth attachment');
   if (shape.sampleDepth === false) fail('SOURCE', 'Enable sampleDepth before reading depth');
   const samples = shape.sampleCount;

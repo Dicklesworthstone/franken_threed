@@ -568,13 +568,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
     const framebuffer = texture?.isFramebufferTexture === true;
-    const target = texture?.isRenderTargetTexture === true;
-    const array = texture?.isDataArrayTexture === true || storage && texture.isArrayTexture === true;
+    const target = texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true && texture.renderTarget != null;
+    const targetLayout = target && texture instanceof three.Texture
+      ? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false}) : null;
+    // The shared target owner initializes attached depth dimensions before
+    // WGSLNodeBuilder selects its texture type and implicit array coordinates.
+    const array = texture?.isDataArrayTexture === true || (storage || target) && texture.isArrayTexture === true;
     const volume = storage && texture.is3DTexture === true;
     if (!(texture instanceof three.Texture) ||
         texture.is3DTexture && !volume || volume && (array || texture.isCubeTexture) ||
         texture.isArrayTexture && !array || texture.isData3DTexture ||
-        array && !storage && !(texture instanceof three.DataArrayTexture) ||
+        array && !storage && !target && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isExternalTexture)
       fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, data or decoded cube faces, 2D/array/3D storage and target-owned color/depth textures');
@@ -638,8 +642,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {primarySamples} = renderer.backend.utils.getTextureSampleData(texture), multisampled = primarySamples > 1;
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
-    const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || integerData || framebuffer || target && viewDimension === 'cube') && !layout?.texture)
+    const layout = targetLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
+    if ((storage || integerData || framebuffer || target && ['cube', '2d-array'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
@@ -893,8 +897,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           fail('TEXTURE', 'Native comparison sampling requires an attached depth texture with a comparison function');
       }
       if (node.depthNode !== null && node.value?.isDataArrayTexture !== true &&
-          !(node.value?.isStorageTexture === true && node.value.isArrayTexture === true))
-        fail('TEXTURE', 'Native layer coordinates require a source DataArrayTexture or StorageArrayTexture');
+          !(node.value?.isArrayTexture === true && (node.value.isStorageTexture === true ||
+            node.value.isRenderTargetTexture === true || node.value.isDepthTexture === true && node.value.renderTarget != null)))
+        fail('TEXTURE', 'Native layer coordinates require source data, storage or target-owned array textures');
     } else if (node.constructor === three.PMREMNode) inspectPMREMNode(node);
     else if (node.value?.isTexture)
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');

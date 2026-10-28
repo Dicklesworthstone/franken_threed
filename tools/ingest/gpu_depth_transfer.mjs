@@ -2,8 +2,8 @@
  * Owners must keep both attachments borrowed until submitGpuDepthCopy returns.
  * Submission is synchronous; its promise covers validation and GPU completion.
  * The only transient allocation is a bounded 32-byte uniform per pending copy.
- * Cube endpoints explicitly select sourceFace/face; each view addresses one
- * depth-only 2D face. No cube filtering or extra color attachment is introduced.
+ * Cube/array depth endpoints explicitly select sourceFace/face; each view
+ * addresses one depth-only 2D layer. No filtering or extra color is introduced.
  */
 export class GpuDepthTransferError extends Error {
   constructor(code, message) {
@@ -22,10 +22,12 @@ const integer = (value, label, min = 0, max = Number.MAX_SAFE_INTEGER) => {
 };
 const states = new WeakMap(), admittedPlans = new WeakSet(), UNIFORM_BYTES = 32;
 function depthFace(shape, face, name) {
-  const cube = shape.cube === true;
-  if (face === undefined && !cube) face = 0;
-  if (!Number.isSafeInteger(face) || face < 0 || face >= (cube ? 6 : 1))
-    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five` : `${name} must be zero for a 2D target`);
+  const cube = shape.cube === true, layers = shape.depthLayers ?? (cube ? 6 : shape.layers ?? 1);
+  const array = (shape.depthArray ?? shape.array) === true || layers > 1;
+  if (face === undefined && !cube && !array) face = 0;
+  if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
+    fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five`
+      : array ? `${name} must explicitly select an allocated depth layer` : `${name} must be zero for a 2D depth attachment`);
   if (cube && (shape.width !== shape.height || shape.sampleCount !== 1))
     fail('SOURCE', 'Cube depth transfers require square single-sample faces');
   return face;
@@ -85,7 +87,7 @@ export function inspectGpuDepthCopy(source, destination, options = {}) {
     sourceFormat: source.depthFormat, format: destination.depthFormat,
     sourceSampleCount: source.sampleCount, sampleCount: destination.sampleCount,
     mode, sampleIndex: sampleIndex ?? 0, maxInFlightBytes,
-    sourceFace, face, sourceLayers: source.cube === true ? 6 : 1,
+    sourceFace, face, sourceLayers: source.depthLayers ?? (source.cube === true ? 6 : source.layers ?? 1),
   });
   admittedPlans.add(plan);
   return plan;
