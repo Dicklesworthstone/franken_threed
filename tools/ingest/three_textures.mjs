@@ -542,7 +542,9 @@ export function createGpuThreeTextures(device,{
           if(!resource){
             const texture=native(()=>device.createTexture({label,size:[d.width,d.height,d.layers],format:d.format,
               ...(d.layered?{dimension:d.volume?'3d':'2d'}:{}),
-              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral||d.blockUploads?2|4:2|4|16}));
+              // COPY_SRC lets captured sampled inputs feed native texture copies.
+              // The allocation, upload versions and disposal owner stay shared.
+              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral||d.blockUploads?1|2|4:1|2|4|16}));
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;

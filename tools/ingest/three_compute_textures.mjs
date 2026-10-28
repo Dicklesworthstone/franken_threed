@@ -456,6 +456,36 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding, captureShared,
+    /** Metadata and a synchronous native borrow for source-shaped copies.
+     * These use the SAME immutable upload history as material/compute reads.
+     * Never expose the caller's mutable CPU image as the queued copy source. */
+    copyShape(snapshot) {
+      live();
+      if (!leases.has(snapshot) || snapshot.sampler)
+        fail('BINDING', 'Texture copies require an owned sampled-texture lease');
+      validate(snapshot);
+      const shape = sourcePool().inspect(snapshot.record.texture);
+      return Object.freeze({width: shape.width, height: shape.height, depth: shape.layers,
+        mipLevelCount: shape.levels, format: shape.format,
+        viewDimension: shape.cube ? '2d-array' : shape.viewDimension});
+    },
+    withTexture(snapshot, run) {
+      live();
+      if (!leases.has(snapshot) || snapshot.sampler || typeof run !== 'function')
+        fail('BINDING', 'Expected an owned sampled-texture lease and synchronous copy callback');
+      if (resolving) fail('REENTRY', 'Cannot borrow a texture during another native texture operation');
+      this.resolve(snapshot);
+      resolving = true;
+      try {
+        const result = run(sourcePool().nativeTexture(snapshot.record.texture));
+        if (result?.then) {
+          Promise.resolve(result).catch(() => {});
+          fail('ASYNC_USE', 'Native texture borrows cannot cross an await');
+        }
+        live(); validate(snapshot);
+        return result;
+      } finally { resolving = false; if (poolDirty) syncPool(); }
+    },
     prepareFramebuffer(texture, type) { live(); framebuffers().prepareFramebuffer(texture, type); },
     captureFramebuffer(texture, options) { live(); return framebuffers().captureFramebuffer(texture, options); },
     encodeFramebufferCopy(snapshot, encoder, source) { live(); return framebuffers().encodeFramebufferCopy(snapshot, encoder, source); },
