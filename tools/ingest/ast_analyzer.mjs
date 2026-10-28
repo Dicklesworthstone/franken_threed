@@ -742,6 +742,72 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       }
     }
   };
+  // A direct call to an immutable local function is another part of this
+  // ownership graph, not an opaque consumer. Flow its actual resources into
+  // the lexical parameter cells; the ordinary sinks below then examine the
+  // body, nested calls and closures with the same conservative rules. Returning
+  // a resource still escapes: this does not invent a call-result alias model.
+  const helperTargets = new Map(), helperWrites = new Set(), helperSafety = new WeakMap();
+  const patternIdentifiers = pattern => {
+    if (!pattern) return [];
+    if (pattern.type === "Identifier") return [pattern];
+    if (pattern.type === "AssignmentPattern") return patternIdentifiers(pattern.left);
+    if (pattern.type === "RestElement") return patternIdentifiers(pattern.argument);
+    if (pattern.type === "ArrayPattern") return pattern.elements.flatMap(patternIdentifiers);
+    if (pattern.type === "ObjectPattern") return pattern.properties.flatMap(property =>
+      patternIdentifiers(property.type === "RestElement" ? property.argument : property.value));
+    return [];
+  };
+  const registerHelper = (cell, fn) => {
+    if (!cell) return;
+    if (helperTargets.has(cell) && helperTargets.get(cell) !== fn) helperTargets.set(cell, null);
+    else helperTargets.set(cell, fn);
+  };
+  for (const node of nodes) {
+    if (functions.has(node.type) && node.id) {
+      registerHelper(scopes.get(node)?.get(node.id.name), node);
+      if (node.type === "FunctionDeclaration") {
+        let scope = parents.get(node);
+        while (scope && !lexical.has(scope.type)) scope = parents.get(scope);
+        registerHelper(scopes.get(scope)?.get(node.id.name), node);
+      }
+    } else if (node.type === "VariableDeclarator") {
+      for (const identifier of patternIdentifiers(node.id)) {
+        registerHelper(binding(identifier), parents.get(node)?.kind !== "var" && node.id.type === "Identifier" &&
+          functions.has(node.init?.type) ? node.init : null);
+      }
+    }
+    const target = node.type === "AssignmentExpression" ? node.left : node.type === "UpdateExpression" ? node.argument :
+      ["ForInStatement", "ForOfStatement"].includes(node.type) && node.left.type !== "VariableDeclaration" ? node.left : null;
+    for (const identifier of patternIdentifiers(target)) helperWrites.add(binding(identifier));
+  }
+  // Function declarations have registered outer and recursive-name cells.
+  // A write through either spelling invalidates every call to that function.
+  const reassignedHelpers = new Set();
+  for (const [cell, fn] of helperTargets)
+    if (fn && helperWrites.has(cell)) reassignedHelpers.add(fn);
+  const localHelper = call => {
+    if (call.type !== "CallExpression" || call.arguments.some(value => value.type === "SpreadElement")) return null;
+    const callee = call.callee;
+    const fn = functions.has(callee.type) ? callee : callee.type === "Identifier" && !helperWrites.has(binding(callee))
+      ? helperTargets.get(binding(callee)) : null;
+    if (!fn || reassignedHelpers.has(fn)) return null;
+    if (!helperSafety.has(fn)) {
+      const names = new Set(fn.params.filter(value => value.type === "Identifier").map(value => value.name));
+      let safe = !fn.async && !fn.generator && names.size === fn.params.length && !names.has(fn.id?.name);
+      // `arguments` can expose the original call frame without referring to a
+      // parameter. A var/function redeclaration of a parameter also needs a
+      // shared binding model that this lexical proof deliberately does not use.
+      walk.full(fn.body, value => {
+        if (value.type === "Identifier" && value.name === "arguments" ||
+            value.type === "VariableDeclaration" && value.kind === "var" && value.declarations.some(declaration =>
+              [...collectPatternIdentifiers(declaration.id)].some(name => names.has(name))) ||
+            value.type === "FunctionDeclaration" && names.has(value.id?.name)) safe = false;
+      });
+      helperSafety.set(fn, safe);
+    }
+    return helperSafety.get(fn) ? fn : null;
+  };
   // A bounded fixpoint covers aliases assigned before their source declaration,
   // closures and later reassignments without simulating application control flow.
   for (let iteration = 0; iteration < 64; iteration++) {
@@ -761,6 +827,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
         mark(node.arguments[0], CANVAS);
       }
+      const helper = localHelper(node);
+      if (helper) for (let index = 0; index < helper.params.length; index++)
+        mark(helper.params[index], kind(node.arguments[index]));
     }
     if (!changed) break;
     if (iteration === 63) report(ast, "alias-analysis-limit");
@@ -935,7 +1004,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         report(node, "opaque-eval");
       for (const [index, argument] of node.arguments.entries()) {
         const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
-        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index))
+        const helper = localHelper(node);
+        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) &&
+            !(helper && index < helper.params.length))
           report(node, "opaque-call-argument");
       }
     } else if (node.type === "AssignmentExpression") {
