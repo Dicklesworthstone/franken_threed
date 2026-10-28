@@ -15,6 +15,7 @@
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
@@ -382,8 +383,23 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             const nested = compileLoop(statement, depth);
             bytes.push(...nested.bytes);
             advance(nested.completions);
+          } else if (control && statement.type === 'SwitchStatement') {
+            const discriminant = expression(statement.discriminant);
+            const parent = environment, parentDepth = controlDepth;
+            environment = new Map(parent);
+            loopControls.push({breakDepth:parentDepth});
+            controlDepth += 2;
+            try {
+              for (const name of numericSwitchBindings(statement, fail)) environment.set(name, null);
+              const nested = compileNumericSwitch(statement, {discriminant, expression, allocateLocal,
+                compileCase:branch => block(branch.consequent, depth + 1),
+              });
+              bytes.push(...nested.bytes);
+              advance(nested.completions);
+            } finally { environment = parent; controlDepth = parentDepth; loopControls.pop(); }
           } else if (control && ['BreakStatement', 'ContinueStatement'].includes(statement.type)) {
-            const target = loopControls.at(-1);
+            const target = statement.type === 'BreakStatement' ? loopControls.at(-1)
+              : loopControls.findLast(target => target.continueDepth !== undefined);
             if (statement.label || !target) fail('Helper loop control requires an enclosing loop and no label', statement);
             const label = statement.type === 'BreakStatement' ? target.breakDepth : target.continueDepth;
             bytes.push(0x0c, ...u32(controlDepth - 1 - label));

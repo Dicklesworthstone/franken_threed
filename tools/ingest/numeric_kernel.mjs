@@ -14,6 +14,7 @@
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -715,8 +716,32 @@ export function compileNumericKernel(source, {
           bytes.push(0x0b);
           continue;
         }
+        if (generalControl && statement.type === 'SwitchStatement') {
+          // Case declarations shadow case tests/bodies, but not the head.
+          const discriminant = expression(statement.discriminant);
+          const parent = temporaries, parentDepth = controlDepth;
+          temporaries = new Map(parent);
+          loopControls.push({breakDepth: parentDepth});
+          controlDepth += 2; // enclosing switch block and selected-case if
+          try {
+            for (const name of numericSwitchBindings(statement, fail)) {
+              if (params.has(name) || name === indexName || nestedIndices.has(name))
+                fail('Switch locals must not shadow parameters or loop indices', statement);
+              temporaries.set(name, null);
+            }
+            const compiled = compileNumericSwitch(statement, {discriminant, expression,
+              allocateLocal:() => temporaryBase + temporaryCount++,
+              // Each case starts from the shared TDZ. Cross-case locals that
+              // would require proving a particular entry path retain JS.
+              compileCase:branch => ({bytes:compileBlock(branch.consequent, true, depth + 1)}),
+            });
+            bytes.push(...compiled.bytes);
+          } finally { temporaries = parent; controlDepth = parentDepth; loopControls.pop(); }
+          continue;
+        }
         if (structuredLoops && ['BreakStatement', 'ContinueStatement'].includes(statement.type)) {
-          const target = loopControls.at(-1);
+          const target = statement.type === 'BreakStatement' ? loopControls.at(-1)
+            : loopControls.findLast(target => target.continueDepth !== undefined);
           if (statement.label || !target) fail('Loop control requires an enclosing loop and no label', statement);
           const label = statement.type === 'BreakStatement' ? target.breakDepth : target.continueDepth;
           bytes.push(0x0c, ...u32(controlDepth - 1 - label));

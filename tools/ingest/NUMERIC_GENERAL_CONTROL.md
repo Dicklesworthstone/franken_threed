@@ -108,6 +108,34 @@ require `Symbol.iterator`. Custom iterables, ordinary arrays, async iteration,
 destructuring and assignment into an existing loop binding remain on the original
 path.
 
+## Numeric switch dispatch
+
+Numeric `switch` statements run inside closed kernels, helpers and callback
+islands. The discriminant is evaluated once outside the case lexical scope.
+Case expressions use strict Number equality and run in source order until the
+first match; later tests are skipped. A default anywhere in the statement is
+selected only if every case misses. Empty labels and body fallthrough keep the
+same behavior, including duplicate values, signed zero and nonmatching NaN.
+
+`break` exits the nearest switch or loop. `continue` passes through switches to
+the enclosing loop's update/test, and returns preserve the function boundary.
+Helper completion analysis follows fallthrough, so a switch whose cases and
+default all return can establish the helper's numeric result. Switches do not
+spend loop credits; any loops or helper work they execute share the existing
+invocation budget and transactional publication.
+
+Case declarations keep their TDZ across the whole switch while its discriminant
+still sees outer bindings. Cases may use their own initialized lexical locals or
+explicit blocks. Reading a local declared in another case remains conservative
+because its initialization depends on the selected entry. Nonnumeric case
+values, labeled exits and unsupported source operations retain JavaScript. A
+switch admits at most 256 cases within the existing statement/depth limits.
+
+The focused suite includes packed RGB-to-HSL conversion compared with pinned
+`Color.getHSL`, source-ordered effectful cases, nested exits, scopes, rollback,
+and automatic whole-function and callback dispatch. This is native numeric
+control lowering, without a measured-speedup claim.
+
 ## Scope and evidence
 
 v8 has one appended intrinsic length per array parameter, in declaration order,
@@ -128,7 +156,8 @@ Run the direct compiler/runtime and application/package integration tests:
 ```sh
 node --test tools/ingest/numeric_general_control.test.mjs \
   tools/ingest/numeric_general_control_integration.test.mjs \
-  tools/ingest/numeric_for_of.test.mjs
+  tools/ingest/numeric_for_of.test.mjs \
+  tools/ingest/numeric_switch.test.mjs
 ```
 
 The tests execute native Wasm, compare results to original JavaScript, exercise
