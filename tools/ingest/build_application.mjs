@@ -1216,7 +1216,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
-    ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets } } : {}),
+    ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites } } : {}),
   });
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {
     throw new Error("A renderer route was decided but no pinned three build import was substituted");
@@ -1309,6 +1309,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             reason: rendererRoute.reason,
             decisions: rendererRoute.decisions,
             targets: rendererRoute.targets,
+            exactConstructionSites: rendererRoute.exactSites.map(({moduleId, sourceSpan}) => ({moduleId, sourceSpan})),
             substitutedModules: bundleResult.routedRendererModules ?? [],
           },
         }
@@ -1320,8 +1321,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
  * Build-time renderer route decision for the opt-in general new-backend
  * renderers (three_renderer.mjs). The whole-application module graph and the
  * existing route decider choose. A renderer class is substituted only when every
- * construction site of it routes to GENERAL_WEBGPU, no construction anywhere needs
- * the exact backend, and every graph import of its build file is the admitted
+ * construction site of it routes to GENERAL_WEBGPU or explicitly selects the
+ * source WebGL backend, and every graph import of its build file is the admitted
  * pinned build. WebGLRenderer additionally requires that no application module
  * reads GL-context state (capabilities/extensions/context attributes/loss), which
  * this route cannot provide. Anything else keeps the retained upstream build
@@ -1348,13 +1349,22 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
   ].filter(Boolean);
   const targets = [];
   const reasons = [];
+  // An explicit source selection can coexist with native sites: the bundler
+  // preserves its original constructor call without reading any options first.
+  // A native site is still required to prove the global escape/closure guards.
+  const sourceSelected = decision => decision.constructorName === "WebGPURenderer" &&
+    decision.route === "exact-backend" && decision.reasons.length === 1 &&
+    decision.reasons[0] === "explicit-source-selection";
   for (const { exportName, urls } of candidates) {
     const gl = exportName === "WebGLRenderer";
     const sites = decisions.filter((d) => d.constructorName === exportName);
     let reason = null;
     if (sites.length === 0) reason = gl ? "no-webgl-renderer-construction" : "no-webgpu-renderer-construction";
-    else if (sites.some((d) => d.route !== "general-webgpu")) reason = "construction-site-not-general-webgpu";
-    else if (decisions.some((d) => d.route === "exact-backend")) reason = "exact-backend-renderer-present";
+    else if (!sites.some((d) => d.route === "general-webgpu") ||
+        sites.some((d) => d.route !== "general-webgpu" && (gl || !sourceSelected(d))))
+      reason = "construction-site-not-general-webgpu";
+    else if (decisions.some((d) => d.route === "exact-backend" && (gl || !sourceSelected(d))))
+      reason = "exact-backend-renderer-present";
     else if (urls.length === 0) reason = gl ? "no-three-module-import" : "no-three-webgpu-import";
     else if (!urls.every((id) => isInternalLibraryModule(id, packageRootUrl)))
       reason = gl ? "unpinned-three-module" : "unpinned-three-webgpu-module";
@@ -1362,7 +1372,16 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
     if (reason) reasons.push(reason);
     else for (const url of urls) targets.push({ url, exportName });
   }
-  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets };
+  const exactSites = targets.some(target => target.exportName === "WebGPURenderer")
+    ? decisions.filter(sourceSelected).map(decision => {
+      const module = graph.modules[decision.moduleId];
+      const siteIndex = module.renderer_construction_sites.findIndex(site =>
+        site.source_span.start.offset === decision.sourceSpan.start.offset &&
+        site.source_span.end.offset === decision.sourceSpan.end.offset);
+      if (siteIndex < 0) throw new Error("Source-selected renderer construction lost its original site");
+      return {moduleId: decision.moduleId, sourceSpan: decision.sourceSpan, siteIndex, sourceHash: module.content_hash};
+    }) : [];
+  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets, exactSites };
 }
 
 const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttributes", "forceContextLoss", "forceContextRestore"]);

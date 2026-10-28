@@ -13,12 +13,30 @@ node tools/ingest/cli.mjs path/to/index.html --build-app out --route-webgpu-rend
 ```
 
 The build decides the route from the whole module graph with the existing route
-decider. It substitutes only when every `WebGPURenderer` construction site routes
-to general-webgpu, no exact-backend renderer or GL escape exists, and every import
-of `build/three.webgpu.js` is the admitted pinned r186 build. The substituted
+decider. It substitutes when at least one `WebGPURenderer` construction site routes
+to general-webgpu and all remaining sites either share that route or explicitly
+select the source WebGL backend. Other exact-backend requirements and GL escapes
+remain conservative, and every import of `build/three.webgpu.js` must be the
+admitted pinned r186 build. The substituted
 module re-exports the upstream namespace (every other class keeps its upstream
 identity) and replaces only `WebGPURenderer`. Otherwise the build is unchanged
 and the printed/returned `rendererRoute.reason` says why.
+
+Mixed applications preserve each explicit `forceWebGL: true` construction through
+its genuine upstream constructor. The compiler resolves the original callee once
+before the untouched argument list; it does not pre-read, clone or validate source
+options through the native facade. Option getters, extra arguments, constructor
+errors and source prototypes retain their source behavior. Renamed constructors,
+inline scripts and lazy modules use the same source module instance retained by
+their routed export. `instanceof` that export recognizes actual native and source
+instances without accepting flag-shaped objects or broadening subclass checks.
+
+Per-site `rendererRoute.decisions` continue to identify source-selected calls as
+`exact-backend`; `exactConstructionSites` records their original source spans.
+Applications containing only explicit source selections remain unchanged.
+Runtime-valued `forceWebGL` selections retain the existing facade dispatch.
+Opaque renderer access, unknown extensions, native-context observations and
+prototype mutation still prevent the mixed build route.
 
 Construction routing follows local renderer and canvas aliases before choosing
 an owner. Exports, external stores, returned renderer factories, unknown consumers,

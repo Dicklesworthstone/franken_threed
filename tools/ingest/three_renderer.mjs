@@ -76,6 +76,14 @@ const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth
 const MAX_PENDING = 64;
 const MAX_NODE_CAPTURE_BYTES = 64 * 1024 * 1024;
 const MAX_MATERIAL_CAPTURE_VALUES = 1024 * 1024;
+const SOURCE_RENDERER_CONSTRUCTORS = new WeakMap();
+const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
+
+/** Compiler-private dispatch for statically source-selected construction sites.
+ * No option is read or copied, and unknown constructors keep their own behavior. */
+export function sourceThreeRendererConstructor(Constructor) {
+  return SOURCE_RENDERER_CONSTRUCTORS.get(Constructor) ?? Constructor;
+}
 
 /** True when the error is a recoverable "call prepare()" boundary from the bridge. */
 const isPrepareBoundary = error => error?.code === 'THREE_SCENE_PREPARE' || error?.code === 'F3D_RENDERER_PREPARE';
@@ -1528,7 +1536,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
   }
   const nativeInit = WebGPURenderer.prototype.init;
-  return withThreeCompute(WebGPURenderer, THREE);
+  const Routed = withThreeCompute(WebGPURenderer, THREE);
+  if (exactBackend) {
+    SOURCE_RENDERER_CONSTRUCTORS.set(Routed, exactBackend);
+    Object.defineProperty(Routed, Symbol.hasInstance, {value(value) {
+      return ordinaryHasInstance.call(this, value) ||
+        this === Routed && ordinaryHasInstance.call(exactBackend, value);
+    }});
+  }
+  return Routed;
 }
 
 const WEBGL_PARAMETERS = new Set(['canvas', 'context', 'depth', 'stencil', 'alpha', 'antialias', 'premultipliedAlpha',

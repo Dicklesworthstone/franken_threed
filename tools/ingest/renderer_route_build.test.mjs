@@ -65,6 +65,90 @@ test("an ordinary WebGPURenderer application is routed and keeps upstream class 
   assert.equal(emitted.REVISION, "186");
 });
 
+for (const inline of [false, true]) test(`mixed source-selected WebGL and native construction preserve option effects with inline=${inline}`, async () => {
+  const body = `import * as THREE from 'three/webgpu';
+import {WebGPURenderer as Renderer} from 'three/webgpu';
+const events = globalThis.__f3d_mixed_options;
+const native = new THREE.WebGPURenderer({antialias: false});
+const exact = new Renderer({
+  forceWebGL: true,
+  get alpha() { events.push('alpha'); return true; },
+  get antialias() { events.push('antialias'); return false; },
+  get sourceOption() { events.push('sourceOption'); return 17; }
+}, events.push('extra argument'));
+export const nativeFlags = [native.isF3DRenderer === true, exact.isF3DRenderer === true];
+export const instances = [native instanceof THREE.WebGPURenderer, exact instanceof Renderer];
+export const sourceFlags = [native.isWebGPURenderer, exact.isWebGPURenderer];
+export const dispose = () => native.dispose();
+`;
+  const a = app(body), reference = app(body);
+  if (inline) fs.writeFileSync(a.entry, fs.readFileSync(a.entry, 'utf8').replace(
+    '<script type="module" src="./main.js"></script>', '<script type="module">\n' + body + '</script>'));
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  const source = await buildApplication(reference.entry, reference.out);
+  assert.equal(result.rendererRoute.routed, true);
+  assert.deepEqual(result.rendererRoute.decisions.map(value => value.route), ['general-webgpu', 'exact-backend']);
+  assert.deepEqual(result.rendererRoute.decisions[1].reasons, ['explicit-source-selection']);
+  assert.equal(result.rendererRoute.exactConstructionSites.length, 1);
+  assert.ok(result.rendererRoute.exactConstructionSites[0].sourceSpan.start.offset > 0);
+  const document = globalThis.document, previousEvents = globalThis.__f3d_mixed_options;
+  globalThis.document = {createElementNS: () => ({width: 32, height: 24, style: {}})};
+  try {
+    globalThis.__f3d_mixed_options = [];
+    const expected = await import(pathToFileURL(path.join(reference.out, source.entryFiles[0])).href);
+    const observed = globalThis.__f3d_mixed_options.slice();
+    globalThis.__f3d_mixed_options = [];
+    const emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.deepEqual(emitted.nativeFlags, [true, false]);
+    assert.deepEqual(expected.nativeFlags, [false, false]);
+    assert.deepEqual(emitted.instances, [true, true]);
+    assert.deepEqual(emitted.sourceFlags, [true, true]);
+    assert.deepEqual(globalThis.__f3d_mixed_options, observed,
+      'source-selected option getters and extra arguments keep the exact source evaluation order');
+    assert.equal(observed[0], 'extra argument');
+    assert.ok(observed.includes('sourceOption'), 'source options are not rejected by native validation');
+    emitted.dispose();
+  } finally {
+    globalThis.document = document; globalThis.__f3d_mixed_options = previousEvents;
+  }
+});
+
+test('source-selected constructions in lazy modules retain the same routed export identity', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+const native = new THREE.WebGPURenderer();
+export const nativeFlag = native.isF3DRenderer;
+export const load = () => import('./exact.js');
+export const dispose = () => native.dispose();`);
+  fs.writeFileSync(path.join(a.dir, 'exact.js'), `import {WebGPURenderer as Renderer} from 'three/webgpu';
+const exact = new Renderer({forceWebGL: true});
+export const nativeFlag = exact.isF3DRenderer === true;
+export const sameClass = exact instanceof Renderer;`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.exactConstructionSites[0].moduleId, pathToFileURL(path.join(a.dir, 'exact.js')).href);
+  const previous = globalThis.document;
+  globalThis.document = {createElementNS: () => ({width: 32, height: 24, style: {}})};
+  try {
+    const emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.equal(emitted.nativeFlag, true);
+    const exact = await emitted.load();
+    assert.equal(exact.nativeFlag, false); assert.equal(exact.sameClass, true);
+    emitted.dispose();
+  } finally { globalThis.document = previous; }
+});
+
+test('mixed source selection does not exempt opaque renderer state or unknown code', async () => {
+  for (const extra of ['const backend = exact.backend;', "import 'https://example.invalid/renderer-plugin.js';"]) {
+    const a = app(`import * as THREE from 'three/webgpu';
+const native = new THREE.WebGPURenderer();
+const exact = new THREE.WebGPURenderer({forceWebGL: true});\n` + extra);
+    const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+    assert.equal(result.rendererRoute.routed, false);
+    assert.deepEqual(result.rendererRoute.exactConstructionSites, []);
+    assert.equal(result.chunks.some(chunk => chunk.fileName.startsWith('f3d-renderer-runtime-')), false);
+  }
+});
+
 test("top-level native compilation and rendering complete across deferred runtime imports", async () => {
   const a = app(`import './before.js';
 import * as THREE from 'three/webgpu';

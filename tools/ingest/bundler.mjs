@@ -569,14 +569,51 @@ const RENDERER_FACTORIES = {
  * @param {{ targets: Array<{ url: string, exportName: 'WebGPURenderer' | 'WebGLRenderer' }> }} options
  * @returns {import('rollup').Plugin}
  */
-export function rendererRoutePlugin({ targets }) {
+export function rendererRoutePlugin({ targets, exactSites = [] }) {
   const byUrl = new Map(targets.map((t) => [t.url, t.exportName]));
   if (byUrl.size === 0) throw new Error("rendererRoutePlugin requires target modules");
   for (const name of byUrl.values())
     if (!RENDERER_FACTORIES[name]) throw new Error(`Unsupported routed renderer export: ${name}`);
   const routed = new Set();
+  const sourceSites = new Map();
+  for (const site of exactSites) {
+    if (!sourceSites.has(site.moduleId)) sourceSites.set(site.moduleId, []);
+    sourceSites.get(site.moduleId).push(site);
+  }
   return {
     name: "f3d-renderer-route",
+    transform(code, id) {
+      const sites = sourceSites.get(id);
+      if (!sites?.length) return null;
+      const hash = 'sha256:' + createHash('sha256').update(code).digest('hex');
+      if (sites.some(site => site.sourceHash !== hash))
+        throw new Error(`Source-selected renderer module changed before emission: ${id}`);
+      const analysis = analyzeModuleAst(code, id), ast = this.parse(code), spans = new Map();
+      for (const site of sites) {
+        const current = analysis.renderer_construction_sites[site.siteIndex];
+        if (current?.constructor_name !== 'WebGPURenderer' || current.force_webgl !== true)
+          throw new Error(`Source-selected renderer construction changed before emission: ${id}`);
+        spans.set(current.source_span.start.offset, current.source_span.end.offset);
+      }
+      const names = new Set();
+      walk.full(ast, node => { if (node.type === 'Identifier') names.add(node.name); });
+      let helper = '__f3dSourceRenderer';
+      while (names.has(helper)) helper += '_';
+      const edits = [];
+      walk.simple(ast, {NewExpression(node) {
+        if (spans.get(node.start) !== node.end) return;
+        // Evaluate the original callee once, before its untouched argument list.
+        // The private registry selects the actual source constructor belonging
+        // to this facade, even with multiple independent Three module copies.
+        edits.push({start: node.callee.start, end: node.callee.end,
+          text: `(${helper}(${code.slice(node.callee.start, node.callee.end)}))`});
+      }});
+      if (edits.length !== sites.length) throw new Error(`Source-selected renderer sites were not emitted: ${id}`);
+      for (const edit of edits.sort((a, b) => b.start - a.start))
+        code = code.slice(0, edit.start) + edit.text + code.slice(edit.end);
+      code += `\nimport { sourceThreeRendererConstructor as ${helper} } from ${JSON.stringify(THREE_RENDERER_URL)};\n`;
+      return {code, map: null};
+    },
     async resolveId(source, importer, resolveOptions) {
       if (source.startsWith(ROUTED_RENDERER_PREFIX)) return source;
       // Resolve facade imports from the backing module's URL. Passing the

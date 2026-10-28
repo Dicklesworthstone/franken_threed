@@ -9,7 +9,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {createWebGPURendererClass} from './three_renderer.mjs';
+import {createWebGPURendererClass, sourceThreeRendererConstructor} from './three_renderer.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const T = await import(pathToFileURL(path.join(root, 'build/three.webgpu.js')));
 const settings = fs.readFileSync(path.join(root, 'examples/jsm/inspector/tabs/Settings.js'), 'utf8');
@@ -28,6 +28,31 @@ function fixture() {
   const original = Routed.prototype.init;
   return {calls, canvas, ExactRenderer, Routed, original, forceWebGL: installSettings(Routed, T.WebGLBackend)};
 }
+
+test('compiler-selected source construction preserves exact options, prototype and exported instanceof', () => {
+  const f = fixture(), events = [];
+  const options = () => ({canvas: f.canvas, forceWebGL: true,
+    get alpha() { events.push(['alpha', this]); return true; },
+    get customOption() { events.push(['customOption', this]); return 7; }});
+  const baseline = options(), direct = new f.ExactRenderer(baseline);
+  const expected = events.map(([key]) => key); events.length = 0;
+  const parameters = options(), Source = sourceThreeRendererConstructor(f.Routed);
+  assert.equal(Source, f.ExactRenderer);
+  const selected = new Source(parameters);
+  assert.deepEqual(events.map(([key]) => key), expected);
+  assert.ok(events.every(([, receiver]) => receiver === parameters));
+  assert.equal(Object.getPrototypeOf(selected), Object.getPrototypeOf(direct));
+  assert.equal(selected.constructor, f.ExactRenderer);
+  assert.equal(selected instanceof f.Routed, true);
+  assert.equal(selected instanceof T.WebGPURenderer, true);
+  assert.ok(selected.backend instanceof T.WebGLBackend);
+  assert.equal(selected.isF3DRenderer, undefined);
+  assert.equal({isF3DRenderer: true, isWebGPURenderer: true} instanceof f.Routed, false);
+  class Child extends f.Routed {}
+  assert.equal(selected instanceof Child, false, 'inherited instance checks do not broaden arbitrary subclasses');
+  assert.equal(sourceThreeRendererConstructor(Child), Child, 'unregistered subclasses keep their original constructor');
+  assert.equal(sourceThreeRendererConstructor(T.WebGPURenderer), T.WebGPURenderer);
+});
 
 test('persisted source Inspector forceWebGL constructs the real retained renderer before native ownership', async () => {
   const f = fixture(), parameters = {canvas: f.canvas, antialias: true};
