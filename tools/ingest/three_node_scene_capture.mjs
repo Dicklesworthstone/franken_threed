@@ -21,6 +21,8 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
+  material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true ||
+  material.isPointsMaterial === true && (material.map != null || material.alphaMap != null) ||
   material.wireframe === true &&
     ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
       material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) ||
@@ -163,7 +165,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
-    if (!object.material || object.isLineLoop === true) continue;
+    if (!object.material) continue;
+    // Preserve the source renderer's report-and-skip branch in the fixed
+    // projection owner; a native material must not turn a loop into a strip.
+    if (object.isLineLoop === true) continue;
     if (shadowPass) {
       // The retained source selector, rather than the ordinary fixed route,
       // owns every renderable in a shadow pass, including excluded noncasters.
@@ -182,8 +187,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
     // A Mesh can use the source billboard shader too (for particle instances).
     // Ordinary Sprite objects without authored nodes retain the fixed path.
-    const spriteMesh = object.isMesh === true && effective.some(material =>
-      material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true);
+    const spriteMesh = (object.isMesh === true || object.isSprite === true) && effective.some(material =>
+      object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
+      material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true);
     if (!bundle && !instancedGeometry && !batch && !spriteMesh && !effective.some(nativeMaterial)) continue;
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups

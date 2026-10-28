@@ -16,6 +16,8 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.
 const {chromium} = createRequire(process.env.PLAYWRIGHT_MODULE_DIR ?? '/opt/node-tools/node_modules/')('playwright');
 const {rollup} = createRequire(path.join(repo, 'tools/package.json'))('rollup');
 const checkpoints = [1, 7, 8, 10, 12, 13, 30], width = 128, height = 96;
+const scenarioModule = process.env.F3D_NATIVE_SCENARIO_MODULE ?? '/tests/e2e/webgpu_renderer/scenarios_sprites.js';
+const scenarioExport = process.env.F3D_NATIVE_SCENARIO_EXPORT ?? 'spriteScenarios';
 const pin = JSON.parse(await readFile(path.join(repo, 'upstream/pin.json'), 'utf8')).oracle;
 assert.equal(pin.source_commit, '148ef33ecb6d2502ff796d4554abd1549c95d519');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -62,7 +64,7 @@ async function capture(mode, name) {
     page.on('pageerror', error => browserErrors.push(String(error)));
     page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
     await page.goto('http://127.0.0.1:' + server.address().port + '/');
-    const result = await page.evaluate(async ({mode, name, checkpoints, width, height}) => {
+    const result = await page.evaluate(async ({mode, name, checkpoints, width, height, scenarioModule, scenarioExport}) => {
       // Identity-only compatibility for Chromium builds predating this spelling.
       // Apply identically to both renderers, without modifying source shaders.
       const createView = GPUTexture.prototype.createView;
@@ -71,7 +73,7 @@ async function capture(mode, name) {
         return createView.call(this, descriptor);
       };
       const T = await import('three/webgpu');
-      const {spriteScenarios} = await import('/tests/e2e/webgpu_renderer/scenarios_sprites.js');
+      const scenarios = (await import(scenarioModule))[scenarioExport];
       const Renderer = mode === 'source' ? T.WebGPURenderer
         : (await import('/__f3d_renderer.mjs')).createWebGPURendererClass(T);
       const canvas = document.createElement('canvas'); document.body.appendChild(canvas);
@@ -85,7 +87,7 @@ async function capture(mode, name) {
         device = renderer.backend?.device ?? renderer._device;
         device.addEventListener('uncapturederror', event => errors.push(event.error.message));
         device.pushErrorScope('validation'); scope = true;
-        const {scene, camera} = spriteScenarios[name](T, renderer);
+        const {scene, camera} = scenarios[name](T, renderer);
         await renderer.compileAsync(scene, camera);
         for (let frame = 1; frame <= checkpoints.at(-1); frame++) {
           renderer.render(scene, camera);
@@ -104,7 +106,7 @@ async function capture(mode, name) {
         if (scope) await device.popErrorScope();
         target?.dispose(); renderer.dispose(); canvas.remove();
       }
-    }, {mode, name, checkpoints, width, height});
+    }, {mode, name, checkpoints, width, height, scenarioModule, scenarioExport});
     assert.deepEqual(browserErrors, [], `${mode} browser errors`);
     assert.deepEqual(result.errors, [], `${mode} GPU errors`);
     assert.deepEqual(result.frames.map(frame => frame.frame), checkpoints);

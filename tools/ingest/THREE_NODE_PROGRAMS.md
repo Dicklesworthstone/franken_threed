@@ -1,7 +1,8 @@
 # Native TSL graphics programs
 
 The native `WebGPURenderer` facade can draw authored TSL graphs on ordinary
-meshes, authored `Sprite` objects, CPU- or storage-backed `InstancedMesh` objects,
+meshes, authored `Sprite`, `Points`, `Line` and `LineSegments` objects,
+CPU- or storage-backed `InstancedMesh` objects,
 `InstancedBufferGeometry` and `BatchedMesh`. It retains the exact r186
 `WGSLNodeBuilder`, node classes, uniform packing
 and `NodeFrame`; FrankenThreeD owns the WebGPU pipelines, geometry residency,
@@ -13,7 +14,8 @@ acceleration or a Rust implementation of node evaluation.
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 `MeshPhongMaterial`, `MeshStandardMaterial`, `MeshPhysicalMaterial`,
-`MeshNormalMaterial`, `MeshMatcapMaterial` and `SpriteMaterial` can also
+`MeshNormalMaterial`, `MeshMatcapMaterial`, `SpriteMaterial`, `PointsMaterial`,
+`LineBasicMaterial` and `LineDashedMaterial` can also
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
@@ -24,6 +26,14 @@ When one material group on a mesh needs native shading, its other groups use the
 same source library conversion and geometry owner. All selected groups must pass
 admission before any node update runs. Custom material subclasses and overridden
 conversion methods remain outside this entrance.
+
+Native `PointsNodeMaterial`, `LineBasicNodeMaterial` and
+`LineDashedNodeMaterial` retain their source graphs and object-selected WebGPU
+topology. Points can use compute-produced storage directly, and point materials
+on sprites or meshes retain source pixel sizing, DPR and viewport semantics.
+Dashed lines use the source distance attribute and four authored dash slots.
+See [THREE_NATIVE_PRIMITIVES.md](./THREE_NATIVE_PRIMITIVES.md) for the material
+matrix, source limits and validation commands.
 
 Source material maps now lower through the pinned material accessors: base
 color, alpha, emissive, normal, bump, displacement, AO, light, specular, roughness,

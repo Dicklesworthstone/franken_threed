@@ -62,6 +62,7 @@ const topologyOf=object=>object.isPoints?'points':object.isLineSegments?'lines':
 // Indexed line strips fix their index format in the native pipeline.
 const srgbEncode=rgb=>rgb.map(c=>c<=0.0031308?c*12.92:1.055*Math.pow(c,0.41666)-0.055);
 const stripSignature=(shape,topology)=>topology==='line-strip'&&shape.indexFormat?shape.signature+'|'+shape.indexFormat:shape.signature;
+const programSignature=(shape,native,topology)=>(native?'node-program:':'program:')+stripSignature(shape,native?topology:null);
 const drawable=object=>object.isMesh||object.isSprite||object.isPoints||(object.isLine&&!object.isLineLoop);
 
 export async function createGpuThreeScene(device,scene,{
@@ -1173,7 +1174,7 @@ export async function createGpuThreeScene(device,scene,{
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(compiled.attributesKey,gpu);
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
-          signature=(native?'node-program:':'program:')+(native?programGeometrySnapshot:programSupport.geometrySnapshot)(gpu,device).signature;
+          signature=programSignature((native?programGeometrySnapshot:programSupport.geometrySnapshot)(gpu,device),native,item.desc.options.topology);
           let entry=lookup.get(item.key)?.get(item.material)?.find(e=>!e.mesh.disposed&&e.programGeometry===gpu&&e.signature===signature&&same(e.structural,item.desc.structural));
           if(!entry){
             const mesh=await Promise.race([renderer.addMesh(gpu,item.desc.options),stopped]);
@@ -1335,7 +1336,7 @@ export async function createGpuThreeScene(device,scene,{
       for(const entry of next){
         if(entry.programGeometry){
           if(!checked.has(entry.programGeometry)){entry.programGeometry.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});checked.add(entry.programGeometry);}
-          const signature=(entry.nodeProgram?'node-program:':'program:')+(entry.nodeProgram?programGeometrySnapshot:programSupport.geometrySnapshot)(entry.programGeometry,device).signature;
+          const signature=programSignature((entry.nodeProgram?programGeometrySnapshot:programSupport.geometrySnapshot)(entry.programGeometry,device),entry.nodeProgram,entry.topology);
           if(signature!==entry.signature)fail('CHANGED','Geometry layout changed during preparation');
           continue;
         }
@@ -1688,7 +1689,7 @@ export async function createGpuThreeScene(device,scene,{
         if(item.nodeProgram){
           const gpu=item.bindings[0].programGeometry;
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
-          if(item.bindings[0].signature!=='node-program:'+programGeometrySnapshot(gpu,device).signature)
+          if(item.bindings[0].signature!==programSignature(programGeometrySnapshot(gpu,device),true,item.bindings[0].topology))
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
           copiesAtDraw(item.nodeFramebufferCopies);
           drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews});
