@@ -31,7 +31,7 @@ function pattern(node, names) {
 // This is only a proof that reading a capture cannot invoke a global-object
 // getter. Its current type, initialization, lengths and ownership remain guarded
 // at the source boundary. No initializer values or constness are assumed.
-function scopeBindings() {
+export function numericLoopScopeBindings() {
   const cache = new WeakMap();
   return (node, position) => {
     // Parameter initializers do not see body var bindings; switch discriminants
@@ -167,7 +167,7 @@ export function planNumericLoopIslands(source, {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
   const edits = [], registrations = [], runtimeImports = [], accepted = [], absorbedEdits = new Set();
-  const candidates = [], bindings = scopeBindings(), hints = discoverNumericStorageHints(ast);
+  const candidates = [], bindings = numericLoopScopeBindings(), hints = discoverNumericStorageHints(ast);
   const helperMath = new Map();
   function usesHelperMath(name) {
     if (!helperMath.has(name)) {

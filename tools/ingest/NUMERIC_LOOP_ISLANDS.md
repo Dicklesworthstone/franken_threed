@@ -105,6 +105,58 @@ with the emitted package; actual runtime imports appear in Rollup metadata.
 
 ## Verification and limits
 
+### Source-shaped Euler updates
+
+The same application opt-in also recognizes an ordinary forward child loop
+whose body selects one object, reads its per-object Euler input and updates its
+rotation. This separate source-pinned library path uses constructor allocation
+witnesses and exact method/callback identities; arbitrary property access is
+still outside the generic numeric island's contract.
+
+```js
+export function rotate(root, count) {
+  for (let i = 0; i < count; i++) {
+    const object = root.children[i];
+    const speed = object.userData.angularVelocity;
+    object.rotation.set(
+      object.rotation.x + speed.x,
+      object.rotation.y + speed.y,
+      object.rotation.z + speed.z
+    );
+  }
+}
+```
+
+The unchanged first update loop in the pinned H1 application has this shape.
+Names and source filenames do not select the implementation. Component
+`+`, `-`, `*` and `/` expressions can use different source axes. Scalar counts,
+the current child-array length, and own numeric control fields on witnessed
+literal objects are guarded at each invocation. The initial domain requires
+the pinned built core, its ordinary child arrays, three-argument `Euler.set`,
+and source Euler values reached through witnessed data objects such as the
+original `Object3D.userData`.
+
+One Wasm call computes Euler results and the pinned `Quaternion.setFromEuler`
+arithmetic for all six rotation orders. The original JavaScript engine's native
+`Math.cos` and `Math.sin` calls remain in the packing pass, in source order.
+The public Euler and Quaternion objects keep identity and remain authoritative
+between calls. This is a copying transaction, not persistent packed ownership or
+a measured performance result.
+
+Duplicate output objects, any speed/output alias, changed methods or rotation
+callbacks, getters, proxies, nonwritable fields, unsupported counts and exhausted
+native budgets retain the original loop before any native publication. Reentrant
+callbacks and exceptions therefore keep their source partial effects. Live child
+membership, API counts and input values are rechecked every call. The report's
+`libraryKernels.eulerUpdates` records source spans, operations, retained trig and
+the original-loop fallback.
+
+`node tools/ingest/euler_update.test.mjs` checks the unchanged 4,000-object H1
+loop, other variable names and expressions, all six rotation orders, identity,
+live inputs, aliases, observable guards, reentry and partial failures against
+the pinned source. It does not establish complete H1 application or hardware
+performance closure.
+
 ```bash
 node --test tools/ingest/numeric_loop*.test.mjs
 ```

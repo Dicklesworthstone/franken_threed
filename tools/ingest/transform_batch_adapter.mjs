@@ -15,6 +15,8 @@ const xyz=['x','y','z'],xyzw=['_x','_y','_z','_w'];
 export function registerTransformObject(object){apply(weakAdd,objects,[object]);}
 export function registerTransformNumeric(object){apply(weakAdd,numbers,[object]);}
 export function registerTransformChildren(array){apply(weakAdd,arrays,[array]);return array;}
+// Shared by source update islands; inspection never invokes a Proxy trap.
+export function isTransformChildren(array){return apply(weakHas,arrays,[array]);}
 export function createTransformBatchDispatch(base64,stride,maxMemoryPages){
   const token=freeze({});
   apply(mapSet,dispatches,[token,{base64,stride,maxRows:floor((maxMemoryPages*65536-128)/(stride*8)),
