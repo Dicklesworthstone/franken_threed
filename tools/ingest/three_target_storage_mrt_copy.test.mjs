@@ -119,9 +119,41 @@ test('limits, dimensions, formats, levels and regions are admitted before native
   assert.throws(() => capture(f, source.texture, storageTexture(), box(0, 0, 5, 4)), /BOUNDS/);
   assert.throws(() => capture(f, source.texture, storageTexture(), null, null, 1), /LEVEL/);
   const volume = storageTexture(); volume.is3DTexture = true;
-  assert.throws(() => capture(f, source.texture, volume), /DIMENSION/);
+  assert.doesNotThrow(() => capture(f, source.texture, volume));
   const request = capture(f, source.texture, storageTexture()); f.device.limits.maxTextureDimension2D = 2;
   assert.throws(() => request.issue(), /LIMIT/); assert.equal(f.calls.textures.length, 0); f.dispose();
+});
+
+for (const [sourceVolume, destinationVolume] of [[true, false], [false, true], [true, true]])
+test(`layered target to storage copies every selected slice (${sourceVolume ? '3D' : 'array'} to ${destinationVolume ? '3D' : 'array'})`, async () => {
+  const f = fixture(), source = target({depth: 3, volume: sourceVolume, colors: ['rgba8unorm', 'rgba8unorm']});
+  const destination = storageTexture('rgba8unorm', 4, 4, 4);
+  if (destinationVolume) { destination.isArrayTexture = false; destination.is3DTexture = true; }
+  const entry = f.targets.capture(source);
+  for (let face = 0; face < 3; face++) f.targets.writePixels(entry, new Uint8Array(64).fill(31 + face), {face, colorIndex: 1});
+  capture(f, source.textures[1], destination, null, position(0, 0, 1)).issue();
+  const expected = new Uint8Array(256);
+  for (let layer = 1; layer < 4; layer++) expected.fill(30 + layer, layer * 64, (layer + 1) * 64);
+  assert.deepEqual(destinationBytes(f, destination), expected);
+  assert.deepEqual(f.calls.copies[0].size, [4, 4, 3]);
+  assert.deepEqual(f.calls.copies[0].destination.origin, [0, 0, 1]);
+  assert.equal(f.calls.samplers.length, 0); assert.equal(f.calls.passes.length, 0);
+  await Promise.all([f.targets.whenIdle(), f.storage.whenIdle()]); f.dispose();
+});
+
+test('target volume source mips shrink Z before entering storage array layers', async () => {
+  const f = fixture(), source = target({width: 8, height: 4, depth: 6, volume: true, mips: 4});
+  const destination = storageTexture('rgba8unorm', 4, 2, 5), entry = f.targets.ensure(f.targets.capture(source));
+  entry.storage.withTexture(native => {
+    for (let slice = 0; slice < 3; slice++) native.levels[1].bytes.fill(71 + slice, slice * 32, (slice + 1) * 32);
+  });
+  capture(f, source.texture, destination, null, position(0, 0, 1), 1).issue();
+  const expected = new Uint8Array(160);
+  for (let layer = 1; layer < 4; layer++) expected.fill(70 + layer, layer * 32, (layer + 1) * 32);
+  assert.deepEqual(destinationBytes(f, destination), expected);
+  assert.deepEqual(f.calls.copies[0].size, [4, 2, 3]); assert.equal(f.calls.copies[0].source.mipLevel, 1);
+  assert.throws(() => capture(f, source.texture, destination, box(0, 0, 4, 2, 3), null, 1), /BOUNDS/);
+  assert.equal(f.calls.copies.length, 1); await f.storage.whenIdle(); f.dispose();
 });
 
 test('empty copy remains GPU-free but still validates captured generations', () => {

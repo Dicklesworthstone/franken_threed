@@ -105,11 +105,9 @@ test('both endpoint dimensions and destination array layers are checked before s
   }
 });
 
-test('format conversion, volume destinations, depth and detached color fail without a copy', () => {
+test('format conversion, depth and detached color fail without a copy', () => {
   const c = setup(), target = renderTarget(), destination = storageTexture(4, 4, 'r32float');
   assert.throws(() => c.renderer.copyTextureToTexture(target.texture, destination), /FORMAT/);
-  const volume = storageTexture(); volume.is3DTexture = true; volume.image.depth = 2;
-  assert.throws(() => c.renderer.copyTextureToTexture(target.texture, volume), /DIMENSION/);
   target.texture.isDepthTexture = true;
   assert.throws(() => c.renderer.copyTextureToTexture(target.texture, storageTexture()), /SOURCE/);
   target.texture.isDepthTexture = false;

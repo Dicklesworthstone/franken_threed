@@ -857,6 +857,41 @@ replacement/removal, shared versus object uniforms, inactive fog, source shadow
 ownership and texture versions across queued renders. Sampled-owner tests also
 check shared image histories, sampler domains and disposal identity.
 
+## Native 3D texture inputs
+
+Ordinary source `Data3DTexture` inputs now enter native graphics through
+`TSL.texture3D` and `TSL.texture3DLoad`. The existing shared texture uploader owns
+the allocation and upload history; shader generation stays with the pinned
+`Texture3DNode` and `WGSLNodeBuilder`. Supported single-mip profiles include
+normalized bytes, half floats and floats. Float32 linear filtering requires
+the native `float32-filterable` capability.
+
+Sampler-free loads also preserve signed and unsigned 32-bit integer volume
+texels. They use source `IntType`/`UnsignedIntType` and integer texture formats,
+with matching `texture_3d<i32>`/`texture_3d<u32>` declarations. Source 8/16-bit
+integer graphics typing remains outside this profile.
+
+Queued consumers retain acknowledged upload versions and immutable captured
+bytes. CPU edits without `needsUpdate` do not upload early. Typed-array offsets,
+padded rows, compatible image replacements and captured linear wrapR samplers
+use the same ownership rules as existing 2D inputs. Node/texture dimension
+mismatches fail before allocation. Volume dimensions and wrapping participate
+in the program signature.
+
+Target-owned `RenderTarget3D` and registered `WebGL3DRenderTarget` color textures
+use their existing native 3D attachment as the sampled input in graphics and
+compute. They are admitted only when the target owner supplies a matching 3D
+layout; no CPU image, second uploader or UV-oriented replica is created.
+Authored target mip levels remain available for explicit LOD sampling.
+
+The focused `three_renderer_native_volumes.test.mjs` and
+`three_renderer_volume_targets.test.mjs` suites compare generated source WGSL,
+binding layouts, queued upload bytes and native ownership. They do not execute
+shaders. Ordinary authored volume mip arrays and partial volume uploads remain
+outside this entrance. The retained builder's module-global capability and
+nearest-neighbor wrapR helper caches are unchanged; the tests disclose those
+source constraints rather than presenting them as fixes.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Writable or
@@ -866,9 +901,9 @@ graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models, transmitted shadows,
 custom shadow filter/replacement nodes, projected light maps and custom
 `lightsNode` graphs remain missing.
-Depth/comparison, array, volume, compressed, storage, video and unfilterable
-or integer texture graphs beyond the admitted 32-bit data/storage profiles still
-require additional native profiles. Sampled
+Compressed and video textures, and depth/comparison, array, volume, storage,
+unfilterable or integer profiles beyond those admitted above still require
+additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions and unregistered shadow lifecycles,

@@ -53,8 +53,9 @@ R/RG/RGBA32F uses one/two/four `Float32Array` components per pixel. R8 returns
 one `Uint8Array` value per texel; packed R11G11B10 returns one original
 `Uint32Array` word per texel. Reads use base mip zero regardless of the active
 render mip or cube face. The native cube profile remains single-sample; source
-`WebGLCubeRenderTarget`, array and 3D targets retain their existing explicit
-admission limits.
+`WebGLCubeRenderTarget` retains its explicit admission limit. Array layers and
+3D slices use the same explicit `faceIndex` argument; they do not infer a layer
+from mutable renderer state.
 
 Source-shaped reads and the explicit mip/depth readback extensions share the
 renderer transfer request limit, target generation and submission FIFO. A later
@@ -349,11 +350,63 @@ General scenes, large meshes and callback-bearing roots keep the existing
 live-source path. This is **not** a complete per-call scene-state snapshot. Shader
 compiler and renderer admission restrictions also remain in force.
 
+## Native volume targets and layered transfers
+
+`RenderTarget3D` and registered `WebGL3DRenderTarget` instances now own actual
+WebGPU 3D color textures. `setRenderTarget(volume, slice, mipLevel)` selects the
+color attachment's `depthSlice`; clear, scissored-clear, geometry and background
+passes all preserve it, including slice zero. Multiple color attachments share
+the selected slice. Source `WebGL3DRenderTarget.texture.renderTarget` remains
+null: the existing target owner records its association privately.
+
+```js
+const volume = new THREE.RenderTarget3D(32, 32, 16, {depthBuffer: false});
+renderer.setRenderTarget(volume, 7);
+renderer.render(sourceScene, sourceCamera);
+
+const material = new THREE.MeshBasicNodeMaterial();
+material.colorNode = THREE.TSL.texture3D(volume.texture,
+  THREE.TSL.vec3(0.25, 0.5, 0.75)).rgb;
+```
+
+Graphics and compute borrow this same native image. Sampling retains the source
+3D node shader, filters, wrapR and authored LOD. An ordinary depth attachment is
+independently 2D; `useArrayDepthTexture` or an attached array depth texture selects
+per-slice 2D depth views. Color depth shrinks at each authored mip, while depth
+array layer counts follow the source's separate depth allocation. XYZ limits,
+volumetric byte budgets and mip-local slice bounds are checked before native
+work. Resizing depth replaces storage generations and retains submitted images
+until their queue work completes.
+
+Explicit target upload, copy and readback operations use `face`/`sourceFace` as
+the selected volume slice and validate it against the requested mip. Typed
+readbacks retain their captured bytes across later writes. The existing
+`copyTextureToTexture` bridge also supports multi-slice copies among admitted
+3D textures and 2D arrays, including target color to compute storage and the
+reverse direction. Box3/Vector3 coordinates address mip-local voxels or layers;
+formats remain identical and no sampler or conversion shader is introduced.
+An explicit one-slice box can copy between a volume and an ordinary 2D image.
+
+Public `copyFramebufferToTexture` retains the pinned r186 behavior: it copies
+base mip zero, slice zero, even when a different render slice/mip is active.
+The facade regression compares its encoded command to the pinned renderer and
+backend. Use an explicit texture copy when a different source slice is needed.
+
+Volume color is single-sample. Automatic 3D mip generation, volume history
+rotation, nonzero MRT render mips and storage-to-target writes above mip zero
+remain explicit boundaries. Authored single-color volume mips can be rendered,
+sampled, copied as sources and read back. These additions do not close the full
+render-target compatibility bead.
+
+The focused volume owner, source target, facade, storage-copy and framebuffer
+tests record native commands and independently compare transferred bytes.
+They do not execute GPU shaders or establish browser pixel parity or speedups.
+
 ## Remaining gaps and verification
 
-Public MRT and native cube readback does not close all target rendering and
-sampling contracts. Array/3D target readback and source `WebGLCubeRenderTarget`
-remain outside this profile. Nonzero mip rendering retains the restrictions above. Shader programs retain their
+Public MRT, native cube, array and 3D readback do not close all target rendering
+and sampling contracts. Source `WebGLCubeRenderTarget` remains outside this
+profile. Nonzero mip rendering retains the restrictions above. Shader programs retain their
 explicit unsupported-feature errors. Mesh-root, offscreen shader and small-pass
 capture support remove postprocessing blockers but do not establish complete
 EffectComposer compatibility, effect parity or arbitrary scene snapshots.

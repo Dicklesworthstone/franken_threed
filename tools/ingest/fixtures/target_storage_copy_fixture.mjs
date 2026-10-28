@@ -25,6 +25,11 @@ class Texture extends Events {
       compareFunction: null, generateMipmaps: false, mipmaps: [], version: 0, source: {version: 0}, flipY: false});
   }
 }
+class Data3DTexture extends Texture {
+  constructor(width, height, depth) {
+    super(); this.isData3DTexture = true; this.image = {data: null, width, height, depth};
+  }
+}
 class RenderTarget extends Events {
   constructor(width = 4, height = 4) {
     super(); Object.assign(this, {width, height, depth: 1, depthBuffer: true, stencilBuffer: false,
@@ -40,7 +45,7 @@ class StorageTexture extends Texture {
     if (depth > 1) this.isArrayTexture = true;
   }
 }
-export const T = {Texture, RenderTarget, StorageTexture, RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030,
+export const T = {Texture, Data3DTexture, RenderTarget, StorageTexture, RGBAFormat: 1023, RedFormat: 1028, RGFormat: 1030,
   UnsignedByteType: 1009, HalfFloatType: 1016, FloatType: 1015, IntType: 1013, UnsignedIntType: 1014,
   NoColorSpace: '', LinearSRGBColorSpace: 'srgb-linear', SRGBColorSpace: 'srgb', NearestFilter: 1003,
   LinearFilter: 1006, NearestMipmapNearestFilter: 1004, NearestMipmapLinearFilter: 1005,
@@ -57,10 +62,12 @@ export function setFormat(texture, format) {
   const spec = formats.find(spec => spec[0] === format); assert.ok(spec);
   texture.format = spec[1]; texture.type = spec[2]; return texture;
 }
-export function target({width = 4, height = 4, colors = ['rgba8unorm'], samples = 0, mips = 1, generateMipmaps = false} = {}) {
-  const value = new RenderTarget(width, height); value.samples = samples;
+export function target({width = 4, height = 4, depth = 1, volume = false, colors = ['rgba8unorm'], samples = 0, mips = 1, generateMipmaps = false} = {}) {
+  const value = new RenderTarget(width, height); value.samples = samples; value.depth = depth;
+  if (volume) value.isRenderTarget3D = true;
   value.textures = colors.map(format => {
-    const texture = setFormat(new Texture(), format);
+    const texture = setFormat(volume ? new Data3DTexture(width, height, depth) : new Texture(), format);
+    if (!volume) texture.image = {width, height, depth};
     Object.assign(texture, {isRenderTargetTexture: true, renderTarget: value, generateMipmaps});
     if (mips > 1) texture.mipmaps = new Array(mips).fill(null); return texture;
   });

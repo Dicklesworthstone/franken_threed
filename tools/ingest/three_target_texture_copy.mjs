@@ -9,9 +9,10 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
   region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
   const targets = renderer._targets, storage = renderer._storageTextures, device = renderer._device;
   if (!targets || !storage || !device) fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
-  if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !texture.renderTarget || !destinationTexture?.isStorageTexture)
+  const target = targets.getTextureTarget(texture);
+  if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target || !destinationTexture?.isStorageTexture)
     fail('SOURCE', 'Expected target-owned color and a storage texture destination');
-  const entry = targets.capture(texture.renderTarget);
+  const entry = targets.capture(target);
   if (entry.shape.cube) fail('SOURCE', 'Cube target copies require explicit face-aware support');
   const colorIndex = entry.shape.textures.indexOf(texture);
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
@@ -20,7 +21,7 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
   // a sampler through captureNativeTexture(). The resolved color is single-
   // sample even when the source render attachment is multisampled.
   const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
-  const shape = {...entry.shape.colors[colorIndex], depth: 1, viewDimension: '2d'};
+  const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1, viewDimension: entry.shape.viewDimension};
   const destination = storage.capture(destinationTexture);
   const plan = inspectStorageTextureCopy(shape, destination.shape, region, position, sourceLevel, destinationLevel);
   const write = plan.empty ? null : storage.captureBinding({texture: destinationTexture,
@@ -33,8 +34,8 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
     if (plan.empty) return false;
     // Check both budgets and all device extents before allocating either side.
     targets.validateNativeTextures([source]); storage.validateAllocations([destination]);
-    const limit = device.limits?.maxTextureDimension2D;
-    if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit)
+    const limit = device.limits?.[shape.viewDimension === '3d' ? 'maxTextureDimension3D' : 'maxTextureDimension2D'];
+    if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit || shape.viewDimension === '3d' && shape.depth > limit)
       fail('LIMIT', 'Source target exceeds the device texture dimension limit');
     targets.withNativeTexture(source, nativeSource => storage.withTexture(destination, nativeDestination => {
       const encoder = device.createCommandEncoder({label: 'f3d-target-to-storage-copy'});
@@ -56,17 +57,18 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
   region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
   const targets = renderer._targets, storage = renderer._storageTextures, device = renderer._device;
   if (!targets || !storage || !device) fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
+  const target = targets.getTextureTarget(destinationTexture);
   if (!texture?.isStorageTexture || !destinationTexture?.isRenderTargetTexture ||
-      destinationTexture.isDepthTexture || !destinationTexture.renderTarget)
+      destinationTexture.isDepthTexture || !target)
     fail('SOURCE', 'Expected a storage texture and target-owned color destination');
-  const entry = targets.capture(destinationTexture.renderTarget);
+  const entry = targets.capture(target);
   if (entry.shape.cube) fail('SOURCE', 'Cube target copies require explicit face-aware support');
   if (entry.shape.sampleCount !== 1) fail('SAMPLES', 'Storage copies require a single-sample target destination');
   if (destinationLevel !== 0) fail('LEVEL', 'Storage copies write target mip zero; derived mips regenerate on demand');
   const colorIndex = entry.shape.textures.indexOf(destinationTexture);
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   const destination = Object.freeze({entry, texture: destinationTexture, device, depth: false, colorIndex});
-  const shape = {...entry.shape.colors[colorIndex], depth: 1, viewDimension: '2d'};
+  const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1, viewDimension: entry.shape.viewDimension};
   const source = storage.capture(texture);
   const plan = inspectStorageTextureCopy(source.shape, shape, region, position, sourceLevel, destinationLevel);
   return Object.freeze({issue() {
@@ -76,8 +78,8 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
     if (entry.shape.textures[colorIndex] !== destinationTexture) fail('STALE', 'Captured color texture was replaced');
     if (plan.empty) return false;
     targets.validateNativeTextures([destination]); storage.validateAllocations([source]);
-    const limit = device.limits?.maxTextureDimension2D;
-    if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit)
+    const limit = device.limits?.[shape.viewDimension === '3d' ? 'maxTextureDimension3D' : 'maxTextureDimension2D'];
+    if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit || shape.viewDimension === '3d' && shape.depth > limit)
       fail('LIMIT', 'Destination target exceeds the device texture dimension limit');
     // The source borrow closes its validation scope only after the destination
     // submits. Resolve with the snapshot synchronously after that scope closes:

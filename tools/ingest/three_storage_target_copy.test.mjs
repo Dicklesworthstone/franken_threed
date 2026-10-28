@@ -175,15 +175,42 @@ for (const budget of ['target', 'storage']) test(`${budget} budget fails before 
   assert.throws(() => request.issue(), /BUDGET/); assert.equal(f.calls.textures.length, 0); f.dispose();
 });
 
-test('MSAA destinations, higher target levels, conversions and volume dimensions remain explicit refusals', () => {
+test('MSAA destinations, higher target levels, format conversions and out-of-range slices remain explicit refusals', () => {
   const f = fixture(), source = storageTexture(), destination = target();
   assert.throws(() => capture(f, source, target({samples: 4}).texture), /SAMPLES/);
   assert.throws(() => capture(f, source, target({mips: 2}).texture, null, null, 0, 1), /LEVEL/);
   assert.throws(() => capture(f, source, target({colors: ['rgba16float']}).texture), /FORMAT/);
   const volume = storageTexture(); volume.is3DTexture = true;
-  assert.throws(() => capture(f, volume, destination.texture), /DIMENSION/);
+  assert.doesNotThrow(() => capture(f, volume, destination.texture));
   assert.throws(() => capture(f, storageTexture('rgba8unorm', 4, 4, 2), destination.texture), /BOUNDS/);
   assert.equal(f.calls.textures.length, 0); f.dispose();
+});
+
+for (const [sourceVolume, destinationVolume] of [[true, false], [false, true], [true, true]])
+test(`storage to layered target copies all slices with independent origins (${sourceVolume ? '3D' : 'array'} to ${destinationVolume ? '3D' : 'array'})`, async () => {
+  const f = fixture(), source = storageTexture('rgba8unorm', 4, 4, 3);
+  if (sourceVolume) { source.isArrayTexture = false; source.is3DTexture = true; }
+  const destination = target({depth: 5, volume: destinationVolume, colors: ['rgba8unorm', 'rgba8unorm']});
+  for (let layer = 0; layer < 3; layer++) seed(f, source, new Uint8Array(64).fill(41 + layer), {layer});
+  capture(f, source, destination.textures[1], null, position(0, 0, 1)).issue();
+  assert.deepEqual(f.calls.copies[0].size, [4, 4, 3]);
+  for (let face = 0; face < 5; face++) {
+    const expected = face >= 1 && face <= 3 ? 40 + face : 0;
+    assert.ok((await read(f, destination, 1, {face})).every(value => value === expected));
+    assert.ok((await read(f, destination, 0, {face})).every(value => value === 0));
+  }
+  assert.equal(f.calls.samplers.length, 0); assert.equal(f.calls.passes.length, 0);
+  await f.targets.whenIdle(); f.dispose();
+});
+
+test('one selected 3D storage slice can populate an ordinary 2D render target', async () => {
+  const f = fixture(), source = storageTexture('rgba8unorm', 4, 4, 3), destination = target();
+  source.isArrayTexture = false; source.is3DTexture = true;
+  seed(f, source, new Uint8Array(64).fill(129), {layer: 2});
+  capture(f, source, destination.texture, box(0, 0, 4, 4, 2)).issue();
+  assert.ok((await read(f, destination)).every(value => value === 129));
+  assert.deepEqual(f.calls.copies[0].source.origin, [0, 0, 2]);
+  assert.throws(() => capture(f, source, destination.texture), /BOUNDS/); f.dispose();
 });
 
 test('empty requests are allocation-free and callbacks cannot reenter either owner', async () => {

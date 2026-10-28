@@ -21,15 +21,14 @@ function extent(shape, level) {
 
 /** Box2/Box3 and Vector2/Vector3 follow renderer.copyTextureToTexture's surface.
  * Coordinates address texels of the selected mip (z is an array layer or voxel
- * slice). Fractional extents, conversions and cross-2D/3D copies are not guessed.
+ * slice). WebGPU permits 3D slices and 2D array layers at either endpoint;
+ * their mip-local XYZ bounds are independent. No format conversion is performed.
  * https://www.w3.org/TR/webgpu/#dom-gpucommandencoder-copytexturetotexture
  */
 export function inspectStorageTextureCopy(source, destination, region = null, position = null,
   sourceLevel = 0, destinationLevel = 0, sameTexture = false) {
   const from = extent(source, sourceLevel), to = extent(destination, destinationLevel);
   if (source.format !== destination.format) fail('FORMAT', 'Texture copies require the same native format');
-  if ((source.viewDimension === '3d') !== (destination.viewDimension === '3d'))
-    fail('DIMENSION', 'Texture copies require matching native dimensions');
   let origin = [0, 0, 0], size = from.slice(), target = [0, 0, 0];
   if (region !== null) {
     if (!region || (!!region.isBox2 === !!region.isBox3) || !region.min || !region.max)

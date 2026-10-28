@@ -140,12 +140,24 @@ test('float base copies regenerate destination mips; manual mip copies never reg
   owner.dispose();
 });
 
-test('invalid coordinate types and 2D/3D conversion are not silently coerced', () => {
+test('invalid coordinate types are not silently coerced; 2D and 3D bounds are independent', () => {
   const shape = {width: 4, height: 4, depth: 1, mipLevelCount: 1, viewDimension: '2d', format: 'r32uint'};
   for (const region of [{}, box([0, 0, 0], [1.5, 1, 1]), box([1, 0, 0], [0, 1, 1])])
     assert.throws(() => inspectStorageTextureCopy(shape, shape, region));
   assert.throws(() => inspectStorageTextureCopy(shape, shape, null, at(NaN)), /BOUNDS/);
-  assert.throws(() => inspectStorageTextureCopy(shape, {...shape, viewDimension: '3d'}), /DIMENSION/);
+  assert.deepEqual(inspectStorageTextureCopy(shape, {...shape, viewDimension: '3d'}).size, [4, 4, 1]);
+});
+
+for (const [from, to] of [['3d', '2d-array'], ['2d-array', '3d']])
+test(`${from} to ${to} copies several layers without integer conversion`, () => {
+  const {owner} = setup(), source = texture(from, 4, 4, 3), destination = texture(to, 4, 4, 5);
+  const input = words(owner, source); input.set(Array.from({length: input.length}, (_, i) => 0x80000001 + i));
+  words(owner, destination).fill(0xffffffff);
+  copy(owner, source, destination, null, at(0, 0, 1));
+  assert.deepEqual(words(owner, destination).slice(16, 64), input);
+  assert.ok(words(owner, destination).slice(0, 16).every(value => value === 0xffffffff));
+  assert.ok(words(owner, destination).slice(64).every(value => value === 0xffffffff));
+  assert.throws(() => copy(owner, source, destination, null, at(0, 0, 3)), /BOUNDS/); owner.dispose();
 });
 
 function rendererSetup(options = {}) {

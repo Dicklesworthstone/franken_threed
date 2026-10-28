@@ -59,10 +59,12 @@ export function setup(options = {}) {
     const mipLevelCount = texture.generateMipmaps ? 1 + Math.floor(Math.log2(Math.max(target.width, target.height))) : 1;
     let colorBytes = 0;
     for (let i = 0; i < mipLevelCount; i++) colorBytes += Math.max(1, Math.floor(target.width / 2 ** i)) * Math.max(1, Math.floor(target.height / 2 ** i)) * formats.get(format)[2];
-    return {width: target.width, height: target.height, format, mipLevelCount, texture, bytes: colorBytes,
+    const color = {width: target.width, height: target.height, format, mipLevelCount, texture};
+    return {...color, colors: [color], textures: [texture], layers: 1, viewDimension: '2d', bytes: colorBytes,
       sampleCount: target.samples, generateMipmaps: texture.generateMipmaps, key: `${target.width}/${target.height}/${format}/${target.samples}/${mipLevelCount}`};
   }
   const targets = {
+    getTextureTarget(texture) { return texture?.renderTarget ?? null; },
     capture(target) {
       const shape = shapeOf(target);
       let entry = entries.get(target);
