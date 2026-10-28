@@ -2,6 +2,7 @@
 import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy, captureStorageToTargetCopy} from './three_target_texture_copy.mjs';
+import {copySampledTextureToStorage} from './three_sampled_texture_copy.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
@@ -35,6 +36,10 @@ export function withStorageTextureCopies(Base) {
       }
       if (!this.isWebGPURenderer) fail('ROUTE', 'Storage texture copies require the WebGPU renderer surface');
       if (!this._initialized) fail('INITIALIZATION', 'Initialize the renderer before copying textures');
+      const rejected = error => {
+        if (!failures.has(this)) failures.set(this, error);
+        this._deferredError ??= error;
+      };
       let issue;
       if (source?.isRenderTargetTexture && destination?.isStorageTexture) {
         const request = captureTargetToStorageCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
@@ -46,15 +51,15 @@ export function withStorageTextureCopies(Base) {
         const owner = this._storageTextures;
         const request = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
         issue = () => { owner.copy(request); };
+      } else if (source?.isTexture && destination?.isStorageTexture) {
+        copySampledTextureToStorage(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
+        this.inspector?.copyTextureToTexture?.(source, destination);
+        return;
       } else {
         if (typeof super.copyTextureToTexture === 'function')
           return super.copyTextureToTexture(source, destination, region, position, sourceLevel, destinationLevel);
         fail('SOURCE', 'Expected storage textures or copies between storage and target-owned color');
       }
-      const rejected = error => {
-        if (!failures.has(this)) failures.set(this, error);
-        this._deferredError ??= error;
-      };
       if (this._computeTurn) this._computeTurn.submit(issue)?.catch?.(rejected);
       else if (!this._drain && !this._preparing && !this._pending?.length) issue();
       else this._enqueue({transfer: true, issue, resolve() {}, reject: rejected});
