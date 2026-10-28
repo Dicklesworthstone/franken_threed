@@ -207,7 +207,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (pipelineEntries.get(entry.key) === entry) pipelineEntries.delete(entry.key);
     for (const [key, value] of resourceGroups) if (value.pipelineEntry === entry) resourceGroups.delete(key);
   }
-  async function add(gpu, {nodeProgram, raster, topology = 'triangles'}) {
+  async function add(gpu, {nodeProgram, raster, topology = 'triangles', stripIndexFormat}) {
     live();
     if (nodeProgram?.nodeProgram !== true || typeof nodeProgram.vertex !== 'string' ||
         typeof nodeProgram.fragment !== 'string' || !Array.isArray(nodeProgram.groups) ||
@@ -217,7 +217,10 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (nodeProgram.instanceCapacity !== undefined &&
         (!Number.isSafeInteger(instanceCapacity) || instanceCapacity < 0 || instanceCapacity > 0xffffffff))
       fail('ANIMATION_RENDER_OPTIONS', 'Native node instance capacity must be a nonnegative 32-bit integer');
-    if (!['triangles', 'lines'].includes(topology)) fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics require triangle or line-list primitives');
+    const primitiveTopology = {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
+    if (typeof primitiveTopology !== 'string' || stripIndexFormat !== undefined &&
+        (topology !== 'line-strip' || !['uint16', 'uint32'].includes(stripIndexFormat)))
+      fail('ANIMATION_RENDER_OPTIONS', 'Native node graphics require a supported primitive topology and matching strip index format');
     const groups = nodeProgram.groups.map(groupDescriptor);
     if (groups.reduce((count, group) => count + group.uniforms.length, 0) >
         (device.limits.maxDynamicUniformBuffersPerPipelineLayout ?? 8))
@@ -259,6 +262,9 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const geometry = programGeometrySnapshot(gpu, device);
     if (geometry.channels.missing.length)
       fail('ANIMATION_RENDER_GEOMETRY', 'Native node graphics require complete source geometry attributes');
+    if (stripIndexFormat !== undefined && stripIndexFormat !== geometry.indexFormat)
+      fail('ANIMATION_RENDER_GEOMETRY', 'Native line-strip index format must match the captured geometry');
+    const nativeStripIndexFormat = topology === 'line-strip' ? geometry.indexFormat : undefined;
     const geometrySignature = geometry.signature, geometryInstanced = geometry.instanced, layouts = geometry.layouts;
     // Capture all source-facing values before registrations or pipeline work
     // can yield. Older program records/groups survive arena growth unchanged.
@@ -270,7 +276,8 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       targets: colorFormats.map((format, index) => ({format,
         ...(colorStates[index].blend ? {blend: colorStates[index].blend} : {}),
         writeMask: index < colorCount ? state.writeMask : 0})),
-      primitive: {topology: topology === 'lines' ? 'line-list' : 'triangle-list', cullMode: state.cullMode, frontFace: state.frontFace},
+      primitive: {topology: primitiveTopology, cullMode: state.cullMode, frontFace: state.frontFace,
+        ...(nativeStripIndexFormat ? {stripIndexFormat: nativeStripIndexFormat} : {})},
       ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: state.depthWriteEnabled,
         depthCompare: state.depthCompare, ...state.bias, ...(hasAnimationStencil(depthFormat) ? state.stencil : {})}} : {}),
       multisample: {count: sampleCount, alphaToCoverageEnabled: state.alphaToCoverageEnabled},
@@ -320,6 +327,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     catch (error) { releasePipeline(pipelineEntry); throw error; }
     const {pipelines, bindGroupLayouts} = prepared;
     const record = {nodeProgram: true, gpu, groups, uniformBindings, bindGroupLayouts, pipelineEntry, geometrySignature, geometryInstanced, instanceCapacity,
+      topology, stripIndexFormat: nativeStripIndexFormat,
       resourceCount: groups.reduce((sum, group) => sum + group.resources.length, 0),
       pipelines: {normal: pipelines[0], flipped: pipelines[1]},
       blended: !!state.blend, alphaMode: state.blend ? 'BLEND' : 'OPAQUE',
@@ -345,8 +353,9 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one owned uniform byte packet per native group');
     const resources = snapshotResources(record, input);
     const geometry = programGeometrySnapshot(record.gpu, device);
-    if (geometry.signature !== record.geometrySignature || geometry.instanced !== record.geometryInstanced)
-      fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout changed; register it again');
+    if (geometry.signature !== record.geometrySignature || geometry.instanced !== record.geometryInstanced ||
+        record.topology === 'line-strip' && geometry.indexFormat !== record.stripIndexFormat)
+      fail('ANIMATION_RENDER_GEOMETRY', 'Native node geometry layout or strip index format changed; register it again');
     const instanceCount = input.instanceCount ?? 1, firstInstance = input.firstInstance ?? 0;
     if (instanceCount + firstInstance > 0x100000000 ||
         instanceCount + firstInstance > Math.min(record.instanceCapacity, geometry.instanceCapacity ?? Infinity))

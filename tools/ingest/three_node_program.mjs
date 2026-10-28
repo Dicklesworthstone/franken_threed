@@ -2,7 +2,7 @@
  * are retained helpers; this module constructs no renderer/backend and submits
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
- * The profile is rigid/skinned/morphed meshes, source sprite billboards,
+ * The profile is rigid/skinned/morphed meshes, native points and lines, source sprite billboards,
  * InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
@@ -46,6 +46,7 @@ export class ThreeNodeProgramError extends Error {
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode']);
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
+const POINTS_SLOTS = new Set([...SPRITE_SLOTS, 'sizeNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode', 'envNode']);
@@ -55,7 +56,7 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
   'transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']);
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
-const GRAPH_SLOTS = [...SLOTS, ...SPRITE_SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
+const GRAPH_SLOTS = [...SLOTS, ...POINTS_SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
 // These source material accessors lower to ordinary 2D texture bindings. AO and
 // light maps additionally retain their exact source material lighting nodes.
 // Environment maps use their separate source PMREM identity and context below.
@@ -105,7 +106,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
     [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial],
     [three.MeshNormalMaterial, three.MeshNormalNodeMaterial], [three.MeshMatcapMaterial, three.MeshMatcapNodeMaterial],
-    [three.ShadowMaterial, three.ShadowNodeMaterial], [three.SpriteMaterial, three.SpriteNodeMaterial]
+    [three.ShadowMaterial, three.ShadowNodeMaterial], [three.SpriteMaterial, three.SpriteNodeMaterial],
+    [three.PointsMaterial, three.PointsNodeMaterial], [three.LineBasicMaterial, three.LineBasicNodeMaterial]
   ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
   // Share immutable source text only. Each render object keeps its own builder,
   // observer and bindings, since source nodes may close over its live values.
@@ -692,8 +694,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   // Sprite shader construction branches on attenuation and the presence of
   // an anchor reference. Values of center/rotation/scale stay live uniforms.
   function spriteSignature(material, object) {
-    return Object.getPrototypeOf(material) === three.SpriteNodeMaterial.prototype
+    const prototype = Object.getPrototypeOf(material);
+    if (prototype === three.PointsNodeMaterial.prototype)
+      return JSON.stringify([object.isPoints === true, material.sizeAttenuation]);
+    return prototype === three.SpriteNodeMaterial.prototype
       ? JSON.stringify([material.sizeAttenuation, object.center?.isVector2 === true]) : null;
+  }
+  function primitiveLayout(material, object) {
+    // Match WebGPUUtils: point size and line width do not expand primitives.
+    // Sprite-backed PointsNodeMaterial instead uses the retained quad shader.
+    const wireframe = object.isMesh === true && material.wireframe === true;
+    const topology = object.isPoints ? 'points' : object.isLineSegments || wireframe ? 'lines' :
+      object.isLine ? 'line-strip' : 'triangles';
+    const index = object.geometry.index;
+    const stripIndexFormat = topology === 'line-strip' && index
+      ? index.array instanceof Uint32Array ? 'uint32' : 'uint16' : null;
+    return {topology, stripIndexFormat, wireframe};
   }
   function transmissionSignature(material) {
     if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
@@ -748,11 +764,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     material = prepareMaterial(material);
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
-        ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite or unlit base NodeMaterial');
+        ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.PointsNodeMaterial.prototype,
+          three.LineBasicNodeMaterial.prototype, three.NodeMaterial.prototype, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
-      physical = prototype === three.MeshPhysicalNodeMaterial.prototype, sprite = prototype === three.SpriteNodeMaterial.prototype;
+      physical = prototype === three.MeshPhysicalNodeMaterial.prototype, sprite = prototype === three.SpriteNodeMaterial.prototype,
+      points = prototype === three.PointsNodeMaterial.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     sourceLights(material, context);
@@ -760,10 +778,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
     sourceEnvironment(material, context);
-    if (!(object instanceof three.Mesh || object instanceof three.Sprite) ||
+    if (!(object instanceof three.Mesh || object instanceof three.Sprite || object instanceof three.Points ||
+        object instanceof three.Line && !object.isLineLoop) ||
         !(object.geometry instanceof three.BufferGeometry) ||
         object.geometry.isInstancedBufferGeometry && !(object.geometry instanceof three.InstancedBufferGeometry))
-      fail('OBJECT', 'Native node graphs require source sprites, meshes, BatchedMesh, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
+      fail('OBJECT', 'Native node graphs require source points, lines, sprites, meshes, BatchedMesh, InstancedBufferGeometry or CPU/storage-backed InstancedMesh objects');
     inspectInstances(object);
     inspectThreeNativeBatch(three, object, fail);
     inspectSkinning(object);
@@ -799,7 +818,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           fail('TEXTURE', 'Native material map slots require ordinary 2D textures');
         inspectTexture(value);
       }
-      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(sprite && SPRITE_SLOTS.has(key)) && !(lit && LIT_SLOTS.has(key)) &&
+      if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(sprite && SPRITE_SLOTS.has(key)) &&
+          !(points && POINTS_SLOTS.has(key)) && !(lit && LIT_SLOTS.has(key)) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
@@ -918,7 +938,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // builder nodes which close over a particular source object.
     return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
-      material.wireframe === true ? [object.geometry.index?.array.length ?? null,
+      primitiveLayout(material, object),
+      primitiveLayout(material, object).wireframe ? [object.geometry.index?.array.length ?? null,
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
@@ -1147,7 +1168,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`,
       vertex: shaders.vertex, fragment: shaders.fragment, colorCount,
       cameraIndex,
-      wireframe: preparedMaterial.wireframe === true,
+      ...primitiveLayout(preparedMaterial, object),
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),
       ...(instances ? {instanceCapacity: instances.capacity} : {})});
     // Node.build() deduplicates unsized storage by attribute before addNode().
@@ -1489,8 +1510,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native batch texture identities changed; compile the source batching graph again');
   }
   function checkWireframe(state) {
-    if (state.descriptor.wireframe !== (state.material.wireframe === true))
-      fail('CHANGED', 'Native wireframe topology changed; compile the graph again');
+    const primitive = primitiveLayout(state.material, state.object);
+    if (Object.entries(primitive).some(([key, value]) => state.descriptor[key] !== value))
+      fail('CHANGED', 'Native primitive topology or strip index format changed; compile the graph again');
   }
   function captureGeometry(state, renderId, captureVertexAttribute) {
     const generated = state.generated ? generatedAttributes.capture(state.descriptor, renderId, captureVertexAttribute) : null;

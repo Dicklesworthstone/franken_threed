@@ -357,7 +357,7 @@ export async function createGpuThreeScene(device,scene,{
           if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
             fail('OBJECT','Custom frustum tests are not admitted');
           // Line casters draw through the program shadow port (WebGL surface).
-          if(object.isPoints?(object.castShadow||object.receiveShadow):((object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled)))
+          if(!capturedNodeObject(object)&&(object.isPoints?(object.castShadow||object.receiveShadow):((object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled))))
             fail('SHADOW','Line and point shadows are not admitted');
           geometryAdmission(object.geometry,object);
         }
@@ -1029,9 +1029,10 @@ export async function createGpuThreeScene(device,scene,{
   }
   function nodeDescription(binding){
     const {nodeProgram,raster,material}=binding;
-    const topology=nodeProgram.wireframe?'lines':'triangles';
-    return {nodeProgram,options:{nodeProgram,raster,topology},values:{},clipped:null,
-      structural:[trackMaterial(material),'native-node',nodeProgram.key,topology,JSON.stringify(raster)]};
+    const topology=nodeProgram.topology??(nodeProgram.wireframe?'lines':'triangles');
+    const stripIndexFormat=nodeProgram.stripIndexFormat;
+    return {nodeProgram,options:{nodeProgram,raster,topology,...(stripIndexFormat?{stripIndexFormat}:{})},values:{},clipped:null,
+      structural:[trackMaterial(material),'native-node',nodeProgram.key,topology,stripIndexFormat,JSON.stringify(raster)]};
   }
   function desired(nodes){
     const clippingFrame=clippingState();

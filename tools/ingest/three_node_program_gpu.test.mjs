@@ -94,6 +94,47 @@ test('native graphics uses main entrypoints, native group order and F3D-owned pi
   assert.equal(a.nodeProgram.groups[0].offset % 256, 0); assert.equal(b.nodeProgram.groups[1].offset % 256, 0);
   assert.equal(a.program, undefined); assert.equal(a.instanceCount, 1);
 });
+for (const [topology, native] of [['points', 'point-list'], ['lines', 'line-list'], ['line-strip', 'line-strip']])
+  for (const Index of [null, Uint16Array, Uint32Array])
+    test(`native ${topology} retains ${Index?.name ?? 'nonindexed'} geometry and primitive topology`, async t => {
+      const f = rig(t, {configureGeometry(source) {
+        if (Index === null) source.index = null;
+        else source.index.array = new Index([2, 0, 1]);
+      }});
+      const stripIndexFormat = topology === 'line-strip' && Index ? Index === Uint16Array ? 'uint16' : 'uint32' : undefined;
+      const record = await f.add([], {topology, stripIndexFormat}), command = f.stage(record, [], {first: 1, count: 2});
+      assert.equal(record.pipelines.normal.primitive.topology, native);
+      assert.equal(record.pipelines.flipped.primitive.topology, native);
+      assert.equal(record.pipelines.normal.primitive.stripIndexFormat, stripIndexFormat);
+      assert.deepEqual([command.first, command.count], [1, 2]);
+      assert.equal(command.indexFormat, Index ? Index === Uint16Array ? 'uint16' : 'uint32' : null);
+      if (Index) assert.deepEqual([...new Index(command.indexBuffer.bytes.buffer).subarray(0, 3)], [2, 0, 1]);
+      else assert.equal(command.indexBuffer, null);
+    });
+test('native strip formats are validated before allocation and inferred for direct registrations', async t => {
+  const f = rig(t), before = [f.buffers.length, f.pipelines.length];
+  for (const options of [{topology: 'line-loop'}, {topology: 'toString'},
+    {topology: 'points', stripIndexFormat: 'uint16'}, {topology: 'line-strip', stripIndexFormat: 'uint8'}])
+    await assert.rejects(f.add([], options), {code: 'ANIMATION_RENDER_OPTIONS'});
+  await assert.rejects(f.add([], {topology: 'line-strip', stripIndexFormat: 'uint32'}), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  assert.deepEqual([f.buffers.length, f.pipelines.length], before);
+  const record = await f.add([], {topology: 'line-strip'});
+  assert.equal(record.pipelines.normal.primitive.stripIndexFormat, 'uint16');
+  f.source.index = {...f.source.index, array: new Uint32Array([0, 1, 2]), version: 0};
+  f.gpu.update();
+  assert.throws(() => f.stage(record, []), {code: 'ANIMATION_RENDER_GEOMETRY'});
+  const replacement = await f.add([], {topology: 'line-strip', stripIndexFormat: 'uint32'});
+  assert.equal(f.stage(replacement, []).indexFormat, 'uint32');
+  assert.notEqual(replacement.pipelines.normal, record.pipelines.normal);
+});
+test('native primitive topology participates in pipeline sharing', async t => {
+  const f = rig(t), records = [];
+  for (const topology of ['triangles', 'lines', 'points', 'line-strip']) {
+    const record = await f.add([], {topology}); records.push(record);
+    assert.equal((await f.add([], {topology})).pipelines.normal, record.pipelines.normal);
+  }
+  assert.equal(new Set(records.map(record => record.pipelines.normal)).size, 4);
+});
 test('draws preserve native source index order and intersect current draw ranges', async t => {
   const f = rig(t), record = await f.add(); f.source.drawRange = {start: 1, count: 2};
   const command = f.stage(record, [1, 2], {first: 0, count: 2, frontFaceCW: true});

@@ -20,6 +20,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
+  material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
   material.wireframe === true &&
     ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
       material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) ||
@@ -162,7 +163,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
-    if (!object.material) continue;
+    if (!object.material || object.isLineLoop === true) continue;
     if (shadowPass) {
       // The retained source selector, rather than the ordinary fixed route,
       // owns every renderable in a shadow pass, including excluded noncasters.
@@ -189,9 +190,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // through the source library conversion when any group needs native shading;
     // unsupported classes still fail the complete preflight below.
     const sprite = object instanceof three.Sprite && object.isSprite === true;
-    if (!(object instanceof three.Mesh || sprite) || object.intersectsFrustum !==
-        (sprite ? three.Sprite.prototype : object.isSkinnedMesh ? three.SkinnedMesh.prototype : three.Mesh.prototype).intersectsFrustum)
-      fail('OBJECT', 'Native node scenes require source meshes or sprites with their source frustum implementation');
+    const points = object instanceof three.Points && object.isPoints === true;
+    const line = object instanceof three.Line && object.isLine === true;
+    if (!(object instanceof three.Mesh || sprite || points || line) || object.intersectsFrustum !==
+        (sprite ? three.Sprite.prototype : points ? three.Points.prototype : line ? three.Line.prototype :
+          object.isSkinnedMesh ? three.SkinnedMesh.prototype : three.Mesh.prototype).intersectsFrustum)
+      fail('OBJECT', 'Native node scenes require source meshes, sprites, points or lines with their source frustum implementation');
     if (sprite && Array.isArray(object.material))
       fail('MATERIAL', 'Source sprites require one material');
     if (batch) inspectThreeNativeBatch(three, object, fail);
@@ -408,7 +412,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         // Retain generated streams while this accepted render waits for submit.
         binding.programGeometry = programs.geometry?.(binding.nodeProgram) ?? binding.geometry;
         binding.raster = raster(binding.material, {mrt, textures: destination?.textures ?? null,
-          topology: binding.nodeProgram.wireframe ? 'lines' : 'triangles'});
+          topology: binding.nodeProgram.topology ?? (binding.nodeProgram.wireframe ? 'lines' : 'triangles')});
         if (shadowPass) binding.shadowState = Object.freeze(captureThreeShadowMaterialState(binding.material));
         Object.freeze(binding);
         if (programs.textures(binding.nodeProgram).length) {

@@ -1499,7 +1499,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
     } finally { pendingMeshes--; }
   }
   async function addNodeProgramMesh(gpu, options) {
-    keys(options, ["nodeProgram", "raster", "topology"], "node program mesh");
+    keys(options, ["nodeProgram", "raster", "topology", "stripIndexFormat"], "node program mesh");
     if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
     pendingMeshes++;
     let record;
