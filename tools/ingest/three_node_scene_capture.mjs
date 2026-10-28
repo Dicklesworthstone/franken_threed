@@ -20,6 +20,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
+  material.alphaHash === true ||
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
   material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true ||
   material.isPointsMaterial === true && (material.map != null || material.alphaMap != null) ||

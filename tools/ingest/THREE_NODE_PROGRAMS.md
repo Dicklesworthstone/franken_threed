@@ -792,6 +792,25 @@ removing a Matcap map rebuilds the graph; compatible replacements preserve each
 captured texture binding. Fog checks use the converted source defaults without
 mutating the original material.
 
+## Alpha-hashed transparency
+
+Ordinary admitted mesh materials with `alphaHash: true` now enter the native
+source shader route automatically. The pinned `NodeMaterial` supplies its
+derivative-based threshold and fragment discard, using the deformed local
+position. Opacity, base-color/alpha maps, authored opacity nodes, alpha testing,
+clipping and alpha-to-coverage compose through that same source graph. Hashing
+does not force blending, change the sample count, or add transparent passes.
+
+Changing `alphaHash` rebuilds the native shader; queued enabled/disabled/enabled
+renders keep their accepted programs and material values. Source shadow
+materials retain their own alpha behavior. Explicit fragment graphs and the
+source Normal material's diffuse override keep their source bypass semantics.
+
+Focused tests compare complete vertex/fragment WGSL with r186 and exercise live
+opacity, map upload versions, queued route changes, construction/update mutation
+checks and shadow ownership through the actual native facade. These checks do
+not establish browser pixel parity or hardware performance.
+
 ## Authored scene fog
 
 Assign a source TSL graph to `scene.fogNode` to compose fog with native material
@@ -853,7 +872,7 @@ require additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions and unregistered shadow lifecycles,
-alpha hashing and alpha-to-coverage; skinned or morph meshes,
+skinned or morph meshes,
 including per-instance morph textures; XR/multiview and native ArrayCamera bundles or BatchedMesh;
 object render hooks outside the source lifecycle profile above and effectful
 attribute upload callbacks.

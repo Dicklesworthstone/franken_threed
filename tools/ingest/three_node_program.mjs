@@ -797,8 +797,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     inspectThreeNodeClipping(three, context, maxNodes, fail);
     if (material.clippingPlanes?.length || renderer.clippingPlanes?.length)
       fail('EFFECT', 'Native WebGPU clipping uses source ClippingGroup objects, not legacy material or renderer planes');
-    if (material.alphaHash)
-      fail('RASTER', 'Native node graph hashed alpha is not admitted');
     if (typeof material.alphaToCoverage !== 'boolean')
       fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
     if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
@@ -946,7 +944,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       object.isMesh === true && material.wireframe === true ? [object.geometry.index?.array.length ?? null,
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
-      material.alphaTest > 0, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
+      material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
       spriteSignature(material, object),
       primitiveLayout(object, material),
@@ -993,7 +991,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
-    const fogKey = fogSignature(preparedMaterial, context);
+    const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
@@ -1041,6 +1039,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     if (fogSignature(prepareMaterial(material), context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
+    if ((material.alphaHash === true) !== alphaHash) fail('CHANGED', 'Native alpha hashing changed during source graph construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
@@ -1219,7 +1218,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       spriteSignature: spriteSignature(preparedMaterial, object),
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
-      clippingSignature: clippingKey, alphaToCoverage: material.alphaToCoverage,
+      clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
@@ -1506,6 +1505,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native transmission or dispersion graph changed; compile the physical draw variant again');
   }
   function checkClipping(state, context) {
+    if ((state.material.alphaHash === true) !== state.alphaHash)
+      fail('CHANGED', 'Native alpha hashing changed; compile the material graph again');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
         state.material.alphaToCoverage !== state.alphaToCoverage ||
         (state.material.alphaToCoverage && renderer.currentSamples > 1) !== state.clippingSamples)
