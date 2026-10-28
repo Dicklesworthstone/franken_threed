@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
-import { findThreeLoaderRequests } from "./three_loader_assets.mjs";
+import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
 const coreUrl = rootUrl + "build/three.core.js";
@@ -86,6 +86,45 @@ test("fluent GLTFLoader path and resource settings retain their final values", (
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, "models/scene.gltf");
   assert.equal(requests[0].resourcePath, "textures/");
+});
+
+test("ObjectLoader retains sticky image bases and finite resets visible to pending loads", () => {
+  const requests = discover(`import { ObjectLoader } from 'three';
+    const loader = new ObjectLoader();
+    loader.load('first/scene.json'); loader.loadAsync('second/scene.json');
+    loader.setResourcePath('shared/'); loader.load('third/scene.json');
+    loader.setResourcePath(''); loader.setPath('models/'); loader.load('nested/scene.json');
+    new ObjectLoader().setPath('other/').load('nested/scene.json');`);
+  assert.deepEqual(requests.map(({url}) => url), ['first/scene.json', 'second/scene.json',
+    'third/scene.json', 'models/nested/scene.json', 'other/nested/scene.json']);
+  const pendingBases = new Set(['first/', 'second/', 'shared/', 'models/', '']);
+  for (const request of requests.slice(0, 4)) assert.deepEqual(new Set(request.imagePaths), pendingBases);
+  assert.deepEqual(requests[4].imagePaths, ['other/']);
+  const callbacks = discover(`import { ObjectLoader } from 'three'; const loader = new ObjectLoader();
+    export const first = () => loader.loadAsync('a/scene.json');
+    export const second = () => loader.loadAsync('b/scene.json');`);
+  assert.ok(callbacks.every(request => request.imagePaths.join(',') === 'a/,b/'));
+  const pending = discover(`import { ObjectLoader } from 'three';
+    const loader = new ObjectLoader(); loader.loadAsync('models/scene.json'); loader.setResourcePath('late/');
+    const reset = new ObjectLoader().setResourcePath('before/'); reset.load('models/scene.json'); reset.setResourcePath('');`);
+  assert.deepEqual(new Set(pending[0].imagePaths), new Set(['models/', 'late/']));
+  assert.deepEqual(new Set(pending[1].imagePaths), new Set(['before/', '']));
+});
+
+test("ObjectLoader unknown sticky bases and custom managers retain their host routes", () => {
+  const requests = discover(`import { ObjectLoader } from 'three';
+    const unknown = new ObjectLoader(); unknown.load(runtimeURL); unknown.load('known/scene.json');
+    const fixed = new ObjectLoader().setPath('fixed/'); fixed.load(runtimeURL); fixed.load('scene.json');
+    new ObjectLoader(manager).load('managed.json');
+    const escaped = new ObjectLoader(); customize(escaped); escaped.load('escaped.json');`);
+  assert.deepEqual(requests.map(({url, imagePaths}) => [url, imagePaths]), [
+    ['known/scene.json', null], ['fixed/scene.json', ['fixed/']],
+  ]);
+  const pending = discover(`import { ObjectLoader } from 'three';
+    const loader = new ObjectLoader(); loader.loadAsync('scene.json'); loader.setResourcePath(runtimePath);
+    const changed = new ObjectLoader(); changed.load('scene.json'); changed.setPath(runtimePath); changed.setResourcePath(runtimeImages);`);
+  assert.equal(pending.length, 2);
+  assert.ok(pending.every(request => request.imagePaths === null), 'unknown later resets remain host-owned');
 });
 
 test("configured GLTF loaders retain model roots and source codec paths through fluent and separate setters", () => {
@@ -176,6 +215,39 @@ function fixture(files) {
   }
   return root;
 }
+
+test("ObjectLoader collects encoded image and cube sidecars without changing JSON, data images or host URLs", () => {
+  const scene = JSON.stringify({metadata: {type: 'Object'}, images: [
+    {uuid: 'paint', url: 'paint%20%23.png?version=2#surface'},
+    {uuid: 'cube', url: ['faces/px.png', 'faces/nx.png', {data: [0, 1, 2, 255], width: 1, height: 1, type: 'Uint8Array'}]},
+    {uuid: 'embedded', url: 'data:image/png;base64,AA=='},
+    {uuid: 'remote', url: 'https://example.test/live.png'},
+    {uuid: 'relative', url: '/slash.png'},
+  ]});
+  const root = fixture({'index.html': '', 'site/models/nested/scene.json': scene,
+    'site/models/paint #.png': 'paint', 'site/models/faces/px.png': 'px', 'site/models/faces/nx.png': 'nx',
+    'site/models/slash.png': 'slash', 'site/models/nested/paint #.png': 'wrong model-directory base',
+    'site/shared/paint #.png': 'override', 'site/shared/faces/px.png': 'shared-px',
+    'site/shared/faces/nx.png': 'shared-nx', 'site/shared/slash.png': 'shared-slash',
+    'site/models/bad.json': '{invalid source JSON'});
+  const requests = discover(`import { ObjectLoader } from 'three';
+    new ObjectLoader().setPath('models/').load('nested/scene.json');
+    new ObjectLoader().setPath('models/').setResourcePath('shared/').loadAsync('nested/scene.json');
+    new ObjectLoader().setPath('models/').load('bad.json');`);
+  const resources = [], assets = collectThreeLoaderAssets(requests, {
+    documentUrl: pathToFileURL(path.join(root, 'index.html')).href,
+    documentBaseUrl: pathToFileURL(path.join(root, 'site/')).href,
+    fail: (code, message) => { throw new Error(`${code}: ${message}`); },
+    onResource: (name, url) => resources.push({name, url}),
+  });
+  assert.deepEqual([...assets.keys()].sort(), ['site/models/nested/scene.json', 'site/models/paint #.png',
+    'site/models/faces/px.png', 'site/models/faces/nx.png', 'site/models/slash.png',
+    'site/shared/paint #.png', 'site/shared/faces/px.png', 'site/shared/faces/nx.png',
+    'site/shared/slash.png', 'site/models/bad.json'].sort());
+  assert.equal(assets.get('site/models/nested/scene.json').source.toString(), scene);
+  assert.equal(assets.get('site/models/bad.json').source.toString(), '{invalid source JSON');
+  assert.ok(resources.some(({url}) => url.endsWith('/models/paint%20%23.png?version=2#surface')));
+});
 
 test("built FileLoader and GLTFLoader fetch original document-base URLs and external geometry bytes", async () => {
   const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);

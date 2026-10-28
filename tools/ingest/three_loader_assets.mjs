@@ -264,7 +264,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       // An application-supplied manager can map a logical URL to an unrelated
       // runtime resource. Keep that authored route without assuming disk files.
       return loader && node.arguments.length === 0
-        ? { loader, paths: [""], resourcePaths: [""], codecs: new Map(), codecUrls: [] } : null;
+        ? { loader, origin: node, paths: [""], resourcePaths: [""], codecs: new Map(), codecUrls: [] } : null;
     }
     if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee))) {
       const value = instance(node.callee.object, use, active);
@@ -335,17 +335,49 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     const elements = node.elements.map((element) => finite(element));
     return elements.every(Boolean) && elements.flat().length <= LIMIT ? [...new Set(elements.flat())] : null;
   };
-  const requests = [];
+  // Identity alone is enough to invalidate an already admitted ObjectLoader
+  // image closure after an unknown setting; this never admits a new request.
+  const instanceOrigin = (node, active = new Set()) => {
+    if (node?.type === "NewExpression") return node;
+    if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee)))
+      return instanceOrigin(node.callee.object, active);
+    if (node?.type !== "Identifier") return null;
+    const binding = lookup(node.name, node);
+    return binding?.kind === "const" && !active.has(binding)
+      ? instanceOrigin(binding.init, new Set(active).add(binding)) : null;
+  };
+  const requests = [], objectLoads = new Map(), unresolvedLoads = new Set();
   for (const call of calls) {
     const method = memberName(call.callee);
     if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile"].includes(method)) continue;
     const value = instance(call.callee.object, call);
-    if (!value) continue;
+    if (!value) {
+      if (["load", "loadAsync"].includes(method)) unresolvedLoads.add(instanceOrigin(call.callee.object));
+      continue;
+    }
     if (["load", "loadAsync"].includes(method)) {
       const urls = value.loader === "CubeTextureLoader" ? cubeUrls(call.arguments[0]) : finite(call.arguments[0]);
+      let objectGroup;
+      if (value.loader === "ObjectLoader") {
+        // ObjectLoader keeps its first default base, but reads resourcePath
+        // again when asynchronous JSON loading finishes. Preserve all finite
+        // first-load bases and explicit resets, including for pending requests.
+        if (!objectLoads.has(value.origin)) objectLoads.set(value.origin, { paths: new Set(), requests: [], unknown: false });
+        objectGroup = objectLoads.get(value.origin);
+        for (const prefix of value.resourcePaths) {
+          if (prefix) objectGroup.paths.add(prefix);
+          else for (const loaderPath of value.paths) {
+            if (loaderPath) objectGroup.paths.add(loaderPath);
+            else if (urls) for (const url of urls) objectGroup.paths.add(extractUrlBase(url));
+            else objectGroup.unknown = true;
+          }
+        }
+      }
       if (urls && urls.length * value.paths.length * value.resourcePaths.length <= LIMIT) {
         for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
-          requests.push({ loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url });
+          const request = { loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url };
+          requests.push(request);
+          objectGroup?.requests.push(request);
         }
       }
     } else if (!isUse(value.loader, method) && !(value.loader === "DRACOLoader" && method === "preload")) continue;
@@ -354,6 +386,18 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     for (const codec of codecs) for (const url of codec.codecUrls) {
       requests.push({ loader: codec.loader, url, resourcePath: "", path: "", originalUrl: url });
     }
+  }
+  for (const call of calls) {
+    if (memberName(call.callee) !== "setResourcePath") continue;
+    const group = objectLoads.get(instanceOrigin(call.callee.object));
+    if (!group) continue;
+    const paths = finite(call.arguments[0]);
+    if (!paths) group.unknown = true;
+    else for (const prefix of paths) group.paths.add(prefix);
+  }
+  for (const [origin, group] of objectLoads) {
+    for (const request of group.requests) request.imagePaths = group.unknown || unresolvedLoads.has(origin) || group.paths.size > LIMIT
+      ? null : [...group.paths];
   }
   return requests;
 }
@@ -381,7 +425,26 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
   };
   for (const request of requests) {
     const asset = add(request.url);
-    if (!asset || request.loader !== "GLTFLoader") continue;
+    if (!asset) continue;
+    if (request.loader === "ObjectLoader") {
+      if (!request.imagePaths) continue; // An unknown earlier load can own the sticky base.
+      let json;
+      try { json = JSON.parse(asset.source.toString("utf8")); } catch { continue; }
+      // Keep the JSON bytes and source parse errors intact. DataTexture image
+      // objects are already embedded; string URLs include ordinary/cube images.
+      for (const image of Array.isArray(json?.images) ? json.images : []) {
+        for (const uri of Array.isArray(image?.url) ? image.url : [image?.url]) {
+          if (typeof uri !== "string") continue;
+          for (const base of request.imagePaths) {
+            // Match the pinned deserializeImage rule, including a single '/'
+            // being concatenated with resourcePath rather than replacing it.
+            add(/^(\/\/)|([a-z]+:(\/\/)?)/i.test(uri) ? uri : base + uri);
+          }
+        }
+      }
+      continue;
+    }
+    if (request.loader !== "GLTFLoader") continue;
     const binary = asset.source.length >= 4 && asset.source.readUInt32LE(0) === 0x46546c67;
     const base = request.resourcePath || (request.path
       ? request.path + extractUrlBase(request.originalUrl)

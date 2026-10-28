@@ -52,6 +52,7 @@ class ImageHost extends EventTarget {
     this.complete=true;this.naturalWidth=1;this.naturalHeight=1;this.dispatchEvent(new Event('load'));
   }).catch(error=>{this.dispatchEvent(new Event('error'));});}
 }
+globalThis.HTMLImageElement=ImageHost;
 globalThis.createImageBitmap=async blob=>({width:1,height:1,type:blob.type,byteLength:(await blob.arrayBuffer()).byteLength});
 try {
   const app=await import(workerData.url), manager=app.THREE?.DefaultLoadingManager;
@@ -129,6 +130,74 @@ test("packed source loaders and Meshopt preserve callbacks, manager URLs and dec
   assert.ok(result.events.some(([kind, url]) => kind === "end" && url === "shared/geometry%20%23.bin?buffer=1#position"));
   assert.ok(result.events.every(([, url]) => !url.startsWith("data:")), "manager sees logical resolved URLs, not embedded host URLs");
   assert.deepEqual(fs.readFileSync(core), sourceBefore, "the pinned source oracle is never edited");
+});
+
+test("ObjectLoader saved scenes retain external images, cube faces and edited JSON round trips offline", async () => {
+  const faces = ["px", "nx", "py", "ny", "pz", "nz"];
+  const model = JSON.stringify({metadata: {version: 4.6, type: "Object"},
+    geometries: [{uuid: "box", type: "BoxGeometry", width: 1, height: 2, depth: 3}],
+    images: [{uuid: "paint-image", url: "paint%20%23.png?edition=1#surface"},
+      {uuid: "cube-image", url: faces.map(face => `faces/${face}.png`)},
+      {uuid: "data-image", url: {data: [10, 20, 30, 255], width: 1, height: 1, type: "Uint8Array"}}],
+    textures: [{uuid: "paint", image: "paint-image", repeat: [2, 3], colorSpace: "srgb"},
+      {uuid: "cube", image: "cube-image", mapping: 301}, {uuid: "data", image: "data-image"}],
+    materials: [{uuid: "material", type: "MeshBasicMaterial", map: "paint", envMap: "cube", alphaMap: "data"}],
+    object: {uuid: "scene", type: "Scene", userData: {source: "saved scene"},
+      children: [{uuid: "mesh", type: "Mesh", name: "saved mesh", geometry: "box", material: "material"}]},
+  });
+  const images = Object.fromEntries(["models/a/", "models/prefix/", "shared/", "pending-images/"].flatMap(base => [
+    [`${base}paint #.png`, pixel], ...faces.map(face => [`${base}faces/${face}.png`, pixel]),
+  ]));
+  const f = fixture({"index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      export async function run() {
+        const order=[], loader=new THREE.ObjectLoader();
+        const pending=loader.loadAsync('models/a/scene.json'); order.push('returned');
+        const first=await pending; order.push('loaded');
+        const second=await loader.loadAsync('models/b/scene.json');
+        const callback=await new Promise((resolve,reject)=>new THREE.ObjectLoader().setPath('models/prefix/')
+          .load('nested/scene.json',resolve,undefined,reject));
+        const explicit=await new THREE.ObjectLoader().setPath('models/override/').setResourcePath('shared/')
+          .loadAsync('nested/scene.json');
+        const changed=new THREE.ObjectLoader(), changing=changed.loadAsync('models/pending/scene.json');
+        changed.setResourcePath('pending-images/');
+        const late=await changing;
+        const a=first.children[0], b=second.children[0];
+        a.position.x=9; a.name='edited mesh'; a.updateMatrix();
+        const restored=await new THREE.ObjectLoader().parseAsync(first.toJSON());
+        const raw=await new THREE.FileLoader().loadAsync('models/a/scene.json');
+        return {order,kind:first.type,vertices:a.geometry.attributes.position.count,
+          independent:first!==second&&a.geometry!==b.geometry&&a.material!==b.material&&a.material.map!==b.material.map,
+          stickyImage:a.material.map.image.src===b.material.map.image.src,
+          cube:a.material.envMap.images.length,cubeFaces:new Set(a.material.envMap.images.map(image=>image.src)).size,
+          data:[...a.material.alphaMap.image.data],repeat:a.material.map.repeat.toArray(),
+          callback:callback.children[0].name,explicit:explicit.children[0].name,
+          late:late.children[0].name,
+          restored:{x:restored.children[0].position.x,name:restored.children[0].name,userData:restored.userData},
+          unchangedX:b.position.x,raw};
+      }`,
+    "models/a/scene.json": model, "models/b/scene.json": model,
+    "models/prefix/nested/scene.json": model, "models/override/nested/scene.json": model,
+    "models/pending/scene.json": model, ...images,
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(images)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, "index.html"), f.packed);
+  const html = fs.readFileSync(f.packed, "utf8");
+  fs.renameSync(path.join(f.root, "source"), path.join(f.root, "source-unavailable"));
+  fs.renameSync(f.out, path.join(f.root, "build-unavailable"));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.result, {order: ["returned", "loaded"], kind: "Scene", vertices: 24,
+    independent: true, stickyImage: true, cube: 6, cubeFaces: 6, data: [10, 20, 30, 255], repeat: [2, 3],
+    callback: "saved mesh", explicit: "saved mesh",
+    late: "saved mesh",
+    restored: {x: 9, name: "edited mesh", userData: {source: "saved scene"}}, unchangedX: 0, raw: model});
+  for (const base of ["models/a/", "models/prefix/", "shared/", "pending-images/"]) {
+    assert.ok(result.events.some(([kind, url]) => kind === "end" && url === base + "paint%20%23.png?edition=1#surface"));
+  }
+  assert.ok(result.events.some(([kind, url]) => kind === "end" && url.startsWith("data:image/png;")),
+    "re-import retains the data-image URLs written by the source JSON exporter");
 });
 
 test("resource lookup preserves unknown and manager-owned URLs and exact bytes with real MIME", async () => {

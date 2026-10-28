@@ -153,6 +153,32 @@ and main-thread decoding still worked afterward. With source and build trees
 unavailable, the packed application made no HTTP requests and reported no page
 or console errors.
 
+## Saved ObjectLoader scenes
+
+Finite `ObjectLoader.load()` and `loadAsync()` requests now include external
+images from the saved scene's `images` table, including cube-face URL arrays.
+The model JSON remains byte-for-byte intact, and serialized data-image objects
+and data URLs keep their source representation. The same closure copies image
+files into normal application output and supplies the existing embedded loader
+resource route when standalone preparation is enabled.
+
+The source default image base is `setPath()` when nonempty, otherwise the first
+load URL's directory. ObjectLoader retains that base on later loads until
+`setResourcePath()` resets it. Shared loaders include all finite possible first
+load bases and resource-path resets, so callbacks may execute in either order.
+The path remains live while JSON is loading; a later reset also affects images
+of an already pending scene. A dynamic base or reset,
+custom manager, or escaping loader keeps its host-owned route; external URLs
+are not downloaded. Explicit resource paths, encoded filenames and URL suffixes
+retain their original logical identities. Invalid JSON is still delivered to
+the source loader for its original parse failure.
+
+The focused regression executes the retained source loader with external
+requests rejected and source/build directories unavailable. It checks async and
+callback loading, sticky image bases and pending resets, cube faces, embedded data textures,
+independent instances, and editing/exporting/re-importing a loaded scene. Its
+image host checks resource bytes and ownership, not browser image-decoder parity.
+
 ## Validation and boundaries
 
 ```sh
