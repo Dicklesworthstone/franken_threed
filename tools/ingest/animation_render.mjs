@@ -2542,6 +2542,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         [
           "colorView",
           "colorViews",
+          "depthSlice",
           "depthView",
           "resolveTarget",
           "resolveTargets",
@@ -2569,6 +2570,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         fail("ANIMATION_RENDER_OPTIONS", "Enable clipping before supplying planes");
       const {
         colorView,
+        depthSlice,
         depthView,
         resolveTarget,
         viewProjection,
@@ -2596,6 +2598,9 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           !Array.isArray(clearColors) || clearColors.length !== colorFormats.length ||
           colorView != null && colorView !== colorViews[0] || resolveTarget != null && resolveTarget !== resolveTargets[0])
         fail("ANIMATION_RENDER_ATTACHMENT", "Color attachments, resolves and clear values must match the pipeline layout");
+      if (depthSlice !== undefined && (!Number.isSafeInteger(depthSlice) || depthSlice < 0 || depthSlice > 0xffffffff ||
+          sampleCount !== 1 || colorViews.length === 0 || resolveTargets.some(Boolean)))
+        fail("ANIMATION_RENDER_ATTACHMENT", "Volume slices require a nonnegative integer and single-sample color attachments");
       if (typeof useBundles !== "boolean" || (useBundles && !renderBundles))
         fail("ANIMATION_RENDER_OPTIONS", "Enable renderer renderBundles before using bundled frames");
       if (
@@ -2970,7 +2975,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         if (scissoredClear) {
           // Its own pass, ahead of the frame's, so no pass state leaks into draws.
           const clearPass = encoder.beginRenderPass({label: `${label}/scissor-clear`,
-            colorAttachments: colorViews.map(view => ({view, loadOp: "load", storeOp: "store"})),
+            colorAttachments: colorViews.map(view => ({view, ...(depthSlice === undefined ? {} : {depthSlice}), loadOp: "load", storeOp: "store"})),
             ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp: "load", depthStoreOp: "store",
               ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})});
           clearPass.setScissorRect(...scissor);
@@ -2981,6 +2986,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         const pass = encoder.beginRenderPass({
           label,
           colorAttachments: colorViews.map((view, index) => ({view,
+            ...(depthSlice === undefined ? {} : {depthSlice}),
             ...(resolveTargets[index] ? {resolveTarget: resolveTargets[index]} : {}),
             loadOp: scissoredClear ? "load" : loadOp, storeOp: "store",
             clearValue: {r: clearColors[index][0], g: clearColors[index][1], b: clearColors[index][2], a: clearColors[index][3]},

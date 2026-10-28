@@ -589,11 +589,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // WGSLNodeBuilder selects its texture type and implicit array coordinates.
     const array = texture?.isDataArrayTexture === true || (storage || target) && texture.isArrayTexture === true;
     const dataVolume = texture?.isData3DTexture === true && !storage && !target;
-    const volume = dataVolume || storage && texture.is3DTexture === true;
+    const targetVolume = target && targetLayout?.texture?.viewDimension === '3d';
+    const volume = dataVolume || targetVolume || storage && texture.is3DTexture === true;
     if (!(texture instanceof three.Texture) ||
         texture.is3DTexture && !volume || volume && (array || texture.isCubeTexture) ||
-        texture.isArrayTexture && !array || texture.isData3DTexture && !dataVolume ||
-        dataVolume && (typeof three.Data3DTexture !== 'function' || !(texture instanceof three.Data3DTexture)) ||
+        texture.isArrayTexture && !array || texture.isData3DTexture && !dataVolume && !targetVolume ||
+        (dataVolume || targetVolume) && (typeof three.Data3DTexture !== 'function' || !(texture instanceof three.Data3DTexture)) ||
         array && !storage && !target && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isExternalTexture)
@@ -660,7 +661,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = targetLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array'].includes(viewDimension)) && !layout?.texture)
+    if ((storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))

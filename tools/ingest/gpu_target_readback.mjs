@@ -37,14 +37,17 @@ const FORMATS = new Map([
 // A cube's active rendering face is not readback state. Require the caller to
 // select it explicitly, including for empty requests, rather than quietly
 // returning +X. A 2D target retains its existing default face-zero behavior.
-function readbackFace(shape, face, depth = false) {
+function readbackFace(shape, face, depth = false, mipLevel = 0) {
   const cube = shape?.cube === true;
-  const layers = depth ? shape?.depthLayers ?? (cube ? 6 : shape?.layers ?? 1) : cube ? 6 : shape?.layers ?? 1;
+  const volume = !depth && shape?.volume === true;
+  const baseLayers = depth ? shape?.depthLayers ?? (cube ? 6 : shape?.layers ?? 1) : cube ? 6 : shape?.layers ?? 1;
+  const layers = volume ? Math.max(1, Math.floor(baseLayers / 2 ** mipLevel)) : baseLayers;
   const array = (depth ? shape?.depthArray : shape?.array) === true || layers > 1;
-  if (face === undefined && !cube && !array) face = 0;
+  if (face === undefined && !cube && !array && !volume) face = 0;
   if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
     fail('FACE', cube ? 'Cube readback requires an explicit face from zero to five'
-      : array ? 'Array readback requires an explicit allocated layer' : '2D readback requires face zero');
+      : volume ? 'Volume readback requires an explicit allocated mip slice'
+        : array ? 'Array readback requires an explicit allocated layer' : '2D readback requires face zero');
   return face;
 }
 
@@ -87,16 +90,18 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
   for (const value of [session.width, session.height])
     if (!Number.isSafeInteger(value) || value < 0) fail('SOURCE', 'Expected finite integer target dimensions');
   const diagnostics = session.diagnostics;
-  const format = gpuTargetColorFormat(diagnostics?.target ?? diagnostics, colorIndex, fail);
-  face = readbackFace(diagnostics?.target ?? diagnostics, face);
+  const shape = diagnostics?.target ?? diagnostics;
+  const format = gpuTargetColorFormat(shape, colorIndex, fail);
   let mipLevelCount = diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
   // Suspended owners have no allocation, but still admit an empty base-level read.
   if (mipLevelCount === 0 && (session.width === 0 || session.height === 0)) mipLevelCount = 1;
-  const maxMipLevels = session.width && session.height ? 1 + Math.floor(Math.log2(Math.max(session.width, session.height))) : 1;
+  const maxMipLevels = session.width && session.height
+    ? 1 + Math.floor(Math.log2(Math.max(session.width, session.height, shape?.volume ? shape.layers : 1))) : 1;
   if (!Number.isSafeInteger(mipLevelCount) || mipLevelCount < 1 || mipLevelCount > maxMipLevels)
     fail('SOURCE', 'Invalid allocated mip count');
   if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= mipLevelCount)
     fail('REGION', 'Readback mip level is not allocated');
+  face = readbackFace(shape, face, false, mipLevel);
   const divisor = 2 ** mipLevel;
   const mipWidth = session.width === 0 ? 0 : Math.max(1, Math.floor(session.width / divisor));
   const mipHeight = session.height === 0 ? 0 : Math.max(1, Math.floor(session.height / divisor));

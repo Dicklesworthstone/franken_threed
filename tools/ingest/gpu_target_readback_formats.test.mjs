@@ -60,6 +60,18 @@ function fixture(format = 'rgba8unorm') {
 const region = {x: 1, y: 1, width: 3, height: 2};
 const pixel = {x: 0, y: 0, width: 1, height: 1};
 
+test('volume readback uses XYZ mip count and validates selected mip-local slices before staging', async () => {
+  const f = fixture(); f.session.width = 2; f.session.height = 1;
+  Object.assign(f.session.diagnostics.target, {volume: true, layers: 16, depth: 16, mipLevelCount: 5});
+  await readGpuTargetPixels(f.session, {mipLevel: 2, face: 3});
+  await readGpuTargetPixels(f.session, {mipLevel: 4, face: 0});
+  assert.deepEqual(f.copies.map(copy => [copy.source.mipLevel, copy.source.origin.z, copy.size.width, copy.size.height]),
+    [[2, 3, 1, 1], [4, 0, 1, 1]]);
+  for (const request of [{mipLevel: 0}, {mipLevel: 2, face: 4}, {mipLevel: 4, face: 1}])
+    await assert.rejects(readGpuTargetPixels(f.session, request), {code: 'GPU_READBACK_FACE'});
+  assert.equal(f.buffers.length, 2); assert.ok(f.buffers.every(buffer => buffer.destroyed === 1));
+});
+
 for (const [format, [Type, components]] of layouts) {
   test(`${format}: typed, tightly packed rows preserve channel order and copy origin`, async () => {
     const f = fixture(format), result = await readGpuTargetPixels(f.session, region);

@@ -10,7 +10,7 @@ const N = THREE.TSL;
 
 async function fixture(t, options = {}) {
   const device = geometryDevice(), events = [], textures = [];
-  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256,
+  Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureDimension3D: 256, maxTextureArrayLayers: 256,
     maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
   device.features = new Set(['float32-filterable', 'float32-blendable']);
   device.createTexture = descriptor => {
@@ -132,6 +132,48 @@ test('public copies capture source target and source rectangle before later call
   const at = f.events.indexOf(copy);
   assert.equal(meshDraws(f.events.slice(0, at)).length, 1); assert.equal(meshDraws(f.events.slice(at + 1)).length, 1);
   assert.equal(renderer._targets.capture(first).references, 0);
+});
+
+test('public volume framebuffer copies preserve source layer-zero/mip-zero behavior despite the active render slice', async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const volume = new THREE.RenderTarget3D(8, 8, 4, {type: THREE.HalfFloatType});
+  volume.texture.mipmaps = [{}, {}, {}, {}];
+  const image = new THREE.FramebufferTexture(5, 4), rectangle = new THREE.Vector4(2, 1, 5, 4);
+  t.after(() => { volume.dispose(); image.dispose(); });
+  f.mesh(new THREE.MeshBasicMaterial());
+  renderer.setRenderTarget(volume, 1, 1); renderer.render(scene, camera);
+  renderer.copyFramebufferToTexture(image, rectangle);
+  renderer.setRenderTarget(volume, 3, 0); rectangle.set(0, 0, 1, 1);
+  await renderer.waitForGPU();
+  const [copy] = copies(f.events); assert.equal(copies(f.events).length, 1);
+  const pass = f.events.find(event => event.draws.some(draw => draw.indexed));
+  assert.equal(pass.desc.colorAttachments[0].depthSlice, 1);
+  assert.equal(pass.desc.colorAttachments[0].view.descriptor.baseMipLevel, 1);
+  assert.equal(copy.source.texture, pass.desc.colorAttachments[0].view.texture);
+  assert.equal(copy.source.texture.dimension, '3d'); assert.equal(copy.destination.texture.dimension, '2d');
+  assert.equal(renderer._targets.capture(volume).references, 0);
+
+  // Exercise the retained copy implementation, not an inferred "current view"
+  // policy. r186 copies the base image's first slice even though its preceding
+  // render used slice 1/mip 1; this rectangle only fits that base image.
+  const reference = [], backend = new THREE.WebGPUBackend();
+  const command = (source, destination, size) => ({source: {mipLevel: source.mipLevel, origin: {...source.origin}},
+    destination: {mipLevel: destination.mipLevel, origin: {...destination.origin}}, size: {...size}});
+  backend.device = {queue: {submit() {}}, createCommandEncoder() { return {
+    copyTextureToTexture(source, destination, size) { reference.push(command(source, destination, size)); }, finish() { return {}; },
+  }; }};
+  backend.get(volume.texture).texture = copy.source.texture;
+  backend.get(image).texture = copy.destination.texture;
+  const context = {renderTarget: volume, textures: volume.textures, depthTexture: null, camera,
+    activeCubeFace: 1, activeMipmapLevel: 1};
+  THREE.Renderer.prototype.copyFramebufferToTexture.call({
+    _currentRenderContext: null, _renderTarget: volume, _activeCubeFace: 1, _activeMipmapLevel: 1,
+    _textures: {updateRenderTarget() {}, get: () => context, updateTexture() {}},
+    backend, _inspector: {copyFramebufferToTexture() {}},
+  }, image, new THREE.Vector4(2, 1, 5, 4));
+  assert.deepEqual(command(copy.source, copy.destination, copy.size), reference[0]);
+  assert.equal(reference.length, 1);
+  assert.deepEqual(reference[0].source, {mipLevel: 0, origin: {x: 2, y: 1, z: 0}});
 });
 
 test('queued public copies retain destination generations through framebuffer resize', async t => {

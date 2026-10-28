@@ -21,6 +21,24 @@ function setup(sourceOptions = {}, destinationOptions = {}) {
 }
 const code = value => ({code: `GPU_DEPTH_TRANSFER_${value}`});
 
+test('volume color slices retain independently selectable 2D-array depth for depth-only cross-target copies', async t => {
+  const f = depthDevice(); f.device.limits.maxTextureDimension3D = 256;
+  const source = make(f, {cube: false, volumeDepth: 3, depthArray: true});
+  const destination = make(f, {cube: false, volumeDepth: 5});
+  t.after(() => { source.dispose(); destination.dispose(); });
+  const a = storage(source), b = storage(destination), color = b.color.data.slice();
+  a.depth.data.set(Float32Array.from({length: 48}, (_, i) => (i + 1) / 64));
+  destination.copyDepthFrom(source, {sourceFace: 2});
+  assert.deepEqual(await destination.readDepthPixels(), a.depth.data.slice(32));
+  const pass = f.submissions[0][0][0];
+  assert.equal(pass.group.entries[0].resource.options.baseArrayLayer, 2);
+  assert.equal(pass.group.entries[0].resource.texture.dimension, '2d');
+  assert.equal(pass.desc.depthStencilAttachment.view.texture.dimension, '2d');
+  assert.deepEqual(pass.desc.colorAttachments, []); assert.deepEqual(b.color.data, color);
+  assert.throws(() => destination.copyDepthFrom(source, {sourceFace: 2, face: 1}), code('FACE'));
+  await destination.whenIdle();
+});
+
 for (const depthFormat of ['depth16unorm', 'depth24plus', 'depth32float', 'depth24plus-stencil8', 'depth32float-stencil8'])
   test(`${depthFormat}: six depth-face copies bind single-layer views and preserve color/stencil`, async () => {
     const f = setup({depthFormat}, {depthFormat}), beforeColor = f.b.color.data.slice();

@@ -68,6 +68,24 @@ test('pipeline has no depth state; fullscreen pass leaves depth unattached and c
   assert.deepEqual(events(h,'draw'),[[3]]);assert.equal(r.drawCount,1);assert.equal(r.allocatedBytes,128);assert.equal(h.scopes.length,0);
   r.dispose();assert.equal(h.source.destroyed,0);assert.equal(h.buffers[0].destroyed,1);assert.equal(r.allocatedBytes,0);
 });
+
+test('volume backgrounds render into the selected slice, including slice zero',async()=>{
+  const h=gpu(),r=await createGpuAnimationBackground(h.device,h.source);
+  for(const depthSlice of [0,3])r.render(frame({depthSlice}));
+  r.render(frame());
+  assert.deepEqual(events(h,'pass').map(pass=>pass.colorAttachments[0].depthSlice),[0,3,undefined]);
+  assert.equal(Object.hasOwn(events(h,'pass')[2].colorAttachments[0],'depthSlice'),false);
+  await r.whenIdle();r.dispose();
+});
+
+test('invalid or multisampled volume backgrounds fail before buffer writes and command encoding',async()=>{
+  for(const sampleCount of [1,4]){
+    const h=gpu(),r=await createGpuAnimationBackground(h.device,h.source,{sampleCount}),before=h.events.length;
+    for(const depthSlice of sampleCount===1?[-1,.5,Infinity,0x100000000]:[0])
+      assert.throws(()=>r.render(frame({depthSlice})),code('FRAME'));
+    assert.equal(h.events.length,before);r.dispose();
+  }
+});
 test('consecutive frames snapshot matrices/intensity before their ordered submissions',async()=>{
   const h=gpu(),r=await createGpuAnimationBackground(h.device,h.source),m=[...identity];
   r.render(frame({directionFromClip:m,intensity:2}));m[0]=3;r.render(frame({directionFromClip:m,intensity:4}));

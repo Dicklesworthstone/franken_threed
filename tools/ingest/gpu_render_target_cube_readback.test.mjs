@@ -6,7 +6,7 @@ import {gpuPostprocessFixture, deferred} from './fixtures/animation/gpu_postproc
 
 function fixture(options = {}) {
   const f = gpuPostprocessFixture(), mappings = [], reads = [], depthViews = [];
-  Object.assign(f.device.limits, {maxTextureArrayLayers: 256, maxBufferSize: 1 << 20,
+  Object.assign(f.device.limits, {maxTextureArrayLayers: 256, maxTextureDimension3D: 256, maxBufferSize: 1 << 20,
     maxStorageBufferBindingSize: 1 << 20, maxComputeWorkgroupsPerDimension: 65535});
   f.device.createTexture = descriptor => {
     const {width, height, depthOrArrayLayers} = descriptor.size;
@@ -60,12 +60,47 @@ function fixture(options = {}) {
   const target = createGpuRenderTarget(f.device, {width: 3, height: 3, cube: true, format: 'rgba8unorm', sampleDepth: true, ...options});
   function paint(face, color, depth) {
     target.withFrame(frame => f.device.queue.submit([[() => {
-      frame.colorView.texture.data[frame.colorView.baseArrayLayer ?? 0].fill(color);
+      frame.colorView.texture.data[frame.depthSlice ?? frame.colorView.baseArrayLayer ?? 0].fill(color);
       if (frame.depthView) frame.depthView.texture.data[frame.depthView.baseArrayLayer ?? 0].fill(depth);
     }]]), {face});
   }
   return {...f, target, reads, depthViews, paint, finish() { for (const gate of mappings) gate.resolve(); }};
 }
+
+test('volume reads select independent color slices and array-depth layers at the call-time submission', async t => {
+  const f = fixture({cube: false, volumeDepth: 3, depthArray: true, width: 4, height: 2});
+  t.after(() => f.target.dispose());
+  for (let face = 0; face < 3; face++) f.paint(face, 42 + face, (face + 1) / 4);
+  const reads = Array.from({length: 3}, (_, face) => [f.target.readPixels({face}), f.target.readDepthPixels({face})]);
+  f.paint(1, 99, .875); f.finish();
+  for (const [face, pair] of reads.entries()) {
+    const [color, depth] = await Promise.all(pair);
+    assert.deepEqual([...color], Array(32).fill(42 + face));
+    assert.deepEqual([...depth], Array(8).fill((face + 1) / 4));
+  }
+  assert.deepEqual(f.reads.map(read => read.source.origin.z), [0, 1, 2]);
+  assert.ok(f.reads.every(read => read.source.texture.dimension === '3d'));
+  assert.deepEqual(f.depthViews.map(view => view.baseArrayLayer), [0, 1, 2]);
+  assert.ok(f.depthViews.every(view => view.texture.dimension === '2d'));
+  assert.ok(f.calls.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(f.target.diagnostics.pendingReadbacks, 0);
+});
+
+test('volume resize preserves issued slice reads while retiring the previous XYZ allocation', async t => {
+  const f = fixture({cube: false, volumeDepth: 3, width: 4, height: 2}); t.after(() => f.target.dispose());
+  f.paint(2, 61, .5);
+  const color = f.target.readPixels({face: 2}), depth = f.target.readDepthPixels();
+  const old = f.calls.textures.slice(), fence = deferred(); f.controls.completion = fence;
+  f.target.resize(2, 1, 5); f.paint(4, 87, .75);
+  const next = f.target.readPixels({face: 4});
+  assert.ok(old.every(texture => texture.destroyed === 0));
+  f.finish();
+  assert.deepEqual([...await color], Array(32).fill(61)); assert.deepEqual([...await depth], Array(8).fill(.5));
+  assert.deepEqual([...await next], Array(8).fill(87));
+  fence.resolve(); await f.target.whenIdle();
+  assert.ok(old.every(texture => texture.destroyed === 1));
+  assert.equal(f.target.diagnostics.layers, 5); assert.equal(f.target.diagnostics.depthLayers, 1);
+});
 
 test('owner reads every rendered color/depth cube face without changing render selection or color generation', async t => {
   const f = fixture(); t.after(() => f.target.dispose());

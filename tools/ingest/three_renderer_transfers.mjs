@@ -296,10 +296,12 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // Never infer a cube layer from mutable renderer state, even for an empty
     // read. Validate before queueing or allocating native storage/staging.
     const face = value.face === undefined && !entry.shape.cube ? 0 : value.face;
-    const layers = depth ? entry.shape.depthLayers ?? (entry.shape.cube ? 6 : 1) : entry.shape.layers ?? (entry.shape.cube ? 6 : 1);
+    const baseLayers = depth ? entry.shape.depthLayers ?? (entry.shape.cube ? 6 : 1) : entry.shape.layers ?? (entry.shape.cube ? 6 : 1);
+    const layers = !depth && entry.shape.volume ? Math.max(1, Math.floor(baseLayers / 2 ** mipLevel)) : baseLayers;
     if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
       fail('FACE', entry.shape.cube ? 'Cube readback requires an explicit face from zero to five'
-        : layers > 1 ? 'Array readback requires an in-range layer' : '2D readback requires face zero');
+        : !depth && entry.shape.volume ? 'Volume readback requires an in-range mip slice'
+          : layers > 1 ? 'Array readback requires an in-range layer' : '2D readback requires face zero');
     if (depth && !entry.shape.depthTexture)
       fail('UNSUPPORTED', 'Attach a source DepthTexture before requesting depth readback');
     const levels = depth ? 1 : entry.shape.mipLevelCount;

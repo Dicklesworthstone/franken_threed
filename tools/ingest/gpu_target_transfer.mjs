@@ -4,8 +4,9 @@
  * half-floats are Uint16 bit patterns and float32 payloads are never converted.
  * Copies are raw GPU copies (including copy-compatible sRGB format pairs), not
  * color-space conversion, blending, resizing or an MSAA destination resolve.
- * Cube/array endpoints require explicit face/sourceFace indices; every
- * operation addresses one 2D layer, never an implicit active rendering layer.
+ * Cube/array/volume endpoints require explicit face/sourceFace indices; every
+ * operation addresses one layer or mip-local volume slice, independently of
+ * active rendering state. Native copies may cross 2D/array/3D dimensions.
  * colorIndex/sourceColorIndex select independent MRT attachments, defaulting to
  * zero. Their formats, not the primary attachment, determine layouts and budgets.
  * R8 uses one byte per texel; R11G11B10 uses one Uint32 packed word per texel.
@@ -56,13 +57,16 @@ function layout(shape, colorIndex = 0) {
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
 }
-function transferFace(shape, face, name) {
-  const cube = shape.cube === true, layers = cube ? 6 : shape.layers ?? 1;
+function transferFace(shape, face, name, mipLevel = 0) {
+  const cube = shape.cube === true, volume = shape.volume === true;
+  const baseLayers = cube ? 6 : shape.layers ?? 1;
+  const layers = volume ? Math.max(1, Math.floor(baseLayers / 2 ** mipLevel)) : baseLayers;
   const array = shape.array === true || layers > 1;
-  if (face === undefined && !cube && !array) face = 0;
+  if (face === undefined && !cube && !array && !volume) face = 0;
   if (!Number.isSafeInteger(face) || face < 0 || face >= layers)
     fail('FACE', cube ? `${name} must explicitly select a cube face from zero to five`
-      : array ? `${name} must explicitly select an allocated array layer` : `${name} must be zero for a 2D target`);
+      : volume ? `${name} must explicitly select an allocated mip slice`
+        : array ? `${name} must explicitly select an allocated array layer` : `${name} must be zero for a 2D target`);
   return face;
 }
 function region(w, h, x, y, width, height) {
@@ -132,7 +136,6 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
   options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
   const {sourceColorIndex = 0, colorIndex = 0} = value;
   const [Type, components] = layout(source, sourceColorIndex); layout(destination, colorIndex);
-  const sourceFace = transferFace(source, value.sourceFace, 'sourceFace');
   const face = transferFace(destination, value.face, 'face');
   if (gpuTargetColorFormat(source, sourceColorIndex).replace(/-srgb$/, '') !==
       gpuTargetColorFormat(destination, colorIndex).replace(/-srgb$/, ''))
@@ -143,6 +146,7 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
   integer(sourceMipLevel, 'Source mip level');
   if (!Number.isSafeInteger(source.mipLevelCount) || source.mipLevelCount < 1 || sourceMipLevel >= source.mipLevelCount)
     fail('REGION', 'Source mip level is not allocated');
+  const sourceFace = transferFace(source, value.sourceFace, 'sourceFace', sourceMipLevel);
   const divisor = 2 ** sourceMipLevel;
   const sw = source.width === 0 ? 0 : Math.max(1, Math.floor(source.width / divisor));
   const sh = source.height === 0 ? 0 : Math.max(1, Math.floor(source.height / divisor));

@@ -69,3 +69,29 @@ test('comparison-only changes select all native depth functions without aliasing
   assert.equal(new Set(d.snapshots[0].map(s=>s.pipeline)).size,8);
   assert.equal(r.bundleDiagnostics.reuses,1);await r.whenIdle();r.dispose();
 });
+
+test('volume slices reach every MRT attachment in clear and geometry passes without changing depth attachments',async()=>{
+  const d=geometryDevice();Object.assign(d.limits,{maxColorAttachments:8,maxColorAttachmentBytesPerSample:32});
+  d.createRenderPipeline=descriptor=>({...descriptor,getBindGroupLayout:()=>({})});
+  const r=await createGpuAnimationRenderer(d,{format:'rgba8unorm',colorFormats:['rgba8unorm','rgba16float']});
+  const colorViews=[{},{}],depthView={};
+  for(const depthSlice of [0,3])r.render({...frame([]),colorView:colorViews[0],colorViews,depthView,depthSlice,scissor:[0,0,4,4]});
+  assert.equal(d.passes.length,4);
+  for(const [index,pass] of d.passes.entries()){
+    assert.deepEqual(pass.desc.colorAttachments.map(attachment=>attachment.depthSlice),Array(2).fill(index<2?0:3));
+    assert.equal(pass.desc.depthStencilAttachment.view,depthView);
+    assert.equal(Object.hasOwn(pass.desc.depthStencilAttachment,'depthSlice'),false);
+  }
+  await r.whenIdle();r.dispose();
+});
+
+test('invalid volume slices and multisampled volume attachments reject before GPU effects',async()=>{
+  for(const sampleCount of [1,4]){
+    const d=geometryDevice(),r=await createGpuAnimationRenderer(d,{sampleCount}),before=[d.buffers.length,d.writes.length,d.passes.length];
+    for(const depthSlice of sampleCount===1?[-1,.5,NaN,0x100000000]:[0])
+      assert.throws(()=>r.render({...frame([]),depthSlice}),{code:'ANIMATION_RENDER_ATTACHMENT'});
+    assert.deepEqual([d.buffers.length,d.writes.length,d.passes.length],before);r.dispose();
+  }
+  const d=geometryDevice(),r=await createGpuAnimationRenderer(d);r.render(frame([]));
+  assert.equal(Object.hasOwn(d.passes[0].desc.colorAttachments[0],'depthSlice'),false);await r.whenIdle();r.dispose();
+});

@@ -90,7 +90,7 @@ test('array source preflight rejects out-of-range layers, invalid dimensions and
     assert.throws(() => inspectThreeRenderTargetMip(entry.shape, 0, face), {code: 'THREE_TARGET_FACE'});
     assert.throws(() => f.owner.render(entry, () => assert.fail('invalid layer'), {face}), {code: 'THREE_TARGET_FACE'});
   }
-  for (const source of [target({multiview: true}), new THREE.RenderTarget3D(8, 4, 3), new THREE.WebGL3DRenderTarget(8, 4, 3)])
+  for (const source of [target({multiview: true})])
     assert.throws(() => inspectThreeRenderTarget(source, THREE), {code: 'THREE_TARGET_UNSUPPORTED'});
   const invalid = target(); invalid.texture.image.depth = 4;
   assert.throws(() => inspectThreeRenderTarget(invalid, THREE), {code: 'THREE_TARGET_SIZE'});

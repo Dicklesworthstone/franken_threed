@@ -188,9 +188,11 @@ export async function createGpuAnimationBackground(device, source, options = {})
     render(frame) {
       live(); if (busy) fail('REENTRANT', 'Background submission cannot be reentered');
       if (autoLod && frame?.mipLevel !== undefined) fail('FRAME', 'Automatic LOD does not accept an explicit mip level');
-      const {colorView, resolveTarget = null, loadOp = 'clear', viewport = null, scissor = null, screenSize = null} = frame;
+      const {colorView, depthSlice, resolveTarget = null, loadOp = 'clear', viewport = null, scissor = null, screenSize = null} = frame;
       const clearValue = tuple(frame.clearColor ?? [0, 0, 0, 1], 4, 'clear color');
       if (!colorView || typeof colorView !== 'object' || !['clear', 'load'].includes(loadOp)) fail('FRAME', 'Expected a color attachment and load policy');
+      if (depthSlice !== undefined && (!Number.isSafeInteger(depthSlice) || depthSlice < 0 || depthSlice > 0xffffffff || sampleCount !== 1))
+        fail('FRAME', 'Volume background slices require a nonnegative integer and single-sample color');
       if (resolveTarget !== null && (sampleCount !== 4 || !resolveTarget || typeof resolveTarget !== 'object'))
         fail('FRAME', 'Resolve requires a multisample output and a texture view');
       if (viewport !== null) {
@@ -218,6 +220,7 @@ export async function createGpuAnimationBackground(device, source, options = {})
           device.queue.writeBuffer(buffer, 0, packet);
           const encoder = device.createCommandEncoder({label});
           const pass = encoder.beginRenderPass({colorAttachments: [{view: colorView, loadOp, clearValue,
+            ...(depthSlice === undefined ? {} : {depthSlice}),
             storeOp: 'store', ...(resolveTarget ? {resolveTarget} : {})}]});
           if (viewport) pass.setViewport(...viewport);
           if (scissor) pass.setScissorRect(...scissor);
