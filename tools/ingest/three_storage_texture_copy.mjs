@@ -2,7 +2,7 @@
 import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy, captureStorageToTargetCopy} from './three_target_texture_copy.mjs';
-import {copySampledTextureToStorage} from './three_sampled_texture_copy.mjs';
+import {copySampledTexture} from './three_sampled_texture_copy.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
@@ -51,8 +51,9 @@ export function withStorageTextureCopies(Base) {
         const owner = this._storageTextures;
         const request = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
         issue = () => { owner.copy(request); };
-      } else if (source?.isTexture && destination?.isStorageTexture) {
-        copySampledTextureToStorage(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
+      } else if (source?.isTexture && !source.isStorageTexture && !source.isRenderTargetTexture &&
+          (destination?.isStorageTexture || destination?.isRenderTargetTexture)) {
+        copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
         this.inspector?.copyTextureToTexture?.(source, destination);
         return;
       } else {

@@ -4,7 +4,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {copySampledTextureToStorage} from './three_sampled_texture_copy.mjs';
+import {copySampledTexture} from './three_sampled_texture_copy.mjs';
 
 const deferred = () => {
   let resolve, reject;
@@ -95,7 +95,7 @@ function fixture() {
     },
   };
   const copy = (region = null, position = null, sourceLevel = 0, destinationLevel = 0) =>
-    copySampledTextureToStorage(renderer, source, destination, region, position, sourceLevel, destinationLevel, e => errors.push(e));
+    copySampledTexture(renderer, source, destination, region, position, sourceLevel, destinationLevel, e => errors.push(e));
   async function flush() {
     while (renderer._pending.length) {
       const request = renderer._pending[0];
@@ -260,4 +260,153 @@ test('nested compute turns receive the image submission barrier, not a GPU-compl
   f.copy(); assert.equal(awaits, true); assert.equal(f.renderer._pending.length, 0);
   ready.resolve(); await turnResult;
   assert.equal(f.commands.length, 1); assert.equal(f.releases, 1);
+});
+
+function targetFixture(options = {}) {
+  const f = fixture(); delete f.destination.isStorageTexture;
+  f.destination.isRenderTargetTexture = true;
+  const first = texture(options);
+  const target = {alive: true, epoch: 1, textures: [first, f.destination]};
+  f.destination.renderTarget = first.renderTarget = target;
+  const targetShape = {width: 2, height: 2, layers: 1, sampleCount: 1, cube: false,
+    viewDimension: '2d', ...options, colors: [shape(options), shape(options)], textures: target.textures};
+  let refs = 0, released = 0;
+  f.device.limits = {maxTextureDimension2D: 8192, maxTextureDimension3D: 2048, maxTextureArrayLayers: 256};
+  const targets = {
+    getTextureTarget(value) { return value.renderTarget === target ? target : null; },
+    capture(value) {
+      assert.equal(value, target);
+      return {target, epoch: target.epoch, shape: {...targetShape, textures: target.textures.slice()}};
+    },
+    assertCurrent(entry) { if (!target.alive || entry.epoch !== target.epoch) throw error('STALE_TARGET'); },
+    retainGeneration(entry) {
+      targets.assertCurrent(entry); refs++; let live = true;
+      return () => { assert.ok(live); live = false; refs--; released++; };
+    },
+    validateNativeTextures(borrows) {
+      f.events.push('target-preflight');
+      for (const borrow of borrows) {
+        targets.assertCurrent(borrow.entry);
+        assert.equal(borrow.device, f.renderer._device); assert.equal(borrow.depth, false);
+        assert.equal(borrow.texture, target.textures[borrow.colorIndex]);
+      }
+      if (targets.budgetError) throw targets.budgetError;
+    },
+    withNativeColorDestination(borrow, run, {validation}) {
+      targets.validateNativeTextures([borrow]); f.events.push('target-destination');
+      const result = run({target, colorIndex: borrow.colorIndex});
+      const task = Promise.resolve(validation); task.catch(() => {}); f.pending.push(task);
+      return result;
+    },
+  };
+  f.renderer._targets = targets;
+  return {...f, target, targets, targetShape,
+    get targetReferences() { return refs; }, get targetReleases() { return released; }};
+}
+
+test('native target copies select the actual MRT attachment without a sampler or UV replica', async () => {
+  const f = targetFixture(); f.source.shape.mipLevelCount = 2;
+  f.copy(box(0, 0, 0, 1, 1, 1), point(1, 1, 0), 1);
+  assert.equal(f.commands[0].to.texture.colorIndex, 1);
+  assert.equal(f.commands[0].to.texture.target, f.target);
+  assert.equal(f.commands[0].from.mipLevel, 1); assert.equal(f.commands[0].to.mipLevel, 0);
+  assert.deepEqual(f.commands[0].to.origin, [1, 1, 0]);
+  assert.equal(f.storage.lastWrite, undefined); assert.equal(f.targetReferences, 0); assert.equal(f.targetReleases, 1);
+  await Promise.all(f.pending);
+});
+
+test('sampled versions remain independent across queued target copies', async () => {
+  const f = targetFixture(); f.renderer._preparing = true;
+  f.copy(); f.source.version++; f.source.bytes.fill(9); f.copy(); f.source.bytes.fill(77);
+  assert.equal(f.targetReferences, 2); await f.flush();
+  assert.deepEqual(f.commands.map(c => c.bytes), [[1, 2, 3, 4], [9, 9, 9, 9]]);
+  assert.equal(f.targetReferences, 0); assert.equal(f.targetReleases, 2); assert.deepEqual(f.errors, []);
+});
+
+test('array and 3D target writes retain selected slices and raw float32 formats', () => {
+  for (const viewDimension of ['2d-array', '3d']) {
+    const f = targetFixture({viewDimension, layers: 4, format: 'rgba32float'});
+    f.source.shape = shape({viewDimension: '3d', depth: 6, format: 'rgba32float'});
+    f.copy(box(0, 0, 3, 2, 2, 2), point(0, 0, 1));
+    assert.deepEqual(f.commands[0].size, [2, 2, 2]); assert.deepEqual(f.commands[0].to.origin, [0, 0, 1]);
+    assert.equal(f.targetReferences, 0);
+  }
+});
+
+test('unsupported target destinations fail before source capture or GPU work', () => {
+  for (const [options, code] of [[{cube: true}, 'SOURCE'], [{sampleCount: 4}, 'SAMPLES']]) {
+    const f = targetFixture(options);
+    assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_' + code});
+    assert.equal(f.active.size, 0); assert.equal(f.targetReferences, 0); assert.equal(f.commands.length, 0);
+  }
+  const f = targetFixture();
+  assert.throws(() => f.copy(null, null, 0, 1), {code: 'THREE_STORAGE_COPY_LEVEL'});
+  f.destination.isDepthTexture = true;
+  assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_SOURCE'});
+  delete f.destination.isDepthTexture; f.destination.renderTarget = null;
+  assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_SOURCE'});
+  assert.ok(!f.events.includes('capture')); assert.equal(f.targetReferences, 0);
+});
+
+test('target budgets and 2D/3D device limits are checked before uploading sampled pixels', () => {
+  for (const viewDimension of ['2d', '3d']) {
+    const f = targetFixture({viewDimension});
+    f.device.limits[viewDimension === '3d' ? 'maxTextureDimension3D' : 'maxTextureDimension2D'] = 1;
+    assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_LIMIT'});
+    assert.ok(!f.events.includes('upload')); assert.equal(f.targetReferences, 0);
+  }
+  const f = targetFixture(); f.targets.budgetError = error('TARGET_BUDGET');
+  assert.throws(() => f.copy(), {code: 'TARGET_BUDGET'});
+  assert.ok(!f.events.includes('upload')); assert.equal(f.targetReferences, 0);
+});
+
+test('queued target disposal and generation changes cannot redirect an accepted copy', async () => {
+  for (const change of [f => { f.target.alive = false; }, f => { f.target.epoch++; }]) {
+    const f = targetFixture(); f.renderer._preparing = true; f.copy(); change(f); await f.flush();
+    assert.equal(f.errors[0].code, 'STALE_TARGET'); assert.equal(f.targetReferences, 0);
+    assert.equal(f.commands.length, 0); assert.ok(!f.events.includes('upload'));
+  }
+});
+
+test('target format rejection, empty copies and full FIFOs release their generation lease', () => {
+  for (const mode of ['format', 'empty', 'full']) {
+    const f = targetFixture(); f.renderer._preparing = true;
+    if (mode === 'format') f.source.shape.format = 'rgba16float';
+    if (mode === 'full') f.renderer.queueError = error('FULL');
+    if (mode === 'empty') f.copy(box(0, 0, 0, 0, 2, 1));
+    else assert.throws(() => f.copy());
+    assert.equal(f.targetReferences, 0); assert.equal(f.targetReleases, 1);
+    assert.equal(f.active.size, 0); assert.equal(f.history.size, 0); assert.equal(f.commands.length, 0);
+  }
+});
+
+test('pending target image copies cancel both owners and cannot resume after disposal', async () => {
+  const f = targetFixture(), ready = deferred(); f.source.ready = ready.promise; f.copy();
+  const drain = f.flush(); await Promise.resolve(); f.dispose(); await drain;
+  assert.equal(f.targetReferences, 0); assert.equal(f.targetReleases, 1); assert.equal(f.active.size, 0);
+  ready.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.commands.length, 0); assert.equal(f.targetReleases, 1);
+});
+
+test('target validation receives the source error and later writes cannot form a cycle', async () => {
+  const f = targetFixture(); f.source.validation = Promise.reject(error('SOURCE_GPU'));
+  f.source.validation.catch(() => {}); f.copy();
+  await assert.rejects(Promise.all(f.pending), {code: 'SOURCE_GPU'});
+  const good = targetFixture(); good.copy(); good.copy(); await Promise.all(good.pending);
+  assert.equal(good.commands.length, 2); assert.equal(good.targetReferences, 0);
+});
+
+test('target changes in upload and encoder completion callbacks are rejected before submission', () => {
+  for (const phase of ['upload', 'finish']) {
+    const f = targetFixture(), change = () => { f.target.epoch++; };
+    if (phase === 'upload') f.source.onUpdate = change; else f.device.onFinish = change;
+    assert.throws(() => f.copy(), {code: 'STALE_TARGET'});
+    assert.equal(f.commands.length, 0); assert.equal(f.targetReferences, 0); assert.equal(f.active.size, 0);
+  }
+});
+
+test('registered target ownership does not require a public renderTarget back-pointer', () => {
+  const f = targetFixture(); f.destination.renderTarget = null;
+  f.targets.getTextureTarget = value => value === f.destination ? f.target : null;
+  f.copy(); assert.equal(f.commands[0].to.texture.colorIndex, 1); assert.equal(f.targetReferences, 0);
 });
