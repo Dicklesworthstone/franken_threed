@@ -6,6 +6,15 @@ owner for `CompressedTexture`, `CompressedArrayTexture`, and
 path too. Ordinary material maps and `sampler2DArray` programs consume these
 bindings; applications do not need to supply a second allocator or borrowed map.
 
+The native renderer's node-material path also consumes these sources through
+the pinned `TextureNode`/`CubeTextureNode` builder. Compressed array textures
+retain their layer coordinates. The shared owner supplies the native sample
+layout, including filterable compressed HDR formats independently of the
+source upload type. Native graphics use the existing immutable capture path
+for queued mip versions, sampler state and partial array-layer histories.
+`three_renderer_native_compressed.test.mjs` exercises this facade path with
+actual source graphs, including compressed HDR and queued cube face histories.
+
 The caller supplies already transcoded blocks and authored mip levels. This
 change neither starts a decoder nor fetches URLs, changes source pixels, creates
 workers, or adds a submission loop. It adds native upload/sampling support, not

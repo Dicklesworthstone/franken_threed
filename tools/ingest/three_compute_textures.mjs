@@ -241,7 +241,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const rangesAtCapture = original.updateRanges, rangeValues = (rangesAtCapture ?? []).map(r => ({ref: r, start: r.start, count: r.count}));
     const layersAtCapture = original.layerUpdates, layerValues = [...layersAtCapture ?? []];
     const dataAtCapture = imageAtCapture?.data, mipsAtCapture = original.mipmaps;
-    const mipValues = shape.blockUploads ? mipsAtCapture.map(image => ({image, data: image.data})) : null;
+    // CompressedCubeTexture stores authored chains on its six faces and leaves
+    // the top-level mipmaps undefined. Face data is copied by copyImage below.
+    const mipValues = shape.blockUploads && !shape.cube ? mipsAtCapture.map(image => ({image, data: image.data})) : null;
     const source = original.source, version = original.version, sourceVersion = existingPixels?.source.version ?? source.version;
     const key = JSON.stringify([sourceVersion, shape.key]);
     let pixels = existingPixels ?? sources.get(source)?.get(key);
@@ -355,7 +357,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       }
       try {
-        const image = copyImage(original.image), mipmaps = original.mipmaps.map(copyImage);
+        const image = copyImage(original.image), mipmaps = Array.isArray(original.mipmaps)
+          ? original.mipmaps.map(copyImage) : original.mipmaps;
         const ready = pendingImages.length ? Promise.all(pendingImages).then(() => {}) : null;
         ready?.catch(() => {});
         pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0,

@@ -587,7 +587,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false}) : null;
     // The shared target owner initializes attached depth dimensions before
     // WGSLNodeBuilder selects its texture type and implicit array coordinates.
-    const array = texture?.isDataArrayTexture === true || (storage || target) && texture.isArrayTexture === true;
+    const compressed = texture?.isCompressedTexture === true ||
+      texture?.isCubeTexture === true && texture.image?.[0]?.isCompressedTexture === true;
+    const compressedArray = texture?.isCompressedArrayTexture === true;
+    const array = texture?.isDataArrayTexture === true || compressedArray || (storage || target) && texture.isArrayTexture === true;
     const dataVolume = texture?.isData3DTexture === true && !storage && !target;
     const targetVolume = target && targetLayout?.texture?.viewDimension === '3d';
     const volume = dataVolume || targetVolume || storage && texture.is3DTexture === true;
@@ -595,10 +598,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.is3DTexture && !volume || volume && (array || texture.isCubeTexture) ||
         texture.isArrayTexture && !array || texture.isData3DTexture && !dataVolume && !targetVolume ||
         (dataVolume || targetVolume) && (typeof three.Data3DTexture !== 'function' || !(texture instanceof three.Data3DTexture)) ||
-        array && !storage && !target && !(texture instanceof three.DataArrayTexture) ||
-        texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
+        array && !storage && !target && !(compressedArray
+          ? typeof three.CompressedArrayTexture === 'function' && texture instanceof three.CompressedArrayTexture
+          : texture instanceof three.DataArrayTexture) ||
+        texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isExternalTexture)
-      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array/3D textures, data or decoded cube faces, 2D/array/3D storage and target-owned color/depth textures');
+      fail('TEXTURE', 'Native graphics nodes sample ordinary or compressed 2D/array/cube textures, data volumes, 2D/array/3D storage and target-owned color/depth textures');
     // Compute owns these images. Admission must use the same residency owner,
     // never the CPU texture pool or an independently inferred storage layout.
     // TextureNode/Texture3DNode sampling remains read-only. Volume coordinates
@@ -626,16 +631,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           texture.renderTarget == null)))
       fail('TEXTURE', 'Native depth sampling requires a source DepthTexture or attached CubeDepthTexture');
     const viewDimension = volume ? '3d' : texture.isCubeTexture === true ? 'cube' : array ? '2d-array' : '2d';
-    if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) ||
+    if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) &&
+        !(compressed && typeof three.CompressedCubeTexture === 'function' && texture instanceof three.CompressedCubeTexture) ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
         !Array.isArray(texture.image) || texture.image.length !== 6 || (target
-          ? typeof renderer._getSampledTextureInputs !== 'function' : texture.image.some(face =>
+          ? typeof renderer._getSampledTextureInputs !== 'function' : !compressed && texture.image.some(face =>
           !(face instanceof three.DataTexture && face.isDataTexture === true &&
             ArrayBuffer.isView(face.image?.data) && !(face.image.data instanceof DataView)) &&
           !(typeof renderer._getSampledTextureInputs === 'function' &&
             ['ImageData', 'ImageBitmap', 'HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas'].some(name =>
               typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
-      fail('TEXTURE', 'Native cube sampling requires six source data/image faces or a registered native cube target with reflection or refraction mapping');
+      fail('TEXTURE', 'Native cube sampling requires six source data/image/compressed faces or a registered native cube target with reflection or refraction mapping');
     const integerType = integerTextureType(texture);
     const integerData = integerType && (dataVolume || typeof three.DataTexture === 'function' &&
       texture instanceof three.DataTexture && texture.isDataTexture === true && !volume) &&
@@ -649,7 +655,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
     if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')
       fail('SOURCE', 'Native depth comparison requires source renderer compatibility metadata');
-    const sampleType = integerType ?? (depth ? 'depth' : texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
+    const compressedLayout = compressed
+      ? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false}) : null;
+    if (compressed && !compressedLayout?.texture)
+      fail('TEXTURE', 'Missing shared GPU texture sampling layout');
+    // Compressed block formats (including BC6H HDR) have filterable float
+    // samples independently of the source's upload type. The shared owner
+    // validates source classes, mip blocks, color space and device features.
+    const sampleType = compressed ? compressedLayout.texture.sampleType : integerType ?? (depth ? 'depth' : texture.type === three.FloatType && !renderer.hasFeature('float32-filterable')
       ? 'unfilterable-float' : 'float');
     if (sampleType === 'unfilterable-float' &&
         (texture.magFilter !== three.NearestFilter ||
@@ -660,7 +673,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {primarySamples} = renderer.backend.utils.getTextureSampleData(texture), multisampled = primarySamples > 1;
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
-    const layout = targetLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
+    const layout = targetLayout ?? compressedLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
     if ((storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
@@ -694,10 +707,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // float32-filterable. Effects choose precision in updateBefore, after
       // consumer construction. Keep unfilterable, integer and depth types
       // separate; the image owner still validates exact formats/generations.
-      const type = checked.get(texture).sampleType === 'float' ? 'float-color' : texture.type;
+      // FloatType compressed sources still select the pinned builder's manual
+      // filtering path without float32-filterable, despite a float GPU layout.
+      const type = checked.get(texture).sampleType === 'float' &&
+        (texture.type !== three.FloatType || renderer.hasFeature('float32-filterable')) ? 'float-color' : texture.type;
       return [aliases.get(texture.uuid), type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
+        texture.isCompressedTexture === true, texture.isCompressedArrayTexture === true, texture.isCompressedCubeTexture === true,
         texture.is3DTexture === true, texture.isData3DTexture === true, node.isTexture3DNode === true,
         texture.is3DTexture === true || texture.isData3DTexture === true ? [texture.wrapS, texture.wrapT, texture.wrapR] : null,
         texture.isCubeTexture === true ? texture.mapping : null,
@@ -900,10 +917,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (node.isSampleCompare?.() === true && (!node.value.isDepthTexture || node.value.compareFunction === null || !node.sampler))
           fail('TEXTURE', 'Native comparison sampling requires an attached depth texture with a comparison function');
       }
-      if (node.depthNode !== null && node.value?.isDataArrayTexture !== true &&
+      if (node.depthNode !== null && node.value?.isDataArrayTexture !== true && node.value?.isCompressedArrayTexture !== true &&
           !(node.value?.isArrayTexture === true && (node.value.isStorageTexture === true ||
             node.value.isRenderTargetTexture === true || node.value.isDepthTexture === true && node.value.renderTarget != null)))
-        fail('TEXTURE', 'Native layer coordinates require source data, storage or target-owned array textures');
+        fail('TEXTURE', 'Native layer coordinates require source data, compressed, storage or target-owned array textures');
     } else if (node.constructor === three.PMREMNode) inspectPMREMNode(node);
     else if (node.value?.isTexture)
       fail('TEXTURE', 'Native graphics textures require source TextureNode or PMREMNode bindings');

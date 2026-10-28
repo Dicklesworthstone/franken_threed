@@ -857,6 +857,32 @@ replacement/removal, shared versus object uniforms, inactive fog, source shadow
 ownership and texture versions across queued renders. Sampled-owner tests also
 check shared image histories, sampler domains and disposal identity.
 
+## Native compressed texture inputs
+
+Source `CompressedTexture`, `CompressedArrayTexture` and
+`CompressedCubeTexture` inputs now enter native node graphics through the
+pinned `TextureNode` and `CubeTextureNode` builders. Ordinary cube textures
+containing compressed faces use the same path. Array samples retain their
+source layer coordinates. Ordinary material maps routed through native node
+materials share these bindings.
+
+The existing sampled-texture owner validates and captures authored mip blocks,
+color-space views, device compression features and sampler state. It supplies
+the binding layout rather than inferring compressed HDR filterability from the
+source upload type. This preserves BC, ETC/EAC, ASTC and RGBA8 decoder fallback
+profiles without another uploader or block conversion. Source-generated WGSL
+and the pinned builder's filtering behavior remain authoritative.
+
+Queued draws keep their acknowledged upload versions and immutable block bytes;
+compressed-array partial updates preserve unselected layers at every mip.
+Texture family, dimension and shader-relevant type changes invalidate program
+reuse. Capability, malformed mip and node/view dimension failures remain
+pre-submission admission errors. See `THREE_COMPRESSED_TEXTURES.md` for the
+shared owner's format and upload boundaries. The 16 focused cases in
+`three_renderer_native_compressed.test.mjs` record generated WGSL, layouts,
+uploads and draw bindings; they do not execute compressed-texture shaders or
+establish browser pixel parity.
+
 ## Native 3D texture inputs
 
 Ordinary source `Data3DTexture` inputs now enter native graphics through
@@ -901,7 +927,7 @@ graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models, transmitted shadows,
 custom shadow filter/replacement nodes, projected light maps and custom
 `lightsNode` graphs remain missing.
-Compressed and video textures, and depth/comparison, array, volume, storage,
+Video textures, and compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require
 additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates

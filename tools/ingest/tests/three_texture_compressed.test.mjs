@@ -41,7 +41,7 @@ function gpu(features=allFeatures){
     const profile=profiles.find(p=>p[1]===desc.format);
     assert.ok(profile,desc.format);const [, ,bw,bh,bb]=profile;
     if(profile[5])assert.ok(d.features.has('texture-compression-'+profile[5]));
-    assert.equal(desc.usage,desc.label==='f3d-default-texture'?4:6,'sampled storage, never a render attachment');
+    assert.equal(desc.usage,desc.label==='f3d-default-texture'?4:7,'sampled copy source/destination, never a render attachment');
     const [w,h,layers]=desc.size;
     const t={desc,destroyed:false,levels:[],
       createView(v={}){return {texture:t,dimension:v.dimension??'2d',...v};},destroy(){this.destroyed=true;}};
