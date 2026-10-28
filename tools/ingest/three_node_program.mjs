@@ -8,7 +8,7 @@
  * built-in materials with authored slots, ordinary or registered direct analytic
  * lights, source float/integer attributes, scalar/vector/matrix uniforms,
  * source bone palettes, authored typed uniform arrays and multiple uniform blocks per source group,
- * sampled 2D/data-array/cube textures, native cube render-target color,
+ * sampled 2D/data-array/3D/cube textures, native cube render-target color,
  * GPU-authored 2D/array/3D storage inputs, including lossless signed/unsigned texel loads,
  * target-owned depth comparisons and read-only
  * scalar/vector/mat4 or flat-struct storage buffers.
@@ -588,14 +588,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // The shared target owner initializes attached depth dimensions before
     // WGSLNodeBuilder selects its texture type and implicit array coordinates.
     const array = texture?.isDataArrayTexture === true || (storage || target) && texture.isArrayTexture === true;
-    const volume = storage && texture.is3DTexture === true;
+    const dataVolume = texture?.isData3DTexture === true && !storage && !target;
+    const volume = dataVolume || storage && texture.is3DTexture === true;
     if (!(texture instanceof three.Texture) ||
         texture.is3DTexture && !volume || volume && (array || texture.isCubeTexture) ||
-        texture.isArrayTexture && !array || texture.isData3DTexture ||
+        texture.isArrayTexture && !array || texture.isData3DTexture && !dataVolume ||
+        dataVolume && (typeof three.Data3DTexture !== 'function' || !(texture instanceof three.Data3DTexture)) ||
         array && !storage && !target && !(texture instanceof three.DataArrayTexture) ||
         texture.isCompressedTexture || texture.isVideoTexture || texture.isVideoFrameTexture ||
         texture.isExternalTexture)
-      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array textures, data or decoded cube faces, 2D/array/3D storage and target-owned color/depth textures');
+      fail('TEXTURE', 'Native graphics nodes sample ordinary 2D/data-array/3D textures, data or decoded cube faces, 2D/array/3D storage and target-owned color/depth textures');
     // Compute owns these images. Admission must use the same residency owner,
     // never the CPU texture pool or an independently inferred storage layout.
     // TextureNode/Texture3DNode sampling remains read-only. Volume coordinates
@@ -634,10 +636,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
               typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
       fail('TEXTURE', 'Native cube sampling requires six source data/image faces or a registered native cube target with reflection or refraction mapping');
     const integerType = integerTextureType(texture);
-    const integerData = integerType && typeof three.DataTexture === 'function' && texture instanceof three.DataTexture &&
-      texture.isDataTexture === true && !array && !volume && !texture.isCubeTexture && !target;
+    const integerData = integerType && (dataVolume || typeof three.DataTexture === 'function' &&
+      texture instanceof three.DataTexture && texture.isDataTexture === true && !volume) &&
+      !array && !texture.isCubeTexture && !target;
     if (integerType && ((!storage && !integerData) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
-      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage or source 2D DataTexture inputs with NoColorSpace');
+      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, DataTexture or Data3DTexture inputs with NoColorSpace');
     const packedTarget = target && three.UnsignedInt101111Type !== undefined &&
       texture.type === three.UnsignedInt101111Type && texture.format === three.RGBFormat;
     if (!depth && !integerType && (!packedTarget && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
@@ -657,7 +660,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = targetLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || integerData || framebuffer || target && ['cube', '2d-array'].includes(viewDimension)) && !layout?.texture)
+    if ((storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
@@ -694,7 +697,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [aliases.get(texture.uuid), type, texture.format, texture.colorSpace, texture.channel,
         texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
-        texture.is3DTexture === true, node.isTexture3DNode === true,
+        texture.is3DTexture === true, texture.isData3DTexture === true, node.isTexture3DNode === true,
+        texture.is3DTexture === true || texture.isData3DTexture === true ? [texture.wrapS, texture.wrapT, texture.wrapR] : null,
         texture.isCubeTexture === true ? texture.mapping : null,
         renderer.backend.utils.getTextureSampleData(texture).primarySamples,
         texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
@@ -884,8 +888,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // an empty placeholder image. Only real native bindings need residency;
       // authored graph inputs were already inspected before construction.
       if (boundTextures === null || boundTextures.has(node.value)) {
-        if ((node.isTexture3DNode === true) !== (node.value?.is3DTexture === true))
-          fail('TEXTURE', 'Native volume samples require matching Texture3DNode and Storage3DTexture dimensions');
+        if ((node.isTexture3DNode === true) !== (node.value?.is3DTexture === true || node.value?.isData3DTexture === true))
+          fail('TEXTURE', 'Native volume samples require matching Texture3DNode and source 3D texture dimensions');
         inspectIntegerRead(node);
         const layout = inspectTexture(node.value);
         if (layout.multisampled && (node.isSampleCompare?.() === true || node.biasNode != null ||
