@@ -4,6 +4,25 @@
  */
 import {withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 
+/** Inspect the producer's finite private target fields without running getters.
+ * Scene-pass subclasses and texture effects use the same generation owner. */
+export function inspectThreeNativeEffectTargets(three, node, fail, maxTargets = 64) {
+  const targets = new Set();
+  const add = value => {
+    if (!(value instanceof three.RenderTarget)) return;
+    if (targets.size >= maxTargets && !targets.has(value)) fail('LIMIT', 'Native effect target capacity exceeded');
+    targets.add(value);
+  };
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(node))) {
+    const value = descriptor.value;
+    if (Array.isArray(value)) {
+      if (value.length > 8192) fail('LIMIT', 'Native effect resource arrays exceed their inspection capacity');
+      for (const item of Object.values(Object.getOwnPropertyDescriptors(value))) add(item.value);
+    } else add(value);
+  }
+  return [...targets];
+}
+
 export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} = {}) {
   if (typeof fail !== 'function' || !Number.isSafeInteger(maxTargets) || maxTargets < 1)
     throw new TypeError('Expected native effect limits and an admission error factory');
@@ -12,25 +31,6 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
   // retained TSL factory supplies the exact constructor/prototype identity.
   let passTexturePrototype;
 
-  function targetsFor(node) {
-    const targets = new Set();
-    const add = value => {
-      if (!(value instanceof three.RenderTarget)) return;
-      if (targets.size >= maxTargets && !targets.has(value)) fail('LIMIT', 'Native effect target capacity exceeded');
-      targets.add(value);
-    };
-    // Source effects keep their private targets in own fields or finite arrays.
-    // Inspect data properties without evaluating application accessors.
-    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(node))) {
-      const value = descriptor.value;
-      if (Array.isArray(value)) {
-        if (value.length > 8192) fail('LIMIT', 'Native effect resource arrays exceed their inspection capacity');
-        for (const item of Object.values(Object.getOwnPropertyDescriptors(value))) add(item.value);
-      } else add(value);
-    }
-    return [...targets];
-  }
-
   function inspectProducer(node) {
     if (!(node instanceof three.Node) || node.isPassNode === true ||
         node.updateBeforeType !== 'frame' || node.updateType !== 'none' || node.updateAfterType !== 'none' ||
@@ -38,7 +38,7 @@ export function createThreeNodeEffects(three, renderer, {fail, maxTargets = 64} 
         ['getUpdateBeforeType', 'getUpdateType', 'getUpdateAfterType', 'updateReference']
           .some(key => node[key] !== three.Node.prototype[key]))
       fail('PASS', 'Native texture-producing effects require an ordinary source NodeFrame lifecycle');
-    const targets = targetsFor(node);
+    const targets = inspectThreeNativeEffectTargets(three, node, fail, maxTargets);
     if (!targets.length) fail('PASS', 'Native texture-producing effects must own their render targets');
     let record = producers.get(node);
     if (!record) { record = {outputs: new Set(), targets}; producers.set(node, record); }

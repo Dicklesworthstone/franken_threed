@@ -2,6 +2,8 @@
  * Source nodes retain their construction and update frequencies; recursive
  * scene draws and sampled attachments remain owned by the native renderer.
  */
+import {inspectThreeNativeEffectTargets} from './three_node_effects.mjs';
+
 const fail = (message, code = 'PASS') => {
   const error = new Error(`THREE_NODE_PROGRAM_${code}: ${message}`);
   error.name = 'ThreeNodeProgramError'; error.code = `THREE_NODE_PROGRAM_${code}`; throw error;
@@ -145,14 +147,17 @@ export function inspectThreePipelineContext(three, renderer, material, object, e
 }
 
 export function inspectThreeNativePass(three, renderer, node) {
-  const source = three.PassNode?.prototype;
-  if (!source || Object.getPrototypeOf(node) !== source ||
-      ['setup', 'updateBefore', 'setSize', 'getTexture', 'getTextureNode', 'getPreviousTexture', 'getPreviousTextureNode', 'toggleTexture',
+  const source = three.PassNode?.prototype, prototype = Object.getPrototypeOf(node);
+  let ancestor = prototype, depth = 0;
+  while (ancestor && ancestor !== source && ++depth <= 8) ancestor = Object.getPrototypeOf(ancestor);
+  if (!source || !(node instanceof three.PassNode) || ancestor !== source ||
+      ['setup', 'updateBefore', 'setSize'].some(key => typeof prototype[key] !== 'function' || node[key] !== prototype[key]) ||
+      ['getTexture', 'getTextureNode', 'getPreviousTexture', 'getPreviousTextureNode', 'toggleTexture',
         'getLinearDepthNode', 'getViewZNode'].some(key => node[key] !== source[key]) ||
       ['getUpdateBeforeType', 'getUpdateType', 'getUpdateAfterType', 'updateReference']
         .some(key => node[key] !== three.Node.prototype[key]) ||
       node.updateBeforeType !== 'frame' || node.updateType !== 'none' || node.updateAfterType !== 'none')
-    fail('Native scene passes require the pinned PassNode lifecycle');
+    fail('Native scene passes require the source PassNode texture lifecycle and bounded prototype methods');
   if (!(node.scene instanceof three.Scene)) fail('Native scene passes require an ordinary source scene');
   inspectThreeNativeCamera(three, node.camera, 'PASS');
   if (node.scope !== three.PassNode.COLOR && node.scope !== three.PassNode.DEPTH)
@@ -205,7 +210,16 @@ export function updateThreeNativePass(three, renderer, node, frame) {
   const state = three.RendererUtils.saveRendererAndSceneState(renderer, scene), name = scene.name, mask = camera.layers.mask;
   const fields = Object.fromEntries(['autoClearColor', 'autoClearDepth', 'autoClearStencil',
     'transparent', 'opaque', 'lighting', 'contextNode'].map(key => [key, renderer[key]]));
-  try { return renderer._targets.withNativePassResize(node.renderTarget, width, height, update); }
+  try {
+    if (Object.getPrototypeOf(node) === three.PassNode.prototype)
+      return renderer._targets.withNativePassResize(node.renderTarget, width, height, update);
+    // Stereo/composite passes compute their own target sizes in retained source
+    // code. Preserve every accepted eye/output generation across that update,
+    // just as for ordinary target-producing effects. Actual explicit disposal
+    // still invalidates queued uses through the existing owner.
+    const targets = inspectThreeNativeEffectTargets(three, node, (code, message) => fail(message, code));
+    return renderer._targets.withNativeEffectTargets(targets, update);
+  }
   catch (error) {
     camera.layers.mask = mask; scene.name = name;
     Object.assign(renderer, fields);

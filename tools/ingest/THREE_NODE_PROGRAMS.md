@@ -1378,6 +1378,30 @@ and transfer ordering. Browser scenarios are `native_pipeline_history`,
 `native_pipeline_history_resize` and `native_pipeline_history_accumulation`;
 the accumulation scenario uses four samples.
 
+## Native stereo scene passes
+
+The pinned `stereoPass`, `anaglyphPass` and `parallaxBarrierPass` addons now
+execute their scene and composite draws through the native renderer. The source
+`StereoCamera` retains eye separation, projection updates and camera identities.
+Side-by-side output preserves the source half-width viewport/scissor commands;
+anaglyph and parallax output sample their independent left/right eye targets
+using the unchanged source composite graphs.
+
+Scene-pass admission now allows a bounded `PassNode` subclass prototype chain
+while retaining the source named-texture/history methods and ordinary FRAME
+lifecycle. Subclasses keep their construction, sizing and update methods. All
+targets declared in their own fields or finite arrays use the existing native
+effect generation owner, so resizing a later frame cannot replace the eye or
+output images already accepted by earlier queued frames. Unsupported resource
+operations still pass through the normal renderer admission; this does not
+claim arbitrary pass subclasses or XR presentation are complete.
+
+Seven `three_renderer_stereo_passes.test.mjs` cases compare composite WGSL with
+the pinned builder and check actual eye cameras, viewports/scissors, source
+target identities, queued colors and resized generations, plus restoration
+after a child callback throws. These are command/resource tests, without a
+stereo GPU pixel comparison or hardware performance claim.
+
 ## Native Bloom and Gaussian blur
 
 The pinned `bloom` and `gaussianBlur` addons execute their original TSL graphs
