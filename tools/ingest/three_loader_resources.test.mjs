@@ -200,6 +200,63 @@ test("ObjectLoader saved scenes retain external images, cube faces and edited JS
     "re-import retains the data-image URLs written by the source JSON exporter");
 });
 
+test("packed HDR/EXR environments, fonts and geometry execute retained addon parsers without network or source files", async () => {
+  const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
+  const hdr = Buffer.concat([Buffer.from('#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n'), Buffer.from([255, 128, 64, 128])]);
+  // Existing native OpenEXR ZIP fixture: 8x4 RGBA HALF, red x/2,
+  // green 1/2, blue 1/4, alpha 3/4. No candidate encoder makes these bytes.
+  const exr = Buffer.from('di8xAQIAAABjaGFubmVscwBjaGxpc3QASQAAAEEAAQAAAAAAAAABAAAAAQAAAEIAAQAAAAAAAAABAAAAAQAAAEcAAQAAAAAAAAABAAAAAQAAAFIAAQAAAAAAAAABAAAAAQAAAABjb21wcmVzc2lvbgBjb21wcmVzc2lvbgABAAAAA2RhdGFXaW5kb3cAYm94MmkAEAAAAAAAAAAAAAAABwAAAAMAAABkaXNwbGF5V2luZG93AGJveDJpABAAAAAAAAAAAAAAAAcAAAADAAAAbGluZU9yZGVyAGxpbmVPcmRlcgABAAAAAHBpeGVsQXNwZWN0UmF0aW8AZmxvYXQABAAAAAAAgD9zY3JlZW5XaW5kb3dDZW50ZXIAdjJmAAgAAAAAAAAAAAAAAHNjcmVlbldpbmRvd1dpZHRoAGZsb2F0AAQAAAAAAIA/AFMBAAAAAAAAAAAAAB8AAAB4nGNoGFiwC0pXQekWKO2xo6WpqbGxsZzG8gDgUX/E', 'base64');
+  const font = JSON.stringify({familyName: 'Packed font', resolution: 100,
+    boundingBox: {yMin: 0, yMax: 100}, underlineThickness: 0,
+    glyphs: {A: {ha: 100, o: 'm 0 0 l 100 0 l 0 100 l 0 0'}}});
+  const positions = [0, 0, 0, 1, 0, 0, 0, 1, 0];
+  const resources = {
+    'env/sky #.hdr': hdr, 'env/sky.exr': exr, 'fonts/typeface.json': Buffer.from(font),
+    'geometry/triangle.stl': Buffer.from('solid triangle\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid triangle\n'),
+    'geometry/triangle.obj': Buffer.from('v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n'),
+    'geometry/triangle.ply': Buffer.from('ply\nformat ascii 1.0\nelement vertex 3\nproperty float px\nproperty float y\nproperty float z\nproperty float alpha\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0 0.25\n1 0 0 0.5\n0 1 0 1\n3 0 1 2\n'),
+  };
+  const names = ['HDRLoader', 'RGBELoader', 'EXRLoader', 'FontLoader', 'STLLoader', 'PLYLoader', 'OBJLoader'];
+  const f = fixture({'index.html': '<script type="module" src="modules/app.mjs"></script>',
+    'modules/app.mjs': `import {FloatType, RGBAFormat} from ${JSON.stringify(core.href)};
+      ${names.map(name => `import {${name}} from ${JSON.stringify(loaderUrl(name))};`).join('\n')}
+      export async function run() {
+        const sequence=[], hdrLoader=new HDRLoader();
+        hdrLoader.setDataType(FloatType).setPath('env/');
+        const pending=hdrLoader.loadAsync('sky%20%23.hdr?version=1#radiance').then(value=>{sequence.push('loaded');return value;});
+        sequence.push('returned'); const hdr=await pending;
+        const rgbe=await new RGBELoader().setDataType(FloatType).setPath('env/').loadAsync('sky%20%23.hdr?version=1#radiance');
+        const exr=await new EXRLoader().setPart(0).setOutputFormat(RGBAFormat).setDataType(FloatType).setPath('env/').loadAsync('sky.exr');
+        const font=await new Promise((resolve,reject)=>new FontLoader().setPath('fonts/').load('typeface.json',resolve,undefined,reject));
+        const stl=await new STLLoader().setPath('geometry/').loadAsync('triangle.stl');
+        const plyLoader=new PLYLoader();
+        plyLoader.setPropertyNameMapping({px:'x'}); plyLoader.setCustomPropertyNameMapping({opacity:['alpha']});
+        const ply=await plyLoader.setPath('geometry/').loadAsync('triangle.ply');
+        const obj=await new OBJLoader().setPath('geometry/').loadAsync('triangle.obj');
+        return {sequence,hdr:{width:hdr.image.width,height:hdr.image.height,pixels:[...hdr.image.data]},
+          rgbe:[...rgbe.image.data],exr:{width:exr.image.width,height:exr.image.height,pixels:[...exr.image.data]},
+          font:{name:font.data.familyName,shapes:font.generateShapes('A',1).length},
+          stl:[...stl.attributes.position.array],ply:[...ply.attributes.position.array],
+          opacity:[...ply.attributes.opacity.array],obj:[...obj.children[0].geometry.attributes.position.array]};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html), radiance = [1, Math.fround(128 / 255), Math.fround(64 / 255), 1];
+  assert.equal(result.ok, true, result.error?.split('\n')[0]);
+  assert.deepEqual(result.result, {sequence: ['returned', 'loaded'],
+    hdr: {width: 1, height: 1, pixels: radiance}, rgbe: radiance,
+    exr: {width: 8, height: 4, pixels: Array.from({length: 4}, () =>
+      Array.from({length: 8}, (_, x) => [x / 2, .5, .25, .75]).flat()).flat()},
+    font: {name: 'Packed font', shapes: 1}, stl: positions, ply: positions,
+    opacity: [.25, .5, 1], obj: positions});
+  assert.equal(result.requests.length, 7, 'each retained load reaches the embedded host route');
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
 test("resource lookup preserves unknown and manager-owned URLs and exact bytes with real MIME", async () => {
   const bytes = Buffer.from([0, 255, 123, 9]);
   const source = createThreeLoaderResourceModule(new Map([["site/a #.bin", { source: bytes }]]), {

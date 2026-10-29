@@ -16,7 +16,20 @@ const CORE_LOADERS = new Set([
   "FileLoader", "AudioLoader", "BufferGeometryLoader", "ObjectLoader",
 ]);
 const SETTINGS = new Set(["setPath", "setResourcePath", "setCrossOrigin", "setWithCredentials", "setRequestHeader"]);
+// These pinned loaders fetch one source file; their parsers do not fetch model
+// sidecars. OBJ materials supplied through setMaterials remain an opaque route.
+// The setters below change decoding, not the URL, and still execute upstream.
+const SINGLE_FILE_ADDONS = new Map([
+  ["HDRLoader", new Set(["setDataType"])],
+  ["RGBELoader", new Set(["setDataType"])],
+  ["EXRLoader", new Set(["setDataType", "setOutputFormat", "setPart"])],
+  ["FontLoader", new Set()],
+  ["STLLoader", new Set()],
+  ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],
+  ["OBJLoader", new Set()],
+]);
 const ADDON_SETTINGS = new Map([
+  ...SINGLE_FILE_ADDONS,
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -28,7 +41,8 @@ const ADDON_USES = new Map([
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
 const isSetting = (loader, method) => SETTINGS.has(method) || ADDON_SETTINGS.get(loader)?.has(method);
-const isUse = (loader, method) => ["load", "loadAsync", "dispose"].includes(method) || ADDON_USES.get(loader)?.has(method);
+const isUse = (loader, method) => ["load", "loadAsync", "dispose"].includes(method) ||
+  (SINGLE_FILE_ADDONS.has(loader) && method === "parse") || ADDON_USES.get(loader)?.has(method);
 const FUNCTION_TYPES = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
 const SCOPE_TYPES = new Set([
   "Program", "BlockStatement", "StaticBlock", "SwitchStatement", "CatchClause",
@@ -75,15 +89,18 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     let resolved;
     try { resolved = canonicalUrl(resolveModule(node.source.value)); } catch { continue; }
     const core = isInternalLibraryModule(resolved, root);
+    const addons = [...ADDON_SETTINGS.keys()].filter(name =>
+      resolved === root + "examples/jsm/Addons.js" || resolved === root + `examples/jsm/loaders/${name}.js`);
     for (const specifier of node.specifiers) {
       let value;
       if (specifier.type === "ImportNamespaceSpecifier" && core) value = { namespace: true };
+      if (specifier.type === "ImportNamespaceSpecifier" && addons.length) value = { addonNamespace: new Set(addons) };
       if (specifier.type === "ImportSpecifier") {
         const imported = specifier.imported.name ?? specifier.imported.value;
         if (core && imported === "DefaultLoadingManager") value = { manager: true };
         if ((core && CORE_LOADERS.has(imported)) ||
             (CORE_LOADERS.has(imported) && resolved === root + `src/loaders/${imported}.js`) ||
-            (ADDON_SETTINGS.has(imported) && resolved === root + `examples/jsm/loaders/${imported}.js`)) {
+            addons.includes(imported)) {
           value = { loader: imported };
         }
       }
@@ -203,7 +220,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
     if (node?.type === "MemberExpression" && node.object.type === "Identifier") {
       const binding = lookup(node.object.name, node.object), name = memberName(node);
-      if (binding?.value?.namespace && CORE_LOADERS.has(name)) return name;
+      if ((binding?.value?.namespace && CORE_LOADERS.has(name)) || binding?.value?.addonNamespace?.has(name)) return name;
     }
     return null;
   };

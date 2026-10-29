@@ -179,6 +179,23 @@ callback loading, sticky image bases and pending resets, cube faces, embedded da
 independent instances, and editing/exporting/re-importing a loaded scene. Its
 image host checks resource bytes and ownership, not browser image-decoder parity.
 
+## Single-file addon assets
+
+Finite document-relative loads through the pinned `HDRLoader`, `RGBELoader`,
+`EXRLoader`, `FontLoader`, `STLLoader`, `PLYLoader` and `OBJLoader` include their
+source files in application output and the prepared standalone resource map.
+Named and namespace imports from their source modules or the addon aggregate
+retain the same discovery rules. Decoder settings, including EXR part/format
+selection and PLY property mappings, execute in the retained upstream loaders.
+Original asset bytes, logical URL suffixes and callback ordering are preserved.
+
+An executable packed regression decodes HDR and ZIP-compressed EXR pixels,
+generates font outlines and loads STL/PLY/OBJ triangles after source/build files
+are unavailable, with non-data requests rejected. This is retained-loader
+packaging, not new renderer or browser GPU validation. Custom managers, escaping
+loaders, unknown paths and OBJ `setMaterials()` remain on their original host
+route; this does not close material/texture sidecars for other model formats.
+
 ## Validation and boundaries
 
 ```sh

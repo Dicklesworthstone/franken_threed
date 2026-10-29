@@ -88,6 +88,46 @@ test("fluent GLTFLoader path and resource settings retain their final values", (
   assert.equal(requests[0].resourcePath, "textures/");
 });
 
+test("pinned single-file addons retain finite paths, decoder settings and import identities", () => {
+  const addons = rootUrl + "examples/jsm/Addons.js";
+  const requests = discover(`import { HDRLoader as SourceHDR, RGBELoader, EXRLoader, FontLoader, STLLoader, PLYLoader, OBJLoader } from ${JSON.stringify(addons)};
+    import * as HDR from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/HDRLoader.js')};
+    import * as Addons from ${JSON.stringify(addons)};
+    const Loader = SourceHDR;
+    const radiance = new Loader(); radiance.setDataType(floatType).setPath('env/');
+    radiance.loadAsync(useDay ? 'day.hdr' : 'night.hdr');
+    new RGBELoader().setDataType(halfType).load('legacy.hdr');
+    new EXRLoader().setPart(1).setOutputFormat(rgba).setDataType(floatType).setPath('exr/').loadAsync('sky.exr');
+    const font = new FontLoader(); font.parse(inMemoryFont); font.load('font.json');
+    new STLLoader().setPath('geometry/').load('mesh.stl');
+    const ply = new PLYLoader();
+    ply.setPropertyNameMapping({diffuse_red:'red'}); ply.setCustomPropertyNameMapping({custom:['alpha']}); ply.load('mesh.ply');
+    new OBJLoader().loadAsync('mesh.obj');
+    new HDR.HDRLoader().load('namespace.hdr');
+    new Addons.FontLoader().load('namespace-font.json');`);
+  assert.deepEqual(requests.map(({url}) => url), ['env/day.hdr', 'env/night.hdr', 'legacy.hdr',
+    'exr/sky.exr', 'font.json', 'geometry/mesh.stl', 'mesh.ply', 'mesh.obj', 'namespace.hdr', 'namespace-font.json']);
+});
+
+test("addon asset discovery preserves opaque loaders, shadows and side-resource routes", () => {
+  const addon = name => JSON.stringify(rootUrl + `examples/jsm/loaders/${name}.js`);
+  const requests = discover(`import { HDRLoader } from ${addon('HDRLoader')};
+    import { OBJLoader } from ${addon('OBJLoader')};
+    import { FBXLoader } from ${addon('FBXLoader')};
+    import { HDRLoader as Foreign } from 'file:///other/examples/jsm/loaders/HDRLoader.js';
+    import * as Wrong from ${addon('FontLoader')};
+    function shadow(HDRLoader) { new HDRLoader().load('shadow.hdr'); }
+    new Foreign().load('foreign.hdr'); new Wrong.HDRLoader().load('wrong-export.hdr');
+    new HDRLoader(manager).load('managed.hdr');
+    const escaped = new HDRLoader(); modify(escaped); escaped.load('escape.hdr');
+    const changed = new HDRLoader(); changed.setPath(runtimePath); changed.load('dynamic.hdr');
+    const nested = new HDRLoader(); nested.setDataType(nested.setPath('nested/') && floatType).load('nested.hdr');
+    new OBJLoader().setMaterials(materials).load('materials.obj');
+    new FBXLoader().load('sidecars.fbx');
+    new HDRLoader().load('known.hdr');`);
+  assert.deepEqual(requests.map(({url}) => url), ['known.hdr']);
+});
+
 test("ObjectLoader retains sticky image bases and finite resets visible to pending loads", () => {
   const requests = discover(`import { ObjectLoader } from 'three';
     const loader = new ObjectLoader();
