@@ -515,7 +515,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('LIGHTS', 'Captured lighting enablement must match the source renderer during construction');
     if (!lightingEnabled) return [];
     if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
-    if (lights.length > 8) fail('LIMIT', 'Native lit node graphs currently admit at most eight selected scene lights');
+    // The source forward graph includes every selected light. Its generated
+    // node, shader and device-binding budgets below bound the actual work;
+    // the fixed shader's eight-light storage layout is not a native limit.
+    if (lights.length > maxNodes) fail('LIMIT', 'Selected scene lights exceed the native node budget');
     lightSignature(lights);
     // The pinned LightsNode retains analytic nodes in its module WeakMap by the
     // real light identity. Never clone lights or instantiate per-program light

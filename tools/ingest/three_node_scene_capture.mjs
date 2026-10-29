@@ -120,13 +120,22 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       pendingVisibility.push({object: children[i], parentVisible: active, parentBundle: bundle,
         suppressed: blocked || !!bundle && (bundle.warm || !uniforms)});
   }
-  // Native owners capture probe/area and authored light selection. The fixed owner must not
+  // Native owners capture probe/area, authored and many-light selection. The fixed owner must not
   // reread or reject these lights, including inactive lights and lights ignored
   // by a material's source lighting model. Their children remain traversable.
   const authoredLight = object => object.isLight === true && (object.colorNode || object.isSpotLight === true && object.map);
-  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true || authoredLight(object)));
+  const projectedLights = new Set([...hierarchy.keys()].filter(object => object.isLight === true &&
+    visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers)));
+  // Eight is the fixed shader's storage capacity, not a source-light cutoff.
+  // Select one native owner for the complete material list beyond that size,
+  // including unlit companions and lighting-disabled passes. The source graph
+  // decides each material's contributions; no fixed frame can drop a tail or
+  // reinterpret a shadow's index in a partially filtered light list.
+  const nativeManyLightScene = !shadowPass && projectedLights.size > 8;
+  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true ||
+    authoredLight(object) || nativeManyLightScene && object.isLight === true));
   const selectedLight = object => !shadowPass && renderer?.lighting?.enabled !== false &&
-    visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers);
+    projectedLights.has(object);
   const nativeProbeScene = [...nativeLights].some(object => object.isLightProbe === true && selectedLight(object));
   const nativeAreaScene = [...nativeLights].some(object => object.isRectAreaLight === true && selectedLight(object));
   const nativeAuthoredScene = [...nativeLights].some(object => authoredLight(object) && selectedLight(object));
@@ -165,7 +174,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // The source builder owns fragment depth and camera conventions. A fixed
   // color shader must never silently render a logarithmic or reversed scene.
   const nativeDepthScene = renderer?.logarithmicDepthBuffer === true || renderer?.reversedDepthBuffer === true;
-  const nativeMaterial = material => nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene
+  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;

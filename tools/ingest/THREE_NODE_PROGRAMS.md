@@ -538,9 +538,22 @@ renderer lighting switch participate in program selection; live light values
 remain uniforms. Source analytic light nodes share their retained identity across
 objects and program rebuilds, preserving FRAME updates for radiance/falloff and
 RENDER updates for view-space light positions and targets. Queued draws retain
-the light uniform bytes captured for their logical call. The profile admits up
-to eight selected lights and validates unsupported light kinds or shadow/projector
-state before any application node update.
+the light uniform bytes captured for their logical call. Native forward graphs
+include every selected light within the existing generated-node, shader-byte,
+uniform and device-binding budgets. Unsupported light kinds or shadow/projector
+state fail before any application node update.
+
+Scenes with more than eight visible, layer-selected lights select native
+rendering for the complete material list, including unlit companions and passes
+with lighting disabled. This avoids the fixed shader's eight-entry light block
+and preserves one shadow owner and the source light indices. Smaller scenes
+retain their existing route. A queued scene that later removes lights keeps its
+accepted light set and uniform values. Eleven `three_many_lights.test.mjs` cases
+check nine and 32 mixed lights across Lambert, Phong, Toon, Standard and Physical
+materials against pinned source shader bodies and exact uniform bytes, plus
+queued 24-to-eight transitions, layers, inherited visibility, disabled lighting,
+late-index shadows and real capacity failures. This uses the source forward
+algorithm; it adds no clustered-light algorithm or performance claim.
 
 Graphics and compute share the renderer's existing sampled-texture snapshot
 adapter and upload pool. Each draw leases its post-update texture identities,
