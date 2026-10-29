@@ -463,8 +463,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     };
     return JSON.stringify(lights.map(light => {
       const Native = sourceLightClass(light);
-      if (light.map != null || light.colorNode != null)
-        fail('LIGHTS', 'Native lit graph projected maps and custom light color nodes are not admitted');
+      // SpotLightNode calls its authored color with projected coordinates;
+      // other analytic nodes consume an authored color graph directly. Keep
+      // those source entrances distinct and let the pinned builder call Fn.
+      const spot = Native === three.SpotLightNode, color = light.colorNode || null;
+      if (light.map != null && !spot)
+        fail('LIGHTS', 'Native projected maps require the source SpotLightNode');
+      if (color && (spot ? typeof color !== 'function' || typeof color.getCacheKey !== 'function' : !(color instanceof three.Node)))
+        fail('LIGHTS', 'Native spot color nodes require a callable projection with the source cache key; other light colors require source node graphs');
+      const map = spot && !color ? light.map || null : null;
+      if (map && (inspectTexture(map).viewDimension !== '2d' || integerTextureType(map)))
+        fail('LIGHTS', 'Projected spot maps require floating-point source 2D textures');
+      // A projected map is a render-update TextureNode inside the source
+      // lighting graph. Rebuild on replacement so layout and binding aliases
+      // are checked before that callback selects the new resource.
+      const projected = map ? [sourceId(map), textureSignature([{value: map}])] : null;
+      const authored = color ? [sourceId(color), color.getCacheKey()] : null;
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
       const filter = shadow ? inspectThreeNativeShadowFilter(shadow) : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
@@ -476,7 +490,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
         id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
-        filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null];
+        filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null, projected, authored];
     }));
   }
   function checkAnalyticLight(node, lights) {

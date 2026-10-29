@@ -120,17 +120,19 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       pendingVisibility.push({object: children[i], parentVisible: active, parentBundle: bundle,
         suppressed: blocked || !!bundle && (bundle.warm || !uniforms)});
   }
-  // Native owners capture probe/area light selection. The fixed owner must not
+  // Native owners capture probe/area and authored light selection. The fixed owner must not
   // reread or reject these lights, including inactive lights and lights ignored
   // by a material's source lighting model. Their children remain traversable.
-  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true));
+  const authoredLight = object => object.isLight === true && (object.colorNode || object.isSpotLight === true && object.map);
+  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true || authoredLight(object)));
   const selectedLight = object => !shadowPass && renderer?.lighting?.enabled !== false &&
     visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers);
   const nativeProbeScene = [...nativeLights].some(object => object.isLightProbe === true && selectedLight(object));
   const nativeAreaScene = [...nativeLights].some(object => object.isRectAreaLight === true && selectedLight(object));
+  const nativeAuthoredScene = [...nativeLights].some(object => authoredLight(object) && selectedLight(object));
   // Non-PBR lighting models have no rectangular-light contribution, but their
   // source light node still constructs its LTC inputs and runs its lifecycle.
-  const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene) && litMaterial(material);
+  const nativeLightMaterial = material => (nativeProbeScene || nativeAreaScene || nativeAuthoredScene) && litMaterial(material);
   // Basic uses a source lighting model for AO and baked light as well. Even an
   // otherwise fixed material must reach that model when the pass supplies AO.
   const nativeContextMaterial = material => lightingContext !== null && material?.lights !== false &&

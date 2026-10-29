@@ -149,6 +149,32 @@ shadow ownership. An additional facade test combines ordinary Physical
 transmission with area lighting. These are source and recording-device checks;
 browser pixels and performance remain unverified.
 
+Source `SpotLight.map` projections now select native lighting automatically for
+ordinary lit materials as well as node materials. The pinned `SpotLightNode`
+owns projection coordinates, frustum selection, attenuation and render-time
+shadow-matrix updates. The existing sampled owner captures ready 2D map inputs,
+including compressed textures and their color-space views. Queued draws retain
+their matrices, accepted map versions and replacement-map bindings; versionless
+CPU edits do not change an already accepted upload. Projected maps also compose
+with the existing PCF shadow owner.
+
+Authored light colors use the distinct source contracts: spotlight `colorNode`
+is a callable projection with a source cache key, such as
+`TSL.Fn(([uv]) => TSL.texture(projectedTexture, uv.xy).rgb)`, while other analytic
+lights consume a source color node graph directly. Spotlight color projections
+take precedence over `map`, as upstream does. Texture and graph replacements
+participate in program selection, while uniforms keep source update frequencies
+and per-draw captured values. Analytic-node reuse remains controlled by the
+pinned source light cache.
+
+Visibility, camera layers and renderer lighting enablement govern this route;
+inactive projected lights do not force native draws or inspect invalid maps.
+Fifteen `three_renderer_light_projection.test.mjs` cases cover ordinary
+Lambert/Standard routing, source WGSL, compressed maps, queued matrices and
+resources, PCF integration, spotlight color projections, directional/point/
+ambient color graphs and admission failures. These are recording-device checks,
+not browser pixel or performance measurements.
+
 Explicit `renderer.library.addLight(NodeClass, LightClass)` registrations can
 supply direct analytic illumination, including the pinned H7 `SunLight` and
 `SunLightNode` addons. The light must directly extend the source `Light`, and
@@ -161,8 +187,9 @@ direction and radiance.
 Constructor, registration and direct-light graph changes participate in program
 selection. Changing the registered node class of a previously used light is
 refused because the source retains its analytic node by light identity; a fresh
-light can use the new registration. Projected maps and custom light color
-nodes remain explicitly refused. The registered SunLight also retains its source
+light can use the new registration. Projected maps require the source
+`SpotLightNode`; registered analytic lights can use source color graphs.
+The registered SunLight also retains its source
 two-cascade shadow atlas through the native shadow owner described below.
 
 Unassigned slots retain their source material color, emissive, specular and
@@ -940,7 +967,7 @@ atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models, transmitted shadows,
-custom shadow replacement nodes, projected light maps and custom
+custom shadow replacement nodes and custom
 `lightsNode` graphs remain missing.
 Video textures, and compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require
