@@ -1682,7 +1682,7 @@ test('renderer MRT context has no effect on the source canvas output', t => {
   assert.equal(f.compile(), d); f.owner.captureDraw(d, f.context);
 });
 for (const [name, change, code] of [
-  ['atomic storage graph', f => { f.material.colorNode = N.storage(new THREE.StorageBufferAttribute(4, 1, Uint32Array), 'uint', 4).toAtomic().element(0).toFloat(); }, 'STORAGE'],
+  ['float atomic storage graph', f => { f.material.colorNode = N.atomicLoad(N.storage(new THREE.StorageBufferAttribute(4, 1), 'float', 4).toAtomic().element(0)); }, 'STORAGE'],
   ['normalized storage attribute graph', f => { const attribute = new THREE.StorageBufferAttribute(4, 3); attribute.normalized = true; f.material.colorNode = N.bufferAttribute(attribute); }, 'ATTRIBUTE'],
   ['material environment texture', f => { f.material.envMap = new THREE.Texture(); }, 'TEXTURE'],
   ['output struct exceeding canvas attachments', f => { f.material.fragmentNode = N.outputStruct(N.vec4(1), N.vec4(.5)); }, 'MRT'],

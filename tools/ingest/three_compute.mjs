@@ -138,7 +138,13 @@ function createThreeCompute(renderer, three) {
   }
   function validateReads(leases) {
     live();
-    const versions = new Map();
+    const versions = new Map(), accesses = new Map();
+    const access = (attribute, writable) => {
+      const previous = accesses.get(attribute);
+      if (previous !== undefined && previous !== writable)
+        fail('STORAGE_CONFLICT', 'One native render pass cannot combine writable storage with a read-only or vertex/index use of the same attribute');
+      accesses.set(attribute, writable);
+    };
     for (const lease of leases) {
       const record = readRecord(lease), previous = versions.get(record.key);
       // One graphics pass cannot bind two queue-upload histories of the same
@@ -148,6 +154,7 @@ function createThreeCompute(renderer, three) {
         fail('READ_CONFLICT', 'One native render cannot read conflicting upload versions of a storage attribute');
       if (!record.data && (uploaded.get(record.key) !== record || !gpu.getBuffer(record.key)))
         fail('STALE', 'Native graphics storage residency was released before its captured use');
+      access(record.key, readLeases.get(lease).writable);
       versions.set(record.key, record);
     }
     return versions.values();
@@ -159,11 +166,12 @@ function createThreeCompute(renderer, three) {
       capturingReads = true;
       try { return run(); } finally { capturingReads = false; }
     },
-    capture(attribute) {
+    capture(attribute, {writable = false} = {}) {
       live();
       if (issuing) fail('REENTRY', 'Cannot capture native storage from an upload callback');
+      if (typeof writable !== 'boolean') fail('STORAGE', 'Native storage access must be a captured boolean');
       const record = attributeRecord(attribute, true), lease = Object.freeze({});
-      record.refs++; readLeases.set(lease, {record, released: false});
+      record.refs++; readLeases.set(lease, {record, writable, released: false});
       return lease;
     },
     validate: validateReads,

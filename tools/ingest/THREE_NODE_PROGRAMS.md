@@ -430,7 +430,7 @@ remain unchanged. The H8 fluid particle record (`position: vec3`,
 `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written by compute and
 read directly in both vertex and fragment graphs.
 
-A compute-writable source node can be read by graphics; the pinned builder
+A non-atomic compute-writable source node can be read by graphics; the pinned builder
 supplies read-only graphics bindings. Member, matrix-column and whole-record
 writes are rejected, while explicit local copies remain writable. Struct names,
 member order, names and types participate in the program signature, so even
@@ -441,6 +441,19 @@ graphics allocation, or CPU upload merely because a graphics draw consumes
 compute-produced values. Nested, boolean and atomic struct members are not yet
 admitted; a three-word struct is also refused because the source storage uploader
 treats that stride as a padded vec3.
+
+Scalar Int32 and Uint32 storage also supports source `.toAtomic()` graphs with
+TSL atomic operations in the fragment stage. The pinned builder supplies the
+atomic WGSL, and native bind groups retain its writable storage access. Fragment
+producers, compute dispatches and asynchronous readback share one GPU allocation
+in queue order. A later requested partial CPU upload changes only its selected
+components, preserving untouched GPU-produced values. A render pass cannot mix
+writable and read-only/vertex uses of the same attribute, and a draw cannot bind
+overlapping writable aliases. Float, vector, struct and vertex-stage atomics
+remain refused before native uploads. Ten focused fragment-atomic tests cover
+source WGSL, binding limits, aliases, captured uploads and FIFO ownership using
+explicit recorded producer effects; they do not execute WGSL or prove GPU pixel
+parity.
 
 Ordinary meshes and native sprites support source `count` with TSL `instanceIndex`, including
 compute-driven scalar/vector and structured particle positions. Each logical
@@ -1045,8 +1058,9 @@ source constraints rather than presenting them as fixes.
 
 ## Explicit remaining boundaries
 
-This is a bounded native graphics entrance, not full TSL coverage. Writable or
-atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
+This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
+graphics writes, atomics outside the scalar integer fragment profile above,
+standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids, other custom light models, custom shadow replacement nodes

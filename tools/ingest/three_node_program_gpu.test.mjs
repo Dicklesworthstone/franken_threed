@@ -335,10 +335,10 @@ test('unsupported native binding layouts fail before allocating uniform pages', 
   assert.equal(f.buffers.length, before);
 });
 
-function storageProgram(f, {uniform = true, minBindingSize = 16, visibility = 3} = {}) {
+function storageProgram(f, {uniform = true, minBindingSize = 16, writable = false, visibility = writable ? 2 : 3} = {}) {
   const program = f.program([]);
   program.groups = [{index: 0, byteLength: uniform ? 16 : 0, entries: [
-    {binding: 0, visibility, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize}},
+    {binding: 0, visibility, buffer: {type: writable ? 'storage' : 'read-only-storage', hasDynamicOffset: false, minBindingSize}},
     ...(uniform ? [{binding: 1, visibility: 3, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: 16}}] : []),
   ]}];
   return program;
@@ -408,6 +408,56 @@ test('storage ranges are validated before any uniform slot or GPU side effect is
   assert.deepEqual([f.buffers.length, f.bindGroups.length, f.writes.length], before);
   assert.equal(f.owner.uniformDiagnostics.draws, 0);
   f.stage(record, [1], {nodeResources: storageResource(buffer)});
+});
+
+test('disjoint writable and read-only bindings still conflict across the whole buffer', async t => {
+  const f = rig(t), program = storageProgram(f, {writable: true});
+  program.groups[0].entries.push({binding: 2, visibility: 2,
+    buffer: {type: 'read-only-storage', minBindingSize: 16}});
+  const record = await f.add([], {nodeProgram: program}), buffer = {size: 512, usage: 128};
+  const resources = [...storageResource(buffer), {group: 0, binding: 2, resource: {buffer, offset: 256, size: 16}}];
+  const before = [f.buffers.length, f.bindGroups.length, f.writes.length];
+  assert.throws(() => f.stage(record, [1], {nodeResources: resources}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.deepEqual([f.buffers.length, f.bindGroups.length, f.writes.length], before);
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
+  resources[1].resource.buffer = {size: 512, usage: 128};
+  f.stage(record, [2], {nodeResources: resources});
+});
+
+test('disjoint writable bindings and repeated draws are legal, while overlapping draw bindings are rejected', async t => {
+  const f = rig(t), program = storageProgram(f, {writable: true});
+  program.groups[0].entries.push({binding: 2, visibility: 2,
+    buffer: {type: 'storage', minBindingSize: 16}});
+  const record = await f.add([], {nodeProgram: program}), buffer = {size: 512, usage: 128};
+  const resources = [...storageResource(buffer), {group: 0, binding: 2, resource: {buffer, offset: 0, size: 16}}];
+  assert.throws(() => f.stage(record, [1], {nodeResources: resources}), {code: 'ANIMATION_RENDER_VALUE'});
+  assert.equal(f.owner.uniformDiagnostics.draws, 0);
+  resources[1].resource.offset = 256;
+  const first = f.stage(record, [2], {nodeResources: resources}), second = f.stage(record, [3], {nodeResources: resources});
+  f.owner.prepare(); f.owner.write();
+  assert.equal(first.nodeProgram.groups[0].group, second.nodeProgram.groups[0].group);
+  assert.deepEqual([first.nodeProgram.groups[0].offset, second.nodeProgram.groups[0].offset], [0, 256]);
+  assert.deepEqual(first.nodeProgram.groups[0].group.entries.filter(entry => entry.binding !== 1).map(entry => entry.resource),
+    [{buffer, offset: 0, size: 16}, {buffer, offset: 256, size: 16}]);
+  assert.ok(f.writes.every(write => write.buffer !== buffer));
+});
+
+test('native draws share one buffer usage scope and begin resets it after rejection', async t => {
+  const f = rig(t), writer = await f.add([], {nodeProgram: storageProgram(f, {writable: true})});
+  const reader = await f.add([], {nodeProgram: storageProgram(f)}), buffer = {size: 512, usage: 128};
+  for (const [first, second] of [[reader, writer], [writer, reader]]) {
+    f.owner.begin();
+    const before = [f.buffers.length, f.bindGroups.length, f.writes.length];
+    f.stage(first, [1], {nodeResources: storageResource(buffer)});
+    assert.throws(() => f.stage(second, [2], {nodeResources: storageResource(buffer, 256)}),
+      {code: 'ANIMATION_RENDER_VALUE'});
+    assert.equal(f.owner.uniformDiagnostics.draws, 1);
+    assert.deepEqual([f.buffers.length, f.bindGroups.length, f.writes.length], before);
+  }
+  f.owner.begin();
+  f.stage(reader, [3], {nodeResources: storageResource(buffer)});
+  f.owner.prepare(); f.owner.write();
+  assert.equal(f.owner.uniformDiagnostics.draws, 1);
 });
 
 test('storage layout and per-stage limits are separate from uniform limits', async t => {

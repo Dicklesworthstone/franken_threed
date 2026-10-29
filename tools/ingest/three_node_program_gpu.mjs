@@ -1,6 +1,6 @@
 /** F3D graphics pipelines for native WGSL node programs. Bindings follow the
  * pinned builder's groups directly, with native uniform blocks packed per
- * group plus borrowed sampler/texture/read-only storage resources at their
+ * group plus borrowed sampler/texture/storage resources at their
  * source binding indices.
  * Each logical draw gets independent aligned slices. No ESSL reflection, shader
  * rewriting, vertex-index rotation, upstream backend or hidden submission path.
@@ -30,6 +30,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
   // Immutable GPU programs are shared; resource bindings, draw ranges and
   // uniform histories remain owned by each record and logical draw.
   const pipelineEntries = new Map();
+  const bufferUsages = new Map();
   const maxResourceGroups = maxDraws * maxBindGroups;
   let pendingGroups = [], stagedDraws = 0, nextResourceId = 0;
   if (!Array.isArray(colorFormats) || (colorFormats[0] ?? null) !== format)
@@ -45,7 +46,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     if (stoppedError) return;
     stoppedError = reason; rejectStopped(reason);
     for (const record of records) record.disposed = true;
-    pendingGroups = []; resourceGroups.clear(); pipelineEntries.clear();
+    pendingGroups = []; resourceGroups.clear(); pipelineEntries.clear(); bufferUsages.clear();
     records.clear(); for (const arena of arenas.values()) arena.dispose(); arenas.clear();
   }
   function live() { if (stoppedError) throw stoppedError; }
@@ -79,14 +80,15 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       seen.add(entry.binding);
       const base = {binding: entry.binding, visibility: entry.visibility};
       if (entry.buffer) {
-        if (entry.buffer.type === 'read-only-storage') {
+        if (entry.buffer.type === 'read-only-storage' || entry.buffer.type === 'storage') {
           const minBindingSize = entry.buffer.minBindingSize ?? 0;
           if ((entry.buffer.hasDynamicOffset !== undefined && entry.buffer.hasDynamicOffset !== false) ||
-              !Number.isSafeInteger(minBindingSize) || minBindingSize < 0 || minBindingSize % 4)
-            fail('ANIMATION_RENDER_OPTIONS', 'Native node storage requires a static read-only buffer layout');
+              !Number.isSafeInteger(minBindingSize) || minBindingSize < 0 || minBindingSize % 4 ||
+              entry.buffer.type === 'storage' && entry.visibility !== 2)
+            fail('ANIMATION_RENDER_OPTIONS', 'Native node storage requires a static layout; writable buffers are fragment-only');
           if (minBindingSize > (device.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024))
             limit('Native node storage layout exceeds the device binding size limit');
-          return {...base, buffer: {type: 'read-only-storage', hasDynamicOffset: false, minBindingSize}};
+          return {...base, buffer: {type: entry.buffer.type, hasDynamicOffset: false, minBindingSize}};
         }
         const size = entry.buffer.minBindingSize;
         if (entry.buffer.type !== 'uniform' || entry.buffer.hasDynamicOffset !== true ||
@@ -143,7 +145,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const resources = input.nodeResources ?? [];
     if (!Array.isArray(resources) || resources.length !== record.resourceCount)
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one borrowed resource per sampler/texture/storage binding');
-    const captured = record.groups.map(() => new Map());
+    const captured = record.groups.map(() => new Map()), bufferUses = new Map();
     for (const binding of resources) {
       const group = record.groups[binding?.group];
       if (!Number.isSafeInteger(binding?.group) || !group || !Number.isSafeInteger(binding.binding) ||
@@ -162,13 +164,33 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
           fail('ANIMATION_RENDER_VALUE', 'Native node storage resources require an aligned, in-bounds STORAGE buffer range');
         if (size > (device.limits.maxStorageBufferBindingSize ?? 128 * 1024 * 1024))
           limit('Native node storage resource exceeds the device binding size limit');
+        const uses = bufferUses.get(buffer) ?? [], writable = layout.buffer.type === 'storage';
+        if (uses.some(use => use.writable !== writable))
+          fail('ANIMATION_RENDER_VALUE', 'A render pass cannot mix writable storage and read-only uses of one buffer');
+        if (writable && uses.some(use => offset < use.offset + use.size && use.offset < offset + size))
+          fail('ANIMATION_RENDER_VALUE', 'A native draw cannot alias overlapping writable storage bindings');
+        uses.push({offset, size, writable}); bufferUses.set(buffer, uses);
         // A caller can reuse or mutate its resource wrapper after stage().
         // Keep the selected allocation/range, while borrowing its GPU contents.
         resource = Object.freeze({buffer, offset, size});
       }
       captured[binding.group].set(binding.binding, resource);
     }
-    return record.groups.map((group, index) => group.resources.map(entry => ({binding: entry.binding, resource: captured[index].get(entry.binding)})));
+    return {resources: record.groups.map((group, index) => group.resources.map(entry =>
+      ({binding: entry.binding, resource: captured[index].get(entry.binding)}))),
+      buffers: new Map([...bufferUses].map(([buffer, uses]) => [buffer, uses[0].writable]))};
+  }
+  function checkBufferUsage(buffer, writable, usages = bufferUsages) {
+    if (usages.has(buffer) && usages.get(buffer) !== writable)
+      fail('ANIMATION_RENDER_VALUE', 'A render pass cannot mix writable storage and read-only or vertex/index uses of one buffer');
+  }
+  function validateCommands(commands, count) {
+    // Fixed and ESSL commands share the native draw's render pass. A buffer is
+    // one usage-scope subresource even when vertex/index ranges are disjoint.
+    for (let i = 0; i < count; i++) {
+      for (const buffer of commands[i].vertexBuffers ?? []) checkBufferUsage(buffer, false);
+      if (commands[i].indexBuffer) checkBufferUsage(commands[i].indexBuffer, false);
+    }
   }
   function identity(resource) {
     let id = resourceIds.get(resource);
@@ -227,7 +249,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       limit('Native node bindings exceed maxDynamicUniformBuffersPerPipelineLayout');
     for (const stage of [1, 2, 4]) for (const [matches, name, fallback] of [
       [entry => entry.buffer?.type === 'uniform', 'maxUniformBuffersPerShaderStage', 12],
-      [entry => entry.buffer?.type === 'read-only-storage', 'maxStorageBuffersPerShaderStage', 8],
+      [entry => entry.buffer?.type === 'read-only-storage' || entry.buffer?.type === 'storage', 'maxStorageBuffersPerShaderStage', 8],
       [entry => entry.sampler, 'maxSamplersPerShaderStage', 16],
       [entry => entry.texture, 'maxSampledTexturesPerShaderStage', 16]])
       if (groups.reduce((count, group) => count + group.entries.filter(entry => matches(entry) && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
@@ -351,7 +373,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
         bytes.some((value, index) => !(value instanceof Uint8Array) || value.byteLength !== record.groups[index].byteLength ||
           !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable))
       fail('ANIMATION_RENDER_VALUE', 'Native node draws need one owned uniform byte packet per native group');
-    const resources = snapshotResources(record, input);
+    const {resources, buffers} = snapshotResources(record, input);
     const geometry = programGeometrySnapshot(record.gpu, device);
     if (geometry.signature !== record.geometrySignature || geometry.instanced !== record.geometryInstanced ||
         record.topology === 'line-strip' && geometry.indexFormat !== record.stripIndexFormat)
@@ -367,6 +389,10 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const range = input.nodeRangeCaptured ? {first: 0, count: extent} : geometry.drawRange;
     const first = Math.min(extent, Math.max(input.first ?? 0, range.first));
     const end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
+    for (const buffer of [...geometry.vertexBuffers, ...(geometry.indexBuffer ? [geometry.indexBuffer] : [])]) {
+      checkBufferUsage(buffer, false, buffers); buffers.set(buffer, false);
+    }
+    for (const [buffer, writable] of buffers) checkBufferUsage(buffer, writable);
     const groups = record.groups.map((group, index) => {
       const packet = group.arena ? group.arena.stage(record.uniformBindings[index], bytes[index]) : null;
       const offsets = Object.freeze(group.uniforms.map(() => packet.offset));
@@ -375,6 +401,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       pendingGroups.push({record, index, packet, resources: resources[index], output});
       return output;
     });
+    for (const [buffer, writable] of buffers) bufferUsages.set(buffer, writable);
     stagedDraws++;
     Object.assign(command, {record, first, count: Math.max(0, end - first),
       pipeline: input.frontFaceCW ? record.pipelines.flipped : record.pipelines.normal,
@@ -383,8 +410,8 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       instanceCount, firstInstance, instanceBindGroup: null, blendConstant: record.blendConstant, stencilReference: record.stencilReference});
     return geometry;
   }
-  return Object.freeze({add, stage, prepare,
-    begin() { live(); pendingGroups = []; stagedDraws = 0; for (const arena of arenas.values()) arena.begin(); },
+  return Object.freeze({add, stage, prepare, validateCommands,
+    begin() { live(); pendingGroups = []; stagedDraws = 0; bufferUsages.clear(); for (const arena of arenas.values()) arena.begin(); },
     write() { live(); for (const arena of arenas.values()) arena.write(); },
     remove(record) {
       if (records.delete(record)) { record.disposed = true; releasePipeline(record.pipelineEntry); }

@@ -21,8 +21,8 @@
  * Named MRT outputs share native attachments and retain source graph construction.
  * ClippingGroup planes retain source union/intersection and alpha-to-coverage
  * composition. Physical transmission and dispersion retain source framebuffer
- * nodes and require the renderer's ordered scene-color copy owner. Writable/atomic
- * storage fails explicitly. VSM retains the source moment and blur passes.
+ * nodes and require the renderer's ordered scene-color copy owner. Fragment
+ * integer atomics share compute storage. VSM retains the source moment and blur passes.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -286,6 +286,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function inspectStorage(node) {
     const attribute = node.value, struct = node.structTypeNode;
+    const atomic = node.isAtomic === true;
+    if (atomic && (struct || !['int', 'uint'].includes(node.nodeType)))
+      fail('STORAGE', 'Native fragment atomics require scalar signed or unsigned 32-bit storage');
     const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat4))$/.exec(node.nodeType ?? '');
     const components = type?.[3] === 'mat4' ? 16 : type?.[2] ? Number(type[2]) : 1;
     const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
@@ -303,7 +306,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!Number.isSafeInteger(stride) || stride < 1 || stride === 3)
         fail('STORAGE', 'Native storage structs require a complete source stride without ambiguous three-word padding');
     }
-    if ((!type && !struct) || node.isAtomic || node.isPBO ||
+    if ((!type && !struct) || node.isAtomic && !atomic || node.isPBO ||
         !['readOnly', 'readWrite'].includes(node.access) || attribute?.isIndirectStorageBufferAttribute ||
         !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
         attribute.isInterleavedBufferAttribute || attribute.normalized ||
@@ -312,9 +315,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !(struct ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
-      fail('STORAGE', 'Native storage reads require matching non-atomic scalar/vector/mat4 or flat-struct 32-bit storage attributes');
+      fail('STORAGE', 'Native storage requires matching scalar/vector/mat4 or flat-struct 32-bit attributes; atomics require scalar integers');
     if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
-      fail('HOOK', 'Native storage reads require the source upload callback');
+      fail('HOOK', 'Native shader storage requires the source upload callback');
     const bytes = attribute.count * stride * 4;
     if (bytes > (renderer._device?.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024) ||
         bytes > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))
@@ -332,6 +335,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // replacements retain bindings; only unsized nodes share by attribute, so
       // their alias partition must remain stable. Fixed arrays bind separately.
       return [unsized ? aliases.get(attribute) : null, node.nodeType, node.bufferCount, attribute.count, bytes, node.groupNode?.name,
+        node.isAtomic === true, node.access,
         struct ? [struct.name, struct.membersLayout.map(({name, type}) => [name, type])] : null];
     }));
   }
@@ -990,8 +994,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     else if (managedUniformBuffer(node)) inspectUniformArray(node);
     else if (rawUniformBuffer(node)) inspectUniformBuffer(node);
     else if (!(node instanceof three.BufferAttributeNode) &&
-        (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode || node.isAtomicFunctionNode))
-      fail('STORAGE', 'Unsupported managed buffers, atomic and compute graphs are not admitted');
+        (node.isBufferNode || node.isBufferAttributeNode || node.isComputeNode))
+      fail('STORAGE', 'Unsupported managed buffers and compute graphs are not admitted');
     if (node.isAssignNode) {
       const seen = new Set(), targets = [node.targetNode];
       while (targets.length) {
@@ -1196,12 +1200,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         if (binding.isStorageBuffer && binding.nodeUniform?.isStorageBufferNode) {
           const minBindingSize = inspectStorage(binding.nodeUniform);
+          const atomic = binding.nodeUniform.isAtomic === true;
+          if (atomic && binding.visibility !== 2)
+            fail('STORAGE', 'Source atomic storage is supported only in the fragment stage of native graphics');
           for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
             if (++storageCounts[stage] > (renderer._device?.limits?.maxStorageBuffersPerShaderStage ?? 8))
               fail('LIMIT', 'Native node storage bindings exceed per-stage device limits');
-          // r186 WGSLNodeBuilder.getNodeAccess makes non-atomic graphics reads
-          // read-only even when the same source node is writable in compute.
-          return Object.freeze({...base, buffer: Object.freeze({type: 'read-only-storage', hasDynamicOffset: false, minBindingSize})});
+          // Match r186 getNodeAccess and WebGPUBindingUtils: fragment atomics
+          // are writable; ordinary graphics storage remains read-only.
+          return Object.freeze({...base, buffer: Object.freeze({type: atomic ? 'storage' : 'read-only-storage', hasDynamicOffset: false, minBindingSize})});
         }
         if (!binding.textureNode?.isTextureNode || binding.store || (!binding.isSampledTexture && !binding.isSampler))
           fail('BINDING', 'Native graphics groups require uniform blocks or ordinary sampled 2D, array, cube or 3D texture bindings');
@@ -1533,9 +1540,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function readStorage(state) {
     if (storageSignature(state.storageNodes) !== state.storageSignature)
       fail('CHANGED', 'Native storage layout, struct schema or binding aliases changed; compile the graph again');
-    const storage = [];
+    const storage = [], attributes = new Map();
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
-      if (value.isStorageBuffer) storage.push(Object.freeze({group, binding, attribute: value.attribute}));
+      if (value.isStorageBuffer) {
+        const attribute = value.attribute;
+        const writable = state.descriptor.groups[group].entries.find(entry => entry.binding === binding).buffer.type === 'storage';
+        if (attributes.has(attribute) && (writable || attributes.get(attribute)))
+          fail('STORAGE', 'A native draw cannot bind the same attribute to multiple bindings when one is writable');
+        attributes.set(attribute, writable);
+        storage.push(Object.freeze({group, binding, attribute, writable}));
+      }
     return Object.freeze(storage);
   }
   function checkUniformBuffers(state) {

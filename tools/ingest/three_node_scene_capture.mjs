@@ -625,7 +625,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
       draw.nodeStorage = Object.freeze(captured.storage.map(binding => {
-        const lease = storageOwner.capture(binding.attribute);
+        const lease = storageOwner.capture(binding.attribute, {writable: binding.writable === true});
         storageUses.push(lease);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));

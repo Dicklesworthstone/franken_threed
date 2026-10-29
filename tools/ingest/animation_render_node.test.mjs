@@ -3,6 +3,7 @@ import test from 'node:test';
 import {createGpuAnimationRenderer} from './animation_render.mjs';
 import {createAnimationRenderBundleCache} from './animation_render_bundles.mjs';
 import {createGpuBufferGeometry, createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
+import {createGpuCompute} from './gpu_compute.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 // Exercise renderer/encoder ownership and queue boundaries, not builder or
@@ -211,6 +212,40 @@ test('a rejected final sampled draw creates no native bindings or writes and ret
   assert.deepEqual(snapshot.groups.get(0).offsets,[0]);assert.deepEqual(snapshot.groups.get(1).offsets,[]);
   assert.deepEqual([...words(snapshot,0)],Array(4).fill(7));
   await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();
+});
+
+for(const kind of ['vertex','index']) for(const renderBundles of [false,true])
+test(`fragment storage rejects shared fixed ${kind} buffers before GPU work (${renderBundles})`,async t=>{
+  const d=geometryDevice(),compute=createGpuCompute(d),s=source();
+  if(kind==='vertex')s.attributes.position=attribute(new Float32Array([0,0,0,0,1,0,0,0,0,1,0,0]),4);
+  else s.index=attribute(new Uint32Array([0,1,2]),1);
+  const storage=kind==='vertex'?s.attributes.position:s.index;
+  storage.isStorageBufferAttribute=true;
+  const buffer=compute.upload(storage,storage.array,storage.version);
+  const ordinary=createGpuBufferGeometry(d,s),gpu=createGpuProgramGeometry(d,source(),attributes);
+  const r=await createGpuAnimationRenderer(d,{maxDraws:2,renderBundles});
+  t.after(async()=>{await r.whenIdle();r.dispose();gpu.dispose();ordinary.dispose();compute.dispose();});
+  const builtin=await r.addMesh(ordinary),nodeProgram={...descriptor(),groups:[{index:0,byteLength:0,entries:[
+    {binding:0,visibility:2,buffer:{type:'storage',minBindingSize:4}},
+  ]}]};
+  const mesh=await r.addMesh(gpu,{nodeProgram,raster:raster()});
+  const writer={mesh,nodeUniforms:[new Uint8Array(0)],nodeResources:[{group:0,binding:0,resource:{buffer,offset:0,size:4}}]};
+  const create=d.createBindGroup;let groups=0;
+  d.createBindGroup=description=>{groups++;return create(description);};
+  const writes=d.writes.length;
+  for(const draws of [[builtin,writer],[writer,builtin]]) {
+    assert.throws(()=>r.render(frame(draws)),{code:'ANIMATION_RENDER_VALUE'});
+    assert.equal(groups,0);assert.equal(d.writes.length,writes);assert.equal(d.submissions.length,0);
+    assert.equal(r.version,0);assert.equal(r.failed,false);
+    if(renderBundles)assert.equal(r.bundleDiagnostics.cachedBundles,0);
+  }
+  r.render(frame([writer,writer]));
+  assert.equal(d.snapshots[0].length,2);
+  for(const draw of d.snapshots[0])assert.equal(draw.groups.get(0).group.entries[0].resource.buffer,buffer);
+  // A later render pass may consume the same allocation as geometry.
+  r.render(frame([builtin]));
+  const fixed=d.snapshots[1][0];
+  assert.equal(kind==='vertex'?fixed.streams.get(0):fixed.index.buffer,buffer);
 });
 
 for(const renderBundles of [false,true])

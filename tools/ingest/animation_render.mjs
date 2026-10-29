@@ -2900,6 +2900,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         dependencies.add(gpu);
         if (record.instanceHandle !== null) dependencies.add(record.instanceHandle);
       }
+      nodePrograms?.validateCommands(commands, draws.length);
       projected?.check();
       ambient?.check();
       let submittedDrawCalls = 0;
