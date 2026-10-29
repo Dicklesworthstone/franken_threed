@@ -555,6 +555,22 @@ queued 24-to-eight transitions, layers, inherited visibility, disabled lighting,
 late-index shadows and real capacity failures. This uses the source forward
 algorithm; it adds no clustered-light algorithm or performance claim.
 
+Authored `material.lightsNode = TSL.lights([...])` compositions now select their
+own source lights and lighting contributors. Lists can contain ordinary lights,
+analytic light nodes, irradiance, ambient-occlusion and environment nodes. They
+retain source precedence over scene membership, visibility/layers, the renderer
+lighting switch and the material's ordinary light-collection flag. An explicit
+off-scene shadow light uses the same native shadow prerequisite as scene lights.
+
+The private source light list receives bounded graph validation and structural
+cache keys. List edits and replacement graphs produce the appropriate program;
+uniform-only changes retain the program and capture new per-draw values. Nine
+`three_renderer_lights_graph.test.mjs` cases compare source WGSL and queued
+lighting packets, explicit selection and disable flags, shadows and rejection
+of generated unsupported writes. The root composition must retain the pinned
+`LightsNode` methods; custom lighting-manager subclasses and probe grids remain
+separate work. These command/resource checks do not establish pixel parity.
+
 Graphics and compute share the renderer's existing sampled-texture snapshot
 adapter and upload pool. Each draw leases its post-update texture identities,
 sampler state and requested CPU pixel versions before after-update callbacks.
@@ -1033,9 +1049,8 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
-Light-probe grids and other custom light models,
-custom shadow replacement nodes and custom
-`lightsNode` graphs remain missing.
+Light-probe grids, other custom light models, custom shadow replacement nodes
+and custom lighting-manager subclasses remain missing.
 Media, compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require
 additional native profiles. Sampled

@@ -45,7 +45,7 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode']);
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
 const POINT_SLOTS = new Set(['sizeNode']);
 const DASH_SLOTS = new Set(['offsetNode', 'dashScaleNode', 'dashSizeNode', 'gapSizeNode']);
@@ -517,11 +517,41 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return true;
   }
+  function authoredLightsNode(material) {
+    if (material.lightsNode == null || material.fragmentNode != null || !lightingMaterial(material)) return null;
+    const node = material.lightsNode;
+    if (!(node instanceof three.LightsNode) || Object.getPrototypeOf(node) !== three.LightsNode.prototype ||
+        ['getScope', 'getLights', 'getBuiltinLights', 'setup', 'setupLightsNode', 'setupDirectLight', 'setupDirectRectAreaLight']
+          .some(key => node[key] !== three.LightsNode.prototype[key]))
+      fail('GRAPH', 'Authored material lighting requires the pinned LightsNode composition');
+    const inputs = node.getBuiltinLights();
+    if (!Array.isArray(inputs) || inputs.some(input => !(input instanceof three.Light || input instanceof three.Node)))
+      fail('GRAPH', 'Authored lighting lists require source lights or source node contributors');
+    if (inputs.length > maxNodes) fail('LIMIT', 'Authored light inputs exceed the native node budget');
+    return node;
+  }
+  function authoredLightings(node) {
+    return node ? node.getBuiltinLights().filter(input => input instanceof three.Node) : [];
+  }
+  function lightingSignature(material, lights) {
+    const node = authoredLightsNode(material);
+    // LightsNode keeps its list in a private field, outside Node.getChildren().
+    // Capture the selected identities explicitly; contributor uniforms remain
+    // live data while their source graph keys describe structural changes.
+    return JSON.stringify([lightSignature(lights), node ? [sourceId(node), node.getCacheKey(),
+      node.getBuiltinLights().map(input => input.isNode === true
+        ? [sourceId(input), input.getCacheKey()] : input.id)] : null]);
+  }
   function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
-    if (!litMaterial(material) || material.lights !== true || material.fragmentNode != null) return [];
+    const authored = authoredLightsNode(material);
+    if (!authored && (!litMaterial(material) || material.lights !== true || material.fragmentNode != null)) return [];
     if (typeof lightingEnabled !== 'boolean' || lightingEnabled !== (renderer.lighting?.enabled !== false))
       fail('LIGHTS', 'Captured lighting enablement must match the source renderer during construction');
-    if (!lightingEnabled) return [];
+    // NodeMaterial gives an explicit lightsNode precedence even when the scene
+    // lighting manager or the material's ordinary light collection is disabled.
+    if (authored) lights = authored.getBuiltinLights().flatMap(input => input instanceof three.Light
+      ? [input] : input.isAnalyticLightNode === true ? [input.light] : []);
+    else if (!lightingEnabled) return [];
     if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
     // The source forward graph includes every selected light. Its generated
     // node, shader and device-binding budgets below bound the actual work;
@@ -830,7 +860,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       sprite = prototype === three.SpriteNodeMaterial.prototype || points, dashed = prototype === three.LineDashedNodeMaterial?.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
-    sourceLights(material, context);
+    const lights = sourceLights(material, context), lightsNode = authoredLightsNode(material);
+    const authoredNodes = new Set(authoredLightings(lightsNode));
     if (physical && material.useTransmission && (typeof renderer.copyFramebufferToTexture !== 'function' ||
         typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
       fail('TRANSMISSION', 'Native physical transmission and dispersion require the captured scene-color pass');
@@ -882,14 +913,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     const mrt = inspectThreeMRT(three, renderer, material);
-    const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => material[key]).filter(Boolean),
+    const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
+      ...authoredNodes,
       ...[environmentGraph(material, context), fogGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
     while (stack.length) {
       const node = stack.pop();
       if (seen.has(node)) continue;
       seen.add(node);
       if (seen.size > maxNodes) fail('LIMIT', 'Native node graph exceeds its node budget');
-      checkNode(node);
+      checkNode(node, lightsNode, lights, null, null, material, authoredNodes);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
       if (typeof node.getChildren === 'function') for (const child of node.getChildren()) stack.push(child);
     }
@@ -979,7 +1011,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     }
     if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
-      const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) || contextLightings?.has(node) ||
+      const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) ||
+        contextLightings?.has(node) && !node.isAnalyticLightNode && !node.light?.isLight ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
         checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
@@ -1013,7 +1046,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset,
         a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
-      lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightSignature(lights)] : null,
+      lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightingSignature(material, lights)] : null,
       Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection,
           material.useTransmission, material.useDispersion] : null]);
@@ -1037,7 +1070,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function compile(material, object, context = {}) {
     const preparedMaterial = inspect(material, object, context);
     const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
-    const lightKey = lightSignature(lights);
+    const lightKey = lightingSignature(preparedMaterial, lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
     const skinSignature = inspectSkinning(object);
@@ -1073,8 +1106,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
     builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
       [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
-    const lightsNode = lightingMaterial(preparedMaterial) ? three.TSL.lights(lights) : null;
-    if (lightsNode) builder.lightsNode = lightsNode;
+    const authored = authoredLightsNode(preparedMaterial);
+    // Keep the scene entrance distinct from material.lightsNode, just as the
+    // pinned NodeManager does. NodeMaterial selects the authored graph itself.
+    if (lightingMaterial(preparedMaterial)) builder.lightsNode = three.TSL.lights(authored
+      ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
+    const lightsNode = authored ?? builder.lightsNode;
     const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
     builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
@@ -1095,7 +1132,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((material.alphaHash === true) !== alphaHash) fail('CHANGED', 'Native alpha hashing changed during source graph construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
-    if (lightSignature(lights) !== lightKey) fail('CHANGED', 'Native light registration changed during source graph construction');
+    if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
+      fail('CHANGED', 'Native light selection or registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.
     const pmremNodes = [...builder.nodes].filter(node => node.constructor === three.PMREMNode);
@@ -1106,9 +1144,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const bindings = builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
-    // AO/GI hooks add material lighting inside the retained source context.
-    // Admit those exact generated nodes, not unrelated authored light graphs.
-    const contextLightings = new Set();
+    // Explicit contributors and AO/GI hooks share the retained source context.
+    // Their generated graphs still pass every ordinary node/resource check.
+    const contextLightings = new Set(authoredLightings(authored));
     for (const node of builder.nodes) if (Object.getPrototypeOf(node) === three.LightingContextNode.prototype && node.node === lightsNode) {
       for (const lighting of node.materialLightings) {
         if (typeof builder.context.getAO === 'function' && Object.getPrototypeOf(lighting) === three.AONode.prototype &&
@@ -1466,8 +1504,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const state of states) checkPMREM(state);
   }
   function checkLights(state) {
-    if (lightSignature(state.lights) !== state.lightSignature)
-      fail('CHANGED', 'Native light constructors, registrations or direct-light graphs changed; compile the graph again');
+    if (lightingSignature(prepareMaterial(state.material), state.lights) !== state.lightSignature)
+      fail('CHANGED', 'Native light selection, registrations or authored lighting graphs changed; compile the graph again');
     for (const node of state.analyticLightNodes) if (!checkAnalyticLight(node, state.lights))
       fail('LIGHTS', 'Native analytic light identity changed after source construction');
   }
