@@ -34,7 +34,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   if (!storage || typeof poolFactory !== 'function' || !positive(maxTextures) || !positive(maxSnapshotBytes))
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
   const current = new Map(), records = new Set(), watches = new Map(), sources = new Map(), histories = new Map();
-  const leases = new WeakSet(), imageSnapshots = new WeakMap();
+  const leases = new WeakSet(), imageSnapshots = new WeakMap(), mediaSnapshots = new WeakMap();
   let captureState = null;
   let targetInputs = null;
   let framebufferInputs = null;
@@ -57,19 +57,32 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     binding?.texture?.isDepthTexture === true && binding.texture.renderTarget != null;
   let pool = null, disposed = false, snapshotBytes = 0, resolving = false, poolDirty = false;
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
-  const sourcePool = () => { live(); return pool ??= poolFactory({imageSnapshots}); };
+  const sourcePool = () => { live(); return pool ??= poolFactory({imageSnapshots, mediaSnapshots}); };
   const isStorage = binding => binding?.texture?.isStorageTexture === true;
   function describe(binding, {initialize = false} = {}) {
     live();
     const t = binding?.texture;
     if (!t || !(t.isTexture || t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
-        t.isRenderTargetTexture || t.isVideoTexture ||
+        t.isRenderTargetTexture ||
         t.isCubeTexture && (!Array.isArray(t.image) || t.image.length !== 6))
       fail('SOURCE', 'Compute sampled inputs require ready source data, decoded images or canvases');
     if (binding.store) fail('ACCESS', 'Source textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
-    const shape = sourcePool().inspect(t, {initialize});
-    if (!shape.data && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(image => decodedImage(image) || mutableImage(image))))
+    let input = t;
+    const previous = t.isVideoTexture === true ? current.get(t) : null;
+    if (previous?.alive && previous.source === t.source && (previous.version === t.version ||
+        instance(t.image, 'VideoFrame') && !(t.image.displayWidth > 0 && t.image.displayHeight > 0) ||
+        instance(t.image, 'HTMLVideoElement') && t.image.readyState < 2)) {
+      // Closing a caller-owned frame or advancing an unrequested video frame
+      // cannot erase an already captured upload. Reuse its private source
+      // while still validating the live texture's format and sampler fields.
+      input = privateDescriptor(t); input.source = {...t.source, data: previous.pixels.source.data};
+      input.mipmaps = t.mipmaps; input.updateRanges = t.updateRanges;
+    }
+    const shape = sourcePool().inspect(input, {initialize});
+    if (t.isVideoTexture === true && shape.nativeMedia !== true) fail('SOURCE', 'Queued media requires the native WebGPU upload profile');
+    if (shape.nativeMedia && input !== t) shape.previousMedia = previous.pixels;
+    if (!shape.data && !shape.nativeMedia && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(image => decodedImage(image) || mutableImage(image))))
       fail('SOURCE', 'Compute image inputs require ImageData, ImageBitmap, HTML images or canvases');
     updatePlan(t, shape);
     return shape;
@@ -245,7 +258,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // the top-level mipmaps undefined. Face data is copied by copyImage below.
     const mipValues = shape.blockUploads && !shape.cube ? mipsAtCapture.map(image => ({image, data: image.data})) : null;
     const source = original.source, version = original.version, sourceVersion = existingPixels?.source.version ?? source.version;
-    const key = JSON.stringify([sourceVersion, shape.key]);
+    // Modern Textures.updateTexture caches media by Texture/version, even when
+    // Texture.copy shares Source. An alias must own its frame and onUpdate.
+    const key = JSON.stringify(shape.nativeMedia ? [sourceVersion, shape.key, original.id, version] : [sourceVersion, shape.key]);
     let pixels = existingPixels ?? sources.get(source)?.get(key);
     if (!pixels) {
       // Residency is keyed by the same complete descriptor as the native pool.
@@ -256,12 +271,60 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       // Source aliases share one immutable upload version and one native
       // resource, just as the source pool does. Copy only image/mip records;
       // never traverse arbitrary application objects attached to textures.
-      const copies = new Map(), images = new Map(), bitmaps = new Set(), pendingImages = [];
+      const copies = new Map(), images = new Map(), bitmaps = new Set(), pendingImages = [], mediaDependencies = new Set();
       let bytes = 0, retired = false;
       const disposeImages = () => {
         retired = true;
         for (const bitmap of bitmaps) bitmap.close(); bitmaps.clear();
+        for (const previous of mediaDependencies) releasePixels(source, previous);
+        mediaDependencies.clear();
       };
+      function copyMedia() {
+        const size = shape.width * shape.height * 4;
+        if (!positive(size) || size > maxSnapshotBytes - snapshotBytes - bytes)
+          fail('BUDGET', 'Captured media pixels exceed maxSnapshotBytes');
+        const image = {}, captured = {image: null, width: shape.width, height: shape.height, ready: shape.videoReady};
+        mediaSnapshots.set(image, captured); bytes += size;
+        if (!captured.ready) return image;
+        const accept = value => {
+          if (!(instance(value, 'VideoFrame') || instance(value, 'ImageBitmap')))
+            fail('SOURCE', 'The host did not capture an immutable media frame');
+          const width = instance(value, 'VideoFrame') ? value.displayWidth : value.width;
+          const height = instance(value, 'VideoFrame') ? value.displayHeight : value.height;
+          if (width !== captured.width || height !== captured.height) {
+            value.close(); fail('SOURCE', 'Captured media dimensions differ from the source frame');
+          }
+          if (retired) { value.close(); return; }
+          bitmaps.add(value); captured.image = value;
+        };
+        const capture = sourceImage => {
+          if (instance(sourceImage, 'VideoFrame')) return accept(globalThis.VideoFrame.prototype.clone.call(sourceImage));
+          if (instance(sourceImage, 'ImageBitmap') && typeof globalThis.structuredClone === 'function') return accept(globalThis.structuredClone(sourceImage));
+          if (typeof globalThis.VideoFrame === 'function') return accept(new globalThis.VideoFrame(sourceImage));
+          if (typeof globalThis.createImageBitmap !== 'function')
+            fail('SOURCE', 'Queued video requires VideoFrame or createImageBitmap for immutable capture');
+          // HTML copies the current video frame before queuing bitmap promise
+          // resolution. No playback update, resize or canvas conversion occurs.
+          return Promise.resolve(globalThis.createImageBitmap(sourceImage,
+            {premultiplyAlpha: 'none', colorSpaceConversion: 'default'})).then(accept);
+        };
+        const previous = shape.previousMedia;
+        let pending;
+        if (previous?.readyState === 'pending') {
+          // A starved version can retain an earlier immutable frame whose
+          // bitmap has not arrived yet. Pin that capture, never the live video.
+          retainPixels(source, previous); mediaDependencies.add(previous);
+          pending = previous.ready.then(() => {
+            if (!retired) return capture(mediaSnapshots.get(previous.source.data).image);
+          }).finally(() => {
+            if (mediaDependencies.delete(previous)) releasePixels(source, previous);
+          });
+        } else pending = capture(shape.images[0]);
+        if (pending) {
+          pending.catch(() => {}); pendingImages.push(pending);
+        }
+        return image;
+      }
       const copyData = (data, image) => {
         if (data == null) return data;
         if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
@@ -357,7 +420,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       }
       try {
-        const image = copyImage(original.image), mipmaps = Array.isArray(original.mipmaps)
+        const image = shape.nativeMedia ? copyMedia() : copyImage(original.image), mipmaps = Array.isArray(original.mipmaps)
           ? original.mipmaps.map(copyImage) : original.mipmaps;
         const ready = pendingImages.length ? Promise.all(pendingImages).then(() => {}) : null;
         ready?.catch(() => {});
@@ -391,7 +454,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       }
       original.onUpdate?.call(original, original);
     };
-    return record = {original, texture, key: shape.key, source, version, sourceVersion,
+    return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
       pixels, refs: 0, alive: true, binding: null};
   }
   function captureBinding(binding) {
@@ -408,16 +471,19 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // An unused alias can increment Source.version without requesting an upload
     // through this texture. Only an already captured alias payload changes the
     // shared residency; a later uncaptured version must not hide that payload.
-    const sharedPixels = unchanged ? histories.get(original.source)?.get(shape.key) : null;
+    const sharedPixels = unchanged && !shape.nativeMedia ? histories.get(original.source)?.get(shape.key) : null;
     if (!unchanged || sharedPixels && sharedPixels !== record.pixels) {
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
-      const replacement = snapshot(original, shape, sharedPixels);
+      // A sampler change must not reread an advancing video or wait for an
+      // earlier bitmap capture to finish. Its accepted frame remains immutable.
+      const mediaPixels = shape.nativeMedia && record?.source === original.source && record.version === original.version ? record.pixels : null;
+      const replacement = snapshot(original, shape, sharedPixels ?? mediaPixels);
       const pixels = replacement.pixels;
       try { watch(original); }
       catch (error) { if (pixels.refs === 0) pixels.disposeImages?.(); throw error; }
       retainPixels(replacement.source, pixels);
       records.add(replacement);
-      setHistory(replacement.source, replacement.key, pixels);
+      if (!replacement.nativeMedia) setHistory(replacement.source, replacement.key, pixels);
       current.set(original, replacement);
       if (record && record.refs === 0 && !captureState?.records.has(record)) { retire(record); syncPool(); }
       record = replacement;
@@ -438,7 +504,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // unobserved CPU edits and replacement TextureNodes must remain inert.
     if (!leases.has(snapshot) || snapshot.sampler) return null;
     validate(snapshot);
-    const previous = snapshot.record, pixels = histories.get(previous.source)?.get(previous.key);
+    const previous = snapshot.record, accepted = previous.nativeMedia ? current.get(previous.original) : null;
+    // Native media can refresh only from this texture's accepted upload. A
+    // cloned alias shares Source but not modern WebGPU texture residency.
+    const pixels = previous.nativeMedia
+      ? accepted?.source === previous.source && accepted.key === previous.key ? accepted.pixels : null
+      : histories.get(previous.source)?.get(previous.key);
     if (!pixels || pixels === previous.pixels) return null;
     let record = [...records].find(value => value.original === previous.original &&
       value.source === previous.source && value.key === previous.key && value.pixels === pixels);
@@ -542,7 +613,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         histories.clear();
         for (const [source, group] of before.histories) for (const [key, pixels] of group)
           if ([...records].some(record => record.source === source && record.key === key)) setHistory(source, key, pixels);
-        for (const record of uploaded) setHistory(record.source, record.key, record.pixels);
+        for (const record of uploaded) if (!record.nativeMedia) setHistory(record.source, record.key, record.pixels);
         throw error;
       } finally {
         captureState = null;

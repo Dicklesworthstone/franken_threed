@@ -73,7 +73,7 @@ export function inspectThreeTexture(texture, three, limits={}) {
 }
 function textureInspector(T,{
   maxTextureBytes=128*1024*1024,maxPixels=16*1024*1024,maxDimension=32768,maxDimension3D=32768,maxLayers=2048,float32Filterable=false,features=new Set(),
-  imageSnapshots=null,nativeCube=false,
+  imageSnapshots=null,mediaSnapshots=null,nativeCube=false,nativeMedia=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');
@@ -199,10 +199,14 @@ function textureInspector(T,{
   }
   function dimensions(image,data,video=false,volume=false){
     if(!image||image.complete===false)fail('NOT_READY','Source image has not loaded');
-    if(video&&(!(image.videoWidth>0)||!(image.videoHeight>0)))fail('NOT_READY','Video has no decoded frame dimensions');
+    const media=video&&nativeMedia?mediaSnapshots?.get(image):null;
+    const frame=video&&nativeMedia&&instance(image,'VideoFrame'),bitmap=video&&nativeMedia&&instance(image,'ImageBitmap');
+    const videoWidth=media?.width??(frame?image.displayWidth:bitmap?image.width:image.videoWidth);
+    const videoHeight=media?.height??(frame?image.displayHeight:bitmap?image.height:image.videoHeight);
+    if(video&&!nativeMedia&&(!(videoWidth>0)||!(videoHeight>0)))fail('NOT_READY','Video has no decoded frame dimensions');
     const limit=volume?maxDimension3D:maxDimension;
-    const width=integer(video?image.videoWidth:data?image.width:image.naturalWidth??image.width,1,limit,'image width');
-    const height=integer(video?image.videoHeight:data?image.height:image.naturalHeight??image.height,1,limit,'image height');
+    const width=integer(video?videoWidth||1:data?image.width:image.naturalWidth??image.width,1,limit,'image width');
+    const height=integer(video?videoHeight||1:data?image.height:image.naturalHeight??image.height,1,limit,'image height');
     if(width*height>maxPixels)fail('LIMIT','Source exceeds pixel budget');return {width,height};
   }
   function describe(t,{initialize=false}={}){
@@ -220,13 +224,17 @@ function textureInspector(T,{
       fail('SOURCE','Expected an unambiguous source Data3DTexture or DataArrayTexture');
     if((layered||t.isDataTexture)&&(!t.image||t.image.data==null))fail('NOT_READY','Source texture data has not loaded');
     const layers=layered?integer(t.image?.depth,1,volume?maxDimension3D:maxLayers,'image depth'):cube?6:1;
-    if(video&&(typeof T.VideoTexture!=='function'||!(t instanceof T.VideoTexture)||
-        !instance(t.image,'HTMLVideoElement')||cube||t.isDataTexture||t.isVideoFrameTexture||
-        typeof T.VideoTexture.prototype.update!=='function'||t.update!==T.VideoTexture.prototype.update))
-      fail('SOURCE','Video requires a source VideoTexture, HTMLVideoElement and built-in update hook');
-    // HAVE_CURRENT_DATA is the platform value 2. A resident, temporarily starved
-    // stream retains its last submitted pixels without acknowledging a new frame.
-    const videoReady=video&&integer(t.image.readyState,0,4,'video readyState')>=2;
+    const media=video&&nativeMedia?mediaSnapshots?.get(t.image):null,frame=video&&t.isVideoFrameTexture===true;
+    const mediaDefault=video&&nativeMedia&&t.version===0;
+    if(video&&(typeof T.VideoTexture!=='function'||!(t instanceof T.VideoTexture)||cube||t.isDataTexture||
+        (frame? !nativeMedia||typeof T.VideoFrameTexture!=='function'||!(t instanceof T.VideoFrameTexture)||
+          t.update!==T.VideoFrameTexture.prototype.update||!media&&!mediaDefault&&!instance(t.image,'VideoFrame'):
+          !media&&!instance(t.image,'HTMLVideoElement')||typeof T.VideoTexture.prototype.update!=='function'||t.update!==T.VideoTexture.prototype.update)))
+      fail('SOURCE','Video requires a source VideoTexture/VideoFrameTexture, its media source and built-in update hook');
+    // HAVE_CURRENT_DATA is the platform value 2. Legacy uploads wait for a
+    // current frame; native queued media can retain its private previous frame.
+    const videoReady=video&&!mediaDefault&&(media?media.ready:frame? t.image.displayWidth>0&&t.image.displayHeight>0:
+      integer(t.image.readyState,0,4,'video readyState')>=2);
     if(cube&&(typeof T.CubeTexture!=='function'||!(t instanceof T.CubeTexture)||!Array.isArray(t.image)||t.image.length!==6))
       fail('SOURCE','CubeTexture requires six source faces');
     if(!volume&&layers>maxLayers)fail('LIMIT','Native texture array-layer limit is too small');
@@ -271,6 +279,8 @@ function textureInspector(T,{
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
     const capturedImages=new WeakSet();
     const unwrap=image=>{
+      const capturedMedia=nativeMedia?mediaSnapshots?.get(image):null;
+      if(capturedMedia?.image){image=capturedMedia.image;capturedImages.add(image);}
       const captured=imageSnapshots?.get(image);
       if(captured){image=captured;capturedImages.add(image);}
       if(!cube)return image;
@@ -282,7 +292,7 @@ function textureInspector(T,{
       return image;
     };
     const base=cube?t.image.map(unwrap):[unwrap(t.image)];
-    const {width,height}=dimensions(base[0],data,video,volume),full=1+Math.floor(Math.log2(Math.max(width,height,volume?layers:1)));
+    const {width,height}=mediaDefault?{width:1,height:1}:dimensions(base[0],data,video,volume),full=1+Math.floor(Math.log2(Math.max(width,height,volume?layers:1)));
     if(cube&&width!==height)fail('SOURCE','Cube faces must be square');
     if(width*height*layers>maxPixels)fail('LIMIT','All texture faces/layers/voxels together exceed the pixel budget');
     if(!Array.isArray(t.mipmaps))fail('SOURCE','Expected source mipmaps');
@@ -330,7 +340,7 @@ function textureInspector(T,{
         if(channels!==4)fail('FORMAT','External images require RGBA storage');
         if(instance(image,'ImageData')&&image.colorSpace&&image.colorSpace!=='srgb')fail('COLOR','ImageData requires the sRGB copy profile');
       }
-      const extent=dimensions(image,data,video,volume);
+      const extent=mediaDefault?{width:1,height:1}:dimensions(image,data,video,volume);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
         const a=image.data,Kind=integral?kind.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
@@ -367,7 +377,7 @@ function textureInspector(T,{
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
-    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
+    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
@@ -376,12 +386,12 @@ function textureInspector(T,{
 
 export function createGpuThreeTextures(device,{
   three:T,maxTextureBytes=128*1024*1024,maxTextures=256,maxPixels=16*1024*1024,label='f3d-three-textures',
-  imageSnapshots=null,nativeCube=false,
+  imageSnapshots=null,mediaSnapshots=null,nativeCube=false,nativeMedia=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
-  const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,nativeCube,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
+  const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,mediaSnapshots,nativeCube,nativeMedia,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
@@ -446,8 +456,8 @@ export function createGpuThreeTextures(device,{
     native(()=>device.queue.submit([encoder.finish()]));
   }
   function upload(t,r,d){
-    if(!d.video&&t.version===0){r.version=0;return;}
-    if(d.video){
+    if((!d.video||d.nativeMedia)&&t.version===0){r.version=0;return;}
+    if(d.video&&!d.nativeMedia){
       if(!d.videoReady)return;
       // The pinned hook is a no-op with requestVideoFrameCallback. On older
       // hosts it requests one upload per consuming update, after set admission.
@@ -501,7 +511,7 @@ export function createGpuThreeTextures(device,{
           if(flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
           native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:flipY?row:pitch},[image.width,image.height,1]));stats.writeCalls++;
         }
-      }else for(const {image,level,layer} of d.uploads){
+      }else if(!d.video||d.videoReady)for(const {image,level,layer} of d.uploads){
         native(()=>device.queue.copyExternalImageToTexture({source:image,flipY:d.flipY},
           {texture:a.texture,colorSpace:'srgb',premultipliedAlpha:d.premultiplyAlpha,mipLevel:level,
             ...(d.cube?{origin:[0,0,layer]}:{})},
@@ -525,7 +535,7 @@ export function createGpuThreeTextures(device,{
     try{
       let addedBytes=0,addedCount=0;const newKeys=new Map();
       for(const {t,d} of list){
-        if(d.video&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
+        if(d.video&&!d.nativeMedia&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
         if(!d.data&&typeof device.queue.copyExternalImageToTexture!=='function')
           fail('DEVICE','External source uploads require GPUQueue.copyExternalImageToTexture');
         if(!records.has(t))addedCount++;

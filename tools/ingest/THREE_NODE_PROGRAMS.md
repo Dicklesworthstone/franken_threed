@@ -955,6 +955,43 @@ shared owner's format and upload boundaries. The 16 focused cases in
 uploads and draw bindings; they do not execute compressed-texture shaders or
 establish browser pixel parity.
 
+## Native media texture inputs
+
+Source `VideoTexture` and `VideoFrameTexture` inputs now use the existing shared
+native sampled-texture owner. Ordinary material map slots select this path
+automatically; authored TSL texture nodes use the same bindings. The pinned
+WebGPU builder emits ordinary `texture_2d<f32>` sampling for both classes, and
+uploads use `copyExternalImageToTexture`. Public source classes, image identity,
+texture versions and upload callbacks remain intact.
+
+Each accepted upload version captures an immutable frame at the render call.
+Caller-owned `VideoFrame` inputs are cloned; HTML video uses `VideoFrame`
+capture when available and call-time `createImageBitmap(video)` otherwise.
+Bitmap readiness joins the existing render FIFO. Later video playback, public
+frame closure and sampler changes cannot replace an accepted frame. A
+temporarily starved stream keeps its previously captured pixels, including
+while an earlier bitmap capture is still preparing. Private captures are
+charged to the existing snapshot budget and closed on release, rollback or
+disposal; caller frames and playback state remain application-owned.
+
+Native media retains the pinned WebGPU upload-version behavior. It does not
+call the legacy `VideoTexture.update()` fallback, add frame notifications or
+control playback. Version-zero textures receive the source's unuploaded 1x1
+default allocation. Compilation inspects layouts without capturing frames or
+uploading media. The profile retains single-level RGBA8 sampling and the
+existing source format, sampler and origin checks.
+
+Cloned media textures can share a source while keeping independent accepted
+frames and upload callbacks. Updating one alias cannot advance another alias
+whose texture version is unchanged. Shared node refreshes consult only the
+same texture's accepted uploads.
+
+Eighteen `three_renderer_native_media.test.mjs` cases exercise source WGSL, ordinary map and
+alpha-map routing, queued versions, frame closure, private capture disposal,
+alias isolation, bitmap readiness, default storage, origin failures and upload metadata. The
+recording host/GPU checks do not establish browser decoder or color-pixel
+parity.
+
 ## Native 3D texture inputs
 
 Ordinary source `Data3DTexture` inputs now enter native graphics through
@@ -999,7 +1036,7 @@ graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models,
 custom shadow replacement nodes and custom
 `lightsNode` graphs remain missing.
-Video textures, and compressed, depth/comparison, array, volume, storage,
+Media, compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require
 additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates

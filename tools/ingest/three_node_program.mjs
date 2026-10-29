@@ -88,6 +88,14 @@ export function hasThreeNodeProgram(material) {
   return material?.isMaterial === true && Object.keys(material).some(key => key.endsWith('Node') && material[key] != null);
 }
 
+/** Built-in media maps need the same immutable queued frames as authored nodes. */
+export function hasThreeNativeMedia(material) {
+  if (material?.isMaterial !== true) return false;
+  for (const slot of MATERIAL_MAPS)
+    if (material[slot]?.isVideoTexture === true || material[slot]?.isVideoFrameTexture === true) return true;
+  return false;
+}
+
 export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, maxNodes = 8192,
   maxShaderBytes = 16 * 1024 * 1024, maxUniformBytes = 256 * 1024, maxAttributeBytes = 64 * 1024 * 1024, maxBindGroups = 4} = {}) {
   if (three?.REVISION !== '186' || typeof three.WGSLNodeBuilder !== 'function' ||
@@ -602,6 +610,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
     const framebuffer = texture?.isFramebufferTexture === true;
+    const media = texture?.isVideoTexture === true;
     const target = texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true && texture.renderTarget != null;
     const targetLayout = target && texture instanceof three.Texture
       ? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false}) : null;
@@ -621,7 +630,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         array && !storage && !target && !(compressedArray
           ? typeof three.CompressedArrayTexture === 'function' && texture instanceof three.CompressedArrayTexture
           : texture instanceof three.DataArrayTexture) ||
-        texture.isVideoTexture || texture.isVideoFrameTexture ||
+        texture.isVideoFrameTexture && !media ||
         texture.isExternalTexture)
       fail('TEXTURE', 'Native graphics nodes sample ordinary or compressed 2D/array/cube textures, data volumes, 2D/array/3D storage and target-owned color/depth textures');
     // Compute owns these images. Admission must use the same residency owner,
@@ -694,7 +703,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = targetLayout ?? compressedLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
+    if ((media || storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
@@ -735,6 +744,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isRenderTargetTexture === true, texture.isFramebufferTexture === true, texture.normalized === true, texture.isCubeTexture === true,
         texture.isDataArrayTexture === true, texture.isStorageTexture === true, texture.isArrayTexture === true,
         texture.isCompressedTexture === true, texture.isCompressedArrayTexture === true, texture.isCompressedCubeTexture === true,
+        texture.isVideoTexture === true, texture.isVideoFrameTexture === true,
         texture.is3DTexture === true, texture.isData3DTexture === true, node.isTexture3DNode === true,
         texture.is3DTexture === true || texture.isData3DTexture === true ? [texture.wrapS, texture.wrapT, texture.wrapR] : null,
         texture.isCubeTexture === true ? texture.mapping : null,

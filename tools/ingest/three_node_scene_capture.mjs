@@ -3,7 +3,7 @@
  * Pipeline preparation consumes these packets later and never repeats updates.
  * Geometry bytes still follow the bridge's existing upload/version contract.
  */
-import {hasThreeNodeProgram, ThreeNodeProgramError} from './three_node_program.mjs';
+import {hasThreeNodeProgram, hasThreeNativeMedia, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
 import {inspectThreeLightingContext, inspectThreeNativeCamera} from './three_node_passes.mjs';
@@ -19,7 +19,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Additional source material features use the retained native shader builder.
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
-const nativeFeatures = material => hasThreeNodeProgram(material) || material?.isMaterial === true && (
+const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNativeMedia(material) || material?.isMaterial === true && (
   material.alphaHash === true ||
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
   material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true ||
