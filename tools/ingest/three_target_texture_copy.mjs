@@ -127,8 +127,8 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
 }
 
 /** Source-shaped cube/array/volume color copies through existing target owners.
- * Level-zero writes keep the face-aware transfer path; authored non-cube mips
- * borrow native destinations. One accepted range always occupies one FIFO slot.
+ * Non-cube destinations borrow one native image and copy the complete XYZ range.
+ * Cube level-zero writes retain the face-aware path. One range has one FIFO slot.
  */
 export function captureTargetColorCopy(renderer, texture, destinationTexture,
   region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
@@ -173,18 +173,18 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       // Admit the combined allocation, not two individually affordable owners.
       // No layer may be written before all destination extents/budgets pass.
       targets.validateNativeTextures([source.source, destination.source]);
-      if (destinationLevel !== 0) {
-        // The level-zero transfer owner intentionally regenerates derived mips.
-        // Borrow the existing authored chain instead, copying the entire XYZ
-        // range in one command. Destination ownership still tracks validation,
-        // dirty sampling replicas and cancellation; no alternate owner is added.
+      if (!destination.entry.shape.cube) {
+        // One native copy covers every contiguous layer/slice. The destination
+        // borrow marks the same level-zero mip chain and sampling replica dirty
+        // as copyColor, without one submission/source borrow per array layer.
+        // Authored higher mips share that ownership but never auto-regenerate.
         let resolve, reject;
         const validation = new Promise((yes, no) => { resolve = yes; reject = no; });
         validation.catch(() => {});
         try {
           targets.withNativeTexture(source.source, nativeSource =>
             targets.withNativeColorDestination(destination.source, nativeDestination => {
-              const encoder = device.createCommandEncoder({label: 'f3d-target-authored-mip-copy'});
+              const encoder = device.createCommandEncoder({label: 'f3d-target-color-range-copy'});
               encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
                 {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
               const commands = encoder.finish();

@@ -40,9 +40,11 @@ The source-shaped call remains void. Source/destination identities, mip levels,
 regions and positions are captured at the call. GPU-produced source contents
 are observed at the copy's FIFO submission point, after preceding producers.
 Each accepted range occupies one FIFO slot, including nested compute turns.
-Mip-zero target copies reuse the face-aware transfer operation once per slice.
-Authored nonzero target copies encode the entire XYZ range in one native copy
-command. Later queued work cannot interleave within either accepted range.
+Every non-cube destination copies its complete XYZ range in one native copy
+command and one submission, at mip zero or an authored higher mip. This avoids
+one source borrow, encoder and submission per array layer or volume slice.
+Cube mip-zero destinations retain the existing per-face transfer path. Later
+queued work cannot interleave within either accepted range.
 
 Both target generations remain retained while queued. Rejected admission,
 earlier queue failure, target disposal and renderer cancellation release them,
@@ -72,9 +74,13 @@ Run the focused recording-contract tests:
 node --test tools/ingest/three_target_texture_copy.test.mjs \
   tools/ingest/three_target_color_copy.test.mjs \
   tools/ingest/three_storage_target_mips.test.mjs \
-  tools/ingest/three_target_authored_mips.test.mjs
+  tools/ingest/three_target_authored_mips.test.mjs \
+  tools/ingest/three_target_copy_batch.test.mjs
 ```
 
-These 89 tests execute production capture, planning and scheduling with recording
-owner/device contracts. They are not full-renderer integration, browser GPU pixel
-parity or hardware benchmark evidence. No speedup is claimed.
+These 104 tests execute production capture, planning and scheduling with recording
+owner/device contracts. The batching suite also interprets recorded commands
+against an independent byte oracle, checking unmodified texels, layers, mips and
+MRT attachments. It records one submission for a 32-layer range; this is command-
+count evidence, not measured GPU throughput. These tests are not full-renderer
+integration, browser GPU pixel parity or hardware benchmarks. No speedup is claimed.

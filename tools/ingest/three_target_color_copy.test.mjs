@@ -7,6 +7,17 @@ import {targetCopyFixture, box, point, failure} from './three_target_copy_fixtur
 const copy = (f, source, destination, ...args) => submitTextureCopy(f.renderer,
   captureTargetColorCopy(f.renderer, source.texture, destination.texture, ...args), f.rejected);
 
+// Compare logical slices across one native range command and the cube owner's
+// per-face path. Submission-count assertions belong to the batching suite.
+const slices = commands => commands.flatMap(command => {
+  if (!Array.isArray(command.size)) return [command];
+  const [width, height, count] = command.size;
+  return Array.from({length: count}, (_, layer) => ({...command,
+    from: {...command.from, origin: {x: command.from.origin[0], y: command.from.origin[1], z: command.from.origin[2] + layer}},
+    to: {...command.to, origin: {x: command.to.origin[0], y: command.to.origin[1], z: command.to.origin[2] + layer}},
+    size: {width, height, depthOrArrayLayers: 1}}));
+});
+
 test('whole cube-to-cube copies address six corresponding faces through existing target transfers', () => {
   const f = targetCopyFixture(), source = f.target({dimension: 'cube', pointer: false}), destination = f.target({dimension: 'cube', pointer: false});
   assert.equal(copy(f, source, destination), undefined);
@@ -28,8 +39,8 @@ test('cube, array and volume endpoints copy contiguous multi-slice regions in ev
   for (const from of ['cube', '2d-array', '3d']) for (const to of ['cube', '2d-array', '3d']) {
     const f = targetCopyFixture(), source = f.target({dimension: from, depth: 6}), destination = f.target({dimension: to, depth: 6});
     copy(f, source, destination, box(1, 1, 2, 2, 3, 3), point(0, 0, 1));
-    assert.deepEqual(f.commands.map(c => [c.from.origin.z, c.to.origin.z]), [[2,1],[3,2],[4,3]]);
-    assert.ok(f.commands.every(c => c.size.width === 2 && c.size.height === 3)); assert.equal(f.references, 0);
+    assert.deepEqual(slices(f.commands).map(c => [c.from.origin.z, c.to.origin.z]), [[2,1],[3,2],[4,3]]);
+    assert.ok(slices(f.commands).every(c => c.size.width === 2 && c.size.height === 3)); assert.equal(f.references, 0);
   }
 });
 
@@ -37,11 +48,11 @@ test('source cube mips retain six faces while volume mip depth shrinks', () => {
   const f = targetCopyFixture(), cube = f.target({dimension: 'cube'}), volume = f.target({dimension: '3d', depth: 6});
   const destination = f.target({dimension: '2d-array', depth: 6});
   copy(f, cube, destination, null, null, 1);
-  assert.equal(f.commands.length, 6); assert.ok(f.commands.every(c => c.size.width === 2 && c.from.mipLevel === 1));
+  assert.equal(slices(f.commands).length, 6); assert.ok(slices(f.commands).every(c => c.size.width === 2 && c.from.mipLevel === 1));
   f.commands.length = 0;
   copy(f, volume, destination, null, null, 1);
-  assert.equal(f.commands.length, 3);
-  assert.deepEqual(f.commands.map(c => c.from.origin.z), [0, 1, 2]);
+  assert.equal(slices(f.commands).length, 3);
+  assert.deepEqual(slices(f.commands).map(c => c.from.origin.z), [0, 1, 2]);
 });
 
 test('queued regions and MRT identities are captured while GPU content stays submission-time', () => {
@@ -51,10 +62,11 @@ test('queued regions and MRT identities are captured while GPU content stays sub
   const region = box(0, 0, 1, 2, 2, 2), position = point(1, 1, 2);
   copy(f, source, destination, region, position);
   region.min.z = 99; position.z = 99; source.entry.stamp = 'earlier-render-completed';
+  let observed; f.device.onSubmit = () => { observed = source.entry.stamp; };
   assert.equal(f.references, 2); assert.equal(f.renderer._pending.length, 1); f.flush();
-  assert.deepEqual(f.commands.map(c => [c.from.origin.z, c.to.origin.z]), [[1,2],[2,3]]);
+  assert.deepEqual(slices(f.commands).map(c => [c.from.origin.z, c.to.origin.z]), [[1,2],[2,3]]);
   assert.ok(f.commands.every(c => c.from.texture.colorIndex === 2 && c.to.texture.colorIndex === 1));
-  assert.ok(f.commands.every(c => c.sourceStamp === 'earlier-render-completed')); assert.equal(f.references, 0);
+  assert.equal(observed, 'earlier-render-completed'); assert.equal(f.references, 0);
 });
 
 test('copy-compatible sRGB target pairs preserve format bits without conversion', () => {
@@ -71,7 +83,7 @@ test('float32 and packed target formats remain raw transfers without filtering a
   for (const format of ['r8unorm', 'r16float', 'rg16float', 'rgba16float', 'r32float', 'rg32float', 'rgba32float', 'rg11b10ufloat']) {
     const f = targetCopyFixture();
     copy(f, f.target({dimension: 'cube', format}), f.target({dimension: '2d-array', depth: 6, format}));
-    assert.equal(f.commands.length, 6); assert.equal(f.references, 0);
+    assert.equal(slices(f.commands).length, 6); assert.equal(f.references, 0);
   }
 });
 
@@ -90,7 +102,7 @@ test('a bad final layer rejects the whole range before any prefix write', () => 
   }
 });
 
-test('nonzero destination mips remain rejected rather than being silently written at level zero', () => {
+test('nonzero destination mips without an authored chain remain rejected', () => {
   const f = targetCopyFixture();
   assert.throws(() => copy(f, f.target(), f.target(), null, null, 1, 1), {code: 'THREE_STORAGE_COPY_LEVEL'});
   assert.equal(f.commands.length, 0); assert.equal(f.references, 0);
