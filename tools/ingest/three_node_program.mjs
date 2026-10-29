@@ -1356,7 +1356,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // The source observer does not count scene.fogNode as an authored
       // material slot. Ordinary materials therefore keep their object-group
       // fog uniforms and resource bindings on SHARED refresh, even though the
-      // fog callbacks still run. Apply that policy only to this scene entrance.
+      // fog callbacks still run. The same observer controls ordinary indirect
+      // geometry: changing only its argument attribute does not force uploads.
       if (context.fogRenderContext === undefined || state.builder.observer.hasNode) return null;
       const records = state.fogRecords ??= new Map(), key = context.fogRenderContext;
       let record = records.get(key);
@@ -1407,6 +1408,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function releaseBundleGeometry(record) {
     record.ownedBundleGeometry?.release?.();
+    if (record.ownedIndirect) record.ownedIndirect.owner.release(record.ownedIndirect.lease);
+    record.ownedIndirect = null;
     record.ownedBundleGeometry = null;
     record.leaseSet?.delete(record); bundleGeometryRecords.delete(record);
   }
@@ -1415,6 +1418,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       for (const binding of record.resources.textures) record.resources.textureOwner.release(binding.lease);
       for (const binding of record.resources.storage) record.resources.storageOwner.release(binding.lease);
       for (const lease of record.resources.vertexStorage ?? []) record.resources.storageOwner.release(lease);
+      if (record.resources.indirect) record.resources.storageOwner.release(record.resources.indirect.lease);
     }
     record.resources = null; fogResourceRecords.delete(record);
   }
@@ -1435,6 +1439,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         resources.storageOwner.retain(lease);
         retained.push(() => resources.storageOwner.release(lease));
       }
+      if (resources.indirect) {
+        resources.storageOwner.retain(resources.indirect.lease);
+        retained.push(() => resources.storageOwner.release(resources.indirect.lease));
+      }
     } catch (error) {
       for (const release of retained.reverse()) release();
       throw error;
@@ -1443,15 +1451,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     record.resources = resources; fogResourceRecords.add(record);
   }
   function storeBundlePacket(state, record, packet) {
-    const previous = record.ownedBundleGeometry;
+    const previous = record.ownedBundleGeometry, previousIndirect = record.ownedIndirect;
+    // Source observer packets can survive a bundle re-recording. Keep their
+    // geometry-time argument lease independently of each submitted draw lease.
+    if (packet.indirect) packet.indirect.owner.retain(packet.indirect.lease);
     record.packet = packet; record.ownedBundleGeometry = packet.bundleGeometry ?? null;
-    if (typeof record.ownedBundleGeometry?.release === 'function') {
+    record.ownedIndirect = packet.indirect;
+    if (typeof record.ownedBundleGeometry?.release === 'function' || record.ownedIndirect) {
       record.leaseSet = state.bundleLeases ??= new Set();
       record.leaseSet.add(record); bundleGeometryRecords.add(record);
     } else {
       record.leaseSet?.delete(record); bundleGeometryRecords.delete(record);
     }
     if (previous !== record.ownedBundleGeometry) previous?.release?.();
+    if (previousIndirect) previousIndirect.owner.release(previousIndirect.lease);
   }
   function withFrame(state, context, run) {
     const previous = Object.fromEntries(FRAME_FIELDS.map(key => [key, frame[key]]));
@@ -1732,6 +1745,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // geometry/lease snapshot; compilation and shared refresh never invoke it.
       bundleGeometry = context.captureGeometry?.(attributes?.geometry ??
         (state.generated ? generatedAttributes.geometry(descriptor) : state.geometry), attributes);
+      const indirect = context.captureIndirect?.() ?? null;
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);
         checkPMREM(state);
@@ -1763,7 +1777,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      const packet = {uniforms, textures, storage, attributes,
+      const packet = {uniforms, textures, storage, attributes, indirect,
         ...(record ? {refreshType: kind} : {}),
         ...(context.captureGeometry ? {bundleGeometry} : {}),
         ...(descriptor.wireframe ? {wireframeIndexCount: attributes.indexCount, programGeometry: attributes.geometry} : {})};

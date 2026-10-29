@@ -2697,7 +2697,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         const input = owned.has(draws[i]) ? { mesh: draws[i] } : draws[i];
         const programRecord = owned.get(input?.mesh);
         if (programRecord?.nodeProgram) {
-          keys(input, ["mesh", "first", "count", "instanceCount", "firstInstance", "nodeUniforms", "nodeResources", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
+          keys(input, ["mesh", "first", "count", "instanceCount", "firstInstance", "nodeUniforms", "nodeResources", "nodeIndirect", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
           if (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== "boolean")
             fail("ANIMATION_RENDER_OPTIONS", "nodeRangeCaptured must be boolean");

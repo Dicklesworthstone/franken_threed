@@ -64,7 +64,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const shadowPass = getThreeNativeShadowPass(renderer, overrideMaterial);
   // Match source RenderContexts identity for the ordinary-material fog
   // observer. Target objects with the same attachment state share a context.
-  const fogRenderContext = sceneFogNode && !shadowPass && bundles ? `${destination === null ? 'default' :
+  const sourceRenderContext = !shadowPass && bundles ? `${destination === null ? 'default' :
     [destination.textures.length, destination.texture.format, destination.texture.type, destination.samples,
       destination.depthBuffer, destination.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-${bundleDepth}` : undefined;
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root], hookedObjects = new Set();
@@ -203,7 +203,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const spriteMesh = (object.isMesh === true || object.isSprite === true) && effective.some(material =>
       object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
       material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true);
-    if (!bundle && !instancedGeometry && !batch && !spriteMesh && !effective.some(nativeMaterial)) continue;
+    if (!bundle && !instancedGeometry && !batch && !spriteMesh && object.geometry?.indirect == null && !effective.some(nativeMaterial)) continue;
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
@@ -438,7 +438,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           if (typeof getTextures !== 'function') fail('SOURCE', 'Native sampled graphs require the renderer texture owner');
           textureOwner ??= textureInputs();
         }
-        if (programs.storage(binding.nodeProgram).length || programs.vertexStorage?.(binding.nodeProgram).length) {
+        if (programs.storage(binding.nodeProgram).length || programs.vertexStorage?.(binding.nodeProgram).length ||
+            binding.geometry.indirect != null && !binding.object.isBatchedMesh) {
           if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage graphs require the renderer storage owner');
           storageOwner ??= storageInputs();
         }
@@ -507,7 +508,24 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     storageUses.push(lease); vertexStorageUses.push(lease);
     return storageOwner.vertexAttribute(lease, view);
   };
-  const capturedDraws = [], sharedFogResources = [];
+  const capturedDraws = [], sharedFogResources = [], indirectUploads = new Map();
+  const preparedIndirectUses = [];
+  let indirectCalls = 0;
+  const captureIndirectUpload = (object, geometry) => {
+    const attribute = geometry.indirect;
+    if (attribute == null || object.isBatchedMesh) return null;
+    if (typeof getStorage !== 'function') fail('SOURCE', 'Indirect draws require the renderer storage owner');
+    storageOwner ??= storageInputs();
+    // Geometries updates one attribute once per source render, before ordinary
+    // node callbacks. Later CPU writes wait for the next admitted upload.
+    let record = indirectUploads.get(attribute);
+    if (!record) {
+      const lease = storageOwner.capture(attribute, {indirect: true}); storageUses.push(lease);
+      record = Object.freeze({attribute, lease, owner: storageOwner, byteLength: attribute.array.byteLength});
+      indirectUploads.set(attribute, record);
+    }
+    return record;
+  };
   let recordTexture = () => {};
   const captureDraw = draw => {
     // RenderObject receives the geometry's current range before this physical
@@ -529,7 +547,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }
       const updateContext = {...frameContext, scene: draw.bundleScene ?? root, object: draw.object, material: draw.material,
         captureVertexAttribute, clippingContext: draw.binding.clippingContext,
-        ...(fogRenderContext !== undefined && draw.material.fog === true ? {fogRenderContext,
+        captureIndirect: () => captureIndirectUpload(draw.object, draw.geometry),
+        ...(sourceRenderContext !== undefined && (sceneFogNode && draw.material.fog === true || draw.geometry.indirect != null)
+          ? {fogRenderContext: sourceRenderContext,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
@@ -605,17 +625,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.nodeTextures = resources.textures; draw.nodeStorage = resources.storage;
         draw.nodeVertexStorage = resources.vertexStorage;
         for (const binding of draw.nodeTextures) textureUses.push(resources.textureOwner.retain(binding.lease));
-        for (const binding of draw.nodeStorage) storageUses.push(resources.storageOwner.retain(binding.lease));
-        for (const lease of draw.nodeVertexStorage ?? []) {
-          storageUses.push(resources.storageOwner.retain(lease)); vertexStorageUses.push(lease);
-        }
       } else if (reuseResources) {
         textureOwner ??= draw.bundleTextureOwner; storageOwner ??= draw.bundleStorageOwner;
         for (const binding of draw.nodeTextures) textureUses.push(textureOwner.retain(binding.lease));
-        for (const binding of draw.nodeStorage) storageUses.push(storageOwner.retain(binding.lease));
-        for (const lease of draw.nodeVertexStorage ?? []) {
-          storageUses.push(storageOwner.retain(lease)); vertexStorageUses.push(lease);
-        }
       } else {
       draw.nodeVertexStorage = Object.freeze(vertexStorageUses.slice(vertexStart));
       draw.nodeTextures = Object.freeze(captured.textures.map(binding => {
@@ -631,9 +643,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }));
       }
       if (draw.nodeBundle) { draw.bundleTextureOwner = textureOwner; draw.bundleStorageOwner = storageOwner; }
-      if (updateContext.fogRenderContext !== undefined && !captured.fogResources)
-        programs.retainFogResources(draw.binding.nodeProgram, updateContext, Object.freeze({
-          textures: draw.nodeTextures, storage: draw.nodeStorage, vertexStorage: draw.nodeVertexStorage, textureOwner, storageOwner}));
       // r186 reads geometry.instanceCount before Mesh.count, after node/binding
       // updates and before after-updates. It does not infer a count from the
       // first instance attribute or clamp it to an attribute's capacity.
@@ -645,13 +654,67 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.instanceCount = draw.geometry.isInstancedBufferGeometry === true
           ? requestedInstances : requestedInstances === undefined ? 1 : Math.max(0, requestedInstances);
       }
-      if (!integer(draw.instanceCount) || draw.instanceCount > 0xffffffff)
+      const hasIndirect = draw.bundleWarm ? draw.nodeIndirect != null : draw.geometry.indirect != null && !draw.object.isBatchedMesh;
+      if ((!integer(draw.instanceCount) || draw.instanceCount > 0xffffffff) && !(hasIndirect && draw.instanceCount === Infinity))
         fail('OBJECT', 'Native node instance counts must fit a nonnegative 32-bit integer');
-      if (draw.binding.nodeProgram.instanceCapacity !== undefined &&
+      if (!hasIndirect && draw.binding.nodeProgram.instanceCapacity !== undefined &&
           draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
         fail('OBJECT', 'Native node instance count exceeds its captured matrix or color capacity');
       const batchDraws = draw.bundleWarm ? null : captureThreeNativeBatch(draw.object, maxDraws - capturedDraws.length, fail, draw.instanceCount,
         {wireframe: draw.binding.nodeProgram.wireframe === true, indexCount: captured.wireframeIndexCount});
+      // Indirect arguments are read by the GPU at execution, while their
+      // source identity and byte offsets are selected before after-updates.
+      // BatchedMesh owns its own direct subdraws and takes source precedence.
+      const previousIndirect = draw.nodeIndirect;
+      if (previousIndirect && draw.bundleWarm && (reuseResources || captured.indirect?.attribute !== previousIndirect.attribute)) {
+        storageOwner ??= draw.bundleStorageOwner;
+        const lease = storageOwner.refreshIndirect(previousIndirect.lease); storageUses.push(lease);
+        draw.nodeIndirect = Object.freeze({...previousIndirect, lease});
+      } else {
+        const record = captured.fogResources?.indirect ?? captured.indirect;
+        const attribute = draw.bundleWarm ? previousIndirect?.attribute : draw.geometry.indirect;
+        draw.nodeIndirect = null;
+        if (attribute != null && !draw.object.isBatchedMesh) {
+          if (record?.attribute !== attribute)
+            fail('INDIRECT', 'A node update replaced the indirect attribute after its geometry upload boundary');
+          const lease = indirectUploads.get(attribute) === record ? record.lease : storageOwner.refreshIndirect(record.lease);
+          if (lease !== record.lease) storageUses.push(lease);
+          const selected = draw.bundleWarm ? previousIndirect.offsets : draw.geometry.indirectOffset;
+          const offsets = Array.isArray(selected) ? selected.slice() : [selected];
+          const geometry = capturedGeometry ?? draw.binding.programGeometry;
+          const index = geometry.index, words = index ? 5 : 4, byteLength = record.byteLength;
+          if (offsets.length > maxDraws || offsets.some(offset => !integer(offset) || offset % 4 ||
+              !Number.isSafeInteger(offset + words * 4) || offset + words * 4 > byteLength))
+            fail('INDIRECT', 'Indirect draw offsets require aligned, in-bounds 16-byte or indexed 20-byte records');
+          const factor = draw.binding.nodeProgram.wireframe ? 2 : 1;
+          const range = draw.sourceRange, group = draw.sourceGroup;
+          const extent = index?.count ?? geometry.attributes.position?.count;
+          const start = Math.max(range.start, group?.start ?? 0) * factor;
+          const end = Math.min(extent, (range.start + range.count) * factor,
+            group ? (group.start + group.count) * factor : Infinity);
+          draw.nodeIndirect = Object.freeze({...record, lease, offsets: Object.freeze(offsets),
+            skip: draw.bundleWarm ? previousIndirect.skip : end < start});
+        }
+      }
+      if (draw.nodeIndirect && (indirectCalls += draw.nodeIndirect.offsets.length) > maxDraws)
+        fail('LIMIT', 'Native indirect calls exceed the draw budget');
+      if (captured.fogResources || reuseResources) {
+        const retainStorage = lease => {
+          const alias = draw.nodeIndirect ? storageOwner.captureIndirectAlias(lease, draw.nodeIndirect.lease) : null;
+          const retained = alias ?? storageOwner.retain(lease);
+          storageUses.push(retained); return retained;
+        };
+        draw.nodeStorage = Object.freeze(draw.nodeStorage.map(binding =>
+          Object.freeze({...binding, lease: retainStorage(binding.lease)})));
+        draw.nodeVertexStorage = Object.freeze((draw.nodeVertexStorage ?? []).map(lease => {
+          const retained = retainStorage(lease); vertexStorageUses.push(retained); return retained;
+        }));
+      }
+      if (draw.nodeBundle) draw.bundleStorageOwner = storageOwner;
+      if (updateContext.fogRenderContext !== undefined && !captured.fogResources)
+        programs.retainFogResources(draw.binding.nodeProgram, updateContext, Object.freeze({
+          textures: draw.nodeTextures, storage: draw.nodeStorage, vertexStorage: draw.nodeVertexStorage,
+          indirect: draw.nodeIndirect, textureOwner, storageOwner}));
       if (batchDraws === null && capturedDraws.length >= maxDraws)
         fail('LIMIT', 'Native source draw list exceeds its capacity');
       // WebGPUBackend.draw selects views after node/binding updates, before
@@ -900,6 +963,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
             const attributes = programs.captureAttributes?.(binding.nodeProgram,
               {...frameContext, object: binding.object, material: binding.material, captureVertexAttribute});
             if (attributes) { preparedAttributes.push(attributes); attributes.install(); }
+            const indirect = captureIndirectUpload(binding.object, binding.geometry);
+            if (indirect) preparedIndirectUses.push(indirect.lease);
             if (bundles) {
               const lease = bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
               bundleGeometries.push(lease);
@@ -914,6 +979,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // versions at the FIFO preparation boundary; unchanged versions preserve
       // compute-authored bytes. Submission retains the same storage leases.
       if (vertexStorageUses.length) storageOwner.withReads(vertexStorageUses, () => {});
+      if (preparedIndirectUses.length) storageOwner.withReads(preparedIndirectUses, () => {});
     },
     installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
     textureOwner, textureUses: Object.freeze(textureUses), storageOwner,

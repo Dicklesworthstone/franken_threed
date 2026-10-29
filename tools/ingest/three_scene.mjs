@@ -1693,7 +1693,7 @@ export async function createGpuThreeScene(device,scene,{
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
           copiesAtDraw(item.nodeFramebufferCopies);
           drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews});
-          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
+          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,nodeIndirect:item.nodeIndirect,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           copiesAtDraw(item.nodeFramebufferAfterCopies);
           continue;
@@ -1886,7 +1886,7 @@ export async function createGpuThreeScene(device,scene,{
           renderer.render({...loaded,draws:[]});passes+=renderer.colorPassCount??1;live();
         }
         logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+(item.nodeProgram?
-          item.instanceCount===0?0:item.nodeViews?.length??1:arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length),0);
+          item.instanceCount===0||item.nodeIndirect?.skip?0:item.nodeViews?.length??1:arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length),0);
         backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
       }else{
       if(backgroundFrame){
@@ -1923,7 +1923,7 @@ export async function createGpuThreeScene(device,scene,{
       }else{
         renderer.render(prepared);live();logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;passes=renderer.colorPassCount??1;
       }
-      sourceDraws=items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0),0);
+      sourceDraws=items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0&&!item.nodeIndirect?.skip),0);
       backgroundPasses=backgroundFrame?1:0;
       if(backgroundEnabled)backgroundColorPasses=passes+backgroundPasses;
       }

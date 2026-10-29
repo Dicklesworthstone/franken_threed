@@ -43,6 +43,63 @@ function pointSprites(T, renderer, orthographic) {
   return {scene: world, camera: view};
 }
 export const nativePrimitiveScenarios = {
+  native_indirect_compute(T, renderer) {
+    const N = T.TSL, world = new T.Scene(), vertices = N.uniform(3, 'uint'), objects = [], buffers = [], kernels = [];
+    world.background = new T.Color(0x182435);
+    for (let i = 0; i < 3; i++) {
+      const source = new T.PlaneGeometry(.65, .65);
+      let geometry = i === 1 ? source.toNonIndexed() : source;
+      if (i === 2) {
+        geometry = new T.InstancedBufferGeometry();
+        geometry.attributes = source.attributes; geometry.setIndex(source.index);
+      }
+      const words = geometry.index ? 5 : 4, data = new Uint32Array(words * 2);
+      data.set(words === 5 ? [0, 1, 0, 0, 0, 3, 1, 3, 0, 0] : [0, 1, 0, 0, 3, 1, 3, 0]);
+      const buffer = new T.IndirectStorageBufferAttribute(data, 1), storage = N.storage(buffer, 'uint', data.length);
+      const kernel = N.Fn(() => { storage.element(0).assign(vertices); storage.element(1).assign(i === 2 ? 2 : 1); })().compute(1);
+      const material = new T.MeshBasicNodeMaterial({color: [0xff6945, 0x58c7fa, 0xa7e74b][i]});
+      if (i === 2) material.positionNode = N.positionLocal.add(N.vec3(N.instanceIndex.toFloat().mul(.75).sub(.375), 0, 0));
+      const object = new T.Mesh(geometry, material); object.frustumCulled = false;
+      object.position.set(i === 0 ? -.85 : i === 1 ? .85 : 0, i === 2 ? -.65 : .55, 0);
+      geometry.setIndirect(buffer, 0); world.add(object);
+      objects.push(object); buffers.push(buffer); kernels.push(kernel);
+    }
+    const compile = renderer.compileAsync.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      await renderer.computeAsync(kernels); buffers.forEach(buffer => buffer.array.fill(73));
+      return compile(...args);
+    };
+    installChanges(renderer, frame => {
+      if (frame === 8) { vertices.value = 6; renderer.compute(kernels); }
+      if (frame === 10) {
+        objects[0].geometry.indirectOffset = [20, 0]; objects[1].geometry.indirectOffset = [16];
+        objects[2].geometry.setDrawRange(0, 0); // Only GPU arguments choose this draw's extent.
+      }
+      if (frame === 12) { objects[0].count = 0; objects[1].geometry.indirectOffset = []; }
+      if (frame === 13) {
+        objects[0].count = 1; objects[1].geometry.indirectOffset = 0;
+        vertices.value = 3; renderer.compute(kernels);
+      }
+      if (buffers.some(buffer => buffer.array.some(value => value !== 73)))
+        throw new Error('Indirect drawing changed compute-owned CPU arguments');
+    });
+    return {scene: world, camera: camera(T)};
+  },
+  native_indirect_host_upload(T, renderer) {
+    const world = new T.Scene(); world.background = new T.Color(0x182435);
+    const geometry = new T.PlaneGeometry(2, 2), data = new Uint32Array([3, 1, 0, 0, 0]);
+    const argumentsBuffer = new T.BufferAttribute(data, 1);
+    geometry.setIndirect(argumentsBuffer);
+    const material = new T.MeshBasicMaterial({color: 0x58c7fa}), object = new T.Mesh(geometry, material);
+    object.frustumCulled = false; world.add(object);
+    installChanges(renderer, frame => {
+      if (frame === 8) { data[0] = 6; argumentsBuffer.needsUpdate = true; }
+      if (frame === 10) material.color.setHex(0xa7e74b); // Source observer now chooses FULL refresh.
+      if (frame === 12) { data[0] = 0; argumentsBuffer.needsUpdate = true; material.color.setHex(0xff6945); }
+      if (frame === 13) { data[0] = 3; argumentsBuffer.needsUpdate = true; material.color.setHex(0x58c7fa); }
+    });
+    return {scene: world, camera: camera(T)};
+  },
   native_tsl_lines(T, renderer) {
     const N = T.TSL, world = scene(T), shift = N.uniform(.1), dash = N.uniform(.23), objects = [];
     for (let i = 0; i < 4; i++) {

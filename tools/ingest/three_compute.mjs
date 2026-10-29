@@ -91,7 +91,7 @@ function createThreeCompute(renderer, three) {
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
     const data = deferred ? new array.constructor(array) : array;
     const admission = !uniform && deferred ? gpu.captureUpload(key, data, version) : null;
-    const record = {key, source: array, version, uniform, data, charged, ranges, admission, refs: 0};
+    const record = {key, source: array, byteLength: array.byteLength, version, uniform, data, charged, ranges, admission, refs: 0};
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
     return record;
@@ -122,8 +122,18 @@ function createThreeCompute(renderer, three) {
     }
     return buffer;
   }
-  function attributeRecord(attribute, deferred) {
-    const array = normalize(attribute), version = attribute.version ?? 0;
+  function attributeRecord(attribute, deferred, indirect = false) {
+    // Ordinary indirect BufferAttributes retain their raw words. Storage-backed
+    // inputs retain the source backend's shared normalization (including vec3
+    // padding), so compute and drawing observe the same allocation/layout.
+    if (indirect && (!(attribute instanceof three.BufferAttribute) || attribute.isInterleavedBufferAttribute ||
+        attribute.normalized || ![Uint32Array, Int32Array].includes(attribute.array?.constructor) ||
+        !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 ||
+        !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
+        attribute.array.length !== attribute.itemSize * attribute.count))
+      fail('INDIRECT', 'Indirect drawing requires a complete unnormalized source 32-bit integer buffer attribute');
+    const plainIndirect = indirect && !attribute.isStorageBufferAttribute && !attribute.isStorageInstancedBufferAttribute;
+    const array = plainIndirect ? attribute.array : normalize(attribute), version = attribute.version ?? 0;
     const ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
     if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
       !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
@@ -166,13 +176,41 @@ function createThreeCompute(renderer, three) {
       capturingReads = true;
       try { return run(); } finally { capturingReads = false; }
     },
-    capture(attribute, {writable = false} = {}) {
+    capture(attribute, {writable = false, indirect = false} = {}) {
       live();
       if (issuing) fail('REENTRY', 'Cannot capture native storage from an upload callback');
-      if (typeof writable !== 'boolean') fail('STORAGE', 'Native storage access must be a captured boolean');
-      const record = attributeRecord(attribute, true), lease = Object.freeze({});
-      record.refs++; readLeases.set(lease, {record, writable, released: false});
+      if (typeof writable !== 'boolean' || typeof indirect !== 'boolean' || writable && indirect)
+        fail('STORAGE', 'Native storage access must be a captured boolean and indirect use must be read-only');
+      const record = attributeRecord(attribute, true, indirect), lease = Object.freeze({});
+      record.refs++; readLeases.set(lease, {record, writable, indirect, released: false});
       return lease;
+    },
+    refreshIndirect(lease) {
+      const previous = readRecord(lease);
+      if (!readLeases.get(lease).indirect) fail('INDIRECT', 'Expected a captured indirect argument use');
+      // Reused source bindings still read the current GPU allocation. Select
+      // only an upload already admitted before this render: never scan current
+      // CPU data, and never resolve a later queued compute version at submit.
+      const pending = captured.get(previous.key), resident = uploaded.get(previous.key);
+      const record = pending && (pending.data || pending === resident) ? pending : resident ?? previous;
+      if (record.byteLength !== previous.byteLength)
+        fail('INDIRECT', 'A reused indirect command cannot replace its captured buffer allocation size');
+      const next = Object.freeze({});
+      record.refs++; readLeases.set(next, {record, writable: false, indirect: true, released: false});
+      return next;
+    },
+    captureIndirectAlias(lease, indirectLease) {
+      const previous = readRecord(lease), record = readRecord(indirectLease);
+      if (!readLeases.get(indirectLease).indirect) fail('INDIRECT', 'Expected a captured indirect argument use');
+      if (previous.key !== record.key) return null;
+      if (record.byteLength !== previous.byteLength)
+        fail('INDIRECT', 'A reused indirect storage alias cannot replace its captured buffer allocation size');
+      // Retained shader/vertex bindings alias the same source GPU allocation.
+      // Follow this draw's admitted indirect history, never a later CPU edit
+      // or queued dispatch. Preserve access so writable aliases still fail.
+      const value = readLeases.get(lease), next = Object.freeze({});
+      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect, released: false});
+      return next;
     },
     validate: validateReads,
     vertexAttribute(lease, view) {

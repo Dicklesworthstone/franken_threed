@@ -1185,6 +1185,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;
         const resources = () => {
           if (nodeFrame) nodeFrame = {...nodeFrame, draws: nodeFrame.draws.map(draw => ({...draw,
+            nodeIndirect: draw.nodeIndirect ? {...storage.resolve(draw.nodeIndirect.lease),
+              offsets: draw.nodeIndirect.offsets, skip: draw.nodeIndirect.skip} : null,
             nodeResources: [
               ...draw.nodeTextures.map(({group, binding, lease}) => ({group, binding, resource: textures.resolve(lease)})),
               ...draw.nodeStorage.map(({group, binding, lease}) => ({group, binding, resource: storage.resolve(lease)})),

@@ -30,7 +30,8 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
       if (key === 'release') return release;
       const value = owner[key];
       if (typeof value !== 'function') return value;
-      if (!methods.has(key)) methods.set(key, key === 'captureBinding' || key === 'capture' || key === 'captureShared'
+      if (!methods.has(key)) methods.set(key, key === 'captureBinding' || key === 'capture' || key === 'captureShared' ||
+          key === 'refreshIndirect' || key === 'captureIndirectAlias'
         ? (...args) => { const token = value.apply(owner, args); return token === null ? null : retain(token); } : value.bind(owner));
       return methods.get(key);
     }});
@@ -40,6 +41,7 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
     for (const binding of draw.nodeTextures) draw.bundleTextureOwner.release(binding.lease);
     for (const binding of draw.nodeStorage) draw.bundleStorageOwner.release(binding.lease);
     for (const lease of draw.nodeVertexStorage ?? []) draw.bundleStorageOwner.release(lease);
+    if (draw.nodeIndirect) draw.bundleStorageOwner.release(draw.nodeIndirect.lease);
     draw.bundleGeometry?.release();
   }
   return Object.freeze({resources,
@@ -90,6 +92,10 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
           for (const vertexLease of draw.nodeVertexStorage ?? []) {
             draw.bundleStorageOwner.retain(vertexLease);
             undo.push(() => draw.bundleStorageOwner.release(vertexLease));
+          }
+          if (draw.nodeIndirect) {
+            draw.bundleStorageOwner.retain(draw.nodeIndirect.lease);
+            undo.push(() => draw.bundleStorageOwner.release(draw.nodeIndirect.lease));
           }
           retained.push(Object.freeze({...draw, bundleGeometry: lease}));
         }

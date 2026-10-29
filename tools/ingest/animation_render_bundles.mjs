@@ -38,7 +38,8 @@ export function encodeAnimationDraws(encoder, commands, length, {
     if (command.nodeProgram) {
       // Source node updates still run for an empty draw, but the backend emits
       // no GPU call. Preserve that distinction in direct and bundled encoding.
-      if (count === 0 || command.instanceCount === 0) { i++; continue; }
+      const indirect = command.nodeIndirect;
+      if ((!indirect && count === 0) || command.instanceCount === 0 || indirect?.skip) { i++; continue; }
       // Native node WGSL owns all groups in their source builder order. Its
       // dynamic offsets select this logical draw, independent of arena index i.
       encoder.setPipeline(pipeline);
@@ -49,9 +50,12 @@ export function encodeAnimationDraws(encoder, commands, length, {
       for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
       if (command.indexBuffer) {
         encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-        encoder.drawIndexed(count, command.instanceCount, first, 0, command.firstInstance ?? 0);
+        if (indirect) for (const offset of indirect.offsets) encoder.drawIndexedIndirect(indirect.buffer, offset);
+        else encoder.drawIndexed(count, command.instanceCount, first, 0, command.firstInstance ?? 0);
+      } else if (indirect) {
+        for (const offset of indirect.offsets) encoder.drawIndirect(indirect.buffer, offset);
       } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
-      calls++; i++;
+      calls += indirect ? indirect.offsets.length : 1; i++;
       continue;
     }
     if (command.program) {
@@ -108,6 +112,9 @@ function snapshot(command, lightGroup) {
     blend: blended(command.record),
     // Plans are immutable, owned snapshots; never retain a live index reader.
     pointRuns: command.program?.pointRuns ?? null,
+    indirectBuffer: command.nodeIndirect?.buffer ?? null,
+    indirectOffsets: command.nodeIndirect?.offsets ?? null,
+    indirectSkip: command.nodeIndirect?.skip ?? false,
     nodeGroups: command.nodeProgram?.groups.map(binding => ({group: binding.group, offsets: [...nodeOffsets(binding)]})) ?? null,
     programGroup: command.program?.group ?? null, programOffset: command.program?.offset ?? null, firstInstance: command.firstInstance ?? 0};
 }
@@ -130,6 +137,9 @@ function matches(recorded, commands, length, lightGroup, start) {
         a.blend !== blended(r) || a.vertexBuffers.length !== b.vertexBuffers.length ||
         a.programGroup !== (b.program?.group ?? null) || a.programOffset !== (b.program?.offset ?? null) ||
         a.firstInstance !== (b.firstInstance ?? 0) ||
+        a.indirectBuffer !== (b.nodeIndirect?.buffer ?? null) ||
+        a.indirectSkip !== (b.nodeIndirect?.skip ?? false) ||
+        !samePointRuns(a.indirectOffsets, b.nodeIndirect?.offsets ?? null) ||
         !sameNodeGroups(a.nodeGroups, b.nodeProgram?.groups) ||
         !samePointRuns(a.pointRuns, b.program?.pointRuns ?? null))
       return false;

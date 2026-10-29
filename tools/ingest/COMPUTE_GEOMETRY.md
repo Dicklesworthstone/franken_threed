@@ -54,6 +54,61 @@ Compute-authored indices, integer vertex fetch and repeated instance divisors
 must not be inferred from Float32 vertex-buffer support. Shader storage reads
 through authored node-material slots use the separate profile below.
 
+## Native indirect geometry
+
+The native renderer executes `BufferGeometry.setIndirect(attribute, offset)`
+through `drawIndirect` or `drawIndexedIndirect`. `offset` is a byte offset or
+an array of byte offsets, as in pinned r186. Ordinary built-in materials select
+this native path automatically; an authored node slot is unnecessary.
+
+```js
+const args = new THREE.IndirectStorageBufferAttribute(
+  new Uint32Array([3, 1, 0, 0, 0]), 1); // indexed count, instances, first, base vertex, first instance
+geometry.setIndirect(args);
+const words = TSL.storage(args, 'uint', args.count);
+const update = TSL.Fn(() => {
+  words.element(0).assign(6);
+})().compute(1);
+renderer.compute(update);
+renderer.render(scene, camera);
+```
+
+The command borrows the compute owner's GPU allocation. It introduces no CPU
+readback or copy of GPU-produced arguments. Ordinary unnormalized Uint32/Int32
+`BufferAttribute` arguments use the same versioned upload owner. Storage-backed
+three-component attributes retain the source's padded layout; ordinary buffer
+attributes retain their packed words. Indexed commands need 20 in-bounds bytes;
+nonindexed commands need 16. Wireframe uses its generated index buffer and the
+indexed layout. Offsets and upload histories are captured independently for
+queued renders, including partial source uploads.
+
+Source geometry upload precedes ordinary node updates; offsets are selected
+after those updates. Ordinary materials retain the pinned observer behavior:
+an indirect-only `needsUpdate` does not itself force a full render-object
+refresh. A preceding compute upload remains visible even when the material or
+source bundle reuses its bindings. Bundle offsets and buffer identity remain
+recorded until bundle invalidation, while GPU contents stay live.
+
+Retained shader-storage bindings may alias the same argument allocation. Using
+that allocation as a generated vertex input as well still has an explicit
+preparation gap after a compute upload changes its host version; the retained
+vertex proof rejects the stale version. That combination remains unfinished.
+
+Source zero object-instance counts and negative effective draw ranges suppress
+the call. A zero-length draw range still allows indirect commands, whose GPU
+arguments supply their actual extent. Default infinite `InstancedBufferGeometry`
+instance counts are admitted for indirect drawing. `BatchedMesh` retains its
+source direct-subdraw precedence. Source object statistics remain separate from
+the number of physical GPU calls. Argument contents, including optional nonzero
+first-instance support, receive the device's normal WebGPU validation.
+
+`three_renderer_indirect.test.mjs` checks the production facade, captured bytes,
+resource sharing and bundle behavior with a recording device. The
+`native_indirect_compute` and `native_indirect_host_upload` cases in the existing
+native-primitives browser comparison exercise real compute and draw commands.
+This is general WebGPU execution with retained source preparation, not a Rust
+specialization or a measured performance claim.
+
 ## Native graphics storage bindings
 
 The native program GPU owner also accepts borrowed `read-only-storage` bindings

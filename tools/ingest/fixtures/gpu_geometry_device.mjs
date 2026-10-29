@@ -53,6 +53,7 @@ export function geometryDevice() {
         const contents=new Map();
         for (const buffer of draw.streams.values()) if (buffer.data) contents.set(buffer,snapshot(buffer));
         if (draw.index?.buffer.data) contents.set(draw.index.buffer,snapshot(draw.index.buffer));
+        if (draw.indirect?.buffer.data) contents.set(draw.indirect.buffer,snapshot(draw.indirect.buffer));
         for (const {group} of draw.groups.values()) for (const entry of group.entries ?? []) {
           const buffer=entry.resource?.buffer;
           if (buffer?.data) contents.set(buffer,snapshot(buffer));
@@ -80,6 +81,8 @@ export function geometryDevice() {
     }),setPipeline(x){pipeline=x;}, setBindGroup(slot,group,offsets=[]){groups.set(slot,{group,offsets:[...offsets]});},
       setVertexBuffer(slot,buffer){streams.set(slot,buffer);}, setIndexBuffer(buffer,format){index={buffer,format};},
       draw(...args){draw(false,args);}, drawIndexed(...args){draw(true,args);}, setViewport(){},setScissorRect(){},end(){},
+      drawIndirect(buffer, offset){draw(false,[]);target.draws.at(-1).indirect={buffer,offset};},
+      drawIndexedIndirect(buffer, offset){draw(true,[]);target.draws.at(-1).indirect={buffer,offset};},
       executeBundles(bundles){
         if(d.bundleExecuteError)throw d.bundleExecuteError;
         target.bundles.push(...bundles);
