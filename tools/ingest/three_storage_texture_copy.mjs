@@ -2,12 +2,15 @@
 import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
 import {captureTargetToStorageCopy, captureStorageToTargetCopy} from './three_target_texture_copy.mjs';
+import {submitTextureCopy} from './three_texture_copy_lifetime.mjs';
 import {copySampledTexture} from './three_sampled_texture_copy.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
 export {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 const ordinaryTargetTexture = texture => texture?.renderTarget != null && texture.isStorageTexture !== true &&
   (texture.isRenderTargetTexture === true || texture.isDepthTexture === true);
+const targetColor = texture => texture?.isRenderTargetTexture === true &&
+  texture.isStorageTexture !== true && texture.isDepthTexture !== true;
 
 /** Install below withThreeCompute's facade. Its waitForGPU already waits on the
  * shared storage owner; this layer additionally reports rejected FIFO entries.
@@ -40,17 +43,15 @@ export function withStorageTextureCopies(Base) {
         if (!failures.has(this)) failures.set(this, error);
         this._deferredError ??= error;
       };
-      let issue;
-      if (source?.isRenderTargetTexture && destination?.isStorageTexture) {
-        const request = captureTargetToStorageCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
-        issue = request.issue;
-      } else if (source?.isStorageTexture && ordinaryTargetTexture(destination)) {
-        const request = captureStorageToTargetCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
-        issue = request.issue;
+      let request;
+      if (targetColor(source) && destination?.isStorageTexture) {
+        request = captureTargetToStorageCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
+      } else if (source?.isStorageTexture && targetColor(destination)) {
+        request = captureStorageToTargetCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
       } else if (source?.isStorageTexture && destination?.isStorageTexture) {
         const owner = this._storageTextures;
-        const request = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
-        issue = () => { owner.copy(request); };
+        const copy = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
+        request = {issue: () => { owner.copy(copy); }};
       } else if (source?.isTexture && !source.isStorageTexture && !source.isRenderTargetTexture &&
           (destination?.isStorageTexture || destination?.isRenderTargetTexture)) {
         copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
@@ -61,9 +62,7 @@ export function withStorageTextureCopies(Base) {
           return super.copyTextureToTexture(source, destination, region, position, sourceLevel, destinationLevel);
         fail('SOURCE', 'Expected storage textures or copies between storage and target-owned color');
       }
-      if (this._computeTurn) this._computeTurn.submit(issue)?.catch?.(rejected);
-      else if (!this._drain && !this._preparing && !this._pending?.length) issue();
-      else this._enqueue({transfer: true, issue, resolve() {}, reject: rejected});
+      submitTextureCopy(this, request, rejected);
       this.inspector?.copyTextureToTexture?.(source, destination);
     }
     /** F3D extension: upload exact raw pixel bytes without a seeding kernel.
