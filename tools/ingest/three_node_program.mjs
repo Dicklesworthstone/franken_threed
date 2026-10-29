@@ -641,6 +641,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         node.biasNode != null || node.gradNode != null || node.gatherNode != null)
       fail('TEXTURE', 'Native integer graphics inputs require sampler-free texel loads without comparison, bias, gradients or gather');
   }
+  function storageTextureLayout(node, texture = node.value, mipLevel = 0) {
+    if (typeof three.StorageTextureNode !== 'function' || !(node instanceof three.StorageTextureNode) ||
+        node.storeNode !== null || texture?.isStorageTexture !== true ||
+        node.compareNode != null || node.isSampleCompare?.() === true || node.biasNode != null ||
+        node.gradNode != null || node.gatherNode != null)
+      fail('TEXTURE', 'Native graphics storage textures require source read-only texel loads without stores, comparison, bias, gradients or gather');
+    // r186 getNodeAccess always selects readOnly for non-atomic graphics
+    // storage. Keep its actual storage view, including the compiled mip, rather
+    // than replacing it with a sampled texture or inventing a sampler.
+    const layout = renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true,
+      store: true, access: 'readOnly', mipLevel});
+    if (layout?.storageTexture?.access !== 'read-only')
+      fail('TEXTURE', 'Native storage texel loads require the shared renderer storage texture owner');
+    return layout.storageTexture;
+  }
   function inspectTexture(texture) {
     const storage = texture?.isStorageTexture === true;
     const framebuffer = texture?.isFramebufferTexture === true;
@@ -759,12 +774,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const aliases = new Map(), checked = new Map();
     return JSON.stringify(nodes.map(node => {
       const texture = references ? textureValue(node, references) : node.value;
+      if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
+      if (node.isStorageTextureNode) {
+        const layout = storageTextureLayout(node, texture);
+        // The source binding freezes mipLevel during shader construction.
+        // A later setMipLevel alone does not rebind it; material invalidation
+        // or a new graph selects a new view. Exact formats remain structural
+        // because storage texture declarations include their format in WGSL.
+        return [aliases.get(texture.uuid), 'storageTexture', layout.format, layout.viewDimension,
+          texture.channel, node.sampler, node.updateMatrix, node.groupNode?.name];
+      }
       inspectIntegerRead(node, texture);
       if (!checked.has(texture)) checked.set(texture, inspectTexture(texture));
       // The pinned builder aliases uniforms by texture UUID. Keep that alias
       // partition, not the identities themselves, in the structural signature:
       // replacing one compatible sampled image must not rebuild the shader.
-      if (!aliases.has(texture.uuid)) aliases.set(texture.uuid, aliases.size);
       // Validated filterable colors share the source f32 sample/filter shader
       // and native binding layout, including FloatType when the device enables
       // float32-filterable. Effects choose precision in updateBefore, after
@@ -957,12 +981,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (node.passNode?.isPassNode === true) inspectThreeNativePass(three, renderer, node.passNode);
       else effects.inspectTexture(node);
     }
-    if (node.isStorageTextureNode)
-      fail('TEXTURE', 'Graphics storage writes require additional native bindings; use read-only TextureNode/Texture3DNode samples');
     if (node.isTexture3DNode && (node.constructor !== three.Texture3DNode ||
         Object.getPrototypeOf(node) !== three.Texture3DNode.prototype || node.gatherNode != null))
       fail('TEXTURE', 'Native volume graphs require the pinned Texture3DNode without unsupported 3D gathers');
-    if (node.isTextureNode) {
+    if (node.isStorageTextureNode) storageTextureLayout(node);
+    else if (node.isTextureNode) {
       if (node.isCubeTextureNode && (node.constructor !== three.CubeTextureNode ||
           Object.getPrototypeOf(node) !== three.CubeTextureNode.prototype || node.sampler !== true))
         fail('TEXTURE', 'Native cube graphs require the source CubeTextureNode with sampled direction coordinates');
@@ -1173,7 +1196,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const alignment = renderer._device?.limits?.minUniformBufferOffsetAlignment ?? 256;
     if (!Number.isSafeInteger(alignment) || alignment < 1 || !Number.isInteger(Math.log2(alignment)))
       fail('LIMIT', 'Native uniform offsets require a valid device alignment');
-    const sampledCounts = [0, 0], samplerCounts = [0, 0], storageCounts = [0, 0], uniformCounts = [0, 0];
+    const sampledCounts = [0, 0], samplerCounts = [0, 0], storageCounts = [0, 0], storageTextureCounts = [0, 0], uniformCounts = [0, 0];
     const groups = bindings.map((group, index) => {
       let byteLength = 0;
       const uniforms = [];
@@ -1209,6 +1232,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           // Match r186 getNodeAccess and WebGPUBindingUtils: fragment atomics
           // are writable; ordinary graphics storage remains read-only.
           return Object.freeze({...base, buffer: Object.freeze({type: atomic ? 'storage' : 'read-only-storage', hasDynamicOffset: false, minBindingSize})});
+        }
+        if (binding.textureNode?.isStorageTextureNode && binding.isSampledTexture && binding.store) {
+          const layout = storageTextureLayout(binding.textureNode, binding.textureNode.value, binding.mipLevel);
+          if (binding.access !== 'readOnly' || (binding.visibility & ~3) !== 0)
+            fail('TEXTURE', 'Native storage texture bindings require read-only vertex or fragment visibility');
+          for (let stage = 0; stage < 2; stage++) if (binding.visibility & (1 << stage))
+            if (++storageTextureCounts[stage] > (renderer._device?.limits?.maxStorageTexturesPerShaderStage ?? 4))
+              fail('LIMIT', 'Native storage texture bindings exceed per-stage device limits');
+          return Object.freeze({...base, storageTexture: Object.freeze({...layout})});
         }
         if (!binding.textureNode?.isTextureNode || binding.store || (!binding.isSampledTexture && !binding.isSampler))
           fail('BINDING', 'Native graphics groups require uniform blocks or ordinary sampled 2D, array, cube or 3D texture bindings');
@@ -1319,6 +1351,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage,
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
+      storageTextures: textureNodes.some(node => node.isStorageTextureNode),
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
@@ -1543,11 +1576,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native node texture layout, UV channel or binding aliases changed; compile the graph again');
     const textures = [];
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
-      if (value.isSampledTexture || value.isSampler) textures.push(Object.freeze({group, binding,
-        texture: liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value,
+      if (value.isSampledTexture || value.isSampler) {
+        const texture = liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value;
+        if (value.store) storageTextureLayout(value.textureNode, texture, value.mipLevel);
+        textures.push(Object.freeze({group, binding, texture,
         isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
-        comparison: comparison(value.textureNode, liveReferences ? textureValue(value.textureNode, references) : value.textureNode.value),
-        store: false, access: null, mipLevel: 0}));
+        comparison: comparison(value.textureNode, texture),
+        store: value.store === true, access: value.store === true ? value.access : null,
+        mipLevel: value.store === true ? value.mipLevel : 0}));
+      }
     return Object.freeze(textures);
   }
   function readStorage(state) {
@@ -1662,7 +1699,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Catch stale signedness, aliases and newly sampled integer reads before
     // observable callbacks. Live material references are read without updates;
     // readTextures also revalidates mutations made by the actual node updates.
-    if (state.integerTextures || state.textureNodes.some(node => integerTextureType(textureValue(node, state.textureReferences))))
+    if (state.integerTextures || state.storageTextures || state.textureNodes.some(node =>
+      node.isStorageTextureNode || integerTextureType(textureValue(node, state.textureReferences))))
       readTextures(state, true);
     checkLights(state);
     assertInstances(object, state.instanceSignature);

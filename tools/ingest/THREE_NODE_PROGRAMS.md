@@ -1056,6 +1056,47 @@ outside this entrance. The retained builder's module-global capability and
 nearest-neighbor wrapR helper caches are unchanged; the tests disclose those
 source constraints rather than presenting them as fixes.
 
+## Native read-only storage texture views
+
+Authored `TSL.storageTexture()` texel reads now retain the pinned builder's
+storage bindings in both vertex and fragment graphs. In r186 these graphics
+bindings are read-only even when the node's compute access defaults to
+write-only. The native layout preserves the exact WGSL storage format,
+dimension, binding index and stage visibility, with no sampler. The shared
+compute texture owner supplies the GPU allocation and single-mip view, so a
+compute producer and its graphics consumers use the same storage without CPU
+pixel uploads or readback.
+
+The admitted formats are linear RGBA8 normalized, RGBA16 float, and
+R/RG/RGBA32 float, signed integer and unsigned integer. Native layouts retain
+2D, array and 3D storage view dimensions. Ordinary 2D and array texel reads are
+covered by source/candidate browser execution; the pinned ordinary
+`StorageTextureNode` 3D coordinate generator still has a source shader
+limitation, and this change does not replace it or establish 3D read parity.
+
+`setMipLevel()` selects the authored mip when the source binding is compiled.
+Changing it afterward retains that compiled selection until material
+invalidation or a new graph rebuilds the binding, matching r186. Compatible
+texture replacements reuse the program while queued draws retain their own
+texture identity and compiled mip. Separate stage bindings may share the same
+native view. Compute and graphics requests keep FIFO order; disposed or
+reconfigured queued textures fail before drawing. Compilation prepares shader
+and binding layouts without dispatching a producer or allocating storage
+pixels. Per-stage storage texture limits are enforced before native pipeline
+allocation. Graphics texture stores, comparison, bias, gradient and gather
+variants remain outside this read-only profile.
+
+Eleven `three_renderer_storage_textures.test.mjs` cases check exact source WGSL,
+formats, stage aliases, mip capture, queued replacements, shared compute
+residency, limits, compilation and stale texture rejection. The direct GPU
+suite also checks layout snapshotting and invalid access, dimension and format
+rejection. The `native_storage_reads` browser lane compares RGBA8 2D, RGBA32F
+array and RGBA32Uint 2D compute-authored mips 0/1/2 in both shader stages at
+seven checkpoints per scene. All three matched pinned r186 exactly under
+Chromium 151 software Vulkan, including updates and hide/show transitions,
+with no GPU or browser errors. These results establish rendering correctness
+for those scenes; they do not measure hardware acceleration.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic

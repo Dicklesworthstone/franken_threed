@@ -75,7 +75,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const entries = sourceEntries.map(entry => {
       if (!Number.isSafeInteger(entry.binding) || entry.binding < 0 || entry.binding >= bindingLimit || seen.has(entry.binding) ||
           !Number.isInteger(entry.visibility) || entry.visibility < 1 || entry.visibility > 7 ||
-          ['buffer', 'sampler', 'texture'].filter(kind => entry[kind] != null).length !== 1)
+          ['buffer', 'sampler', 'texture', 'storageTexture'].filter(kind => entry[kind] != null).length !== 1)
         fail('ANIMATION_RENDER_OPTIONS', 'Invalid native node binding index, visibility or resource kind');
       seen.add(entry.binding);
       const base = {binding: entry.binding, visibility: entry.visibility};
@@ -103,6 +103,14 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
         if (!['filtering', 'non-filtering', 'comparison'].includes(entry.sampler.type))
           fail('ANIMATION_RENDER_OPTIONS', 'Unsupported native node sampler layout');
         return {...base, sampler: {type: entry.sampler.type}};
+      }
+      if (entry.storageTexture) {
+        const {access, format, viewDimension} = entry.storageTexture;
+        if (access !== 'read-only' || (entry.visibility & ~3) !== 0 ||
+            !/^(?:rgba8unorm|rgba16float|(?:r|rg|rgba)32(?:float|sint|uint))$/.test(format) ||
+            !['2d', '2d-array', '3d'].includes(viewDimension))
+          fail('ANIMATION_RENDER_OPTIONS', 'Native graphics storage textures require read-only source color views in vertex or fragment stages');
+        return {...base, storageTexture: {access, format, viewDimension}};
       }
       if (!['float', 'unfilterable-float', 'depth', 'sint', 'uint'].includes(entry.texture.sampleType) ||
           !['1d', '2d', '2d-array', 'cube', 'cube-array', '3d'].includes(entry.texture.viewDimension) ||
@@ -251,6 +259,7 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
       [entry => entry.buffer?.type === 'uniform', 'maxUniformBuffersPerShaderStage', 12],
       [entry => entry.buffer?.type === 'read-only-storage' || entry.buffer?.type === 'storage', 'maxStorageBuffersPerShaderStage', 8],
       [entry => entry.sampler, 'maxSamplersPerShaderStage', 16],
+      [entry => entry.storageTexture, 'maxStorageTexturesPerShaderStage', 4],
       [entry => entry.texture, 'maxSampledTexturesPerShaderStage', 16]])
       if (groups.reduce((count, group) => count + group.entries.filter(entry => matches(entry) && (entry.visibility & stage)).length, 0) > (device.limits[name] ?? fallback))
         limit(`Native node bindings exceed ${name}`);

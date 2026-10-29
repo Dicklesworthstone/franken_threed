@@ -335,6 +335,44 @@ test('unsupported native binding layouts fail before allocating uniform pages', 
   assert.equal(f.buffers.length, before);
 });
 
+test('read-only storage texture layouts retain exact format, dimension and borrowed views', async t => {
+  const f = rig(t), before = f.buffers.length, writes = f.writes.length, program = f.program([]);
+  program.groups = [{index: 0, byteLength: 0, entries: [
+    {binding: 0, visibility: 1, storageTexture: {access: 'read-only', format: 'rgba8unorm', viewDimension: '2d'}},
+    {binding: 1, visibility: 2, storageTexture: {access: 'read-only', format: 'rg32sint', viewDimension: '2d-array'}},
+    {binding: 2, visibility: 3, storageTexture: {access: 'read-only', format: 'r32uint', viewDimension: '3d'}},
+  ]}];
+  const expected = structuredClone(program.groups[0].entries), pending = f.add([], {nodeProgram: program});
+  program.groups[0].entries[0].storageTexture.format = 'rgba16float';
+  const record = await pending;
+  assert.deepEqual(record.pipelines.normal.layout.bindGroupLayouts[0].entries, expected);
+  const resources = expected.map(entry => ({group: 0, binding: entry.binding, resource: {view: entry.binding}}));
+  const command = f.stage(record, [], {nodeResources: resources});
+  f.owner.prepare(); f.owner.write();
+  assert.deepEqual(command.nodeProgram.groups[0].group.entries,
+    resources.map(({binding, resource}) => ({binding, resource})));
+  assert.equal(command.nodeProgram.groups[0].offset, null);
+  assert.equal(f.buffers.length, before); assert.equal(f.writes.length, writes);
+});
+
+test('invalid graphics storage texture layouts and per-stage limits fail before pipeline allocation', async t => {
+  const f = rig(t), before = f.buffers.length;
+  const add = (entry = {}, storageTexture = {}) => {
+    const program = f.program([]);
+    program.groups = [{index: 0, byteLength: 0, entries: [{binding: 0, visibility: 3,
+      storageTexture: {access: 'read-only', format: 'rgba8unorm', viewDimension: '2d', ...storageTexture}, ...entry}]}];
+    return f.add([], {nodeProgram: program});
+  };
+  for (const storageTexture of [{access: 'write-only'}, {access: 'read-write'}, {format: 'bgra8unorm'},
+    {format: 'rgba8unorm-srgb'}, {format: 'depth32float'}, {viewDimension: 'cube'}, {viewDimension: '1d'}])
+    await assert.rejects(add({}, storageTexture), {code: 'ANIMATION_RENDER_OPTIONS'});
+  for (const entry of [{visibility: 4}, {visibility: 7}, {sampler: {type: 'filtering'}}])
+    await assert.rejects(add(entry), {code: 'ANIMATION_RENDER_OPTIONS'});
+  f.device.limits.maxStorageTexturesPerShaderStage = 0;
+  await assert.rejects(add(), {code: 'ANIMATION_RENDER_LIMIT'});
+  assert.equal(f.buffers.length, before); assert.equal(f.pipelines.length, 0);
+});
+
 function storageProgram(f, {uniform = true, minBindingSize = 16, writable = false, visibility = writable ? 2 : 3} = {}) {
   const program = f.program([]);
   program.groups = [{index: 0, byteLength: uniform ? 16 : 0, entries: [
