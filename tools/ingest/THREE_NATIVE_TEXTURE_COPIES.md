@@ -20,49 +20,61 @@ must be single-sample. Cube constructors may leave `texture.renderTarget` null:
 the existing target registry resolves that texture after its owning target has
 been initialized, selected or rendered. Unknown ownership remains an error.
 
+## Authored destination mip chains
+
+Target-to-target and storage-to-target copies accept independently selected
+source and destination levels in existing non-cube target allocations. Nonzero
+destination levels require the selected color's captured `generateMipmaps` to
+be `false`. Generated higher levels remain rejected: a subsequent owner refresh
+would otherwise silently overwrite the copy. Mip-zero behavior is unchanged.
+
+Both endpoints use their own mip-local bounds. Array layer counts stay fixed;
+volume depth shrinks with each mip, including NPOT and one-texel tails. Native
+destination borrowing preserves the allocation, validation, retirement and
+sampling-replica invalidation of the existing target owner. It does not create
+new texture storage, alter public source descriptors or perform format conversion.
+
 ## Submission and lifetime
 
 The source-shaped call remains void. Source/destination identities, mip levels,
-regions and positions are captured at the call. Unlike CPU sampled uploads,
-GPU-produced source contents are observed at the copy's FIFO submission point.
-Each accepted range occupies one renderer FIFO slot, including nested compute
-turns. Target-to-target ranges reuse the existing face-aware transfer operation
-once per slice; this is not a claim of one GPU command or submission per range.
-Later queued work cannot interleave between those slices.
+regions and positions are captured at the call. GPU-produced source contents
+are observed at the copy's FIFO submission point, after preceding producers.
+Each accepted range occupies one FIFO slot, including nested compute turns.
+Mip-zero target copies reuse the face-aware transfer operation once per slice.
+Authored nonzero target copies encode the entire XYZ range in one native copy
+command. Later queued work cannot interleave within either accepted range.
 
 Both target generations remain retained while queued. Rejected admission,
 earlier queue failure, target disposal and renderer cancellation release them,
 including while unrelated preparation is blocked. Cancellation cannot undo an
-already submitted prefix. Every region is admitted before submission begins,
-and the combined source/destination allocation budget is checked before the
-first target-to-target slice is written. GPU errors and mip-generation checks
-continue to belong to the existing resource owners and `waitForGPU()`.
+already submitted prefix. Combined allocation budgets and whole color/depth
+allocation limits are checked before borrowing or writing. Per-slice transfer
+byte limits remain enforced, even for copies into a nonzero destination mip.
 
-WebGL, depth and pre-initialization target copies keep their existing transfer
-path. Sampled-image copies keep their separate captured-upload path, including
-its authored destination mip support; they are not rerouted through this helper.
+Source validation is captured after borrowing, including source mip generation,
+and gates destination completion without waiting inside the FIFO. A later
+reverse copy cannot change that captured dependency or create a validation cycle.
+GPU errors and completion continue to belong to the existing owners.
 
-## Remaining boundaries
+WebGL, depth and pre-initialization copies retain their existing transfer path.
+Sampled-image copies keep their captured-upload path; they are not rerouted here.
 
-Target-to-target and storage-to-target copies in this helper write destination
-mip zero. In-place copies within one target allocation or registered history
-group are rejected. Storage-to-cube target writes and depth/combined-aspect
-copies are not added by this change. Target-to-storage copies retain the storage
-owner's supported destination mips, formats and mip-update behavior. None of
-these boundaries silently selects another face, mip, format or backend.
+## Remaining boundaries and evidence
 
-## Evidence
+Nonzero cube destination mips, storage-to-cube target writes, and additional
+depth/combined-aspect copies are not added. In-place copies within one target
+allocation or registered history group remain rejected. MRT and authored-mip
+allocation capabilities remain those of the existing target owner.
 
-Run:
+Run the focused recording-contract tests:
 
 ```sh
 node --test tools/ingest/three_target_texture_copy.test.mjs \
   tools/ingest/three_target_color_copy.test.mjs \
-  tools/ingest/three_texture_copy_routes.test.mjs
+  tools/ingest/three_storage_target_mips.test.mjs \
+  tools/ingest/three_target_authored_mips.test.mjs
 ```
 
-The 47 focused tests execute production capture, planning and scheduling against
-recording owner/device contracts. The routing suite executes the production
-facade body with only unrelated sampled-upload, raw-pixel and shadow boundaries
-linked to recording modules. These tests are not full-renderer integration,
-browser GPU pixel parity or a hardware benchmark. No speedup is claimed.
+These 89 tests execute production capture, planning and scheduling with recording
+owner/device contracts. They are not full-renderer integration, browser GPU pixel
+parity or hardware benchmark evidence. No speedup is claimed.

@@ -31,6 +31,21 @@ function targetColor(renderer, texture, retain) {
       const limit = device.limits?.[volume ? 'maxTextureDimension3D' : 'maxTextureDimension2D'];
       if (!Number.isSafeInteger(limit) || shape.width > limit || shape.height > limit || volume && shape.depth > limit)
         fail('LIMIT', 'Target exceeds the device texture dimension limit');
+      // Check the whole allocation, not only the selected mip's copied region.
+      // A volume's color is 3D, but its independently owned depth is 2D/array.
+      const hasDepth = entry.shape.depthFormat != null;
+      if (volume && hasDepth) {
+        const depthLimit = device.limits?.maxTextureDimension2D;
+        if (!Number.isSafeInteger(depthLimit) || shape.width > depthLimit || shape.height > depthLimit)
+          fail('LIMIT', 'Target depth exceeds the device 2D texture dimension limit');
+      }
+      const array = shape.viewDimension === '2d-array';
+      if (array || hasDepth && entry.shape.depthArray) {
+        const layerLimit = device.limits?.maxTextureArrayLayers;
+        const layers = Math.max(array ? shape.depth : 1, hasDepth ? entry.shape.depthLayers ?? 1 : 1);
+        if (!Number.isSafeInteger(layerLimit) || layers > layerLimit)
+          fail('LIMIT', 'Target exceeds the device texture array layer limit');
+      }
     }};
 }
 function checkRenderer(renderer, device) {
@@ -111,9 +126,9 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
   });
 }
 
-/** Source-shaped cube/array/volume color copies through the target owner's
- * existing face-aware transfer path. One accepted range has one FIFO slot;
- * each slice keeps the same owner validation, mip and history-color policy.
+/** Source-shaped cube/array/volume color copies through existing target owners.
+ * Level-zero writes keep the face-aware transfer path; authored non-cube mips
+ * borrow native destinations. One accepted range always occupies one FIFO slot.
  */
 export function captureTargetColorCopy(renderer, texture, destinationTexture,
   region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
@@ -123,7 +138,10 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
     const source = targetColor(renderer, texture, retain), destination = targetColor(renderer, destinationTexture, retain);
     if (source.entry === destination.entry || source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup)
       fail('FEEDBACK', 'In-place target color copies are not admitted');
-    if (destinationLevel !== 0) fail('LEVEL', 'Target color copies write mip zero; derived mips remain owner-managed');
+    if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
+      fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
+    if (destinationLevel !== 0 && destination.entry.shape.cube)
+      fail('SOURCE', 'Authored cube destination mips require face-aware native write ownership');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Target color copies require a single-sample destination');
     // Native copies preserve bits across sRGB view-compatible formats. The
     // target transfer planner below still validates the original formats.
@@ -137,9 +155,16 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
     const step = index => ({...base, sourceFace: sourceFace + index, face: face + index});
     // Extents are contiguous; the checked XYZ plan plus both endpoint slices
     // validates every middle layer without building an unbounded request list.
+    // Reuse the raw transfer format/byte-budget checks in destination-mip
+    // coordinates, without changing the actual allocation or owner metadata.
+    const divisor = 2 ** destinationLevel, destinationShape = destination.entry.shape;
+    const mipShape = destinationLevel === 0 ? destinationShape : {...destinationShape,
+      width: Math.max(1, Math.floor(destinationShape.width / divisor)),
+      height: Math.max(1, Math.floor(destinationShape.height / divisor)),
+      layers: destinationShape.volume ? Math.max(1, Math.floor(destinationShape.layers / divisor)) : destinationShape.layers};
     if (!plan.empty) {
-      inspectGpuTargetCopy(source.entry.shape, destination.entry.shape, step(0));
-      inspectGpuTargetCopy(source.entry.shape, destination.entry.shape, step(count - 1));
+      inspectGpuTargetCopy(source.entry.shape, mipShape, step(0));
+      inspectGpuTargetCopy(source.entry.shape, mipShape, step(count - 1));
     }
     return {empty: plan.empty, issue() {
       checkRenderer(renderer, device); source.check(); destination.check();
@@ -148,6 +173,30 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       // Admit the combined allocation, not two individually affordable owners.
       // No layer may be written before all destination extents/budgets pass.
       targets.validateNativeTextures([source.source, destination.source]);
+      if (destinationLevel !== 0) {
+        // The level-zero transfer owner intentionally regenerates derived mips.
+        // Borrow the existing authored chain instead, copying the entire XYZ
+        // range in one command. Destination ownership still tracks validation,
+        // dirty sampling replicas and cancellation; no alternate owner is added.
+        let resolve, reject;
+        const validation = new Promise((yes, no) => { resolve = yes; reject = no; });
+        validation.catch(() => {});
+        try {
+          targets.withNativeTexture(source.source, nativeSource =>
+            targets.withNativeColorDestination(destination.source, nativeDestination => {
+              const encoder = device.createCommandEncoder({label: 'f3d-target-authored-mip-copy'});
+              encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
+                {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
+              const commands = encoder.finish();
+              checkRenderer(renderer, device); source.check(); destination.check();
+              device.queue.submit([commands]);
+            }, {validation}));
+          // Snapshot after the source borrow (including generated source mips),
+          // before a subsequent reverse copy can depend on this destination.
+          resolve(Promise.all([source.entry.validation, source.entry.storage.validation]));
+          return true;
+        } catch (error) { reject(error); throw error; }
+      }
       for (let index = 0; index < count; index++) {
         checkRenderer(renderer, device); source.check(); destination.check();
         targets.copyColor(source.entry, destination.entry, step(index));
