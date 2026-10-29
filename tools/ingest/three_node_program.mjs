@@ -3,6 +3,7 @@
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
  * The profile is rigid/skinned/morphed meshes, source sprites, points and lines,
+ * including source Line2NodeMaterial wide-line mesh expansion,
  * InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
@@ -107,7 +108,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const effects = createThreeNodeEffects(three, renderer, {fail});
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
   const normalPrototypes = [three.MeshNormalNodeMaterial.prototype, three.MeshMatcapNodeMaterial.prototype];
-  const primitivePrototypes = [three.PointsNodeMaterial, three.LineBasicNodeMaterial, three.LineDashedNodeMaterial]
+  const primitivePrototypes = [three.PointsNodeMaterial, three.LineBasicNodeMaterial, three.LineDashedNodeMaterial,
+    three.Line2NodeMaterial]
     .filter(Boolean).map(Type => Type.prototype);
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
@@ -827,6 +829,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return Object.getPrototypeOf(material) === three.SpriteNodeMaterial.prototype
       ? JSON.stringify([material.sizeAttenuation, object.center?.isVector2 === true]) : null;
   }
+  function wideLineSignature(material) {
+    if (Object.getPrototypeOf(material) !== three.Line2NodeMaterial?.prototype) return null;
+    // Width, dash sizes and offset values are live uniforms. These controls
+    // instead change expansion, attributes, fragment coverage or framebuffer
+    // dependencies, so an already captured program cannot accept a new shape.
+    return JSON.stringify([material.worldUnits, material.dashed, material.transparent, material.vertexColors,
+      ...[...DASH_SLOTS].map(key => sourceId(material[key]))]);
+  }
   function transmissionSignature(material) {
     if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
     return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
@@ -881,11 +891,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...primitivePrototypes, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic, LineDashed or unlit base NodeMaterial');
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic, LineDashed, Line2 or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
       physical = prototype === three.MeshPhysicalNodeMaterial.prototype, points = prototype === three.PointsNodeMaterial?.prototype,
-      sprite = prototype === three.SpriteNodeMaterial.prototype || points, dashed = prototype === three.LineDashedNodeMaterial?.prototype;
+      sprite = prototype === three.SpriteNodeMaterial.prototype || points,
+      dashed = prototype === three.LineDashedNodeMaterial?.prototype || prototype === three.Line2NodeMaterial?.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     const lights = sourceLights(material, context), lightsNode = authoredLightsNode(material);
@@ -1058,7 +1069,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       material.depthWrite, material.depthTest, material.lights, clippingKey,
-      spriteSignature(material, object),
+      spriteSignature(material, object), wideLineSignature(material),
       primitiveLayout(object, material),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
@@ -1346,6 +1357,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
       spriteSignature: spriteSignature(preparedMaterial, object),
+      wideLineSignature: wideLineSignature(preparedMaterial),
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage,
@@ -1689,6 +1701,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkWireframe(state, object);
     if (spriteSignature(prepareMaterial(state.material), object) !== state.spriteSignature)
       fail('CHANGED', 'Native sprite attenuation or center reference changed; compile the billboard graph again');
+    if (wideLineSignature(prepareMaterial(state.material)) !== state.wideLineSignature)
+      fail('CHANGED', 'Native wide-line expansion, dashes, colors or transparency changed; compile the line graph again');
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);

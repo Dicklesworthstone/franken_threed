@@ -22,7 +22,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNativeMedia(material) || material?.isMaterial === true && (
   material.alphaHash === true ||
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
-  material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true ||
+  material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true || material.isLine2NodeMaterial === true ||
   material.isPointsMaterial === true && (material.map != null || material.alphaMap != null) ||
   material.wireframe === true &&
     ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>

@@ -726,6 +726,40 @@ direct native renderer route; it does not establish automatic construction routi
 ArrayCamera or shadow pixel parity, or physical-device performance. See
 [THREE_SPRITES.md](THREE_SPRITES.md) for source culling semantics and route boundaries.
 
+## Native wide lines
+
+The pinned `Line2NodeMaterial` and official WebGPU `Line2`/`LineSegments2`
+addons now select the native graphics path without requiring an authored node
+slot. They retain the source expansion into indexed, instanced triangles,
+including screen-space and world-unit widths, round caps, perspective near-plane
+trimming, dash distances, endpoint colors and alpha-to-coverage. Their shared
+interleaved endpoint/color/distance attributes use the existing geometry owner.
+
+The source `onBeforeRender` callback still updates the line's viewport resolution
+for public raycasting. Width, DPR, viewport, color and authored dash uniforms are
+captured at the logical render boundary, so subsequent edits do not alter queued
+draws. World-unit, dash, endpoint-color and transparency changes rebuild the
+program; stale structural captures fail before authored node updates. Transparent
+lines preserve the source opaque-framebuffer sampling and mip generation through
+the existing ordered copy owner.
+
+`three_renderer_native_wide_lines.test.mjs` covers both official addons, the four
+screen/world and solid/dashed shader combinations, queued value/count mutations,
+source callbacks, MSAA transitions, stale-graph rejection and transparent copies.
+The shader comparison normalizes generated uniform names and independent uniform
+block declaration order while retaining each binding, member layout and shader
+operation. These recording-device tests establish command/data behavior;
+physical-device performance and the wider material-family closure remain open.
+
+`tests/e2e/webgpu_renderer/native_wide_lines.mjs` compares screen-space connected
+lines, world-unit dashed segments and transparent authored dashes against pinned
+r186 at seven 128x96 RGBA checkpoints each. All three match exactly in Chromium
+151.0.7922.34 / SwiftShader, including dynamic width/DPR/camera/count/visibility
+changes and the source addon callback. The lane asserts the owned
+`general-webgpu` submission route and reports zero GPU/browser errors. Shader
+construction and addon behavior remain retained JavaScript; these software-GPU
+results establish correctness for the tested scenes, not hardware acceleration.
+
 ## Native source shadows
 
 Directional and spot VSM shadows now run the pinned ShadowNode depth pass,
