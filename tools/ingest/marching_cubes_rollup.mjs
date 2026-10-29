@@ -6,11 +6,13 @@ import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeTransformBatch} from './transform_batch_specialization.mjs';
 import {specializeEulerUpdateBase,specializeEulerUpdateLoops} from './euler_update_specialization.mjs';
 import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
+import {specializeQuaternionFlat} from './quaternion_flat_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
 const ATTRIBUTE_TRANSFORMS='\0f3d-geometry-transforms-adapter';
 const EULER_UPDATES='\0f3d-euler-update-adapter';
+const QUATERNIONS='\0f3d-quaternion-flat-adapter';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -28,14 +30,14 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],quaternionReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;quaternionReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
-      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
       if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
@@ -48,11 +50,12 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===TRANSFORMS) return fs.readFileSync(new URL('./transform_batch_adapter.mjs',import.meta.url),'utf8');
       if (id===ATTRIBUTE_TRANSFORMS) return fs.readFileSync(new URL('./geometry_transforms_adapter.mjs',import.meta.url),'utf8');
       if (id===EULER_UPDATES) return fs.readFileSync(new URL('./euler_update_adapter.mjs',import.meta.url),'utf8');
+      if (id===QUATERNIONS) return fs.readFileSync(new URL('./quaternion_flat_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -81,6 +84,11 @@ export function marchingCubesRollupPlugin(options={}) {
           const matrix=specializeMatrixMultiply(code,{runtimeModule:MATRICES,maxMemoryPages,maxIterations});
           if(matrix.report)matrixReports.push({id,...matrix.report});
           if(matrix.changed){edits.push(...matrix.edits);headers.push(matrix.header);tail+=matrix.tail;}
+        }
+        if(code.includes('class Quaternion')) {
+          const quaternion=specializeQuaternionFlat(code,{runtimeModule:QUATERNIONS,maxMemoryPages,maxIterations});
+          if(quaternion.report)quaternionReports.push({id,...quaternion.report});
+          if(quaternion.changed){edits.push(...quaternion.edits);headers.push(quaternion.header);tail+=quaternion.tail;}
         }
         if(code.includes('class Object3D')) {
           const batch=specializeTransformBatch(code,{runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
@@ -130,6 +138,8 @@ export function marchingCubesRollupPlugin(options={}) {
         compiledModules:normalReports.filter(report=>report.compiledMethods.length).length,modules:normalReports.map(report=>({...report}))};},
       getMatrixMultiplicationReport(){return {version:1,accelerationClaim:false,
         compiledModules:matrixReports.length,modules:matrixReports.map(report=>({...report}))};},
+      getQuaternionFlatReport(){return {version:1,accelerationClaim:false,
+        compiledModules:quaternionReports.length,modules:quaternionReports.map(report=>({...report}))};},
       getTransformBatchesReport(){return {version:1,accelerationClaim:false,
         compiledModules:transformReports.length,modules:transformReports.map(report=>({...report}))};},
       getEulerUpdatesReport(){return {version:1,accelerationClaim:false,

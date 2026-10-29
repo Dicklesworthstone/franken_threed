@@ -817,6 +817,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           geometryNormals: marchingPlugin.api.getGeometryNormalsReport(),
           geometryTransforms: marchingPlugin.api.getGeometryTransformsReport(),
           matrixMultiplication: marchingPlugin.api.getMatrixMultiplicationReport(),
+          quaternionFlat: marchingPlugin.api.getQuaternionFlatReport(),
           transformBatches: marchingPlugin.api.getTransformBatchesReport(),
           eulerUpdates: marchingPlugin.api.getEulerUpdatesReport() },
       };
