@@ -2,12 +2,12 @@
 import {sourceBlob} from './marching_cubes_specialization.mjs';
 import {geometryNormalSourceRole} from './geometry_normals_specialization.mjs';
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
-import {deriveGeometryBoxKernel,compileGeometryBoxKernels} from './geometry_bounds_compile.mjs';
+import {deriveGeometryBoxKernel,compileGeometryBoxKernels,deriveGeometryRadiusKernels,compileGeometryRadiusKernels} from './geometry_bounds_compile.mjs';
 const boxBlob='675f74156954c1df38cafb2862d8bbd21a0e6b98';
 const fresh=(source,name)=>{let value='__f3d_bounds_'+name;while(source.includes(value))value+='_';return value;};
 export function geometryBoundsSourceRole(source) {
   if(sourceBlob(source)===boxBlob)return 'box';
-  const role=geometryNormalSourceRole(source);return ['core','vector','attributes'].includes(role)?role:null;
+  const role=geometryNormalSourceRole(source);return ['core','vector','attributes','geometry'].includes(role)?role:null;
 }
 export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vectorSource,attributeSource,
   maxMemoryPages=2048,maxIterations=100000000}={}) {
@@ -19,11 +19,11 @@ export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vec
   if(role==='attributes' || role==='core')tails.push(register+'("attribute",BufferAttribute,Float32BufferAttribute);');
   const report={sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,
     compiledMethods:[],accelerationClaim:false};
+  if(role==='core'){vectorSource=source;attributeSource=source;}
+  if((role==='box' || role==='geometry') && (geometryNormalSourceRole(vectorSource??'')!=='vector' ||
+      geometryNormalSourceRole(attributeSource??'')!=='attributes'))
+    return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
   if(role==='box' || role==='core') {
-    if(role==='core'){vectorSource=source;attributeSource=source;}
-    if(role==='box' && (geometryNormalSourceRole(vectorSource??'')!=='vector' ||
-        geometryNormalSourceRole(attributeSource??'')!=='attributes'))
-      return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
     const derived=deriveGeometryBoxKernel(source,vectorSource,attributeSource);
     const variants=compileGeometryBoxKernels(derived,{maxMemoryPages,maxIterations});
     const create=fresh(source,'create'),token=fresh(source,'token'),attempt=fresh(source,'try');
@@ -36,6 +36,22 @@ export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vec
     tails.push(register+'("box",Box3);',token+'='+create+'('+JSON.stringify(variants)+',()=>Math);');
     report.compiledMethods=['Box3.setFromBufferAttribute'];report.sourceDerived=true;
     report.wasmBytes=variants.reduce((sum,variant)=>sum+Buffer.from(variant.base64,'base64').length,0);
+  }
+  if(role==='geometry' || role==='core') {
+    const derived=deriveGeometryRadiusKernels(source,vectorSource,attributeSource);
+    const variants=compileGeometryRadiusKernels(derived,{maxMemoryPages,maxIterations});
+    const create=fresh(source,'create_radius'),token=fresh(source,'radius_token'),attempt=fresh(source,'try_radius');
+    headers.push('import {createGeometryBoundsDispatch as '+create+',tryGeometryRadiusBounds as '+attempt+'} from '+JSON.stringify(runtimeModule)+';var '+token+';');
+    for(const [index,scan]of derived.scans.entries()) {
+      const result=fresh(source,'radius_result_'+index),morph=scan.method==='morph-radius';
+      const args=['this',token,JSON.stringify(scan.method),scan.attribute,morph?derived.positionName:'null',derived.centerName,
+        derived.scratchName,morph?derived.offsetName:'null',derived.reductionName,morph?derived.relativeName:'false'];
+      edits.push({...scan.span,text:'{const '+result+'='+attempt+'('+args.join(',')+');\nif('+result+'===null){\n'+
+        source.slice(scan.span.start,scan.span.end)+'\n}else '+derived.reductionName+'='+result+';}'});
+    }
+    tails.push(token+'='+create+'('+JSON.stringify(variants)+',()=>Math);');
+    report.compiledMethods.push('BufferGeometry.computeBoundingSphere');report.sourceDerived=true;
+    report.wasmBytes=(report.wasmBytes??0)+variants.reduce((sum,variant)=>sum+Buffer.from(variant.base64,'base64').length,0);
   }
   return {changed:true,edits,header:headers.join('\n')+'\n',tail:'\n'+tails.join('\n')+'\n',report};
 }

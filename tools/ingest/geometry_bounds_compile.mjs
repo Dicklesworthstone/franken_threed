@@ -4,6 +4,7 @@
  */
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
+import * as walk from 'acorn-walk';
 
 export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) {
   const box=normalClasses(boxSource).get('Box3'),vector=normalClasses(vectorSource).get('Vector3');
@@ -88,4 +89,90 @@ export function compileGeometryBoxKernels(derived,{maxMemoryPages=2048,maxIterat
       generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned Box3.setFromBufferAttribute'});
     return {type,base64:Buffer.from(artifact.wasm).toString('base64')};
   });
+}
+
+/** Keep the radius loop and squared-distance formula as source text. Only
+ * verified object/attribute accesses become packed scalar cells; no alternative
+ * center/radius algorithm, reduction order or fused arithmetic is introduced.
+ */
+export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attributeSource) {
+  const geometry=normalClasses(geometrySource).get('BufferGeometry'),vector=normalClasses(vectorSource).get('Vector3');
+  const attribute=normalClasses(attributeSource).get('BufferAttribute');
+  if(!geometry || !vector || !attribute)throw new TypeError('Missing verified radius classes');
+  const body=normalMethod(geometry,'computeBoundingSphere').body.body.at(-1).consequent.body;
+  const ordinary=body.find(node=>node.type==='ForStatement');
+  const morph=body[body.indexOf(ordinary)+1].consequent.body[0].body.body.find(node=>node.type==='ForStatement');
+  const scratchName=ordinary.body.body[0].expression.callee.object.name;
+  const distanceCall=ordinary.body.body[1].expression.right.arguments[1],centerName=distanceCall.callee.object.name;
+  const reductionName=ordinary.body.body[1].expression.left.name;
+  const positionName=ordinary.body.body[0].expression.arguments[0].name;
+  const morphName=morph.body.body[0].expression.arguments[0].name;
+  const conditional=morph.body.body[1],relativeName=conditional.test.name;
+  const offsetName=conditional.consequent.body[0].expression.callee.object.name;
+  const path=node=>node.type==='ThisExpression'?'this':node.type==='Identifier'?node.name:
+    node.type==='MemberExpression' && !node.computed?path(node.object)+'.'+node.property.name:null;
+  function rewrite(source,node,bindings,calls=()=>null) {
+    const edits=[];
+    walk.fullAncestor(node,(current,_state,parents)=>{
+      const parent=parents.at(-2);
+      if(current.type==='Identifier' && parent?.type==='MemberExpression' && parent.property===current && !parent.computed)return;
+      const replacement=current.type==='CallExpression'?calls(current):bindings.get(path(current));
+      if(replacement!==null && replacement!==undefined)edits.push({start:current.start,end:current.end,text:replacement});
+    });
+    // A replaced call/member owns its nested tokens. Keep only disjoint edits.
+    const selected=[];let end=-1;
+    for(const edit of edits.sort((a,b)=>a.start-b.start || b.end-a.end))if(edit.start>=end){selected.push(edit);end=edit.end;}
+    let result=source.slice(node.start,node.end);
+    for(const edit of selected.reverse())result=result.slice(0,edit.start-node.start)+edit.text+result.slice(edit.end-node.start);
+    return result;
+  }
+  const cells=(name,offset)=>['x','y','z'].map((axis,index)=>[name+'.'+axis,'state['+(offset+index)+']']);
+  const distance=normalMethod(vector,'distanceToSquared');
+  const helper='function __boundsDistance(state)'+rewrite(vectorSource,distance.body,
+    new Map([...cells('this',3),...cells(distance.params[0].name,0)]));
+  const attributes=new Map([[positionName,{array:'baseValues',size:'baseItemSize'}],[morphName,{array:'values',size:'itemSize'}]]);
+  function load(call,ordinaryScan) {
+    const name=call.arguments[0].name,layout=ordinaryScan?{array:'values',size:'itemSize'}:attributes.get(name);
+    const target=call.callee.object.name===scratchName?0:6,method=normalMethod(vector,'fromBufferAttribute');
+    const index=geometrySource.slice(call.arguments[1].start,call.arguments[1].end);
+    return method.body.body.filter(node=>node.type!=='ReturnStatement').map(node=>rewrite(vectorSource,node,new Map(cells('this',target)),getter=>{
+      const source=normalMethod(attribute,getter.callee.property.name);
+      return rewrite(attributeSource,source.body.body[0].declarations[0].init,
+        new Map([['this.array',layout.array],['this.itemSize',layout.size],[source.params[0].name,'('+index+')']]));
+    })).join('\n');
+  }
+  function emit(node,ordinaryScan) {
+    if(node.type==='BlockStatement')return '{'+node.body.map(child=>emit(child,ordinaryScan)).join('\n')+'}';
+    if(node.type==='IfStatement')return 'if(relative)'+emit(node.consequent,ordinaryScan);
+    const call=node.expression;
+    if(call.type==='CallExpression') {
+      if(call.callee.property.name==='fromBufferAttribute')return load(call,ordinaryScan);
+      if(call.callee.property.name==='add') {
+        const method=normalMethod(vector,'add');
+        return method.body.body.filter(node=>node.type!=='ReturnStatement').map(node=>rewrite(vectorSource,node,
+          new Map([...cells('this',0),...cells(method.params[0].name,6)]))).join('\n');
+      }
+      throw new TypeError('Unsupported verified radius call');
+    }
+    return rewrite(geometrySource,node,new Map(),call=>path(call.callee)===centerName+'.distanceToSquared'?'__boundsDistance(state)':null);
+  }
+  const scans=[['radius',ordinary],['morph-radius',morph]].map(([method,loop])=>({method,
+    span:{start:loop.start,end:loop.end},attribute:method==='radius'?positionName:morphName,
+    source:'function scanRadius(values,baseValues,state,count,itemSize,baseItemSize,'+reductionName+',relative){'+
+      'for('+rewrite(geometrySource,loop.init,new Map([[positionName+'.count','count'],[morphName+'.count','count']]))+';'+
+      geometrySource.slice(loop.test.start,loop.test.end)+';'+geometrySource.slice(loop.update.start,loop.update.end)+')'+
+      emit(loop.body,method==='radius')+'return '+reductionName+';}',
+  }));
+  return {scans,helper,scratchName,centerName,reductionName,positionName,offsetName,relativeName};
+}
+
+export function compileGeometryRadiusKernels(derived,{maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const variants=[];
+  for(const scan of derived.scans)for(const type of ['f32[]','f64[]'])for(const baseType of scan.method==='radius'?['f64[]']:['f32[]','f64[]']) {
+    const artifact=compileNumericKernel(scan.source,{parameterTypes:[type,baseType,'f64[]','f64','f64','f64','f64','f64'],
+      helperSources:new Map([['__boundsDistance',derived.helper]]),generalControl:true,allowMath:true,maxMemoryPages,maxIterations,
+      sourceName:'pinned BufferGeometry.computeBoundingSphere '+scan.method});
+    variants.push({method:scan.method,type,baseType,base64:Buffer.from(artifact.wasm).toString('base64')});
+  }
+  return variants;
 }

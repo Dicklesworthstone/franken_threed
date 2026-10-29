@@ -28,7 +28,7 @@ async function fixture(core,options={}) {
   try {
     const {output}=await bundle.generate({format:'es'}),code=output[0].code;
     return {api:await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64')),code,
-      report:plugin.api.getGeometryBoundsReport()};
+      report:plugin.api.getGeometryBoundsReport(),core};
   }finally{await bundle.close();}
 }
 let fixtures;
@@ -46,10 +46,14 @@ test('previously refused source bounds scan lowers in both source and core build
   const generic=specializeNumericModule(source,{loopIslands:true});
   assert.equal(generic.report.loopIslands.candidates.find(item=>item.sourceSpan.line===90).route,'retained-js');
   assert.equal(specializeGeometryBounds(source+'\n// changed source').changed,false);
-  for(const {api,report}of fixtures) {
-    assert.equal(report.compiledModules,1);assert.equal(report.accelerationClaim,false);
-    const compiled=report.modules.find(item=>item.compiledMethods.length);
-    assert.deepEqual(compiled.compiledMethods,['Box3.setFromBufferAttribute']);assert.ok(compiled.sourceDerived && compiled.wasmBytes>0);
+  const geometrySource=fs.readFileSync(path.join(upstream,'src/core/BufferGeometry.js'),'utf8');
+  const radius=specializeNumericModule(geometrySource,{loopIslands:true});
+  for(const line of [782,799])assert.equal(radius.report.loopIslands.candidates.find(item=>item.sourceSpan.line===line).route,'retained-js');
+  for(const {api,report,core}of fixtures) {
+    assert.equal(report.compiledModules,core?1:2);assert.equal(report.accelerationClaim,false);
+    const compiled=report.modules.filter(item=>item.compiledMethods.length);
+    assert.deepEqual(compiled.flatMap(item=>item.compiledMethods).sort(),['Box3.setFromBufferAttribute','BufferGeometry.computeBoundingSphere']);
+    assert.ok(compiled.every(item=>item.sourceDerived && item.wasmBytes>0));
     const actual=new api.Box3(),expected=new reference.Box3(),min=actual.min,max=actual.max,method=actual.setFromBufferAttribute;
     assert.equal(method.name,'setFromBufferAttribute');assert.equal(method.length,1);
     assert.equal(actual.setFromBufferAttribute(attribute(api)),actual);expected.setFromBufferAttribute(attribute(reference));
@@ -92,6 +96,7 @@ test('live geometry edits and absolute/relative morph bounds keep public box/sph
       assert.deepEqual(actual.toJSON().data.boundingSphere,expected.toJSON().data.boundingSphere);
     }
     assert.equal(api.diagnostics(box).wasmCalls,12);
+    assert.equal(api.diagnostics(actual).wasmCalls,36);
   }
 });
 
@@ -177,26 +182,155 @@ test('geometry bounds feed retained Mesh raycasts and frustum decisions after li
         expected.ray.intersectObject(expected.mesh).map(hit=>[hit.distance,hit.point.toArray(),hit.faceIndex]));
     }
     assert.equal(api.diagnostics(actual.mesh.geometry.boundingBox).wasmCalls,4);
+    assert.equal(api.diagnostics(actual.mesh.geometry).wasmCalls,4);
   }
+});
+
+test('radius and morph scans preserve source f64 reductions across mixed storage and independent strides',()=>{
+  for(const {api}of fixtures)for(const Position of [Float32Array,Float64Array])for(const Morph of [Float32Array,Float64Array])
+    for(const relative of [false,true])for(const stride of [3,5]) {
+      const make=lib=>{
+        const g=new lib.BufferGeometry(),values=[];
+        for(let i=0;i<points.length;i+=3)values.push(...points.slice(i,i+3),...Array(stride-3).fill(111));
+        g.setAttribute('position',attribute(lib,values,Position,stride));
+        g.morphAttributes.position=[attribute(lib,points.map((v,i)=>v/3+(i%3-1)/7),Morph)];
+        g.morphTargetsRelative=relative;return g;
+      };
+      const actual=make(api),expected=make(reference);
+      for(let frame=0;frame<3;frame++) {
+        for(const g of [actual,expected]){g.attributes.position.array[0]+=frame/17;g.computeBoundingSphere();}
+        same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+        assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));
+      }
+      assert.deepEqual(api.diagnostics(actual),{wasmCalls:6,fallbackCalls:0,lastFailure:null});
+    }
+});
+
+test('radius reduction leaves final sqrt and public radius setters at their original source boundaries',()=>{
+  for(const {api}of fixtures) {
+    const make=lib=>{const g=new lib.BufferGeometry();g.setAttribute('position',attribute(lib));g.computeBoundingSphere();return g;};
+    const actual=make(api),expected=make(reference),logs=[[],[]],sqrt=Math.sqrt;
+    try {
+      let log;
+      Math.sqrt=function(value){log.push(['sqrt',value]);return sqrt(value);};
+      for(const [i,g]of [actual,expected].entries()) {
+        let value=g.boundingSphere.radius;
+        Object.defineProperty(g.boundingSphere,'radius',{configurable:true,get(){return value;},set(next){logs[i].push(['radius',next,...g.boundingSphere.center.toArray()]);value=next;}});
+        log=logs[i];g.attributes.position.array[0]-=2;g.computeBoundingSphere();
+      }
+      assert.deepEqual(logs[0],logs[1]);assert.equal(logs[0].length,2);assert.equal(api.diagnostics(actual).wasmCalls,2);
+      for(const g of [actual,expected])Object.defineProperty(g.boundingSphere,'radius',{configurable:true,set(){throw new Error('radius publication');}});
+      log=[];assert.throws(()=>actual.computeBoundingSphere(),/radius publication/);assert.throws(()=>expected.computeBoundingSphere(),/radius publication/);
+      assert.equal(api.diagnostics(actual).wasmCalls,3,'a source publication error never replays the native scan');
+    }finally{Math.sqrt=sqrt;}
+  }
+});
+
+test('morph-list and relative-mode getters observe each original boundary between native scans',()=>{
+  for(const {api}of fixtures) {
+    const logs=[[],[]];
+    function make(lib,i) {
+      const g=new lib.BufferGeometry();g.setAttribute('position',attribute(lib));
+      const morphs=[attribute(lib,points.map(v=>v/3)),attribute(lib,points.map(v=>v/-4))];let reads=0;
+      g.morphAttributes.position=morphs;
+      Object.defineProperty(g,'morphTargetsRelative',{get(){
+        logs[i].push(['relative',...g.boundingSphere.center.toArray()]);
+        g.attributes.position.array[0]+=0.125;return true;
+      }});
+      const first=morphs[0];Object.defineProperty(morphs,'0',{get(){
+        logs[i].push(['morph',++reads,...g.boundingSphere.center.toArray()]);
+        first.array[1]+=0.25;return first;
+      }});
+      return g;
+    }
+    const actual=make(api,0),expected=make(reference,1);
+    actual.computeBoundingSphere();expected.computeBoundingSphere();
+    assert.deepEqual(logs[0],logs[1]);same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+    assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));
+    assert.equal(api.diagnostics(actual).wasmCalls,3);
+  }
+});
+
+test('radius scratch and relative offsets remain observable, including centers aliased to escaped vectors',()=>{
+  for(const {api}of fixtures)for(const alias of ['none','scratch','offset']) {
+    const escaped=[{},{}],make=lib=>{const g=new lib.BufferGeometry();g.setAttribute('position',attribute(lib));
+      g.morphAttributes.position=[attribute(lib,points.map(v=>v/3))];g.morphTargetsRelative=true;return g;};
+    const actual=make(api),expected=make(reference);
+    for(const [i,lib,g]of [[0,api,actual],[1,reference,expected]]) {
+      const distance=lib.Vector3.prototype.distanceToSquared,add=lib.Vector3.prototype.add;
+      try {
+        lib.Vector3.prototype.distanceToSquared=function(v){escaped[i].scratch=v;return distance.call(this,v);};
+        lib.Vector3.prototype.add=function(v){escaped[i].offset=v;return add.call(this,v);};
+        g.computeBoundingSphere();
+      }finally{lib.Vector3.prototype.distanceToSquared=distance;lib.Vector3.prototype.add=add;}
+      if(alias!=='none')g.boundingSphere.center=escaped[i][alias];
+    }
+    for(const g of [actual,expected]){g.attributes.position.array[0]-=0.75;g.computeBoundingSphere();}
+    same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+    same(escaped[0].scratch.toArray(),escaped[1].scratch.toArray());same(escaped[0].offset.toArray(),escaped[1].offset.toArray());
+    assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));
+    assert.equal(api.diagnostics(actual).wasmCalls,alias==='none'?2:alias==='offset'?1:0);
+  }
+});
+
+test('radius method hooks and partial throws preserve source calls without speculative reads or stores',()=>{
+  for(const {api}of fixtures)for(const mode of ['method','getter','throw']) {
+    const logs=[[],[]],make=lib=>{const g=new lib.BufferGeometry();g.setAttribute('position',attribute(lib));g.computeBoundingSphere();return g;};
+    const actual=make(api),expected=make(reference),before=api.diagnostics(actual).wasmCalls;
+    for(const [i,g]of [actual,expected].entries()) {
+      const center=g.boundingSphere.center,original=center.distanceToSquared;let calls=0;
+      const hook=function(v){logs[i].push(v.toArray());if(mode==='throw' && ++calls===2)throw new Error('distance stop');return original.call(this,v);};
+      if(mode==='getter')Object.defineProperty(center,'distanceToSquared',{get(){logs[i].push('getter');return hook;}});
+      else center.distanceToSquared=hook;
+    }
+    for(const g of [actual,expected])if(mode==='throw')assert.throws(()=>g.computeBoundingSphere(),/distance stop/);else g.computeBoundingSphere();
+    assert.deepEqual(logs[0],logs[1]);assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));
+    assert.equal(api.diagnostics(actual).wasmCalls,before);
+  }
+});
+
+test('empty and nonfinite radius inputs, normalized attributes and shared storage preserve source results',()=>{
+  const errors=[[],[]],error=console.error;let messages;
+  try {
+    console.error=(...args)=>messages.push(args[0]);
+    for(const {api}of fixtures)for(const mode of ['empty','infinite','nan','normalized','shared']) {
+      const make=lib=>{const g=new lib.BufferGeometry();let values=attribute(lib,mode==='empty'?[]:points,Float64Array);
+        if(mode==='infinite')values.array[0]=Infinity;if(mode==='nan')values.array[0]=NaN;
+        if(mode==='normalized')values=new lib.BufferAttribute(new Int16Array(points.map(v=>v*1000)),3,true);
+        if(mode==='shared'){const data=new Float64Array(new SharedArrayBuffer(points.length*8));data.set(points);values=new lib.BufferAttribute(data,3);}
+        g.setAttribute('position',values);return g;};
+      const actual=make(api),expected=make(reference);errors[0].length=errors[1].length=0;
+      messages=errors[0];actual.computeBoundingSphere();messages=errors[1];expected.computeBoundingSphere();
+      same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+      assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));assert.deepEqual(errors[0],errors[1]);
+      if(mode!=='empty')assert.equal(api.diagnostics(actual).wasmCalls,0);
+    }
+  }finally{console.error=error;}
 });
 
 test('work-budget exhaustion and a fresh no-Wasm module resume the original complete scan',async()=>{
   const budget=await fixture(false,{maxIterations:1}),actual=new budget.api.Box3(),expected=new reference.Box3();
   actual.setFromBufferAttribute(attribute(budget.api));expected.setFromBufferAttribute(attribute(reference));same(boxValues(actual),boxValues(expected));
   assert.equal(budget.api.diagnostics(actual).wasmCalls,0);assert.equal(budget.api.diagnostics(actual).fallbackCalls,1);
+  const g=new budget.api.BufferGeometry(),eg=new reference.BufferGeometry();g.setAttribute('position',attribute(budget.api));eg.setAttribute('position',attribute(reference));
+  g.computeBoundingSphere();eg.computeBoundingSphere();assert.equal(g.boundingSphere.radius,eg.boundingSphere.radius);
+  assert.deepEqual(budget.api.diagnostics(g),{wasmCalls:0,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
   const wasm=globalThis.WebAssembly;let api;
   try {globalThis.WebAssembly=undefined;api=await import('data:text/javascript;base64,'+Buffer.from(fixtures[0].code+'\n// no Wasm realm bootstrap').toString('base64'));}
   finally{globalThis.WebAssembly=wasm;}
   const box=new api.Box3();box.setFromBufferAttribute(attribute(api));same(boxValues(box),boxValues(expected));assert.equal(api.diagnostics(box).wasmCalls,0);
+  const noWasm=new api.BufferGeometry();noWasm.setAttribute('position',attribute(api));noWasm.computeBoundingSphere();
+  assert.equal(noWasm.boundingSphere.radius,eg.boundingSphere.radius);assert.equal(api.diagnostics(noWasm).wasmCalls,0);
 });
 
 test('ordinary application build ships native bounds through the existing opt-in compilation path',async()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-geometry-bounds-')),entry=path.join(root,'entry.mjs');
-  fs.writeFileSync(entry,"import {BufferGeometry,Float32BufferAttribute} from 'three';export function frame(values){const g=new BufferGeometry();g.setAttribute('position',new Float32BufferAttribute(values,3));g.computeBoundingBox();return g;}"+
+  fs.writeFileSync(entry,"import {BufferGeometry,Float32BufferAttribute} from 'three';export function frame(values){const g=new BufferGeometry();g.setAttribute('position',new Float32BufferAttribute(values,3));g.computeBoundingBox();g.computeBoundingSphere();return g;}"+
     'export {geometryBoundsDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-geometry-bounds-adapter')+';');
   const result=await buildApplication(entry,path.join(root,'dist'),{specializeNumeric:true,packageRootUrl:pathToFileURL(upstream+path.sep).href});
   assert.equal(result.numericSpecialization.libraryKernels.geometryBounds.compiledModules,1);
   const api=await import(pathToFileURL(path.join(result.outDir,result.entryFiles[0]))),geometry=api.frame(points);
   same(boxValues(geometry.boundingBox),boxValues(new reference.Box3().setFromBufferAttribute(attribute(reference))));
   assert.equal(api.diagnostics(geometry.boundingBox).wasmCalls,1);
+  assert.equal(api.diagnostics(geometry).wasmCalls,1);
 });
