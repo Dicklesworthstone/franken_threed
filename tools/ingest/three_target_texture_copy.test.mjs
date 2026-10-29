@@ -192,7 +192,7 @@ test('storage-to-target destination disposal cancels its queued write', () => {
 });
 
 test('unsupported storage-to-target destinations release their admission', () => {
-  for (const options of [{dimension: 'cube'}, {samples: 4}]) {
+  for (const options of [{samples: 4}]) {
     const f = targetCopyFixture(), destination = f.target(options);
     assert.throws(() => reverse(f, f.storageTexture(), destination)); assert.equal(f.references, 0);
   }

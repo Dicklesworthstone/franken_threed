@@ -18,7 +18,10 @@ function targetColor(renderer, texture, retain) {
   // A raw copy addresses cube faces as native array layers. Never introduce
   // a cube sampler, source-face permutation, CPU upload or UV-flipped replica.
   const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1,
-    viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension};
+    viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension,
+    // CubeCamera can toggle this flag without replacing the allocation. Capture
+    // this use's policy, not an earlier entry's temporary generation setting.
+    ...(entry.shape.cube ? {generateMipmaps: texture.generateMipmaps} : {})};
   const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
   return {entry, shape, source,
     check() {
@@ -93,7 +96,6 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
   return captureTextureCopy(renderer, retain => {
     if (!texture?.isStorageTexture) fail('SOURCE', 'Expected a storage texture source');
     const destination = targetColor(renderer, destinationTexture, retain);
-    if (destination.entry.shape.cube) fail('SOURCE', 'Cube target destinations require explicit face-aware write support');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Storage copies require a single-sample target destination');
     // Explicitly authored levels already share this native allocation. Never
     // write a derived level: the next automatic mip refresh would overwrite it.
@@ -127,7 +129,7 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
 }
 
 /** Source-shaped cube/array/volume color copies through existing target owners.
- * Non-cube destinations borrow one native image and copy the complete XYZ range.
+ * Non-cube destinations and authored cube mips copy one complete native range.
  * Cube level-zero writes retain the face-aware path. One range has one FIFO slot.
  */
 export function captureTargetColorCopy(renderer, texture, destinationTexture,
@@ -140,8 +142,6 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       fail('FEEDBACK', 'In-place target color copies are not admitted');
     if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
       fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
-    if (destinationLevel !== 0 && destination.entry.shape.cube)
-      fail('SOURCE', 'Authored cube destination mips require face-aware native write ownership');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Target color copies require a single-sample destination');
     // Native copies preserve bits across sRGB view-compatible formats. The
     // target transfer planner below still validates the original formats.
@@ -173,7 +173,7 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       // Admit the combined allocation, not two individually affordable owners.
       // No layer may be written before all destination extents/budgets pass.
       targets.validateNativeTextures([source.source, destination.source]);
-      if (!destination.entry.shape.cube) {
+      if (!destination.entry.shape.cube || destinationLevel !== 0) {
         // One native copy covers every contiguous layer/slice. The destination
         // borrow marks the same level-zero mip chain and sampling replica dirty
         // as copyColor, without one submission/source borrow per array layer.

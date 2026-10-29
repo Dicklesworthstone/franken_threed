@@ -1011,12 +1011,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     },
     // A raw transfer destination must not sample old mips or allocate a UV
     // replica. Keep identity, lifetime, allocation and validation with this owner.
+    // Cube colors are the same six-layer native allocation: the caller's checked
+    // copy origin/range selects faces, never the renderer's active face or a view.
+    // As with face-aware copyColor, cube mip generation stays source-ordered.
     withNativeColorDestination(source, callback, {validation} = {}) {
       if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
       this.validateNativeTextures([source]);
       const {entry, colorIndex} = source;
-      if (source.depth || entry.shape.cube || entry.shape.sampleCount !== 1)
-        fail('UNSUPPORTED', 'Native color destinations require single-sample non-cube color attachments');
+      if (source.depth || entry.shape.sampleCount !== 1)
+        fail('UNSUPPORTED', 'Native color destinations require single-sample color attachments');
       ensure(entry);
       entry.busy = true;
       if (colorIndex === 0) entry.dirty = true;
