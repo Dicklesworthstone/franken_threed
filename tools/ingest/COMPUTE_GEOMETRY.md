@@ -89,10 +89,12 @@ refresh. A preceding compute upload remains visible even when the material or
 source bundle reuses its bindings. Bundle offsets and buffer identity remain
 recorded until bundle invalidation, while GPU contents stay live.
 
-Retained shader-storage bindings may alias the same argument allocation. Using
-that allocation as a generated vertex input as well still has an explicit
-preparation gap after a compute upload changes its host version; the retained
-vertex proof rejects the stale version. That combination remains unfinished.
+Retained shader-storage bindings may alias the same argument allocation. F3D's
+combined buffer usages also admit generated vertex fetch from that allocation,
+including a new host version published through preceding compute work. This
+last combination is a candidate extension: pinned r186 assigns mutually
+exclusive indirect/vertex buffer usages. The source-comparison fixtures keep
+indirect arguments and generated vertex data in distinct allocations.
 
 Source zero object-instance counts and negative effective draw ranges suppress
 the call. A zero-length draw range still allows indirect commands, whose GPU
@@ -108,6 +110,23 @@ resource sharing and bundle behavior with a recording device. The
 native-primitives browser comparison exercise real compute and draw commands.
 This is general WebGPU execution with retained source preparation, not a Rust
 specialization or a measured performance claim.
+
+## Retained generated vertex and shader bindings
+
+Ordinary SHARED refreshes and `BundleGroup` draws retain their source bindings
+while observing earlier compute uploads to the same allocation. Each accepted
+draw selects only the upload history already admitted at its call boundary;
+later queued compute versions and unrequested CPU edits cannot replace it.
+This applies to generated `.toAttribute()` vertex inputs, shader-only storage
+reads, and their aliases. Partial uploads preserve the untouched GPU words.
+
+Generated vertex metadata gets a new immutable version proof while retaining
+its original layout, CPU geometry generations and native buffer identity.
+Earlier proofs keep their strict version checks. A retained binding cannot
+silently resize or replace its allocation. No readback, extra simulation upload,
+or copy of GPU contents is introduced. Changed proof versions can rebuild the
+native geometry/bundle record; unchanged subsequent versions reuse it. Retired
+records release their geometry resources, including across repeated updates.
 
 ## Native graphics storage bindings
 

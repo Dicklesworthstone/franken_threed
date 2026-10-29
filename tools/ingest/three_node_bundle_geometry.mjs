@@ -16,12 +16,36 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
   const live = () => { if (disposed) reject('DISPOSED', 'Bundle geometry histories are disposed'); };
   const keep = generation => { generation.refs++; };
   const drop = generation => { if (--generation.refs === 0) allocatedBytes -= generation.array.byteLength; };
-  const dropView = view => { if (--view.refs === 0) for (const generation of view.generations) drop(generation); };
+  const dropView = view => {
+    if (--view.refs !== 0) return;
+    if (view.storageView) dropView(view.storageView);
+    for (const generation of view.generations) drop(generation);
+  };
   function lease(view) {
     view.refs++; let released = false;
     return Object.freeze({geometry: view.geometry, bytes: view.bytes,
       // A retired program's wrapper can still name a view retained by a bundle.
       retain() { if (view.refs === 0) reject('RELEASED', 'Bundle geometry view has retired'); return lease(view); },
+      refreshStorage(refresh) {
+        if (view.refs === 0) reject('RELEASED', 'Bundle geometry view has retired');
+        const attributes = {}; let changed = false;
+        for (const [name, attribute] of Object.entries(view.geometry.attributes)) {
+          const next = refresh(attribute) ?? attribute;
+          attributes[name] = next; changed ||= next !== attribute;
+        }
+        if (!changed) return null;
+        const previous = view.storageView;
+        if (previous && Object.entries(attributes).every(([name, attribute]) => previous.geometry.attributes[name] === attribute))
+          return lease(previous);
+        // Only GPU metadata changes. Keep the exact retained CPU generations,
+        // ranges and index instead of recapturing live source geometry bytes.
+        for (const generation of view.generations) keep(generation);
+        const next = {refs: 1, generations: view.generations, bytes: view.bytes,
+          geometry: Object.freeze({...view.geometry, attributes: Object.freeze(attributes)})};
+        if (previous) dropView(previous);
+        view.storageView = next;
+        return lease(next);
+      },
       release() { if (!released) { released = true; dropView(view); } }});
   }
   function inspect(attribute) {

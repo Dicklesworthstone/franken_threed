@@ -4,7 +4,7 @@
  * Publication is after compute upload (including compileComputeAsync). Native
  * buffer usages must include VERTEX as well as STORAGE from creation onward;
  * index borrowers additionally require INDEX usage. */
-const devices = new WeakMap(), vertexViews = new WeakMap(), immutableVertexViews = new WeakMap();
+const devices = new WeakMap(), vertexViews = new WeakMap(), immutableVertexViews = new WeakMap(), refreshedVertexViews = new WeakMap();
 export class ComputeAttributeError extends Error {
   constructor(code, message) {
     super(`COMPUTE_ATTRIBUTE_${code}: ${message}`);
@@ -102,34 +102,43 @@ export function captureComputeStorage(device, attribute) {
     fail('SHAPE', 'Graphics storage requires a complete normalized 32-bit storage attribute and nonnegative version');
   const scalar = array.constructor, byteLength = array.byteLength,
     initial = devices.get(device)?.get(attribute);
-  let resolved = null;
-  function current() {
-    // Retain the actual terminal reason even when disposal/loss has removed
-    // the owner from the shared table already.
-    initial?.live(); resolved?.live();
-    const entry = devices.get(device)?.get(attribute);
-    if (!entry) fail('UNPREPARED', 'Compute must publish the captured storage version on the drawing device before submission');
-    entry.live();
-    if ((initial && entry.identity !== initial.identity) ||
-        (resolved && (entry.identity !== resolved.identity || entry.buffer !== resolved.buffer)))
-      fail('STALE', 'Captured shader storage was released or replaced before its queued use');
-    if (entry.stride !== stride || entry.count !== count || entry.scalar !== scalar || entry.byteLength !== byteLength)
-      fail('SHAPE', 'Published shader storage does not match the captured attribute layout');
-    if (entry.version !== version)
-      fail('UNPREPARED', 'Compute must publish the captured storage attribute version before drawing');
-    resolved ??= entry;
-    return entry;
+  function atVersion(version, previous = null) {
+    let resolved = previous;
+    function current() {
+      // Retain the actual terminal reason even when disposal/loss has removed
+      // the owner from the shared table already.
+      initial?.live(); resolved?.live();
+      const entry = devices.get(device)?.get(attribute);
+      if (!entry) fail('UNPREPARED', 'Compute must publish the captured storage version on the drawing device before submission');
+      entry.live();
+      if ((initial && entry.identity !== initial.identity) ||
+          (resolved && (entry.identity !== resolved.identity || entry.buffer !== resolved.buffer)))
+        fail('STALE', 'Captured shader storage was released or replaced before its queued use');
+      if (entry.stride !== stride || entry.count !== count || entry.scalar !== scalar || entry.byteLength !== byteLength)
+        fail('SHAPE', 'Published shader storage does not match the captured attribute layout');
+      if (entry.version !== version)
+        fail('UNPREPARED', 'Compute must publish the captured storage attribute version before drawing');
+      resolved ??= entry;
+      return entry;
+    }
+    return Object.freeze({version, byteLength,
+      get ownerIdentity() { return resolved?.identity ?? initial?.identity; },
+      resolve: () => current().resource,
+      assertCurrent() { current(); },
+      atVersion(next) {
+        if (!Number.isSafeInteger(next) || next < 0) fail('PUBLICATION', 'A storage read requires an admitted nonnegative version');
+        // Derive a new proof; the old queued read remains strict. Preserve any
+        // resolved allocation identity and the original shape/owner checks.
+        return atVersion(next, resolved);
+      },
+      whenIdle() {
+        // Retiring a geometry waits for the allocation it already used. A later
+        // FIFO upload may legitimately advance that buffer's content version.
+        const allocation = resolved ?? current(); allocation.live();
+        return allocation.whenIdle();
+      }});
   }
-  return Object.freeze({version, byteLength,
-    get ownerIdentity() { return resolved?.identity ?? initial?.identity; },
-    resolve: () => current().resource,
-    assertCurrent() { current(); },
-    whenIdle() {
-      // Retiring a geometry waits for the allocation it already used. A later
-      // FIFO upload may legitimately advance that buffer's content version.
-      const allocation = resolved ?? current(); allocation.live();
-      return allocation.whenIdle();
-    }});
+  return atVersion(version);
 }
 
 /** Private geometry view of a captured storage generation. Only this module
@@ -165,6 +174,24 @@ export function snapshotComputeAttributeView(view) {
       Object.keys(proof.shape).every(key => old.shape[key] === proof.shape[key])) return previous.view;
   const snapshot = Object.freeze(Object.assign(Object.create(Object.getPrototypeOf(view)), proof.shape));
   vertexViews.set(snapshot, proof); immutableVertexViews.set(view, {view: snapshot, proof});
+  return snapshot;
+}
+
+/** Retained draw commands keep their vertex layout and allocation, but an
+ * earlier admitted compute/upload can advance its content version. Derive a
+ * fresh immutable proof for that draw's exact storage lease without inspecting
+ * the source's later mutable array, shape, or version. */
+export function refreshComputeAttributeView(device, source, view, version) {
+  const proof = vertexViews.get(view);
+  if (!proof || proof.source !== source) return null;
+  if (proof.device !== device) fail('OWNER', 'Captured vertex storage belongs to another device');
+  if (proof.shape.version === version) return view;
+  const previous = refreshedVertexViews.get(view);
+  if (previous?.proof === proof && previous.version === version) return previous.view;
+  const lease = proof.lease.atVersion(version), shape = Object.freeze({...proof.shape, version});
+  const snapshot = Object.freeze(Object.assign(Object.create(Object.getPrototypeOf(view)), shape));
+  vertexViews.set(snapshot, Object.freeze({...proof, shape, lease}));
+  refreshedVertexViews.set(view, {proof, version, view: snapshot});
   return snapshot;
 }
 

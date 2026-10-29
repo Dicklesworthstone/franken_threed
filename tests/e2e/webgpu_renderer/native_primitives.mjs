@@ -5,5 +5,6 @@ process.env.F3D_NATIVE_SCENARIO_MODULE = '/tests/e2e/webgpu_renderer/scenarios_n
 process.env.F3D_NATIVE_SCENARIO_EXPORT = 'nativePrimitiveScenarios';
 if (process.argv.length === 2) process.argv.push('native_tsl_lines', 'native_tsl_point_storage',
   'native_tsl_point_sprites', 'native_tsl_point_sprites_orthographic',
-  'native_indirect_compute', 'native_indirect_host_upload');
+  'native_indirect_compute', 'native_indirect_host_upload',
+  'native_indirect_vertex_alias', 'native_indirect_vertex_alias_bundle');
 await import('./sprites.mjs');

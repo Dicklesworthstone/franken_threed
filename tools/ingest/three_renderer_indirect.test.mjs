@@ -254,6 +254,34 @@ for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARE
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARED'} generated vertex aliases follow captured indirect uploads`, async t => {
+  const f = await fixture(t, {bundle});
+  const attribute = new T.StorageBufferAttribute(f.attribute.array.slice(), 1);
+  // F3D's combined buffer usages admit this alias. The pinned source allocates
+  // mutually exclusive INDIRECT/VERTEX usages, so this is no parity claim.
+  f.geometry.setIndirect(attribute, 0);
+  const data = N.storage(attribute, 'uint', attribute.count);
+  f.scene.fogNode = N.fog(N.vec3(data.toAttribute().toFloat().div(6)), N.float(.5));
+  const kernel = N.Fn(() => { data.element(0).addAssign(0); })().compute(1);
+  await f.renderer.compileComputeAsync(kernel);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const encoded = f.device.bundleEncoders.length;
+  attribute.array[0] = 6; attribute.needsUpdate = true;
+  f.renderer.compute(kernel); f.renderer.render(f.scene, f.camera);
+  attribute.array[0] = 0; attribute.needsUpdate = true;
+  f.renderer.compute(kernel); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99);
+  await f.renderer.waitForGPU();
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const submitted = draws(f.device);
+  assert.deepEqual(submitted.map(draw => argumentsOf(draw)[0]), [3, 6, 0, 0]);
+  for (const draw of submitted)
+    assert.ok([...draw.streams.values()].includes(draw.indirect.buffer), 'vertex fetch and indirect arguments share their captured allocation');
+  if (bundle) assert.equal(f.device.bundleEncoders.length, encoded + 2, 'unchanged captured versions reuse the refreshed geometry');
+  assert.equal(f.device.writes.filter(write => write.buffer === submitted[0].indirect.buffer).length, 3);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('native command bundle keys include indirect buffer identity and captured offsets', () => {
   const device = geometryDevice(), buffer = device.createBuffer({size: 40, usage: 256});
   const cache = createAnimationRenderBundleCache(device, {format: 'rgba8unorm', depthFormat: null,

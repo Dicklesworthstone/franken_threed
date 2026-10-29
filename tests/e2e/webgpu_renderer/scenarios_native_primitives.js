@@ -12,6 +12,43 @@ function installChanges(renderer, change) {
   const render = renderer.render.bind(renderer); let frame = 0;
   renderer.render = (...args) => { change(++frame); return render(...args); };
 }
+function indirectVertexAlias(T, renderer, bundled) {
+  const N = T.TSL, world = new T.Scene(), geometry = new T.PlaneGeometry(2, 2);
+  world.background = new T.Color(0x182435);
+  const attribute = new T.StorageBufferAttribute(new Uint32Array([3, 1, 0, 0]), 1);
+  const argumentsBuffer = new T.IndirectStorageBufferAttribute(new Uint32Array([3, 1, 0, 0, 0]), 1);
+  const data = N.storage(attribute, 'uint', attribute.count);
+  const args = N.storage(argumentsBuffer, 'uint', argumentsBuffer.count);
+  const publish = N.Fn(() => { data.element(0).addAssign(0); args.element(0).addAssign(0); })().compute(1);
+  geometry.setIndirect(argumentsBuffer, 0);
+  const material = new T.MeshBasicMaterial({color: 0x58c7fa}), object = new T.Mesh(geometry, material);
+  object.frustumCulled = false;
+  // Source SHARED refresh and retained bundles keep this compute/vertex alias
+  // bound while preceding dispatches publish newer host versions. Indirect
+  // arguments are separate because the pinned source cannot combine usages.
+  world.fogNode = N.fog(N.vec3(data.toAttribute().toFloat().div(6)), N.float(.5));
+  const group = bundled ? new T.BundleGroup() : world;
+  if (bundled) world.add(group);
+  group.add(object);
+  const compile = renderer.compileAsync.bind(renderer);
+  renderer.compileAsync = async (...args) => {
+    await renderer.computeAsync(publish);
+    attribute.array.fill(73); argumentsBuffer.array.fill(73);
+    return compile(...args);
+  };
+  installChanges(renderer, frame => {
+    const count = frame === 8 ? 6 : frame === 12 ? 0 : frame === 13 ? 3 : null;
+    if (count !== null) {
+      attribute.array.set([count, 1, 0, 0]); attribute.needsUpdate = true;
+      argumentsBuffer.array.set([count, 1, 0, 0, 0]); argumentsBuffer.needsUpdate = true;
+      renderer.compute(publish);
+      attribute.array.fill(73); argumentsBuffer.array.fill(73);
+    }
+    if (attribute.array.some(value => value !== 73) || argumentsBuffer.array.some(value => value !== 73))
+      throw new Error('Indirect vertex alias changed compute-owned CPU arguments');
+  });
+  return {scene: world, camera: camera(T)};
+}
 function pointSprites(T, renderer, orthographic) {
   const N = T.TSL, world = scene(T), objects = [], sizes = [], rotations = [];
   renderer.setPixelRatio(1.5);
@@ -43,6 +80,8 @@ function pointSprites(T, renderer, orthographic) {
   return {scene: world, camera: view};
 }
 export const nativePrimitiveScenarios = {
+  native_indirect_vertex_alias(T, renderer) { return indirectVertexAlias(T, renderer, false); },
+  native_indirect_vertex_alias_bundle(T, renderer) { return indirectVertexAlias(T, renderer, true); },
   native_indirect_compute(T, renderer) {
     const N = T.TSL, world = new T.Scene(), vertices = N.uniform(3, 'uint'), objects = [], buffers = [], kernels = [];
     world.background = new T.Color(0x182435);

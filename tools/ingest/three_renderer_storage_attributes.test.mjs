@@ -282,3 +282,55 @@ test('ordinary SHARED fog retains storage-only vertex leases and later queued GP
     'retired observer and completed frames release the allocation lease');
   f.renderer.dispose(); assert.equal(buffer.destroyed, true);
 });
+
+for (const bundled of [false, true]) for (const vertex of [false, true])
+test(`${bundled ? 'bundled' : 'ordinary SHARED'} ${vertex ? 'generated' : 'shader-only'} storage retains each preceding compute upload`, async t => {
+  const f = fixture(t), colors = N.attributeArray(4, 'vec3'), attribute = colors.value;
+  attribute.array.fill(.125);
+  f.scene.fogNode = N.fog(vertex ? colors.toAttribute().add(colors.element(0)) : colors.element(0), N.float(.5));
+  if (bundled) {
+    const group = new T.BundleGroup(); group.add(f.mesh); f.scene.add(group);
+  }
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  const encoded = f.device.bundleEncoders.length;
+  attribute.array.fill(.25); attribute.needsUpdate = true;
+  f.renderer.compute(kernel(colors)); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99); attribute.array[0] = .75; attribute.addUpdateRange(0, 1); attribute.needsUpdate = true;
+  f.renderer.compute(kernel(colors)); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99);
+  await drain(f.renderer);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device);
+  assert.equal(selected.length, 4);
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.125, .25, .75, .75]);
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[1]), [.125, .25, .25, .25], 'partial uploads leave unrequested words GPU-stale');
+  assert.ok(selected.every(draw => (!vertex || [...draw.streams.values()].includes(buffer)) && shaderStorage(draw).includes(buffer)));
+  if (bundled) assert.equal(f.device.bundleEncoders.length, encoded + (vertex ? 2 : 0), 'unchanged captured versions reuse their native command bundle');
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 3,
+    'retained bindings never restore earlier snapshots or later unrequested CPU writes');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('repeated retained vertex refreshes retire old geometry while unchanged versions stay warm', async t => {
+  const f = fixture(t), colors = N.attributeArray(4, 'vec3'), group = new T.BundleGroup();
+  f.scene.fogNode = N.fog(colors.toAttribute(), N.float(.5));
+  group.add(f.mesh); f.scene.add(group);
+  const update = kernel(colors);
+  await f.renderer.init(); await f.renderer.compileComputeAsync(update);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const alive = () => f.device.buffers.filter(buffer => !buffer.destroyed).length;
+  const liveBuffers = alive(), geometryBytes = f.renderer.info.memory.attributesSize;
+  for (let version = 1; version <= 64; version++) {
+    colors.value.array[0] = version / 64; colors.value.needsUpdate = true;
+    f.renderer.compute(update); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+    assert.equal(alive(), liveBuffers, 'replaced metadata retires the old native geometry buffers');
+    assert.equal(f.renderer.info.memory.attributesSize, geometryBytes);
+  }
+  const encoded = f.device.bundleEncoders.length;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(f.device.bundleEncoders.length, encoded);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.renderer.dispose(); assert.equal(alive(), 0);
+});

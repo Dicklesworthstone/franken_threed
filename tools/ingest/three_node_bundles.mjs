@@ -31,7 +31,7 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
       const value = owner[key];
       if (typeof value !== 'function') return value;
       if (!methods.has(key)) methods.set(key, key === 'captureBinding' || key === 'capture' || key === 'captureShared' ||
-          key === 'refreshIndirect' || key === 'captureIndirectAlias'
+          key === 'refreshIndirect' || key === 'refreshStorage' || key === 'captureIndirectAlias'
         ? (...args) => { const token = value.apply(owner, args); return token === null ? null : retain(token); } : value.bind(owner));
       return methods.get(key);
     }});

@@ -701,7 +701,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (captured.fogResources || reuseResources) {
         const retainStorage = lease => {
           const alias = draw.nodeIndirect ? storageOwner.captureIndirectAlias(lease, draw.nodeIndirect.lease) : null;
-          const retained = alias ?? storageOwner.retain(lease);
+          const retained = alias ?? storageOwner.refreshStorage(lease) ?? storageOwner.retain(lease);
           storageUses.push(retained); return retained;
         };
         draw.nodeStorage = Object.freeze(draw.nodeStorage.map(binding =>
@@ -709,6 +709,21 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.nodeVertexStorage = Object.freeze((draw.nodeVertexStorage ?? []).map(lease => {
           const retained = retainStorage(lease); vertexStorageUses.push(retained); return retained;
         }));
+        if (draw.nodeVertexStorage.length && draw.bundleGeometry) {
+          const refreshed = draw.bundleGeometry.refreshStorage(attribute => {
+            for (const lease of draw.nodeVertexStorage) {
+              const view = storageOwner.refreshVertexAttribute(lease, attribute);
+              if (view !== null) return view;
+            }
+            return null;
+          });
+          if (refreshed) {
+            bundleGeometries.push(refreshed); draw.bundleGeometry = refreshed;
+            const previous = draw.binding;
+            draw.binding = Object.freeze({...previous, programGeometry: refreshed.geometry});
+            compiledBindings.delete(previous); compiledBindings.add(draw.binding);
+          }
+        }
       }
       if (draw.nodeBundle) draw.bundleStorageOwner = storageOwner;
       if (updateContext.fogRenderContext !== undefined && !captured.fogResources)

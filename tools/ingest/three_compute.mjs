@@ -11,7 +11,7 @@
  * readback or CPU upload is introduced. Sampled image/canvas inputs retain
  * private call-time pixels through the same source texture owner. */
 import {createGpuCompute} from './gpu_compute.mjs';
-import {captureComputeAttributeView} from './gpu_compute_attributes.mjs';
+import {captureComputeAttributeView, refreshComputeAttributeView} from './gpu_compute_attributes.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
 import {createGpuThreeTextures} from './three_textures.mjs';
@@ -169,6 +169,12 @@ function createThreeCompute(renderer, three) {
     }
     return versions.values();
   }
+  function admittedRead(previous) {
+    // Retained bindings observe uploads admitted before this logical render.
+    // Never scan current CPU data or select a later queued version at submit.
+    const pending = captured.get(previous.key), resident = uploaded.get(previous.key);
+    return pending && (pending.data || pending === resident) ? pending : resident ?? previous;
+  }
   const storageReads = Object.freeze({
     captureDispatch(run) {
       live();
@@ -191,12 +197,20 @@ function createThreeCompute(renderer, three) {
       // Reused source bindings still read the current GPU allocation. Select
       // only an upload already admitted before this render: never scan current
       // CPU data, and never resolve a later queued compute version at submit.
-      const pending = captured.get(previous.key), resident = uploaded.get(previous.key);
-      const record = pending && (pending.data || pending === resident) ? pending : resident ?? previous;
+      const record = admittedRead(previous);
       if (record.byteLength !== previous.byteLength)
         fail('INDIRECT', 'A reused indirect command cannot replace its captured buffer allocation size');
       const next = Object.freeze({});
       record.refs++; readLeases.set(next, {record, writable: false, indirect: true, released: false});
+      return next;
+    },
+    refreshStorage(lease) {
+      const previous = readRecord(lease), record = admittedRead(previous);
+      if (record === previous) return null;
+      if (record.byteLength !== previous.byteLength)
+        fail('STORAGE', 'A retained storage binding cannot replace its captured buffer allocation size');
+      const value = readLeases.get(lease), next = Object.freeze({});
+      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect, released: false});
       return next;
     },
     captureIndirectAlias(lease, indirectLease) {
@@ -216,6 +230,10 @@ function createThreeCompute(renderer, three) {
     vertexAttribute(lease, view) {
       const record = readRecord(lease);
       return captureComputeAttributeView(device, record.key, view);
+    },
+    refreshVertexAttribute(lease, view) {
+      const record = readRecord(lease);
+      return refreshComputeAttributeView(device, record.key, view, record.version);
     },
     withReads(leases, run) {
       const records = [...validateReads(leases)];
