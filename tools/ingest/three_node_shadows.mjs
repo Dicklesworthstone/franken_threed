@@ -8,6 +8,17 @@ const reject = message => {
   error.name = 'ThreeNodeProgramError'; error.code = 'THREE_NODE_PROGRAM_SHADOW'; throw error;
 };
 
+/** ShadowNode selects a truthy callable filter during source graph construction.
+ * Do not invoke it during preflight: generated resources and writes pass through
+ * the ordinary native node admission after the retained builder expands it.
+ */
+export function inspectThreeNativeShadowFilter(shadow) {
+  const filter = shadow.filterNode || null;
+  if (filter !== null && typeof filter !== 'function')
+    reject('Native shadow filters require a callable source TSL filter');
+  return filter;
+}
+
 /** Register the exact source caster selector before updateShadow installs it.
  * Direct ShadowNode subclasses retain the source update lifecycle, as the
  * registered SunLight addon does; their constructed graphs are still admitted
@@ -27,8 +38,9 @@ export function registerThreeNativeShadow(three, renderer, node) {
     reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
   if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type) || renderer.shadowMap.transmitted)
     reject('Native shadow maps require Basic, PCF or VSM filtering without transmitted shadows');
-  if (node.shadow.filterNode != null || node.shadow.shadowNode != null && node.shadow.shadowNode !== node)
-    reject('Custom shadow filter and shadow replacement nodes require an explicit native adapter');
+  inspectThreeNativeShadowFilter(node.shadow);
+  if (node.shadow.shadowNode != null && node.shadow.shadowNode !== node)
+    reject('Shadow replacement nodes require an explicit native adapter');
   const passSource = point ? three.PointShadowNode.prototype : source;
   if (['setup', 'updateBefore', 'updateShadow', 'dispose', '_reset', 'getShadowFilterFn', 'setupShadowCoord', 'setupShadowFilter']
       .some(key => node[key] !== passSource[key]) ||

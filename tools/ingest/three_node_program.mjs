@@ -29,7 +29,7 @@
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
 import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
-import {registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
+import {inspectThreeNativeShadowFilter, registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
@@ -466,15 +466,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (light.map != null || light.colorNode != null)
         fail('LIGHTS', 'Native lit graph projected maps and custom light color nodes are not admitted');
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
+      const filter = shadow ? inspectThreeNativeShadowFilter(shadow) : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
           ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
-          shadow.filterNode != null || shadow.shadowNode != null ||
+          shadow.shadowNode != null ||
           ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
         fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF/VSM maps');
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
         id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
-        renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true];
+        renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
+        filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null];
     }));
   }
   function checkAnalyticLight(node, lights) {

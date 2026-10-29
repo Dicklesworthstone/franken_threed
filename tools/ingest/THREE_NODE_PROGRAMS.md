@@ -677,7 +677,22 @@ Point lights under global VSM keep the source six-face cube comparison filter
 and do not create moment passes. Registered SunLight keeps the source two-tile
 PCF atlas fallback and warning; its source vsmPass is empty. This does not add
 variance filtering to the SunLight atlas. Transmitted shadows and custom shadow
-filter/replacement nodes remain outside the admitted profile.
+replacement nodes remain outside the admitted profile.
+
+Authored `LightShadow.filterNode` functions now construct their source filter
+graphs on the native path. Both TSL `Fn` filters and ordinary callable filters
+use the pinned shadow inputs, samplers, pass ordering and update lifecycle.
+Filter-generated resources go through the same graph admission as material
+nodes, so unsupported storage writes still fail before GPU submission. Queued
+receiver draws retain their own filter-uniform values.
+
+The pinned `ShadowNode` caches its constructed output. Assigning a new filter
+alone does not replace that output; the source shadow lifecycle must reset it
+(for example, `light.dispose()` followed by material invalidation). Native
+program keys include filter identity without overriding that source behavior.
+Five focused `three_renderer_shadow_filters.test.mjs` cases exercise directional
+and spot filters, Basic/PCF comparison sampler defaults, queued uniforms,
+replacement, callable admission and rejection of generated writes.
 
 Seven focused recording-device cases cover directional and spot moments,
 queued resize/uniform history, explicit disposal, ordinary-material routing,
@@ -925,7 +940,7 @@ atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids and other custom light models, transmitted shadows,
-custom shadow filter/replacement nodes, projected light maps and custom
+custom shadow replacement nodes, projected light maps and custom
 `lightsNode` graphs remain missing.
 Video textures, and compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require
