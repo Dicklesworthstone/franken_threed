@@ -37,23 +37,37 @@ half-float encodings and float32 payloads, without color-space conversion.
 A transfer is not sampling: float32 copies do not require `float32-filterable`
 and do not create a sampler or impose the texture's filtering preferences.
 Integer storage formats cannot be copied to currently admitted float/color
-render-target formats. Depth textures and cube endpoints are not admitted by
-this texture-shaped bridge.
+render-target formats. Depth textures and cube destinations are not admitted by
+this texture-shaped bridge. Cube sources address their six native array layers.
 
 `Box2`/`Box3`, `Vector2`/`Vector3` and source/destination level arguments retain
 the existing storage-copy planner. Coordinates are native top-left texels of
-the chosen mip. A selected array slice can move between a StorageArrayTexture
-and a 2D render target. Copying a complete multilayer array into one target face
-is not inferred; select one layer with a Box3. Native 3D/2D cross-dimension
-copies are rejected.
+the chosen mip. Array layers and volume slices can move between compatible
+2D, array and 3D native images. A whole multilayer source does not fit a single
+2D destination: select one slice with a Box3. Mip width and height shrink at
+each level; volume depth also shrinks, while array layer counts stay constant.
 
 Target sources may read an allocated mip or a multisampled target's resolved
 single-sample color image. Storage destinations may write allocated mip levels;
 their captured auto-update policy still determines subsequent mip generation.
-Target destinations must be single-sample and write **level zero**. Their
-existing generated mip chain becomes dirty, regenerating on subsequent use,
-never before the external write. No implicit multisample replication or resolve
-into a destination is introduced.
+Target destinations must be single-sample. Explicitly authored mip chains
+(`generateMipmaps: false`) accept independently selected source and destination
+levels in the existing native allocation, including non-primary MRT colors,
+array layers and volume slices. The planner checks both levels and mip-local
+bounds before either endpoint is borrowed. The copy does not regenerate or
+replace neighboring levels, layers or attachments.
+
+Automatically generated target chains still accept writes only at **level zero**.
+Their existing mip chain becomes dirty, regenerating on subsequent use, never
+before the external write. Writing a derived level is refused because a later
+refresh would overwrite it. No implicit multisample replication or resolve into
+a destination is introduced.
+
+```js
+// Both chains must already allocate these levels, and the chosen extents must fit.
+// target.textures[1].generateMipmaps is false for its authored chain.
+renderer.copyTextureToTexture(simulation, target.textures[1], null, null, 1, 2);
+```
 
 ## Ordering and ownership
 
@@ -68,7 +82,10 @@ fences do not hold up later copy submissions.
 Both owners' allocation budgets, device limits, generation identities and
 nonreentrancy constraints are checked before either endpoint is allocated.
 Copies borrow existing native images synchronously. They add no readback buffer,
-intermediate texture, UV replica or per-copy completion fence.
+intermediate texture, UV replica or per-copy completion fence. Captured target
+generations retain the existing single-submission lease, including admission
+failure, cancellation and disposal. Final identity/device checks run after
+command finalization and before submission.
 
 A storage-to-target write marks only the selected color's relevant state dirty.
 A secondary MRT write does not refresh the unchanged primary WebGL sampling
@@ -97,16 +114,32 @@ boundary with an independently verified compute execution result.
 
 ## Verification scope
 
-The three focused suites execute production source/native target owners, the
-storage owner, source copy facade, pixel upload/readback helper and transfer
-planners. Source-class descriptors, the renderer queue/compute-turn driver and
-GPU calls are recording doubles. Independent byte arrays verify selected
-attachment/layer/mip routing, unchanged neighbors, queued history and bit
-preservation. They do not compile WGSL, rasterize MSAA, run the full renderer
+The three focused integration suites execute production source/native target
+owners, the storage owner, source copy facade, pixel upload/readback helper and
+transfer planners. Source-class descriptors, the renderer queue/compute-turn
+driver and GPU calls are recording doubles. Independent byte arrays verify
+selected attachment/layer/mip routing, unchanged neighbors, queued history and
+bit preservation. They do not compile WGSL, rasterize MSAA, run the full renderer
 class, establish pinned-source browser pixel parity, or measure performance.
 
 ```sh
 node --test tools/ingest/three_target_storage_mrt_copy.test.mjs \
   tools/ingest/three_storage_target_copy.test.mjs \
   tools/ingest/three_storage_target_facade.test.mjs
+```
+
+The additional `three_target_texture_copy_mips.test.mjs` suite executes the
+production captures, lifetime helper and copy planner against recording owner
+contracts and an independent byte-copy oracle. It covers independently selected
+mips, MRT preservation, multi-slice copies, full-chain round trips, immutable
+capture coordinates, GPU-time source contents, generated-level rejection,
+validation dependencies, budget failures and finalization-time disposal. Its
+integer-format cases test bit preservation at the planner boundary, not
+admission by real render-target owners. `three_target_texture_copy.test.mjs`
+checks the shared lifetime scheduler and cube-source contract. Neither suite
+substitutes for the integration or browser checks above.
+
+```sh
+node --test tools/ingest/three_target_texture_copy.test.mjs \
+  tools/ingest/three_target_texture_copy_mips.test.mjs
 ```

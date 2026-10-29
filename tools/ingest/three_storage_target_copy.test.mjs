@@ -175,10 +175,10 @@ for (const budget of ['target', 'storage']) test(`${budget} budget fails before 
   assert.throws(() => request.issue(), /BUDGET/); assert.equal(f.calls.textures.length, 0); f.dispose();
 });
 
-test('MSAA destinations, higher target levels, format conversions and out-of-range slices remain explicit refusals', () => {
+test('MSAA destinations, higher generated target levels, format conversions and out-of-range slices remain explicit refusals', () => {
   const f = fixture(), source = storageTexture(), destination = target();
   assert.throws(() => capture(f, source, target({samples: 4}).texture), /SAMPLES/);
-  assert.throws(() => capture(f, source, target({mips: 2}).texture, null, null, 0, 1), /LEVEL/);
+  assert.throws(() => capture(f, source, target({generateMipmaps: true}).texture, null, null, 0, 1), /LEVEL/);
   assert.throws(() => capture(f, source, target({colors: ['rgba16float']}).texture), /FORMAT/);
   const volume = storageTexture(); volume.is3DTexture = true;
   assert.doesNotThrow(() => capture(f, volume, destination.texture));

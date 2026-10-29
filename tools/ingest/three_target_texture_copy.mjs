@@ -66,7 +66,8 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
   });
 }
 
-/** Copy a storage mip or array layer into a selected single-sample target color.
+/** Copy storage mips, array layers or volume slices into an authored target mip.
+ * The selected color must be single-sample; its native allocation stays shared.
  * Keep GPU contents at the submission point, while the source-shaped box,
  * destination position, formats and attachment identities are captured now.
  */
@@ -79,7 +80,10 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
     const destination = targetColor(renderer, destinationTexture, retain);
     if (destination.entry.shape.cube) fail('SOURCE', 'Cube target destinations require explicit face-aware write support');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Storage copies require a single-sample target destination');
-    if (destinationLevel !== 0) fail('LEVEL', 'Storage copies write target mip zero; derived mips regenerate on demand');
+    // Explicitly authored levels already share this native allocation. Never
+    // write a derived level: the next automatic mip refresh would overwrite it.
+    if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
+      fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
     const source = storage.capture(texture);
     const plan = inspectStorageTextureCopy(source.shape, destination.shape, region, position, sourceLevel, destinationLevel);
     return {empty: plan.empty, issue() {
@@ -95,7 +99,7 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
         storage.withTexture(source, nativeSource => targets.withNativeColorDestination(destination.source, nativeDestination => {
           const encoder = device.createCommandEncoder({label: 'f3d-storage-to-target-copy'});
           encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
-            {texture: nativeDestination, mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+            {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
           const commands = encoder.finish();
           destination.check(); storage.assertCurrent(source); checkRenderer(renderer, device);
           device.queue.submit([commands]);
