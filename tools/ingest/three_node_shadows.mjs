@@ -19,6 +19,20 @@ export function inspectThreeNativeShadowFilter(shadow) {
   return filter;
 }
 
+/** The source cube constructor replaces its color texture without an owner
+ * pointer. Register that private target before WGSL asks for its sample layout;
+ * capture() records metadata only and observes the final depth attachment later.
+ */
+export function installThreeNativeShadowTargets(renderer, builder) {
+  if (typeof renderer._targets?.capture !== 'function') return;
+  const create = builder.createCubeRenderTarget;
+  builder.createCubeRenderTarget = function(...args) {
+    const target = create.apply(this, args);
+    renderer._targets.capture(target);
+    return target;
+  };
+}
+
 /** Register the exact source caster selector before updateShadow installs it.
  * Direct ShadowNode subclasses retain the source update lifecycle, as the
  * registered SunLight addon does; their constructed graphs are still admitted
@@ -36,8 +50,8 @@ export function registerThreeNativeShadow(three, renderer, node) {
       !(node.shadow instanceof three.LightShadow) || !point && node.shadow.isPointLightShadow ||
       ordinary && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
     reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
-  if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type) || renderer.shadowMap.transmitted)
-    reject('Native shadow maps require Basic, PCF or VSM filtering without transmitted shadows');
+  if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type))
+    reject('Native shadow maps require Basic, PCF or VSM filtering');
   inspectThreeNativeShadowFilter(node.shadow);
   if (node.shadow.shadowNode != null && node.shadow.shadowNode !== node)
     reject('Shadow replacement nodes require an explicit native adapter');

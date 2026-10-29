@@ -29,7 +29,8 @@
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
 import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
-import {inspectThreeNativeShadowFilter, registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
+import {inspectThreeNativeShadowFilter, installThreeNativeShadowTargets,
+  registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
@@ -482,7 +483,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
       const filter = shadow ? inspectThreeNativeShadowFilter(shadow) : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
-          ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) || renderer.shadowMap.transmitted ||
+          ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) ||
           shadow.shadowNode != null ||
           ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
@@ -1054,6 +1055,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
     const builder = new three.WGSLNodeBuilder(object, renderer);
     effects.installBuilder(builder);
+    installThreeNativeShadowTargets(renderer, builder);
     builder.material = material; builder.context.material = material;
     builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
     builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>

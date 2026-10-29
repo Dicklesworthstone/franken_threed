@@ -703,8 +703,25 @@ semantics remain in force.
 Point lights under global VSM keep the source six-face cube comparison filter
 and do not create moment passes. Registered SunLight keeps the source two-tile
 PCF atlas fallback and warning; its source vsmPass is empty. This does not add
-variance filtering to the SunLight atlas. Transmitted shadows and custom shadow
-replacement nodes remain outside the admitted profile.
+variance filtering to the SunLight atlas. Custom shadow replacement nodes remain
+outside the admitted profile.
+
+`renderer.shadowMap.transmitted = true` now routes ordinary materials through
+the same native shadow owner. Directional and spot receivers sample the source
+RGBA shadow map alongside its depth map; point receivers sample the source cube
+color/depth pair after all six caster faces. Source `castShadowNode` color and
+alpha, transparent and transmission caster handling, and `NoBlending` remain in
+the retained shadow material construction. This does not infer colored optical
+transmission beyond the source's own shadow graph.
+
+Queued transmitted shadows retain their captured tint, alpha and matching color
+and depth generations across map resizes. Point-shadow compilation registers
+cube target metadata before sampling without allocating GPU images. Changes to
+transmitted mode or `shadow.mapType` follow the source cached-graph lifecycle;
+the source light must reset before those constructed resources change. Nine
+focused `three_renderer_transmitted_shadows.test.mjs` cases check these paths,
+compile-only registration, material restoration and rejection of generated
+storage writes. These are resource/command checks, not GPU pixel comparisons.
 
 Authored `LightShadow.filterNode` functions now construct their source filter
 graphs on the native path. Both TSL `Fn` filters and ordinary callable filters
@@ -966,7 +983,7 @@ This is a bounded native graphics entrance, not full TSL coverage. Writable or
 atomic graphics storage, standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
-Light-probe grids and other custom light models, transmitted shadows,
+Light-probe grids and other custom light models,
 custom shadow replacement nodes and custom
 `lightsNode` graphs remain missing.
 Video textures, and compressed, depth/comparison, array, volume, storage,
