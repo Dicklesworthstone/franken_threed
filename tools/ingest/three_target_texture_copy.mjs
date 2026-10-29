@@ -3,6 +3,7 @@
  * The renderer facade schedules the captured request in its ordinary FIFO.
  */
 import {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
+import {inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 import {captureTextureCopy} from './three_texture_copy_lifetime.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 
@@ -102,6 +103,52 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
         resolve(storage.validation);
         return true;
       } catch (error) { reject(error); throw error; }
+    }};
+  });
+}
+
+/** Source-shaped cube/array/volume color copies through the target owner's
+ * existing face-aware transfer path. One accepted range has one FIFO slot;
+ * each slice keeps the same owner validation, mip and history-color policy.
+ */
+export function captureTargetColorCopy(renderer, texture, destinationTexture,
+  region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
+  const targets = renderer._targets, device = renderer._device;
+  if (!targets || !device) fail('DEVICE', 'Initialize the renderer and its target owner before copying');
+  return captureTextureCopy(renderer, retain => {
+    const source = targetColor(renderer, texture, retain), destination = targetColor(renderer, destinationTexture, retain);
+    if (source.entry === destination.entry || source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup)
+      fail('FEEDBACK', 'In-place target color copies are not admitted');
+    if (destinationLevel !== 0) fail('LEVEL', 'Target color copies write mip zero; derived mips remain owner-managed');
+    if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Target color copies require a single-sample destination');
+    // Native copies preserve bits across sRGB view-compatible formats. The
+    // target transfer planner below still validates the original formats.
+    const compatible = shape => ({...shape, format: shape.format.replace(/-srgb$/, '')});
+    const plan = inspectStorageTextureCopy(compatible(source.shape), compatible(destination.shape),
+      region, position, sourceLevel, destinationLevel);
+    const [sourceX, sourceY, sourceFace] = plan.sourceOrigin, [x, y, face] = plan.destinationOrigin;
+    const [width, height, count] = plan.size;
+    const base = Object.freeze({sourceX, sourceY, x, y, width, height, sourceMipLevel: sourceLevel,
+      sourceColorIndex: source.source.colorIndex, colorIndex: destination.source.colorIndex, flipY: false});
+    const step = index => ({...base, sourceFace: sourceFace + index, face: face + index});
+    // Extents are contiguous; the checked XYZ plan plus both endpoint slices
+    // validates every middle layer without building an unbounded request list.
+    if (!plan.empty) {
+      inspectGpuTargetCopy(source.entry.shape, destination.entry.shape, step(0));
+      inspectGpuTargetCopy(source.entry.shape, destination.entry.shape, step(count - 1));
+    }
+    return {empty: plan.empty, issue() {
+      checkRenderer(renderer, device); source.check(); destination.check();
+      if (plan.empty) return false;
+      source.preflight(); destination.preflight();
+      // Admit the combined allocation, not two individually affordable owners.
+      // No layer may be written before all destination extents/budgets pass.
+      targets.validateNativeTextures([source.source, destination.source]);
+      for (let index = 0; index < count; index++) {
+        checkRenderer(renderer, device); source.check(); destination.check();
+        targets.copyColor(source.entry, destination.entry, step(index));
+      }
+      return true;
     }};
   });
 }

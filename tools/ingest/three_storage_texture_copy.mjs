@@ -1,7 +1,7 @@
 /** Source-shaped, queue-ordered GPU texture copies. */
 import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
 import {ThreeStorageCopyError} from './three_texture_copy_plan.mjs';
-import {captureTargetToStorageCopy, captureStorageToTargetCopy} from './three_target_texture_copy.mjs';
+import {captureTargetToStorageCopy, captureStorageToTargetCopy, captureTargetColorCopy} from './three_target_texture_copy.mjs';
 import {submitTextureCopy} from './three_texture_copy_lifetime.mjs';
 import {copySampledTexture} from './three_sampled_texture_copy.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
@@ -30,8 +30,10 @@ export function withStorageTextureCopies(Base) {
       assertThreeNativeTextureWrite(this, destination);
       // The target transfer facade installs source methods per instance. This
       // inherited method suppresses that installation, so super cannot reach it.
-      // Dispatch only two ordinary target endpoints; storage admission stays here.
-      if (ordinaryTargetTexture(source) && ordinaryTargetTexture(destination) &&
+      // Keep WebGL/depth and pre-initialization behavior on that original path.
+      // Initialized native color copies additionally address faces and layers.
+      const nativeTargets = this.isWebGPURenderer && this._initialized && targetColor(source) && targetColor(destination);
+      if (!nativeTargets && ordinaryTargetTexture(source) && ordinaryTargetTexture(destination) &&
           typeof this._transfers?.copyTexture === 'function') {
         this._transfers.copyTexture(source, destination, region, position, sourceLevel, destinationLevel)
           .catch(error => { this._deferredError ??= error; });
@@ -44,7 +46,9 @@ export function withStorageTextureCopies(Base) {
         this._deferredError ??= error;
       };
       let request;
-      if (targetColor(source) && destination?.isStorageTexture) {
+      if (nativeTargets) {
+        request = captureTargetColorCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
+      } else if (targetColor(source) && destination?.isStorageTexture) {
         request = captureTargetToStorageCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
       } else if (source?.isStorageTexture && targetColor(destination)) {
         request = captureStorageToTargetCopy(this, source, destination, region, position, sourceLevel, destinationLevel);

@@ -1,4 +1,5 @@
 /** Recording contracts, not a WebGPU implementation or a pixel oracle. */
+import {inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 export const box = (x, y, z, width, height, depth) => ({isBox3: true,
   min: {x, y, z}, max: {x: x + width, y: y + height, z: z + depth}});
 export const point = (x, y, z) => ({isVector3: true, x, y, z});
@@ -34,6 +35,17 @@ export function targetCopyFixture() {
         if (source.entry.shape.layers > device.limits.maxTextureArrayLayers && !source.entry.shape.volume) throw failure('LAYERS');
       }
       if (targets.budgetError) throw targets.budgetError;
+    },
+    copyColor(source, destination, options) {
+      targets.assertCurrent(source); targets.assertCurrent(destination);
+      const plan = inspectGpuTargetCopy(source.shape, destination.shape, options);
+      if (plan.empty) return false;
+      targets.onCopy?.(source, destination, options);
+      events.push('target-copy');
+      commands.push({from: {texture: source.native[plan.sourceColorIndex], origin: plan.sourceOrigin, mipLevel: plan.sourceMipLevel},
+        to: {texture: destination.native[plan.colorIndex], origin: plan.destinationOrigin, mipLevel: 0}, size: plan.size,
+        sourceStamp: source.stamp, options});
+      return true;
     },
     withNativeTexture(source, run) {
       events.push('source-borrow'); targets.assertCurrent(source.entry);
