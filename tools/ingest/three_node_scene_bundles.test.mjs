@@ -7,7 +7,7 @@ import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
-function fixture(t) {
+function fixture(t, {camera: selectedCamera} = {}) {
   const renderer = {library: new T.StandardNodeLibrary(), contextNode: T.TSL.context(),
     debug: {diagnostics: {keywords: false}}, depth: true, lighting: {enabled: true},
     backend: {hasFeature: () => false, capabilities: {getUniformBufferLimit: () => 65536}},
@@ -15,7 +15,7 @@ function fixture(t) {
     currentSamples: 1, sortObjects: true, opaque: true, transparent: true,
     _nodes: {nodeFrame: new T.NodeFrame()}, info: {calls: 1}};
   const programs = createThreeNodePrograms({three: T, renderer}), bundles = createThreeNodeBundles(T);
-  const scene = new T.Scene(), group = new T.BundleGroup(), camera = new T.PerspectiveCamera(50, 1, .1, 100);
+  const scene = new T.Scene(), group = new T.BundleGroup(), camera = selectedCamera ?? new T.PerspectiveCamera(50, 1, .1, 100);
   camera.position.z = 5; scene.add(group);
   const frames = [], released = new Set(), release = frame => {
     if (released.has(frame)) return;
@@ -37,6 +37,59 @@ function fixture(t) {
   return {renderer, programs, bundles, scene, group, camera, capture, mesh, release};
 }
 const uniform = (draw, name) => draw.nodeUniforms[draw.binding.nodeProgram.groups.findIndex(group => group.name === name)];
+
+function arrayCamera() {
+  const children = [-.3, .4].map(x => {
+    const child = new T.PerspectiveCamera(50, 1, .1, 100);
+    child.position.set(x, 0, 5); child.lookAt(0, 0, 0); child.updateMatrixWorld();
+    return child;
+  });
+  return new T.ArrayCamera(children);
+}
+
+test('ArrayCamera bundle records retain child selection and refresh matrices without replaying object callbacks', t => {
+  const f = fixture(t, {camera: arrayCamera()});
+  let updates = 0, before = 0, after = 0;
+  const material = new T.MeshBasicNodeMaterial();
+  material.colorNode = T.TSL.uniform(.5).onObjectUpdate(({camera}) => {
+    assert.equal(camera, f.camera); updates++; return .5;
+  });
+  const object = f.mesh(material); object.frustumCulled = false;
+  object.onBeforeRender = () => { before++; }; object.onAfterRender = () => { after++; };
+  const cold = f.capture().draws[0], old = uniform(cold, 'render').slice();
+  assert.deepEqual(cold.nodeViews.map(view => view.index), [0, 1]);
+  assert.deepEqual([updates, before, after], [1, 1, 1]);
+  f.camera.cameras[0].position.z = 8; f.camera.cameras[0].updateMatrixWorld();
+  f.camera.cameras[1].layers.set(7); object.layers.set(9);
+  // These viewport definitions are never read by a warm source bundle.
+  for (const child of f.camera.cameras) child.viewport = new T.Vector4(3, 5, 16, 20);
+  const warm = f.capture().draws[0];
+  assert.deepEqual(warm.nodeViews.map(view => view.index), [0, 1]);
+  assert.ok(warm.nodeViews.every(view => view.viewport === null));
+  assert.notDeepEqual(uniform(warm, 'render'), old);
+  assert.deepEqual(uniform(cold, 'render'), old);
+  assert.deepEqual([updates, before, after], [2, 1, 1]);
+  f.group.needsUpdate = true; object.layers.set(0);
+  assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_CAMERA'});
+  for (const child of f.camera.cameras) child.viewport = undefined;
+  const rebuilt = f.capture().draws[0];
+  assert.deepEqual(rebuilt.nodeViews.map(view => view.index), [0]);
+});
+
+test('ArrayCamera static bundle camera updates retain object values and cold empty view selections', t => {
+  const f = fixture(t, {camera: arrayCamera()}), object = f.mesh(); object.frustumCulled = false;
+  object.layers.set(2); f.camera.layers.enable(2);
+  const cold = f.capture().draws[0];
+  assert.deepEqual(cold.nodeViews, []);
+  f.camera.cameras[0].layers.enable(2); object.position.x = 3; object.material.color.setRGB(.2, .4, .6);
+  const warm = f.capture().draws[0];
+  assert.deepEqual(warm.nodeViews, []);
+  assert.deepEqual(uniform(warm, 'object'), uniform(cold, 'object'));
+  f.group.needsUpdate = true;
+  const rebuilt = f.capture().draws[0];
+  assert.deepEqual(rebuilt.nodeViews.map(view => view.index), [0]);
+  assert.notDeepEqual(uniform(rebuilt, 'object'), uniform(cold, 'object'));
+});
 
 test('source bundles keep recorded selection, ranges and geometry through warm source edits', t => {
   const f = fixture(t), object = f.mesh(), geometry = object.geometry, material = object.material;
@@ -177,7 +230,7 @@ test('failed bundle replacement retains the previous cache and unwinds new resou
   assert.equal(refs, 1); assert.equal(released, 1); assert.equal(selection.entry.draws.length, 1);
 });
 
-async function gpuFixture(t) {
+async function gpuFixture(t, {camera: selectedCamera} = {}) {
   const device = geometryDevice(); device.limits.maxTextureDimension2D = 8192;
   device.limits.maxBindingsPerBindGroup = 1000;
   device.createTexture = desc => ({dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...desc,
@@ -190,12 +243,77 @@ async function gpuFixture(t) {
     getCurrentTexture: () => device.createTexture({size: [64, 64], format: configured.format, usage: 16})})};
   const Renderer = createWebGPURendererClass(T), renderer = new Renderer({canvas, device});
   renderer.outputColorSpace = T.LinearSRGBColorSpace;
-  const scene = new T.Scene(), group = new T.BundleGroup(), camera = new T.PerspectiveCamera(50, 1, .1, 100);
+  const scene = new T.Scene(), group = new T.BundleGroup(), camera = selectedCamera ?? new T.PerspectiveCamera(50, 1, .1, 100);
   camera.position.z = 5; scene.add(group);
   t.after(() => renderer.dispose()); await renderer.init();
   return {renderer, device, scene, group, camera};
 }
 const gpuDraws = device => device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'main');
+
+test('ArrayCamera bundled BatchedMesh refreshes once per side and replays retained view-first subdraws', async t => {
+  const f = await gpuFixture(t, {camera: arrayCamera()});
+  let updates = 0, selections = 0;
+  const material = new T.MeshBasicNodeMaterial({transparent: true, side: T.DoubleSide, opacity: .5});
+  material.colorNode = T.TSL.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
+  const batch = new T.BatchedMesh(4, 32, 48, material), geometry = new T.PlaneGeometry();
+  const id = batch.addGeometry(geometry);
+  for (const x of [-.5, .5]) batch.setMatrixAt(batch.addInstance(id), new T.Matrix4().makeTranslation(x, 0, 0));
+  batch.frustumCulled = false; batch.perObjectFrustumCulled = false;
+  batch.setCustomSort(list => { selections++; list.sort((a, b) => a.index - b.index); });
+  f.group.add(batch); t.after(() => { batch.dispose(); geometry.dispose(); material.dispose(); });
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.deepEqual([updates, selections], [2, 1]);
+  const location = f.renderer._nodeBundles.select(f.group, f.camera, null, null).entry.draws[0].binding.nodeProgram.cameraIndex;
+  const indexOf = draw => {
+    const {group, offsets} = draw.groups.get(location.group), resource = group.entries[0].resource;
+    const bytes = draw.contents.get(resource.buffer);
+    return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32((resource.offset ?? 0) + offsets[0] + location.offset, true);
+  };
+  const before = gpuDraws(f.device), ordinals = list => list.map(draw => draw.args[4]);
+  assert.deepEqual(ordinals(before), [0, 1, 0, 1, 0, 1, 0, 1]);
+  assert.deepEqual(before.map(indexOf), [0, 0, 1, 1, 0, 0, 1, 1]);
+  const entry = f.renderer._nodeBundles.select(f.group, f.camera, null, null).entry;
+  assert.equal(entry.draws.length, 2, 'two logical source render objects, not eight expanded commands');
+  batch.setVisibleAt(0, false); batch.layers.set(7); f.camera.cameras[1].layers.set(6);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const warm = gpuDraws(f.device).slice(before.length);
+  assert.deepEqual(ordinals(warm), ordinals(before)); assert.deepEqual(warm.map(indexOf), before.map(indexOf));
+  assert.deepEqual([updates, selections], [4, 1]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('ArrayCamera bundled draws inherit the last ordinary viewport and retain queued child layers', async t => {
+  const f = await gpuFixture(t, {camera: arrayCamera()});
+  const create = f.device.createCommandEncoder;
+  f.device.createCommandEncoder = () => {
+    const encoder = create();
+    return {...encoder, beginRenderPass(descriptor) {
+      const pass = encoder.beginRenderPass(descriptor), record = f.device.passes.at(-1);
+      return {...pass, setViewport(...value) { record.viewport = value; }};
+    }};
+  };
+  let callbacks = 0;
+  const bundled = new T.Mesh(new T.PlaneGeometry(), new T.MeshBasicNodeMaterial()); bundled.frustumCulled = false;
+  bundled.onBeforeRender = () => { callbacks++; }; f.group.add(bundled);
+  const ordinary = new T.Mesh(new T.BoxGeometry(), new T.MeshBasicNodeMaterial()); ordinary.frustumCulled = false;
+  ordinary.material.colorNode = T.TSL.color(0xffffff);
+  ordinary.onBeforeRender = () => {
+    f.camera.cameras[0].viewport = new T.Vector4(0, 0, 32, 32);
+    f.camera.cameras[1].viewport = new T.Vector4(16, 8, 40, 48);
+  };
+  f.scene.add(ordinary);
+  f.renderer.render(f.scene, f.camera);
+  bundled.layers.set(7); f.camera.cameras[1].layers.set(7);
+  f.renderer.render(f.scene, f.camera);
+  await f.renderer.waitForGPU();
+  const passes = f.device.passes.filter(pass => pass.draws.some(draw => draw.pipeline.vertex.entryPoint === 'main'));
+  assert.deepEqual(passes.map(pass => pass.draws[0].args[0]), [36, 36, 6, 6, 36, 6, 6]);
+  assert.deepEqual(passes.map(pass => pass.viewport), [[0, 0, 32, 32, 0, 1], [16, 8, 40, 48, 0, 1],
+    [16, 8, 40, 48, 0, 1], [16, 8, 40, 48, 0, 1],
+    [0, 0, 32, 32, 0, 1], [0, 0, 32, 32, 0, 1], [0, 0, 32, 32, 0, 1]]);
+  assert.equal(callbacks, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.ok(f.renderer._dispatcher.entry(f.scene).bridge.diagnostics.bundles.builds > 0);
+});
 
 test('native renderer executes ordinary draws before retained bundle commands without replaying updates', async t => {
   const f = await gpuFixture(t), seen = [];

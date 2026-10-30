@@ -209,7 +209,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const bundle = bundleMembers.get(object);
     const instancedGeometry = object.geometry?.isInstancedBufferGeometry === true;
     const batch = object.isBatchedMesh === true;
-    if (bundle && batch) fail('OBJECT', 'Source bundles currently require ordinary or CPU-instanced mesh draws');
     const originals = Array.isArray(object.material) ? object.material.slice() : [object.material];
     if (originals.length > maxNodes) fail('LIMIT', 'Native scene material array exceeds its budget');
     if (shadowPass && originals.some(original => original && original.allowOverride !== true))
@@ -319,8 +318,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
   inspectThreeNativeCamera(three, camera);
-  if (camera.isArrayCamera && bundleSelections.length)
-    fail('CAMERA', 'Native ArrayCamera bundles require additional per-view command ordering');
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
@@ -528,7 +525,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     storageUses.push(lease); vertexStorageUses.push(lease);
     return storageOwner.vertexAttribute(lease, view);
   };
-  const capturedDraws = [], sharedFogResources = [], indirectUploads = new Map();
+  const capturedDraws = [], capturedBundleDraws = [], sharedFogResources = [], indirectUploads = new Map();
   const preparedIndirectUses = [];
   let indirectCalls = 0;
   const captureIndirectUpload = (object, geometry) => {
@@ -680,8 +677,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (!hasIndirect && draw.binding.nodeProgram.instanceCapacity !== undefined &&
           draw.instanceCount > draw.binding.nodeProgram.instanceCapacity)
         fail('OBJECT', 'Native node instance count exceeds its captured matrix or color capacity');
-      const batchDraws = draw.bundleWarm ? null : captureThreeNativeBatch(draw.object, maxDraws - capturedDraws.length, fail, draw.instanceCount,
+      const batchDraws = draw.bundleWarm ? draw.bundleRanges ?? null : captureThreeNativeBatch(draw.object, maxDraws - capturedDraws.length, fail, draw.instanceCount,
         {wireframe: draw.binding.nodeProgram.wireframe === true, indexCount: captured.wireframeIndexCount});
+      if (draw.nodeBundle) draw.bundleRanges = batchDraws;
       // Indirect arguments are read by the GPU at execution, while their
       // source identity and byte offsets are selected before after-updates.
       // BatchedMesh owns its own direct subdraws and takes source precedence.
@@ -755,22 +753,37 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // WebGPUBackend.draw selects views after node/binding updates, before
       // updateAfter and the object's after hook. Nodes still see the parent and
       // run once per source material side, even when no child layer matches.
+      const recordedViews = draw.bundleWarm ? draw.nodeViews : null;
+      const viewPacket = (index, viewport) => {
+        const uniforms = draw.nodeUniforms.slice(), location = draw.binding.nodeProgram.cameraIndex;
+        if (location) {
+          const packet = uniforms[location.group].slice();
+          new DataView(packet.buffer, packet.byteOffset, packet.byteLength).setUint32(location.offset, index, true);
+          uniforms[location.group] = packet; bytes += packet.byteLength;
+          if (bytes > maxUniformBytes) fail('LIMIT', 'Native camera-index captures exceed the pending byte budget');
+        }
+        return Object.freeze({index, viewport: viewport ? Object.freeze(viewport) : null, uniforms: Object.freeze(uniforms)});
+      };
       draw.nodeViews = null;
-      if (camera.isArrayCamera && camera.cameras.length) {
+      if (draw.bundleWarm) {
+        // The source replays its recorded camera-index bindings and layer
+        // selection. Only the shared camera/object uniform data can refresh;
+        // adding a view, changing layers or defining viewports cannot rerecord
+        // a BundleGroup without its explicit version invalidation.
+        if (recordedViews !== null) draw.nodeViews = Object.freeze(recordedViews.map(view => viewPacket(view.index, null)));
+      } else if (camera.isArrayCamera && camera.cameras.length) {
         inspectThreeNativeCamera(three, camera);
         draw.nodeViews = Object.freeze(camera.cameras.flatMap((child, index) => {
           if (!draw.object.layers.test(child.layers)) return [];
+          // r186's authored BundleGroup uses one GPURenderBundleEncoder for
+          // ordinary targets. That encoder has no setViewport; viewport-less
+          // child draws inherit the pass viewport when the bundle executes.
+          if (draw.nodeBundle && child.viewport)
+            fail('CAMERA', 'Pinned ArrayCamera BundleGroup recording does not support child viewports');
           const viewport = child.viewport ? ['x', 'y', 'z', 'w'].map(key => child.viewport[key]) : null;
           if (viewport?.some(value => !Number.isFinite(value) || value < 0))
             fail('CAMERA', 'Native ArrayCamera viewports require nonnegative finite components');
-          const uniforms = draw.nodeUniforms.slice(), location = draw.binding.nodeProgram.cameraIndex;
-          if (location) {
-            const packet = uniforms[location.group].slice();
-            new DataView(packet.buffer, packet.byteOffset, packet.byteLength).setUint32(location.offset, index, true);
-            uniforms[location.group] = packet; bytes += packet.byteLength;
-            if (bytes > maxUniformBytes) fail('LIMIT', 'Native camera-index captures exceed the pending byte budget');
-          }
-          return [Object.freeze({index, viewport: viewport ? Object.freeze(viewport) : null, uniforms: Object.freeze(uniforms)})];
+          return [viewPacket(index, viewport)];
         }));
       }
       copies = afterCopies;
@@ -781,6 +794,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       draw.nodeFramebufferCopies = Object.freeze(beforeCopies);
       draw.nodeFramebufferAfterCopies = Object.freeze(afterCopies);
       Object.freeze(draw.nodeUniforms); Object.freeze(draw);
+      // Source renderObjects contains one entry per material-side invocation,
+      // not one per generated view or BatchedMesh subdraw. Warm refresh must
+      // keep that callback/resource multiplicity while retaining all commands.
+      if (draw.nodeBundle) capturedBundleDraws.push(draw);
       // One source material pass owns one NodeFrame/resource capture. The
       // backend loops its immutable subdraws without repeating user updates.
       // Copy effects remain at that pass's boundaries, not at every subdraw.
@@ -916,7 +933,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // executes their recorded GPU commands after the ordinary scene draws.
     // Warm records retain physical draw order and ignore current list flags.
     if (uniforms) for (const selection of bundleSelections) {
-      const first = capturedDraws.length;
+      const first = capturedBundleDraws.length;
       if (selection.warm) {
         programs ??= getPrograms();
         for (const recorded of selection.entry.draws) {
@@ -931,7 +948,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }
       // A later ordinary draw may invalidate this group. Record the source
       // version at the end of this bundle, not at the end of the scene.
-      capturedBundles.push({selection, draws: capturedDraws.slice(first),
+      capturedBundles.push({selection, draws: capturedBundleDraws.slice(first),
         version: selection.warm ? selection.entry.version : selection.group.version});
     }
     phases.opaque = listEnabled('opaque');

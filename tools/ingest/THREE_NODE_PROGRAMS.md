@@ -893,14 +893,49 @@ construct a new uniform layout without invalidating earlier accepted packets.
 The same route supports native `PassNode` scene output, ordinary/native mixed
 lists, and native instanced sprites. Framebuffer copy effects remain before or
 after the complete group of child views belonging to their source draw. Native
-array `BundleGroup` and `BatchedMesh` command ordering still require separate
-work and fail explicitly, as do XR, multiview and nested camera arrays.
+`BatchedMesh` and authored `BundleGroup` ordering are supported as described
+below. XR, multiview and nested camera arrays still fail explicitly.
 WebGL-authored ArrayCamera rendering keeps its existing boundary.
 
 `three_renderer_native_arrays.test.mjs` uses the pinned `renderObject` and
 `WebGPUBackend.draw` as an ordering oracle and inspects actual submitted uniform
 bytes and commands. These checks establish the tested execution behavior, not
 browser rasterization parity or a performance result.
+
+### Authored ArrayCamera bundles
+
+Source `BundleGroup` records now support ordinary native `ArrayCamera` targets
+whose selected children have no viewport when the group is recorded. The pinned
+r186 backend records these groups into a single `GPURenderBundleEncoder`, which
+cannot set viewports. The native route preserves this source limitation and
+refuses a cold selected child with an explicit viewport. Viewport-less commands
+inherit the active pass viewport when the bundle executes, after ordinary draws;
+ordinary companions may therefore establish that viewport after recording.
+
+Warm groups keep the recorded child indices and layer selection, including an
+empty selection. Later object visibility, child layers and child viewport edits
+do not change those commands until `group.needsUpdate` records the group again.
+Shared camera uniforms still advance, while local material/object values follow
+the source static/dynamic refresh policy. Accepted queued frames own independent
+camera-index packets and matrix bytes. Object callbacks run at recording, and
+node updates retain their source refresh frequencies.
+
+Bundled `BatchedMesh` draws use the same route for single and array cameras.
+The cache stores one logical capture per source material-side invocation,
+retaining its batch ranges and selected camera indices. Each frame expands those
+commands in material-side, child-view, then subdraw order. Warm refresh therefore
+does not multiply node updates or resource leases by the number of views or
+instances, and batch sorting/selection runs only when the source rerecords.
+
+Four focused cases in `three_node_scene_bundles.test.mjs` cover camera refresh,
+static/empty selections, queued viewport inheritance, callbacks and retained
+batch ordinals. Two `native_bundle_views.mjs` browser scenes additionally compare
+mixed static/dynamic groups, changed layers/visibility, explicit invalidation,
+ordinary viewport inheritance and translucent DoubleSide batches. All 688,128
+RGBA bytes at fourteen checkpoints match pinned r186 under Chromium
+151.0.7922.34 SwiftShader, with zero GPU validation errors. These establish the
+tested ordinary-target behavior; layered/XR targets and hardware performance
+remain outside this evidence.
 
 ## InstancedBufferGeometry
 
@@ -959,7 +994,7 @@ updates. Queued renders keep independent camera and batch-texture histories;
 canvas viewports use DPR while render-target viewports use physical pixels.
 Empty child selections preserve callbacks and framebuffer copy boundaries without
 issuing geometry commands. Expanded view/subdraw counts use the existing budget.
-ArrayCamera render bundles remain outside this profile.
+Authored ArrayCamera bundles use the viewport-less recording profile above.
 
 The 19-case batch suite and 50-case scene-capture suite pass. Two browser scenes
 cover indexed and nonindexed batches, mixed ordinary companions, overlapping
@@ -1262,7 +1297,7 @@ texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions and unregistered shadow lifecycles,
 skinned or morph meshes,
-including per-instance morph textures; XR/multiview and native ArrayCamera bundles;
+including per-instance morph textures; XR/multiview and layered ArrayCamera bundles;
 object render hooks outside the source lifecycle profile above and effectful
 attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and

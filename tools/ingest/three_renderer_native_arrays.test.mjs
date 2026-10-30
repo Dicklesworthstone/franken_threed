@@ -216,7 +216,7 @@ test('framebuffer copies stay between source draws rather than between their cam
   assert.deepEqual(indices(f.device), [0, 1, 0, 1]);
 });
 
-test('XR, multiview, nested arrays and recorded array bundles keep explicit boundaries', async t => {
+test('XR, multiview, nested arrays and cold bundle child viewports keep explicit boundaries', async t => {
   for (const kind of ['xr', 'multiview', 'nested', 'bundle']) {
     const f = fixture(t), object = f.mesh(); let updates = 0;
     object.material.colorNode = N.uniform(.5).onObjectUpdate(() => { updates++; return .5; });
@@ -225,6 +225,9 @@ test('XR, multiview, nested arrays and recorded array bundles keep explicit boun
     if (kind === 'bundle') { const group = new T.BundleGroup(); group.add(object); f.scene.add(group); }
     await f.renderer.init(); if (kind === 'xr') f.renderer.xr.isPresenting = true;
     assert.throws(() => f.renderer.render(f.scene, f.camera), error => /CAMERA|UNSUPPORTED/.test(error.code));
-    assert.equal(updates, 0); assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+    // Bundle viewports are selected after node updates, which may change
+    // layers or viewport definitions before the source backend draws.
+    assert.equal(updates, kind === 'bundle' ? 1 : 0);
+    assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
   }
 });
