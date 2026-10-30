@@ -9,9 +9,10 @@ import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {createWebGPURendererClass, sourceThreeRendererConstructor} from './three_renderer.mjs';
+import {createWebGPURendererClass, createWebGLRendererClass, sourceThreeRendererConstructor} from './three_renderer.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const T = await import(pathToFileURL(path.join(root, 'build/three.webgpu.js')));
+const GL = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
 const settings = fs.readFileSync(path.join(root, 'examples/jsm/inspector/tabs/Settings.js'), 'utf8');
 const begin = settings.indexOf('const _init = WebGPURenderer.prototype.init;');
 const end = settings.indexOf('let _state = null;', begin);
@@ -19,12 +20,14 @@ assert.ok(begin >= 0 && end > begin, 'pinned Inspector initialization contract')
 const installSettings = new Function('WebGPURenderer', 'WebGLBackend',
   settings.slice(begin, end) + '\nreturn forceWebGL;');
 
-function fixture() {
+const capableGpu = {requestAdapter() { throw new Error('Unexpected native device initialization'); }};
+
+function fixture({gpu = capableGpu} = {}) {
   const calls = [], canvas = {width: 8, height: 8, style: {}, getContext() { throw new Error('Unexpected canvas context acquisition'); }};
   class ExactRenderer extends T.WebGPURenderer {
     init() { calls.push({receiver: this, backend: this.backend}); return Promise.resolve(this); }
   }
-  const Routed = createWebGPURendererClass(T, {exactBackend: ExactRenderer});
+  const Routed = createWebGPURendererClass(T, {exactBackend: ExactRenderer, gpu});
   const original = Routed.prototype.init;
   return {calls, canvas, ExactRenderer, Routed, original, forceWebGL: installSettings(Routed, T.WebGLBackend)};
 }
@@ -185,4 +188,116 @@ test('subclass init wrappers keep their receiver and live prototype lookup on th
   await renderer.init();
   assert.equal(wrapperCalls, 2);
   assert.ok(renderer.backend instanceof T.WebGLBackend);
+});
+
+async function withHostGPU(gpu, run) {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {configurable: true, value: {gpu}});
+  try { return await run(); }
+  finally {
+    if (previous) Object.defineProperty(globalThis, 'navigator', previous);
+    else delete globalThis.navigator;
+  }
+}
+
+test('an unavailable WebGPU host keeps source constructor options, prototypes and device policy untouched', async () => {
+  await withHostGPU(undefined, () => {
+    const calls = [];
+    const canvas = {width: 8, height: 8, style: {}, getContext() { assert.fail('No context before source init'); }};
+    const device = {};
+    const parameters = forceWebGL => new Proxy({canvas, device, forceWebGL, alpha: true, customSourceOption: 19}, {
+      get(target, key, receiver) { calls.push(['get', String(key)]); return Reflect.get(target, key, receiver); },
+      set(target, key, value, receiver) { calls.push(['set', String(key)]); return Reflect.set(target, key, value, receiver); },
+      ownKeys(target) { calls.push(['ownKeys']); return Reflect.ownKeys(target); },
+      getOwnPropertyDescriptor(target, key) { calls.push(['descriptor', String(key)]); return Reflect.getOwnPropertyDescriptor(target, key); },
+    });
+    const Routed = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer});
+    for (const forced of [false, true]) {
+      const baseline = new T.WebGPURenderer(parameters(forced));
+      const expected = calls.splice(0);
+      const sourceOptions = parameters(forced), renderer = new Routed(sourceOptions);
+      assert.deepEqual(calls.splice(0), expected, 'host selection never inspects, enumerates or copies source options');
+      assert.equal(Object.getPrototypeOf(renderer), Object.getPrototypeOf(baseline));
+      assert.equal(renderer.constructor, T.WebGPURenderer);
+      assert.equal(renderer instanceof Routed, true);
+      assert.equal(renderer.isF3DRenderer, undefined);
+      assert.equal(renderer.domElement, canvas);
+      assert.equal(renderer.backend.parameters.canvas, canvas);
+      assert.equal(renderer.backend.parameters.device, device, 'the retained source still receives its supplied device');
+      assert.equal(renderer.backend.isWebGLBackend === true, forced);
+      assert.equal(renderer.backend.isWebGPUBackend === true, !forced);
+      assert.equal(typeof sourceOptions.getFallback, forced ? 'undefined' : 'function');
+      calls.length = 0;
+      assert.equal(Object.hasOwn(renderer, '_session'), false);
+      assert.equal(Object.hasOwn(renderer, '_storageTextures'), false);
+    }
+    assert.throws(() => new Routed(null), TypeError, 'the unchanged source owns invalid-input errors');
+    assert.equal({isWebGPURenderer: true} instanceof Routed, false);
+    class Child extends Routed {}
+    assert.equal(new Routed({canvas}) instanceof Child, false);
+  });
+});
+
+test('a no-WebGPU WebGL constructor reaches the actual source GL boundary with original option effects', async t => {
+  t.mock.method(console, 'error', () => {});
+  await withHostGPU(undefined, () => {
+    const calls = [], marker = new Error('source WebGL context boundary');
+    const canvas = {width: 8, height: 8, style: {}, addEventListener() {}, removeEventListener() {},
+      setAttribute() {}, getContext(...args) { calls.push(['context', ...args]); throw marker; }};
+    const parameters = () => ({
+      get canvas() { calls.push('canvas'); return canvas; },
+      get alpha() { calls.push('alpha'); return true; },
+      get antialias() { calls.push('antialias'); return false; },
+      get ignoredSourceOption() { assert.fail('Source ignores unknown options without reading them'); },
+    });
+    assert.throws(() => new GL.WebGLRenderer(parameters()), error => error === marker);
+    const expected = calls.splice(0);
+    const Routed = createWebGLRendererClass(GL, {exactBackend: GL.WebGLRenderer});
+    assert.throws(() => new Routed(parameters()), error => error === marker);
+    assert.deepEqual(calls, expected);
+    assert.ok(calls.some(call => Array.isArray(call) && call[0] === 'context' && call[1] === 'webgl2'));
+    assert.equal(sourceThreeRendererConstructor(Routed), GL.WebGLRenderer);
+    assert.equal({isWebGLRenderer: true, isF3DRenderer: true} instanceof Routed, false);
+  });
+});
+
+test('host selection happens per construction and native initialization failures never replace the exposed renderer', async () => {
+  await withHostGPU(undefined, async () => {
+    const canvas = {width: 8, height: 8, style: {}, getContext() { assert.fail('No context before an adapter exists'); }};
+    const Routed = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer});
+    const retained = new Routed({canvas});
+    assert.equal(retained.isF3DRenderer, undefined);
+    let requests = 0;
+    globalThis.navigator.gpu = {async requestAdapter() { requests++; return null; }};
+    const native = new Routed({canvas});
+    assert.equal(native.isF3DRenderer, true);
+    await assert.rejects(native.init(), {code: 'F3D_RENDERER_UNAVAILABLE'});
+    assert.equal(requests, 1);
+    assert.equal(native.isF3DRenderer, true);
+    assert.equal(native.domElement, canvas);
+    assert.equal(native instanceof T.WebGPURenderer, false);
+    native.dispose();
+    delete globalThis.navigator.gpu;
+    assert.equal(new Routed({canvas}).isF3DRenderer, undefined);
+    const Injected = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer, gpu: capableGpu});
+    const injected = new Injected({canvas});
+    assert.equal(injected.isF3DRenderer, true, 'an explicitly supplied host selects the native route');
+    injected.dispose();
+  });
+});
+
+test('host fallback preserves the live source Inspector init override', async () => {
+  await withHostGPU(undefined, async () => {
+    const f = fixture({gpu: null});
+    f.forceWebGL(true);
+    const renderer = new f.Routed({canvas: f.canvas});
+    await renderer.init();
+    assert.equal(renderer.isF3DRenderer, undefined);
+    assert.ok(renderer.backend instanceof T.WebGLBackend);
+    assert.equal(f.calls.length, 1);
+    f.forceWebGL(false);
+    assert.equal(renderer.init, f.original);
+    await renderer.init();
+    assert.equal(f.calls.length, 2);
+  });
 });

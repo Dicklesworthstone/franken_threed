@@ -83,6 +83,12 @@ const MAX_MATERIAL_CAPTURE_VALUES = 1024 * 1024;
 const SOURCE_RENDERER_CONSTRUCTORS = new WeakMap();
 const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
 
+// Make this choice at construction, before inspecting source options or owning
+// a canvas. The retained constructor keeps its own device/fallback semantics.
+// Adapter or device-request failures after native construction do not authorize
+// replacing an already exposed renderer with another owner.
+const hasWebGPUHost = gpu => typeof (gpu ?? globalThis.navigator?.gpu)?.requestAdapter === 'function';
+
 /** Compiler-private dispatch for statically source-selected construction sites.
  * No option is read or copied, and unknown constructors keep their own behavior. */
 export function sourceThreeRendererConstructor(Constructor) {
@@ -258,11 +264,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
   class WebGPURenderer {
     constructor(parameters = {}) {
-      if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
       const sourcePrototype = exactBackend && overriddenInitPrototype(this);
       if (sourcePrototype) {
         if (typeof exactInit !== 'function') fail('ROUTE', 'An overridden init requires an exact backend with its source init method');
-        const retained = new exactBackend(parameters);
+        const retained = new exactBackend(...arguments);
         retainedInitReceivers.add(retained);
         // Keep prototype changes live: Settings can restore the captured init
         // after constructing this instance. An application assignment still
@@ -279,6 +284,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         }
         return retained;
       }
+      if (exactBackend && !hasWebGPUHost(defaultGpu)) return new exactBackend(...arguments);
+      if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
       for (const key of Object.keys(parameters)) if (!(this._parameterNames?.() ?? PARAMETERS).has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       const {
         canvas = null, antialias = false, alpha = true, depth = true, stencil = false, samples = 0,
@@ -1732,6 +1739,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     // source fact. The program compiler converts GL clip depth separately.
     get coordinateSystem() { return THREE.WebGLCoordinateSystem; }
     constructor(parameters = {}) {
+      if (exactBackend && !hasWebGPUHost(options.gpu)) return new exactBackend(...arguments);
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
       for (const key of Object.keys(parameters)) if (!WEBGL_PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       // A supplied GL context is the exact backend by definition.
@@ -1848,6 +1856,13 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       fail('UNSUPPORTED', `WebGLRenderer.capabilities.${String(key)} describes a GL context; this route has none`);
     }});
   }});
+  if (exactBackend) {
+    SOURCE_RENDERER_CONSTRUCTORS.set(WebGLRenderer, exactBackend);
+    Object.defineProperty(WebGLRenderer, Symbol.hasInstance, {value(value) {
+      return ordinaryHasInstance.call(this, value) ||
+        this === WebGLRenderer && ordinaryHasInstance.call(exactBackend, value);
+    }});
+  }
   return WebGLRenderer;
 }
 

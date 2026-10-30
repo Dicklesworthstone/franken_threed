@@ -78,7 +78,8 @@ test('source construction surface: render before init throws the source error', 
   assert.deepEqual(renderer.getDrawingBufferSize(new T.Vector2()).toArray(), [400, 200]);
   assert.throws(() => new WebGPURenderer({forceWebGL: true}), {code: 'F3D_RENDERER_ROUTE'});
   // With the pinned upstream class supplied, a runtime WebGL request constructs it unchanged.
-  const Routed = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer});
+  const Routed = createWebGPURendererClass(T, {exactBackend: T.WebGPURenderer,
+    gpu: {requestAdapter() { assert.fail('Construction must not request an adapter'); }}});
   globalThis.document ??= {createElementNS: () => ({width: 300, height: 150, style: {}, getContext() { return null; }})};
   const exact = new Routed({canvas: {width: 1, height: 1, style: {}, getContext() { return null; }}, forceWebGL: true});
   assert.ok(exact instanceof T.WebGPURenderer); assert.equal(exact.isF3DRenderer, undefined);

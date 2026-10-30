@@ -1355,6 +1355,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources) {
   const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources });
   const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
+    packageRootUrl,
     generalWebGPUAvailable: enabled.webgpu,
     generalWebGLAvailable: enabled.webgl,
     hostCapabilities: { hasWebGPU: true, hasWebGL: true },

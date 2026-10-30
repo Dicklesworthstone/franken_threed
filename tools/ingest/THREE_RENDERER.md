@@ -22,6 +22,16 @@ module re-exports the upstream namespace (every other class keeps its upstream
 identity) and replaces only `WebGPURenderer`. Otherwise the build is unchanged
 and the printed/returned `rendererRoute.reason` says why.
 
+On a host without a WebGPU `requestAdapter` API, each routed constructor instead
+creates its genuine pinned source renderer before reading options or binding a
+canvas. Source WebGL construction stays synchronous; source `WebGPURenderer`
+keeps its own device, `forceWebGL` and initialization fallback behavior. Option
+getters, source errors, canvas identity and `instanceof` are preserved. This is
+exact-backend compatibility, not new-renderer execution. An injected GPU host
+still selects the native route. If adapter/device initialization fails after
+native construction, that error remains visible: the exposed renderer is never
+silently replaced with another owner.
+
 Mixed applications preserve each explicit `forceWebGL: true` construction through
 its genuine upstream constructor. The compiler resolves the original callee once
 before the untouched argument list; it does not pre-read, clone or validate source

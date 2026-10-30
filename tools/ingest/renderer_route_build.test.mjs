@@ -8,11 +8,25 @@ import path from "node:path";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { buildApplication } from "./build_application.mjs";
+import { buildApplication as buildSourceApplication } from "./build_application.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 import { geometryDevice } from "./fixtures/gpu_geometry_device.mjs";
 
 const upstreamBuild = path.resolve(process.env.F3D_THREE_ROOT ?? "upstream/three.js", "build");
+const buildApplication = (entry, out, options = {}) => buildSourceApplication(entry, out, {
+  packageRootUrl: pathToFileURL(path.resolve(upstreamBuild, '..') + path.sep).href, ...options,
+});
+
+test.beforeEach(t => {
+  // Native-route tests supply a capable host; no GPU work occurs here.
+  const navigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {configurable: true,
+    value: {gpu: {requestAdapter: async () => null}}});
+  t.after(() => {
+    if (navigator) Object.defineProperty(globalThis, 'navigator', navigator);
+    else delete globalThis.navigator;
+  });
+});
 
 function app(body, { html = true } = {}) {
   const dir = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_build_"));
@@ -363,4 +377,58 @@ export const native = renderer instanceof THREE.WebGPURenderer;
     if (previousDocument === undefined) delete globalThis.document;
     else globalThis.document = previousDocument;
   }
+});
+
+test('an emitted native application preserves the source constructor and synchronous APIs on a WebGL-only host', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+const renderer = new THREE.WebGPURenderer({alpha: false});
+renderer.setSize(40, 24);
+renderer.setClearColor(0x336699, .5);
+export const flags = [renderer.isF3DRenderer === true, renderer.isWebGPURenderer, renderer instanceof THREE.WebGPURenderer];
+export const size = renderer.getSize(new THREE.Vector2()).toArray();
+export const clearAlpha = renderer.getClearAlpha();
+export const clearColor = renderer.getClearColor(new THREE.Color()).getHex();
+`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  delete globalThis.navigator.gpu;
+  let acquired = 0;
+  const previous = globalThis.document;
+  globalThis.document = {createElementNS: () => ({width: 16, height: 16, style: {},
+    getContext() { acquired++; assert.fail('Construction must preserve deferred source initialization'); }})};
+  try {
+    const emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.deepEqual(emitted.flags, [false, true, true]);
+    assert.deepEqual(emitted.size, [40, 24]);
+    assert.equal(emitted.clearAlpha, .5);
+    assert.equal(emitted.clearColor, 0x336699);
+    assert.equal(acquired, 0);
+  } finally { globalThis.document = previous; }
+});
+
+test('an emitted WebGL application reaches the unchanged synchronous source context boundary without WebGPU', async t => {
+  t.mock.method(console, 'error', () => {});
+  const body = `import * as THREE from 'three/legacy';
+const renderer = new THREE.WebGLRenderer({antialias: false, alpha: true});
+export const isF3DRenderer = renderer.isF3DRenderer;
+`;
+  const original = app(body), candidate = app(body);
+  const source = await buildApplication(original.entry, original.out);
+  const result = await buildApplication(candidate.entry, candidate.out, {routeWebGLRenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  delete globalThis.navigator.gpu;
+  const calls = [], marker = new Error('actual source WebGL context boundary');
+  const previous = globalThis.document;
+  globalThis.document = {createElementNS: () => ({width: 16, height: 16, style: {},
+    addEventListener(name) { calls.push(['add', name]); },
+    removeEventListener(name) { calls.push(['remove', name]); },
+    setAttribute(...args) { calls.push(['attribute', ...args]); },
+    getContext(...args) { calls.push(['context', ...args]); throw marker; }})};
+  try {
+    await assert.rejects(import(pathToFileURL(path.join(original.out, source.entryFiles[0])).href), error => error === marker);
+    const expected = calls.splice(0);
+    await assert.rejects(import(pathToFileURL(path.join(candidate.out, result.entryFiles[0])).href), error => error === marker);
+    assert.deepEqual(calls, expected);
+    assert.ok(calls.some(call => call[0] === 'context' && call[1] === 'webgl2'));
+  } finally { globalThis.document = previous; }
 });
