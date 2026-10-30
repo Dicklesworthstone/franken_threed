@@ -1035,6 +1035,20 @@ export async function createGpuThreeScene(device,scene,{
     return {nodeProgram,options:{nodeProgram,raster,topology,...(stripIndexFormat?{stripIndexFormat}:{})},values:{},clipped:null,
       structural:[trackMaterial(material),'native-node',nodeProgram.key,topology,stripIndexFormat,JSON.stringify(raster)]};
   }
+  function nativeDrawBinding(packet){
+    const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
+    const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&
+      e.programSource===(packet.binding.programGeometry??packet.binding.geometry)&&same(e.structural,desc.structural));
+    if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
+    return {desc,binding};
+  }
+  function assertNativePrepared(nodeFrame){
+    live();
+    // Preparation is retryable only before resource transactions. In
+    // particular, borrowed framebuffer destinations terminalize callback
+    // failures because those callbacks may already have submitted GPU writes.
+    for(const packet of nodeFrame.draws)nativeDrawBinding(packet);
+  }
   function desired(nodes){
     const clippingFrame=clippingState();
     const out=[],descriptions=new Map(),seen=new Map(),usedGeometry=new Set(),usedInstances=new Set(),usedDeformations=new Set();
@@ -1609,10 +1623,7 @@ export async function createGpuThreeScene(device,scene,{
       let nativeBackground = null;
       const bundleTail = [];
       if(passNodeFrame)for(const packet of passNodeFrame.draws){
-        const desc=nodeDescription(packet.binding),records=lookup.get(packet.object)?.get(packet.material);
-        const binding=records?.find(e=>!e.mesh.disposed&&e.nodeProgram&&
-          e.programSource===(packet.binding.programGeometry??packet.binding.geometry)&&same(e.structural,desc.structural));
-        if(!binding)fail('PREPARE','Prepare the captured native node program before drawing it');
+        const {desc,binding}=nativeDrawBinding(packet);
         const draw={...packet,desc:[desc],bindings:[binding],shadowPass:false,nodeProgram:true};
         if(packet.nodeBundle)bundleTail.push(draw);
         else if(packet.background)nativeBackground=draw;
@@ -1937,7 +1948,7 @@ export async function createGpuThreeScene(device,scene,{
       return failed(error);
     }finally{busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;if(disposed||terminal)release();}
   }
-  const bridge=Object.freeze({scene:root,prepare,render,
+  const bridge=Object.freeze({scene:root,prepare,render,assertNativePrepared,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},
     get diagnostics(){return Object.freeze({prepareVersion,sourceDraws,logicalDraws,
       drawCalls,geometryCount:geometries.size,geometryBytes:geometryBytes(),

@@ -743,6 +743,15 @@ program; stale structural captures fail before authored node updates. Transparen
 lines preserve the source opaque-framebuffer sampling and mip generation through
 the existing ordered copy owner.
 
+Visible wide-line scenes also capture compatible ordinary material companions
+through the native path, preserving the addon's callback and opaque/transparent
+draw order in mixed scenes. The shader cache retains the source coverage branch
+for logical sample counts zero versus one, even though both use a single-sample
+GPU attachment. Native binding readiness is checked before borrowing framebuffer,
+storage or target resources, so a new shader can request preparation without
+turning that recoverable boundary into a terminal framebuffer failure. Failures
+after submitted GPU work keep their existing resource failure semantics.
+
 `three_renderer_native_wide_lines.test.mjs` covers both official addons, the four
 screen/world and solid/dashed shader combinations, queued value/count mutations,
 source callbacks, MSAA transitions, stale-graph rejection and transparent copies.
@@ -759,6 +768,14 @@ changes and the source addon callback. The lane asserts the owned
 `general-webgpu` submission route and reports zero GPU/browser errors. Shader
 construction and addon behavior remain retained JavaScript; these software-GPU
 results establish correctness for the tested scenes, not hardware acceleration.
+
+`three_renderer_wide_lines.test.mjs` adds thirteen regressions for mixed ordinary
+meshes, interleaved partial uploads, queued viewport/DPR controls, sample-count
+changes and framebuffer-dependent shader transitions. The `native_wide_lines`
+and `native_wide_lines_msaa` cases in `native_primitives.mjs` match all 688,128 RGBA
+bytes at fourteen source/candidate checkpoints on Chromium 151.0.7922.34 /
+SwiftShader, including four-sample coverage, transparency, near-camera trimming
+and dynamic mode changes, with zero GPU validation errors.
 
 ## Native source shadows
 

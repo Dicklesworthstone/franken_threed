@@ -1,4 +1,9 @@
 // The same source scene, storage, controls and nodes run on both renderers.
+import {Line2} from '../../../upstream/three.js/examples/jsm/lines/webgpu/Line2.js';
+import {LineSegments2} from '../../../upstream/three.js/examples/jsm/lines/webgpu/LineSegments2.js';
+import {LineGeometry} from '../../../upstream/three.js/examples/jsm/lines/LineGeometry.js';
+import {LineSegmentsGeometry} from '../../../upstream/three.js/examples/jsm/lines/LineSegmentsGeometry.js';
+
 function camera(T, orthographic = false) {
   const result = orthographic ? new T.OrthographicCamera(-2.4, 2.4, 1.8, -1.8, .1, 50)
     : new T.PerspectiveCamera(50, 4 / 3, .1, 50);
@@ -79,7 +84,57 @@ function pointSprites(T, renderer, orthographic) {
   });
   return {scene: world, camera: view};
 }
+function wideLines(T, renderer, multisampled) {
+  const world = new T.Scene(), objects = [], target = renderer.getRenderTarget();
+  world.background = new T.Color(0x182435); target.samples = multisampled ? 4 : 0;
+  const backdrop = new T.Mesh(new T.PlaneGeometry(4.5, 3.4), new T.MeshBasicMaterial({color: 0x284b57}));
+  backdrop.position.z = -.6; world.add(backdrop);
+  for (let i = 0; i < 4; i++) {
+    const polyline = i < 2, geometry = polyline ? new LineGeometry() : new LineSegmentsGeometry();
+    geometry.setPositions(polyline ? [-1.7, 0, 0, -.7, .22, 0, .4, -.18, 0, 1.7, 0, 0]
+      : [-1.7, 0, 0, -.15, .2, 0, .15, -.15, 0, 1.7, .12, 0]);
+    geometry.setColors([1, .25, .12, .3, .9, .4, .25, .4, 1, 1, .8, .2]);
+    const material = new T.Line2NodeMaterial({linewidth: polyline ? 5 + i * 2 : .13 + i * .015,
+      worldUnits: !polyline, dashed: i % 2 === 1, dashSize: .23, gapSize: .12,
+      vertexColors: true, transparent: i === 3, opacity: .65});
+    if (i === 1) material.offsetNode = T.TSL.uniform(.125);
+    const object = polyline ? new Line2(geometry, material) : new LineSegments2(geometry, material);
+    object.computeLineDistances(); object.position.y = .95 - i * .62; object.frustumCulled = false;
+    world.add(object); objects.push(object);
+  }
+  const view = camera(T, multisampled);
+  installChanges(renderer, frame => {
+    if (frame === 8) {
+      renderer.setPixelRatio(1.5);
+      if (!multisampled) target.samples = 1; // Source coverage shader distinguishes 0 from 1.
+      objects.forEach((object, i) => { object.material.linewidth *= 1.3; object.material.dashOffset = .19; });
+      objects[1].material.offsetNode.value = .375;
+      view.position.x = -.4; view.lookAt(0, 0, 0);
+    }
+    if (frame === 10) {
+      objects[0].material.worldUnits = true; objects[0].material.linewidth = .19;
+      objects[2].material.dashed = true;
+      const owner = objects[1].geometry.attributes.instanceStart.data;
+      owner.array[1] -= .25; owner.addUpdateRange(1, 1); owner.needsUpdate = true;
+      target.viewport.set(5, 3, target.width - 10, target.height - 6);
+    }
+    if (frame === 12) {
+      objects[0].geometry.instanceCount = 1;
+      objects[2].material.alphaToCoverage = false;
+    }
+    if (frame === 13) {
+      objects[0].geometry.instanceCount = 3;
+      const ends = objects[0].geometry.attributes.instanceEnd;
+      ends.setZ(ends.count - 1, 5.4); ends.data.needsUpdate = true;
+      objects[0].computeLineDistances();
+      target.viewport.set(0, 0, target.width, target.height);
+    }
+  });
+  return {scene: world, camera: view};
+}
 export const nativePrimitiveScenarios = {
+  native_wide_lines(T, renderer) { return wideLines(T, renderer, false); },
+  native_wide_lines_msaa(T, renderer) { return wideLines(T, renderer, true); },
   native_indirect_vertex_alias(T, renderer) { return indirectVertexAlias(T, renderer, false); },
   native_indirect_vertex_alias_bundle(T, renderer) { return indirectVertexAlias(T, renderer, true); },
   native_indirect_compute(T, renderer) {

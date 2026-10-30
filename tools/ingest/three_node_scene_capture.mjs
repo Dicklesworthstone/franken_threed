@@ -174,7 +174,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // The source builder owns fragment depth and camera conventions. A fixed
   // color shader must never silently render a logarithmic or reversed scene.
   const nativeDepthScene = renderer?.logarithmicDepthBuffer === true || renderer?.reversedDepthBuffer === true;
-  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene
+  // The pinned wide-line addon updates raycast resolution in onBeforeRender.
+  // Its ordinary companions need the same ordered source capture, including
+  // when transparent ribbons copy their already-rendered opaque background.
+  const nativeWideLineScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
+    object.layers.test(camera.layers) && (Array.isArray(object.material) ? object.material : [object.material])
+      .some(material => material?.visible !== false && material && Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype));
+  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;

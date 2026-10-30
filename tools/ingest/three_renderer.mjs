@@ -1159,6 +1159,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       snapshot?.install();
       nodeFrame?.installAttributes?.();
+      if (nodeFrame) {
+        const entry = destination._dispatcher?.entry(scene);
+        if (!entry) fail('PREPARE', 'Scene has not been prepared');
+        entry.bridge.assertNativePrepared(nodeFrame);
+      }
       const previous = this._programFrame;
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.

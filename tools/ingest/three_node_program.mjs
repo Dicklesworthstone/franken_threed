@@ -837,6 +837,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return JSON.stringify([material.worldUnits, material.dashed, material.transparent, material.vertexColors,
       ...[...DASH_SLOTS].map(key => sourceId(material[key]))]);
   }
+  const wideLineCoverage = material => Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype &&
+    material.alphaToCoverage && renderer.currentSamples > 0;
   function transmissionSignature(material) {
     if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
     return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
@@ -1068,6 +1070,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.isMesh === true && material.wireframe === true ? [object.geometry.index?.array.length ?? null,
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
+      wideLineCoverage(material),
       material.depthWrite, material.depthTest, material.lights, clippingKey,
       spriteSignature(material, object), wideLineSignature(material),
       primitiveLayout(object, material),
@@ -1360,7 +1363,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       wideLineSignature: wideLineSignature(preparedMaterial),
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
-      clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage,
+      clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       storageTextures: textureNodes.some(node => node.isStorageTextureNode),
@@ -1676,6 +1679,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native alpha hashing changed; compile the material graph again');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== state.clippingSignature ||
         state.material.alphaToCoverage !== state.alphaToCoverage ||
+        wideLineCoverage(state.material) !== state.wideLineCoverage ||
         (state.material.alphaToCoverage && renderer.currentSamples > 1) !== state.clippingSamples)
       fail('CHANGED', 'Native clipping layout or coverage mode changed; compile the graph again');
   }
