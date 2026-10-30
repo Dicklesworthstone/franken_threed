@@ -689,7 +689,7 @@ export function withThreeCompute(Base, THREE) {
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
       await submit(this, () => owner(this).compile(list, onProgress), true);
     }
-    /** F3D extension: copy GPU storage bytes into a normal 2D RenderTarget.
+    /** F3D extension: copy GPU storage bytes into a selected target color mip/layer.
      * The texture can then be sampled by ordinary scene materials. No CPU
      * readback/re-upload or format conversion; row layout is expressed in bytes.
      * x/y are top-left coordinates; flipY reverses rows within the copied region. */
@@ -700,8 +700,9 @@ export function withThreeCompute(Base, THREE) {
         fail('STORAGE', 'Expected a source storage buffer attribute');
       if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected copy options');
       const destination = this._targets.capture(target), copiedOptions = {...options};
-      if (destination.shape.cube) fail('TARGET', 'Cube target buffer copies require explicit face-aware support');
-      return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions));
+      const release = this._targets.retainGeneration(destination);
+      try { return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions)); }
+      finally { release(); }
     }
     async getArrayBufferAsync(attribute) { return await submit(this, () => owner(this).read(attribute)); }
     async waitForGPU() {

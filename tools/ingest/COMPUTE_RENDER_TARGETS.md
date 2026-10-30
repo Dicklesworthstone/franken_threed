@@ -61,6 +61,43 @@ image/video compute inputs, and partial CPU texture snapshots are not enabled by
 this feature. The independent native target API can expose multisampled depth;
 this does not expand the source target inspector's single-sample depth contract.
 
+## Compute-buffer output to render targets
+
+`copyStorageBufferToRenderTargetAsync(attribute, target, options)` copies the
+renderer-owned GPU buffer into the target's primary color attachment. It now
+selects allocated authored destination mips and explicit cube faces, array
+layers, or volume slices through the existing native target owner:
+
+```js
+await renderer.copyStorageBufferToRenderTargetAsync(attribute, cubeTarget, {
+  face: 5,
+  destinationMipLevel: 2,
+  x: 0, y: 0, width: 2, height: 2,
+  offset: 0, bytesPerRow: 8, // RGBA8 bytes in the existing GPU buffer.
+});
+```
+
+The target must be single-sample. Higher destination mips and all cube
+destinations require `generateMipmaps: false`; the level must already be
+allocated. Default width/height cover the selected mip's remaining extent.
+`face` is required for cube, array and volume destinations. Cube and array
+indices stay fixed across levels; volume slice counts shrink with the mip.
+Two-dimensional targets default to face zero. Existing ordinary level-zero
+generated-target behavior remains with the target owner.
+
+Coordinates remain native top-left, and `flipY` reverses only the copied source
+rows. Offsets and row strides address GPU bytes, including storage-buffer
+padding; the copy never reads newer CPU attribute data or performs a format
+conversion. A suitably aligned region uses one encoded buffer-to-texture copy;
+tight or reversed rows use row copies in one submission, without staging.
+
+Queued calls capture destination generation, mip, face and layout. They consume
+GPU buffer contents at their FIFO submission point and retain the target until
+completion or failure. Admission checks the existing target budget before
+allocation or write scopes, so a budget refusal is retryable. Native color
+borrowing invalidates the existing sampling image without allocating a mip depth
+attachment or modifying depth contents.
+
 ## Queue and lifetime semantics
 
 On an initialized renderer, calls capture source target generation and sampler
@@ -113,3 +150,12 @@ Source behavior was checked against frozen Three.js commit `148ef33`, specifical
 sampler2D path's vertically flipped replicas. No upstream pin or source file is
 changed. Static imports connect the new adapter into the existing runtime module
 graph; no separate hand-maintained package file list is introduced.
+
+The destination extension has focused cases in
+`tests/unit/gpu_compute_texture_copy.test.mjs` and
+`tests/unit/three_compute_queue.test.mjs`. The byte recorder checks selected
+mips/faces/slices, raw half/float bits, NPOT extents, row padding/reversal,
+untouched subresources, retryable budgets and asynchronous lifetime behavior.
+It records native commands without executing WGSL or establishing browser pixel
+parity. The public FIFO suite also checks generation retention through its GPU
+completion fence and release on stale-target rejection.

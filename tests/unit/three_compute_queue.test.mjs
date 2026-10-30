@@ -315,17 +315,23 @@ test('preparation started by a before-update hook still snapshots the current ca
 
 
 function targetFor(renderer, width = 2, height = 2) {
-  const target = {}, texture = {width, data: new Uint8Array(width * height * 4)};
-  const entry = {target, alive: true, busy: false, depthDirty: false, dirty: false,
-    shape: {format: 'r32float', width, height, sampleCount: 1}, validation: Promise.resolve(),
+  const target = {texture: {}}, texture = {width, data: new Uint8Array(width * height * 4)};
+  const entry = {target, alive: true, busy: false, depthDirty: false, dirty: false, references: 0,
+    shape: {format: 'r32float', width, height, sampleCount: 1, textures: [target.texture]}, validation: Promise.resolve(),
     lifetime: new AbortController(), storage: {whenIdle: async () => {}}};
   renderer._targets = {
     capture(value) { assert.equal(value, target); return entry; },
     assertCurrent(value) { assert.equal(value, entry); if (!value.alive) throw new Error('stale target'); if (value.error) throw value.error; },
     ensure(value) { this.assertCurrent(value); },
-    render(value, callback) {
-      this.assertCurrent(value); value.busy = true; value.dirty = value.depthDirty = true;
-      try { callback({}, texture); } finally { value.busy = false; }
+    validateNativeTextures(writes) { for (const {entry} of writes) this.assertCurrent(entry); },
+    retainGeneration(value) {
+      this.assertCurrent(value); value.references++; let active = true;
+      return () => { assert.equal(active, true); active = false; value.references--; };
+    },
+    withNativeColorDestination({entry: value, texture: source, depth, colorIndex}, callback) {
+      assert.equal(source, target.texture); assert.equal(depth, false); assert.equal(colorIndex, 0);
+      this.assertCurrent(value); value.busy = true; value.dirty = true;
+      try { callback(texture); } finally { value.busy = false; }
     },
   };
   return {target, entry, values: () => [...new Float32Array(texture.data.buffer)]};
@@ -338,6 +344,7 @@ test('public compute-to-target copies preserve compute/copy/draw order without w
   device.queue.onSubmittedWorkDone = () => fence.promise;
   const a = renderer.computeAsync(kernel), options = {width: 2, height: 2};
   const copy = renderer.copyStorageBufferToRenderTargetAsync(data, target, options);
+  assert.equal(entry.references, 1);
   options.flipY = true; options.width = 1;
   let drawn;
   const draw = new Promise((resolve, reject) => renderer._enqueue({resolve, reject, issue() { drawn = values(); events.push(['draw']); }}));
@@ -346,7 +353,8 @@ test('public compute-to-target copies preserve compute/copy/draw order without w
   assert.deepEqual(drawn, [1, 11, 21, 31]);
   assert.deepEqual(events.filter(e => ['dispatch', 'texture-copy', 'draw'].includes(e[0])).map(e => e[0]),
     ['dispatch', 'texture-copy', 'texture-copy', 'draw', 'dispatch']);
-  fence.resolve(); assert.equal(await copy, true);
+  assert.equal(entry.references, 1, 'pending GPU completion retains the captured target');
+  fence.resolve(); assert.equal(await copy, true); assert.equal(entry.references, 0);
   assert.deepEqual(await read(renderer, data), [2, 12, 22, 32]);
   assert.equal(entry.depthDirty, false); assert.equal(entry.dirty, true); renderer.dispose();
 });
@@ -370,6 +378,6 @@ test('public copies reject missing GPU storage and stale target generations', as
   renderer.compute(node([storage(data)]));
   const gate = block(), copy = renderer.copyStorageBufferToRenderTargetAsync(data, target);
   entry.alive = false; gate.open();
-  await assert.rejects(copy, /stale target/);
+  await assert.rejects(copy, /stale target/); assert.equal(entry.references, 0);
   assert.equal(events.some(e => e[0] === 'texture-copy'), false); renderer.dispose();
 });
