@@ -42,9 +42,9 @@
  * readDepthPixels() reads sampled depth as native-space Float32 values; MSAA
  * requires an explicit sampleIndex. Depth never travels through RGBA/half floats.
  * copyDestination:true additionally admits writePixels(data, options) and
- * copyFrom(sourceTarget, options). Uploads and level-zero copies dirty
+ * copyFrom(sourceTarget, options). Level-zero uploads and copies dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
- * destinationMipLevel selects an authored, non-generated destination level;
+ * destinationMipLevel selects an authored, non-generated upload or copy level;
  * its bounds and array/volume slice are independent of the source selection.
  * Upload/copy destinations must be single-sample. No implicit color conversion.
  * withColorDestination(callback, {colorIndex, validation}) admits externally
@@ -766,7 +766,7 @@ export function createGpuRenderTarget(device, options = {}) {
       busy = true;
       try {
         current.used = true; current.mipsDirty = true;
-        checked(() => device.queue.writeTexture({texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: 0, origin: plan.origin},
+        checked(() => device.queue.writeTexture({texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: plan.destinationMipLevel, origin: plan.origin},
           upload.data, upload.layout, plan.size));
         live(); colorUploads++; return true;
       } finally { busy = false; if (disposed || terminal !== null) release(); }

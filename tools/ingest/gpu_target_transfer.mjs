@@ -83,14 +83,23 @@ function budget(bytes, maxBytes) {
  * GPUQueue.writeTexture does not have the buffer-copy row alignment constraint.
  */
 export function inspectGpuTargetWrite(shape, data, value = {}) {
-  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes', 'face', 'colorIndex']);
-  const {colorIndex = 0} = value;
+  options(value, ['x', 'y', 'width', 'height', 'offset', 'bytesPerRow', 'flipY', 'maxBytes', 'face', 'colorIndex', 'destinationMipLevel']);
+  const {colorIndex = 0, destinationMipLevel = 0} = value;
   const [Type, components, bgra] = layout(shape, colorIndex), pixelBytes = Type.BYTES_PER_ELEMENT * components;
-  const face = transferFace(shape, value.face, 'face');
+  integer(destinationMipLevel, 'Destination mip level');
+  const mipLevelCount = shape.mipLevelCount ?? 1;
+  if (!Number.isSafeInteger(mipLevelCount) || mipLevelCount < 1 || destinationMipLevel >= mipLevelCount)
+    fail('REGION', 'Destination mip level is not allocated');
+  if (destinationMipLevel > 0 && shape.generateMipmaps !== false)
+    fail('MIP', 'Nonzero upload destinations require authored, non-generated mip levels');
+  const divisor = 2 ** destinationMipLevel;
+  const mipWidth = shape.width === 0 ? 0 : Math.max(1, Math.floor(shape.width / divisor));
+  const mipHeight = shape.height === 0 ? 0 : Math.max(1, Math.floor(shape.height / divisor));
+  const face = transferFace(shape, value.face, 'face', destinationMipLevel);
   if (shape.sampleCount !== 1) fail('SAMPLES', 'Color uploads require a single-sample destination');
-  const {x = 0, y = 0, width = shape.width - x, height = shape.height - y, offset = 0,
+  const {x = 0, y = 0, width = mipWidth - x, height = mipHeight - y, offset = 0,
     bytesPerRow = width * pixelBytes, flipY = false, maxBytes = 64 * 1024 * 1024} = value;
-  region(shape.width, shape.height, x, y, width, height);
+  region(mipWidth, mipHeight, x, y, width, height);
   if (typeof flipY !== 'boolean') fail('OPTIONS', 'flipY must be boolean');
   integer(offset, 'Data byte offset'); integer(bytesPerRow, 'Row byte stride');
   const rowBytes = width * pixelBytes, packedBytes = rowBytes * height;
@@ -105,8 +114,8 @@ export function inspectGpuTargetWrite(shape, data, value = {}) {
   // Limit the view passed to writeTexture: a tiny region must not snapshot an
   // arbitrarily large unused tail of the caller's underlying allocation.
   const bytes = empty ? null : new Uint8Array(data.buffer, data.byteOffset + offset, requiredBytes);
-  return {empty, colorIndex, data: bytes, bytesPerRow, rowBytes, packedBytes, flipY, bgra,
-    origin: {x, y: flipY ? shape.height - y - height : y, z: face},
+  return {empty, colorIndex, destinationMipLevel, data: bytes, bytesPerRow, rowBytes, packedBytes, flipY, bgra,
+    origin: {x, y: flipY ? mipHeight - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
 }
 

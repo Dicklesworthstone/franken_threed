@@ -125,6 +125,31 @@ await renderer.copyRenderTargetPixelsAsync(source, destination, {
 const pixels = await renderer.readRenderTargetMipPixelsAsync(destination, 2);
 ```
 
+Explicit CPU uploads use the same `destinationMipLevel` option through
+`writeRenderTargetPixelsAsync(target, data, options)` and the native owner's
+`writePixels(data, options)`. The level must be allocated; higher levels require
+`generateMipmaps: false` and a single-sample color destination. Region defaults,
+bounds and `flipY` conversion use that mip's dimensions. An explicit `face`
+selects a cube face, array layer or mip-local volume slice, independently of the
+active rendering selector.
+
+```js
+await renderer.writeRenderTargetPixelsAsync(target, rgbaPixels, {
+  destinationMipLevel: 2,
+  x: 1, y: 0, width: 4, height: 2,
+  offset: 16, bytesPerRow: 24,
+});
+```
+
+`offset` is a byte offset within the supplied typed-array view; `bytesPerRow`
+allows padded source rows. The public queue captures the selected bytes and
+options immediately, retaining half/float bit patterns and the existing
+RGBA-to-BGRA upload mapping. Later CPU edits cannot redirect an accepted write.
+Other levels and faces stay intact, and authored uploads do not generate mips.
+Pending uploads retain the existing transfer budget, cancellation and target
+generation lifetime rules. This extension does not change source CubeCamera
+generation-flag ownership.
+
 The WebGL source-shaped `copyTextureToTexture` and its asynchronous extension
 also accept their `dstLevel` argument for authored 2D color targets. A level-zero
 source supports cropped regions and offset destinations. When both source and
@@ -172,6 +197,12 @@ untouched levels; exercise NPOT bounds, both coordinate origins, queued option
 snapshots, zero-area tails and invalid generation/level requests. These recording
 device checks establish transfer and scheduling behavior, not rasterized pixel
 parity or hardware performance.
+
+The authored-mip upload cases in those same suites cover NPOT extents, padded
+rows, view-relative offsets, both orientations, raw RGBA/BGRA8 and half/float
+bits, untouched levels/faces, volume slice bounds, queued snapshots, rejected
+selectors and cancellation releasing the shared transfer budget. Facade cases
+use actual pinned source descriptors and the production FIFO and target owners.
 
 The focused tests run directly with:
 

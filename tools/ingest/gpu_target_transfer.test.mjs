@@ -122,6 +122,55 @@ test('destination mip validation rejects unallocated/generated levels and uses m
   a.dispose(); b.dispose(); generated.dispose();
 });
 
+for (const [format, Type, components] of cases.filter(([format]) =>
+  ['rgba8unorm', 'bgra8unorm', 'rgba16float', 'rgba32float'].includes(format)))
+  for (const flipY of [false, true]) test(`${format}/flip=${flipY}: authored mip uploads preserve raw bits, padded rows and untouched levels`, async () => {
+    const f = transferDevice(), t = make(f, {format, width: 15, height: 19, mipLevelCount: 4});
+    t.withTexture(texture => texture.levels.forEach(level => level.bytes.fill(191)));
+    const row = 2 * components, stride = 3 * components, elementBytes = Type.BYTES_PER_ELEMENT;
+    const input = payload(Type, 3 + stride + row + 7), view = input.subarray(2, input.length - 2);
+    const original = raw(input).slice(), expected = new Uint8Array(2 * row * elementBytes);
+    expected.set(original.subarray(3 * elementBytes, (3 + row) * elementBytes));
+    expected.set(original.subarray((3 + stride) * elementBytes, (3 + stride + row) * elementBytes), row * elementBytes);
+    assert.equal(t.writePixels(view, {destinationMipLevel: 2, x: 1, y: 0, width: 2, height: 2,
+      offset: elementBytes, bytesPerRow: stride * elementBytes, flipY}), true);
+    assert.deepEqual(raw(input), original); input.fill(0);
+    const upload = f.calls.uploads[0];
+    assert.equal(upload.destination.mipLevel, 2); assert.equal(upload.destination.origin.y, flipY ? 2 : 0);
+    assert.deepEqual(raw(await t.readPixels({mipLevel: 2, x: 1, y: 0, width: 2, height: 2, flipY})), expected);
+    for (const mipLevel of [0, 1, 3]) assert.ok(raw(await t.readPixels({mipLevel})).every(value => value === 191));
+    assert.ok(raw(await t.readPixels({mipLevel: 2, width: 1})).every(value => value === 191));
+    assert.equal(t.diagnostics.mipGenerations, 0); assert.equal(t.diagnostics.colorUploads, 1);
+    await t.whenIdle(); t.dispose();
+  });
+
+test('upload mip selectors reject unallocated/generated levels and enforce mip-local bounds before writes', () => {
+  const f = transferDevice(), t = make(f, {width: 8, height: 8, mipLevelCount: 4}),
+    generated = make(f, {width: 8, height: 8, generateMipmaps: true}), data = new Uint8Array(16);
+  for (const destinationMipLevel of [-1, .5, '1', NaN, Infinity, 4])
+    assert.throws(() => t.writePixels(data, {destinationMipLevel}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => t.writePixels(data, {destinationMipLevel: 2, x: 1, width: 2}), {code: 'GPU_TRANSFER_REGION'});
+  for (const width of [0, 2])
+    assert.throws(() => generated.writePixels(data, {destinationMipLevel: 1, width}), {code: 'GPU_TRANSFER_MIP'});
+  assert.equal(t.writePixels(new Uint8Array(0), {destinationMipLevel: 3, x: 1, width: 0}), false);
+  assert.equal(f.calls.uploads.length, 0); assert.equal(t.diagnostics.colorUploads, 0);
+  t.dispose(); generated.dispose();
+});
+
+test('authored upload mips shrink volume slices while keeping cube faces and array layers', () => {
+  const shape = {width: 8, height: 8, layers: 8, format: 'rgba8unorm', sampleCount: 1,
+    mipLevelCount: 4, generateMipmaps: false}, data = new Uint8Array(16);
+  for (const [kind, face] of [['volume', 1], ['array', 7], ['cube', 5]]) {
+    const plan = inspectGpuTargetWrite({...shape, [kind]: true}, data, {destinationMipLevel: 2, face});
+    assert.deepEqual(plan.origin, {x: 0, y: 0, z: face});
+    assert.deepEqual(plan.size, {width: 2, height: 2, depthOrArrayLayers: 1});
+    assert.throws(() => inspectGpuTargetWrite({...shape, [kind]: true}, data,
+      {destinationMipLevel: 2, face: face + 1}), {code: 'GPU_TRANSFER_FACE'});
+    assert.throws(() => inspectGpuTargetWrite({...shape, [kind]: true}, data,
+      {destinationMipLevel: 2}), {code: 'GPU_TRANSFER_FACE'});
+  }
+});
+
 test('destination mip copies shrink volume slice bounds while retaining array layers and cube faces', () => {
   const source = {width: 2, height: 2, format: 'rgba8unorm', sampleCount: 1, mipLevelCount: 1};
   const destination = {width: 8, height: 8, layers: 8, format: 'rgba8unorm', sampleCount: 1,

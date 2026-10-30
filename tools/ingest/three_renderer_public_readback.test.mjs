@@ -56,6 +56,77 @@ function mipTarget(width, height, gl = true) {
   return result;
 }
 
+for (const format of ['rgba8unorm', 'rgba16float', 'rgba32float']) for (const gl of [false, true])
+  test(`queued ${format} mip uploads capture padded CPU bytes, options and orientation (${gl})`, async t => {
+    const f = fixture(t, {gl}), r = f.r, destination = mipTarget(15, 19, gl);
+    destination.texture.type = format === 'rgba16float' ? T.HalfFloatType : format === 'rgba32float' ? T.FloatType : T.UnsignedByteType;
+    const [Type, components] = layouts.get(format), pixelBytes = components * Type.BYTES_PER_ELEMENT;
+    const input = payload(format, 12), view = input.subarray(components, input.length - components);
+    const expected = new Uint8Array([...bytes(input).subarray(2 * pixelBytes, 4 * pixelBytes),
+      ...bytes(input).subarray(5 * pixelBytes, 7 * pixelBytes)]);
+    const options = {destinationMipLevel: 2, x: 1, y: 0, width: 2, height: 2,
+      offset: pixelBytes, bytesPerRow: 3 * pixelBytes};
+    const writing = r.writeRenderTargetPixelsAsync(destination, view, options);
+    const reading = r.readRenderTargetMipPixelsAsync(destination, 2, {x: 1, y: 0, width: 2, height: 2});
+    const base = r.readRenderTargetMipPixelsAsync(destination, 0), tail = r.readRenderTargetMipPixelsAsync(destination, 3);
+    options.destinationMipLevel = options.x = options.y = 99; options.flipY = !gl; input.fill(0);
+    assert.equal(f.calls.textures.length, 0); await f.ready(); await writing;
+    assert.deepEqual(bytes(await reading), expected);
+    assert.ok(bytes(await base).every(value => value === 0)); assert.ok(bytes(await tail).every(value => value === 0));
+    assert.equal(f.uploads.length, 1); const upload = f.uploads[0];
+    assert.equal(upload.destination.mipLevel, 2); assert.equal(upload.destination.origin.y, gl ? 2 : 0);
+    assert.equal(upload.layout.bytesPerRow, 2 * pixelBytes); assert.equal(upload.data.byteLength, 4 * pixelBytes);
+    const entry = r._targets.capture(destination);
+    assert.equal(entry.references, 0); assert.equal(entry.storage.diagnostics.mipGenerations, 0);
+    assert.equal(entry.sample, null); assert.equal(r.getRenderTarget(), null);
+  });
+
+for (const dimension of ['cube', 'array', 'volume'])
+  test(`native public mip uploads select the ${dimension} face or mip-local slice`, async t => {
+    const f = fixture(t), r = f.r;
+    f.device.limits.maxTextureDimension3D = 2048;
+    const destination = dimension === 'cube' ? new T.CubeRenderTarget(8, textureOptions)
+      : dimension === 'volume' ? new T.RenderTarget3D(8, 8, 8, textureOptions)
+        : new T.RenderTarget(8, 8, {...textureOptions, depth: 8});
+    destination.texture.mipmaps = Array.from({length: dimension === 'cube' ? 3 : 4}, () => ({}));
+    const face = dimension === 'cube' ? 5 : dimension === 'volume' ? 1 : 7, input = payload('rgba8unorm', 4);
+    const writing = r.writeRenderTargetPixelsAsync(destination, input, {destinationMipLevel: 2, face});
+    const reading = r.readRenderTargetMipPixelsAsync(destination, 2, {face});
+    await assert.rejects(r.writeRenderTargetPixelsAsync(destination, input, {destinationMipLevel: 2, face: face + 1}),
+      {code: 'GPU_TRANSFER_FACE'});
+    await f.ready(); await writing; assert.deepEqual(await reading, input);
+    const upload = f.uploads[0]; assert.equal(upload.destination.origin.z, face);
+    for (const [level, planes] of upload.destination.texture.planes.entries())
+      for (const [index, plane] of planes.entries())
+        if (level !== 2 || index !== face) assert.ok(plane.every(value => value === 0));
+  });
+
+test('rejected public mip uploads leave no allocation or queued transfer', async t => {
+  const f = fixture(t), destination = mipTarget(8, 8, false), generated = mipTarget(8, 8, false);
+  generated.texture.generateMipmaps = true;
+  for (const options of [{destinationMipLevel: -1}, {destinationMipLevel: 4}, {destinationMipLevel: 2, x: 1, width: 2}])
+    await assert.rejects(f.r.writeRenderTargetPixelsAsync(destination, new Uint8Array(16), options), {code: 'GPU_TRANSFER_REGION'});
+  await assert.rejects(f.r.writeRenderTargetPixelsAsync(generated, new Uint8Array(0), {destinationMipLevel: 1, width: 0}),
+    {code: 'GPU_TRANSFER_MIP'});
+  assert.equal(f.calls.textures.length, 0); assert.equal(f.uploads.length, 0);
+  assert.equal(f.r._pending.length, 0); assert.equal(f.r._transfers.allocatedBytes, 0);
+});
+
+test('cancelled mip uploads release their shared budget and generation before a replacement writes', async t => {
+  const f = fixture(t, {maxTransfers: 1, maxTransferBytes: 16}), r = f.r, destination = mipTarget(8, 8, false);
+  const controller = new AbortController(), reason = new Error('cancel mip upload');
+  const cancelled = r.writeRenderTargetPixelsAsync(destination, new Uint8Array(16), {destinationMipLevel: 2, signal: controller.signal});
+  const entry = r._targets.capture(destination);
+  assert.equal(r._transfers.allocatedBytes, 16); assert.equal(entry.references, 1);
+  await assert.rejects(r.writeRenderTargetPixelsAsync(destination, new Uint8Array(16), {destinationMipLevel: 2}), {code: 'F3D_RENDERER_LIMIT'});
+  controller.abort(reason); await assert.rejects(cancelled, error => error === reason);
+  assert.equal(r._transfers.allocatedBytes, 0); assert.equal(entry.references, 0);
+  const input = payload('rgba8unorm', 4), replacement = r.writeRenderTargetPixelsAsync(destination, input, {destinationMipLevel: 2});
+  await f.ready(); await replacement;
+  assert.equal(f.uploads.length, 1); assert.equal(r._transfers.allocatedBytes, 0); assert.equal(entry.references, 0);
+  assert.deepEqual(await r.readRenderTargetMipPixelsAsync(destination, 2), input);
+});
+
 for (const gl of [false, true]) test(`queued destination mip copies preserve raw regions, selectors and readback (${gl})`, async t => {
   const f = fixture(t, {gl}), r = f.r, seed = mipTarget(4, 4, gl), source = mipTarget(8, 8, gl), destination = mipTarget(16, 16, gl);
   const input = payload('rgba8unorm', 16), expected = new Uint8Array([...input.subarray(20, 28), ...input.subarray(36, 44)]);

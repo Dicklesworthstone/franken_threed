@@ -190,7 +190,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         // Pick built-in constructors, not a caller-controlled data.constructor.
         const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint32Array ? Uint32Array
           : data instanceof Uint16Array ? Uint16Array : Uint8Array;
-        const uploadOptions = Object.freeze({...value, colorIndex: plan.colorIndex, width: plan.size.width, height: plan.size.height,
+        const uploadOptions = Object.freeze({...value, colorIndex: plan.colorIndex, destinationMipLevel: plan.destinationMipLevel,
+          width: plan.size.width, height: plan.size.height,
           offset: 0, bytesPerRow: plan.rowBytes});
         return schedule([entry], signal, plan.packedBytes, () => {
           // Copy bytes rather than float values (preserves NaN/half-float bits).
