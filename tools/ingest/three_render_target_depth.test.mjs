@@ -314,11 +314,16 @@ test('depth texture and detached/external texture bindings retain distinct owner
   owner.dispose(); gone(f);
 });
 
-test('shared-depth ownership is refused rather than rendering into an unrelated target generation', () => {
+test('shared-depth ownership retains the original association and native image', () => {
   const f = fixture(), other = new T.RenderTarget(7, 5, {depthTexture: f.depth});
   assert.equal(f.depth.renderTarget, f.target, 'r186 retains the first association');
-  assert.throws(() => f.owner.capture(other), {code: 'THREE_TARGET_SOURCE'});
-  assert.equal(f.textures.length, 0); f.owner.dispose();
+  const borrower = f.owner.capture(other);
+  assert.equal(f.textures.length, 0);
+  const source = f.owner.ensure(f.owner.capture(f.target));
+  let depth;
+  f.owner.render(source, frame => { depth = frame.depthView.texture; });
+  f.owner.render(borrower, frame => assert.equal(frame.depthView.texture, depth));
+  f.owner.dispose();
 });
 
 test('unsupported depth profiles fail before allocating native attachments or mirrors', () => {

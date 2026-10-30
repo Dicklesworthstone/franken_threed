@@ -55,6 +55,44 @@ test('depthless target allocates only its color; stable-size resizing changes no
   t.dispose();
 });
 
+test('shared depth retains the exact native allocation through a borrowing frame', () => {
+  const f = fixture(), a = make(f, {sampleDepth: true}), b = make(f, {sampleDepth: true, depthSource: a});
+  let depth;
+  a.withDepthTexture(texture => { depth = texture; });
+  b.withFrame(frame => assert.equal(frame.depthView.texture, depth));
+  assert.equal(f.calls.textures.length, 3);
+  assert.equal(b.allocatedBytes, 16 * 8 * 8, 'only borrower color is charged again');
+  assert.throws(() => b.withFrame(() => {
+    a.dispose(); assert.equal(depth.destroyed, 0, 'an active borrower retains its native handle');
+  }), {code: 'GPU_TARGET_DISPOSED'});
+  b.dispose(); gone(f.calls.textures);
+});
+
+test('shared depth admission authenticates device and layout before allocating borrower color', () => {
+  const f = fixture(), a = make(f, {sampleDepth: true}), count = f.calls.textures.length;
+  for (const options of [{width: 8}, {sampleCount: 4}, {depthFormat: 'depth32float'}, {depthSource: {}}, {sampleDepth: false}])
+    assert.throws(() => make(f, {sampleDepth: true, depthSource: a, ...options}), {code: 'GPU_TARGET_DEPTH'});
+  assert.equal(f.calls.textures.length, count); a.dispose();
+});
+
+test('shared depth completion waits for source validation and propagates its failure', async () => {
+  const f = fixture(), pending = deferred(), pop = f.device.popErrorScope;
+  let first = true;
+  f.device.popErrorScope = function () {
+    const result = pop.call(this);
+    if (first) { first = false; return pending.promise; }
+    return result;
+  };
+  const a = make(f, {sampleDepth: true}), b = make(f, {sampleDepth: true, depthSource: a});
+  let completed = false;
+  const validation = b.validation, idle = b.whenIdle().then(() => { completed = true; });
+  const invalid = assert.rejects(validation, /shared source allocation failed/);
+  const stopped = assert.rejects(idle, /shared source allocation failed/);
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(completed, false);
+  pending.resolve({message: 'shared source allocation failed'});
+  await invalid; await stopped; a.dispose(); b.dispose(); gone(f.calls.textures);
+});
+
 test('used targets survive replacement until the fence covering their last use', async () => {
   const f = fixture(), t = make(f, {sampleCount: 4}), first = f.calls.textures.slice();
   t.withTexture(() => {});

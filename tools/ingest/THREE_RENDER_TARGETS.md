@@ -100,6 +100,39 @@ attachment flags; storage budgets include the history depth. Sampling that same
 target's depth while rendering its color still encounters the existing feedback
 restriction; TRAA uses separate resolve and history targets.
 
+### Shared depth between 2D passes
+
+Distinct 2D color targets can attach the same source `DepthTexture`, including
+one/four-sample and MRT targets. The first source target remains its owner;
+borrowers use the same native image, preserving depth writes in both directions.
+Borrower disposal or resize preserves the original image. Owner disposal,
+replacement and direct configuration changes invalidate its borrowers, while
+active program leases keep their storage and byte charges until release.
+Recognized automatic pass resizing retains matching older color/depth generations
+until accepted consumers finish. Native allocation validation also gates every
+borrower's completion and readback publication.
+
+Attached depth must match the color extent and sample count. A borrower with
+`depthBuffer: false` can sample shared depth while rendering differently sized
+color, without attaching or resizing the shared image. Feedback checks follow
+the physical depth identity, including owners with PassNode color history.
+Writes through any borrower invalidate the WebGL depth sampling replica.
+
+The native renderer preserves r186's first-use clear per destination target:
+the first borrower render clears shared depth even with `autoClearDepth: false`;
+later renders load it. Actual `PassNode`/`RenderPipeline` dependencies initialize
+the owner before its borrower. A standalone borrower used before its owner has
+native storage is explicitly rejected rather than eagerly changing source
+initialization. Shared cube/array/volume depth remains outside this profile.
+
+`three_render_targets_shared_depth.test.mjs` covers resource identity, history
+feedback, disposal, byte budgets, source cloning and queued resize generations.
+`native_shared_depth.mjs` compares 18 browser checkpoints with pinned r186:
+111,616 RGBA8 bytes match exactly in Chromium 151/SwiftShader, including cold and
+warm deferred-style RenderPipeline composition and 1x/4x depth. Both lanes have
+zero GPU/browser errors and assert the actual shared GPUTexture identity. This
+is software-GPU correctness evidence, not a hardware performance measurement.
+
 Ordinary detached 2D `DepthTexture` inputs also have native, zero-initialized
 storage at source version zero. `UnsignedIntType` uses `depth24plus` and
 `FloatType` uses `depth32float`. Graphics and compute share this owner, including

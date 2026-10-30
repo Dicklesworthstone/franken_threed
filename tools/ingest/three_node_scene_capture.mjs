@@ -643,7 +643,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // can edit it. The shared owner snapshots CPU upload/sampler histories;
       // target leases hold generation metadata and observe contents in the FIFO.
       if (destination && captured.textures.some(binding =>
-        destination.textures.includes(binding.texture) || destination.depthTexture === binding.texture))
+        destination.textures.includes(binding.texture) ||
+        (destination.depthBuffer || destination.stencilBuffer) && destination.depthTexture === binding.texture))
         fail('FEEDBACK', 'A native draw cannot sample its own render target');
       const reuseResources = draw.bundleWarm && captured.refreshType !== three.RenderObjectRefreshType.FULL;
       if (captured.fogResources) {

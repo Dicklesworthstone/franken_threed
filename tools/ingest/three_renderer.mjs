@@ -1215,18 +1215,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame},
             this._hdr ? {...frame, outputEnabled: nodeFrame?.phases?.output !== false} : frame);
           else {
-            // The output pair needs source Renderer's first-use depth clear:
-            // its quad loads color, and WebGPU initially stores zero depth.
-            // Scope this to output passes and preserve authoritative copies.
+            // Source Renderer initializes depth once per destination target,
+            // even when that image is borrowed from an already rendered target.
+            // Its first borrower render therefore clears the shared depth too.
             const sourceDepth = destination.target.depthBuffer === true && destination.shape.depthFormat;
             const copiedDepth = mipLevel === 0 && destination.storage?.diagnostics.depthCopies > 0;
-            const firstDepth = outputPass && sourceTarget !== null && sourceDepth && !copiedDepth &&
-              !this._targetDepthInitialized.has(destination);
+            const firstDepth = sourceDepth && !this._targetDepthInitialized.has(destination) &&
+              (!this._shaderEncodedOutput && destination.shape.sharedDepth ||
+                outputPass && sourceTarget !== null && !copiedDepth);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
             this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
-            if (!this._shaderEncodedOutput && sourceDepth) this._targetDepthInitialized.add(destination);
+            if (!this._shaderEncodedOutput && sourceDepth && (!destination.shape.sharedDepth || !clearOnly))
+              this._targetDepthInitialized.add(destination);
           }
         };
         const textures = nodeFrame?.textureOwner, storage = nodeFrame?.storageOwner;

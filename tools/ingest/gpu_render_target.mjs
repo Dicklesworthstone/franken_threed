@@ -12,6 +12,10 @@
  * sampleDepth:true exposes the actual depth attachment through withDepthTexture.
  * withSampledTextures borrows resolved color and sampled depth together under
  * one lifetime guard. Depth-only reads do not refresh or dirty color mipmaps.
+ * depthSource reuses a sampled target's exact depth allocation on this device.
+ * Matching attachments share depth storage without another byte charge. Its
+ * owner must stay valid; source validation gates borrower publication, and an
+ * active borrowed generation retains the native image until it unwinds.
  * A four-sample depth attachment stays multisampled: no depth resolve, averaging
  * or precision conversion is inferred. Consumers choose their shader sample index.
  * colorFormats adds ordered 2D mip-zero MRT attachments under the same owner.
@@ -202,14 +206,14 @@ export function createGpuRenderTarget(device, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected render target options');
   for (const key of Object.keys(options))
-    if (!['width', 'height', 'format', 'colorFormats', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'mipLevelCount', 'sampleDepth', 'copyDestination', 'cube', 'arrayLayers', 'volumeDepth', 'depthArray'].includes(key))
+    if (!['width', 'height', 'format', 'colorFormats', 'depthFormat', 'sampleCount', 'maxBytes', 'label', 'generateMipmaps', 'mipLevelCount', 'sampleDepth', 'copyDestination', 'cube', 'arrayLayers', 'volumeDepth', 'depthArray', 'depthSource'].includes(key))
       fail('OPTIONS', `Unknown target option: ${key}`);
   const {
     width: initialWidth = 1, height: initialHeight = 1,
     format = options.colorFormats?.[0] ?? 'rgba16float', depthFormat = 'depth24plus', sampleCount = 1,
     maxBytes = 256 * 1024 * 1024, label = 'Offscreen render target', generateMipmaps = false,
     mipLevelCount: requestedMipLevels, sampleDepth = false, copyDestination = false, cube = false,
-    arrayLayers, volumeDepth, depthArray = false,
+    arrayLayers, volumeDepth, depthArray = false, depthSource = null,
   } = options;
   const colorFormats = inspectGpuRenderTargetColors(device, options.colorFormats ?? [format]), multiple = colorFormats.length > 1;
   if (colorFormats[0] !== format) fail('FORMAT', 'The primary format must match colorFormats[0]');
@@ -222,6 +226,9 @@ export function createGpuRenderTarget(device, options = {}) {
   if (typeof copyDestination !== 'boolean') fail('OPTIONS', 'copyDestination must be boolean');
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
+  const sharedDepth = depthSource === null ? null : transferTargets.get(depthSource);
+  if (depthSource !== null && (!sharedDepth || sharedDepth.device !== device || !sampleDepth || depthFormat === null))
+    fail('DEPTH', 'Shared depth requires a sampled target from this GPUDevice');
   if (typeof generateMipmaps !== 'boolean') fail('OPTIONS', 'generateMipmaps must be boolean');
   if (typeof cube !== 'boolean') fail('OPTIONS', 'cube must be boolean');
   const array = arrayLayers !== undefined, volume = volumeDepth !== undefined;
@@ -271,6 +278,7 @@ export function createGpuRenderTarget(device, options = {}) {
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount, ...(multiple ? {colorFormats} : {})});
   let current = null, disposed = false, terminal = null, busy = false, version = 0;
   let validation = Promise.resolve(), retirement = Promise.resolve();
+  const dependencyValidation = () => sharedDepth ? Promise.all([validation, sharedDepth.validation()]) : validation;
   let mipPipeline = null, mipSampler = null, mipGenerations = 0, colorUploads = 0, colorCopies = 0, depthCopies = 0;
   const levels = (w, h, d = layers) => {
     if (!w || !h) return 1;
@@ -286,6 +294,11 @@ export function createGpuRenderTarget(device, options = {}) {
   if (generateMipmaps && levels(width, height) > 1) requireMipFeatures();
   const transferShape = () => ({width, height, format, colorFormats, sampleCount, mipLevelCount: levels(width, height), cube, array, volume, depth: volume ? layers : 1, layers});
   const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth, cube, array: depthArray, layers: depthLayers, depthLayers});
+  if (sharedDepth) {
+    const source = sharedDepth.depthShape(), shape = depthShape();
+    if (Object.keys(shape).some(key => shape[key] !== source[key]))
+      fail('DEPTH', 'Shared depth attachment extent, format, dimension and samples must match');
+  }
   const retired = new Set(), readbacks = new Set();
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
@@ -302,7 +315,7 @@ export function createGpuRenderTarget(device, options = {}) {
     }
     const colorBytes = colorFormats.reduce((sum, value, index) => sum + COLOR_BYTES.get(value) * (historyIndices.has(index) ? 2 : 1), 0);
     const bytes = colorBytes * (texels + (sampleCount === 4 ? base * d * 4 : 0)) +
-      (cube || depthArray ? d : 1) * base * DEPTH_BYTES.get(depthFormat) * sampleCount;
+      (sharedDepth ? 0 : (cube || depthArray ? d : 1) * base * DEPTH_BYTES.get(depthFormat) * sampleCount);
     if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte count exceeds safe integer precision');
     return bytes;
   };
@@ -312,7 +325,10 @@ export function createGpuRenderTarget(device, options = {}) {
     for (const texture of pair?.multisamples ?? []) texture.destroy();
     for (const texture of pair?.historyColors?.values() ?? []) texture.destroy();
     for (const texture of pair?.historyMultisamples?.values() ?? []) texture.destroy();
-    for (const depth of pair?.depths ?? []) depth.destroy();
+    if (pair?.depthStorage) {
+      if (--pair.depthStorage.references === 0) for (const depth of pair.depthStorage.textures) depth.destroy();
+      pair.depthStorage = null;
+    }
     for (const depth of pair?.mipDepths?.values() ?? []) depth.destroy();
   };
   function release() {
@@ -330,6 +346,7 @@ export function createGpuRenderTarget(device, options = {}) {
   function live() {
     if (disposed) fail('DISPOSED', 'Render target is disposed');
     if (terminal !== null) throw terminal;
+    current?.validateDepth?.();
   }
   function exclusive() {
     live();
@@ -380,12 +397,19 @@ export function createGpuRenderTarget(device, options = {}) {
         pair.multisample = pair.multisamples[0]; pair.multisampleView = pair.multisampleViews[0];
         for (const index of historyIndices) allocateHistory(pair, index, w, h);
         if (depthFormat !== null) {
-          const separate = sampleCount === 4 && depthLayers > 1;
-          for (let layer = 0; layer < (separate ? depthLayers : 1); layer++) {
-            const depth = device.createTexture({label: `${label} depth${separate ? ` ${layer}` : ''}`,
-              size: {width: w, height: h, depthOrArrayLayers: separate ? 1 : depthLayers}, format: depthFormat,
-              dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | 1 | (sampleDepth ? 4 : 0)});
-            pair.depths.push(depth);
+          if (sharedDepth) {
+            const shared = sharedDepth.shareDepth({width: w, height: h, depthFormat, sampleCount, depthLayers, cube, array: depthArray});
+            pair.depthStorage = shared.storage; pair.validateDepth = shared.validate;
+            pair.depths = shared.storage.textures;
+          } else {
+            pair.depthStorage = {references: 1, textures: pair.depths};
+            const separate = sampleCount === 4 && depthLayers > 1;
+            for (let layer = 0; layer < (separate ? depthLayers : 1); layer++) {
+              const depth = device.createTexture({label: `${label} depth${separate ? ` ${layer}` : ''}`,
+                size: {width: w, height: h, depthOrArrayLayers: separate ? 1 : depthLayers}, format: depthFormat,
+                dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | 1 | (sampleDepth ? 4 : 0)});
+              pair.depths.push(depth);
+            }
           }
           pair.depth = pair.depths[0];
           pair.depthView = pair.depth.createView(depthLayers > 1 && sampleCount === 1 ? layerView(0) : {});
@@ -638,7 +662,7 @@ export function createGpuRenderTarget(device, options = {}) {
       // draws cannot change which version of the texture this call observes.
       return await operation({device, width, height, diagnostics: {target: {...transferShape(), depthFormat, sampleDepth, depthLayers, depthArray}},
         get disposed() { return disposed; }, get failed() { return terminal !== null; },
-        get validation() { return validation; },
+        get validation() { return dependencyValidation(); },
         withTexture: (callback, settings = {}) => api.withTexture(callback, {...settings, colorSlots}),
         withDepthTexture: api.withDepthTexture}, {...options, signal: controller.signal});
     } finally {
@@ -648,7 +672,7 @@ export function createGpuRenderTarget(device, options = {}) {
   }
   const api = Object.freeze({
     rendererOptions,
-    get validation() { live(); return validation; },
+    get validation() { live(); return dependencyValidation(); },
     get width() { return width; }, get height() { return height; }, get depth() { return volume ? layers : 1; },
     get mipLevelCount() { return current?.mipLevelCount ?? 0; },
     get suspended() { return width === 0 || height === 0; },
@@ -784,6 +808,7 @@ export function createGpuRenderTarget(device, options = {}) {
         current.used = true;
         let completion;
         other.borrowDepth(texture => {
+          if (texture === current.depth) fail('FEEDBACK', 'Depth copies cannot read and write the same shared image');
           const view = cube || depthArray ? current.layerFrames[plan.face].depthView : current.depthView;
           completion = submitGpuDepthCopy(device, texture, view, plan);
         });
@@ -799,7 +824,7 @@ export function createGpuRenderTarget(device, options = {}) {
     async whenIdle() {
       exclusive();
       try {
-        await Promise.race([Promise.all([validation, retirement, device.queue.onSubmittedWorkDone()]), stopped]);
+        await Promise.race([Promise.all([dependencyValidation(), retirement, device.queue.onSubmittedWorkDone()]), stopped]);
         live(); return api;
       } catch (error) { stop(error); throw error; }
     },
@@ -820,8 +845,19 @@ export function createGpuRenderTarget(device, options = {}) {
     if (device.lost && typeof device.lost.then === 'function')
       device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     transferTargets.set(api, {owner: api, device, exclusive, shape: transferShape, depthShape,
+      shareDepth(shape) {
+        live();
+        const actual = depthShape(), storage = current?.depthStorage;
+        if (!sampleDepth || !storage || Object.keys(shape).some(key => shape[key] !== actual[key]))
+          fail('DEPTH', 'Shared depth attachment extent, format, dimension and samples must match');
+        storage.references++;
+        return {storage, validate() {
+          live();
+          if (current?.depthStorage !== storage) fail('STALE', 'Shared depth source was resized or replaced');
+        }};
+      },
       borrowDepth: callback => borrow(callback, 'depth'),
-      borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex), validation: () => validation});
+      borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex), validation: dependencyValidation});
     return api;
   } catch (error) { disposed = true; release(); throw error; }
 }

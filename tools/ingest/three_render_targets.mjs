@@ -172,8 +172,13 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   let depthFormat = target.depthBuffer ? (target.stencilBuffer ? 'depth24plus-stencil8' : 'depth24plus') : null;
   if (depthTexture !== null) {
     if (typeof three.DepthTexture !== 'function' || !(depthTexture instanceof three.DepthTexture) ||
-        depthTexture.isDepthTexture !== true || depthTexture.renderTarget !== target)
-      fail('SOURCE', 'Expected the target-owned source DepthTexture; shared depth attachments are not admitted');
+        depthTexture.isDepthTexture !== true || !(depthTexture.renderTarget instanceof three.RenderTarget) ||
+        depthTexture.renderTarget.depthTexture !== depthTexture)
+      fail('SOURCE', 'Expected a source DepthTexture with its original render target owner');
+    if (depthTexture.renderTarget !== target && (cube || array || volume ||
+        depthTexture.renderTarget.isCubeRenderTarget || depthTexture.renderTarget.isWebGLCubeRenderTarget ||
+        depthTexture.renderTarget.depth !== 1 || depthTexture.renderTarget.texture?.isData3DTexture))
+      fail('UNSUPPORTED', 'Shared depth attachments currently require ordinary 2D targets');
     // Source updateRenderTarget initializes owned depth dimensions lazily, so
     // setSize() may leave the previous image depth visible until preparation.
     // The selected target extent determines the new native depth allocation.
@@ -239,14 +244,15 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     if (volume) d = Math.max(1, Math.floor(d / 2));
     colorBytes += w * h * texelBytes * d;
   }
+  const depthOwner = depthTexture?.renderTarget ?? null, sharedDepth = depthOwner !== null && depthOwner !== target;
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
-    (depthFormat ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
+    (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
     cube, webglCube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
-    depthTexture, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
+    depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
     key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
 }
 
@@ -344,7 +350,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
   function release(entry) {
-    if (entry.busy || entry.programReferences || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
+    if (entry.busy || entry.programReferences || entry.depthReferences || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
     entry.released = true;
     try { entry._dispatcher?.dispose(); }
     finally {
@@ -362,6 +368,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
       entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = null;
       entry._wanted.clear();
+      entry.releaseDepthOwner?.(); entry.releaseDepthOwner = null;
     }
   }
   function retire(entry) {
@@ -371,8 +378,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     entry.target.removeEventListener('dispose', entry.onDispose);
     for (const texture of entry.shape.textures) texture.removeEventListener('dispose', entry.onDispose);
     entry.shape.depthTexture?.removeEventListener('dispose', entry.onDispose);
+    entry.shape.depthOwner?.removeEventListener('dispose', entry.onDepthOwnerDispose);
     if (entries.get(entry.target) === entry) entries.delete(entry.target);
     preserved.delete(entry); historyEntries.delete(entry);
+    // Color disposal and direct owner configuration changes also invalidate
+    // its depth, even when no public RenderTarget dispose event was emitted.
+    for (const borrower of allEntries()) if (borrower.depthEntry === entry) retire(borrower);
     release(entry);
   }
   function collect(entry) {
@@ -390,9 +401,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   const sameColors = (a, b) => a.textures.length === b.textures.length && a.textures.every((texture, index) =>
     texture === b.textures[index] && a.colorFormats[index] === b.colorFormats[index]);
-  const sameShape = (a, b) => a.key === b.key && sameColors(a, b) && a.depthTexture === b.depthTexture;
+  const sameShape = (a, b) => a.key === b.key && sameColors(a, b) && a.depthTexture === b.depthTexture && a.depthOwner === b.depthOwner;
   function historyShape(group, shape, base = group.shape) {
-    return shape.key === base.key && shape.depthTexture === base.depthTexture &&
+    return shape.key === base.key && shape.depthTexture === base.depthTexture && shape.depthOwner === base.depthOwner &&
       shape.textures.length === group.pairs.length && shape.textures.every((texture, index) => group.pairs[index].includes(texture));
   }
   function retireHistory(group) { for (const entry of [...group.entries]) retire(entry); }
@@ -482,7 +493,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const entry = historyEntry(group, shape); entries.set(target, entry); return entry;
     }
     let entry = entries.get(target);
-    if (entry && !sameShape(entry.shape, shape)) { retire(entry); entry = null; }
+    if (entry && (!sameShape(entry.shape, shape) || entry.depthEntry && !entry.depthEntry.alive)) { retire(entry); entry = null; }
     if (entry) {
       if (initialize && shape.cube) entry.cubeInitialized = true;
       return entry;
@@ -493,6 +504,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     return entry;
   }
   function createEntry(target, shape) {
+    const depthEntry = shape.sharedDepth ? capture(shape.depthOwner) : null;
     if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
       references: 0, sourceShape: null, retirement: null, cubeInitialized: false,
@@ -502,6 +514,25 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     target.addEventListener('dispose', entry.onDispose);
     for (const texture of shape.textures) texture.addEventListener('dispose', entry.onDispose);
     shape.depthTexture?.addEventListener('dispose', entry.onDispose);
+    if (shape.sharedDepth) {
+      entry.depthEntry = depthEntry;
+      const finish = retainGeneration(depthEntry);
+      depthEntry.depthReferences = (depthEntry.depthReferences ?? 0) + 1;
+      entry.releaseDepthOwner = () => {
+        depthEntry.depthReferences--; finish();
+        if (!depthEntry.alive) release(depthEntry);
+      };
+      entry.onDepthOwnerDispose = () => {
+        // Automatic effect/pass resizes preserve accepted older generations.
+        // The borrowing color keeps the corresponding older depth generation.
+        if (preserved.has(entry.depthEntry)) {
+          entry.sourceShape = sourceShape(target, entry); preserved.add(entry);
+          if (entries.get(target) === entry) entries.delete(target);
+          collect(entry);
+        } else retire(entry);
+      };
+      shape.depthOwner.addEventListener('dispose', entry.onDepthOwnerDispose);
+    }
     return entry;
   }
   function historyEntry(group, shape) {
@@ -567,6 +598,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       fail('STALE', 'Target configuration changed before its queued use');
     if (entry.error) throw entry.error;
     if (entry.storage?.failed) fail('GPU', 'Native target storage failed');
+    if (entry.depthEntry) assertCurrent(entry.depthEntry);
     return entry;
   }
   function budget(bytes) {
@@ -584,12 +616,22 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Public resize preserves this source identity, but its old layer count
     // must not select array depth again after a shrink to ordinary 2D. Earlier
     // retained effect/shadow generations cannot rewrite the current image.
-    if (!depthTexture || cube || preserved.has(entry)) return;
+    if (!depthTexture || cube || entry.shape.sharedDepth || preserved.has(entry)) return;
     depthTexture.isArrayTexture = depthViewDimension === '2d-array';
     Object.assign(depthTexture.image, {width, height, depth: depthLayers});
   }
   function ensure(entry) {
     assertCurrent(entry);
+    const depthEntry = entry.depthEntry;
+    if (depthEntry) {
+      // The source does not initialize an owning target through its borrower.
+      // Keep this boundary explicit instead of silently changing its image
+      // dimensions or allocating a private replacement for the shared depth.
+      if (!depthEntry.storage) fail('UNINITIALIZED', 'Initialize the owning target before rendering with its shared depth');
+      if (entry.shape.depthAttachment && ['width', 'height', 'sampleCount', 'depthFormat', 'depthLayers'].some(key =>
+        entry.shape[key] !== depthEntry.shape[key]))
+        fail('DEPTH', 'Shared depth attachment extent, format and samples must match its color target');
+    }
     const group = entry.historyGroup;
     const additional = allocationBytes(entry), needed = group ? group.charged + additional : entry.shape.bytes;
     if (entry.storage && (!group || group.charged === needed)) return entry;
@@ -598,16 +640,18 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     prepareDepthTexture(entry);
     const {width, height, format, colorFormats, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
+    const depthOptions = depthEntry ? entry.shape.depthAttachment
+      ? {depthSource: depthEntry.storage} : {depthFormat: null, sampleDepth: false} : {};
     if (group) {
       group.storage ??= gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
-        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
+        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
       if (group.charged !== needed)
         group.storage.reserveColorHistory(group.pairs.flatMap((pair, index) => pair.length > 1 ? [index] : []));
       allocatedBytes += needed - group.charged; group.charged = needed;
       entry.storage = group.storage.selectColorSlots(entry.colorSlots);
     } else {
       entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube ? false : generateMipmaps, mipLevelCount,
-        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
+        sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
       entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     }
     // The readback helper consumes this session-shaped object. It copies the
@@ -815,7 +859,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       get(texture) {
         if (!targetTexture(texture)) return retained.get(texture);
         const target = textureTarget(texture);
-        if (target === destination) fail('FEEDBACK', 'A render pass cannot sample its own color or depth target');
+        if (destination && (destination.textures.includes(texture) ||
+            (destination.depthBuffer || destination.stencilBuffer) && destination.depthTexture === texture))
+          fail('FEEDBACK', 'A render pass cannot sample an attached color or depth image');
         const entry = capture(target);
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
@@ -839,6 +885,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function copyTarget(source, destination, options, depth = false) {
     assertCurrent(source); assertCurrent(destination);
+    if (depth) { source = source.depthEntry ?? source; destination = destination.depthEntry ?? destination; }
     if (source === destination || source.historyGroup && source.historyGroup === destination.historyGroup)
       fail('FEEDBACK', 'In-place target copies are not admitted');
     if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
@@ -849,7 +896,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     budget(allocationBytes(source) + allocationBytes(destination));
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
-    if (depth) destination.depthDirty = true;
+    if (depth) { destination.depthDirty = true; if (destination.depthEntry) destination.depthEntry.depthDirty = true; }
     else if (plan.colorIndex === 0) destination.dirty = true;
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
@@ -978,8 +1025,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
               Math.max(entry.shape.width, entry.shape.height) > device.limits.maxTextureDimension2D))
           fail('DEVICE', 'Volume depth attachments exceed the device 2D texture limit');
         const group = entry.historyGroup;
+        if (source.depth && [...allEntries()].some(active => (active.busy || active.historyGroup?.frame) &&
+            active.shape.depthAttachment && active.shape.depthTexture === texture))
+          fail('FEEDBACK', 'A pass cannot sample a shared depth image attached for writing');
         if (group?.frame) {
-          if (source.depth || group.frame.writes.has(texture)) fail('FEEDBACK', 'A pass cannot sample its active color or depth attachments');
+          if (source.depth && group.frame.depthAttachment || group.frame.writes.has(texture)) fail('FEEDBACK', 'A pass cannot sample its active color or depth attachments');
         } else if (entry.busy || group?.busy) fail('REENTRANT', 'Cannot sample a target during its submission');
         const owner = group ?? entry;
         if (!seen.has(owner)) bytes += allocationBytes(entry);
@@ -1049,13 +1099,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           for (const member of group.entries) { if (!member.alive) release(member); else collect(member); }
         }
       }
-      entry.busy = true;
+      entry.busy = true; entry.nativeReads = new Set(sources.map(source => source.texture));
       try {
         if (entry.shape.textures.length > 1) return entry.storage.withAttachments(invoke);
         if (color && depth) return entry.storage.withSampledTextures((native, nativeDepth) => invoke([native], nativeDepth));
         if (depth) return entry.storage.withDepthTexture(native => invoke(null, native));
         return entry.storage.withTexture(native => invoke([native], null));
-      } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
+      } finally { entry.nativeReads = null; entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
     },
     // A raw transfer destination must not sample old mips or allocate a UV
     // replica. Keep identity, lifetime, allocation and validation with this owner.
@@ -1097,17 +1147,23 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const group = entry.historyGroup;
       const borrowed = group?.readBorrow;
       if (entry.busy || group?.busy && !borrowed || group?.frame) fail('REENTRANT', 'Cannot reenter a target submission');
-      if (borrowed && [...entry.shape.textures, entry.shape.depthTexture].some(texture => borrowed.reads.has(texture)))
+      if (borrowed && [...entry.shape.textures, ...(entry.shape.depthAttachment ? [entry.shape.depthTexture] : [])].some(texture => borrowed.reads.has(texture)))
         fail('FEEDBACK', 'A pass cannot write an attachment held by its sampled inputs');
+      const depthReads = entry.depthEntry?.nativeReads ?? entry.depthEntry?.historyGroup?.readBorrow?.reads;
+      if (entry.shape.depthAttachment && depthReads?.has(entry.shape.depthTexture))
+        fail('FEEDBACK', 'A pass cannot write shared depth held by its sampled inputs');
       if (!borrowed) budget(entry.storage.frameAllocationBytes(mipLevel, face));
       const allocatedBefore = entry.storage.allocatedBytes;
       entry.busy = true; entry.dirty = true;
       // Higher private depth levels never modify the source's level-zero depth.
-      if (mipLevel === 0 && entry.shape.depthAttachment) entry.depthDirty = true;
+      if (mipLevel === 0 && entry.shape.depthAttachment) {
+        entry.depthDirty = true;
+        if (entry.depthEntry) entry.depthEntry.depthDirty = true;
+      }
       const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots}) : entry.storage.withFrame;
       try {
         const result = withFrame((frame, texture, handles) => {
-          if (group) group.frame = {handles, writes: new Set(entry.shape.textures)};
+          if (group) group.frame = {handles, writes: new Set(entry.shape.textures), depthAttachment: entry.shape.depthAttachment};
           try {
             // Source targets can own a depth texture solely for history copies.
             // Allocate and sample it normally, but a color render must neither
