@@ -9,6 +9,7 @@ import { parse } from "acorn";
 import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
+import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
 
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
 const coreUrl = rootUrl + "build/three.core.js";
@@ -17,6 +18,7 @@ const dracoUrl = rootUrl + "examples/jsm/loaders/DRACOLoader.js";
 const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
 const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
 const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
+const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -127,7 +129,7 @@ test("addon asset discovery preserves opaque loaders and shadows while OBJ mater
     new OBJLoader().setMaterials(materials).load('materials.obj');
     new FBXLoader().load('sidecars.fbx');
     new HDRLoader().load('known.hdr');`);
-  assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'known.hdr']);
+  assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'sidecars.fbx', 'known.hdr']);
 });
 
 test("MTL and configured OBJ loaders retain finite model paths, material settings and namespace identity", () => {
@@ -176,6 +178,22 @@ test("only the exact pinned MTL manager fallback is exempt from application mana
     assert.equal(exposed, expected);
     assert.deepEqual(requests, []);
   }
+});
+
+test("FBX pending resources preserve captured file bases, live resets and opaque loader boundaries", () => {
+  const requests = discover(`import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { FBXLoader as Source } from ${JSON.stringify(fbxUrl)};
+    const loader = new Source(); loader.load('first/scene.fbx'); loader.loadAsync('second/scene.fbx');
+    loader.setPath('models/'); loader.load('nested/scene.fbx'); loader.setResourcePath('shared/');
+    const reset = new Source().setResourcePath('before/'); reset.load('fallback/scene.fbx'); reset.setResourcePath('');
+    new Addons.FBXLoader().setResourcePath('textures/').loadAsync('namespace.fbx');
+    const dynamic = new Source(); dynamic.load('host.fbx'); dynamic.setResourcePath(runtimePath);
+    new Source(manager).load('managed.fbx'); const escaped = new Source(); change(escaped); escaped.load('escaped.fbx');`);
+  assert.deepEqual(requests.map(({url,texturePaths})=>[url,texturePaths]), [
+    ['first/scene.fbx',['first/','shared/']], ['second/scene.fbx',['second/','shared/']],
+    ['models/nested/scene.fbx',['models/','shared/']], ['fallback/scene.fbx',['before/','fallback/']],
+    ['namespace.fbx',['textures/']], ['host.fbx',null],
+  ]);
 });
 
 test("ObjectLoader retains sticky image bases and finite resets visible to pending loads", () => {
@@ -305,6 +323,61 @@ function fixture(files) {
   }
   return root;
 }
+
+for (const encoding of [{binary:false}, {binary:true,version:7400}, {binary:true,version:7500}]) {
+  test(`FBX ${encoding.binary ? encoding.version : 'ASCII'} closes texture metadata without touching model or embedded bytes`, () => {
+    const model = fbxResources([
+      {relative:'C:\\export\\paint%20%23.png?variant=2#map', filename:'discarded.png'},
+      {filename:'faces/front.png', relative:''},
+      {relative:'embedded.png',content:fbxPixel}, {relative:'embedded.png'},
+      {relative:'empty.png',content:Buffer.alloc(0)},
+      {relative:'fallback.unknown',content:fbxPixel},
+      {relative:'data:image/png;base64,'+fbxPixel.toString('base64')},
+      {relative:'blob:https://example.test/image'},
+      {relative:'../escape.png'},
+    ],encoding);
+    const images=['paint #.png','faces/front.png','empty.png','fallback.unknown'];
+    const root=fixture({'index.html':'','site/models/nested/scene.fbx':model,
+      ...Object.fromEntries([...images,'embedded.png','discarded.png'].map(name=>['site/textures/'+name,fbxPixel]))});
+    const requests=discover(`import {FBXLoader} from ${JSON.stringify(fbxUrl)};
+      new FBXLoader().setPath('models/').setResourcePath('textures/').load('nested/scene.fbx');`);
+    const logical=[],assets=collectThreeLoaderAssets(requests,{
+      documentUrl:pathToFileURL(path.join(root,'index.html')).href,
+      documentBaseUrl:pathToFileURL(path.join(root,'site/')).href,
+      onResource:(name,url)=>logical.push(url),
+    });
+    assert.deepEqual([...assets.keys()].sort(),['site/models/nested/scene.fbx',...images.map(name=>'site/textures/'+name)].sort());
+    assert.deepEqual(assets.get('site/models/nested/scene.fbx').source,model);
+    assert.ok(logical.some(url=>url.endsWith('paint%20%23.png?variant=2#map')));
+  });
+}
+
+test('FBX binary image records retain every source numeric ID encoding',()=>{
+  for (const version of [7400,7500]) for (const [numberType,id] of [['L',10],['I',-10],['D',10.5],['F',10.5],['Y',-10]]) {
+    const model=fbxResources([{id,relative:'paint.png'}],{binary:true,version,numberType});
+    const root=fixture({'index.html':'','scene.fbx':model,'paint.png':fbxPixel});
+    const requests=discover(`import {FBXLoader} from ${JSON.stringify(fbxUrl)};new FBXLoader().load('scene.fbx');`);
+    const options={documentUrl:pathToFileURL(path.join(root,'index.html')).href,documentBaseUrl:pathToFileURL(root+'/').href};
+    const assets=collectThreeLoaderAssets(requests,options);
+    assert.deepEqual([...assets.keys()],['scene.fbx','paint.png'],`${version} ${numberType}`);
+    assert.deepEqual(assets.get('scene.fbx').source,model);
+  }
+});
+
+test('FBX duplicate video IDs retain each source parser rule and malformed offsets preserve original bytes',()=>{
+  for (const binary of [false,true]) {
+    const model=fbxResources([{id:10,relative:'first.png'},{id:10,relative:'last.png'}],{binary});
+    const root=fixture({'index.html':'','scene.fbx':model,'first.png':fbxPixel,'last.png':fbxPixel});
+    const requests=discover(`import {FBXLoader} from ${JSON.stringify(fbxUrl)};new FBXLoader().load('scene.fbx');`);
+    const options={documentUrl:pathToFileURL(path.join(root,'index.html')).href,documentBaseUrl:pathToFileURL(root+'/').href};
+    assert.deepEqual([...collectThreeLoaderAssets(requests,options).keys()],['scene.fbx',binary?'first.png':'last.png']);
+    if (binary) {
+      model.writeUInt32LE(0xffffffff,27);fs.writeFileSync(path.join(root,'scene.fbx'),model);
+      const assets=collectThreeLoaderAssets(requests,options);
+      assert.deepEqual([...assets.keys()],['scene.fbx']);assert.deepEqual(assets.get('scene.fbx').source,model);
+    }
+  }
+});
 
 test("MTL texture closure matches source map overrides, option parsing, encoded URLs and document bases", () => {
   const mtl = `# No material owns this first map\nmap_Kd unused.png

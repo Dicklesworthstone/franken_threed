@@ -11,6 +11,7 @@ import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
 import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
 import { vertex, vertexExpected } from "../../tests/fixtures/meshopt/vectors.mjs";
+import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
 const gltf = new URL("../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js", import.meta.url);
@@ -46,7 +47,7 @@ globalThis.fetch=async (input,options)=>{
 class ImageHost extends EventTarget {
   get src(){return this._src;}
   set src(url){this._src=url;images.push(url);Promise.resolve().then(async()=>{
-    if(!url.startsWith('data:image/png;'))throw new Error('Unembedded image: '+url);
+    if(!url.startsWith('data:image/png;')&&!url.startsWith('blob:'))throw new Error('Unembedded image: '+url);
     const bytes=new Uint8Array(await (await nativeFetch(url)).arrayBuffer());
     if(bytes[0]!==137||bytes[1]!==80)throw new Error('Image bytes changed');
     this.complete=true;this.naturalWidth=1;this.naturalHeight=1;this.dispatchEvent(new Event('load'));
@@ -343,6 +344,51 @@ test("packed HDR/EXR environments, fonts and geometry execute retained addon par
     opacity: [.25, .5, 1], obj: positions});
   assert.equal(result.requests.length, 7, 'each retained load reaches the embedded host route');
   assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
+test('packed ASCII and binary FBX retain textured geometry, embedded images and pending resource bases offline',async()=>{
+  const fbxUrl=new URL('../../upstream/three.js/examples/jsm/loaders/FBXLoader.js',import.meta.url).href;
+  const models={
+    'models/nested/ascii.fbx':fbxResources([{relative:'C:\\exports\\paint%20%23.png?version=2#map'}],{triangle:true}),
+    'models/binary.fbx':fbxResources([{relative:'paint.png'}],{binary:true,triangle:true}),
+    'models/embedded.fbx':fbxResources([{relative:'embedded.png',content:fbxPixel}],{binary:true,version:7500,triangle:true}),
+    'late/scene.fbx':fbxResources([{relative:'paint.png'}],{triangle:true}),
+  };
+  const f=fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import * as THREE from ${JSON.stringify(core.href)};export {THREE};
+      import {FBXLoader} from ${JSON.stringify(fbxUrl)};
+      async function ready(scene){const mesh=scene.children[0];for(let i=0;i<100;i++){
+        if(mesh.material.map.image?.complete)return mesh;await new Promise(resolve=>setTimeout(resolve,10));
+      }throw new Error('FBX image failed to load');}
+      export async function run(){
+        const order=[],loader=new FBXLoader().setPath('models/');
+        const pending=loader.loadAsync('nested/ascii.fbx');order.push('returned');
+        const first=await ready(await pending);order.push('loaded');
+        const second=await ready(await loader.loadAsync('nested/ascii.fbx'));
+        const binary=await ready(await new FBXLoader().setPath('models/').setResourcePath('shared/').loadAsync('binary.fbx'));
+        const embedded=await ready(await new FBXLoader().setPath('models/').loadAsync('embedded.fbx'));
+        const changing=new FBXLoader(),latePending=changing.loadAsync('late/scene.fbx');changing.setResourcePath('shared/');
+        const late=await ready(await latePending);first.position.x=7;
+        return {order,meshes:[first,binary,embedded,late].map(mesh=>({name:mesh.name,type:mesh.type,
+          material:mesh.material.type,positions:[...mesh.geometry.attributes.position.array],
+          uv:[...mesh.geometry.attributes.uv.array],colorSpace:mesh.material.map.colorSpace,complete:mesh.material.map.image.complete})),
+          independent:first!==second&&first.geometry!==second.geometry&&first.material!==second.material&&second.position.x===0,
+          embedded:embedded.material.map.image.src.startsWith('blob:')};
+      }`,...models,'models/paint #.png':fbxPixel,'shared/paint.png':fbxPixel});
+  await buildApplication(f.entry,f.out,{prepareStandaloneLoaders:true});
+  for(const [name,bytes]of Object.entries(models))assert.deepEqual(fs.readFileSync(path.join(f.out,name)),bytes);
+  packHtml(path.join(f.out,'index.html'),f.packed);const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  assert.deepEqual(result.result,{order:['returned','loaded'],meshes:Array.from({length:4},()=>({
+    name:'Triangle',type:'Mesh',material:'MeshPhongMaterial',positions:[0,0,0,1,0,0,0,1,0],
+    uv:[0,0,1,0,0,1],colorSpace:'srgb',complete:true})),independent:true,embedded:true});
+  assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
+  assert.equal(result.images.length,5);
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='models/paint%20%23.png?version=2#map'));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='shared/paint.png'));
 });
 
 test("resource lookup preserves unknown and manager-owned URLs and exact bytes with real MIME", async () => {

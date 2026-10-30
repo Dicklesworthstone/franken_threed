@@ -230,6 +230,32 @@ decode, all material/geometry assertions pass, and there are no browser errors.
 This validates retained-loader packaging and native image decoding, not rendering
 or acceleration.
 
+## FBX models and texture dependencies
+
+Finite pinned `FBXLoader.load()` and `loadAsync()` requests now include original
+ASCII and binary FBX files plus their local external image dependencies. The
+metadata reader follows `Objects.Video`, `RelativeFilename` precedence, Windows
+basename handling and the source's duplicate-record rules. Binary 32-bit and
+64-bit node offsets skip geometry and compressed animation/attribute arrays;
+their original bytes remain for the retained loader to decode at runtime.
+Supported embedded images stay inside the FBX bytes, including shared filename
+references. Existing data and Blob URLs retain their source handling.
+
+Image bases preserve the FBX loader's captured `setPath()` or model directory,
+with finite `setResourcePath()` changes visible to pending requests. Unknown
+paths, custom managers and escaping loader objects keep their host routes.
+Malformed metadata never replaces the original model or its source parse error.
+
+The packed execution regression runs ASCII, compressed-array binary, and
+embedded-image binary models after both source and build directories become
+unavailable. It checks textured triangle geometry, UVs, material color space,
+asynchronous ordering, independent loader results and pending resource resets.
+Its image host verifies image bytes and completion. An independent Chrome
+151.0.7922.34 run also decoded all five native PNG images, including the source
+Blob image, and checked exact red RGBA bytes with zero external requests or
+browser errors. This establishes retained-loader packaging and browser image
+decoding; rendering and acceleration are separate claims.
+
 ## Validation and boundaries
 
 ```sh

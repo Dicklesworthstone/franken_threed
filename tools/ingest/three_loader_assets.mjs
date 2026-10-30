@@ -32,6 +32,7 @@ const SINGLE_FILE_ADDONS = new Map([
 const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
   ["MTLLoader", new Set(["setMaterialOptions"])],
+  ["FBXLoader", new Set()],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -41,6 +42,7 @@ const ADDON_USES = new Map([
   ["DRACOLoader", new Set(["decodeDracoFile", "decodeGeometry"])],
   ["KTX2Loader", new Set(["parse", "init", "detectSupportAsync"])],
   ["MTLLoader", new Set(["parse"])],
+  ["FBXLoader", new Set(["parse"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
 const isSetting = (loader, method) => SETTINGS.has(method) || ADDON_SETTINGS.get(loader)?.has(method);
@@ -400,8 +402,8 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
         }
       }
       let materialGroup;
-      if (value.loader === "MTLLoader") {
-        // MTL captures its default path when load() starts, but resourcePath is
+      if (value.loader === "MTLLoader" || value.loader === "FBXLoader") {
+        // MTL/FBX capture their default path when load() starts, but resourcePath is
         // read later by parse(). Each pending request keeps its own fallback.
         if (!materialLoads.has(value.origin)) materialLoads.set(value.origin, { paths: new Set(), requests: [], unknown: false });
         materialGroup = materialLoads.get(value.origin);
@@ -482,6 +484,106 @@ function mtlTextureUris(text) {
   return uris;
 }
 
+// Read only r186 FBXLoader's Video image metadata. Geometry, compressed arrays,
+// animation and embedded image bytes stay untouched and are parsed by upstream
+// at runtime. A malformed metadata record preserves the source error route.
+function fbxTextureUris(bytes) {
+  let videos = new Map();
+  const binary = bytes.subarray(0, 23).equals(Buffer.from("Kaydara FBX Binary  \0\x1a\0"));
+  try {
+    if (binary) {
+      const version = bytes.readUInt32LE(23), width = version >= 7500 ? 8 : 4;
+      const headerSize = width * 3 + 1;
+      if (version < 6400) return [];
+      const integer = at => width === 8 ? Number(bytes.readBigUInt64LE(at)) : bytes.readUInt32LE(at);
+      const string = (at, length) => {
+        const value = bytes.subarray(at, at + length), zero = value.indexOf(0);
+        return value.subarray(0, zero < 0 ? value.length : zero).toString("utf8");
+      };
+      function* nodes(start, limit) {
+        for (let at = start; at + headerSize <= limit;) {
+          const end = integer(at);
+          if (!end) return; // Pinned null-record sentinel; the file footer follows.
+          const count = integer(at + width), length = integer(at + width * 2);
+          const nameLength = bytes[at + headerSize - 1], properties = at + headerSize + nameLength;
+          const children = properties + length;
+          if (![end, count, length, children].every(Number.isSafeInteger) ||
+              end <= at || end > limit || children > end || properties > children) throw new Error("FBX metadata extent");
+          yield { name: string(at + headerSize, nameLength), properties, count, children, end };
+          at = end;
+        }
+      }
+      const firstProperty = node => {
+        const at = node.properties, type = String.fromCharCode(bytes[at]);
+        if (!node.count || at >= node.children) return undefined;
+        if (type === "L" && at + 9 <= node.children) return Number(bytes.readBigInt64LE(at + 1));
+        if (type === "I" && at + 5 <= node.children) return bytes.readInt32LE(at + 1);
+        if (type === "D" && at + 9 <= node.children) return bytes.readDoubleLE(at + 1);
+        if (type === "F" && at + 5 <= node.children) return bytes.readFloatLE(at + 1);
+        if (type === "Y" && at + 3 <= node.children) return bytes.readInt16LE(at + 1);
+        if ((type === "S" || type === "R") && at + 5 <= node.children) {
+          const length = bytes.readUInt32LE(at + 1);
+          if (at + 5 + length > node.children) throw new Error("FBX metadata property");
+          return type === "S" ? string(at + 5, length) : length > 0;
+        }
+        return undefined;
+      };
+      for (const root of nodes(27, bytes.length)) {
+        if (root.name !== "Objects") continue;
+        videos = new Map(); // The source FBXTree replaces duplicate top-level nodes.
+        for (const node of nodes(root.children, root.end)) {
+          if (node.name !== "Video") continue;
+          const id = firstProperty(node);
+          if (typeof id !== "number" || videos.has(id)) continue; // Binary duplicate IDs keep the first.
+          const video = {};
+          for (const field of nodes(node.children, node.end)) {
+            if (!["Filename", "RelativeFilename", "Content"].includes(field.name) ||
+                field.count !== 1 || field.children !== field.end) continue;
+            video[field.name] = firstProperty(field);
+          }
+          videos.set(id, video);
+        }
+      }
+    } else {
+      const lines = bytes.toString("utf8").split(/[\r\n]+/), stack = [];
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index], depth = stack.length;
+        if (/^[\s\t]*(?:;|$)/.test(line)) continue;
+        // Match the source's indentation and property recognition, including
+        // its quote removal and next-line Content form.
+        const begin = line.match(new RegExp("^\\t{" + depth + "}(\\w+):(.*){"));
+        const property = line.match(new RegExp("^\\t{" + depth + "}(\\w+):[\\s\\t\\r\\n](.*)"));
+        if (begin) {
+          const name = begin[1], parent = stack.at(-1), node = { name };
+          if (depth === 0 && name === "Objects") videos = new Map();
+          if (depth === 1 && parent.name === "Objects" && name === "Video") {
+            const id = parseInt(begin[2].split(",")[0].trim().replace(/^"/, "").replace(/"$/, ""));
+            if (!Number.isNaN(id)) { node.video = {}; videos.set(id, node.video); }
+          }
+          stack.push(node);
+        } else if (property) {
+          const video = stack.at(-1)?.video, name = property[1];
+          if (!video || !["Filename", "RelativeFilename", "Content"].includes(name)) continue;
+          let value = property[2].replace(/^"/, "").replace(/"$/, "").trim();
+          if (name === "Content" && value === ",") value = lines[index + 1].replace(/"/g, "").replace(/,$/, "").trim();
+          video[name] = value;
+        } else if (depth && new RegExp("^\\t{" + (depth - 1) + "}}").test(line)) stack.pop();
+      }
+    }
+  } catch { return []; }
+  // Embedded content is indexed by filename across all Videos, not just by ID.
+  // Unsupported embedded extensions still use the source's external image path.
+  const embedded = new Set(), names = [];
+  for (const video of videos.values()) {
+    const name = video.RelativeFilename || video.Filename;
+    if (typeof name !== "string") continue;
+    names.push(name);
+    if ((video.Content === true || typeof video.Content === "string" && video.Content !== "") &&
+        /\.(bmp|jpe?g|png|tif|tga|webp)$/i.test(name)) embedded.add(name);
+  }
+  return [...new Set(names.filter(name => !embedded.has(name)).map(name => name.split("\\").pop()))];
+}
+
 /** Copies the finite local closure without changing the loader's original URL strings. */
 export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl, fail, onResource }) {
   const result = new Map(), entryDir = path.dirname(fileURLToPath(documentUrl));
@@ -511,6 +613,14 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
       for (const uri of mtlTextureUris(asset.source.toString("utf8"))) {
         // Pinned MaterialCreator only bypasses its prefix for HTTP(S) URLs.
         for (const base of request.texturePaths) add(/^https?:\/\//i.test(uri) ? uri : base + uri);
+      }
+      continue;
+    }
+    if (request.loader === "FBXLoader") {
+      if (!request.texturePaths) continue;
+      for (const uri of fbxTextureUris(asset.source)) {
+        if (uri.startsWith("data:") || uri.startsWith("blob:")) continue;
+        for (const base of request.texturePaths) add(base + uri);
       }
       continue;
     }
