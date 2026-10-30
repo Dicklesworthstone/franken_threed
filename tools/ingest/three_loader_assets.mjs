@@ -29,7 +29,11 @@ const SINGLE_FILE_ADDONS = new Map([
   ["STLLoader", new Set()],
   ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],
   ["OBJLoader", new Set(["setMaterials"])],
+  // The archive owns its model parts and images. The retained parser creates
+  // their Blob URLs; no ZIP contents are extracted or rewritten by packaging.
+  ["ThreeMFLoader", new Set()],
 ]);
+const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"]]);
 const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
   ["MTLLoader", new Set(["setMaterialOptions"])],
@@ -102,7 +106,8 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     try { resolved = canonicalUrl(resolveModule(node.source.value)); } catch { continue; }
     const core = isInternalLibraryModule(resolved, root);
     const addons = [...ADDON_SETTINGS.keys()].filter(name =>
-      resolved === root + "examples/jsm/Addons.js" || resolved === root + `examples/jsm/loaders/${name}.js`);
+      resolved === root + "examples/jsm/Addons.js" ||
+      resolved === root + `examples/jsm/loaders/${ADDON_FILES.get(name) ?? name + ".js"}`);
     for (const specifier of node.specifiers) {
       let value;
       if (specifier.type === "ImportNamespaceSpecifier" && core) value = { namespace: true };

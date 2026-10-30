@@ -19,6 +19,7 @@ const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
 const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
 const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
 const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
+const threeMfUrl = rootUrl + "examples/jsm/loaders/3MFLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -130,6 +131,37 @@ test("addon asset discovery preserves opaque loaders and shadows while OBJ mater
     new FBXLoader().load('sidecars.fbx');
     new HDRLoader().load('known.hdr');`);
   assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'sidecars.fbx', 'known.hdr']);
+});
+
+test("3MF discovery follows its actual source filename, aggregate exports and finite archive choices", () => {
+  const requests = discover(`import { ThreeMFLoader as Source } from ${JSON.stringify(threeMfUrl)};
+    import * as SourceModule from ${JSON.stringify(threeMfUrl)};
+    import { ThreeMFLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const Loader = Source, loader = new Loader();
+    loader.parse(inMemoryArchive); loader.setPath('models/');
+    loader.loadAsync(choice ? 'truck%20%23.3mf?edition=2#model' : 'colors.3mf');
+    new SourceModule.ThreeMFLoader().load('module.3mf');
+    new ThreeMFLoader().load('aggregate.3mf');
+    new Addons.ThreeMFLoader().loadAsync('namespace.3mf');`);
+  assert.deepEqual(requests.map(({loader, url}) => [loader, url]), [
+    ['ThreeMFLoader', 'models/truck%20%23.3mf?edition=2#model'], ['ThreeMFLoader', 'models/colors.3mf'],
+    ['ThreeMFLoader', 'module.3mf'], ['ThreeMFLoader', 'aggregate.3mf'], ['ThreeMFLoader', 'namespace.3mf'],
+  ]);
+});
+
+test("3MF foreign files, shadows, custom extensions and escaping loaders retain their host route", () => {
+  const requests = discover(`import { ThreeMFLoader } from ${JSON.stringify(threeMfUrl)};
+    import { ThreeMFLoader as Invented } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/ThreeMFLoader.js')};
+    import { ThreeMFLoader as Foreign } from 'file:///foreign/3MFLoader.js';
+    function shadow(ThreeMFLoader) { new ThreeMFLoader().load('shadow.3mf'); }
+    new Invented().load('invented.3mf'); new Foreign().load('foreign.3mf');
+    new ThreeMFLoader(manager).load('managed.3mf');
+    const custom = new ThreeMFLoader(); custom.addExtension(extension); custom.load('custom.3mf');
+    const escaped = new ThreeMFLoader(); change(escaped); escaped.load('escaped.3mf');
+    new ThreeMFLoader().setPath(dynamicPath).load('dynamic.3mf');
+    new ThreeMFLoader().load('known.3mf');`);
+  assert.deepEqual(requests.map(({url}) => url), ['known.3mf']);
 });
 
 test("FBX loader discovery retains animation settings, captured defaults and pending resource changes", () => {
@@ -353,6 +385,25 @@ function fixture(files) {
   }
   return root;
 }
+
+test("3MF application builds preserve complete source ZIP archives and their logical URL variants", async () => {
+  const archive = fs.readFileSync(new URL('../../upstream/three.js/examples/models/3mf/facecolors.3mf', import.meta.url));
+  const root = fixture({
+    'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import { ThreeMFLoader } from ${JSON.stringify(threeMfUrl)};
+      export const load=()=>new ThreeMFLoader().setPath('models/').loadAsync('colors%20%23.3mf?edition=2#model');`,
+    'models/colors #.3mf': archive,
+  });
+  const output = path.join(root, 'dist');
+  await buildApplication(path.join(root, 'index.html'), output, {prepareStandaloneLoaders: true});
+  assert.deepEqual(fs.readFileSync(path.join(output, 'models/colors #.3mf')), archive);
+  const resources = fs.readFileSync(path.join(output, 'f3d-loader-resources.mjs'), 'utf8');
+  assert.ok(resources.includes('models/colors%20%23.3mf?edition=2'));
+  assert.ok(resources.includes(archive.toString('base64')));
+  const packed = path.join(root, 'packed.html');
+  packHtml(path.join(output, 'index.html'), packed);
+  assert.ok(fs.statSync(packed).size > archive.length);
+});
 
 for (const encoding of [{binary:false}, {binary:true,version:7400}, {binary:true,version:7500}]) {
   test(`FBX ${encoding.binary ? encoding.version : 'ASCII'} closes texture metadata without touching model or embedded bytes`, () => {

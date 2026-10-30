@@ -288,6 +288,32 @@ packaging, not new renderer or browser GPU validation. Custom managers, escaping
 loaders and unknown paths remain on their original host route; this does not
 close material/texture sidecars for every model format.
 
+## 3MF manufacturing models
+
+Finite `ThreeMFLoader.load()` and `loadAsync()` calls now include their complete
+3MF archives in application output and the prepared standalone resource map.
+Source discovery recognizes the actual `3MFLoader.js` module filename as well
+as named and namespace addon-aggregate imports. Constructor aliases, finite URL
+choices, `setPath`, query/fragment suffixes and ordinary `parse()` usage retain
+the existing loader discovery rules. Custom extensions, custom managers and
+escaping loaders keep their original host route.
+
+The ZIP bytes are copied unchanged. The retained Three.js loader and fflate
+decode the original model parts, materials and component hierarchy at runtime;
+the source loader creates and retires its own image Blob URLs. Packaging does
+not extract the archive, rewrite its XML, or substitute a model parser.
+
+Three focused cases and the complete loader-asset suite pass (34/34).
+`three_mf_package.browser.mjs` compares the original HTTP-loaded source models
+with offline packed execution after source/build directories become unavailable.
+The upstream truck fixture retains 40 meshes, 615,930 vertices, 205,310 triangles,
+both component trees, transforms, material values, matching attribute/index
+hashes and decoded pixels from its 1352-by-339 PNG. Repeated face-color model loads remain
+independent, with source asynchronous callback ordering. Chromium 151.0.7922.34
+reports zero external requests or browser errors. This proves retained-loader
+packaging and browser image decoding; it does not claim new GPU execution or a
+decoder speedup.
+
 ## OBJ material libraries
 
 Finite `MTLLoader.load()` and `loadAsync()` requests include their material
