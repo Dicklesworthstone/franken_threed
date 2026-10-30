@@ -18,7 +18,7 @@
  * leaves them) into the reflected uniform-buffer layout every frame.
  *
  * Not admitted yet (explicit errors): material.lights, skinning, morph targets,
- * batching, clipping planes, uniformsGroups, logarithmic/reversed depth, custom
+ * batching, clipping planes, uniformsGroups, reversed depth, custom
  * extensions, onBeforeCompile hooks. No performance claim.
  */
 import {compileEsslProgram} from './essl_wgsl.mjs';
@@ -124,7 +124,7 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
 
 // ---- uniform values ---------------------------------------------------------
 const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix', 'cameraPosition', 'isOrthographic', 'toneMappingExposure', 'receiveShadow',
-  'bindMatrix', 'bindMatrixInverse', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize', 'center']);
+  'bindMatrix', 'bindMatrixInverse', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize', 'center', 'logDepthBufFC']);
 
 // ---- WebGLMorphtargets (retained-JS port) -----------------------------------
 const morphCaches = new WeakMap();
@@ -167,7 +167,7 @@ export function threeMorphTargets(T, geometry, maxTextureSize = 8192) {
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
  * the program declares but nothing sets stay zero, as GL leaves them.
  * Returns the texture (or null) for each reflected sampler binding. */
-export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null} = {}) {
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null, logarithmicDepthBuffer = false} = {}) {
   bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
@@ -175,6 +175,8 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     modelMatrix: object.matrixWorld, modelViewMatrix: object.modelViewMatrix, projectionMatrix: camera.projectionMatrix,
     viewMatrix: camera.matrixWorldInverse, normalMatrix: object.normalMatrix, cameraPosition, isOrthographic: camera.isOrthographicCamera === true,
     toneMappingExposure, receiveShadow: object.receiveShadow === true,
+    // r186 setProgram uploads this camera coefficient before material uniforms.
+    logDepthBufFC: logarithmicDepthBuffer ? 2.0 / (Math.log(camera.far + 1.0) / Math.LN2) : null,
     // setProgram: setOptional(object, 'bindMatrix' / 'bindMatrixInverse') for skinned meshes.
     bindMatrix: object.isSkinnedMesh ? object.bindMatrix : null, bindMatrixInverse: object.isSkinnedMesh ? object.bindMatrixInverse : null,
     morphTargetBaseInfluence: null, morphTargetInfluences: null, morphTargetsTextureSize: null,
@@ -193,9 +195,11 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     builtin.morphTargetsTextureSize = threeMorphTargets(T, geometry).size;
   }
   for (const u of reflection.uniforms) {
-    // receiveShadow: set from the object each draw, then overwritten by a
-    // material uniform of that name when one exists (WebGLRenderer.setProgram order).
-    const own = BUILTIN.has(u.name) && !(u.name === 'receiveShadow' && uniforms?.receiveShadow) ? builtin[u.name] : null;
+    // These source built-ins are set before ordinary material uniforms, which
+    // may override them by name (WebGLRenderer.setProgram order).
+    const authored = (u.name === 'receiveShadow' || u.name === 'logDepthBufFC') && uniforms?.[u.name];
+    const overridden = authored && (u.name !== 'logDepthBufFC' || authored.needsUpdate !== false);
+    const own = BUILTIN.has(u.name) && !overridden ? builtin[u.name] : null;
     const value = own ?? (values && Object.hasOwn(values, u.name) ? values[u.name] : uniforms?.[u.name]?.value);
     if (value === undefined || value === null) continue;
     write(view, u.node, value, u.name);
@@ -299,7 +303,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     const s = state();
     const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping, beforeCompile: p => beforeCompile(material, p),
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
-      shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap});
+      shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap,
+      logarithmicDepthBuffer: s.logarithmicDepthBuffer === true});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
     const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '') + (renderTarget ? '\u0000gl-rows' : '');
     let entry = compiled.get(key);
@@ -367,7 +372,9 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     raster: (material, options) => threeProgramRaster(T, material, options),
     /** options.material: lit materials read shadow maps from the light state. */
     pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) => {
-      const textures = packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: state().toneMappingExposure ?? 1,
+      const s = state();
+      const textures = packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: s.toneMappingExposure ?? 1,
+        logarithmicDepthBuffer: s.logarithmicDepthBuffer === true,
         samplers: objectSamplers(material, object), ...options});
       uniformBlocks.pack(reflection, material, bytes);
       return textures;

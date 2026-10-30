@@ -218,6 +218,39 @@ updates follow the pinned native renderer. This does not admit nested arrays,
 multiview/XR cameras, or ArrayCamera on the WebGL-authored route. Custom native
 scene/object/material render hooks retain their existing explicit rejection.
 
+## Logarithmic depth for WebGL-authored programs
+
+`createWebGLRendererClass(THREE)` admits `logarithmicDepthBuffer: true` on
+canvas and render-target draws. `renderer.capabilities.logarithmicDepthBuffer`
+reports that constructor setting. The source ShaderLib programs execute their
+original logarithmic-depth chunks through the ESSL-to-WGSL compiler, including
+the fragment-depth output. Authored ShaderMaterial programs retain their own
+chunk choices and uniform overrides.
+
+The camera coefficient keeps r186's exact JavaScript expression,
+`2 / (Math.log(camera.far + 1) / Math.LN2)`, and updates independently of program
+compilation. Perspective shaders use the source logarithm; orthographic shaders
+keep their source fragment-coordinate depth. Sampled depth attachments therefore
+expose the same authored values to later effects. Cameras remain in the WebGL
+coordinate system.
+
+All affected materials select their source program, including the existing
+deformation and shadow-program routes. The separate whole-image HDR fallback
+cannot replace this route: it reports the existing tone-mapping admission error
+if a source program is unavailable. Reversed depth on the WebGL-authored facade
+remains outside this admission; native WebGPURenderer depth modes retain their
+existing behavior.
+
+`three_program_log_depth.test.mjs` verifies built-in/custom shader compilation,
+camera coefficients, authored uniform precedence and actual facade submissions.
+`node tests/e2e/webgpu_renderer/program_log_depth.mjs` compares unchanged r186
+WebGL output and owned WebGPU color/depth attachments. Chromium 151.0.7922.34 /
+SwiftShader passed 22 exact checkpoints and 540,672 RGBA bytes: a large depth
+range where linear depth loses foreground separation, changed camera far planes,
+authored shaders, orthographic cameras and sampled one-half/one-quarter depths.
+Both enabled and disabled modes were compared, with zero GPU/browser errors.
+These are correctness results, not physical-device performance measurements.
+
 ## Preserved WebGL-authored canvases
 
 `createWebGLRendererClass(THREE)` admits `preserveDrawingBuffer: true` with
@@ -269,7 +302,7 @@ not physical-device performance measurements.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping, logarithmic/reversed depth on the WebGL-authored facade, non-sRGB
+  XR, custom tone mapping, reversed depth on the WebGL-authored facade, non-sRGB
   output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.

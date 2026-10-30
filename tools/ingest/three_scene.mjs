@@ -275,7 +275,7 @@ export async function createGpuThreeScene(device,scene,{
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
     if(g.isInstancedBufferGeometry)programGeometries_.add(g);
     // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
-    if(hasThreeDeformation(object)&&!programToneMapping()&&!capturedNodeObject(object)){
+    if(hasThreeDeformation(object)&&!programToneMapping()&&!programLogDepth()&&!capturedNodeObject(object)){
       try{inspectThreeDeformation(object,{...deformationOptions,three});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
@@ -424,7 +424,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!lights.length)return false;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
-    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||nodes.some(o=>o.isLine&&o.castShadow))return true;
+    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>o.isLine&&o.castShadow))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
@@ -615,6 +615,9 @@ export async function createGpuThreeScene(device,scene,{
   // every draw is its ShaderLib program; anything else is a TONE_MAPPING error
   // (the facade then keeps its whole-image output pass instead).
   const programToneMapping=()=>programRoute()&&(programSupport.state?.().toneMapping??three.NoToneMapping)!==three.NoToneMapping;
+  // Logarithmic depth is authored in each source fragment shader, including
+  // shadow/deformation variants; the fixed material path cannot supply it.
+  const programLogDepth=()=>programRoute()&&programSupport.state?.().logarithmicDepthBuffer===true;
   // scene.environment read by programs through r186 PMREM instead of the core's
   // panorama owner: always under in-shader tone mapping, otherwise when the core
   // owner cannot take the source.
@@ -622,7 +625,7 @@ export async function createGpuThreeScene(device,scene,{
     const env=scene.environment;
     if(!programRoute()||!env)return false;
     // Renderer-route PMREMGenerator.fromScene captures: r186 PMREM through programs.
-    if(programToneMapping()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
+    if(programToneMapping()||programLogDepth()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
     try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
   }
@@ -843,6 +846,7 @@ export async function createGpuThreeScene(device,scene,{
       // material mapper below follows WebGPU's unsigned reference contract.
       if(m.stencilWrite&&stencilAttachment)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
+      if(programLogDepth())return programDescription(m,topology,object);
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
@@ -862,6 +866,7 @@ export async function createGpuThreeScene(device,scene,{
   function coreDescription(m,clippingFrame,topology='triangles'){
     const source=m;m=materialState(m);
     if(programToneMapping())fail('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${m?.type}`);
+    if(programLogDepth())fail('DEPTH_MODE',`Logarithmic depth needs the source material program: ${m?.type}`);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
