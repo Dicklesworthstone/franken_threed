@@ -171,6 +171,12 @@ export async function buildModuleGraph(entryPath, options = {}) {
       continue;
     }
 
+    // Keep the requested module type separate from the resource's format.
+    // An untyped JSON import must still reach the host's missing-attribute
+    // error, rather than a JavaScript frontend or eager syntax failure here.
+    const nativeResource = moduleType === "json" || (!item.isInline &&
+      path.extname(urlToFilePath(sourceUrl)).toLowerCase() === ".json");
+
     let sourceCode;
     let sourcePath = null;
 
@@ -180,7 +186,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     } else {
       sourcePath = urlToFilePath(sourceUrl);
       try {
-        sourceCode = moduleType === "json" ? fs.readFileSync(sourcePath, "utf-8")
+        sourceCode = nativeResource ? fs.readFileSync(sourcePath, "utf-8")
           : moduleSources.read(sourceUrl).code;
       } catch (err) {
         if (err.code === "F3D_SOURCE_TRANSFORM") throw err;
@@ -213,8 +219,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
     // Native JSON is data, not executable JavaScript. Keep even invalid lazy
     // input unparsed: its rejection belongs to the original import() boundary.
-    const analysis = analyzeModuleAst(moduleType === "json" ? "" : sourceCode, sourceUrl, item.offsets || {});
-    if (moduleType !== "json") sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
+    const analysis = analyzeModuleAst(nativeResource ? "" : sourceCode, sourceUrl, item.offsets || {});
+    if (!nativeResource) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
     if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
     // Every source-bearing export is also a static module request. Keep it in

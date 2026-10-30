@@ -78,11 +78,15 @@ const runner = new URL(data(`
   WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,
     run(...values){wasmCalls++;return instance.exports.run(...values);}}};};
   try {
-    const app=await import(workerData.url), values=new Float64Array([1,2,3]);
-    const first=app.run(values), left=await app.lazy(true), right=await app.lazy(false);
-    const second=app.run(values), asset=await(await fetch(app.asset)).json();
-    const workers=await Promise.all([app.moduleWorker().result,app.classicWorker().result]);
-    parentPort.postMessage({first,second,lazy:[left.read(),right.read()],asset,workers,wasmCalls});
+    const app=await import(workerData.url);
+    if(workerData.nativeModule)parentPort.postMessage(await app.run());
+    else {
+      const values=new Float64Array([1,2,3]);
+      const first=app.run(values), left=await app.lazy(true), right=await app.lazy(false);
+      const second=app.run(values), asset=await(await fetch(app.asset)).json();
+      const workers=await Promise.all([app.moduleWorker().result,app.classicWorker().result]);
+      parentPort.postMessage({first,second,lazy:[left.read(),right.read()],asset,workers,wasmCalls});
+    }
   } finally {await Promise.all(threads.map(thread=>thread.terminate()));}
 `));
 async function execute(input) {
@@ -175,7 +179,7 @@ test('package frontend accepts unchanged handled sources and refuses unhandled f
   await assert.rejects(buildModuleGraph(f.entry, {transformModule: (code, {url}) =>
     url.endsWith('/value.ts') ? {code: 'export const = ;'} : null}));
   for (const [extension, bytes] of [['cjs', 'throw new Error("never execute CommonJS");'],
-    ['json', '{"value":42}'], ['wasm', Buffer.from([0,97,115,109])]]) {
+    ['wasm', Buffer.from([0,97,115,109])]]) {
     const source = fixture({'index.html': '<script type="module" src="main.mjs"></script>',
       'main.mjs': "import 'unhandled';",
       'node_modules/unhandled/package.json': JSON.stringify({name: 'unhandled', exports: './input.' + extension}),
@@ -185,6 +189,92 @@ test('package frontend accepts unchanged handled sources and refuses unhandled f
       return null;
     }}), {code: 'F3D_PACKAGE_FORMAT'});
   }
+});
+
+test('package JSON preserves exports/imports/browser maps, raw bytes and lazy URL identity through build and packing', async () => {
+  const bytes = Buffer.from('\ufeff{"zero":-0,"value":1,"value":42,"__proto__":{"x":1}}');
+  const f = fixture({
+    'index.html': '<script type="module" src="main.mjs"></script>',
+    'main.mjs': `import {config,selected,dependency} from '@app/data';
+      import repeated from '@app/data/settings' with {type:'json'};
+      import copy from '@app/data/copy' with {type:'json'};
+      export async function run(){const log=[];
+        const load=flag=>import((log.push(flag),flag?'@app/data/bad':'@app/data/settings'),{with:{type:'json'}});
+        const lazy=(await load(false)).default;
+        const variant=(await import('@app/data/variant',{with:{type:'json'}})).default;
+        config.added=7;return [config===selected,config===repeated,config===lazy,config!==copy,
+          config!==variant,variant.added,Object.is(config.zero,-0),config.value,
+          Object.hasOwn(config,'__proto__'),dependency.value,log];}`,
+    'packages/data/package.json': JSON.stringify({name:'@app/data', type:'module',
+      exports:{'.':{browser:'./entry.mjs',default:'./server.mjs'},'./settings':'./settings.json',
+        './copy':'./copy.json','./variant':'./settings.json?other#view','./bad':'./bad.json'},
+      imports:{'#settings':'./settings.json','#dependency':'flags/value'},
+      browser:{'./selected.json':'./settings.json'}}),
+    'packages/data/entry.mjs': `export {default as config} from '#settings' with {type:'json'};
+      export {default as selected} from './selected.json' with {type:'json'};
+      export {default as dependency} from '#dependency' with {type:'json'};`,
+    'packages/data/server.mjs': "throw new Error('wrong export condition');",
+    'packages/data/settings.json': bytes, 'packages/data/copy.json': bytes,
+    'packages/data/bad.json': '{"incomplete":', 'packages/data/selected.json': '{"value":"wrong browser map"}',
+    'node_modules/flags/package.json': '{"name":"flags","exports":{"./value":"./value.json"}}',
+    'node_modules/flags/value.json': '{"value":73}',
+  });
+  fs.mkdirSync(path.join(f.source, 'node_modules/@app'), {recursive:true});
+  fs.symlinkSync('../../packages/data', path.join(f.source, 'node_modules/@app/data'), 'dir');
+  const options = {transformModule: frontend(), routeWebGPURenderer:true};
+  const graph = await buildModuleGraph(f.entry, options);
+  const resources = Object.values(graph.modules).filter(module => module.module_type === 'json');
+  assert.equal(resources.length, 5);
+  assert.ok(resources.some(module => module.source_url.endsWith('/settings.json?other#view')));
+  const built = await buildApplication(f.entry, f.out, options);
+  const packed = path.join(f.root, 'packed.html');
+  packHtml(path.join(f.out, 'index.html'), packed);
+  const html = fs.readFileSync(packed, 'utf8');
+  const entry = /<script type="module" src="([^"]+)"/.exec(html)[1];
+  const imports = JSON.parse(/<script type="importmap">(.*?)<\/script>/s.exec(html)[1]).imports;
+  assert.equal(built.emittedFiles.filter(name => name.endsWith('.json')).length, 5);
+  const settings = built.emittedFiles.filter(name => name.endsWith('.json'))
+    .map(name => fs.readFileSync(path.join(f.out, name)));
+  assert.equal(settings.filter(content => content.equals(bytes)).length, 3);
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  const expected = [true,true,true,true,true,undefined,true,42,true,73,[false]];
+  assert.deepEqual(await execute({url:pathToFileURL(path.join(f.out, built.entryFiles[0])).href,nativeModule:true}), expected);
+  assert.deepEqual(await execute({url:entry,imports,nativeModule:true}), expected);
+  assert.ok(folderBytes(f.root) < 64 * 1024);
+});
+
+for (const lane of ['document', 'worker']) test(`package JSON keeps native ${lane} attribute/link/parse errors at the selected import`, async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="main.mjs"></script>',
+    'main.mjs': lane === 'document' ? "export {run} from './cases.mjs';" :
+      `export const run=()=>new Worker(new URL('./worker.mjs',import.meta.url),{type:'module'}).result;`,
+    'worker.mjs': "import {run} from './cases.mjs';postMessage(await run());",
+    'cases.mjs': `import config from 'data/settings' with {type:'json'};
+      export async function run(){const log=[],errors=[];
+        const lazy=await import((log.push('source'),'data/settings'),
+          (log.push('options'),{with:(log.push('with'),{type:(log.push('type'),'json')})}));
+        for(const load of [()=>import('data/bad',{with:{type:'json'}}),
+          ()=>import('data/invalid',{with:{type:'json'}}),()=>import('data/settings'),
+          ()=>import('data/extra',{with:{type:'json',extra:'no'}}),
+          ()=>import('data/code',{with:{type:'json'}}),()=>import('data/named')]){
+          try{await load();errors.push('incorrect success');}catch(error){errors.push([error.name,error.code]);}}
+        return [config===lazy.default,config.value,log,errors];}`,
+    'node_modules/data/package.json': JSON.stringify({name:'data',type:'module',exports:{
+      './settings':'./settings.json','./extra':'./settings.json?extra','./bad':'./bad.json','./invalid':'./invalid.json',
+      './code':'./code.mjs','./named':'./named.mjs'}}),
+    'node_modules/data/settings.json': '{"value":42}', 'node_modules/data/bad.json': '{"incomplete":',
+    'node_modules/data/invalid.json': Buffer.from([0xff]),
+    'node_modules/data/code.mjs': "import './never-loaded.mjs';export default 1;",
+    'node_modules/data/named.mjs': "import {value} from 'data/settings' with {type:'json'};export default value;",
+  });
+  const built = await buildApplication(f.entry, f.out, {transformModule:frontend(),routeWebGPURenderer:true});
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  assert.deepEqual(await execute({url:pathToFileURL(path.join(f.out, built.entryFiles[0])).href,nativeModule:true}),
+    [true,42,['source','options','with','type'],[
+      ['SyntaxError',undefined],['SyntaxError',undefined],['TypeError','ERR_IMPORT_ATTRIBUTE_MISSING'],
+      ['TypeError','ERR_IMPORT_ATTRIBUTE_UNSUPPORTED'],['TypeError','ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE'],
+      ['SyntaxError',undefined]]]);
+  assert.ok(folderBytes(f.root) < 64 * 1024);
 });
 
 test('CLI project frontend executes typed package builds and graph ingestion', typescript, async () => {

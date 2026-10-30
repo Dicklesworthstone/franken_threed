@@ -434,7 +434,7 @@ export function f3dRollupPlugin(options = {}) {
             if (!node.source) return;
             const classified = inspectorImports.get(node.start) ?? classifyImport(node.source);
             const moduleType = classifyImportType(node);
-            const candidates = classified.classification === "literal" && (moduleType === "json" || node.options)
+            const candidates = classified.classification === "literal"
               ? [classified.specifier] : classified.classification === "finite_set" ? classified.candidates : null;
             if (
               !candidates || candidates.length === 0
@@ -444,7 +444,6 @@ export function f3dRollupPlugin(options = {}) {
 
             const uniqueBranches = Array.from(new Set(candidates));
             const specifierMap = new Map();
-            let bundledTarget = false;
 
             for (const cand of uniqueBranches) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
@@ -452,6 +451,12 @@ export function f3dRollupPlugin(options = {}) {
                 _moduleSources: moduleSources,
                 packageRootUrl: options.packageRootUrl,
               });
+              // Untyped JSON also needs an opaque native import expression:
+              // Rollup otherwise merges its attributes with a typed import of
+              // the same external asset and suppresses the host's error.
+              if (classified.classification === "literal" && !node.options && moduleType !== "json" &&
+                  (isExternalUrl(resolvedUrl) || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() !== ".json"))
+                return;
 
               if (retainedModuleUrls.has(resolvedUrl)) {
                 specifierMap.set(cand, JSON.stringify(retainedModuleUrls.get(resolvedUrl)));
@@ -460,7 +465,6 @@ export function f3dRollupPlugin(options = {}) {
               } else if (moduleType === "json" || path.extname(urlToFilePath(resolvedUrl)).toLowerCase() === ".json") {
                 specifierMap.set(cand, JSON.stringify(emitJsonModule(this, resolvedUrl)));
               } else {
-                bundledTarget = true;
                 let chunkRefId = emittedChunksByUrl.get(resolvedUrl);
                 if (!chunkRefId) {
                   chunkRefId = this.emitFile({
@@ -476,21 +480,29 @@ export function f3dRollupPlugin(options = {}) {
             }
 
             if (specifierMap.size > 0) {
+              if (node.options && node.options.type !== "SequenceExpression") {
+                // Keep options as a runtime expression. Reconstructing static
+                // options in pinned Rollup also removes parentheses between
+                // source.end and the comma of a grouped import operand.
+                edits.push({type: "insert", pos: node.options.start, priority: 1, text: "(0, "});
+                edits.push({type: "insert", pos: node.options.end, priority: 3, text: ")"});
+              }
               if (classified.classification === "literal") {
-                // Replacing a literal has no selector effects. Keeping a
-                // one-argument identity call for a bundled URL prevents
-                // Rollup from dropping import options and remains packable.
+                // Replacing a literal has no selector effects. The packable
+                // identity call keeps every site's native options independent
+                // of Rollup's shared attributes for an external asset.
                 const target = specifierMap.get(classified.specifier);
                 edits.push({type: "replace", pos: node.source.start, end: node.source.end,
-                  priority: 2, text: bundledTarget ? `(s => s)(${target})` : target});
+                  priority: 2, text: `(s => s)(${target})`});
                 return;
               }
               const chain = Array.from(specifierMap.entries())
                 .map(([cand, targetExpr]) => `s === ${JSON.stringify(cand)} ? ${targetExpr} : `)
                 .join("");
 
-              const prefix = `(s => ${chain}s)(`;
-              const suffix = `)`;
+              // A sequence is one selector value, not multiple call arguments.
+              const prefix = `(s => ${chain}s)((`;
+              const suffix = `))`;
               const argument = classified.url_argument_span ?? node.source;
 
               // Composable insertions wrapping the argument preserve child edits inside the argument

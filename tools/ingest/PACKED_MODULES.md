@@ -129,6 +129,14 @@ unchanged: no object-literal wrapper, eager JSON parsing, BOM removal or numeric
 round trip occurs during packing. An unselected malformed JSON dependency does
 not fail the build; the native importer reports its error when selected.
 
+Installed and linked workspace packages may select JSON through `exports`,
+private `imports` and browser mappings. Those selected resources use the same
+native JSON path as relative imports in application builds and module workers;
+the project JavaScript frontend never receives their bytes. Missing attributes
+do not relabel JSON as JavaScript, and requesting JSON does not relabel a
+JavaScript resource. Static reexports and lazy imports share the selected URL's
+instance, while query/fragment variants and separate files remain distinct.
+
 Requested type and response MIME are separate. The emitted-file MIME table is
 used, not an assumption that `type: 'json'` authorizes changing JavaScript into
 JSON. Missing JSON attributes, incompatible types, named JSON exports and

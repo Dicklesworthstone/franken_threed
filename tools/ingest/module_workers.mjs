@@ -273,9 +273,15 @@ export function buildWorkerGraph(entryUrl, {
     let record = modules.get(key);
     if (!record) {
       if (modules.size >= maxModules) fail('BUDGET', 'Worker module count exceeds maxModules', url);
+      const extension = path.extname(fileURLToPath(url));
+      const nativeResource = sourceType === 'json' ||
+        (sourceType === 'module' && extension.toLowerCase() === '.json');
+      // Preserve MIME independently of the requested import type. Missing or
+      // incompatible attributes must remain native errors in the worker.
       const name = sourceType === 'script' ? `c-${digest(url)}.js`
-        : sourceType === 'json' ? `j-${digest(url)}.json` : `m-${digest(url)}.mjs`;
-      record = {key, url, realm, sourceType, name, edges: new Set(), hostUses: new Set()};
+        : nativeResource ? `${sourceType === 'json' ? 'j' : 'm'}-${digest(url)}${extension}`
+        : `m-${digest(url)}.mjs`;
+      record = {key, url, realm, sourceType, nativeResource, name, edges: new Set(), hostUses: new Set()};
       modules.set(key, record); queue.push(record);
     }
     return record;
@@ -337,11 +343,11 @@ export function buildWorkerGraph(entryUrl, {
   if (entry.external) fail('ENTRY', 'Worker graph entry must be a local file', entryUrl);
   for (let index = 0; index < queue.length; index++) {
     const record = queue[index], bytes = read(record.url);
-    const source = record.sourceType === 'json' ? null : moduleSources.read(record.url,
+    const source = record.nativeResource ? null : moduleSources.read(record.url,
       {sourceType: record.sourceType, source: bytes}).code;
     analyzedBytes += source === null ? bytes.length : Buffer.byteLength(source);
     if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
-    if (record.sourceType === 'json') {
+    if (record.nativeResource) {
       // JSON is a native module, not a JavaScript object-literal wrapper. Keep
       // bytes (including BOM, duplicate keys and invalid lazy input) untouched;
       // parsing, default-export identity and rejection timing belong to the host.
@@ -540,7 +546,7 @@ export function buildWorkerGraph(entryUrl, {
   for (const record of modules.values()) record.fileName = `${directories.get(record.realm)}/${record.name}`;
   let outputBytes = [...assets.values()].reduce((n, record) => n + record.source.length, 0);
   for (const record of modules.values()) {
-    if (record.sourceType === 'json') {
+    if (record.nativeResource) {
       outputBytes += record.source.length;
       if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
       continue;

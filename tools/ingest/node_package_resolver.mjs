@@ -141,9 +141,12 @@ function resolvePackageRequest(specifier, referrerUrl, {
     // Resolve first, then normalize the exact selected URL once. A successful
     // hook may return identical bytes; null means it did not handle this format.
     // Graph analysis, emission and workers reuse this same source snapshot.
-    if (!esm && !(FRONTEND_SOURCE_EXTENSIONS.has(extension) &&
+    // JSON remains a native resource. Resolution does not parse it or decide
+    // whether the importing site's attributes are valid; the host owns those
+    // checks, including failures from a lazily selected import.
+    if (!esm && extension.toLowerCase() !== ".json" && !(FRONTEND_SOURCE_EXTENSIONS.has(extension) &&
         _moduleSources?.read(canonical.href).frontendHandled === true))
-      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM or JavaScript supplied by the project frontend; CommonJS and non-JavaScript loaders need a separate route`);
+      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM, a native JSON resource or JavaScript supplied by the project frontend; CommonJS and other non-JavaScript loaders need a separate route`);
     return canonical.href;
   }
 
