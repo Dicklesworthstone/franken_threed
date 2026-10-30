@@ -198,6 +198,8 @@ export async function createGpuThreeScene(device,scene,{
   const geometries=new Map(),instances=new Map(),materials=new Map(),deformations=new Map();
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
+  const batchHistoryBuffers=new Map();
+  let batchHistoryBytes=0,batchHistoryValidation=Promise.resolve();
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false,nativeLightMode=false;
   let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
@@ -243,6 +245,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const gpu of geometries.values())gpu.dispose();geometries.clear();
     for(const gpu of programGpus())gpu.dispose();programGeometries.clear();
     for(const gpu of instances.values())gpu.dispose();instances.clear();renderer?.dispose();textureOwner?.dispose();
+    releaseBatchHistory();
     textureBindings.dispose();
   }
   function onAbort(){
@@ -499,6 +502,72 @@ export async function createGpuThreeScene(device,scene,{
     // them after preparing its maps; a scan only needs a stand-in.
     if(t?.isDepthTexture&&textureScan)return placeholderBinding();
     return textureBindings.binding(t,reflection,{initialize});
+  }
+  function checkedBatchHistory(operation){
+    device.pushErrorScope('out-of-memory');device.pushErrorScope('validation');
+    let result,error;
+    try{result=operation();}catch(caught){error=caught;}
+    const validation=device.popErrorScope(),memory=device.popErrorScope();
+    batchHistoryValidation=Promise.all([batchHistoryValidation,validation,memory]).then(([,a,b])=>{
+      if(a||b)throw new ThreeSceneError('DEVICE',(a||b).message??'Batched texture history failed');
+    });
+    batchHistoryValidation.catch(error=>{terminal??=error;rejectStopped(terminal);if(!busy||preparing)release();});
+    if(error)throw error;return result;
+  }
+  function releaseBatchHistory(){
+    for(const buffers of batchHistoryBuffers.values())for(const buffer of buffers)buffer.destroy();
+    batchHistoryBuffers.clear();batchHistoryBytes=0;
+  }
+  // A BatchedMesh can request different IDs, matrices and colors in each child
+  // camera callback. Capture actual uploaded texels, not current CPU arrays:
+  // versionless CPU edits must never become visible through history replay.
+  // Buffers are reused only in later synchronous frames, after all consumers
+  // of this frame have been submitted to the same queue.
+  function captureBatchHistory(object,history){
+    const sources=[object._indirectTexture,object._matricesTexture,object._colorsTexture].filter(Boolean);
+    for(const source of sources){
+      textureBinding(source);
+      if(textures.has(source))fail('CAMERA','ArrayCamera batching requires owned source texture residency');
+    }
+    textureOwner.update(sources);
+    return checkedBatchHistory(()=>{
+      let encoder=null;
+      const snapshots=sources.map(source=>{
+        const texture=textureOwner.nativeTexture(source),binding=textureOwner.binding(source);
+        const previous=history.latest.get(texture);
+        if(previous?.sourceVersion===binding.sourceVersion)return previous;
+        const shape=textureOwner.inspect(source,{initialize:true});
+        if(shape.layers!==1||shape.levels!==1||!['r32uint','rgba32float'].includes(shape.format))
+          fail('CAMERA','Batched texture histories require the source ID, matrix and color formats');
+        const bytesPerRow=Math.ceil(shape.width*shape.channels*shape.bpc/256)*256,size=bytesPerRow*shape.height;
+        integer(size,1,device.limits.maxBufferSize,'batched texture history size');
+        const buffers=batchHistoryBuffers.get(size)??[],index=history.used.get(size)??0;
+        let buffer=buffers[index];
+        if(!buffer){
+          if(size> (textureOptions.maxTextureBytes??128*1024*1024)-batchHistoryBytes-textureOwner.diagnostics.textureBytes)
+            fail('LIMIT','Batched texture histories exceed the shared texture byte budget');
+          buffer=device.createBuffer({label:'f3d-program-batch-history',size,usage:4|8});
+          buffers.push(buffer);batchHistoryBuffers.set(size,buffers);batchHistoryBytes+=size;
+        }
+        history.used.set(size,index+1);
+        const snapshot={texture,buffer,bytesPerRow,width:shape.width,height:shape.height,sourceVersion:binding.sourceVersion};
+        encoder??=device.createCommandEncoder({label:'f3d-program-batch-capture'});
+        encoder.copyTextureToBuffer({texture},{buffer,bytesPerRow,rowsPerImage:shape.height},[shape.width,shape.height,1]);
+        history.latest.set(texture,snapshot);return snapshot;
+      });
+      if(encoder)device.queue.submit([encoder.finish()]);
+      return snapshots;
+    });
+  }
+  function restoreBatchHistory(snapshots){
+    checkedBatchHistory(()=>{
+      const encoder=device.createCommandEncoder({label:'f3d-program-batch-restore'});
+      for(const {texture,buffer,bytesPerRow,width,height} of snapshots)
+        encoder.copyBufferToTexture({buffer,bytesPerRow,rowsPerImage:height},{texture},[width,height,1]);
+      // Queue writes during later callbacks have already happened. Restore and
+      // submit before the corresponding draws, not merely before encoding them.
+      device.queue.submit([encoder.finish()]);
+    });
   }
   // Program variants depend on the object (instancing, geometry streams), not
   // only the material: WebGLPrograms.getParameters reads both.
@@ -1162,6 +1231,9 @@ export async function createGpuThreeScene(device,scene,{
       owned=scanWithShadowRoute();
       // The scan admits version-zero storage only for the built-in batching ids;
       // ordinary unrequested sources remain typed defaults. No upload is implied.
+      // Preparation may grow source residency. Prior history consumers are
+      // already submitted; retire their cache before sharing that byte budget.
+      releaseBatchHistory();
       textureOwner?.prepare(owned,{initialize:true});
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
@@ -1528,8 +1600,7 @@ export async function createGpuThreeScene(device,scene,{
       const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
       const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
       const programArray=programRoute()&&arrayViews!==null;
-      if(programArray&&nodes.some(object=>object.isBatchedMesh))
-        fail('CAMERA','WebGL ArrayCamera BatchedMesh needs per-view indirect texture histories');
+      const batchHistory=programArray?{used:new Map(),latest:new Map(),updates:new Map()}:null;
       const cullingFrustum=arrayViews&&!programArray?{
         intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object)),
         intersectsSprite:object=>arrayViews.some(view=>view.frustum.intersectsSprite(object)),
@@ -1785,10 +1856,15 @@ export async function createGpuThreeScene(device,scene,{
           // (setProgram binds textures after the callback), then r186's
           // no-multi-draw loop: _gl_DrawID = i, render(starts[i] / bytes, counts[i]).
           if(object.isBatchedMesh){
-            // The callback just changed the source version. Keep the prepared
-            // shared residency, validate borrowed versions, then upload ids.
-            textureBinding(object._indirectTexture);
-            if(!textures.has(object._indirectTexture))textureOwner.update([object._indirectTexture]);
+            if(programArray){
+              const snapshot=captureBatchHistory(object,batchHistory);
+              if(object._multiDrawCount>0)batchHistory.updates.set(draws.length,snapshot);
+            }else{
+              // The callback just changed the source version. Keep the prepared
+              // shared residency, validate borrowed versions, then upload ids.
+              textureBinding(object._indirectTexture);
+              if(!textures.has(object._indirectTexture))textureOwner.update([object._indirectTexture]);
+            }
           }
           const multi=object.isBatchedMesh?Array.from({length:object._multiDrawCount},(_,k)=>{
             const index=item.geometry.index,bpe=index?index.array.BYTES_PER_ELEMENT:1;
@@ -1919,12 +1995,21 @@ export async function createGpuThreeScene(device,scene,{
           if(!activeViewport||activeViewport[2]!==0&&activeViewport[3]!==0){
             if(view.background){backgroundOwner.render(view.background,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:'load',
               viewport:activeViewport,scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});backgrounds++;live();}
-            renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
-              lighting:{...view.lighting,lights:lighting.lights},draws:draws.slice(first,end),...(fogEnabled?{fog:view.fog}:{})});
-            logicalDraws+=renderer.drawCount;drawCalls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+            const boundaries=[first,...[...batchHistory.updates.keys()].filter(index=>index>first&&index<end),end];
+            for(let part=0;part<boundaries.length-1;part++){
+              const start=boundaries[part],snapshot=batchHistory.updates.get(start);
+              if(snapshot)restoreBatchHistory(snapshot);
+              renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
+                lighting:{...view.lighting,lights:lighting.lights},draws:draws.slice(start,boundaries[part+1]),...(fogEnabled?{fog:view.fog}:{})});
+              logicalDraws+=renderer.drawCount;drawCalls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+            }
           }
           first=end;
         }
+        // A final culled batch may still request texture uploads without any
+        // draws. Keep shared residency at the last source-visible upload after
+        // replaying the older versions consumed by preceding views.
+        if(batchHistory.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
         sourceDraws=programSourceDraws;backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
       }else if(arrayViews?.length||passNodeFrame?.draws.some(draw=>draw.nodeViews!==null&&draw.nodeViews!==undefined)){
         // One attachment clear precedes every view. A pass per ordered view span
@@ -2044,12 +2129,13 @@ export async function createGpuThreeScene(device,scene,{
       deformedMeshCount:deformations.size,deformationBytes:deformationBytes(),
       materialBindings:entries.filter(e=>!e.mesh.disposed).length,rendererBytes:renderer?.allocatedBytes??0,
       textures:textureOwner?.diagnostics??null,
+      batchHistoryBytes,
       shadowBytes:(shadowOwner?.allocatedBytes??0)+(pendingShadow?.allocatedBytes??0),shadowStats,
       environmentBytes:(environmentOwner?.allocatedBytes??0)+(pendingEnvironment?.allocatedBytes??0),
       backgroundBytes:(backgroundOwner?.allocatedBytes??0)+(pendingBackground?.allocatedBytes??0),backgroundPasses,
       colorPasses:backgroundEnabled?backgroundColorPasses:shadowEnabled||environmentEnabled||fogEnabled?(renderer?.colorPassCount??0):null,
       bundles:renderer?.bundleDiagnostics??null});},
-    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
+    async whenIdle(){live();try{await Promise.race([Promise.all([renderer.whenIdle(),textureOwner?.whenIdle(),batchHistoryValidation,shadowOwner?.whenIdle(),pendingShadow?.whenIdle(),environmentOwner?.whenIdle(),pendingEnvironment?.whenIdle(),backgroundOwner?.whenIdle(),pendingBackground?.whenIdle(),...[...geometries.values(),...programGpus(),...instances.values(),...deformations.values(),...pendingDeformations].map(g=>g.whenIdle())]),stopped]);live();return bridge;}catch(error){return failed(error);}},
     dispose(){if(busy&&!preparing)fail('REENTRANT','Cannot dispose during source submission');if(!disposed){disposed=true;rejectStopped(new ThreeSceneError('DISPOSED','Source scene bridge is disposed'));release();}},
   });
   try{

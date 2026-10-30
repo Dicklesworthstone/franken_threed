@@ -214,9 +214,33 @@ the full target. Directional backgrounds retain their perspective-camera limit.
 Each `render()`/`renderAsync()` captures the array's child identities, matrices,
 layers and viewports at call time, so deferred preparation cannot replace an
 earlier request's views with later camera edits. Public matrix and projection
-updates follow the pinned native renderer. This does not admit nested arrays,
-multiview/XR cameras, or ArrayCamera on the WebGL-authored route. Custom native
+updates follow the pinned native renderer. This does not admit nested arrays
+or multiview/XR cameras. Custom native
 scene/object/material render hooks retain their existing explicit rejection.
+
+## WebGL-authored batched ArrayCamera draws
+
+The WebGL-authored route supports `BatchedMesh` through each child camera's
+source culling and transparent sort order. The existing camera-major draw order,
+bottom-left viewports, layer checks and source callbacks remain intact. Each
+child can request different indirect-ID, matrix and color texture uploads.
+
+GPU copies preserve those uploaded versions and replay them immediately before
+the corresponding native draws. No CPU readback is involved, and versionless
+CPU edits remain stale on the GPU as they do in the source renderer. A final
+camera with no visible instances still leaves its requested texture uploads
+resident. History buffers share the texture byte budget, are reused across
+steady frames, and retire before preparation grows source residency or when
+the scene owner is disposed.
+
+`three_scene_array_batching.test.mjs` checks submitted texture bytes, callback
+updates, stale CPU edits, empty final views, buffer reuse/disposal and combined
+memory limits. `node tests/e2e/webgpu_renderer/program_array_batching.mjs`
+matches eight source checkpoints exactly: opposite/reordered views, culling,
+layers, callback updates, versionless edits, an empty final view and resize.
+Chromium 151.0.7922.34 / SwiftShader matched all 210,432 RGBA bytes and callback
+traces with 73 native draws and zero GPU/browser errors. ArrayCamera transmission
+and the existing BatchedMesh shadow boundaries remain outside this addition.
 
 ## Logarithmic depth for WebGL-authored programs
 
