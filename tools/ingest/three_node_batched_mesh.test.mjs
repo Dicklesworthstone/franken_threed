@@ -82,6 +82,129 @@ for (const indexed of [false, true]) test(`ordinary ${indexed ? 'indexed' : 'non
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+function batchArrayCamera() {
+  const children = [-.35, .45].map((x, index) => {
+    const child = new T.PerspectiveCamera(50, 1, .1, 100);
+    child.position.set(x, 0, 5); child.lookAt(0, 0, 0); child.updateMatrixWorld();
+    child.viewport = new T.Vector4(index * 8, index * 4, 24, 24);
+    return child;
+  });
+  return new T.ArrayCamera(children);
+}
+
+function recordViewports(device) {
+  const create = device.createCommandEncoder;
+  device.createCommandEncoder = () => {
+    const encoder = create();
+    return {...encoder, beginRenderPass(descriptor) {
+      const pass = encoder.beginRenderPass(descriptor), record = device.passes.at(-1);
+      return {...pass, setViewport(...value) { record.viewport = value; }};
+    }};
+  };
+}
+
+function submittedCameraIndex(draw, location) {
+  const {group, offsets} = draw.groups.get(location.group), entry = group.entries[0];
+  const bytes = draw.contents.get(entry.resource.buffer);
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    .getUint32((entry.resource.offset ?? 0) + offsets[0] + location.offset, true);
+}
+
+for (const indexed of [false, true]) test(`ArrayCamera executes every ${indexed ? 'indexed' : 'nonindexed'} batch subdraw before advancing views`, async t => {
+  let updates = 0, selections = 0;
+  const material = new T.MeshBasicNodeMaterial({transparent: true, side: T.DoubleSide, opacity: .5, depthWrite: false});
+  material.colorNode = N.uniform(new T.Color(1, 1, 1)).onObjectUpdate(({camera}) => {
+    assert.equal(camera, f.camera); updates++; return new T.Color(1, 1, 1);
+  });
+  const f = await fixture(t, {indexed, material}); f.camera = batchArrayCamera(); recordViewports(f.device);
+  f.mesh.sortObjects = true;
+  f.mesh.customSort = (list, camera) => {
+    assert.equal(camera, f.camera); selections++; list.sort((a, b) => b.index - a.index);
+  };
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(selections, 1); assert.equal(updates, 0);
+  let location;
+  const capture = f.renderer._captureNodeFrame;
+  f.renderer._captureNodeFrame = function (...args) {
+    const frame = capture.apply(this, args);
+    location = frame.draws[0].binding.nodeProgram.cameraIndex;
+    return frame;
+  };
+  f.renderer.render(f.scene, f.camera);
+  await f.renderer.waitForGPU();
+  const submitted = draws(f.device);
+  assert.equal(submitted.length, 12); assert.equal(selections, 2); assert.equal(updates, 2);
+  assert.deepEqual(submitted.map(firstInstance), [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]);
+  assert.ok(location);
+  assert.deepEqual(submitted.map(draw => submittedCameraIndex(draw, location)), [0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1]);
+  const passes = f.device.passes.filter(pass => pass.draws.some(nativeDraw));
+  assert.deepEqual(passes.map(pass => pass.viewport), [0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1]
+    .map(view => [...f.camera.cameras[view].viewport.toArray(), 0, 1]));
+  assert.deepEqual(submitted.map(draw => draw.pipeline.primitive.frontFace), [...Array(6).fill('cw'), ...Array(6).fill('ccw')]);
+  for (const draw of submitted)
+    assert.deepEqual(textureWords(draw, 'r32uint', f.mesh._indirectTexture.image.width, Uint32Array).slice(0, 3), [2, 1, 0]);
+  assert.equal(f.renderer.info.f3d.nativeDrawCalls, 12); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued ArrayCamera batches retain accepted views, layer masks, uniforms and source texture histories', async t => {
+  const f = await fixture(t); f.camera = batchArrayCamera(); recordViewports(f.device);
+  f.renderer.render(f.scene, f.camera);
+  const first = f.renderer._pending[0].nodeFrame.draws;
+  assert.deepEqual(first.map(draw => draw.nodeViews[0].index), [0, 0, 0, 1, 1, 1]);
+  const location = first[0].binding.nodeProgram.cameraIndex;
+  const matrixWidth = f.mesh._matricesTexture.image.width;
+  f.camera.cameras[0].position.z = 8; f.camera.cameras[0].updateMatrixWorld();
+  f.camera.cameras[0].viewport.set(2, 3, 18, 19);
+  f.camera.cameras[1].layers.set(7); f.camera.cameras.reverse();
+  f.mesh.setVisibleAt(1, false); f.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(2, .5, 0));
+  f.renderer.render(f.scene, f.camera);
+  const second = f.renderer._pending[1].nodeFrame.draws;
+  assert.deepEqual(second.map(draw => draw.nodeViews[0].index), [1, 1]);
+  assert.notDeepEqual(first[0].nodeUniforms, second[0].nodeUniforms);
+  f.camera.cameras[1].viewport.set(99, 99, 99, 99); f.camera.cameras[1].layers.set(7);
+  f.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(99, 99, 99));
+  await f.renderer.waitForGPU();
+  const submitted = draws(f.device);
+  assert.equal(submitted.length, 8);
+  assert.deepEqual(submitted.map(firstInstance), [0, 1, 2, 0, 1, 2, 0, 1]);
+  assert.deepEqual(submitted.map(draw => submittedCameraIndex(draw, location)), [0, 0, 0, 1, 1, 1, 1, 1]);
+  assert.equal(textureWords(submitted[0], 'rgba32float', matrixWidth, Float32Array)[12], -1);
+  assert.equal(textureWords(submitted[6], 'rgba32float', matrixWidth, Float32Array)[12], 2);
+  assert.deepEqual(f.device.passes.filter(pass => pass.draws.some(nativeDraw)).map(pass => pass.viewport),
+    [...Array(3).fill([0, 0, 24, 24, 0, 1]), ...Array(3).fill([8, 4, 24, 24, 0, 1]), ...Array(2).fill([2, 3, 18, 19, 0, 1])]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('ArrayCamera batch viewports honor canvas DPR and physical render-target pixels', async t => {
+  const f = await fixture(t); f.camera = batchArrayCamera(); recordViewports(f.device);
+  f.renderer.setPixelRatio(2); f.renderer.setViewport(0, 0, 32, 32, .2, .8);
+  f.camera.cameras[0].viewport.set(1.4, 2.4, 12.6, 13.6); f.camera.cameras[1].layers.set(7);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const canvas = f.device.passes.filter(pass => pass.draws.some(nativeDraw));
+  assert.deepEqual(canvas.map(pass => pass.viewport), Array(3).fill([2, 4, 25, 27, .2, .8]));
+  const target = new T.RenderTarget(32, 32); t.after(() => target.dispose()); f.renderer.setRenderTarget(target);
+  const start = f.device.passes.length;
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.deepEqual(f.device.passes.slice(start).filter(pass => pass.draws.some(nativeDraw)).map(pass => pass.viewport),
+    Array(3).fill([1, 2, 12, 13, 0, 1]));
+});
+
+test('ArrayCamera batches preserve source updates with no matching child and bound expanded view draws', async t => {
+  let updates = 0;
+  const material = new T.MeshBasicNodeMaterial();
+  material.colorNode = N.uniform(new T.Color(1, 1, 1)).onObjectUpdate(() => { updates++; return new T.Color(1, 1, 1); });
+  const f = await fixture(t, {material, maxDraws: 4}); f.camera = batchArrayCamera();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_LIMIT'});
+  assert.equal(updates, 1); assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  for (const child of f.camera.cameras) child.layers.set(7);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(updates, 2); assert.equal(draws(f.device).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.info.f3d.presentedRenders, 1);
+  f.camera.cameras[1].layers.set(0);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(updates, 3); assert.deepEqual(draws(f.device).map(firstInstance), [0, 1, 2]);
+});
+
 test('hidden instances and reused IDs retain source selection and geometry mapping', async t => {
   const f = await fixture(t); f.mesh.setVisibleAt(1, false);
   f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();

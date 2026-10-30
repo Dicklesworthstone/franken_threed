@@ -308,8 +308,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
   inspectThreeNativeCamera(three, camera);
-  if (camera.isArrayCamera && (bundleSelections.length || [...pairs.keys()].some(object => object.isBatchedMesh)))
-    fail('CAMERA', 'Native ArrayCamera bundles and BatchedMesh require additional per-view command ordering');
+  if (camera.isArrayCamera && bundleSelections.length)
+    fail('CAMERA', 'Native ArrayCamera bundles require additional per-view command ordering');
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
   if (renderer.xr?.isPresenting) fail('CAMERA', 'Native node scenes do not yet capture XR camera views');
@@ -769,10 +769,25 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       // Copy effects remain at that pass's boundaries, not at every subdraw.
       if (batchDraws === null) capturedDraws.push(draw);
       else {
-        const parts = batchDraws.length ? batchDraws : [{first: 0, count: 0, instanceCount: 0, firstInstance: 0}];
-        for (const [index, range] of parts.entries()) capturedDraws.push(Object.freeze({...draw, ...range,
-          nodeFramebufferCopies: index === 0 ? draw.nodeFramebufferCopies : Object.freeze([]),
-          nodeFramebufferAfterCopies: index === parts.length - 1 ? draw.nodeFramebufferAfterCopies : Object.freeze([])}));
+        const parts = batchDraws.length && draw.nodeViews?.length !== 0
+          ? batchDraws : [{first: 0, count: 0, instanceCount: 0, firstInstance: 0}];
+        // WebGPUBackend.draw selects a camera, then _draw executes the whole
+        // batch. Expanding ranges before views would interleave overlapping
+        // translucent views. Source callbacks and resource capture still run
+        // once per material side; every subdraw shares that immutable history.
+        // An empty view selection retains one inert packet for copy boundaries
+        // and preparation, without issuing any geometry commands.
+        const views = draw.nodeViews?.length ? draw.nodeViews.map(view => Object.freeze([view])) : [draw.nodeViews];
+        const expanded = parts.length * views.length;
+        if (expanded > maxDraws - capturedDraws.length)
+          fail('LIMIT', 'Native batch views exceed the captured scene draw budget');
+        let index = 0;
+        for (const nodeViews of views) for (const range of parts) {
+          capturedDraws.push(Object.freeze({...draw, ...range, nodeViews,
+            nodeFramebufferCopies: index === 0 ? draw.nodeFramebufferCopies : Object.freeze([]),
+            nodeFramebufferAfterCopies: index === expanded - 1 ? draw.nodeFramebufferAfterCopies : Object.freeze([])}));
+          index++;
+        }
       }
       };
       const captureStorage = () => storageOwner ? storageOwner.captureDispatch(capture) : capture();

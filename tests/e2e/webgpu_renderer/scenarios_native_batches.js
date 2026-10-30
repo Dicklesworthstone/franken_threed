@@ -34,7 +34,60 @@ function light(T, scene) {
   scene.add(key, new T.HemisphereLight(0xadcfff, 0x514134, .6)); return key;
 }
 
+function arrayBatchStage(T, renderer, indexed) {
+  const result = stage(T), material = new T.MeshBasicNodeMaterial({transparent: true,
+    opacity: .48, side: T.DoubleSide, depthWrite: false});
+  material.colorNode = T.TSL.color(0xffffff).mul(T.TSL.mix(T.TSL.vec3(1, .8, .5),
+    T.TSL.vec3(.5, .85, 1), T.TSL.cameraIndex.toFloat()));
+  const source = batch(T, {indexed, material});
+  source.mesh.setCustomSort(list => list.sort((a, b) => b.index - a.index));
+  const children = [-.45, .55].map((x, index) => {
+    const child = result.camera.clone(); child.position.x = x;
+    child.lookAt(index ? .3 : -.2, 0, 0); child.updateMatrixWorld();
+    child.viewport = new T.Vector4(index * 24, index * 12, 104, 84);
+    return child;
+  });
+  result.camera = new T.ArrayCamera(children);
+  const backdrop = new T.Mesh(new T.PlaneGeometry(6, 5), new T.MeshBasicMaterial({color: 0x385342}));
+  backdrop.position.z = -1; backdrop.renderOrder = -1;
+  const companion = new T.Mesh(new T.IcosahedronGeometry(.35), new T.MeshBasicMaterial({color: 0xeeb054}));
+  companion.position.set(.3, -.45, .5); companion.renderOrder = 1;
+  result.scene.add(backdrop, source.mesh, companion);
+  if (!indexed) {
+    renderer.getRenderTarget().samples = 4;
+    renderer.setPixelRatio(2);
+  }
+  const render = renderer.render.bind(renderer); let frame = 0;
+  renderer.render = (...args) => {
+    if (args[0] === result.scene) {
+      frame++;
+      if (frame === 8) {
+        source.mesh.setVisibleAt(source.ids[1], false); source.mesh.setVisibleAt(source.ids[4], false);
+        source.mesh.setMatrixAt(source.ids[0], transform(T, -.5, .35, .4, .8, 1.8));
+        source.mesh.setColorAt(source.ids[2], new T.Color(0xf36d91));
+        source.mesh.setCustomSort(list => list.sort((a, b) => a.index - b.index));
+        children[0].position.x = .8; children[0].lookAt(0, 0, 0); children[0].updateMatrixWorld();
+        children[0].viewport.set(4, 5, 100, 86);
+      }
+      if (frame === 10) children[1].layers.set(1);
+      if (frame === 12) {
+        children[1].layers.set(0); children[1].viewport.copy(children[0].viewport);
+        result.camera.cameras.reverse();
+      }
+      if (frame === 13) {
+        source.mesh.setVisibleAt(source.ids[1], true); source.mesh.setVisibleAt(source.ids[4], true);
+        source.mesh.setMatrixAt(source.ids[4], transform(T, .6, -.25, .1, 1.2, 1.4));
+      }
+    }
+    return render(...args);
+  };
+  return result;
+}
+
 export const nativeBatchScenarios = {
+  native_batches_array_camera(T, renderer) { return arrayBatchStage(T, renderer, true); },
+  native_batches_array_camera_msaa(T, renderer) { return arrayBatchStage(T, renderer, false); },
+
   native_batches_indexed(T) {
     const result = stage(T), source = batch(T, {material: new T.MeshStandardMaterial({roughness: .4})});
     source.mesh.setVisibleAt(source.ids[4], false);

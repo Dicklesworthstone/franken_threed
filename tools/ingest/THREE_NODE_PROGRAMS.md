@@ -914,6 +914,24 @@ and replaced object lifecycle hooks remain outside this profile; `customSort`
 itself is supported. This supplies the pinned WebGPU subdraw loop, without a
 claim of hardware multidraw acceleration or measured speedup.
 
+Native `ArrayCamera` batches preserve the source view-first order: each selected
+child executes every batch subdraw before the next child, including overlapping
+transparent viewports and both material sides. The source callback still selects
+and sorts against the parent camera once, and node updates run once per material
+side. Child layers, camera-index uniforms and viewports are captured after those
+updates. Queued renders keep independent camera and batch-texture histories;
+canvas viewports use DPR while render-target viewports use physical pixels.
+Empty child selections preserve callbacks and framebuffer copy boundaries without
+issuing geometry commands. Expanded view/subdraw counts use the existing budget.
+ArrayCamera render bundles remain outside this profile.
+
+The 19-case batch suite and 50-case scene-capture suite pass. Two browser scenes
+cover indexed and nonindexed batches, mixed ordinary companions, overlapping
+transparent views, custom sorting, camera/layer/visibility changes, and MSAA4.
+All 688,128 RGBA bytes at fourteen checkpoints match pinned r186 under Chromium
+151 SwiftShader, with zero GPU validation errors. This is correctness evidence,
+not a hardware performance measurement.
+
 ## Native wireframes
 
 Native mesh programs support `material.wireframe`, including ordinary Basic,
@@ -1164,7 +1182,7 @@ texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
 The profile excludes shader context extensions and unregistered shadow lifecycles,
 skinned or morph meshes,
-including per-instance morph textures; XR/multiview and native ArrayCamera bundles or BatchedMesh;
+including per-instance morph textures; XR/multiview and native ArrayCamera bundles;
 object render hooks outside the source lifecycle profile above and effectful
 attribute upload callbacks.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
