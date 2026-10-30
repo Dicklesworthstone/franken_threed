@@ -135,12 +135,14 @@ export function registerThreeNativeShadow(three, renderer, node, provenance = nu
   return true;
 }
 
-export function getThreeNativeShadowPass(renderer, overrideMaterial) {
-  const renderObject = renderer.getRenderObjectFunction?.();
+export function getThreeNativeShadowPass(renderer, overrideMaterial, renderObject = renderer.getRenderObjectFunction?.()) {
   if (renderObject == null) return null;
   const pass = renderFunctions.get(renderer)?.get(renderObject);
-  if (!pass || pass.material !== overrideMaterial)
-    reject('Native render-object functions require a registered source shadow pass');
+  // Ordinary application dispatch belongs to the normal native lifecycle.
+  // Only an exact registered source selector acquires shadow-pass privileges.
+  if (!pass) return null;
+  if (pass.material !== overrideMaterial)
+    reject('Registered shadow render-object functions require their source override material');
   return pass;
 }
 

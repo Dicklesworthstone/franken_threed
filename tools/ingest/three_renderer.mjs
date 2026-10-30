@@ -323,7 +323,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.opaque = true;
       this.transparent = true;
       this.shadowMap = {enabled: false, transmitted: false, type: THREE.PCFShadowMap};
-      this.lighting = {enabled: true};
+      this.lighting = THREE.Lighting ? new THREE.Lighting() : {enabled: true};
       // The source node library instance (registrations such as addLight are
       // recorded on the real object). The F3D bridge evaluates admitted light
       // and material classes itself; unadmitted classes still fail explicitly.
@@ -381,6 +381,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._materialCaptureValues = 0;
       this._nodeRaster = new Map();
       this._renderObjectFunction = null;
+      this._currentRenderObjectFunction = null;
       this._handleObjectFunction = null;
       this._cacheShadowNodes = new WeakMap();
       this._currentSourceMaterial = null;

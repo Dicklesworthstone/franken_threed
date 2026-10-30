@@ -579,16 +579,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       node.getBuiltinLights().map(input => input.isNode === true
         ? [sourceId(input), input.getCacheKey()] : input.id)] : null]);
   }
-  function sourceLights(material, {lights = [], lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
+  function sourceLights(material, {lights = [], lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
     const authored = authoredLightsNode(material);
-    if (!authored && (!litMaterial(material) || material.lights !== true || material.fragmentNode != null)) return [];
-    if (typeof lightingEnabled !== 'boolean' || lightingEnabled !== (renderer.lighting?.enabled !== false))
+    if (!authored && ((!litMaterial(material) && !(lightsNode && lightingMaterial(material))) ||
+        material.lights !== true || material.fragmentNode != null)) return [];
+    if (typeof lightingEnabled !== 'boolean' || !lightsNode && lightingEnabled !== (renderer.lighting?.enabled !== false))
       fail('LIGHTS', 'Captured lighting enablement must match the source renderer during construction');
     // NodeMaterial gives an explicit lightsNode precedence even when the scene
     // lighting manager or the material's ordinary light collection is disabled.
     if (authored) lights = authored.getBuiltinLights().flatMap(input => input instanceof three.Light
       ? [input] : input.isAnalyticLightNode === true ? [input.light] : []);
-    else if (!lightingEnabled) return [];
+    else if (!lightingEnabled && !lightsNode) return [];
     if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
     // The source forward graph includes every selected light. Its generated
     // node, shader and device-binding budgets below bound the actual work;
@@ -1163,7 +1164,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, scene, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
+  function keyOf(material, object, {camera, scene, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -1192,7 +1193,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset,
         a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
-      lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightingSignature(material, lights)] : null,
+      lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightsNode && sourceId(lightsNode), lightingSignature(material, lights)] : null,
       physicalPrototypes.includes(Object.getPrototypeOf(material)) ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection,
           material.useTransmission, material.useDispersion] : null]);
@@ -1272,7 +1273,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const authored = authoredLightsNode(preparedMaterial);
     // Keep the scene entrance distinct from material.lightsNode, just as the
     // pinned NodeManager does. NodeMaterial selects the authored graph itself.
-    if (lightingMaterial(preparedMaterial)) builder.lightsNode = three.TSL.lights(authored
+    if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
       ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
     const lightsNode = authored ?? builder.lightsNode;
     const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);

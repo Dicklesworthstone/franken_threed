@@ -61,6 +61,157 @@ function uniformBlocks(draw){
   return result;
 }
 
+test('native custom object dispatch captures queued prepasses and skips source items without replay',async t=>{
+  const f=fixture(t),material=new T.MeshBasicMaterial(),prepass=new T.MeshBasicMaterial();
+  f.mesh.material=material;f.mesh.frustumCulled=false;
+  const skipped=new T.Mesh(new T.PlaneGeometry(),new T.ShaderMaterial());skipped.frustumCulled=false;
+  skipped.renderOrder=1;f.scene.add(skipped);
+  skipped.onBeforeRender=skipped.onAfterRender=()=>assert.fail('a skipped source item has no object lifecycle');
+  const light=new T.AmbientLight(),unusedArea=new T.RectAreaLight();f.scene.add(light,unusedArea);
+  const source=new T.WGSLNodeBuilder(f.mesh,f.renderer);source.scene=f.scene;source.camera=f.camera;
+  source.lightsNode=new T.LightsNode().setLights([light,unusedArea]);
+  // Even Basic's source lighting model constructs analytic nodes before
+  // discarding their direct contribution, so its LTC prerequisite still holds.
+  T.RectAreaLightNode.setLTC(null);
+  assert.throws(()=>source.build(),error=>error instanceof TypeError&&/LTC_(HALF|FLOAT)_1/.test(error.message));
+  const {RectAreaLightTexturesLib}=await import('./fixtures/three_rect_area_light.mjs');
+  T.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());t.after(()=>T.RectAreaLightNode.setLTC(null));
+  const events=[],position=f.mesh.geometry.attributes.position;let phase=0;
+  f.mesh.onBeforeRender=function(renderer,scene,camera,geometry,selected){
+    events.push(['before',phase,selected]);position.array[0]=phase===0?.125:.25;position.needsUpdate=true;
+  };
+  f.mesh.onAfterRender=function(){events.push(['after',phase]);position.array[0]=99;};
+  let sourceLights=null;
+  const dispatch=function(object,scene,camera,geometry,selected,group,lights,clipping,passId){
+    assert.equal(this,f.renderer);assert.equal(scene,f.scene);assert.equal(camera,f.camera);
+    assert.equal(geometry,object.geometry);assert.equal(selected,object.material);assert.equal(group,null);
+    assert.equal(clipping,null);assert.equal(passId,null);assert.ok(lights instanceof T.LightsNode);
+    assert.equal(lights,f.renderer.lighting.getNode(scene));assert.deepEqual(lights.getLights(),[light,unusedArea]);
+    sourceLights??=lights;assert.equal(lights,sourceLights);
+    events.push(['dispatch',phase,object]);if(object===skipped)return;
+    prepass.color.setRGB(phase===0?.125:.625,.375,.875);
+    this.renderObject(object,scene,camera,geometry,prepass,group,lights,clipping,'prepass');
+    selected.color.setRGB(phase===0?.25:.75,.375,.875);
+    this.renderObject(object,scene,camera,geometry,selected,group,lights,clipping,passId);
+  };
+  f.renderer.setRenderObjectFunction(dispatch);await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);phase=1;f.renderer.render(f.scene,f.camera);
+  prepass.color.setRGB(0,0,0);material.color.setRGB(0,0,0);position.array.fill(-99);
+  const accepted=events.slice();assert.equal(f.acquired(),0);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  for(const [index,red]of[.125,.25,.625,.75].entries())assert.ok(containsColor(draws[index],[red,.375,.875]));
+  const positions=draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];});
+  assert.deepEqual(positions,[.125,.125,.25,.25]);assert.deepEqual(events,accepted);
+  assert.deepEqual(events.filter(event=>event[0]==='dispatch').map(event=>event[2]),[f.mesh,skipped,f.mesh,skipped]);
+  assert.deepEqual(events.filter(event=>event[0]==='before').map(event=>event[2]),[prepass,material,prepass,material]);
+  assert.equal(f.device.textureWrites.length,0,'unlit material passes do not upload unused source LTC tables');
+  assert.deepEqual(sourceLights.getLights(),[]);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native custom object dispatch fixes its function per render and retains history after reset',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const other=new T.Mesh(f.mesh.geometry,f.mesh.material);other.frustumCulled=false;other.renderOrder=1;f.scene.add(other);
+  const events=[],position=f.mesh.geometry.attributes.position;
+  const second=function(object){assert.equal(this._currentRenderObjectFunction,second);events.push(['second',object]);};
+  const first=function(...args){
+    assert.equal(this._currentRenderObjectFunction,first);events.push(['first',args[0]]);
+    this.setRenderObjectFunction(second);position.array[0]=.25;
+    if(args[0]===f.mesh)position.needsUpdate=true;this.renderObject(...args);
+  };
+  f.renderer.setRenderObjectFunction(first);await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);assert.equal(f.renderer.getRenderObjectFunction(),second);
+  f.renderer.render(f.scene,f.camera);f.renderer.setRenderObjectFunction(null);
+  position.array[0]=99;f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(events,[['first',f.mesh],['first',other],['second',f.mesh],['second',other]]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  for(const draw of draws){const bytes=draw.contents.get(draw.streams.get(0));
+    assert.equal(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0],.25);}
+  assert.equal(f.renderer.getRenderObjectFunction(),null);assert.equal(f.renderer._currentRenderObjectFunction,null);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native compileAsync ignores custom dispatch while preserving the source default lifecycle and uploads',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const original=f.mesh.geometry.attributes.position.array.slice(),events=[];let dispatched=0;
+  f.mesh.onBeforeRender=()=>events.push('before');f.mesh.onAfterRender=()=>events.push('after');
+  f.renderer.setRenderObjectFunction(()=>{dispatched++;});
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(dispatched,0);assert.deepEqual(events,['before','after']);
+  f.mesh.geometry.attributes.position.array.fill(7);f.renderer.render(f.scene,f.camera);
+  f.renderer.setRenderObjectFunction(function(...args){dispatched++;this.renderObject(...args);});
+  f.renderer.render(f.scene,f.camera);f.mesh.geometry.attributes.position.array.fill(99);await drain(f.renderer);
+  assert.equal(dispatched,2);assert.deepEqual(events,['before','after','before','after']);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,1);
+  const bytes=draws[0].contents.get(draws[0].streams.get(0));
+  assert.deepEqual(new Float32Array(bytes.buffer,bytes.byteOffset,original.length),original);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native custom object dispatch uses its live source lights for every material pass',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshLambertNodeMaterial();f.mesh.frustumCulled=false;
+  const a=new T.AmbientLight(),b=new T.AmbientLight();a.color.setRGB(.125,.25,.375);b.color.setRGB(.625,.75,.875);
+  f.scene.add(a);let supplied=null;
+  f.renderer.setRenderObjectFunction(function(object,scene,camera,geometry,material,group,lights,clipping){
+    supplied=lights;assert.equal(lights,this.lighting.getNode(scene));assert.deepEqual(lights.getLights(),[a]);
+    this.renderObject(object,scene,camera,geometry,material,group,lights,clipping,'first');
+    lights.setLights([b]);this.renderObject(object,scene,camera,geometry,material,group,lights,clipping,'second');
+  });
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(containsColor(draws[0],[.125,.25,.375]));assert.ok(!containsColor(draws[0],[.625,.75,.875]));
+  assert.ok(containsColor(draws[1],[.625,.75,.875]));assert.ok(!containsColor(draws[1],[.125,.25,.375]));
+  assert.deepEqual(supplied.getLights(),[]);assert.equal(f.renderer.lighting._cache.length,0);
+});
+
+test('native custom dispatch exceptions retain source effects and release accepted captures',async t=>{
+  const f=fixture(t),failure=new Error('dispatch stopped'),light=new T.AmbientLight(),events=[];
+  f.mesh.onBeforeRender=()=>events.push('before');f.mesh.onAfterRender=()=>events.push('after');
+  f.renderer.setRenderObjectFunction(function(...args){
+    this.renderObject(...args);this.lighting.getNode(f.scene).setLights([light]);
+    f.mesh.userData.completedPrepass=true;throw failure;
+  });
+  await f.renderer.init();assert.throws(()=>f.renderer.render(f.scene,f.camera),error=>error===failure);
+  assert.deepEqual(events,['before','after']);assert.equal(f.mesh.userData.completedPrepass,true);
+  assert.deepEqual(f.renderer.lighting.getNode(f.scene).getLights(),[light]);assert.equal(f.renderer.lighting._cache.length,0);
+  assert.equal(f.renderer._handleObjectFunction,null);assert.equal(f.renderer._nodeCaptureBytes,0);
+  assert.equal(f.device.submissions.length,0);assert.equal(f.acquired(),0);
+  f.renderer.setRenderObjectFunction(null);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(events,['before','after','before','after']);assert.equal(nativeDraws(f.device).length,1);
+});
+
+test('native custom dispatch records repeated bundle passes without replaying the dispatcher on warm renders',async t=>{
+  const f=fixture(t),group=new T.BundleGroup();f.scene.add(group);group.add(f.mesh);
+  f.mesh.material=new T.MeshBasicMaterial({color:new T.Color(.125,.375,.625)});
+  let dispatches=0,before=0;f.mesh.onBeforeRender=()=>{before++;};
+  f.renderer.setRenderObjectFunction(function(...args){
+    dispatches++;this.renderObject(...args);args[8]='repeat';this.renderObject(...args);
+  });
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  f.mesh.material.color.setRGB(.875,.625,.375);
+  f.renderer.setRenderObjectFunction(()=>{dispatches++;});
+  f.renderer.render(f.scene,f.camera);group.needsUpdate=true;f.renderer.render(f.scene,f.camera);
+  assert.equal(dispatches,2);assert.equal(before,2);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  assert.ok(draws.every(draw=>containsColor(draw,[.125,.375,.625])));
+  assert.equal(dispatches,2);assert.equal(before,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native custom dispatch rejects replacement source contexts after one unreplayed before callback',async t=>{
+  for(const index of [6,7]){
+    const f=fixture(t);let before=0,after=0;
+    f.mesh.onBeforeRender=()=>{before++;};f.mesh.onAfterRender=()=>{after++;};
+    f.renderer.setRenderObjectFunction(function(...args){
+      args[index]=index===6?new T.LightsNode():{};this.renderObject(...args);
+    });
+    await f.renderer.init();assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_HOOK'});
+    assert.equal(before,1);assert.equal(after,0);assert.equal(f.device.submissions.length,0);
+    assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.renderer.lighting._cache.length,0);
+    f.renderer.setRenderObjectFunction(null);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+    assert.equal(before,2);assert.equal(after,1);assert.equal(nativeDraws(f.device).length,1);
+  }
+});
+
 test('authored sprites retain queued billboard uniforms and render once per source object instead of per instance',async t=>{
   const f=fixture(t),N=T.TSL,material=new T.SpriteNodeMaterial();
   const rotation=N.uniform(.375).setName('queuedSpriteRotation'),scale=N.uniform(new T.Vector2(.625,.8125)).setName('queuedSpriteScale');

@@ -1043,6 +1043,49 @@ hook removal, cross-scene attribute history and the existing-owner boundary. The
 recording device verifies commands and uploaded bytes; this change has no new
 browser-pixel or performance measurement.
 
+## Custom object dispatch
+
+`setRenderObjectFunction()` now selects the native capture path for application
+dispatchers, including scenes made entirely from ordinary built-in materials.
+The function runs synchronously with the renderer as `this` and the original
+source object, scene, camera, geometry, material and group. Its remaining
+arguments include the scene's real source `Lighting` owner's `LightsNode`, the
+selected clipping context and the source pass ID. The dispatcher is selected
+once per render; calling the setter inside it affects subsequent renders.
+
+A dispatcher may skip a selected item, forward it through
+`renderer.renderObject()`, or forward several passes with alternate materials
+and pass IDs. Each forwarded call runs the pinned object lifecycle and captures
+its own material values, light selection and requested geometry uploads before
+preparation can await. Changes to the supplied LightsNode between material
+passes are observed in those passes. Successful renders restore its previous
+light list through the source Lighting owner; exceptions retain completed source
+effects while releasing capture resources and the nesting slot. Preparation
+does not replay dispatchers or object callbacks. Warm bundles execute their
+recorded passes without invoking a newly installed dispatcher until the bundle
+is invalidated. `compileAsync()` uses the source default object lifecycle and
+does not invoke the application dispatcher.
+
+The pinned Basic lighting model still constructs selected analytic light nodes.
+A selected RectAreaLight therefore retains the source LTC initialization
+prerequisite even in an unlit pass; unused LTC tables are not uploaded.
+
+Install the dispatcher before the selected attributes acquire a fixed-path
+owner; the existing explicit history-transfer boundary above still applies.
+Forwarded calls must retain the selected object, scene, camera, geometry and
+group, along with the supplied light-node and clipping-context identities.
+Replacing these selections or issuing nested GPU writes requires another capture
+boundary and is refused. Removing the dispatcher retains the native upload
+history. Registered shadow selectors remain distinct: only the exact source
+function paired with its source override material receives shadow-pass access.
+
+Seven focused facade cases cover skipped and repeated draws, alternate
+materials, queued snapshots, dispatcher replacement, compilation, live lights,
+retained bundles, exceptions and context boundaries. All thirty-seven selected
+dispatch, lifecycle, lighting, shadow and bundle regressions pass with the
+recording device. These checks establish command and upload behavior, without a
+new browser-pixel or performance result.
+
 ## Logarithmic and reversed depth
 
 Native perspective and orthographic mesh scenes accept `logarithmicDepthBuffer`
