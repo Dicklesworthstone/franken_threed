@@ -15,10 +15,10 @@
  *
  * Cache semantics follow r186 WebGLEnvironments.getPMREM: one cube-UV target per
  * source texture, generated once the source is complete (cube: six images;
- * equirect: image height > 0), never regenerated on later source edits (r186
- * regenerates only render-target textures by pmremVersion), released on the
- * source's `dispose` event. Render-target sources (pmremVersion) are explicit
- * errors here. No performance claim.
+ * equirect: image height > 0). Render-target sources regenerate into that same
+ * atlas when pmremVersion changes; ordinary texture edits keep their first
+ * bake. GPU source bindings stay leased through preparation and submission.
+ * No performance claim.
  */
 import {threeProgramSources, threeProgramRaster, packThreeProgramUniforms, createThreeProgramSupport} from './three_program.mjs';
 import {compileEsslProgram} from './essl_wgsl.mjs';
@@ -300,7 +300,7 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
    * Targets with a depth buffer get a depth24plus attachment per layer, cleared
    * to 1.0 on first use (WebGL initializes depth attachments) or by autoClear. */
   async function execute(draws) {
-    const owned = [];
+    const owned = [], borrowed = [], external = new Map();
     let submitted = false, failure = null;
     device.pushErrorScope('validation');
     try {
@@ -317,15 +317,24 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
         if (rt) return {view: targetTexture(rt).view, sampler: linearSampler(), sampleType: 'float'};
         const internal = internalBinding(t);
         if (internal) return {view: internal.view, sampler: internal.sampler, sampleType: 'float'};
-        const b = bindingOf(t);
-        if (!b?.view || !b.sampler) fail('TEXTURE', 'Offscreen source texture has no binding');
+        let b = external.get(t);
+        if (!b) {
+          b = bindingOf(t);
+          if (!b?.view || !b.sampler) fail('TEXTURE', 'Offscreen source texture has no binding');
+          // Public render targets can resize/dispose while a pipeline compiles.
+          // Keep the accepted native generation alive and validate it again at
+          // submission; never refresh individual draws to different storage.
+          borrowed.push({binding: b, release: b.retain?.()});
+          external.set(t, b);
+        }
         return {view: b.view, sampler: d.samplers[k] ?? b.sampler, sampleType: b.sampleType ?? 'float'};
       });
+      const bindings = draws.map(d => views(d));
       for (const [i, d] of draws.entries()) {
         const out = targetTexture(d.target), depth = out.depth ? 'depth24plus' : null;
         if (d.kind === 'scene') {
           const gpu = residencyFor(d.object, d.compiled), geometry = programGeometrySnapshot(gpu, device), reflection = d.compiled.program.reflection;
-          const bound = views(d);
+          const bound = bindings[i];
           const built = await scenePipeline(d.compiled, geometry, d.raster, bound, out.format, depth);
           const range = geometry.drawRange, extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
           const first = Math.max(d.start, range.first), end = Math.min(d.start + d.count, range.first + range.count, extent);
@@ -338,13 +347,14 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
           continue;
         }
         const {pipeline, uniformLayout, textureLayout} = await pipelineOf(d.entry, d.raster, d.geometry, out.format, depth);
-        const bound = views(d), reflection = d.entry.compiled.reflection;
+        const bound = bindings[i], reflection = d.entry.compiled.reflection;
         prepared.push({d, out, kind: 'mesh', pipeline, buffers: vertexBuffers(d.geometry, reflection.attributes, owned),
           uniformGroup: device.createBindGroup({label, layout: uniformLayout, entries: [{binding: 0, resource: {buffer: uniforms, offset: i * stride, size: reflection.uniformBufferSize}}]}),
           textureGroup: device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, k) => [
             {binding: t.textureBinding, resource: bound[k].view}, {binding: t.samplerBinding, resource: bound[k].sampler}])}),
           index: d.geometry.index, first: 0, count: d.geometry.index ? d.geometry.index.count : d.geometry.attributes.position.count, instanceCount: 1});
       }
+      for (const {binding} of borrowed) binding.validate?.();
       const encoder = device.createCommandEncoder({label});
       for (const p of prepared) {
         const [x, y, w, h] = p.d.viewport, [sx, sy, sw, sh] = p.d.scissor, layer = p.out.cube ? p.d.face : 0;
@@ -380,11 +390,17 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
       submitted = true;
     } catch (error) { failure = error; }
     // Per-generation buffers die after their submitted use, or at once.
-    const release = () => { for (const b of owned) b.destroy(); };
+    const release = () => {
+      for (const b of owned) b.destroy();
+      for (const lease of borrowed) lease.release?.();
+    };
     if (submitted) device.queue.onSubmittedWorkDone().then(release, release); else release();
     const scoped = await device.popErrorScope();
     if (failure) throw failure;
     if (scoped) fail('GPU', scoped.message);
+    // Validation itself is asynchronous. A disposed GPU source must not
+    // publish a fresh cache entry after its native commands were accepted.
+    for (const {binding} of borrowed) binding.validate?.();
   }
   function constantBuffer() {
     return constant ??= (() => {
@@ -444,21 +460,29 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
   /** Run r186 PMREMGenerator for one complete source and execute its passes. */
   async function generate(source) {
     if (disposed) fail('DISPOSED', 'PMREM owner is disposed');
-    if (source.isRenderTargetTexture) fail('SOURCE', 'Render-target PMREM sources (pmremVersion) are not admitted yet');
     const kind = pmremSourceKind(T, source);
     if (kind === 'direct') fail('SOURCE', 'Expected an equirectangular or cube environment');
+    const previous = done.get(source), version = source.pmremVersion;
+    const versioned = source.isRenderTargetTexture && version !== (previous?.target.texture.pmremVersion ?? 0);
     let target, draws;
     host.begin();
-    try { target = kind === 'equirect' ? generator.fromEquirectangular(source) : generator.fromCubemap(source); }
+    try { target = kind === 'equirect' ? generator.fromEquirectangular(source, previous?.target) : generator.fromCubemap(source, previous?.target); }
     finally { draws = host.end(); }
-    target.texture.pmremVersion = source.pmremVersion;
     await execute(draws);
+    if (disposed) fail('DISPOSED', 'PMREM owner was disposed during generation');
+    target.texture.pmremVersion = version;
     const out = targetTexture(target);
     // Targets PMREMGenerator no longer holds (a resized ping-pong) are released.
     for (const [rt, t] of targets) if (rt !== target && rt !== generator._pingPongRenderTarget && ![...done.values(), ...cubes.values(), ...scenes.values()].some(e => e.target === rt)) { t.texture.destroy(); t.depth?.destroy(); targets.delete(rt); }
-    const entry = {target, binding: {view: out.view, sampler: linearSampler(), sampleType: 'float'}};
-    done.set(source, entry); outputs.set(target.texture, entry);
-    releaseWith(source, done, entry);
+    // WebGLEnvironments reuses its existing target for versioned GPU inputs.
+    // Keeping the binding identity also avoids rebuilding receiver programs.
+    const entry = previous ?? {target, binding: {view: out.view, sampler: linearSampler(), sampleType: 'float'}};
+    if (!previous) {
+      done.set(source, entry); outputs.set(target.texture, entry);
+      // r186 installs its source-disposal listener only in the initial image-
+      // readiness branch. An initial versioned render-target bake skips it.
+      if (!versioned) releaseWith(source, done, entry);
+    }
     return target.texture;
   }
   function releaseWith(source, map, entry) {
@@ -515,8 +539,8 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
       const kind = pmremSourceKind(T, source);
       if (kind === 'direct') return {state: 'direct'};
       const entry = done.get(source);
+      if (source.isRenderTargetTexture && source.pmremVersion !== (entry?.target.texture.pmremVersion ?? 0)) return {state: 'needed'};
       if (entry) return {state: 'ready', texture: entry.target.texture};
-      if (source.isRenderTargetTexture) fail('SOURCE', 'Render-target PMREM sources (pmremVersion) are not admitted yet');
       return pmremSourceComplete(T, source) ? {state: 'needed'} : {state: 'incomplete'};
     },
     generate, convert, generateScene,

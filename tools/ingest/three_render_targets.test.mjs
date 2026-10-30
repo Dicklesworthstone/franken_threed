@@ -77,6 +77,18 @@ test('direct configuration edits also invalidate already queued work', () => {
   owner.ensure(next); owner.dispose();
 });
 
+test('asynchronous program bindings keep disposed native storage alive until their lease ends', () => {
+  const {owner, target, calls} = fixture(), binding = owner.bindingsFor().get(target.texture);
+  const finish = binding.retain(), resources = calls.textures.slice();
+  target.dispose();
+  assert.throws(() => binding.validate(), {code: 'THREE_TARGET_STALE'});
+  assert.ok(resources.every(texture => texture.destroyed === 0));
+  assert.ok(owner.allocatedBytes > 0, 'borrowed storage remains charged');
+  finish(); finish();
+  assert.ok(resources.every(texture => texture.destroyed === 1));
+  assert.equal(owner.allocatedBytes, 0); owner.dispose();
+});
+
 test('source disposal inside a submission does not destroy a borrowed attachment early', () => {
   const {owner, target, calls} = fixture(), e = owner.capture(target);
   assert.throws(() => owner.render(e, () => {

@@ -651,7 +651,7 @@ export async function createGpuThreeScene(device,scene,{
       // WebGLEnvironments.getPMREM: cube-UV target once the source is complete.
       const r=pmrem().lookup(source);
       if(r.state==='ready')return {envMap:r.texture,envMapRotation};
-      if(r.state==='direct')fail('TEXTURE','Pre-filtered cube-UV environment textures are not admitted yet');
+      if(r.state==='direct')return {envMap:source,envMapRotation};
       if(r.state==='needed'){
         if(textureScan){pmremRequests.add(source);textureBinding(source);}
         else if(!pendingTextures.has(source))fail('PREPARE','A PMREM environment source is complete; prepare() generates it');
@@ -659,7 +659,7 @@ export async function createGpuThreeScene(device,scene,{
       // Incomplete or still loading: r186 renders without the environment.
       return {envMap:null,envMapRotation};
     }
-    if(source.mapping===three.CubeUVReflectionMapping&&pmremOwner?.binding(source))return {envMap:source,envMapRotation};
+    if(source.mapping===three.CubeUVReflectionMapping)return {envMap:source,envMapRotation};
     if(source.mapping===three.EquirectangularReflectionMapping||source.mapping===three.EquirectangularRefractionMapping)
       return {envMap:equirectCube(source),envMapRotation};
     if(!source.isCubeTexture||![three.CubeReflectionMapping,three.CubeRefractionMapping].includes(source.mapping))

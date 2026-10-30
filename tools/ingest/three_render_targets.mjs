@@ -331,7 +331,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   let disposed = false, allocatedBytes = 0, terminal = null;
   const live = () => { if (disposed) fail('DISPOSED', 'Render target owner is disposed'); if (terminal) throw terminal; };
   function release(entry) {
-    if (entry.busy || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
+    if (entry.busy || entry.programReferences || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
     entry.released = true;
     try { entry._dispatcher?.dispose(); }
     finally {
@@ -802,7 +802,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
         if (entry.shape.texture !== texture) fail('UNSUPPORTED', 'Additional MRT attachments require native texture bindings');
-        return sampling(entry, texture);
+        const binding = sampling(entry, texture);
+        // Asynchronous source program preparation (PMREM) may hold this view
+        // across pipeline compilation. The ordinary draw path stays synchronous;
+        // the generator explicitly acquires/releases this existing generation.
+        return {...binding, retain: () => {
+          const finish = retainGeneration(entry);
+          entry.programReferences = (entry.programReferences ?? 0) + 1;
+          let held = true;
+          return () => {
+            if (!held) return;
+            held = false; entry.programReferences--; finish();
+            if (!entry.alive) release(entry);
+          };
+        }, validate: () => assertCurrent(entry)};
       }
     }();
   }

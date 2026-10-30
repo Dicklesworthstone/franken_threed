@@ -139,11 +139,32 @@ receiver's `textureCubeUV` reads them with GL's uv convention) and replayed in
 order on rgba16float targets, each draw with its own viewport, scissor and
 uniform slice. Cache semantics follow `WebGLEnvironments.getPMREM`: generated
 once the source is complete (until then the program renders without the
-environment, as r186 does), never regenerated on source edits, released on
+environment, as r186 does), ordinary textures are never regenerated on source edits, released on
 the source's `dispose`. Scenario `shaderlib_pmrem` (cube and equirect sources,
 roughness 0.05–0.8, Physical clearcoat) matches upstream WebGLRenderer (0.01%
 of pixels differ; mean channel difference 0.01). This runs H2
 `webgl_marchingcubes` "shiny".
+
+GPU-authored equirectangular render targets now feed that filtering path without
+CPU readback. Their `needsPMREMUpdate`/`pmremVersion` changes regenerate the same
+cube-UV allocation and retain its sampler/view identity; ordinary texture upload
+versions do not trigger a bake. Source-disposal handling retains r186's branch
+asymmetry: an initial versioned target bake does not install the ordinary cache
+disposal listener. An input binding is acquired once for the whole
+generation, kept alive across pipeline preparation and the submitted queue
+fence, and validated before submission and publication. Supplied cube-UV atlases
+are sampled directly through the existing texture owner. The WebGL-authored
+route retains its existing live-scene preparation contract; this does not add
+immutable snapshots of arbitrary queued scenes. WebGLCubeRenderTarget/CubeCamera
+input support remains open.
+
+`three_program_pmrem_targets.test.mjs` exercises versioned reuse, public renderer
+integration and asynchronous input lifetimes. `program_pmrem_targets.mjs` compares
+five source/F3D checkpoints: changed GPU panorama with and without an invalidation
+request, two requested regenerations and a supplied atlas. Chromium 151/SwiftShader
+passes the existing WebGL channel-12/pixel-2% budget: 8 of 6,144 pixels exceed the
+channel threshold in each panorama checkpoint; the direct atlas differs by at
+most one channel level. No hardware performance claim.
 
 Shadow maps (`three_program_shadows.mjs`): a retained-JavaScript port of r186
 `WebGLShadowMap` (map allocation, shadow cameras and per-face frustums, caster
@@ -257,9 +278,9 @@ draw. Materials with either hook always draw their program. Scenario
 `webgl_materials_modified`, `webgl_shadowmap_csm` (CSM chunk rewrites) and
 `webgl_materials_toon` run.
 
-Not admitted yet (explicit errors): transmission (needs its render target),
-render-target PMREM sources (`pmremVersion`), pre-filtered cube-UV textures
-supplied directly, Sprite materials.
+The remaining PMREM input gap on this WebGL-authored route is
+WebGLCubeRenderTarget/CubeCamera storage and orientation, rather than ordinary
+GPU equirectangular render targets or supplied cube-UV textures.
 
 Textures: the texture owner now admits HalfFloat (`*16float`) and Float
 (`*32float`) DataTextures with byte-exact rows. Float32 linear filtering

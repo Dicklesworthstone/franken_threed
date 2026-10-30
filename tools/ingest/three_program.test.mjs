@@ -113,7 +113,9 @@ test('PMREM: r186 PMREMGenerator passes record against the host and compile with
   assert.deepEqual(pmrem.lookup(cube), {state: 'needed'});
   await assert.rejects(pmrem.generate(cube), /no-gpu/);
   const rt = new T.WebGLRenderTarget(4, 4); rt.texture.mapping = T.CubeReflectionMapping;
-  assert.throws(() => pmrem.lookup(rt.texture), {code: 'THREE_PMREM_SOURCE'});
+  assert.deepEqual(pmrem.lookup(rt.texture), {state: 'incomplete'});
+  rt.texture.needsPMREMUpdate = true;
+  assert.deepEqual(pmrem.lookup(rt.texture), {state: 'needed'}, 'GPU-authored versions bypass CPU image readiness, as r186 does');
 });
 
 test('WebGLLights shadow state: r186 sorting, shadow uniforms, maps by light type, receiver sources', () => {
