@@ -14,7 +14,7 @@ function videoNodes(records) {
   ]));
 }
 
-export function fbxResources(records, {binary = false, version = 7400, triangle = false, numberType = 'L'} = {}) {
+export function fbxResources(records, {binary = false, version = 7400, triangle = false, numberType = 'L', connectVideos = true} = {}) {
   const objects = videoNodes(records), connections = [];
   if (triangle) {
     objects.push(node('Geometry', [100, 'Geometry::Triangle', 'Mesh'], [
@@ -27,6 +27,14 @@ export function fbxResources(records, {binary = false, version = 7400, triangle 
     node('Texture',[103,'Texture::Paint',''],[field('FileName','paint.png')]));
     for (const properties of [['OO',100,101],['OO',102,101],['OO',101,0],
       ['OP',103,102,'DiffuseColor'],['OO',records[0].id ?? 10,103]]) connections.push({name:'C',properties});
+  } else if (connectVideos) {
+    // Video metadata alone never requests an image. Give metadata-only cases
+    // real Texture consumers, including the source's parseInt image-ID lookup.
+    for (const [index,record] of records.entries()) {
+      const textureId=1000+index;
+      objects.push(node('Texture',[textureId,'Texture::resource','TextureVideoClip'],[field('FileName','resource.png')]));
+      connections.push({name:'C',properties:['OO',parseInt(String(record.id??index+10)),textureId]});
+    }
   }
   const roots = [node('FBXHeaderExtension',[],[field('FBXVersion',version)]),
     node('Objects',[],objects), node('Connections',[],connections)];

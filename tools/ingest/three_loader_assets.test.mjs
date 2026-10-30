@@ -132,6 +132,36 @@ test("addon asset discovery preserves opaque loaders and shadows while OBJ mater
   assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'sidecars.fbx', 'known.hdr']);
 });
 
+test("FBX loader discovery retains animation settings, captured defaults and pending resource changes", () => {
+  const requests = discover(`import { FBXLoader } from ${JSON.stringify(fbxUrl)};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const loader = new FBXLoader(); loader.trimAnimationClips = true; const trimming = loader.trimAnimationClips;
+    loader.setPath('models/'); loader.loadAsync('nested/animated.fbx');
+    loader.setResourcePath('textures/'); loader.load('second.fbx');
+    loader.setResourcePath('');
+    new Addons.FBXLoader().load('other/model.fbx');
+    const late = new FBXLoader(); late.load('before/model.fbx'); late.setResourcePath(runtimePath);
+    new FBXLoader(manager).load('managed.fbx');
+    const escaping = new FBXLoader(); customize(escaping); escaping.load('escaped.fbx');
+    const changed = new FBXLoader(); changed.path = runtimePath; changed.load('changed.fbx');`);
+  assert.deepEqual(requests.map(({url,texturePaths}) => [url,texturePaths]), [
+    ['models/nested/animated.fbx',['models/','textures/']], ['models/second.fbx',['models/','textures/']],
+    ['other/model.fbx',['other/']], ['before/model.fbx',null],
+  ]);
+});
+
+test("FBX animation option methods and unknown mutations cannot masquerade as boolean settings", () => {
+  const requests = discover(`import { FBXLoader } from ${JSON.stringify(fbxUrl)};
+    const loader = new FBXLoader();
+    loader.trimAnimationClips = function(){this.setPath('other/');};
+    loader.trimAnimationClips(); loader.load('mesh.fbx');
+    const indirect = new FBXLoader(); indirect.trimAnimationClips = runtimeOption; indirect.load('unknown.fbx');
+    const destructured = new FBXLoader(); ({flag:destructured.trimAnimationClips}=runtimeOptions);
+    destructured.load('destructured.fbx');
+    new FBXLoader().load('ordinary.fbx');`);
+  assert.deepEqual(requests.map(({url}) => url), ['ordinary.fbx']);
+});
+
 test("MTL and configured OBJ loaders retain finite model paths, material settings and namespace identity", () => {
   const requests = discover(`import { MTLLoader as Materials } from ${JSON.stringify(mtlUrl)};
     import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};

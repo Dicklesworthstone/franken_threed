@@ -289,6 +289,69 @@ f 1/1/1 2/2/1 3/3/1
   assert.ok(result.images.every(url=>url.startsWith('data:image/png;')));
 });
 
+test("packed binary and ASCII FBX retain textured geometry, skeletal clips and animation without files or network", async () => {
+  const sourceRoot=new URL('../../upstream/three.js/examples/models/fbx/',import.meta.url);
+  const models=Object.fromEntries(['monkey.fbx','RotationTest.fbx','ball_anims_asc_2018.fbx']
+    .map(name=>['models/'+name,fs.readFileSync(new URL(name,sourceRoot))]));
+  const image=fs.readFileSync(new URL('monkey.fbm/UVTexture.png',sourceRoot));
+  const f=fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import * as THREE from ${JSON.stringify(core.href)};export {THREE};
+      import {FBXLoader} from ${JSON.stringify(new URL('../../upstream/three.js/examples/jsm/loaders/FBXLoader.js',import.meta.url).href)};
+      async function ready(material){
+        for(let i=0;i<100;i++){
+          if(material.map?.image?.complete)return;
+          await new Promise(resolve=>setTimeout(resolve,10));
+        }
+        throw new Error('FBX diffuse texture did not finish loading');
+      }
+      const round=values=>values.map(value=>Number(value.toFixed(9)));
+      export async function run(){
+        const order=[], pending=new FBXLoader().loadAsync('models/monkey.fbx');order.push('returned');
+        const first=await pending;order.push('loaded');
+        const second=await new Promise((resolve,reject)=>new FBXLoader().setPath('models/')
+          .load('monkey.fbx',resolve,undefined,reject));
+        const rotation=await new FBXLoader().setPath('models/').loadAsync('RotationTest.fbx');
+        const skeletal=new FBXLoader();skeletal.trimAnimationClips=true;
+        skeletal.setPath('models/');const ball=await skeletal.loadAsync('ball_anims_asc_2018.fbx');
+        const changing=new FBXLoader().setPath('models/'), lateLoad=changing.loadAsync('monkey.fbx');
+        changing.setResourcePath('shared/');const late=await lateLoad;
+        const a=first.children[0],b=second.children[0],c=late.children[0],skin=ball.children[0];
+        await Promise.all([ready(a.material),ready(b.material),ready(c.material)]);
+        const rotate=new THREE.AnimationMixer(rotation);rotate.clipAction(rotation.animations[0]).play();rotate.update(0.5);
+        const animate=new THREE.AnimationMixer(ball);animate.clipAction(ball.animations[0]).play();animate.update(0.2);
+        ball.updateMatrixWorld(true);a.position.x=9;
+        return {order,monkey:{name:a.name,vertices:a.geometry.attributes.position.count,material:a.material.type,
+          independent:a!==b&&a.geometry!==b.geometry&&a.material!==b.material&&a.material.map!==b.material.map&&b.position.x===0,
+          lateResource:c.material.map.image.src!==a.material.map.image.src},
+          rotation:{vertices:rotation.children[0].geometry.attributes.position.count,clips:rotation.animations.length,
+            duration:rotation.animations[0].duration,tracks:rotation.animations[0].tracks.length,
+            quaternion:round(rotation.children[0].quaternion.toArray())},
+          skeletal:{skinned:skin.isSkinnedMesh,vertices:skin.geometry.attributes.position.count,
+            bones:skin.skeleton.bones.length,inverses:skin.skeleton.boneInverses.length,
+            clips:ball.animations.map(clip=>({name:clip.name,duration:clip.duration,start:clip.tracks[0].times[0]})),
+            animatedBone:round(skin.skeleton.bones[0].position.toArray())}};
+      }`,...models,'models/monkey.fbm/UVTexture.png':image,'shared/monkey.fbm/UVTexture.png':image});
+  await buildApplication(f.entry,f.out,{prepareStandaloneLoaders:true});
+  for(const [name,bytes] of Object.entries(models))assert.deepEqual(fs.readFileSync(path.join(f.out,name)),bytes);
+  for(const base of ['models/','shared/'])assert.deepEqual(fs.readFileSync(path.join(f.out,base+'monkey.fbm/UVTexture.png')),image);
+  packHtml(path.join(f.out,'index.html'),f.packed);
+  const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  assert.deepEqual(result.result,{order:['returned','loaded'],
+    monkey:{name:'Suzanne',vertices:2910,material:'MeshPhongMaterial',independent:true,lateResource:true},
+    rotation:{vertices:36,clips:1,duration:4.166666507720947,tracks:3,
+      quaternion:[-0.705729324,0.044115921,0.044115723,0.705729205]},
+    skeletal:{skinned:true,vertices:2280,bones:1,inverses:1,
+      clips:[{name:'clip_vertical',duration:0.375,start:0},{name:'clip_horizontal',duration:0.3749999701976776,start:0}],
+      animatedBone:[0,1.326013138,0]}});
+  assert.equal(result.images.length,3);
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='models/monkey.fbm/UVTexture.png'));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='shared/monkey.fbm/UVTexture.png'));
+});
+
 test("packed HDR/EXR environments, fonts and geometry execute retained addon parsers without network or source files", async () => {
   const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
   const hdr = Buffer.concat([Buffer.from('#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n'), Buffer.from([255, 128, 64, 128])]);

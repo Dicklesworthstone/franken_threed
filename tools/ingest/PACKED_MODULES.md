@@ -230,31 +230,50 @@ decode, all material/geometry assertions pass, and there are no browser errors.
 This validates retained-loader packaging and native image decoding, not rendering
 or acceleration.
 
-## FBX models and texture dependencies
+## FBX scenes, textures and animation
 
-Finite pinned `FBXLoader.load()` and `loadAsync()` requests now include original
-ASCII and binary FBX files plus their local external image dependencies. The
-metadata reader follows `Objects.Video`, `RelativeFilename` precedence, Windows
-basename handling and the source's duplicate-record rules. Binary 32-bit and
-64-bit node offsets skip geometry and compressed animation/attribute arrays;
-their original bytes remain for the retained loader to decode at runtime.
-Supported embedded images stay inside the FBX bytes, including shared filename
-references. Existing data and Blob URLs retain their source handling.
+Finite pinned `FBXLoader.load()` and `loadAsync()` requests now package their
+original model bytes and connected external image files. ASCII FBX from version
+7000 and binary FBX from version 6400 are inspected only for resource metadata,
+including the 64-bit node headers introduced in version 7500. Geometry arrays,
+compressed payloads, skeletal bindings, morph data and animations stay with the
+retained source parser. Boolean `trimAnimationClips` assignments remain live
+source settings; unknown mutations or replacing that field with a callable keep
+the opaque host route.
 
-Image bases preserve the FBX loader's captured `setPath()` or model directory,
-with finite `setResourcePath()` changes visible to pending requests. Unknown
-paths, custom managers and escaping loader objects keep their host routes.
-Malformed metadata never replaces the original model or its source parse error.
+Image discovery follows each Texture node's first connection to a Video node,
+uses `RelativeFilename` before `Filename`, and applies the source's Windows-path
+basename rule. Unused Videos and later connection children do not add resources.
+Embedded image content stays embedded, including the source's shared-filename
+deduplication across Video nodes. The metadata scanner does not use a Texture's
+`FileName` as its image URL or decompress geometry to discover dependencies.
 
-The packed execution regression runs ASCII, compressed-array binary, and
-embedded-image binary models after both source and build directories become
-unavailable. It checks textured triangle geometry, UVs, material color space,
-asynchronous ordering, independent loader results and pending resource resets.
-Its image host verifies image bytes and completion. An independent Chrome
-151.0.7922.34 run also decoded all five native PNG images, including the source
-Blob image, and checked exact red RGBA bytes with zero external requests or
-browser errors. This establishes retained-loader packaging and browser image
-decoding; rendering and acceleration are separate claims.
+As with MTL, each load captures its default path while a finite resource-path
+reset can affect an already pending parse. FBX uses the literal texture-loader
+prefix, including for an authored HTTP URL; it does not inherit MTL's different
+absolute-URL exception. Custom managers, unknown paths and escaping loaders
+retain their source host behavior. Metadata inspection has explicit byte,
+node, nesting, property-count and offset bounds. Malformed metadata leaves the
+original model bytes intact for the source parse error; resource-budget failures
+remain explicit.
+
+The packed execution regression loads real pinned binary geometry and animation
+plus an ASCII skinned model after source and build files are unavailable. It
+checks texture completion, independent model instances, a pending resource-path
+reset, a quaternion animation sample, skeletal bone motion and trimmed clips,
+with non-data requests rejected. A complementary regression preserves ASCII,
+compressed-array binary and embedded-image binary triangle models, checking
+UVs, material color space, independent loader results and native Blob-image
+loading. Both suites retain the original loader and model bytes.
+
+Independent Chrome 151.0.7922.34 offline runs cover both applications. The
+authored triangle case decodes five native PNG images, including the source
+Blob image, and checks exact red RGBA bytes. The real-model case decodes three
+1024-by-1024 PNG images and preserves Suzanne's 2,910 vertices, the animated
+cube, and the skinned ball's two trimmed clips and animated bone sample. Both
+runs report zero external requests and browser errors. This establishes
+retained-loader packaging and native image decoding; rendering and acceleration
+are separate claims.
 
 ## Validation and boundaries
 
