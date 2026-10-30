@@ -27,7 +27,7 @@ export function createEulerUpdateKernel(base64,orders,maxMemoryPages){
 }
 export function registerEulerUpdateClass(token,name,Class){
   const record=lookup(kernels,token),proto=data(Class,'prototype'),properties=create(null);
-  for(const key of ['x','y','z','set','setFromEuler'])properties[key]=descriptor(proto,key);
+  for(const key of ['x','y','z','order','set','setFromEuler'])properties[key]=descriptor(proto,key);
   record.classes[name]={proto,parent:prototype(proto),properties};
 }
 export function registerEulerUpdateNumeric(object,token,name){
@@ -166,3 +166,12 @@ export function tryEulerUpdateLoop(group,bound,token){
 export function eulerUpdateDiagnostics(group){
   return freeze({...lookup(statistics,group)??{wasmCalls:0,objects:0,fallbackCalls:0,lastFailure:null}});
 }
+
+/** Shared source-allocation proof for a caller that also validates the platform. */
+export function eulerUpdateNumericSnapshot(euler){
+  const value=numeric(euler,'Euler',null,false);
+  if(!value||descriptor(euler,'order')||!sameDescriptor(descriptor(value.cls.proto,'order'),value.cls.properties.order))return null;
+  const order=data(euler,'_order');
+  return typeof order==='string'?{values:value.values,order}:null;
+}
+export function eulerUpdatePlatformIntact(){return platform();}

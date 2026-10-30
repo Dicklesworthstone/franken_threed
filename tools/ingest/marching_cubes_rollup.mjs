@@ -5,6 +5,7 @@ import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_nor
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeTransformBatch} from './transform_batch_specialization.mjs';
 import {specializeEulerUpdateBase,specializeEulerUpdateLoops} from './euler_update_specialization.mjs';
+import {specializeInstancedMatrixBase,specializeInstancedMatrixLoops} from './instanced_matrix_update_specialization.mjs';
 import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
 import {specializeQuaternionFlat} from './quaternion_flat_specialization.mjs';
 import {geometryBoundsSourceRole,specializeGeometryBounds} from './geometry_bounds_specialization.mjs';
@@ -13,6 +14,7 @@ const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
 const ATTRIBUTE_TRANSFORMS='\0f3d-geometry-transforms-adapter';
 const EULER_UPDATES='\0f3d-euler-update-adapter';
+const INSTANCE_UPDATES='\0f3d-instanced-matrix-update-adapter';
 const QUATERNIONS='\0f3d-quaternion-flat-adapter';
 const BOUNDS='\0f3d-geometry-bounds-adapter';
 
@@ -32,16 +34,17 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],quaternionReports=[],boundsReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;quaternionReports.length=0;boundsReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS,BOUNDS].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
-      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
-      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,BOUNDS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
+      if (importer===INSTANCE_UPDATES && source==='./euler_update_adapter.mjs') return EULER_UPDATES;
+      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
     load(id) {
@@ -52,13 +55,14 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===TRANSFORMS) return fs.readFileSync(new URL('./transform_batch_adapter.mjs',import.meta.url),'utf8');
       if (id===ATTRIBUTE_TRANSFORMS) return fs.readFileSync(new URL('./geometry_transforms_adapter.mjs',import.meta.url),'utf8');
       if (id===EULER_UPDATES) return fs.readFileSync(new URL('./euler_update_adapter.mjs',import.meta.url),'utf8');
+      if (id===INSTANCE_UPDATES) return fs.readFileSync(new URL('./instanced_matrix_update_adapter.mjs',import.meta.url),'utf8');
       if (id===QUATERNIONS) return fs.readFileSync(new URL('./quaternion_flat_adapter.mjs',import.meta.url),'utf8');
       if (id===BOUNDS) return fs.readFileSync(new URL('./geometry_bounds_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,QUATERNIONS,BOUNDS].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -105,6 +109,9 @@ export function marchingCubesRollupPlugin(options={}) {
           const euler=specializeEulerUpdateBase(code,{runtimeModule:EULER_UPDATES,maxMemoryPages,maxIterations});
           if(euler.report)eulerReports.push({id,...euler.report});
           if(euler.changed){edits.push(...euler.edits);headers.push(euler.header);}
+          const instance=specializeInstancedMatrixBase(code,{runtimeModule:INSTANCE_UPDATES,maxMemoryPages,maxIterations});
+          if(instance.report)instanceReports.push({id,...instance.report});
+          if(instance.changed){edits.push(...instance.edits);headers.push(instance.header);}
         }
         if(normalCandidate || code.includes('class Matrix3')) {
           const attributes=specializeGeometryTransforms(code,{...sources,runtimeModule:ATTRIBUTE_TRANSFORMS,maxMemoryPages,maxIterations});
@@ -114,6 +121,9 @@ export function marchingCubesRollupPlugin(options={}) {
         const eulerLoops=specializeEulerUpdateLoops(code,{runtimeModule:EULER_UPDATES});
         if(eulerLoops.report)eulerReports.push({id,...eulerLoops.report});
         if(eulerLoops.changed){edits.push(...eulerLoops.edits);headers.push(eulerLoops.header);}
+        const instanceLoops=specializeInstancedMatrixLoops(code,{runtimeModule:INSTANCE_UPDATES});
+        if(instanceLoops.report)instanceReports.push({id,...instanceLoops.report});
+        if(instanceLoops.changed){edits.push(...instanceLoops.edits);headers.push(instanceLoops.header);}
         if(!headers.length)return null;
         let transformed=code;
         for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
@@ -164,6 +174,9 @@ export function marchingCubesRollupPlugin(options={}) {
       getEulerUpdatesReport(){return {version:1,accelerationClaim:false,
         compiledModules:eulerReports.filter(report=>report.kind==='pinned-euler-kernel').length,
         compiledLoops:eulerReports.reduce((sum,report)=>sum+(report.compiledLoops??0),0),modules:eulerReports.map(report=>({...report}))};},
+      getInstancedMatrixUpdatesReport(){return {version:1,accelerationClaim:false,
+        compiledModules:instanceReports.filter(report=>report.kind==='pinned-instanced-matrix-kernel').length,
+        compiledLoops:instanceReports.reduce((sum,report)=>sum+(report.compiledLoops??0),0),modules:instanceReports.map(report=>({...report}))};},
       getGeometryTransformsReport(){return {version:1,accelerationClaim:false,
         compiledModules:attributeReports.filter(report=>report.compiledMethods.length).length,modules:attributeReports.map(report=>({...report}))};}},
   };

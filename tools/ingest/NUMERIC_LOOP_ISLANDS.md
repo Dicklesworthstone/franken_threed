@@ -157,6 +157,44 @@ live inputs, aliases, observable guards, reentry and partial failures against
 the pinned source. It does not establish complete H1 application or hardware
 performance closure.
 
+### Source-shaped instance-matrix updates
+
+The same build option now extracts the second H1 dynamic loop as one Wasm
+transaction, including source-shaped loops with different variable names:
+
+```js
+for (let i = 0; i < mesh.count; i++) {
+  rotation.makeRotationFromEuler(speeds[i]);
+  mesh.getMatrixAt(i, temporary);
+  temporary.multiply(rotation);
+  mesh.setMatrixAt(i, temporary);
+}
+mesh.instanceMatrix.needsUpdate = true;
+```
+
+The compiler derives rotation and multiplication arithmetic from the pinned
+`Matrix4` source. All six Euler orders and `premultiply` are covered. Native
+JavaScript `cos` and `sin` remain in source evaluation order; one Wasm call
+computes the complete loop. Instance stores retain Float32 or Float64 conversion,
+while both public scratch matrices retain their full-precision final values and
+array identities. The upload request remains at its original source boundary.
+
+Constructor and literal-array allocation witnesses precede descriptor-only
+guards for methods, Euler accessors, counts, indexed inputs and writable output
+cells. Changed methods, proxies/getters, shared, resizable or immutable buffers, scratch
+aliases, unknown arrays and unsupported values retain the complete original
+loop before any native publication. Lazy initialization rechecks inputs, and a
+failed native budget publishes no speculative changes before source fallback.
+This preserves callback reentry and source partial failures without replaying an
+already committed update.
+
+`libraryKernels.instancedMatrixUpdates` reports source spans and the copying
+ownership route. `node tools/ingest/instanced_matrix_update.test.mjs` compares the
+unchanged H1 loop and renamed structural variants against retained source,
+including observable scratch state and zero per-instance multiply dispatches on
+the admitted path. This is implementation evidence, not a measured speedup or
+closure of every instanced animation pattern.
+
 ```bash
 node --test tools/ingest/numeric_loop*.test.mjs
 ```

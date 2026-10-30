@@ -821,7 +821,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
           matrixMultiplication: marchingPlugin.api.getMatrixMultiplicationReport(),
           quaternionFlat: marchingPlugin.api.getQuaternionFlatReport(),
           transformBatches: marchingPlugin.api.getTransformBatchesReport(),
-          eulerUpdates: marchingPlugin.api.getEulerUpdatesReport() },
+          eulerUpdates: marchingPlugin.api.getEulerUpdatesReport(),
+          instancedMatrixUpdates: marchingPlugin.api.getInstancedMatrixUpdatesReport() },
       };
       const reportAsset = output.find(
         (item) => item.type === "asset" && item.fileName === numericReport.reportFile,
