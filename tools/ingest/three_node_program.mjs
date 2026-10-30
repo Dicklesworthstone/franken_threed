@@ -59,9 +59,11 @@ const PHYSICAL_SLOTS = new Set(['clearcoatNode', 'clearcoatRoughnessNode', 'clea
   'sheenNode', 'sheenRoughnessNode', 'iridescenceNode', 'iridescenceIORNode', 'iridescenceThicknessNode',
   'anisotropyNode', 'retroreflectivityNode', 'iorNode', 'specularColorNode', 'specularIntensityNode',
   'transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']);
+const SSS_SLOTS = new Set(['thicknessColorNode', 'thicknessDistortionNode', 'thicknessAmbientNode',
+  'thicknessAttenuationNode', 'thicknessPowerNode', 'thicknessScaleNode']);
 const SHADOW_SLOTS = new Set(['castShadowPositionNode', 'castShadowNode', 'maskShadowNode',
   'receivedShadowPositionNode', 'receivedShadowNode']);
-const GRAPH_SLOTS = [...SLOTS, ...SPRITE_SLOTS, ...POINT_SLOTS, ...DASH_SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SHADOW_SLOTS];
+const GRAPH_SLOTS = [...SLOTS, ...SPRITE_SLOTS, ...POINT_SLOTS, ...DASH_SLOTS, ...LIT_SLOTS, ...PHONG_SLOTS, ...STANDARD_SLOTS, ...PHYSICAL_SLOTS, ...SSS_SLOTS, ...SHADOW_SLOTS];
 // Match WebGPUUtils: primitive type belongs to the object, not its material.
 const topologyOf = (object, material) => object.isPoints === true ? 'points'
   : object.isLineSegments === true || object.isMesh === true && material.wireframe === true ? 'lines'
@@ -108,7 +110,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!Number.isSafeInteger(value) || value < 1) fail('LIMIT', `Invalid ${name}`);
   const frame = renderer._nodes.nodeFrame, cache = new WeakMap(), entries = new Set();
   const effects = createThreeNodeEffects(three, renderer, {fail});
-  const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype];
+  const physicalPrototypes = [three.MeshPhysicalNodeMaterial.prototype,
+    ...(three.MeshSSSNodeMaterial ? [three.MeshSSSNodeMaterial.prototype] : [])];
+  const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, ...physicalPrototypes];
   const normalPrototypes = [three.MeshNormalNodeMaterial.prototype, three.MeshMatcapNodeMaterial.prototype];
   const primitivePrototypes = [three.PointsNodeMaterial, three.LineBasicNodeMaterial, three.LineDashedNodeMaterial,
     three.Line2NodeMaterial]
@@ -850,10 +854,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
     }));
   }
+  function sssSignature(material) {
+    if (Object.getPrototypeOf(material) !== three.MeshSSSNodeMaterial?.prototype) return null;
+    // The retained SSS model consumes these graphs during construction. Slot
+    // replacement (including disabling thicknessColorNode) needs a new graph;
+    // node uniform values remain live at their source update frequencies.
+    return JSON.stringify([...SSS_SLOTS].map(key => {
+      const node = material[key];
+      return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
+    }));
+  }
   const wideLineCoverage = material => Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype &&
     material.alphaToCoverage && renderer.currentSamples > 0;
   function transmissionSignature(material) {
-    if (Object.getPrototypeOf(material) !== three.MeshPhysicalNodeMaterial.prototype) return null;
+    if (!physicalPrototypes.includes(Object.getPrototypeOf(material))) return null;
     return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
       ...['transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']
         .map(key => sourceId(material[key]))]);
@@ -906,10 +920,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...primitivePrototypes, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic, LineDashed, Line2, Volume or unlit base NodeMaterial');
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, SSS, Shadow, Sprite, Points, LineBasic, LineDashed, Line2, Volume or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
-      physical = prototype === three.MeshPhysicalNodeMaterial.prototype, points = prototype === three.PointsNodeMaterial?.prototype,
+      physical = physicalPrototypes.includes(prototype), sss = prototype === three.MeshSSSNodeMaterial?.prototype,
+      points = prototype === three.PointsNodeMaterial?.prototype,
       sprite = prototype === three.SpriteNodeMaterial.prototype || points,
       dashed = prototype === three.LineDashedNodeMaterial?.prototype || prototype === three.Line2NodeMaterial?.prototype,
       volume = prototype === three.VolumeNodeMaterial?.prototype;
@@ -964,6 +979,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !(volume && (key === 'offsetNode' || VOLUME_FUNCTION_SLOTS.has(key))) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
+          !(sss && SSS_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
           !(key === 'contextNode' && pipelineContext !== null))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
@@ -1088,7 +1104,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       wideLineCoverage(material),
       material.depthWrite, material.depthTest, material.lights, clippingKey,
-      spriteSignature(material, object), wideLineSignature(material), volumeSignature(material),
+      spriteSignature(material, object), wideLineSignature(material), volumeSignature(material), sssSignature(material),
       primitiveLayout(object, material),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
@@ -1104,7 +1120,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
       lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightingSignature(material, lights)] : null,
-      Object.getPrototypeOf(material) === three.MeshPhysicalNodeMaterial.prototype ?
+      physicalPrototypes.includes(Object.getPrototypeOf(material)) ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection,
           material.useTransmission, material.useDispersion] : null]);
   }
@@ -1134,7 +1150,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
-    const volumeKey = volumeSignature(preparedMaterial);
+    const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
@@ -1190,6 +1206,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if ((material.alphaHash === true) !== alphaHash) fail('CHANGED', 'Native alpha hashing changed during source graph construction');
     if (volumeSignature(prepareMaterial(material)) !== volumeKey)
       fail('CHANGED', 'Native volume graphs changed during source construction');
+    if (sssSignature(prepareMaterial(material)) !== sssKey)
+      fail('CHANGED', 'Native subsurface scattering graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
@@ -1381,6 +1399,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       spriteSignature: spriteSignature(preparedMaterial, object),
       wideLineSignature: wideLineSignature(preparedMaterial),
       volumeSignature: volumeKey,
+      sssSignature: sssKey,
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
@@ -1698,6 +1717,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (volumeSignature(prepareMaterial(state.material)) !== state.volumeSignature)
       fail('CHANGED', 'Native volume scattering, emission, offset or depth graphs changed; compile the volume graph again');
   }
+  function checkSSS(state) {
+    if (sssSignature(prepareMaterial(state.material)) !== state.sssSignature)
+      fail('CHANGED', 'Native subsurface thickness graphs changed; compile the SSS graph again');
+  }
   function checkClipping(state, context) {
     if ((state.material.alphaHash === true) !== state.alphaHash)
       fail('CHANGED', 'Native alpha hashing changed; compile the material graph again');
@@ -1732,6 +1755,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (wideLineSignature(prepareMaterial(state.material)) !== state.wideLineSignature)
       fail('CHANGED', 'Native wide-line expansion, dashes, colors or transparency changed; compile the line graph again');
     checkVolume(state);
+    checkSSS(state);
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
@@ -1817,6 +1841,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkEnvironment(state, context);
       checkTransmission(state);
       checkVolume(state);
+      checkSSS(state);
       checkAttributes(state);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -1845,6 +1870,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkEnvironment(state, context);
       checkTransmission(state);
       checkVolume(state);
+      checkSSS(state);
       checkClipping(state, context);
       checkWireframe(state);
       const textures = readTextures(state);

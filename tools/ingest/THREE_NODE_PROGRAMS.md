@@ -278,6 +278,47 @@ program. The source's shared 16×16 RG16F DFG lookup texture goes through the sa
 versioned texture owner as authored textures, preserving its aliasing across
 materials and clearcoat samples.
 
+### Native subsurface scattering materials
+
+The pinned `MeshSSSNodeMaterial` now selects native graphics through its source
+material graph. Its `SSSLightingModel` adds the original subsurface term to
+direct diffuse lighting and retains the inherited physical shading. All six
+source controls work: `thicknessColorNode`, `thicknessDistortionNode`,
+`thicknessAmbientNode`, `thicknessAttenuationNode`, `thicknessPowerNode` and
+`thicknessScaleNode`. Thickness can come from sampled textures or authored TSL
+graphs; uniforms keep their source FRAME, RENDER and OBJECT update frequencies.
+
+A null `thicknessColorNode` retains the source physical fallback. Inactive
+lighting paths do not construct or update unused scattering graphs. The pinned
+SSS lighting constructor does not enable the newer retroreflection lobe, even
+when the inherited material property is set; native rendering preserves that
+source behavior. Clearcoat, sheen, iridescence, anisotropy, transmission and
+dispersion keep their source physical paths. Material environments retain
+precedence over scene environments, and native shadows use the shared depth
+target owner. Transmission uses the existing ordered opaque framebuffer copies.
+
+Changing any thickness graph requires a new source program. A stale descriptor
+rejects before node callbacks; mutations during construction or before/current
+node updates cannot publish a stale draw. Uniform value changes retain the
+program and each accepted render keeps independent bytes. Inherited physical
+feature switches and transmission graphs retain their existing cache guards.
+
+`three_renderer_native_sss_material.test.mjs` contains fifteen focused tests for
+default routing, exact source vertex/fragment WGSL, textured directional/point/
+spot scattering, physical lobes, queued state, graph invalidation, inactive
+branches, environment precedence, transmission copies, spot shadows and generated
+storage-write rejection. The tests execute the real renderer with a recording
+device; they do not establish raster pixels or hardware performance. The retained
+source builder and JavaScript callbacks still own graph construction and updates;
+FrankenThreeD owns native resources and GPU submission.
+
+The `native_sss_material.mjs` browser lane compares textured thickness controls,
+inherited transmission/dispersion/clearcoat, and spot shadows with environment
+overrides. All three match pinned source RGBA exactly at seven 128x96 checkpoints
+each in Chrome 151.0.7922.34 / SwiftShader, with visible nonconstant output, live
+changes and zero GPU/browser errors. These software-GPU comparisons establish
+the tested rendering behavior; hardware performance remains unmeasured.
+
 ### Native transmission and viewport snapshots
 
 Ordinary and Node Physical materials execute the pinned transmission, dispersion
