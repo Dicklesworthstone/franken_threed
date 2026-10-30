@@ -145,7 +145,7 @@ roughness 0.05–0.8, Physical clearcoat) matches upstream WebGLRenderer (0.01%
 of pixels differ; mean channel difference 0.01). This runs H2
 `webgl_marchingcubes` "shiny".
 
-GPU-authored equirectangular render targets now feed that filtering path without
+GPU-authored equirectangular and cube render targets feed that filtering path without
 CPU readback. Their `needsPMREMUpdate`/`pmremVersion` changes regenerate the same
 cube-UV allocation and retain its sampler/view identity; ordinary texture upload
 versions do not trigger a bake. Source-disposal handling retains r186's branch
@@ -155,8 +155,28 @@ generation, kept alive across pipeline preparation and the submitted queue
 fence, and validated before submission and publication. Supplied cube-UV atlases
 are sampled directly through the existing texture owner. The WebGL-authored
 route retains its existing live-scene preparation contract; this does not add
-immutable snapshots of arbitrary queued scenes. WebGLCubeRenderTarget/CubeCamera
-input support remains open.
+immutable snapshots of arbitrary queued scenes.
+
+`WebGLCubeRenderTarget` uses the existing native target owner, six color layers,
+source face selectors and explicit face readback. Retained `CubeCamera` observes
+`WebGLCoordinateSystem`, including its original face directions/up vectors; queued
+cube renders retain their camera poses. GPU sampling flips every face and mip
+into the existing UV replica and exposes a cube view to `samplerCube`, direct
+environment maps and PMREM. Automatic mip generation follows each accepted
+base-level render's source flag, so a cold CubeCamera capture filters after its
+sixth face. The owner reserves the full immutable pyramid without exposing
+unallocated source levels. WebGL resize uses target extents; native cube allocation
+semantics remain separate. Cube storage and its replica retain the existing
+budget, feedback checks and asynchronous program leases.
+
+`three_renderer_webgl_cube.test.mjs` checks allocation, generation order, sampling,
+resize, leases and PMREM reuse. Browser `program_cube_targets.mjs` compares twelve
+source/candidate checkpoints (172,032 RGBA bytes) in Chromium 151/SwiftShader:
+all six face readbacks, base cube sampling and resized sampling are byte-identical;
+LOD 2 differs by at most one channel level; retained equirectangular conversion
+by at most six. Each of two changing PMREM checkpoints has 8 of 6,144 pixels over
+channel-12 tolerance (maximum 79/83), within the existing 2% pixel budget.
+There is no hardware performance claim.
 
 `three_program_pmrem_targets.test.mjs` exercises versioned reuse, public renderer
 integration and asynchronous input lifetimes. `program_pmrem_targets.mjs` compares
@@ -278,9 +298,10 @@ draw. Materials with either hook always draw their program. Scenario
 `webgl_materials_modified`, `webgl_shadowmap_csm` (CSM chunk rewrites) and
 `webgl_materials_toon` run.
 
-The remaining PMREM input gap on this WebGL-authored route is
-WebGLCubeRenderTarget/CubeCamera storage and orientation, rather than ordinary
-GPU equirectangular render targets or supplied cube-UV textures.
+WebGL cube target admission currently requires base-level rendering, one sample,
+no stencil and no array depth. Authored WebGL cube mip descriptors and sampling a mip-filtered
+cube before source generation are explicit unsupported boundaries. Native cube
+authored mip support retains its existing contract.
 
 Textures: the texture owner now admits HalfFloat (`*16float`) and Float
 (`*32float`) DataTextures with byte-exact rows. Float32 linear filtering

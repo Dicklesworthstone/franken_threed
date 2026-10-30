@@ -915,6 +915,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
       const snapshot = this._shaderEncodedOutput ? this._passSnapshots.capture(scene, camera) : null;
+      if (this._shaderEncodedOutput && destination.shape?.webglCube && !snapshot && captureCameras) {
+        // CubeCamera submits six public renders before preparation can finish.
+        // Keep those source face poses even if the next capture moves it while
+        // the first cube is queued. Scene/material ownership is unchanged.
+        if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+        camera = captureThreeCamera(THREE, camera);
+      }
       let matricesUpdated = false;
       if (camera?.isArrayCamera === true && captureCameras) {
         // WebGLRenderer has camera-major drawing, physical bottom-left viewports
@@ -953,7 +960,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
           nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize,
-          generateCubeMipmaps: !this._shaderEncodedOutput && !clearOnly && target?.isCubeRenderTarget === true && target.texture.generateMipmaps,
+          generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
+            ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
+            : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
           linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
           hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
@@ -1638,6 +1647,9 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
   const Base = createWebGPURendererClass(THREE, {...options, targetTextureFlipY: true});
   const glOnly = name => ({get() { fail('UNSUPPORTED', `WebGLRenderer.${name} describes a GL context; this route has none`); }, configurable: true});
   class WebGLRenderer extends Base {
+    // CubeCamera selects its face directions/up vectors from this public
+    // source fact. The program compiler converts GL clip depth separately.
+    get coordinateSystem() { return THREE.WebGLCoordinateSystem; }
     constructor(parameters = {}) {
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
       for (const key of Object.keys(parameters)) if (!WEBGL_PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
