@@ -22,7 +22,7 @@ function fixture(options = {}) {
   let refs = 0, releases = 0, rollbacks = 0, sourceReleases = 0;
   const source = {version: 1, alive: true, bytes: Uint8Array.of(1, 2, 3, 4),
     shape: {width: 2, height: 2, depth: 1, mipLevelCount: 1, format: 'rgba8unorm', viewDimension: '2d'}};
-  const destination = {isTexture: true, isRenderTargetTexture: true};
+  const destination = {isTexture: true, isRenderTargetTexture: true, generateMipmaps: false};
   const target = {alive: true, epoch: 1, textures: [destination]};
   destination.renderTarget = target;
   const shape = {width: 8, height: 8, layers: 1, mipLevelCount: 4,
@@ -159,6 +159,35 @@ test('volume mip depth shrinks, but array layer count does not', () => {
   array.copy(null, point(0, 0, 7)); assert.equal(array.commands[0].to.origin[2], 7); released(array);
 });
 
+test('authored cube mip copies address face ranges without shrinking the six layers', () => {
+  const f = fixture({cube: true, viewDimension: 'cube', layers: 6});
+  f.source.shape = {...f.source.shape, viewDimension: '2d-array', depth: 3};
+  f.copy(box(0, 0, 1, 2, 2, 2), point(0, 0, 4));
+  assert.deepEqual(f.commands[0].from.origin, [0, 0, 1]);
+  assert.deepEqual(f.commands[0].to.origin, [0, 0, 4]);
+  assert.deepEqual(f.commands[0].size, [2, 2, 2]); released(f);
+});
+
+test('cube face bounds and full allocation layer limits reject before source upload', () => {
+  for (const limit of [false, true]) {
+    const f = fixture({cube: true, viewDimension: 'cube', layers: 6});
+    if (limit) f.device.limits.maxTextureArrayLayers = 5;
+    assert.throws(() => f.copy(null, point(0, 0, limit ? 0 : 6)),
+      {code: 'THREE_STORAGE_COPY_' + (limit ? 'LIMIT' : 'BOUNDS')});
+    assert.ok(!f.events.includes('upload')); assert.equal(f.commands.length, 0); released(f);
+  }
+});
+
+test('cube policy follows the current public flag and remains captured through the FIFO', async () => {
+  const f = fixture({cube: true, viewDimension: 'cube', layers: 6, generateMipmaps: true});
+  f.renderer._preparing = true;
+  f.copy(null, point(0, 0, 5)); // Public false overrides the earlier descriptor's true.
+  f.destination.generateMipmaps = true;
+  for (const level of [0, 2])
+    assert.throws(() => f.copy(null, null, 0, level), {code: 'THREE_STORAGE_COPY_LEVEL'});
+  await f.flush(); assert.equal(f.commands.length, 1); assert.deepEqual(f.errors, []); released(f);
+});
+
 test('multi-slice source copies select an authored volume mip without changing source pixels', () => {
   const f = fixture({viewDimension: '3d', layers: 16});
   f.source.shape = {...f.source.shape, viewDimension: '2d-array', depth: 6};
@@ -286,10 +315,8 @@ test('missing array-layer device limits fail before upload; exact limits remain 
   exact.copy(null, point(0, 0, 255)); assert.equal(exact.commands[0].to.origin[2], 255); released(exact);
 });
 
-test('cube and multisample destination boundaries remain explicit', () => {
-  for (const [options, code] of [[{cube: true}, 'THREE_STORAGE_COPY_SOURCE'],
-    [{sampleCount: 4}, 'THREE_STORAGE_COPY_SAMPLES']]) {
-    const f = fixture(options); assert.throws(() => f.copy(), {code});
-    assert.equal(f.commands.length, 0); assert.equal(f.refs, 0); assert.equal(f.history.size, 0);
-  }
+test('multisample destination boundaries remain explicit', () => {
+  const f = fixture({sampleCount: 4});
+  assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_SAMPLES'});
+  assert.equal(f.commands.length, 0); assert.equal(f.refs, 0); assert.equal(f.history.size, 0);
 });

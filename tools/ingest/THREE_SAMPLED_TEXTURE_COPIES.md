@@ -18,14 +18,18 @@ independent XYZ extents. Native formats must match exactly. The source owner's
 existing image/format admission still applies; this does not add VideoTexture,
 depth, or writable ordinary sampled-texture residency.
 
-Target destinations include selected MRT attachments, array layers and 3D
-slices. The target owner selects the attachment by texture identity, not the
+Target destinations include selected MRT attachments, array layers, 3D slices
+and authored cube faces. The target owner selects the attachment by texture identity, not the
 currently bound render target or a guessed primary slot. Each accepted copy
 retains its destination generation until submission or cancellation; public
 resize/disposal and replaced attachments still invalidate stale requests.
-Target destinations must be single-sample, non-cube color at mip zero; derived
-mips regenerate through the existing target owner. Higher target destination
-mips, cube target destinations and depth copies remain explicit boundaries.
+Target destinations must be single-sample color. Allocated higher destination
+mips require `generateMipmaps = false`; their XY extents shrink independently,
+volume depth shrinks, and array layers and all six cube faces remain addressable.
+Cube destinations require `generateMipmaps = false` even at level zero until
+source-ordered automatic cube regeneration is connected. Non-cube mip-zero
+destinations retain the existing owner's mip updates. Depth copies remain an
+explicit boundary.
 No sampler/filtering admission or UV-flipped replica is used for target writes.
 
 The source-shaped method remains void. Ready copies submit immediately when
@@ -45,3 +49,8 @@ production planner and copy scheduler against strict recording owner/device
 contracts. It verifies descriptor, lifetime, ordering, failure, and cancellation
 behavior, not browser pixel parity. The existing sampled-owner suites cover its
 upload-history implementation separately. No measured speedup is claimed.
+
+`three_sampled_native_copy.test.mjs` also drives the public copy facade with the
+production sampled and target owners against a byte-recording device, checking
+CPU uploads, authored mip selection, queued versions, and untouched cube faces.
+This does not execute WGSL or establish browser/GPU pixel parity.

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
 import {copyFixtures} from './three_sampled_copy_fixtures.mjs';
+import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
+import {cubeCopyFixture, box, point, checkRegion} from './three_cube_target_copy_fixtures.mjs';
 
 function setup(t) {
   const fixture = copyFixtures();
@@ -12,6 +14,81 @@ function setup(t) {
   t.after(() => inputs.dispose());
   return {...fixture, inputs, capture: texture => inputs.captureBinding({texture, isSampledTexture: true})};
 }
+
+/** Production public facade, sampled upload owner and target owner. Only the
+ * device records byte copies; no GPU shader or browser-pixel claim is made. */
+function cubeSetup(t) {
+  const f = cubeCopyFixture(), {T, storage} = copyFixtures(), {device} = f;
+  device.lost = new Promise(() => {});
+  device.createSampler = descriptor => ({descriptor});
+  const allocate = device.createTexture;
+  device.createTexture = descriptor => allocate({...descriptor, size: Array.isArray(descriptor.size)
+    ? {width: descriptor.size[0], height: descriptor.size[1], depthOrArrayLayers: descriptor.size[2] ?? 1}
+    : descriptor.size});
+  device.queue.writeTexture = ({texture, mipLevel = 0, origin = [0, 0, 0]}, data, layout, size) => {
+    const image = texture.levels[mipLevel], [x, y, z] = origin, [w, h, d = 1] = size;
+    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const row = w * texture.bytes, pitch = layout.bytesPerRow ?? row, rows = layout.rowsPerImage ?? h;
+    for (let layer = 0; layer < d; layer++) for (let line = 0; line < h; line++) {
+      const from = (layout.offset ?? 0) + (layer * rows + line) * pitch;
+      const to = (((z + layer) * image.height + y + line) * image.width + x) * texture.bytes;
+      image.data.set(bytes.subarray(from, from + row), to);
+    }
+    f.events.push('upload');
+  };
+  const inputs = createThreeComputeTextures({storage,
+    poolFactory: options => createGpuThreeTextures(device, {three: T, ...options})});
+  class Base {
+    constructor() {
+      Object.assign(this, f.renderer); this.isWebGPURenderer = this._initialized = true;
+      this.inspections = []; this.inspector = {copyTextureToTexture: (...args) => this.inspections.push(args)};
+    }
+    _getSampledTextureInputs() { return inputs; }
+    async waitForGPU() { await inputs.whenIdle(); await f.targets.whenIdle(); }
+    dispose() { inputs.dispose(); f.targets.dispose(); }
+  }
+  const renderer = new (withStorageTextureCopies(Base))();
+  t.after(() => renderer.dispose());
+  return {...f, T, inputs, renderer};
+}
+
+for (const [type, depth, first, count] of [['DataTexture', 1, 0, 1], ['DataArrayTexture', 6, 0, 6], ['Data3DTexture', 4, 1, 2]])
+  test(`${type} CPU bytes fill selected authored cube faces through the public copy facade`, async t => {
+    const f = cubeSetup(t), destination = f.target();
+    const bytes = Uint8Array.from({length: 4 * 4 * depth * 4}, (_, i) => (7 + i * 13) % 251);
+    const before = bytes.slice(), source = new f.T[type](bytes, 4, 4, depth), face = 6 - count;
+    assert.equal(destination.texture.renderTarget, null, 'cube association comes from the target registry');
+    assert.equal(f.renderer.copyTextureToTexture(source, destination.texture,
+      box(1, 1, first, 2, 2, count), point(0, 0, face), 0, 1), undefined);
+    assert.equal(f.commands.length, 1); assert.equal(f.renderer.inspections.length, 1);
+    checkRegion(f.commands[0].from.texture, f.native(destination), {destinationLevel: 1,
+      sourceOrigin: [1, 1, first], destinationOrigin: [0, 0, face], size: [2, 2, count]});
+    assert.deepEqual(bytes, before); assert.equal(source.image.data, bytes);
+    assert.equal(f.textures.length, 2, 'one source residency and the shared target allocation');
+    assert.equal(destination.entry.storage.diagnostics.mipGenerations, 0);
+    assert.equal(destination.entry.references, 0); await f.renderer.waitForGPU();
+  });
+
+test('queued public cube writes preserve authored source mips and each captured CPU version', async t => {
+  const f = cubeSetup(t), destination = f.target(), source = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  source.mipmaps = [4, 2, 1].map(width => ({width, height: width,
+    data: Uint8Array.from({length: width * width * 4}, (_, i) => i + width)}));
+  const region = box(0, 0, 0, 1, 1, 1), position = point(0, 0, 5);
+  f.renderer._preparing = true;
+  f.renderer.copyTextureToTexture(source, destination.texture, region, position, 2, 2);
+  source.mipmaps[2].data.fill(19); source.needsUpdate = true;
+  f.renderer.copyTextureToTexture(source, destination.texture, region, position, 2, 2);
+  source.mipmaps[2].data.fill(91); region.min.x = 99; position.z = 99;
+  destination.texture.generateMipmaps = true; // Later CubeCamera policy cannot rewrite the queued call.
+  assert.equal(f.commands.length, 0); f.flush();
+  assert.equal(f.commands.length, 2); assert.notEqual(f.commands[0].from.texture, f.commands[1].from.texture);
+  assert.deepEqual([...f.commands[0].from.texture.levels[2].data], [1, 2, 3, 4]);
+  assert.deepEqual([...f.commands[1].from.texture.levels[2].data], [19, 19, 19, 19]);
+  checkRegion(f.commands[1].from.texture, f.native(destination), {sourceLevel: 2, destinationLevel: 2,
+    destinationOrigin: [0, 0, 5], size: [1, 1, 1]});
+  assert.deepEqual([...source.mipmaps[2].data], [91, 91, 91, 91]);
+  assert.equal(destination.entry.references, 0); await f.renderer.waitForGPU();
+});
 
 test('native borrows share sampled residency and preserve distinct queued pixel versions', async t => {
   const {T, inputs, capture, events, textures} = setup(t);

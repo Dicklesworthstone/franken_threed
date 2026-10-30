@@ -25,19 +25,23 @@ function captureDestination(renderer, texture, level) {
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target)
     fail('SOURCE', 'Expected a storage texture or target-owned color destination');
   const entry = targets.capture(target);
-  if (entry.shape.cube) fail('SOURCE', 'Cube target destinations require face-aware write ownership');
   if (entry.shape.sampleCount !== 1) fail('SAMPLES', 'Sampled copies require a single-sample target destination');
   const colorIndex = entry.shape.textures.indexOf(texture);
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   const color = entry.shape.colors[colorIndex];
+  // CubeCamera can toggle generation without changing the native allocation.
+  // Capture this call's policy; authored faces share its six array layers.
+  const generateMipmaps = entry.shape.cube ? texture.generateMipmaps : color.generateMipmaps;
+  if (entry.shape.cube && generateMipmaps !== false)
+    fail('LEVEL', 'Cube destinations require an authored, non-generated mip chain');
   // Authored chains already belong to the target's native allocation. The
   // shared planner validates the selected mip and its independent XYZ extent.
   // Do not write a derived level: the owner's next mip refresh would replace it.
-  if (level !== 0 && color.generateMipmaps !== false)
+  if (level !== 0 && generateMipmaps !== false)
     fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
   const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
   return {shape: {...color, depth: entry.shape.layers ?? 1,
-      viewDimension: entry.shape.viewDimension},
+      viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension},
     check() {
       targets.assertCurrent(entry);
       if (entry.shape.textures[colorIndex] !== texture) fail('STALE', 'Captured color texture was replaced');
@@ -57,7 +61,7 @@ function captureDestination(renderer, texture, level) {
         if (!Number.isSafeInteger(depthLimit) || entry.shape.width > depthLimit || entry.shape.height > depthLimit)
           fail('LIMIT', 'Destination depth exceeds the device 2D texture dimension limit');
       }
-      const array = entry.shape.viewDimension === '2d-array';
+      const array = entry.shape.cube || entry.shape.viewDimension === '2d-array';
       if (array || hasDepth && entry.shape.depthArray) {
         const layerLimit = device.limits?.maxTextureArrayLayers;
         const layers = Math.max(array ? entry.shape.layers : 1, hasDepth ? entry.shape.depthLayers ?? 1 : 1);
