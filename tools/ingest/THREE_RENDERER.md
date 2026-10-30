@@ -344,8 +344,8 @@ then resumes later draws with color/depth/stencil load operations. A first-draw
 copy observes the current clear. Earlier draws remain readable when initialization
 throws; the extra F3D queue fence also reports that failed operation. Callbacks
 execute once and no CPU readback is involved. Changing the active attachment
-during this operation, ArrayCamera callback copies and Lensflare's separate
-direct-draw API remain outside this slice. WebGL depth snapshots, unmatched color
+during this operation and ArrayCamera callback copies remain outside this slice.
+WebGL depth snapshots, unmatched color
 precision/encoding and the whole-image linear HDR fallback also retain explicit
 admission errors.
 
@@ -360,6 +360,52 @@ waits, source resize, cube/array selection, matching half-float storage, raw sRG
 copies, initialization retargeting, before/after-draw copies, a clear-only prefix
 and source-visible partial drawing after an initialization exception. No
 hardware-performance claim is made.
+
+## Callback direct draws and Lensflare
+
+The WebGL-authored `renderBufferDirect(camera, scene, geometry, material, object,
+group)` now executes ShaderMaterial and RawShaderMaterial draws inside an active
+ordinary-camera callback. Programs and geometry first discovered inside the
+callback register synchronously with the existing native owners. Every accepted
+direct draw submits before the call returns, so later copies and callback
+exceptions observe its actual pixels. Native validation scopes close before
+returning to application code; delayed validation failures remain observable.
+
+This enables the unchanged pinned `Lensflare` addon: save the scene color, draw
+the depth-tested occlusion quad, copy the occlusion result, restore the saved
+color, then draw each flare element. The new backend owns all GPU work; the
+source addon and shader semantics remain intact. Cold first use requires neither
+pre-running callbacks nor an explicit compilation call.
+
+Direct draws retain their difference from normal object rendering: they do not
+invoke object/material render hooks, update the caller's public model-view
+matrices, or invent an extra pass for a DoubleSide material. Consecutive calls
+keep custom uniforms and samplers GPU-stale until the source requests an update
+or switches program, material or camera. Per-object matrix values retain their
+source upload boundaries. Queued rendering also restores the accepted target,
+face and mip while its callbacks run, then restores the caller's later selection.
+
+Admission currently requires an unchanged active attachment, an ordinary camera
+and shader materials. Standalone direct calls, ArrayCamera/BatchedMesh direct
+interleaving and shadow/transmission callback contexts remain outside this
+profile. After an exception following submitted work, the existing scene bridge
+requires preparation before reuse; the target's already-drawn color remains
+readable and the F3D queue fence reports the failed render.
+
+The affected real-owner suite passes 170 uniform, point, stencil, index, restart
+and framebuffer/direct cases; subsequent uniform-retention checks pass 45 cases
+and all 15 public copy/direct cases pass after the queued-target regression was
+added. Older mock-target and obsolete stencil-refusal assertions reproduce their
+failures on unchanged main and were not changed by this feature.
+
+`node tests/e2e/webgpu_renderer/program_lensflare.mjs` compares the actual addon
+against pinned WebGL. Chromium 151.0.7922.34 / SwiftShader matches all nine
+checkpoints and 135,168 RGBA bytes exactly, including cold hidden shaders,
+full/partial occlusion, movement, offscreen/behind-camera culling, resize,
+scissored history and a callback exception after direct drawing. All 17 callback
+events, 14 framebuffer copies and 35 direct draws match, with zero GPU/browser
+errors and the owned `general-webgpu` route. Hardware performance remains
+unmeasured.
 
 ## Explicit differences
 

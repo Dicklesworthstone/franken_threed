@@ -858,7 +858,7 @@ export async function createGpuThreeScene(device,scene,{
     u.uvTransform.value.copy(background.matrix);plane.layers.enableAll();
     return plane;
   }
-  function programDescription(m,topology,object){
+  function programDescription(m,topology,object,direct=null){
     if(!programRoute())fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     if(!object)fail('MATERIAL','Program materials need their object for program assembly');
     if(shadowEnabled&&object.castShadow&&!programShadowMode)fail('PROGRAM_SHADOW','Program shadow casters draw through the program shadow map');
@@ -867,17 +867,25 @@ export async function createGpuThreeScene(device,scene,{
       fail('PROGRAM_SHADOW','Programs receiving shadow-casting lights read the program shadow map');
     const epoch=trackMaterial(m);
     const {envMap,envMapRotation}=programEnvironment(m);
-    const sides=m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
+    const sides=!direct&&m.transparent&&m.side===three.DoubleSide&&!m.forceSinglePass?[three.BackSide,three.FrontSide]:[m.side];
+    const fog=direct?direct.scene?.fog??null:scene.fog;
     return sides.map(side=>{
-      const clip=programSupport.clippingState(programClippingControls(),m,programCamera??new three.Camera());
-      const compileOptions={fog:scene.fog,side,envMap,shadows:programShadowMode&&shadows,clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}};
+      const clip=programSupport.clippingState(programClippingControls(),m,direct?.camera??programCamera??new three.Camera());
+      const compileOptions={fog,side,envMap,shadows:programShadowMode&&shadows,clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}};
       const compiled=programSupport.compile(m,programObject(object),compileOptions);
       const reflection=compiled.program.reflection;
-      const refreshOptions={fog:scene.fog,envMap,envMapRotation,...(m.transmission>0?{transmissionRenderTarget:transmissionTarget()}:{})};
-      const uniforms=programSupport.refresh(m,refreshOptions);
+      const refreshOptions={fog,envMap,envMapRotation,...(m.transmission>0?{transmissionRenderTarget:transmissionTarget()}:{})};
+      const previous=direct?.previous;
+      const retained=previous&&previous.material===m&&previous.camera===direct.camera&&previous.version===m.version&&
+        previous.desc.program.key===compiled.key&&m.uniformsNeedUpdate!==true?previous:null;
+      const uniforms=retained?null:programSupport.refresh(m,refreshOptions);
       const sourceTextures=[],bindings=[],textureKey=[];
       const samplers=programSupport.objectSamplers?.(m,programObject(object))??null;
       for(const t of reflection.textures){
+        if(retained){
+          const index=sourceTextures.length,texture=retained.desc.programTextures[index],binding=retained.desc.options.textures[index];
+          sourceTextures.push(texture);bindings.push(binding);textureKey.push(texture,binding.view,binding.sampler);continue;
+        }
         const value=samplers?.[t.name]??uniforms?.[t.name]?.value,texture=t.element===null?value:value?.[t.element];
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&t.dimension!==textureBindings.dimension(texture))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
@@ -885,6 +893,9 @@ export async function createGpuThreeScene(device,scene,{
         if(texture&&t.comparison&&!shadowMap&&!textureScan)fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
+        if(direct&&texture&&!textures.has(texture)&&!shadowMap){
+          ownedTextures().prepare([texture]);retainedTextures.add(texture);
+        }
         const binding=texture?textureBinding(texture,t,object.isBatchedMesh===true&&texture===object._indirectTexture):placeholderBinding(null,t);
         sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float'});textureKey.push(texture??null,binding.view,binding.sampler);
       }
@@ -892,7 +903,7 @@ export async function createGpuThreeScene(device,scene,{
       const options={program:compiled.program,textures:bindings,raster,topology,
         ...(topology==='line-strip'&&programSource(object).index?{stripIndexFormat:programSource(object).index.array instanceof Uint16Array?'uint16':'uint32'}:{})};
       const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
-      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation},compileOptions,refreshOptions};
+      return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation},compileOptions,refreshOptions,retained};
     });
   }
   /** Under in-shader tone mapping a draw the program route cannot take is a
@@ -1820,7 +1831,7 @@ export async function createGpuThreeScene(device,scene,{
       // Submit that prefix now, then resume with load operations; no callback
       // replay or CPU readback is involved. The same boundary serves hidden
       // renderBufferDirect draws discovered during an addon callback.
-      const boundary={first:0,started:false,logical:0,calls:0,passes:0};
+      const boundary={first:0,started:false,logical:0,calls:0,passes:0,direct:0};
       if(publicRenderer?._shaderEncodedOutput&&!programArray){
         const target=publicRenderer.getRenderTarget(),face=publicRenderer._activeCubeFace,mip=publicRenderer._activeMipmapLevel;
         const check=()=>{
@@ -1846,6 +1857,60 @@ export async function createGpuThreeScene(device,scene,{
             if(owner.encodeFramebufferCopy(lease,encoder,source)!==false)device.queue.submit([encoder.finish()]);
           });
           live();
+        },draw(drawCamera,drawScene,geometry,material,object,group){
+          flush();
+          if(!(drawCamera instanceof three.Camera)||!(geometry instanceof three.BufferGeometry)||
+              !(object instanceof three.Object3D)||!material?.isShaderMaterial||
+              !(drawScene===null||drawScene instanceof three.Scene)||object.isBatchedMesh)
+            fail('SOURCE','Direct draws require source ShaderMaterial geometry, an ordinary object and camera');
+          if(draws.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Direct source draws exceed frame capacity');
+          const sourceObject=object.geometry===geometry?object:Object.create(object,{geometry:{value:geometry}});
+          const wire=object.isMesh&&material.wireframe===true,topology=wire?'lines':topologyOf(object);
+          const frontFaceCW=object.isMesh===true&&(object.matrixWorld.determinantAffine?.()??object.matrixWorld.determinant())<0;
+          // renderBufferDirect does not call object/material draw hooks or update
+          // model-view matrices. It consumes the caches supplied by its caller.
+          const desc=programDescription(material,topology,sourceObject,{scene:drawScene,camera:drawCamera,previous:boundary.last})[0];
+          const reflection=desc.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
+          const clipState=programSupport.clippingState(programClippingControls(),material,drawCamera);
+          const current=programSupport.pack(reflection,desc.retained?null:programSupport.uniformsFor(material),programObject(sourceObject),drawCamera,bytes,
+            {targetSize:programTargetSize,material,retainedUniforms:desc.retained,values:programSupport.bindsClippingPlanes(material)?{clippingPlanes:clipState.planes}:{}});
+          if(current.some((texture,index)=>(texture??null)!==desc.programTextures[index]))
+            fail('MATERIAL','A direct program changed sampler identities while packing its uniforms');
+          if(material.uniformsNeedUpdate===true)material.uniformsNeedUpdate=false;
+          boundary.last={material,camera:drawCamera,version:material.version,desc,bytes,receiveShadow:object.receiveShadow};
+          const source=programSource(sourceObject,wire);
+          let byKey=programGeometries.get(source);
+          if(!byKey){
+            if(geometries.size+programGeometries.size>=maxGeometries)fail('LIMIT','Direct geometry residency exceeds capacity');
+            programGeometries.set(source,byKey=new Map());
+          }
+          let gpu=byKey.get(desc.program.attributesKey);
+          if(!gpu){
+            gpu=programSupport.createGeometry(device,source,reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+              maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+            byKey.set(desc.program.attributesKey,gpu);
+          }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
+          const signature=programSignature(programSupport.geometrySnapshot(gpu,device),false,topology);
+          let entry=entries.find(record=>record.direct&&!record.mesh.disposed&&record.material===material&&record.programGeometry===gpu&&
+            record.signature===signature&&same(record.structural,desc.structural));
+          if(!entry){
+            entries=entries.filter(record=>!record.mesh.disposed);
+            if(entries.length>=maxBindings){
+              const oldest=entries.find(record=>record.direct);
+              if(!oldest)fail('LIMIT','Direct program binding capacity exceeded');
+              oldest.mesh.dispose();entries.splice(entries.indexOf(oldest),1);
+            }
+            const mesh=renderer.addProgramMeshImmediate(gpu,desc.options);
+            entry={key:programKeyOf(sourceObject),geometry,material,programGeometry:gpu,programSource:source,topology,signature,
+              structural:desc.structural,mesh,direct:true};entries.push(entry);
+          }
+          const factor=wire?2:1,first=group===null?0:integer(group.start,0,Number.MAX_SAFE_INTEGER,'direct group start')*factor;
+          const count=group===null?0xffffffff:integer(group.count,0,Number.MAX_SAFE_INTEGER,'direct group count')*factor;
+          const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'direct instance count'):
+            geometry.isInstancedBufferGeometry?Math.min(geometry.instanceCount,0xffffffff):1;
+          draws.push({mesh:entry.mesh,first,count,programUniforms:bytes,frontFaceCW,instanceCount,
+            ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
+          boundary.direct++;flush();
         }};
       }
       function* executions(){
@@ -1947,6 +2012,7 @@ export async function createGpuThreeScene(device,scene,{
             if(programArray&&item.material.isShaderMaterial&&item.material.uniformsNeedUpdate===true)item.material.uniformsNeedUpdate=false;
           }
           if(programArray&&item.bindings.length===2)item.material.side=three.DoubleSide;
+          boundary.last=null;
           if(hooked)object.onAfterRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);
           continue;
         }
@@ -2010,6 +2076,7 @@ export async function createGpuThreeScene(device,scene,{
             ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});}}
         }
         if(programArray&&item.bindings.length===2&&!item.shadowPass)item.material.side=three.DoubleSide;
+        boundary.last=null;
       }
       // The retained WebGL behavior updates public versions twice per double-
       // sided transparent item. Native ArrayCamera rendering selects its side
@@ -2148,7 +2215,7 @@ export async function createGpuThreeScene(device,scene,{
       }else{
         renderer.render(prepared);live();logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;passes=renderer.colorPassCount??1;
       }
-      sourceDraws=items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0&&!item.nodeIndirect?.skip),0);
+      sourceDraws=boundary.direct+items.reduce((count,item)=>count+Number(!item.nodeProgram||item.instanceCount!==0&&!item.nodeIndirect?.skip),0);
       backgroundPasses=backgroundFrame?1:0;
       if(backgroundEnabled)backgroundColorPasses=passes+backgroundPasses;
       }

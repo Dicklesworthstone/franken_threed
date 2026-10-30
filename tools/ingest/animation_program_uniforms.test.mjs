@@ -29,6 +29,7 @@ function fixture(t, {maxDraws = 32, maxBytes = 1 << 22, maxBufferSize = 1 << 22,
       groups.push(d); return d;
     },
     async createRenderPipelineAsync(d) { pipelines.push(d); await pipelineGate; return d; },
+    createRenderPipeline(d) { pipelines.push(d); return d; },
     queue: {onSubmittedWorkDone: async () => {}, writeBuffer(buffer, offset, data, start = 0, length) {
       assert.equal(buffer.dead, false); const w = data.BYTES_PER_ELEMENT ?? 1;
       const bytes = new Uint8Array(data.buffer ?? data, (data.byteOffset ?? 0) + start * w,
@@ -206,6 +207,29 @@ test('scalar uniform blocks retain their native four-byte binding size', async t
   const f = fixture(t, {maxDraws: 2}), r = await f.add(4);
   const a = f.stage(r, 1), b = f.stage(r, 2); f.owner.write();
   assert.equal(contents(a).length, 4); assert.equal(contents(b)[0], 2);
+});
+test('immediate registration publishes native programs synchronously while retaining distinct draw slices', async t => {
+  const f = fixture(t), release = f.holdScopes();
+  const record = f.owner.addImmediate(f.gpu, {program: f.program(32), raster: f.raster});
+  assert.equal(record.program, true); assert.equal(record.then, undefined); assert.equal(f.pipelines.length, 2);
+  const first = f.stage(record, 17), second = f.stage(record, 29); f.owner.write();
+  assert.equal(contents(first)[0], 17); assert.equal(contents(second)[0], 29);
+  release(); await f.owner.whenIdle();
+});
+test('delayed immediate validation failures remain observable and stop later program draws', async t => {
+  const f = fixture(t), release = f.holdScopes(), failure = Error('delayed native validation');
+  f.errors({scope: failure});
+  const record = f.owner.addImmediate(f.gpu, {program: f.program(16), raster: f.raster});
+  f.owner.begin(); f.stage(record, 1); f.owner.write();
+  release(); await assert.rejects(f.owner.whenIdle(), error => error === failure);
+  assert.throws(() => f.owner.begin(), error => error === failure);
+});
+test('immediate uniform growth refuses overlapping asynchronous registration without duplicating resources', async t => {
+  const f = fixture(t), arena = f.arena(), release = f.holdScopes();
+  const pending = arena.register(16);
+  assert.throws(() => arena.registerImmediate(32), {code: 'ANIMATION_RENDER_REENTRANT'});
+  release(); await pending;
+  const immediate = arena.registerImmediate(32); arena.stage(immediate, new Uint8Array(32)); arena.write(); await arena.whenIdle();
 });
 test('device loss interrupts an outstanding pipeline with the loss error, not an invalid result', async t => {
   const f = fixture(t), release = f.holdPipelines(), pending = f.add(32768);

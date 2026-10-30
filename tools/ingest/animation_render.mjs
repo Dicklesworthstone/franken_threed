@@ -1477,26 +1477,42 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
     pass.draw(3);
     if (stencil !== null) pass.setStencilReference(0);
   }
-  async function addProgramMesh(gpu, options) {
+  function checkProgramMesh(options) {
+    live();
     keys(options, ["program", "textures", "raster", "topology", "stripIndexFormat"], "program mesh");
     if (colorFormats.length > 1)
       fail("ANIMATION_RENDER_OPTIONS", "Multiple color attachments require native node programs; ESSL programs currently write one attachment");
     if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
+  }
+  function publishProgramMesh(record) {
+    live();
+    const mesh = Object.freeze({
+      get disposed() { return record.disposed || disposed; },
+      dispose() {
+        if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose a mesh during submission");
+        if (!record.disposed) { record.disposed = true; records.delete(record); bundleCache?.clear(); }
+      },
+    });
+    owned.set(mesh, record); records.add(record); return mesh;
+  }
+  async function addProgramMesh(gpu, options) {
+    checkProgramMesh(options);
     pendingMeshes++;
     try {
       const record = await programs.add(gpu, options);
-      live();
-      const mesh = Object.freeze({
-        get disposed() { return record.disposed || disposed; },
-        dispose() {
-          if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose a mesh during submission");
-          if (!record.disposed) { record.disposed = true; records.delete(record); bundleCache?.clear(); }
-        },
-      });
-      owned.set(mesh, record);
-      records.add(record);
-      return mesh;
+      return publishProgramMesh(record);
     } finally { pendingMeshes--; }
+  }
+  function addProgramMeshImmediate(gpu, options) {
+    checkProgramMesh(options);
+    if (busy) fail("ANIMATION_RENDER_REENTRANT", "Immediate registration requires a completed draw submission boundary");
+    const mesh = publishProgramMesh(programs.addImmediate(gpu, options));
+    completion = Promise.all([completion, programs.whenIdle()]).catch(error => {
+      terminal ??= error;
+      throw error;
+    });
+    completion.catch(() => {});
+    return mesh;
   }
   async function addNodeProgramMesh(gpu, options) {
     keys(options, ["nodeProgram", "raster", "topology", "stripIndexFormat"], "node program mesh");
@@ -3108,6 +3124,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
       return renderer;
     },
     addMesh,
+    addProgramMeshImmediate,
     render,
     get drawCallCount() {
       return drawCallCount;

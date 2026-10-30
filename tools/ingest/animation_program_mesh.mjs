@@ -43,8 +43,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
   let pointDraws = 0;
   const indices = createProgramIndexLowering(device, {label, fail, maxBytes: maxIndexBytes, maxEntries: maxDraws});
   const uniforms = createProgramUniformArena(device, {maxDraws, label, fail, scoped, lost, maxBytes: maxUniformBytes});
-  let constant = null;
-  async function add(gpu, {program, textures = [], raster, topology = 'triangles', stripIndexFormat}) {
+  let constant = null, validation = Promise.resolve(), validationError = null;
+  function add(gpu, {program, textures = [], raster, topology = 'triangles', stripIndexFormat}, immediate = false) {
+    if (validationError) throw validationError;
     const source = program?.reflection, vertex = program?.vertex, fragment = program?.fragment;
     if (!source || typeof vertex !== 'string' || typeof fragment !== 'string') fail('ANIMATION_RENDER_OPTIONS', 'Expected a compiled program');
     // Uniform growth is asynchronous. Capture every subsequently consumed
@@ -78,7 +79,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     const layouts = points ? geometry.layouts.map(l => ({...l, stepMode: 'instance'})) : [...geometry.layouts];
     for (const location of geometry.channels.missing)
       layouts.push({arrayStride: 0, stepMode: 'vertex', attributes: [{shaderLocation: location, offset: 0, format: 'float32x4'}]});
-    const uniformBinding = await uniforms.register(reflection.uniformBufferSize);
+    const build = uniformBinding => {
     uniforms.live();
     const allocated = scoped(device, () => {
       const uniformLayout = uniformBinding.layout;
@@ -99,7 +100,7 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: fragment});
       const primitiveTopology = points ? 'triangle-list' : provoking === 'line-strip' ? 'line-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
-      const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
+      const pipeline = frontFace => device[immediate ? 'createRenderPipeline' : 'createRenderPipelineAsync']({label, layout,
         vertex: {module: vertexModule, entryPoint: 'f3d_vertex', buffers: layouts},
         fragment: {module: fragmentModule, entryPoint: 'f3d_fragment', targets: format === null ? [] : [{format,
           ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}]},
@@ -108,20 +109,32 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,
           depthBias: raster.depthBias ?? 0, depthBiasSlopeScale: raster.depthBiasSlopeScale ?? 0, ...stencil}} : {}),
         multisample: {count: sampleCount, alphaToCoverageEnabled: raster.alphaToCoverage === true && sampleCount > 1 && format !== null}});
-      const ready = Promise.all([pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')]);
-      ready.catch(() => {});
+      const pair = [pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')];
+      const ready = immediate ? pair : Promise.all(pair);
+      if (!immediate) ready.catch(() => {});
       return {textureGroup, ready};
     });
-    const [pipelines] = await Promise.race([Promise.all([allocated.value?.ready, allocated.errors]), uniforms.stopped]);
-    if (allocated.error) throw allocated.error;
-    uniforms.live();
-    return {
+    const publish = pipelines => {
+      if (allocated.error) throw allocated.error;
+      if (validationError) throw validationError;
+      uniforms.live();
+      return {
       program: true, gpu, reflection, uniformBinding, textureGroup: allocated.value.textureGroup,
       pipelines: {normal: pipelines[0], flipped: pipelines[1]}, geometrySignature: geometry.signature,
       points, provoking, topology,
       blended: !!raster.blend, alphaMode: raster.blend ? 'BLEND' : 'OPAQUE', blendConstant: raster.blendConstant ?? null, stencilReference,
       surfaceBuffer: null, lit: false, raster: {}, disposed: false,
+      };
     };
+    if (immediate) {
+      validation = Promise.all([validation, allocated.errors]).then(() => uniforms.whenIdle());
+      validation.catch(error => { validationError ??= error; });
+      return publish(allocated.value?.ready);
+    }
+    return Promise.race([Promise.all([allocated.value?.ready, allocated.errors]), uniforms.stopped]).then(([pipelines]) => publish(pipelines));
+    };
+    return immediate ? build(uniforms.registerImmediate(reflection.uniformBufferSize))
+      : uniforms.register(reflection.uniformBufferSize).then(build);
   }
   /** Fill one command for a program draw; uniform bytes go to this frame's slice. */
   function stage(record, input, command) {
@@ -165,9 +178,11 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     return geometry;
   }
   return {
-    add, stage,
-    begin() { uniforms.begin(); pointDraws = 0; indices.begin(); },
+    async add(gpu, options) { return add(gpu, options); }, stage,
+    addImmediate(gpu, options) { return add(gpu, options, true); },
+    begin() { if (validationError) throw validationError; uniforms.begin(); pointDraws = 0; indices.begin(); },
     write() { uniforms.write(); },
+    async whenIdle() { await validation; await uniforms.whenIdle(); if (validationError) throw validationError; },
     get uniformDiagnostics() { return uniforms.diagnostics; },
     dispose() { uniforms.dispose(); constant?.destroy(); constant = null; indices.dispose(); },
   };

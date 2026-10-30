@@ -1264,6 +1264,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const previous = this._programFrame;
       const previousFramebufferFrame = this._programFramebufferFrame;
       this._programFramebufferFrame = programTextures;
+      const previousTarget = this._shaderEncodedOutput && deferred
+        ? {target: this._renderTarget, face: this._activeCubeFace, mip: this._activeMipmapLevel} : null;
+      if (previousTarget) {
+        this._renderTarget = sourceTarget; this._activeCubeFace = face; this._activeMipmapLevel = mipLevel;
+      }
       const previousSubmissionDepth = this._webglSubmissionDepth ?? 0;
       if (this._shaderEncodedOutput) this._webglSubmissionDepth = previousSubmissionDepth + 1;
       const occlusion = nodeFrame && !clearOnly ? this._occlusionQueries?.begin(this._occlusionContexts.get(nodeFrame),
@@ -1312,7 +1317,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         } else readStorage();
         occlusion?.commit();
       } catch (error) { occlusion?.cancel(); throw error; }
-      finally { this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth; }
+      finally {
+        this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth;
+        if (previousTarget) {
+          this._renderTarget = previousTarget.target; this._activeCubeFace = previousTarget.face; this._activeMipmapLevel = previousTarget.mip;
+        }
+      }
       if (initializeOutputDepth) this._targetDepthInitialized.add(initializeOutputDepth);
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -1775,6 +1785,12 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     getContextAttributes() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextLoss() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    renderBufferDirect(camera, scene, geometry, material, object, group) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (!this._programDrawContext)
+        fail('UNSUPPORTED', 'Direct program draws require an active ordinary-camera rendering callback');
+      return this._programDrawContext.draw(camera, scene, geometry, material, object, group);
+    }
     readRenderTargetPixelsAsync(target, x, y, width, height, buffer, activeCubeFace, textureIndex = 0) {
       if (!ArrayBuffer.isView(buffer))
         return Promise.reject(new F3DRendererError('UNSUPPORTED', 'Supply an output array for the selected color attachment'));

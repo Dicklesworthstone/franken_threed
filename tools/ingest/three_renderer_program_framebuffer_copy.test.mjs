@@ -180,6 +180,70 @@ test('draw-time requested mip initialization follows the preceding draw and prec
   assert.equal(f.renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
 });
 
+test('queued draw callbacks observe their captured target while later public selections remain intact', async t => {
+  const f = await fixture(t), image = new T.FramebufferTexture(4, 4), scene = f.scene(new T.MeshBasicMaterial());
+  const target = new T.WebGLRenderTarget(16, 12), later = new T.WebGLRenderTarget(32, 24), seen = [];
+  t.after(() => { target.dispose(); later.dispose(); image.dispose(); });
+  scene.children[0].onAfterRender = () => { seen.push(f.renderer.getRenderTarget()); f.renderer.copyFramebufferToTexture(image); };
+  f.renderer.setRenderTarget(target); f.renderer.render(scene, f.camera);
+  f.renderer.setRenderTarget(later); await f.renderer.waitForGPU();
+  assert.deepEqual(seen, [target]); assert.equal(f.renderer.getRenderTarget(), later);
+  assert.deepEqual(region(blits(f)[0]), [0, 0, 12, 0]);
+});
+
+function directMaterial(t) {
+  const material = new T.RawShaderMaterial({uniforms: {tint: {value: new T.Vector3(1, 0, 0)}},
+    vertexShader: 'precision highp float; attribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }',
+    fragmentShader: 'precision highp float; uniform vec3 tint; void main() { gl_FragColor = vec4(tint, 1.0); }',
+    transparent: true, side: T.DoubleSide, depthTest: false, depthWrite: false});
+  t.after(() => material.dispose()); return material;
+}
+
+test('cold callback-discovered direct shaders submit once per call without source render hooks or matrix updates', async t => {
+  const f = await fixture(t), scene = f.scene(new T.MeshBasicMaterial()), material = directMaterial(t);
+  const direct = new T.Mesh(scene.children[0].geometry, material), image = new T.FramebufferTexture(4, 4);
+  const expected = direct.modelViewMatrix.makeTranslation(19, 23, 29).toArray();
+  direct.onBeforeRender = direct.onAfterRender = material.onBeforeRender = () => assert.fail('direct calls do not run renderObject hooks');
+  let callbacks = 0;
+  scene.children[0].onBeforeRender = () => {
+    callbacks++;
+    material.uniforms.tint.value.set(1, 0, 0); material.uniformsNeedUpdate = true;
+    f.renderer.renderBufferDirect(f.camera, null, direct.geometry, material, direct, null);
+    assert.equal(material.uniformsNeedUpdate, false);
+    material.uniforms.tint.value.set(0, 1, 0); material.uniformsNeedUpdate = true;
+    f.renderer.renderBufferDirect(f.camera, null, direct.geometry, material, direct, null);
+    Object.defineProperty(material.uniforms.tint, 'value', {configurable: true,
+      get() { assert.fail('unchanged direct material does not read an unrequested custom uniform'); }});
+    f.renderer.renderBufferDirect(f.camera, null, direct.geometry, material, direct, null);
+    f.renderer.copyFramebufferToTexture(image);
+  };
+  f.renderer.render(scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(callbacks, 1); assert.deepEqual(direct.modelViewMatrix.toArray(), expected);
+  const copyAt = f.events.indexOf(blits(f)[0]), before = f.events.slice(0, copyAt).filter(event => event.draws.some(value => value.indexed));
+  assert.equal(before.length, 3); assert.ok(before.every(event => event.draws.length === 1));
+  assert.equal(f.events.slice(copyAt + 1).filter(event => event.draws.some(value => value.indexed)).length, 1);
+  const snapshots = f.device.snapshots.flat().filter(value => value.pipeline.fragment.module.code.includes('tint'));
+  const bytes = snapshots.map(value => {
+    const {group, offsets} = value.groups.get(0), {buffer, size} = group.entries[0].resource;
+    return value.contents.get(buffer).slice(offsets[0], offsets[0] + size);
+  });
+  assert.equal(bytes.length, 3); assert.notDeepEqual(bytes[0], bytes[1], 'requested direct uniforms publish their new values');
+  assert.deepEqual(bytes[1], bytes[2], 'unrequested custom edits retain the preceding uploaded values');
+});
+
+test('a later callback exception preserves every direct draw already submitted', async t => {
+  const f = await fixture(t), scene = f.scene(new T.MeshBasicMaterial()), material = directMaterial(t), failure = Error('after direct draws');
+  const direct = new T.Mesh(scene.children[0].geometry, material);
+  scene.children[0].onBeforeRender = () => {
+    f.renderer.renderBufferDirect(f.camera, null, direct.geometry, material, direct, null);
+    throw failure;
+  };
+  await f.renderer.compileAsync(scene, f.camera);
+  assert.throws(() => f.renderer.render(scene, f.camera), error => error === failure);
+  assert.equal(f.events.filter(event => event.draws.some(value => value.indexed)).length, 1);
+  assert.equal(f.renderer._programDrawContext, undefined);
+});
+
 test('queued consumers retain the framebuffer generation preceding a later sampler and version change', async t => {
   const f = await fixture(t), image = new T.FramebufferTexture(8, 6);
   const producer = f.scene(new T.MeshBasicMaterial()), consumer = f.scene(new T.MeshBasicMaterial({map: image}));

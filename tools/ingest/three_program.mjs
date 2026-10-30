@@ -167,8 +167,8 @@ export function threeMorphTargets(T, geometry, maxTextureSize = 8192) {
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
  * the program declares but nothing sets stay zero, as GL leaves them.
  * Returns the texture (or null) for each reflected sampler binding. */
-export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null, logarithmicDepthBuffer = false} = {}) {
-  bytes.fill(0);
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null, logarithmicDepthBuffer = false, retainedUniforms = null} = {}) {
+  if (retainedUniforms) bytes.set(retainedUniforms.bytes); else bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
   const builtin = {
@@ -195,9 +195,16 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     builtin.morphTargetsTextureSize = threeMorphTargets(T, geometry).size;
   }
   for (const u of reflection.uniforms) {
+    // Consecutive renderBufferDirect calls retain custom uniform uploads until
+    // uniformsNeedUpdate or a source program/material/camera switch. Common
+    // object matrices and deformation inputs still upload on every call.
+    if (retainedUniforms && !['modelMatrix', 'modelViewMatrix', 'normalMatrix', 'bindMatrix', 'bindMatrixInverse',
+      'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTargetsTextureSize'].includes(u.name) &&
+      !(u.name === 'receiveShadow' && retainedUniforms.receiveShadow !== object.receiveShadow) &&
+      !(values && Object.hasOwn(values, u.name))) continue;
     // These source built-ins are set before ordinary material uniforms, which
     // may override them by name (WebGLRenderer.setProgram order).
-    const authored = (u.name === 'receiveShadow' || u.name === 'logDepthBufFC') && uniforms?.[u.name];
+    const authored = !retainedUniforms && (u.name === 'receiveShadow' || u.name === 'logDepthBufFC') && uniforms?.[u.name];
     const overridden = authored && (u.name !== 'logDepthBufFC' || authored.needsUpdate !== false);
     const own = BUILTIN.has(u.name) && !overridden ? builtin[u.name] : null;
     const value = own ?? (values && Object.hasOwn(values, u.name) ? values[u.name] : uniforms?.[u.name]?.value);
@@ -208,6 +215,7 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     if (!targetSize || targetSize.length !== 4) fail('FRAME', 'gl_FragCoord and point sprites need the framebuffer and viewport size');
     for (let i = 0; i < 4; i++) view.setFloat32(reflection.targetOffset + 4 * i, targetSize[i], true);
   }
+  if (retainedUniforms) return retainedUniforms.desc.programTextures;
   return reflection.textures.map(t => {
     const v = samplers?.[t.name] ?? uniforms?.[t.name]?.value;
     return t.element === null ? v ?? null : v?.[t.element] ?? null;

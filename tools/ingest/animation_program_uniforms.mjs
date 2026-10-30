@@ -22,6 +22,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     limit('Invalid program uniform arena capacity or alignment');
   const pages = [], resources = new Set(), bindings = new Map();
   let allocatedBytes = 0, draws = 0, stoppedError = null, serial = Promise.resolve(), rejectStopped;
+  let registering = 0, validation = Promise.resolve();
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   function error(code, message) { try { fail(code, message); } catch (e) { return e; } }
   function live() { if (stoppedError) throw stoppedError; }
@@ -52,10 +53,9 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
   const keyOf = (size, packet) => packet ? `packet:${size}` : size;
   const strideOf = size => Math.ceil(size / alignment) * alignment;
   const slots = (bytes, size) => bytes < size ? 0 : 1 + Math.floor((bytes - size) / strideOf(size));
-  async function prepare(size, packet) {
+  function allocate(size, packet) {
     live();
     const key = keyOf(size, packet);
-    if (bindings.has(key)) return bindings.get(key);
     // Serialize registrations, not draws. Failed growth is private and cannot
     // publish invalid groups or strand memory needed by a later registration.
     let missing = maxDraws - pages.reduce((n, page) => n + slots(page.size, size), 0);
@@ -91,28 +91,50 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
         }
         return binding;
       });
-      await Promise.race([issued.errors, stopped]);
       if (issued.error) throw issued.error;
-      live();
-      for (const {binding, page, group} of groups) binding.groups.set(page, group);
-      pages.push(...added);
-      bindings.set(key, issued.value);
-      return issued.value;
+      return {issued, added, groups, key};
     } catch (e) {
       issued?.errors.catch(() => {});
       for (const page of added) destroy(page);
       throw e;
     }
   }
+  function publish({issued, added, groups, key}) {
+    live();
+    for (const {binding, page, group} of groups) binding.groups.set(page, group);
+    pages.push(...added); bindings.set(key, issued.value); return issued.value;
+  }
+  async function prepare(size, packet) {
+    live();
+    const key = keyOf(size, packet);
+    if (bindings.has(key)) return bindings.get(key);
+    const allocation = allocate(size, packet);
+    try { await Promise.race([allocation.issued.errors, stopped]); return publish(allocation); }
+    catch (error) { for (const page of allocation.added) destroy(page); throw error; }
+  }
+  function registerImmediate(size) {
+    checkSize(size);
+    if (bindings.has(size)) return bindings.get(size);
+    if (registering) fail('ANIMATION_RENDER_REENTRANT', 'Immediate program registration cannot overlap asynchronous preparation');
+    const allocation = allocate(size, false);
+    const binding = publish(allocation);
+    // A source draw is synchronous. WebGPU scopes still close before returning
+    // to callbacks, and delayed failures terminalize this arena and its owner.
+    validation = Promise.all([validation, allocation.issued.errors]).then(() => live());
+    validation.catch(stop);
+    return binding;
+  }
   function register(size, packet) {
     // Check before joining the queue; invalid input never reserves resources.
     if (packet) checkPacketSize(size); else checkSize(size);
-    const ready = serial.then(() => prepare(size, packet));
+    registering++;
+    const ready = serial.then(() => prepare(size, packet)).finally(() => { registering--; });
     serial = ready.catch(() => {});
     return ready;
   }
   return Object.freeze({
     checkSize, checkPacketSize, live, stopped,
+    registerImmediate,
     register(size) { return register(size, false); },
     registerPacket(size) { return register(size, true); },
     stage(binding, bytes) {
@@ -140,6 +162,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
       for (const page of pages) if (page.used) device.queue.writeBuffer(page.buffer, 0, page.staged, 0, page.used);
     },
     dispose() { stop(error('ANIMATION_RENDER_DISPOSED', 'Program uniform arena is disposed')); },
+    async whenIdle() { await Promise.race([validation, stopped]); live(); },
     get diagnostics() { return Object.freeze({allocatedBytes, shadowBytes: allocatedBytes, pages: pages.length,
       bindings: bindings.size, draws, maxDraws, maxBytes, alignment}); },
   });
