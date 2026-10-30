@@ -956,8 +956,25 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
       budget(bytes);
     },
-    withFramebufferTexture(entry, callback) {
+    withFramebufferTexture(entry, callback, {depth = false} = {}) {
       assertCurrent(entry);
+      if (depth) {
+        if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous depth-copy callback');
+        if (!entry.shape.depthAttachment || entry.shape.cube || entry.shape.array || entry.shape.volume)
+          fail('DEPTH', 'Framebuffer depth copies require an ordinary 2D depth attachment');
+        ensure(entry);
+        const group = entry.historyGroup;
+        if (entry.busy || group?.busy || group?.frame) fail('REENTRANT', 'Cannot reenter a framebuffer depth borrow');
+        entry.busy = true; if (group) group.busy = true;
+        try {
+          return entry.storage.withFramebufferDepthTexture(native => {
+            const result = callback(native); assertCurrent(entry); return result;
+          });
+        } finally {
+          entry.busy = false; if (group) group.busy = false;
+          for (const member of group?.entries ?? [entry]) { if (!member.alive) release(member); else collect(member); }
+        }
+      }
       const texture = entry.shape.textures[0];
       const source = {entry, texture, device: getDevice(), depth: false, colorIndex: 0};
       return this.withNativeTextures([source], textures => callback(textures.get(texture)));
@@ -1065,7 +1082,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
             // Allocate and sample it normally, but a color render must neither
             // attach nor clear/write it when depthBuffer is disabled.
             const {depthView, ...colorFrame} = frame;
-            const result = callback(entry.shape.depthAttachment ? frame : colorFrame, texture);
+            const result = callback(entry.shape.depthAttachment ? frame : colorFrame, texture,
+              entry.shape.depthAttachment ? handles.depth : null);
             assertCurrent(entry); return result;
           }
           finally { if (group) group.frame = null; }

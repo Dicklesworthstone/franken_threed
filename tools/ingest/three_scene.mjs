@@ -1471,7 +1471,7 @@ export async function createGpuThreeScene(device,scene,{
     let backgroundSubmitted=false;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','framebuffer'].includes(k)))
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','framebuffer','depthbuffer'].includes(k)))
         fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
@@ -1864,7 +1864,7 @@ export async function createGpuThreeScene(device,scene,{
             if(!source)fail('FRAME','Native framebuffer copies require the borrowed resolved color texture');
             const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
             for(const marker of framebufferCopies[nextCopy++].copies)
-              passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source);
+              passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source,options.depthbuffer);
             device.queue.submit([encoder.finish()]);live();
           }
         };
@@ -1932,7 +1932,7 @@ export async function createGpuThreeScene(device,scene,{
         for(const boundary of framebufferCopies){
           if(!loaded||boundary.index!==first)span(boundary.index);
           const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
-          for(const marker of boundary.copies)passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source);
+          for(const marker of boundary.copies)passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source,options.depthbuffer);
           device.queue.submit([encoder.finish()]);live();
         }
         span(draws.length);

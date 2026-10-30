@@ -166,10 +166,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame, framebuffer) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame, framebuffer, depthbuffer) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, framebuffer});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, framebuffer, depthbuffer});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -639,8 +639,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!this._initialized) fail('SOURCE', 'Initialize the renderer before copying its framebuffer');
       if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Public framebuffer copies require the native WebGPU route');
-      if (!(texture instanceof THREE.FramebufferTexture) || texture.isDepthTexture)
-        fail('SOURCE', 'Expected a source color FramebufferTexture');
+      const depth = texture instanceof THREE.DepthTexture && texture.isDepthTexture === true;
+      if (!(texture instanceof THREE.FramebufferTexture) && !depth)
+        fail('SOURCE', 'Expected a source FramebufferTexture or detached DepthTexture');
+      if (depth) {
+        const shape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
+        if (this._activeMipmapLevel !== 0 || shape && (shape.cube || shape.array || shape.volume))
+          fail('COPY', 'Depth framebuffer snapshots require base-level ordinary 2D attachments');
+      }
       let region;
       if (rectangle === null) region = [0, 0, texture.image.width, texture.image.height];
       else if (rectangle.isVector2) region = [rectangle.x, rectangle.y, texture.image.width, texture.image.height].map(Math.floor);
@@ -648,7 +654,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       else { (THREE.error ?? console.error)('Renderer.copyFramebufferToTexture: Invalid rectangle.'); return; }
       const textures = this._getSampledTextureInputs();
       textures.prepareFramebuffer(texture, this._renderTarget?.texture.type ?? THREE.UnsignedByteType);
-      const format = this._framebufferFormat();
+      const format = depth ? undefined : this._framebufferFormat();
       const source = !this._nodeFramebufferCopyRecorder && this._renderTarget
         ? this._targets.capture(this._renderTarget) : null;
       const [width, height] = source ? [source.shape.width, source.shape.height] : this._bufferSize();
@@ -679,12 +685,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               textures.validateDispatch([lease]);
               textures.withDispatch([lease], () => {
                 const encoder = this._device.createCommandEncoder({label: 'f3d-public-framebuffer-copy'});
-                textures.encodeFramebufferCopy(lease, encoder, native);
-                this._device.queue.submit([encoder.finish()]);
+                const copied = textures.encodeFramebufferCopy(lease, encoder, depth ? null : native, depth ? native : null);
+                if (copied !== false) this._device.queue.submit([encoder.finish()]);
               });
             };
-            if (source) this._targets.withFramebufferTexture(source, encode);
-            else this._session.withFramebufferTexture(encode, {width, height});
+            if (source) this._targets.withFramebufferTexture(source, encode, {depth});
+            else this._session.withFramebufferTexture(encode, {width, height, depth});
           };
           const request = {framebufferCopy: true, releaseFramebuffer: release, issue: () => {
             // Invalid destinations must not acquire or replace presentation.
@@ -917,7 +923,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
       const nodeFrame = native && !nodeCaptureDeferred
-        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget}) : null;
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face}) : null;
       if (nodeFrame) matricesUpdated = true;
       // Native callbacks retain the original camera in _captureNodeFrame.
       // Fixed draws can wait on pipeline/texture preparation; capture their
@@ -1064,7 +1070,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
     }
     _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId,
-      canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target}) {
+      canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target, mipLevel = 0, face = 0}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let sourceRaster = this._nodeRaster.get(stencilAttachment);
@@ -1075,6 +1081,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Pre-init requests can be captured after a PassNode restored the public
       // renderer state. Build and update against that request's source context.
       const previousTarget = this._renderTarget, previousMRT = this._mrt, previousCanvas = this.getCanvasTarget();
+      const previousMip = this._activeMipmapLevel, previousFace = this._activeCubeFace;
       const restoreCanvas = canvasTarget !== previousCanvas;
       const previousOutput = outputTransform ? {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
         outputColorSpace: this.outputColorSpace} : null;
@@ -1086,6 +1093,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // public selector null, although their GPU destination is a target.
         // ScreenNode therefore observes the canvas size on those source paths.
         this._renderTarget = sourceTarget; this._mrt = mrt;
+        this._activeMipmapLevel = mipLevel; this._activeCubeFace = face;
         if (restoreCanvas) this._canvases.select(canvasTarget);
         if (outputTransform) Object.assign(this, outputTransform);
         if (destination === this && this.needsFrameBufferTarget) {
@@ -1115,6 +1123,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._nodeCaptureDepth--;
         this._occlusionContext = previousOcclusion;
         this._renderTarget = previousTarget; this._mrt = previousMRT;
+        this._activeMipmapLevel = previousMip; this._activeCubeFace = previousFace;
         if (restoreCanvas) this._canvases.select(previousCanvas);
         if (previousOutput) Object.assign(this, previousOutput);
       }
@@ -1197,7 +1206,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const firstDepth = outputPass && sourceTarget !== null && sourceDepth && !copiedDepth &&
               !this._targetDepthInitialized.has(destination);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
+            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth) this._targetDepthInitialized.add(destination);

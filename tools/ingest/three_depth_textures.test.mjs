@@ -156,3 +156,54 @@ test('shared graphics/compute owner routes detached depth without CPU uploads or
   owner.written([token]); assert.deepEqual(writes, [[]]);
   owner.release(token); await owner.whenIdle(); assert.equal(owner.diagnostics.depth.bindings, 0);
 });
+
+test('framebuffer copy and sampled depth leases share one captured multisample generation', async t => {
+  let samples = 4;
+  const f = fixture(t, {getSamples: () => samples}), texture = new T.DepthTexture(3, 2);
+  const copy = f.owner.captureFramebuffer(texture), read = f.owner.captureBinding(sampled(texture)), commands = [];
+  samples = 1;
+  assert.deepEqual(f.owner.sampleData(texture), {samples: 4, primarySamples: 4, isMSAA: false});
+  assert.equal(f.owner.layout(read).texture.multisampled, true);
+  const source = {format: 'depth24plus', width: 3, height: 2, sampleCount: 4};
+  f.owner.withDispatch([copy, read], () => {
+    const view = f.owner.resolve(read);
+    assert.equal(view.texture.sampleCount, 4);
+    assert.equal(f.owner.encodeFramebufferCopy(copy, {copyTextureToTexture(...args) { commands.push(args); }}, source), true);
+    assert.equal(commands[0][1].texture, view.texture);
+    assert.equal(commands[0][0].aspect, undefined); assert.equal(commands[0][1].aspect, undefined);
+    assert.deepEqual(commands[0][2], {width: 3, height: 2, depthOrArrayLayers: 1});
+    f.device.queue.submit([]);
+  });
+  texture.needsUpdate = true;
+  const next = f.owner.captureFramebuffer(texture), nextRead = f.owner.captureBinding(sampled(texture));
+  assert.equal(f.owner.layout(nextRead).texture.multisampled, false);
+  for (const token of [copy, read, next, nextRead]) f.owner.release(token);
+  await f.owner.whenIdle(); assert.equal(f.owner.diagnostics.bindings, 0);
+});
+
+test('depth copies reject partial extents and sample mismatches before encoding', async t => {
+  const f = fixture(t), texture = new T.DepthTexture(3, 2);
+  for (const rectangle of [{x: 1, y: 0, z: 3, w: 2}, {x: 0, y: 0, z: 2, w: 2}])
+    assert.throws(() => f.owner.captureFramebuffer(texture, {rectangle}), {code: 'THREE_DEPTH_TEXTURE_RECTANGLE'});
+  const token = f.owner.captureFramebuffer(texture), encoder = {copyTextureToTexture() { assert.fail('Invalid copy was encoded'); }};
+  f.owner.withDispatch([token], () => {
+    for (const source of [{width: 4, height: 2, sampleCount: 1}, {width: 3, height: 2, sampleCount: 4}])
+      assert.throws(() => f.owner.encodeFramebufferCopy(token, encoder, {format: 'depth24plus', ...source}), {code: 'THREE_DEPTH_TEXTURE_COPY'});
+  });
+  f.owner.release(token); await f.owner.whenIdle();
+});
+
+test('depth format mismatches retain source diagnostics and combined depth budgets', async t => {
+  const errors = [], f = fixture(t, {three: {...T, error: (...args) => errors.push(args)}, maxBytes: 16});
+  const texture = new T.DepthTexture(2, 1, T.UnsignedInt248Type); texture.format = T.DepthStencilFormat;
+  const token = f.owner.captureFramebuffer(texture);
+  assert.equal(f.owner.diagnostics.bytes, 16);
+  assert.throws(() => f.owner.captureFramebuffer(new T.DepthTexture(1, 1)), {code: 'THREE_DEPTH_TEXTURE_BUDGET'});
+  f.owner.withDispatch([token], () => {
+    assert.equal(f.owner.encodeFramebufferCopy(token, {copyTextureToTexture() { assert.fail('Format mismatch must not copy'); }},
+      {format: 'depth24plus', width: 2, height: 1, sampleCount: 1}), false);
+  });
+  assert.equal(errors.length, 1);
+  assert.deepEqual(errors[0].slice(1), ['depth24plus', 'depth24plus-stencil8']);
+  f.owner.release(token); await f.owner.whenIdle();
+});

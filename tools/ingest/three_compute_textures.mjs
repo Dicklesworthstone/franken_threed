@@ -560,9 +560,16 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       } finally { resolving = false; if (poolDirty) syncPool(); }
     },
-    prepareFramebuffer(texture, type) { live(); framebuffers().prepareFramebuffer(texture, type); },
-    captureFramebuffer(texture, options) { live(); return framebuffers().captureFramebuffer(texture, options); },
-    encodeFramebufferCopy(snapshot, encoder, source) { live(); return framebuffers().encodeFramebufferCopy(snapshot, encoder, source); },
+    prepareFramebuffer(texture, type) { live(); if (!isDetachedDepth({texture})) framebuffers().prepareFramebuffer(texture, type); },
+    captureFramebuffer(texture, options) {
+      live(); return (isDetachedDepth({texture}) ? depths() : framebuffers()).captureFramebuffer(texture, options);
+    },
+    encodeFramebufferCopy(snapshot, encoder, source, depthSource = null) {
+      live();
+      return depthInputs?.owns(snapshot) ? depthInputs.encodeFramebufferCopy(snapshot, encoder,
+        typeof depthSource === 'function' ? depthSource() : depthSource)
+        : framebuffers().encodeFramebufferCopy(snapshot, encoder, source);
+    },
     preparation(snapshots) {
       const pending = new Set();
       for (const snapshot of snapshots) if (leases.has(snapshot)) {

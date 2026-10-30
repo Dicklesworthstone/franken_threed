@@ -384,7 +384,7 @@ export function createGpuRenderTarget(device, options = {}) {
           for (let layer = 0; layer < (separate ? depthLayers : 1); layer++) {
             const depth = device.createTexture({label: `${label} depth${separate ? ` ${layer}` : ''}`,
               size: {width: w, height: h, depthOrArrayLayers: separate ? 1 : depthLayers}, format: depthFormat,
-              dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | (sampleDepth ? 4 : 0)});
+              dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16 | 1 | (sampleDepth ? 4 : 0)});
             pair.depths.push(depth);
           }
           pair.depth = pair.depths[0];
@@ -569,6 +569,7 @@ export function createGpuRenderTarget(device, options = {}) {
       if (sampleCount !== 1) fail('SAMPLES', 'Color destinations require one sample');
     }
     if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
+    if (kind === 'framebuffer-depth' && depthFormat === null) fail('DEPTH', 'A framebuffer depth copy requires a depth attachment');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
     const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel, face) : 0;
     if (!current) return false;
@@ -613,7 +614,7 @@ export function createGpuRenderTarget(device, options = {}) {
         : kind === 'sampled' ? callback(colors[0], current.depth)
         : kind === 'attachments' ? callback(Object.freeze(colors), sampleDepth ? current.depth : null,
           handles.historyColors, nestedFrame)
-        : callback(kind === 'depth' ? current.depth : colors[colorIndex]);
+        : callback(kind === 'depth' || kind === 'framebuffer-depth' ? current.depth : colors[colorIndex]);
       if (result && typeof result.then === 'function') {
         Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
@@ -723,6 +724,7 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     withAttachments(callback, {colorSlots = null} = {}) { return borrow(callback, 'attachments', 0, 0, 0, colorSlots); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
+    withFramebufferDepthTexture(callback) { return borrow(callback, 'framebuffer-depth'); },
     withSampledTextures(callback, {colorSlots = null} = {}) { return borrow(callback, 'sampled', 0, 0, 0, colorSlots); },
     writePixels(data, options = {}, colorSlots = null) {
       exclusive();

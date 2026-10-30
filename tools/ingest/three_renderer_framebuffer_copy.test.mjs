@@ -8,7 +8,7 @@ import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {RectAreaLightTexturesLib} from './fixtures/three_rect_area_light.mjs';
 const N = THREE.TSL;
 
-async function fixture(t, options = {}) {
+async function fixture(t, options = {}, initialize = true) {
   const device = geometryDevice(), events = [], textures = [];
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureDimension3D: 256, maxTextureArrayLayers: 256,
     maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
@@ -34,7 +34,9 @@ async function fixture(t, options = {}) {
       },
       copyTextureToTexture(source, destination, size) {
         assert.ok(source.texture.usage & 1); assert.ok(destination.texture.usage & 2);
-        assert.equal(source.texture.sampleCount, 1); assert.equal(source.texture.format, destination.texture.format);
+        assert.equal(source.texture.sampleCount, destination.texture.sampleCount);
+        if (!source.texture.format.startsWith('depth')) assert.equal(source.texture.sampleCount, 1);
+        assert.equal(source.texture.format, destination.texture.format);
         commands.push({copy: true, source, destination, size, draws: [], label: descriptor?.label});
       }, finish() { return commands; }};
   };
@@ -49,7 +51,7 @@ async function fixture(t, options = {}) {
     getCurrentTexture() { canvas.acquisitions = (canvas.acquisitions ?? 0) + 1; return device.createTexture({size: [canvas.width, canvas.height], format: configuration.format, usage: configuration.usage}); }
   })};
   const Renderer = createWebGPURendererClass(THREE), renderer = new Renderer({canvas, device, ...options});
-  t.after(() => renderer.dispose()); await renderer.init();
+  t.after(() => renderer.dispose()); if (initialize) await renderer.init();
   const scene = new THREE.Scene(); scene.add(new THREE.AmbientLight(0xffffff, .5));
   const camera = new THREE.PerspectiveCamera(50, 1, .1, 30); camera.position.z = 4;
   const mesh = material => {
@@ -290,4 +292,105 @@ test('invalid queued direct copies preserve the producer presentation', async t 
   assert.equal(canvas.acquisitions, 1, 'only the accepted producer acquires a presentation image');
   assert.equal(copies(f.events).length, 0);
   assert.equal(textures.diagnostics.framebuffers.bindings, 0);
+});
+
+for (const samples of [0, 4]) test(`public depth snapshots preserve private target storage and ${samples || 1} samples`, async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const target = new THREE.RenderTarget(16, 16, {samples}); t.after(() => target.dispose());
+  renderer.setRenderTarget(target);
+  f.mesh(new THREE.MeshBasicMaterial());
+  renderer.render(scene, camera);
+  const depth = new THREE.DepthTexture(16, 16);
+  renderer.copyFramebufferToTexture(depth);
+  const consumer = new THREE.Scene(), material = new THREE.MeshBasicNodeMaterial();
+  material.colorNode = N.vec3(N.textureLoad(depth, N.ivec2(0, 0)).r);
+  consumer.add(new THREE.Mesh(new THREE.PlaneGeometry(), material));
+  renderer.setRenderTarget(null); renderer.render(consumer, camera); await renderer.waitForGPU();
+  const recorded = copies(f.events); assert.equal(recorded.length, 1);
+  const copy = recorded[0], at = f.events.indexOf(copy);
+  const producer = f.events.slice(0, at).find(event => event.draws.some(draw => draw.indexed));
+  assert.equal(target.depthTexture, null, 'copying private depth does not manufacture a public depth attachment');
+  assert.equal(copy.source.texture, producer.desc.depthStencilAttachment.view.texture);
+  assert.equal(copy.destination.texture.sampleCount, samples || 1);
+  assert.equal(depth.type, THREE.UnsignedIntType, 'depth destination type remains authored');
+  assert.ok(meshDraws(f.events.slice(at + 1)).some(draw => sampled(draw).includes(copy.destination.texture)));
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+});
+
+for (const options of [{}, {antialias: true}, {linear: true}])
+  test(`viewport depth reads preceding draws and preserves later depth loads ${JSON.stringify(options)}`, async t => {
+    const {linear, ...parameters} = options, f = await fixture(t, parameters), {renderer, scene, camera} = f;
+    if (linear) renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    const prefix = f.mesh(new THREE.MeshBasicMaterial()); prefix.renderOrder = -1;
+    const material = new THREE.MeshBasicNodeMaterial();
+    material.colorNode = N.vec3(N.viewportDepthTexture().r); material.depthWrite = false;
+    f.mesh(material);
+    await renderer.compileAsync(scene, camera);
+    assert.equal(copies(f.events).length, 0, 'compilation does not snapshot depth');
+    await renderer.renderAsync(scene, camera);
+    const recorded = copies(f.events); assert.equal(recorded.length, 1);
+    const copy = recorded[0], at = f.events.indexOf(copy);
+    assert.equal(copy.source.texture.format, 'depth24plus');
+    assert.equal(copy.source.texture.sampleCount, options.antialias ? 4 : 1);
+    assert.equal(meshDraws(f.events.slice(0, at)).length, 1);
+    const after = f.events.slice(at + 1).find(event => event.draws.some(draw => draw.indexed));
+    assert.equal(after.desc.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(after.desc.depthStencilAttachment.view.texture, copy.source.texture);
+    assert.ok(sampled(after.draws.find(draw => draw.indexed)).includes(copy.destination.texture));
+    assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+  });
+
+test('public depth snapshots preserve matching depth/stencil and float target formats', async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f; f.mesh(new THREE.MeshBasicMaterial());
+  for (const [type, format, stencilBuffer, native] of [[THREE.UnsignedInt248Type, THREE.DepthStencilFormat, true, 'depth24plus-stencil8'],
+    [THREE.FloatType, THREE.DepthFormat, false, 'depth32float']]) {
+    const attached = new THREE.DepthTexture(16, 16, type); attached.format = format;
+    const target = new THREE.RenderTarget(16, 16, {depthTexture: attached, stencilBuffer}); t.after(() => target.dispose());
+    renderer.setRenderTarget(target); renderer.render(scene, camera);
+    const depth = new THREE.DepthTexture(16, 16, type); depth.format = format;
+    renderer.copyFramebufferToTexture(depth); await renderer.waitForGPU();
+    const copy = copies(f.events).at(-1);
+    assert.equal(copy.source.texture.format, native); assert.equal(copy.destination.texture.format, native);
+    assert.equal(copy.source.aspect, undefined); assert.equal(copy.destination.aspect, undefined);
+    assert.equal(depth.type, type); assert.equal(depth.format, format);
+  }
+});
+
+test('depth snapshots retain queued generations and reject disposed destinations', async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f; f.mesh(new THREE.MeshBasicMaterial());
+  const depth = new THREE.DepthTexture(8, 8);
+  for (const size of [8, 16]) {
+    const target = new THREE.RenderTarget(size, size); t.after(() => target.dispose());
+    renderer.setRenderTarget(target); renderer.render(scene, camera);
+    if (size === 16) { depth.image.width = depth.image.height = size; depth.needsUpdate = true; }
+    renderer.copyFramebufferToTexture(depth);
+  }
+  await renderer.waitForGPU();
+  const recorded = copies(f.events);
+  assert.deepEqual(recorded.map(copy => copy.destination.texture.width), [8, 16]);
+  assert.notEqual(recorded[0].destination.texture, recorded[1].destination.texture);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+  const second = await fixture(t), target = new THREE.RenderTarget(16, 16), disposed = new THREE.DepthTexture(16, 16);
+  t.after(() => target.dispose()); second.renderer.setRenderTarget(target);
+  second.mesh(new THREE.MeshBasicMaterial()); second.renderer.render(second.scene, second.camera);
+  second.renderer.copyFramebufferToTexture(disposed);
+  const owner = second.renderer._getSampledTextureInputs(); disposed.dispose();
+  await assert.rejects(second.renderer.waitForGPU(), {code: 'THREE_DEPTH_TEXTURE_STALE'});
+  assert.equal(copies(second.events).length, 0);
+  assert.equal(owner.diagnostics.depth.bindings, 0);
+});
+
+for (const acceptedMip of [0, 1]) test(`deferred depth capture retains accepted mip ${acceptedMip} and restores the public selector`, async t => {
+  const f = await fixture(t, {}, false), {renderer, scene, camera} = f;
+  const target = new THREE.RenderTarget(16, 16); target.texture.generateMipmaps = true;
+  t.after(() => target.dispose()); renderer.setRenderTarget(target, 0, acceptedMip);
+  const material = new THREE.MeshBasicNodeMaterial(); material.colorNode = N.vec3(N.viewportDepthTexture().r);
+  f.mesh(material);
+  const pending = renderer.renderAsync(scene, camera);
+  renderer.setRenderTarget(target, 0, 1 - acceptedMip);
+  if (acceptedMip === 0) {
+    await pending; await renderer.waitForGPU();
+    assert.equal(copies(f.events).length, 1);
+  } else await assert.rejects(pending, {code: 'F3D_RENDERER_COPY'});
+  assert.equal(renderer.getActiveMipmapLevel(), 1 - acceptedMip);
 });

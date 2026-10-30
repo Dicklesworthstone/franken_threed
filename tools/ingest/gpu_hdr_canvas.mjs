@@ -113,8 +113,8 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
               (!transparent && sceneFrame.clearColor[3] !== 1)) fail('FRAME', 'Opaque HDR canvas clear alpha must be one');
           live();
           offscreen.resize(canvas.width, canvas.height);
-          offscreen.withFrame((attachments, source) => {
-            const result = renderer.render(input, {...sceneFrame, ...attachments}, source);
+          offscreen.withFrame((attachments, source, handles) => {
+            const result = renderer.render(input, {...sceneFrame, ...attachments}, source, handles.depth);
             if (result && typeof result.then === 'function') {
               Promise.resolve(result).catch(() => {});
               fail('ASYNC_RENDER', 'Scene rendering must submit synchronously');
@@ -130,10 +130,13 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
         } catch (error) { return childFailure(error); }
         finally { busy = false; if (closed()) release(); }
       },
-      withFramebufferTexture(callback, {width, height}) {
+      withFramebufferTexture(callback, {width, height, depth = false}) {
         live(); if (busy || preparing) fail('REENTRANT', 'HDR framebuffer copies cannot overlap another operation');
         busy = true;
-        try { offscreen.resize(width, height); return offscreen.withTexture(callback); }
+        try {
+          offscreen.resize(width, height);
+          return depth ? offscreen.withFramebufferDepthTexture(callback) : offscreen.withTexture(callback);
+        }
         catch (error) { return childFailure(error); }
         finally { busy = false; if (closed()) release(); }
       },

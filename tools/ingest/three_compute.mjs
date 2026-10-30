@@ -622,7 +622,7 @@ export function withThreeCompute(Base, THREE) {
         framebufferFactory: () => createThreeFramebufferTextures({three: THREE, device: this._device,
           getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal}),
         depthFactory: () => createThreeDepthTextures({three: THREE, device: this._device,
-          signal: this._targetLifetime.signal})});
+          getSamples: () => this.currentSamples, signal: this._targetLifetime.signal})});
     }
     /** Graphics leases share compute's authoritative allocation and upload
      * history. An unchanged host version never overwrites GPU-produced bytes. */

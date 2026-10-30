@@ -108,19 +108,19 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         live();
         // Copy attachment descriptors rather than values: with lazyAttachments
         // the presentation texture is acquired only when the renderer reads a view.
-        lastFrameRendered = target.withFrame((attachments, texture) => renderer.render(input,
-          Object.defineProperties(packet, Object.getOwnPropertyDescriptors(attachments)), texture), {lazy: lazyAttachments});
+        lastFrameRendered = target.withFrame((attachments, texture, depth) => renderer.render(input,
+          Object.defineProperties(packet, Object.getOwnPropertyDescriptors(attachments)), texture, depth), {lazy: lazyAttachments});
         live(); return api;
       });
     },
-    withFramebufferTexture(callback, {width = target.width, height = target.height} = {}) {
+    withFramebufferTexture(callback, {width = target.width, height = target.height, depth = false} = {}) {
       return exclusive(() => {
         if (typeof callback !== 'function') fail('FRAME', 'Expected a synchronous framebuffer copy');
         if (typeof renderer.withFramebufferTexture === 'function')
-          return renderer.withFramebufferTexture(callback, {width, height});
+          return renderer.withFramebufferTexture(callback, {width, height, depth});
         if (width !== target.width || height !== target.height)
           fail('SIZE_CHANGED', 'The direct canvas changed size before its framebuffer copy');
-        return target.withFrame((attachments, texture) => callback(texture));
+        return target.withFrame((attachments, texture, depthTexture) => callback(depth ? depthTexture : texture));
       });
     },
     resize(width, height) { return exclusive(() => { target.resize(width, height); return api; }); },

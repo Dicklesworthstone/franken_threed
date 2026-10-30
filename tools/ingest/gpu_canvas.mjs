@@ -1,7 +1,8 @@
 /** Owned WebGPU canvas attachments for the explicit rendering paths.
  * No frame loop, camera mutation, device ownership, or retained renderer.
- * withFrame() lends views and its second-argument presentation texture only
- * for synchronous, immediately submitted work.
+ * withFrame() lends views, its second-argument presentation texture and third-
+ * argument depth texture only for synchronous, immediately submitted work.
+ * Lazy texture arguments are accessors; borrowing depth does not present color.
  * Canvas textures are reacquired on every use, never retained across host turns.
  */
 export class GpuCanvasError extends Error {
@@ -125,7 +126,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
             next.colorView = next.color.createView();
           }
           if (depthFormat) {
-            next.depth = device.createTexture({...descriptor, format: depthFormat, label: 'f3d-canvas-depth'});
+            next.depth = device.createTexture({...descriptor, usage: RENDER_ATTACHMENT | COPY_SRC,
+              format: depthFormat, label: 'f3d-canvas-depth'});
             next.depthView = next.depth.createView();
           }
         }
@@ -180,7 +182,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
         ...(v.depthView ? {depthView: v.depthView} : {}),
         ...(v.resolveTarget ? {resolveTarget: v.resolveTarget} : {})});
     }
-    const result = draw(attachments, lazy ? () => acquire() && presentation : presentation);
+    const depth = () => { current.used = true; return current.depth; };
+    const result = draw(attachments, lazy ? () => acquire() && presentation : presentation, lazy ? depth : current.depth);
     if (result && typeof result.then === 'function') {
       Promise.resolve(result).catch(() => {});
       fail('ASYNC_FRAME', 'Frame views must be consumed and submitted synchronously; returned work is not cancelled');

@@ -23,7 +23,7 @@ function fixture() {
       if (textures.length === throwAt) throw new Error('allocation failed');
       assert.ok(d.size.every(x => x > 0));
       assert.ok([1, 4].includes(d.sampleCount));
-      assert.equal(d.usage, 16);
+      assert.equal(d.usage, d.format.startsWith('depth') ? 17 : 16);
       const t = texture(d); textures.push(t); return t;
     },
     pushErrorScope(type) { scopes.push(type); },
@@ -251,6 +251,17 @@ test('lazy frames acquire the swapchain only when a view is read', () => {
   assert.equal(seen.depth.texture.descriptor.format, 'depth24plus');
   assert.throws(() => target.withFrame(() => {}, {lazy: 1}), GpuCanvasError);
   target.dispose();
+});
+
+test('lazy depth-only borrows retain submitted storage without acquiring presentation', async () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas);
+  let depth;
+  assert.equal(target.withFrame((_views, _color, getDepth) => { depth = getDepth(); }, {lazy: true}), false);
+  assert.equal(count(f, 'acquire'), 0);
+  target.resize(32, 16);
+  assert.equal(depth.destroyed, 0); assert.equal(f.fences.length, 1);
+  f.fences[0].resolve(); await tick();
+  assert.equal(depth.destroyed, 1); target.dispose();
 });
 
 for (const sampleCount of [1, 4]) test(`combined stencil attachments charge eight bytes per sample (${sampleCount}x)`, async () => {

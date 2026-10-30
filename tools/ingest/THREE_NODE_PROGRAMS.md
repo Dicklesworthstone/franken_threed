@@ -46,6 +46,40 @@ rendered into comparison pixels. Chrome 151.0.7922.34 / SwiftShader matches all
 1,032,192 RGBA bytes at twenty-one checkpoints with zero GPU errors. Hardware
 performance remains unmeasured.
 
+### Native framebuffer depth snapshots
+
+`renderer.copyFramebufferToTexture(depthTexture)` and the retained
+`viewportDepthTexture()` node now copy actual native framebuffer depth. Public
+copies stay in the render FIFO; node copies execute after their preceding draws
+and before their consuming draw, including ArrayCamera view spans. Resumed passes
+load the existing color, depth and stencil attachments. Canvas, HDR scene and
+ordinary render-target copies borrow the original depth allocation, including
+private target depth that has no public `target.depthTexture`.
+
+Copies and samples share the existing detached-depth owner and its captured
+texture generations. The first allocation follows the source context's sample
+count; same-version uses retain that allocation. One- and four-sample snapshots
+preserve every sample, with source-generated multisampled depth loads. Public
+depth type/format remains authored. Matching `depth24plus`, `depth32float` and
+`depth24plus-stencil8` copies are admitted; mismatched native formats retain the
+source diagnostic and omit the copy. Raw copies cover complete equal-sized
+subresources, use all aspects and require equal sample counts.
+
+This profile covers base-level ordinary 2D attachments. Cube, layered, volume
+and nonzero-mip depth snapshots remain outside it. Disposal rejects pending
+copies, while submitted storage survives its completion fence. Lazy canvas
+depth borrows retain that storage without acquiring a presentation texture.
+Deferred captures retain their accepted mip/face selectors independently of
+later public selection changes.
+
+The depth owner, complete framebuffer-copy facade and canvas suites pass 66
+tests; adjacent canvas-session, target and color-framebuffer suites pass 56.
+Four `native_depth_snapshots.mjs` source/candidate browser cases cover viewport
+depth, MSAA, ArrayCamera and public float-depth copies. All 1,376,256 RGBA bytes
+at twenty-eight checkpoints match in Chromium 151.0.7922.34 / SwiftShader with
+zero GPU errors. These comparisons use the native F3D backend. Hardware
+performance remains unmeasured.
+
 ### Materials and node graphs
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
@@ -282,8 +316,8 @@ does not acquire or replace presentation. Ordinary public source-target resize
 retains the existing stale-use rejection contract.
 
 This path uses the existing owned WebGPU renderer and texture owners, with no
-readback or retained renderer submission. Depth framebuffer copies, the
-WebGL-authored copy route remain unimplemented. Native ArrayCamera copies preserve
+readback or retained renderer submission. Depth framebuffer copies use the native
+snapshot profile above; the WebGL-authored copy route remains unimplemented. Native ArrayCamera copies preserve
 their source draw boundaries; physical transmission pixel parity across views
 remains unverified.
 Distinct scene overrides retain both the original transmissive back/front phases

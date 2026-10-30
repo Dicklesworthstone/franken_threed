@@ -1,8 +1,9 @@
-/** Detached source DepthTexture inputs, including the initial TRAA history.
+/** Detached source DepthTexture inputs and framebuffer depth snapshots.
  * Source Textures.updateTexture allocates depth storage even at version zero.
  * No CPU upload, source-object mutation or invented render target is required.
- * Each captured version remains zero initialized and resident until its queued
- * readers and submitted-work fence release it; dispose invalidates queued uses.
+ * Each generation starts zero initialized. Framebuffer copies and subsequent
+ * readers share its GPU storage until their submitted-work fences release it;
+ * dispose invalidates queued uses.
  */
 export class ThreeDepthTextureError extends Error {
   constructor(code, message) {
@@ -13,9 +14,9 @@ export class ThreeDepthTextureError extends Error {
 const fail = (code, message) => { throw new ThreeDepthTextureError(code, message); };
 const positive = value => Number.isSafeInteger(value) && value > 0;
 
-export function createThreeDepthTextures({three, device, signal = null, maxTextures = 256,
+export function createThreeDepthTextures({three, device, getSamples = () => 1, signal = null, maxTextures = 256,
   maxBytes = 64 * 1024 * 1024, maxBindings = 4096, maxSamplers = 256, maxPending = 1024} = {}) {
-  if (typeof three?.DepthTexture !== 'function' || !device?.queue ||
+  if (typeof three?.DepthTexture !== 'function' || !device?.queue || typeof getSamples !== 'function' ||
       ![maxTextures, maxBytes, maxBindings, maxSamplers, maxPending].every(positive))
     fail('OPTIONS', 'Expected pinned depth textures, a GPUDevice and positive resource limits');
   const current = new Map(), entries = new Set(), watches = new Map(), leases = new Map(), tokens = new WeakSet();
@@ -74,18 +75,22 @@ export function createThreeDepthTextures({three, device, signal = null, maxTextu
         texture.isDepthTexture !== true || texture.renderTarget != null || texture.isCubeTexture ||
         texture.isArrayTexture || texture.is3DTexture || texture.isRenderTargetTexture || texture.isStorageTexture)
       fail('SOURCE', 'Expected an ordinary detached source 2D DepthTexture');
-    if (texture.format !== three.DepthFormat || texture.internalFormat != null || texture.colorSpace !== three.NoColorSpace ||
+    if (![three.DepthFormat, three.DepthStencilFormat].includes(texture.format) || texture.internalFormat != null || texture.colorSpace !== three.NoColorSpace ||
         texture.generateMipmaps !== false || texture.mipmaps?.length || texture.flipY !== false || texture.image?.data != null)
       fail('FORMAT', 'Detached depth requires no pixels, mipmaps, color transform or internal format override');
-    const format = texture.type === three.UnsignedIntType ? 'depth24plus' : texture.type === three.FloatType ? 'depth32float' : null;
-    if (!format) fail('FORMAT', 'Detached depth requires UnsignedIntType or FloatType');
+    const format = texture.format === three.DepthStencilFormat
+      ? texture.type === three.UnsignedInt248Type ? 'depth24plus-stencil8' : null
+      : texture.type === three.UnsignedIntType ? 'depth24plus' : texture.type === three.FloatType ? 'depth32float' : null;
+    if (!format) fail('FORMAT', 'Detached depth requires matching 24-bit, float32 or 24-bit depth/stencil storage');
+    const requestedSamples = getSamples(), sampleCount = requestedSamples || 1;
+    if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Detached depth requires one or four native samples');
     const width = texture.image?.width || 1, height = texture.image?.height || 1;
     if (!positive(width) || !positive(height) || (texture.image?.depth ?? 1) !== 1 ||
         width > device.limits.maxTextureDimension2D || height > device.limits.maxTextureDimension2D)
       fail('SHAPE', 'Detached depth dimensions must fit one 2D GPU texture');
-    const size = width * height * 4;
+    const size = width * height * (format === 'depth24plus-stencil8' ? 8 : 4) * sampleCount;
     if (!Number.isSafeInteger(size)) fail('BUDGET', 'Depth texture byte size exceeds integer precision');
-    return Object.freeze({width, height, format, bytes: size});
+    return Object.freeze({width, height, format, sampleCount, bytes: size});
   }
   function shapeOf(texture) {
     live(); const entry = current.get(texture);
@@ -113,7 +118,7 @@ export function createThreeDepthTextures({three, device, signal = null, maxTextu
       ...(comparison ? {compare: comparisons.get(texture.compareFunction)} : {})});
     const layout = binding.isSampler && !binding.isSampledTexture
       ? {sampler: {type: comparison ? 'comparison' : 'non-filtering'}}
-      : {texture: {sampleType: 'depth', viewDimension: '2d', multisampled: false}};
+      : {texture: {sampleType: 'depth', viewDimension: '2d', multisampled: shape.sampleCount > 1}};
     return {texture, shape, layout, sampler: binding.isSampler && !binding.isSampledTexture ? sampler : null};
   }
   function entryOf(texture, shape) {
@@ -134,13 +139,28 @@ export function createThreeDepthTextures({three, device, signal = null, maxTextu
   function ensure(entry) {
     if (!entry.native) checked(() => {
       entry.native = device.createTexture({label: 'f3d-detached-depth', size: {width: entry.shape.width, height: entry.shape.height, depthOrArrayLayers: 1},
-        dimension: '2d', format: entry.shape.format, sampleCount: 1, mipLevelCount: 1, usage: 1 | 2 | 4 | 16});
+        dimension: '2d', format: entry.shape.format, sampleCount: entry.shape.sampleCount, mipLevelCount: 1, usage: 1 | 2 | 4 | 16});
     });
   }
   return {
     owns(token) { return tokens.has(token); },
     layoutOf(binding) { return describe(binding).layout; },
-    sampleData(texture) { describe({texture, isSampledTexture: true}); return {samples: 1, primarySamples: 1, isMSAA: false}; },
+    sampleData(texture) {
+      const {shape} = describe({texture, isSampledTexture: true});
+      return {samples: shape.sampleCount, primarySamples: shape.sampleCount, isMSAA: false};
+    },
+    captureFramebuffer(texture, {rectangle = null} = {}) {
+      live();
+      if (active) fail('REENTRY', 'Cannot capture a depth copy during a submitted use');
+      if (leases.size >= maxBindings) fail('BUDGET', 'Queued depth bindings exceed maxBindings');
+      const shape = shapeOf(texture), r = rectangle ?? {x: 0, y: 0, z: shape.width, w: shape.height};
+      // WebGPU depth/stencil copies cover whole subresources, including all
+      // aspects and samples. This is a raw snapshot, never a depth resolve.
+      if (r.x !== 0 || r.y !== 0 || r.z !== shape.width || r.w !== shape.height)
+        fail('RECTANGLE', 'Depth framebuffer copies require the complete destination at origin zero');
+      const entry = entryOf(texture, shape), token = Object.freeze({});
+      entry.refs++; leases.set(token, {entry, copy: true}); tokens.add(token); return token;
+    },
     captureBinding(binding) {
       if (active) fail('REENTRY', 'Cannot capture detached depth during a submitted use');
       const record = describe(binding);
@@ -181,6 +201,7 @@ export function createThreeDepthTextures({three, device, signal = null, maxTextu
     resolve(token) {
       const record = validate(token), entry = record.entry;
       if (!active?.has(entry)) fail('BORROW', 'Resolve detached depth inside its submitted use');
+      if (record.copy) fail('BINDING', 'A depth framebuffer copy marker is not a sampled binding');
       if (record.sampler) {
         const key = JSON.stringify(record.sampler); let sampler = samplers.get(key);
         if (!sampler) {
@@ -190,6 +211,23 @@ export function createThreeDepthTextures({three, device, signal = null, maxTextu
         samplers.set(key, sampler); return sampler;
       }
       return entry.view ??= checked(() => entry.native.createView({dimension: '2d', aspect: 'depth-only', baseMipLevel: 0, mipLevelCount: 1}));
+    },
+    encodeFramebufferCopy(token, encoder, source) {
+      const record = validate(token), entry = record.entry;
+      if (!record.copy || !active?.has(entry)) fail('BORROW', 'Encode a depth copy inside its submitted use');
+      if (!source || typeof encoder?.copyTextureToTexture !== 'function')
+        fail('COPY', 'Depth framebuffer copies require the borrowed native depth attachment');
+      if (source.format !== entry.shape.format) {
+        (three.error ?? console.error)('WebGPUBackend: copyFramebufferToTexture: Source and destination formats do not match.',
+          source.format, entry.shape.format);
+        return false;
+      }
+      const {width, height, sampleCount} = entry.shape;
+      if (source.width !== width || source.height !== height || source.sampleCount !== sampleCount)
+        fail('COPY', 'Depth framebuffer copies require equal source and destination extents and sample counts');
+      encoder.copyTextureToTexture({texture: source, origin: {x: 0, y: 0, z: 0}, mipLevel: 0},
+        {texture: entry.native, origin: {x: 0, y: 0, z: 0}, mipLevel: 0}, {width, height, depthOrArrayLayers: 1});
+      return true;
     },
     release(token) {
       const record = leases.get(token); if (!record) return;
