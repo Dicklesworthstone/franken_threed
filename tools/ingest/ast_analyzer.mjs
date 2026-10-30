@@ -410,7 +410,7 @@ function hasVarBindingInFunctionScope(bodyNode, name, cache = defaultVarBindingC
  * @param {WeakMap<any, Map<string, boolean>>} [varCache]
  * @returns {boolean}
  */
-function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarBindingCache) {
+export function isIdentifierShadowedAtAncestors(name, ancestors, varCache = defaultVarBindingCache) {
   for (let i = ancestors.length - 2; i >= 0; i--) {
     const ancestor = ancestors[i];
     const child = ancestors[i + 1];

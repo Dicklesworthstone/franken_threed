@@ -53,6 +53,49 @@ unavailable. Separate checks construct the native renderer from typed source and
 execute a modified pinned core through the retained route. These establish input
 integration and execution ownership; they do not establish a rendering speedup.
 
+## Native document fetch resources
+
+HTML application builds include finite local GET resources requested by document
+modules and retained classic scripts. Plain strings, immutable module `const`
+aliases, conditional choices, string concatenation and template selectors use
+the existing bounded expression analysis. Resources resolve from the document's
+effective base, including supported local `<base>` paths in the ordinary build,
+regardless of which imported module contains the call. Normalized project source
+participates before bundling. Missing files, remote URLs and unproved requests
+keep their original networked routes.
+
+Standalone packing maps admitted URL arguments to embedded resources and keeps
+the original native `fetch` call. Selector bindings, query/fragment strings,
+evaluation order, receiver, plain `RequestInit` expressions, abort signals,
+integrity checks and response-body consumption remain source-owned. There is no
+global fetch patch, synthetic Response or runtime request handler. Fetched
+JavaScript, CSS, SVG and model files are raw response bytes: they are not executed,
+passed through the project frontend, or recursively rewritten as active assets.
+Wasm retains the exact `application/wasm` MIME needed by native streaming APIs.
+
+Locally bound or imported functions named `fetch` are not treated as the browser
+API. Known host replacement, non-GET methods and opaque options prevent embedding
+finite requests. `Request` objects, fetch aliases and runtime-selected URLs keep
+the existing host path; their closure is not newly proved. Remote and document-root
+requests still need ordinary deployment, and the packer's existing `<base>`
+refusal remains. Embedded Response URLs are data URLs; server HTTP headers, cache
+behavior and live endpoints are not reproduced by this static-resource mode.
+
+The focused execution compares source and emitted applications served over HTTP,
+then closes both servers and runs the packed application with its source and build
+trees unavailable. Native fetch checks raw bodies, cloned and streamed responses,
+finite URL choices, abort reasons, invalid GET bodies and failed integrity, plus
+audio bytes and `WebAssembly.instantiateStreaming()`. This proves resource
+packaging and retained host execution, not rendering or acceleration.
+
+An independent Chrome 151.0.7922.34 run opens that packed HTML with the browser
+offline, both original trees unavailable, and no fetch or response interception.
+All response/body and streaming-Wasm assertions pass with zero external requests,
+page errors or unexpected console errors. The intentionally invalid integrity
+request produces two expected console diagnostics and its caught native failure.
+Native `AudioContext.decodeAudioData()` decodes the embedded 52-byte PCM WAV into
+one channel at 8,000 Hz with four frames.
+
 ## Typed imports and source errors
 
 Static imports, reexports and bounded lazy imports retain their original import

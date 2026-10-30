@@ -19,6 +19,7 @@ import * as walk from "acorn-walk";
 import { embedGltfAssets } from "./pack_gltf.mjs";
 import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
 import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
+import { analyzeDocumentFetch, isRelativeDocumentFetchUrl } from "./document_fetch_assets.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -255,7 +256,7 @@ export function packHtml(
     workerModules = new Map(),
     workerClassics = new Map(),
     workerActive = new Set();
-  let inputBytes = 0, workerBytes = 0;
+  let inputBytes = 0, workerBytes = 0, documentFetchUsed = false, documentFetchMutated = false;
   function chargeWorker(encoded) {
     const size = Buffer.byteLength(encoded);
     if (size > maxBytes - workerBytes)
@@ -532,6 +533,9 @@ export function packHtml(
     } catch (error) {
       fail("SCRIPT_PARSE", `${from}: ${error.message}`);
     }
+    const documentFetch = worker ? {sites: []} : analyzeDocumentFetch(ast);
+    const documentFetchSites = new Map(documentFetch.sites.map(site => [site.node, site]));
+    documentFetchMutated ||= Boolean(documentFetch.hostMutated);
     const replacements = [],
       allowedMeta = new Set(),
       workerURLs = new Set(),
@@ -941,17 +945,21 @@ export function packHtml(
           ["eval", "importScripts"].includes(node.callee.name)
         )
           fail("DYNAMIC_CODE", "Dynamic code cannot establish a closed module graph");
-        if (
-          node.callee.type === "Identifier" &&
-          node.callee.name === "fetch" &&
-          literal(node.arguments[0]) !== null
-        ) {
-          const target = literal(node.arguments[0]);
-          if (!target.startsWith("data:"))
-            fail(
-              "FETCH_URL",
-              "Use a static new URL(..., import.meta.url) asset or retain the normal networked build",
-            );
+        const request = documentFetchSites.get(node);
+        if (request && !request.candidates.every(value => value.startsWith("data:"))) {
+          if (!request.admitted)
+            fail("FETCH_URL", `${from}: ${request.reason} requires the normal networked build`);
+          if (request.candidates.some(value => !value.startsWith("data:") && !isRelativeDocumentFetchUrl(value)))
+            fail("FETCH_URL", `${from}: external or document-root fetches require the normal networked build`);
+          documentFetchUsed = true;
+          const mapping = request.candidates.map(value =>
+            [value, assetFor(local(value, base), false, true)]);
+          // Only the argument changes. Keep its effects/TDZ behavior, the
+          // native callee/receiver, options, response streams and abort signal.
+          const dispatch = mapping.map(([value, target]) =>
+            `s===${JSON.stringify(value)}?${JSON.stringify(target)}:`).join("");
+          replacements.push({start: request.argument.start, end: request.argument.start, value: `(s=>${dispatch}s)((`},
+            {start: request.argument.end, end: request.argument.end, value: "))"});
         }
       },
     });
@@ -1010,16 +1018,16 @@ export function packHtml(
       return `${isImport ? "@import " : ""}url("${assetFor(local(value, from), isImport)}")`;
     });
   }
-  function assetFor(url, stylesheet = false) {
+  function assetFor(url, stylesheet = false, raw = false) {
     if (url.startsWith("data:")) return url;
-    const key = (stylesheet ? "css:" : "asset:") + url;
+    const key = (raw ? "fetch:" : stylesheet ? "css:" : "asset:") + url;
     if (assets.has(key)) return assets.get(key).data;
     if (cssActive.has(key))
       fail(stylesheet ? "CSS_CYCLE" : "ASSET_CYCLE", "Cyclic resources require the ordinary build");
     const parsed = new URL(url),
       bytes = read(url),
       ext = path.extname(parsed.pathname).toLowerCase();
-    if (ext === ".svg") {
+    if (!raw && ext === ".svg") {
       // These formats may contain their own external resource graphs. Retain
       // rather than claim a closed graph after embedding only the outer file.
       const source = text(bytes);
@@ -1030,7 +1038,7 @@ export function packHtml(
     let output;
     try {
       output =
-        ext === ".gltf" || ext === ".glb"
+        raw ? bytes : ext === ".gltf" || ext === ".glb"
           ? embedGltfAssets(bytes, ext === ".glb", (uri) => assetFor(local(uri, url)), fail)
           : stylesheet || ext === ".css"
             ? Buffer.from(css(text(bytes), url))
@@ -1045,7 +1053,7 @@ export function packHtml(
     const identity = keyFor(url).slice("f3d-packed/".length);
     // Wasm streaming requires the exact application/wasm content type.
     const data =
-      dataUrl(output, mime.startsWith("image/") ? mime + ";f3d-resource=" + identity : mime) +
+      dataUrl(output, !raw && mime.startsWith("image/") ? mime + ";f3d-resource=" + identity : mime) +
       parsed.hash;
     assets.set(key, { data, original: bytes, output });
     return data;
@@ -1175,6 +1183,8 @@ export function packHtml(
       });
     }
   }
+  if (documentFetchUsed && documentFetchMutated)
+    fail("FETCH_URL", "A document script replaces fetch; keep its original networked host route");
   // Emit one map before executable code. All identities are now known; circular
   // modules refer to stable keys, never recursively nested data URLs.
   const map = Object.fromEntries([...modules.values()].flatMap((record) =>
@@ -1202,7 +1212,7 @@ export function packHtml(
     ...(workers.size
       ? { workerCount: workers.size, workerScriptCount: workerModules.size + workerClassics.size }
       : {}),
-    staticResourceClosure: "modules-markup-css-and-static-module-relative-assets",
+    staticResourceClosure: "modules-markup-css-static-module-assets-and-finite-document-fetches",
     runtimeNetworking: "unchanged-not-analyzed",
   };
 }

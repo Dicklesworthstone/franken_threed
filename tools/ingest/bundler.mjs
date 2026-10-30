@@ -18,6 +18,7 @@ import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 import {
@@ -114,6 +115,7 @@ export function f3dRollupPlugin(options = {}) {
   const documentAssets = new Map();
   const documentResourceURLs = new Map();
   const documentRequests = [];
+  const documentFetchSites = [];
   let defaultManagerExposed = false;
   let loaderResourceCalls = false;
 
@@ -220,14 +222,22 @@ export function f3dRollupPlugin(options = {}) {
           fail: (code, message) => this.error({ code, message: `${message} (loader in ${JSON.stringify(id)})` }),
         })) documentAssets.set(fileName, asset);
       }
-      for (const [fileName, asset] of documentAssets) {
+      const resources = new Map(documentAssets);
+      if (options.documentUrl) for (const [name, asset] of collectDocumentFetchAssets(documentFetchSites, {
+        documentUrl: options.documentUrl, documentBaseUrl: mapBaseUrl,
+      })) {
+        if (resources.has(name) && !Buffer.from(resources.get(name).source).equals(asset.source))
+          this.error(`Document fetch bytes disagree with loader resource ${JSON.stringify(name)}`);
+        resources.set(name, asset);
+      }
+      for (const [fileName, asset] of resources) {
         if (options.documentUrl && fileName === path.basename(fileURLToPath(options.documentUrl))) {
-          this.error(`Loader resource ${JSON.stringify(fileName)} collides with the emitted HTML entry`);
+          this.error(`Document resource ${JSON.stringify(fileName)} collides with the emitted HTML entry`);
         }
         const existing = bundle[fileName];
         if (existing) {
           if (existing.type === "asset" && Buffer.from(existing.source).equals(asset.source)) continue;
-          this.error(`Loader resource ${JSON.stringify(fileName)} collides with an emitted bundle file`);
+          this.error(`Document resource ${JSON.stringify(fileName)} collides with an emitted bundle file`);
         }
         this.emitFile({ type: "asset", fileName, ...asset });
       }
@@ -398,6 +408,8 @@ export function f3dRollupPlugin(options = {}) {
       }
 
       if (ast) {
+        if (options.documentUrl && code.includes("fetch"))
+          documentFetchSites.push(...analyzeDocumentFetch(ast).sites);
         const classifyImport = createDynamicImportClassifier(ast);
         const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
           .map(request => [request.source_span.start.offset, request]));

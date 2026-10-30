@@ -46,6 +46,7 @@ import {
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 
@@ -973,6 +974,20 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
     const importMap = parsedHtml.importMap;
     const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl);
+    const copyFetchResources = (source, sourceType) => {
+      if (!source.includes("fetch")) return;
+      const {sites} = analyzeDocumentFetch(source, {sourceType});
+      for (const [name, asset] of collectDocumentFetchAssets(sites, {
+        documentUrl: entryBaseUrl, documentBaseUrl: parsedHtml.baseUrl,
+      })) {
+        if (emittedChunkNames.has(name))
+          throw new Error(`Document fetch resource ${JSON.stringify(name)} collides with an emitted chunk or HTML entry`);
+        const previous = targetFiles.get(name);
+        if (previous !== undefined && !Buffer.from(previous).equals(asset.source))
+          throw new Error(`Document fetch bytes disagree with retained resource ${JSON.stringify(name)}`);
+        targetFiles.set(name, asset.source);
+      }
+    };
 
     // Extract relative assets referenced by the HTML (stylesheets, images, media, non-module scripts)
     // Excludes modulepreloads that map to bundled chunks
@@ -1006,6 +1021,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       }
       const scriptBody = inlineMatch[2];
       if (!scriptBody || !scriptBody.trim()) continue;
+      copyFetchResources(scriptBody, "script");
 
       const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
         scriptBody,
@@ -1180,6 +1196,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
         visitedJsUrls.add(fileUrl);
         const jsContent = assetData.toString("utf-8");
+        copyFetchResources(jsContent, item.isModuleSpecifier ? "module" : "script");
         const { moduleRequests, assetSpecifiers } = extractJsModuleDependencies(
           jsContent,
           fileUrl,
