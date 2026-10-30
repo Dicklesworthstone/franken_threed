@@ -44,10 +44,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
   maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null,
   withFramebufferCopies = null, renderLists = null, renderId = renderer?.info?.calls,
-  bundles = null, bundleDepth = 0} = {}) {
+  bundles = null, bundleDepth = 0, sortState = null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
-  const sortObjects = renderer?.sortObjects === true;
+  const sortObjects = sortState ? sortState.sortObjects : renderer?.sortObjects === true;
+  const opaqueSort = sortState ? sortState.opaqueSort : renderer?._opaqueSort;
+  const transparentSort = sortState ? sortState.transparentSort : renderer?._transparentSort;
+  // User comparators observe the complete source list before any draw updates.
+  // Capture ordinary companions through the same owner instead of sorting a
+  // partial native list and replaying callbacks when fixed draws are merged.
+  const customSort = sortObjects && !!(opaqueSort || transparentSort);
   // Removing an admitted environment must keep the same source lighting and
   // deformation path. The fixed shader has different rounding/normal behavior.
   const nativeMaterialFeatures = material => nativeFeatures(material) || environmentMaterialHistory.get(renderer)?.has(material);
@@ -202,7 +208,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
-  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene
+  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene
     ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -387,7 +393,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const end = Math.min(extent, range.start + range.count, group && !object.isBatchedMesh ? group.start + group.count : Infinity);
       const listMaterial = Object.freeze({id: original.id, transparent: transparent(original), transmission: original.transmission ?? 0});
       const packet = {binding, object, geometry, material, listMaterial,
-        group: group ? Object.freeze({...group}) : null, groupOrder, z, renderOrder: object.renderOrder,
+        group: group ? Object.freeze({...group}) : null, groupOrder, z: camera.reversedDepth === true ? -z : z, renderOrder: object.renderOrder,
         first, count: Math.max(0, end - first), frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0,
         nodeRangeCaptured: true, nodeUniforms: null, background, sourceMaterial: original, sourceGroup: group,
         transmissionDoublePass: transmissive(original) && original.side === three.DoubleSide && original.forceSinglePass === false,
@@ -434,11 +440,26 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const children = hierarchy.get(object);
       for (let i = children.length - 1; i >= 0; i--) visible.push({object: children[i], groupOrder});
     }
-    if (sortObjects) {
+    if (sortObjects && uniforms) {
       const order = (a, b) => a.groupOrder - b.groupOrder || a.renderOrder - b.renderOrder;
       // Source WebGPU opaque sorting deliberately has no material-id key.
-      opaque.sort((a, b) => order(a, b) || a.z - b.z || a.object.id - b.object.id);
-      translucent.sort((a, b) => order(a, b) || b.z - a.z || a.object.id - b.object.id);
+      const opaqueDefault = (a, b) => order(a, b) || a.z - b.z || a.object.id - b.object.id;
+      const transparentDefault = (a, b) => order(a, b) || b.z - a.z || a.object.id - b.object.id;
+      const items = new Map();
+      const sourceItem = draw => {
+        if (!items.has(draw)) items.set(draw, {id: draw.object.id, object: draw.object, geometry: draw.geometry,
+          material: draw.sourceMaterial, groupOrder: draw.groupOrder, renderOrder: draw.renderOrder, z: draw.z,
+          group: draw.sourceGroup, clippingContext: draw.binding.clippingContext});
+        return items.get(draw);
+      };
+      const compare = (custom, fallback) => custom ? (a, b) => custom(sourceItem(a), sourceItem(b)) : fallback;
+      const backFaces = translucent.filter(draw => draw.transmissionDoublePass);
+      if (opaque.length > 1) opaque.sort(compare(opaqueSort, opaqueDefault));
+      // Source RenderList sorts this separate list before the complete
+      // transparent list. Share item identities and retain both resulting orders.
+      if (backFaces.length > 1) backFaces.sort(compare(transparentSort, transparentDefault));
+      backFaces.forEach((draw, index) => { draw.transmissionBackOrder = index; });
+      if (translucent.length > 1) translucent.sort(compare(transparentSort, transparentDefault));
     }
     draws.push(...backgroundDraws, ...opaque, ...translucent);
   }
@@ -916,6 +937,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       };
       const transparentDraws = selected.filter(draw => !draw.background && draw.listMaterial.transparent);
       const doublePassDraws = transparentDraws.filter(draw => draw.transmissionDoublePass);
+      if (!bundled && sortObjects && uniforms) doublePassDraws.sort((a, b) => a.transmissionBackOrder - b.transmissionBackOrder);
       for (const draw of selected) if (draw.background || !draw.listMaterial.transparent) captureColor(draw);
       // r186 _renderTransparents renders all transmissive back faces before
       // the complete transparent list. Every participating material already
@@ -1097,7 +1119,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nodeCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram));
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
-    sortObjects, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
+    sortObjects, sortCaptured: customSort && uniforms, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
     get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() { for (const step of preparationSteps(false)) { /* publish without node updates */ } },
     ...(nodeCompilation ? {async compileAttributes(prepare) { for (const step of preparationSteps(true)) await prepare(); }} : {}),

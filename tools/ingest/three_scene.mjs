@@ -1572,13 +1572,13 @@ export async function createGpuThreeScene(device,scene,{
     const previousDrawContext=publicRenderer?._programDrawContext;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','framebuffer','depthbuffer'].includes(k)))
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','sortState','framebuffer','depthbuffer'].includes(k)))
         fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
       passBackgroundState=options.backgroundState;
       passMaterialFrame=options.materialFrame??null;
-      const sorting=passNodeFrame?.sortObjects??sortObjects;
+      const sorting=options.sortState?.sortObjects??passNodeFrame?.sortObjects??sortObjects;
       // Framebuffer size for program gl_FragCoord; not a core renderer frame key.
       programTargetSize=frame.targetSize??null;
       programViewportSize=frame.viewportSize??null;
@@ -1661,7 +1661,8 @@ export async function createGpuThreeScene(device,scene,{
                 if(opaque.length+transmissive.length+transparent.length>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
                 updateObject(object);
                 // WebGLRenderList.push: transmission > 0 joins the transmissive list.
-                (originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true});
+                (originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true,
+                  sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
                 return;
               }
               const instanceSource=object.isInstancedMesh?object:null;
@@ -1675,7 +1676,8 @@ export async function createGpuThreeScene(device,scene,{
               if((shadowPass?casterItems.length:opaque.length+transmissive.length+transparent.length)>=(renderOptions.maxDraws??1024))fail('LIMIT','Source draw list exceeds capacity');
               // Source list partition and sorting precede the draw-time override.
               if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
-              (shadowPass?casterItems:originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass});
+              (shadowPass?casterItems:originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass,
+                sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
             }
         const selectedMaterial=sourceMaterial(object);
         if(Array.isArray(selectedMaterial))for(const group of source.groups)push(selectedMaterial[group.materialIndex],group);
@@ -1733,13 +1735,30 @@ export async function createGpuThreeScene(device,scene,{
         else if(packet.background)nativeBackground=draw;
         else (packet.transmissionBack?transmissionBacks:packet.listMaterial.transparent?transparent:opaque).push(draw);
       }
-      if(sorting){
+      if(sorting&&!passNodeFrame?.sortCaptured){
         const order=(a,b)=>a.groupOrder-b.groupOrder||(a.renderOrder??a.object.renderOrder)-(b.renderOrder??b.object.renderOrder);
-        opaque.sort((a,b)=>order(a,b)||(programRoute()?a.listMaterial.id-b.listMaterial.id:0)||a.z-b.z||a.object.id-b.object.id);
-        transparent.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
-        transmissive.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
+        const variant=item=>(item.object.isInstancedMesh?2:0)+(item.object.isSkinnedMesh?1:0);
+        const opaqueDefault=(a,b)=>order(a,b)||(programRoute()?a.listMaterial.id-b.listMaterial.id||variant(a)-variant(b):0)||a.z-b.z||a.object.id-b.object.id;
+        const transparentDefault=(a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id;
+        const sortItems=new Map();
+        const sourceItem=item=>{
+          if(!sortItems.has(item))sortItems.set(item,{id:item.object.id,object:item.object,
+            geometry:item.sourceGeometry??item.geometry,material:item.sourceMaterial??item.listMaterial,
+            ...(programRoute()?{materialVariant:variant(item)}:{}),
+            groupOrder:item.groupOrder,renderOrder:item.renderOrder,z:item.z,
+            group:item.sourceGroup??null,...(programRoute()?{}:{clippingContext:item.binding?.clippingContext})});
+          return sortItems.get(item);
+        };
+        const sortList=(list,custom,fallback)=>{
+          if(list.length>1)list.sort(custom?(a,b)=>custom(sourceItem(a),sourceItem(b)):fallback);
+        };
+        sortList(opaque,options.sortState?.opaqueSort,opaqueDefault);
+        // WebGLRenderList sorts transmissive before transparent. Preserve that
+        // observable comparator order, including source material/group identities.
+        sortList(transmissive,options.sortState?.transparentSort,transparentDefault);
+        sortList(transparent,options.sortState?.transparentSort,transparentDefault);
         transmissionBacks.sort((a,b)=>order(a,b)||b.z-a.z||a.object.id-b.object.id);
-      }else if(passNodeFrame){
+      }else if(!sorting&&passNodeFrame){
         // Fixed and native packets are prepared separately, but disabling
         // sorting preserves their original shared projection order.
         const order=(a,b)=>projectionOrder.get(a.object)-projectionOrder.get(b.object);

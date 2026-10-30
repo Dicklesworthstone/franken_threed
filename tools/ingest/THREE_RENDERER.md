@@ -228,6 +228,26 @@ updates follow the pinned native renderer. This does not admit nested arrays
 or multiview/XR cameras. Custom native
 scene/object/material render hooks retain their existing explicit rejection.
 
+## Public render-list sorting
+
+Both renderer surfaces implement `setOpaqueSort()` and `setTransparentSort()`.
+Passing `null` restores the source default; `sortObjects = false` bypasses the
+comparators. Callback items retain source `id`, `object`, `geometry`, `material`,
+`groupOrder`, `renderOrder`, `z` and original `group` identities, plus WebGL's
+`materialVariant` or the native clipping context. The transparent comparator
+orders WebGL's transmissive and transparent lists separately, and native
+transmission's back-face list before its complete transparent list.
+
+Native custom-sorted scenes share one source draw capture, including ordinary
+material companions. Comparators run before object/node updates, and the accepted
+draw order survives asynchronous preparation without replaying callbacks. Each
+queued WebGL call retains its comparator references and sorting flag; comparator
+execution follows that route's existing prepared-bridge lifecycle. JavaScript
+closures remain application-owned. `three_renderer_sorting.test.mjs` compares
+the pinned render-list callback traces and recorded GPU draw order, including
+material groups, canvas/target queues, reset, disabled sorting and errors.
+These are source/command correctness checks, not pixel or performance results.
+
 ## WebGL-authored batched ArrayCamera draws
 
 The WebGL-authored route supports `BatchedMesh` through each child camera's

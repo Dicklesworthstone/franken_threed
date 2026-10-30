@@ -177,10 +177,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, frame, framebuffer, depthbuffer) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, frame, framebuffer, depthbuffer) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, framebuffer, depthbuffer});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, framebuffer, depthbuffer});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -318,6 +318,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.toneMapping = NoToneMapping;
       this.toneMappingExposure = 1;
       this.sortObjects = true;
+      this._opaqueSort = null;
+      this._transparentSort = null;
       this.opaque = true;
       this.transparent = true;
       this.shadowMap = {enabled: false, transmitted: false, type: THREE.PCFShadowMap};
@@ -926,6 +928,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return this._renderCall(scene, camera);
     }
     _beforeRender() {}
+    setOpaqueSort(method) { this._opaqueSort = method; }
+    setTransparentSort(method) { this._transparentSort = method; }
     isOccluded(object) { return this._occlusionContext && this._occlusionContext.occluded?.has(object); }
     getRenderObjectFunction() { return this._renderObjectFunction; }
     setRenderObjectFunction(value) {
@@ -962,6 +966,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
+      // Each accepted call keeps its source sort selection while pipelines are
+      // prepared. Changing a sorter for the next call cannot reorder this one.
+      const sortState = Object.freeze({sortObjects: this.sortObjects === true,
+        opaqueSort: this._opaqueSort, transparentSort: this._transparentSort});
       const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement, canvasSize = this._bufferSize();
       const renderId = this.info.calls;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
@@ -997,7 +1005,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
       const nodeFrame = native && !nodeCaptureDeferred
-        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face}) : null;
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face, sortState}) : null;
       if (nodeFrame) matricesUpdated = true;
       // Native callbacks retain the original camera in _captureNodeFrame.
       // Fixed draws can wait on pipeline/texture preparation; capture their
@@ -1018,7 +1026,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const request = {snapshot, nodeFrame, materialFrame};
       try {
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
-          nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize,
+          nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState,
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
             : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
@@ -1147,7 +1155,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (outputState) { this.autoClear = outputState.autoClear; this.xr.enabled = outputState.xrEnabled; }
       }
     }
-    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId,
+    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId, sortState = null,
       canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target, mipLevel = 0, face = 0}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
@@ -1184,7 +1192,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           maxQueries: maxDraws, maxContexts: maxBindings, fail});
         this._occlusionContext = queries.context(destination === this ? this._renderTarget : target, mrt,
           captureCameras ? bundleDepth : 0);
-        captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId,
+        captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId, sortState,
           bundles: this._nodeBundles ??= createThreeNodeBundles(THREE, {maxEntries: maxDraws, fail}),
           bundleDepth,
           getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
@@ -1255,7 +1263,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1286,7 +1294,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._programFrame = deferred ? programFrame : undefined;
       try {
         const issue = () => {
-          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame},
+          if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState},
             this._hdr ? {...frame, outputEnabled: nodeFrame?.phases?.output !== false} : frame);
           else {
             // Source Renderer initializes depth once per destination target,
@@ -1298,7 +1306,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               (!this._shaderEncodedOutput && destination.shape.sharedDepth ||
                 outputPass && sourceTarget !== null && !copiedDepth);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
+            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth && (!destination.shape.sharedDepth || !clearOnly))
