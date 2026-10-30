@@ -12,6 +12,7 @@ import {geometryBoundsSourceRole,specializeGeometryBounds} from './geometry_boun
 import {specializeGeometryTangents} from './geometry_tangents_specialization.mjs';
 import {specializeAnimationInterpolants} from './animation_interpolants_specialization.mjs';
 import {specializePropertyMixer} from './property_mixer_specialization.mjs';
+import {skeletonUpdateSourceRole,specializeSkeletonUpdate,specializeSkeletonArrayWitnesses} from './skeleton_update_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
@@ -23,6 +24,7 @@ const BOUNDS='\0f3d-geometry-bounds-adapter';
 const TANGENTS='\0f3d-geometry-tangents-adapter';
 const INTERPOLANTS='\0f3d-animation-interpolants-adapter';
 const PROPERTY_MIXER='\0f3d-property-mixer-adapter';
+const SKELETON='\0f3d-skeleton-update-adapter';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -40,14 +42,14 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[],tangentReports=[],interpolantReports=[],propertyMixerReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[],tangentReports=[],interpolantReports=[],propertyMixerReports=[],skeletonReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;tangentReports.length=0;interpolantReports.length=0;propertyMixerReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;tangentReports.length=0;interpolantReports.length=0;propertyMixerReports.length=0;skeletonReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
-      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
       if (importer===INSTANCE_UPDATES && source==='./euler_update_adapter.mjs') return EULER_UPDATES;
       if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
@@ -67,11 +69,12 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===TANGENTS) return fs.readFileSync(new URL('./geometry_tangents_adapter.mjs',import.meta.url),'utf8');
       if (id===INTERPOLANTS) return fs.readFileSync(new URL('./animation_interpolants_adapter.mjs',import.meta.url),'utf8');
       if (id===PROPERTY_MIXER) return fs.readFileSync(new URL('./property_mixer_adapter.mjs',import.meta.url),'utf8');
+      if (id===SKELETON) return fs.readFileSync(new URL('./skeleton_update_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -126,6 +129,11 @@ export function marchingCubesRollupPlugin(options={}) {
           if(propertyMixer.report)propertyMixerReports.push({id,...propertyMixer.report});
           if(propertyMixer.changed){edits.push(...propertyMixer.edits);headers.push(propertyMixer.header);tail+=propertyMixer.tail;}
         }
+        if(code.includes('class Skeleton')||code.includes('class Object3D')) {
+          const skeleton=specializeSkeletonUpdate(code,{...sources,runtimeModule:SKELETON,maxMemoryPages,maxIterations});
+          if(skeleton.report)skeletonReports.push({id,...skeleton.report});
+          if(skeleton.changed){edits.push(...skeleton.edits);headers.push(skeleton.header);tail+=skeleton.tail;}
+        }
         if(code.includes('class Object3D')) {
           const batch=specializeTransformBatch(code,{runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
           if(batch.report)transformReports.push({id,...batch.report});
@@ -148,11 +156,22 @@ export function marchingCubesRollupPlugin(options={}) {
         const instanceLoops=specializeInstancedMatrixLoops(code,{runtimeModule:INSTANCE_UPDATES});
         if(instanceLoops.report)instanceReports.push({id,...instanceLoops.report});
         if(instanceLoops.changed){edits.push(...instanceLoops.edits);headers.push(instanceLoops.header);}
+        const skeletonArrays=specializeSkeletonArrayWitnesses(code,{runtimeModule:SKELETON});
+        if(skeletonArrays.changed){edits.push(...skeletonArrays.edits);headers.push(skeletonArrays.header);}
         if(!headers.length)return null;
         let transformed=code;
         for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
         return {code:headers.join('')+transformed+tail,map:null};
       };
+      if(code.includes('class Skeleton')&&skeletonUpdateSourceRole(code)==='skeleton') {
+        return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{
+          let matrixSource;
+          if(resolved&&!resolved.external)try {
+            matrixSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
+          }catch{/* Modified or unavailable dependencies retain the source loop. */}
+          return finish({matrixSource});
+        });
+      }
       if(normalCandidate && geometryNormalSourceRole(code)==='geometry') {
         return Promise.all([['vectorSource','../math/Vector3.js'],['vector2Source','../math/Vector2.js'],['attributeSource','./BufferAttribute.js']].map(async([key,specifier])=>{
           const resolved=await this.resolve(specifier,id,{skipSelf:true});
@@ -197,6 +216,8 @@ export function marchingCubesRollupPlugin(options={}) {
         compiledModules:interpolantReports.length,modules:interpolantReports.map(report=>({...report}))};},
       getPropertyMixerReport(){return {version:1,accelerationClaim:false,
         compiledModules:propertyMixerReports.length,modules:propertyMixerReports.map(report=>({...report}))};},
+      getSkeletonUpdatesReport(){return {version:1,accelerationClaim:false,
+        compiledModules:skeletonReports.length,modules:skeletonReports.map(report=>({...report}))};},
       getGeometryBoundsReport(){return {version:1,accelerationClaim:false,
         compiledModules:boundsReports.filter(report=>report.compiledMethods.length).length,modules:boundsReports.map(report=>({...report}))};},
       getTransformBatchesReport(){return {version:1,accelerationClaim:false,
