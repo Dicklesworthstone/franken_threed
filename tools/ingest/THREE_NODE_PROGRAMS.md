@@ -972,7 +972,7 @@ source setting.
 Captured graph descriptors, raster state, source list properties, draw ranges and
 uniform bytes survive later source edits. Material/geometry disposal invalidates
 the compiler cache, and subsequent graph or structural changes select a new
-program. The facade also captures ordinary CPU geometry through the existing
+program. Native programs also capture ordinary CPU geometry through the existing
 immutable geometry owner at the source upload boundary. Shared geometry uploads
 once per logical render; unmarked edits and untouched partial ranges stay stale,
 including when a render callback is added after initial compilation. This is not
@@ -995,11 +995,34 @@ list items. `compileAsync()` runs object hooks without node updates; warm bundle
 do not replay object hooks or override inheritance. Material `onBeforeRender`
 remains inert, as it is in the pinned WebGPU renderer.
 
-This callback path currently requires a source Scene with wholly native mesh or sprite
-draws. Mixed fixed/native hook lists, callback replacement of selected geometry,
-custom BatchedMesh hooks and recursive GPU writes still require additional
-capture boundaries and fail explicitly. Callback exceptions retain earlier
-source mutations and do not replay updates or run later after-callbacks.
+Object lifecycle hooks now select this path for ordinary built-in materials as
+well as authored node materials. All active companions use the same native
+capture owner, preserving one source-ordered render list without requiring an
+application-provided comparator. Grouped materials, live overrides, transparent
+double-sided draws, visibility, camera layers and opaque/transparent phase
+controls keep the source lifecycle above. Queued calls retain each draw's
+material values and requested geometry uploads before preparation can await.
+Removing the hooks retains the native owner and its upload history, including
+when another scene shares the geometry or individual attributes.
+
+This path requires a source Scene. Install ordinary object hooks before their
+geometry attributes enter a fixed-path render or `compileAsync()`: adding them
+after a fixed owner has accepted those attributes, even through another scene,
+still fails before invoking any hook. Transferring the fixed owner's existing
+upload history, including queued work and unversioned CPU edits, remains
+unimplemented. Hooks added to an already native scene retain
+its existing upload history. Callback replacement of selected geometry, custom
+BatchedMesh hooks, effectful attribute upload hooks and recursive GPU writes also
+require additional capture boundaries and fail explicitly. Callback exceptions
+retain earlier source mutations and do not replay updates or run later
+after-callbacks. These are remaining compatibility gaps, not source-invalid uses.
+
+Fifteen focused cases in `three_node_scene_capture.test.mjs` and
+`three_renderer_nodes.test.mjs` verify the ordinary/mixed lifecycle, source group
+and material identities, compile-only effects, exceptions, queued draw bytes,
+hook removal, cross-scene attribute history and the existing-owner boundary. The
+recording device verifies commands and uploaded bytes; this change has no new
+browser-pixel or performance measurement.
 
 ## Logarithmic and reversed depth
 

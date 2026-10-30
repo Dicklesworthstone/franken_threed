@@ -571,7 +571,7 @@ test('native object callbacks run once around both alpha sides and prepare graph
 });
 
 test('compile-only native callbacks retain source order without running node updates or repeating preparation effects', t => {
-  const f = rig(t), material = f.material(), a = f.mesh(material), b = f.mesh(material), events = [];
+  const f = rig(t), material = f.material(), a = f.mesh(new THREE.MeshBasicMaterial()), b = f.mesh(material), events = [];
   let updates = 0; material.colorNode = N.uniform(.25).onObjectUpdate(() => { updates++; return .25; });
   for (const object of [a, b]) {
     object.onBeforeRender = function() { events.push(['before', this]); };
@@ -618,17 +618,68 @@ test('native callbacks keep thrown source effects, omit later callbacks, and lea
   assert.doesNotThrow(() => assertThreeNativeTargetWrite(f.renderer, null));
 });
 
-test('mixed fixed/native object callback lists refuse before source effects and legacy material callbacks remain inert', t => {
-  const f = rig(t), object = f.mesh(), fixed = f.mesh(new THREE.MeshBasicMaterial()); let callbacks = 0;
-  object.onBeforeRender = () => { callbacks++; };
-  assert.throws(() => f.capture({bundles: f.bundles}), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(callbacks, 0);
-  fixed.visible = false; object.material.onBeforeRender = () => { assert.fail('WebGPU source does not call material.onBeforeRender'); };
-  const captured = f.capture({bundles: f.bundles}); assert.equal(callbacks, 1);
+test('mixed ordinary/native object callbacks capture the complete source list without a custom comparator', t => {
+  const f = rig(t), object = f.mesh(), ordinary = f.mesh(new THREE.MeshBasicMaterial()), events = [];
+  ordinary.renderOrder = -1;
+  object.onBeforeRender = function() { events.push(['before', this]); ordinary.material.color.setRGB(.125, .25, .375); };
+  object.onAfterRender = function() { events.push(['after', this]); };
+  object.material.onBeforeRender = ordinary.material.onBeforeRender = () => { assert.fail('WebGPU source does not call material.onBeforeRender'); };
+  const captured = f.capture({bundles: f.bundles});
+  assert.deepEqual(events, [['before', object], ['after', object]]);
+  assert.deepEqual(captured.draws.map(draw => draw.object), [ordinary, object]);
+  assert.ok(captured.objects.has(ordinary) && captured.objects.has(object));
+  assert.equal(captured.draws[0].material, ordinary.material);
+  assert.ok(!floats(captured.draws[0].nodeUniforms).includes(.125), 'later callbacks cannot rewrite an earlier ordinary draw');
+  assert.equal(f.renderer._opaqueSort, undefined); assert.equal(f.renderer._transparentSort, undefined);
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('ordinary object callbacks preserve source group identities, live overrides and transparent side ordering', t => {
+  const f = rig(t), first = new THREE.MeshBasicMaterial(), second = new THREE.MeshBasicMaterial({transparent: true, side: THREE.DoubleSide});
+  second.allowOverride = false;
+  const object = f.mesh([first, second]), companion = f.mesh(new THREE.MeshBasicMaterial());
+  object.geometry.clearGroups(); object.geometry.addGroup(0, 3, 0); object.geometry.addGroup(3, 3, 1);
+  companion.renderOrder = -1;
+  const override = new THREE.MeshBasicMaterial({color: new THREE.Color(.875, .625, .375)}), events = [];
+  f.scene.overrideMaterial = override;
+  const hook = phase => function(renderer, scene, camera, geometry, material, group) {
+    assert.equal(this, object); assert.equal(renderer, f.renderer); assert.equal(scene, f.scene);
+    assert.equal(camera, f.camera); assert.equal(geometry, object.geometry);
+    events.push([phase, material, group, material.side]);
+  };
+  object.onBeforeRender = hook('before'); object.onAfterRender = hook('after');
+  const captured = f.capture({bundles: f.bundles, overrideMaterial: override});
+  assert.deepEqual(events, [
+    ['before', first, object.geometry.groups[0], THREE.FrontSide],
+    ['after', override, object.geometry.groups[0], THREE.FrontSide],
+    ['before', second, object.geometry.groups[1], THREE.DoubleSide],
+    ['after', second, object.geometry.groups[1], THREE.DoubleSide],
+  ]);
+  assert.deepEqual(captured.draws.map(draw => [draw.object, draw.material, draw.first, draw.count, draw.binding.raster.side]), [
+    [companion, override, 0, 6, THREE.FrontSide], [object, override, 0, 3, THREE.FrontSide],
+    [object, second, 3, 3, THREE.BackSide], [object, second, 3, 3, THREE.FrontSide],
+  ]);
+  assert.ok(floats(captured.draws[1].nodeUniforms).includes(.875));
+  assert.equal(object.material[0], first); assert.equal(object.material[1], second);
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('ordinary object callbacks obey inherited visibility, camera layers and source phase controls', t => {
+  const f = rig(t), material = new THREE.MeshBasicMaterial(), active = f.mesh(material), events = [];
+  active.onAfterRender = function() { events.push(this); };
+  const hidden = new THREE.Group(); hidden.visible = false; f.scene.add(hidden);
+  const hiddenMesh = f.mesh(new THREE.ShaderMaterial(), hidden), layerMesh = f.mesh(material);
+  layerMesh.layers.set(1);
+  const transparentMesh = f.mesh(new THREE.MeshBasicMaterial({transparent: true}));
+  for (const object of [hiddenMesh, layerMesh, transparentMesh]) object.onBeforeRender = () => assert.fail('unselected callback');
+  const captured = f.capture({bundles: f.bundles, renderLists: {opaque: true, transparent: false}});
+  assert.deepEqual(events, [active]); assert.deepEqual(captured.draws.map(draw => draw.object), [active]);
+  assert.ok(captured.excludedObjects.has(hiddenMesh));
   for (const lease of captured.bundleGeometries) lease.release();
 });
 
 test('native callbacks change the live scene override for subsequent source list items', t => {
-  const f = rig(t), first = f.mesh(), second = f.mesh(), replacement = f.material(), observed = [];
+  const f = rig(t), first = f.mesh(new THREE.MeshBasicMaterial()), second = f.mesh(), replacement = f.material(), observed = [];
   replacement.colorNode = N.uniform(new THREE.Color(.875, .625, .375));
   first.onAfterRender = () => { f.scene.overrideMaterial = replacement; };
   second.onBeforeRender = () => { observed.push(f.scene.overrideMaterial); };

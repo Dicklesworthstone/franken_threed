@@ -190,6 +190,85 @@ test('native object callbacks preserve prior upload history when hooks are added
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
+test('ordinary object hooks capture queued draws and retain upload history after callbacks are removed',async t=>{
+  const f=fixture(t),material=new T.MeshBasicMaterial(),companionMaterial=new T.MeshBasicMaterial({color:0xffffff});
+  f.mesh.material=material;f.mesh.frustumCulled=false;
+  const companion=new T.Mesh(new T.PlaneGeometry(),companionMaterial);companion.renderOrder=1;
+  f.scene.add(companion);
+  const position=f.mesh.geometry.attributes.position,events=[];let phase=0;
+  f.mesh.onBeforeRender=function(renderer,scene,camera,geometry,sourceMaterial,group){
+    assert.equal(this,f.mesh);assert.equal(renderer,f.renderer);assert.equal(scene,f.scene);assert.equal(camera,f.camera);
+    assert.equal(geometry,f.mesh.geometry);assert.equal(sourceMaterial,material);assert.equal(group,null);
+    const red=phase===0?.25:.5;material.color.setRGB(red,.375,.875);
+    position.array[0]=red;position.needsUpdate=true;events.push(['before',phase]);
+  };
+  f.mesh.onAfterRender=function(){
+    events.push(['after',phase]);position.array[0]=99;material.color.setRGB(0,0,0);
+    companionMaterial.color.setRGB(phase===0?.125:.625,.75,.875);
+  };
+  material.onBeforeRender=()=>assert.fail('native source does not call material.onBeforeRender');
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  phase=1;f.renderer.render(f.scene,f.camera);
+  f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;f.mesh.onAfterRender=T.Object3D.prototype.onAfterRender;
+  material.color.setRGB(.75,.375,.875);companionMaterial.color.setRGB(.875,.75,.875);
+  f.renderer.render(f.scene,f.camera);
+  material.color.setRGB(0,0,0);companionMaterial.color.setRGB(0,0,0);position.array[0]=-99;
+  assert.deepEqual(events,[['before',0],['after',0],['before',1],['after',1]]);
+  assert.equal(f.acquired(),0,'all callback effects and draw snapshots precede asynchronous preparation');
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,6);
+  for(const [index,color] of [[.25,.375,.875],[.125,.75,.875],[.5,.375,.875],[.625,.75,.875],
+    [.75,.375,.875],[.875,.75,.875]].entries())assert.ok(containsColor(draws[index],color),`ordinary queued color ${index}`);
+  const firstPosition=draw=>{
+    const bytes=draw.contents.get(draw.streams.get(0));return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];
+  };
+  assert.deepEqual([draws[0],draws[2],draws[4]].map(firstPosition),[.25,.5,.5],
+    'removing callbacks preserves the last uploaded bytes without a new source update request');
+  assert.deepEqual(events,[['before',0],['after',0],['before',1],['after',1]],'preparation never replays source effects');
+  assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.renderer.info.f3d.presentedRenders,3);
+});
+
+test('adding ordinary hooks after fixed preparation refuses before effects instead of losing upload history',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  await f.renderer.compileAsync(f.scene,f.camera);
+  f.mesh.geometry.attributes.position.array.fill(7);let callbacks=0;
+  f.mesh.onBeforeRender=()=>{callbacks++;};
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),error=>
+    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
+  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);
+  assert.equal(f.acquired(),0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('ordinary hooks reject prior fixed attribute history shared by another scene before effects',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  await f.renderer.compileAsync(f.scene,f.camera);
+  const otherScene=new T.Scene(),other=new T.Mesh(f.mesh.geometry.clone(),new T.MeshBasicMaterial());
+  other.geometry.setAttribute('position',f.mesh.geometry.attributes.position);
+  otherScene.add(other);other.frustumCulled=false;let callbacks=0;
+  other.geometry.attributes.position.array.fill(7);other.onBeforeRender=()=>{callbacks++;};
+  assert.throws(()=>f.renderer.render(otherScene,f.camera),error=>
+    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
+  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);
+  assert.equal(f.acquired(),0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('ordinary hook attribute history follows shared geometry into another scene after hook removal',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const position=f.mesh.geometry.attributes.position;
+  f.mesh.onBeforeRender=()=>{position.array[0]=.25;position.needsUpdate=true;};
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;position.array[0]=99;
+  const otherScene=new T.Scene(),other=new T.Mesh(f.mesh.geometry.clone(),new T.MeshBasicMaterial());
+  other.geometry.setAttribute('position',position);other.frustumCulled=false;otherScene.add(other);
+  f.renderer.render(otherScene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  for(const draw of draws){
+    const bytes=draw.contents.get(draw.streams.get(0));
+    assert.equal(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0],.25);
+  }
+  assert.equal(position.array[0],99);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('native callback reentrant GPU rendering fails before a nested submission and releases the call scope',async t=>{
   const f=fixture(t);await f.renderer.init();
   const inner=new T.Scene(),innerMaterial=new T.MeshBasicNodeMaterial();innerMaterial.colorNode=T.TSL.vec3(.25);

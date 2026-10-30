@@ -16,6 +16,11 @@ const integer = value => Number.isSafeInteger(value) && value >= 0;
 const transmissive = material => material.transmission > 0 || material.transmissionNode?.isNode === true;
 const transparent = material => material.transparent === true || transmissive(material) || material.backdropNode?.isNode === true;
 const environmentMaterialHistory = new WeakMap();
+const hookSceneHistory = new WeakMap();
+const hookAttributeHistory = new WeakMap();
+const fixedAttributeHistory = new WeakMap();
+const attributeOwners = object => [...Object.values(object.geometry?.attributes ?? {}), object.geometry?.index,
+  object.instanceMatrix, object.instanceColor].filter(Boolean).map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
 
 // Additional source material features use the retained native shader builder.
 // Users must not add a dummy TSL slot to reach an existing implementation.
@@ -206,9 +211,34 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       renderer?._occlusionObjects?.add(object); nativeOcclusionScene = true;
     } else if (renderer?._occlusionObjects?.has(object)) nativeOcclusionScene = true;
   }
+  const objectHooks = object => object.onBeforeRender !==
+    (object.isBatchedMesh === true ? three.BatchedMesh.prototype : three.Object3D.prototype).onBeforeRender ||
+    object.onAfterRender !== three.Object3D.prototype.onAfterRender;
+  // Object callbacks can change ordinary companions and the live override.
+  // Keep one source-ordered owner even without authored nodes or comparators;
+  // source projection and phase controls still select which hooks execute.
+  const hookCandidates = [...hierarchy.keys()].filter(object => visibility.get(object) && !excludedObjects.has(object) &&
+      object !== backgroundMesh && object.isLineLoop !== true &&
+      (object.isMesh || object.isSprite || object.isPoints || object.isLine));
+  const nativeHookScene = hookSceneHistory.get(renderer)?.has(root) === true ||
+    hookCandidates.some(object => objectHooks(object) || attributeOwners(object).some(owner => hookAttributeHistory.get(renderer)?.has(owner)));
+  if (nativeHookScene && hookCandidates.some(object => attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner))))
+    fail('HOOK', 'Object callbacks require native upload history; install them before the geometry attributes reach a fixed owner');
+  if (nativeHookScene && renderer) {
+    let scenes = hookSceneHistory.get(renderer);
+    if (!scenes) hookSceneHistory.set(renderer, scenes = new WeakSet());
+    // Removing hooks must not move retained attribute upload history back to
+    // the fixed owner or recapture later CPU edits without needsUpdate.
+    scenes.add(root);
+    let attributes = hookAttributeHistory.get(renderer);
+    if (!attributes) hookAttributeHistory.set(renderer, attributes = new WeakSet());
+    // Shared attributes and objects moved to another root still belong to the
+    // same renderer history even when the application removes their callbacks.
+    for (const object of hookCandidates) for (const owner of attributeOwners(object)) attributes.add(owner);
+  }
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
-  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene
+  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene || nativeHookScene
     ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -257,8 +287,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (batch) inspectThreeNativeBatch(three, object, fail);
     if (typeof object.onBeforeRender !== 'function' || typeof object.onAfterRender !== 'function')
       fail('HOOK', 'Native object render callbacks must be callable');
-    if (object.onBeforeRender !== (batch ? three.BatchedMesh.prototype : three.Object3D.prototype).onBeforeRender ||
-        object.onAfterRender !== three.Object3D.prototype.onAfterRender) hookedObjects.add(object);
+    if (objectHooks(object)) hookedObjects.add(object);
     const geometry = object.geometry;
     if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
       fail('GEOMETRY', 'Native node meshes require bounded source BufferGeometry groups');
@@ -321,11 +350,30 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       bindings.push(draw.binding); compiledBindings.add(draw.binding);
       objects.add(draw.object); bundleObjects.add(draw.object);
     }
+  const rememberFixedAttributes = (selectedPhases = null) => {
+    const selected = material => material?.visible && (selectedPhases
+      ? selectedPhases[transparent(material) ? 'transparent' : 'opaque']
+      : listEnabled(transparent(material) ? 'transparent' : 'opaque'));
+    if (!renderer || nativeHookScene) return;
+    const fixed = [...hierarchy.keys()].filter(object => visibility.get(object) && !objects.has(object) &&
+        object.isLineLoop !== true && (object.isMesh || object.isSprite || object.isPoints || object.isLine) &&
+        object.layers.test(camera.layers) && (Array.isArray(object.material)
+          ? Array.isArray(object.geometry?.groups) && object.geometry.groups.some(group => selected(object.material[group.materialIndex]))
+          : selected(object.material)));
+    if (!fixed.length) return;
+    // A later hook-driven promotion cannot recover unversioned CPU edits from
+    // the fixed owner's private upload history. Refuse before any hook effect.
+    let attributes = fixedAttributeHistory.get(renderer);
+    if (!attributes) fixedAttributeHistory.set(renderer, attributes = new WeakSet());
+    for (const object of fixed) for (const owner of attributeOwners(object)) attributes.add(owner);
+  };
   const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides;
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {
-    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null) return null;
+    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null) {
+      rememberFixedAttributes(); return null;
+    }
     phases.opaque = listEnabled('opaque'); phases.transparent = listEnabled('transparent'); phases.output = phases.opaque;
     // The facade marks every captured pass as having updated source matrices,
     // including an empty pass. Hidden skins still participate in CPU animation.
@@ -334,6 +382,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
+    rememberFixedAttributes(phases);
     return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
       bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
@@ -1117,6 +1166,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (dirty) { publishAttributes(); yield; }
   }
   const nodeCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram));
+  rememberFixedAttributes(phases);
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
     sortObjects, sortCaptured: customSort && uniforms, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
