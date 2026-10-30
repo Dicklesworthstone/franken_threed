@@ -259,6 +259,7 @@ export function packHtml(
   const documentFactories = new Map(), documentNames = new Set(),
     documentBindings = new Set(), documentWorkerUses = new Set();
   let inputBytes = 0, workerBytes = 0, documentFetchUsed = false, documentFetchMutated = false;
+  let documentRequestUsed = false, documentRequestMutated = false;
   function chargeWorker(encoded) {
     const size = Buffer.byteLength(encoded);
     if (size > maxBytes - workerBytes)
@@ -538,6 +539,7 @@ export function packHtml(
     const documentFetch = worker ? {sites: []} : analyzeDocumentFetch(ast);
     const documentFetchSites = new Map(documentFetch.sites.map(site => [site.node, site]));
     documentFetchMutated ||= Boolean(documentFetch.hostMutated);
+    documentRequestMutated ||= Boolean(documentFetch.requestMutated);
     const replacements = [],
       allowedMeta = new Set(),
       workerURLs = new Set(),
@@ -962,6 +964,7 @@ export function packHtml(
           if (request.candidates.some(value => !value.startsWith("data:") && !isRelativeDocumentFetchUrl(value)))
             fail("FETCH_URL", `${from}: external or document-root fetches require the normal networked build`);
           documentFetchUsed = true;
+          documentRequestUsed ||= Boolean(request.request);
           const mapping = request.candidates.map(value =>
             [value, assetFor(local(value, base), false, true)]);
           // Only the argument changes. Keep its effects/TDZ behavior, the
@@ -1195,6 +1198,8 @@ export function packHtml(
   }
   if (documentFetchUsed && documentFetchMutated)
     fail("FETCH_URL", "A document script replaces fetch; keep its original networked host route");
+  if (documentRequestUsed && documentRequestMutated)
+    fail("FETCH_URL", "A document script replaces Request; keep its original networked host route");
   for (const name of documentWorkerUses)
     if (documentBindings.has(name))
       fail("WORKER_BINDING", `Document scripts rebind the host name ${name}`);

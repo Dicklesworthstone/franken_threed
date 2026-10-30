@@ -41,8 +41,11 @@ const runner = new URL(data(`
   registerHooks({resolve(specifier,context,next){return next(workerData.imports?.[specifier]??specifier,context);}});
   // Only the networked reference needs Node's missing document URL base.
   // Packed execution uses the actual native fetch with no wrapper or replies.
-  if(workerData.base){const nativeFetch=fetch;globalThis.fetch=(input,options)=>nativeFetch(
-    typeof input==='string'?new URL(input,workerData.base):input,options);}
+  if(workerData.base){const nativeFetch=fetch,NativeRequest=Request;
+    globalThis.Request=class extends NativeRequest{constructor(input,...options){
+      super(typeof input==='string'?new URL(input,workerData.base):input,...options);}};
+    globalThis.fetch=(input,options)=>nativeFetch(
+      typeof input==='string'?new URL(input,workerData.base):input,options);}
   for(const source of workerData.scripts)vm.runInThisContext(source);
   const app=await import(workerData.url);
   parentPort.postMessage(await app.run());
@@ -87,7 +90,7 @@ test('finite GET discovery respects lexical fetch bindings, host writes and opaq
     `import {fetch} from './shim.mjs'; fetch('missing.json');`,
     `import {fetch as request} from './shim.mjs'; request('missing.json');`,
     `const request=fetch;request('missing.json');`,
-    `fetch(new Request('config.json'));`, `fetch(runtimeURL);`,
+    `fetch(existingRequest);`, `fetch(runtimeURL);`,
   ]) assert.deepEqual(found(source), []);
   for (const source of [
     `globalThis.fetch=shim;fetch('config.json');`,
@@ -100,6 +103,87 @@ test('finite GET discovery respects lexical fetch bindings, host writes and opaq
   assert.equal(collectDocumentFetchAssets(sites, {
     documentUrl: import.meta.url, documentBaseUrl: 'https://example.invalid/app/',
   }).size, 0, 'a relative fetch against a remote document base stays network-owned');
+});
+
+test('direct native Request discovery preserves URL leaves and rejects unproved constructors or options', () => {
+  const inspect = source => analyzeDocumentFetch(source).sites;
+  const source = `const uri=choice?'left.json':'right.json';
+    fetch((effect(),new globalThis.Request((effect(),uri),{method:'get',signal:controller.signal})),
+      {method:'GET',credentials:'omit'});`;
+  const [site] = inspect(source);
+  assert.deepEqual(site.candidates, ['left.json', 'right.json']); assert.equal(site.admitted, true);
+  assert.equal(source.slice(site.argument.start, site.argument.end), 'effect(),uri');
+  assert.equal(site.request.type, 'NewExpression');
+  for (const source of [
+    `function f(Request){return fetch(new Request('missing.json'))}`,
+    `import {Request} from './shim.mjs';fetch(new Request('missing.json'));`,
+    `const Constructor=Request;fetch(new Constructor('missing.json'));`,
+    `function f(globalThis){return fetch(new globalThis.Request('missing.json'))}`,
+    `fetch(new Request(runtimeURL));`, `fetch(new Request(existingRequest));`,
+  ]) assert.deepEqual(inspect(source), [], source);
+  for (const source of [
+    `Request=Custom;fetch(new Request('data.json'));`,
+    `globalThis.Request=Custom;fetch(new Request('data.json'));`,
+    `Object.defineProperty(globalThis,'Request',{value:Custom});fetch(new Request('data.json'));`,
+    `Object.prototype.method='POST';fetch(new Request('data.json',{}));`,
+    `fetch(new Request('data.json',{method:'POST'}));`,
+    `fetch(new Request('data.json'),{method:'POST'});`,
+    `fetch(new Request('data.json',options));`,
+    `fetch(new Request('data.json'),options);`,
+    `fetch(new Request('data.json',{get method(){return 'GET'}}));`,
+  ]) assert.equal(inspect(source)[0].admitted, false, source);
+  assert.equal(inspect(`globalThis.Request=Custom;fetch('data.json');`)[0].admitted, true,
+    'a Request replacement does not change plain-string fetch semantics');
+  for (const source of [
+    `function local(){var Request=Custom;}`, `{let Request=Custom;}`,
+    `class Local{static{var Request=Custom;}}`, `'use strict';{function Request(){}}`,
+  ]) assert.equal(analyzeDocumentFetch(source, {sourceType:'script'}).requestMutated, false, source);
+});
+
+test('native Request resources execute in source, emitted and offline packed applications', async () => {
+  const json = '{"answer":42}', integrity = 'sha256-' + createHash('sha256').update(json).digest('base64');
+  const f = fixture({
+    'index.html': `<script src="classic.js"></script><script type="module" src="src/main.mjs"></script>`,
+    'classic.js': `globalThis.classicRequest=()=>fetch(new globalThis.Request('raw/body.txt')).then(r=>r.text());`,
+    'src/main.mjs': `export async function run(){const log=[];
+      async function load(left){const uri=left?'data/left.json?v=1#selected':'data/right.json';
+        const response=await globalThis.fetch((log.push('input'),new Request((log.push('url'),uri),
+          (log.push('request-options'),{method:(log.push('method'),'get'),headers:{'x-source':'request'},
+          credentials:'include',integrity:${JSON.stringify(integrity)}}))),
+          (log.push('fetch-options'),{headers:{'x-source':'override'},credentials:'omit'}));
+        const copy=response.clone();return [uri,(await response.json()).answer,await copy.text(),response.bodyUsed];}
+      const first=await load(true),second=await load(false),controller=new AbortController();
+      controller.abort('request-abort');let aborted=false,badBody=false,badIntegrity=false;
+      try{await fetch(new Request('data/left.json',{signal:controller.signal}))}catch(e){aborted=e==='request-abort'}
+      try{await fetch(new Request('data/left.json',{method:'GET',body:'invalid'}))}catch(e){badBody=e instanceof TypeError}
+      try{await fetch(new Request('data/left.json',{integrity:'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='}))}catch(e){badIntegrity=e instanceof TypeError}
+      const overridden=await fetch(new Request('data/left.json',{signal:controller.signal,
+        integrity:'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='}),
+        {signal:new AbortController().signal,integrity:${JSON.stringify(integrity)}});
+      return {first,second,log,aborted,badBody,badIntegrity,overridden:(await overridden.json()).answer,
+        classic:await globalThis.classicRequest()};}`,
+    'data/left.json': json, 'data/right.json': json, 'raw/body.txt': 'native Request bytes',
+  });
+  const built = await buildApplication(f.entry, f.out);
+  for (const name of ['data/left.json', 'data/right.json', 'raw/body.txt'])
+    assert.deepEqual(fs.readFileSync(path.join(f.out, name)), fs.readFileSync(path.join(f.source, name)));
+  const referenceHost = await host(f.source), builtHost = await host(f.out);
+  let expected;
+  try {
+    expected = await execute({...application(fs.readFileSync(f.entry, 'utf8'), f.source), base: referenceHost.base});
+    assert.deepEqual(await execute({...application(fs.readFileSync(path.join(f.out, built.htmlFile), 'utf8'), f.out),
+      base: builtHost.base}), expected);
+  } finally { await Promise.all([referenceHost.close(), builtHost.close()]); }
+  packHtml(path.join(f.out, built.htmlFile), f.packed);
+  const emitted = application(fs.readFileSync(f.packed, 'utf8'), f.out);
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const actual = await execute(emitted);
+  assert.deepEqual(actual, expected);
+  assert.deepEqual(actual.log, ['input','url','request-options','method','fetch-options',
+    'input','url','request-options','method','fetch-options']);
+  assert.ok(actual.aborted && actual.badBody && actual.badIntegrity);
+  assert.equal(actual.overridden, 42); assert.equal(actual.classic, 'native Request bytes');
 });
 
 test('native packed fetch preserves bodies, raw resources, selectors, aborts, integrity and streaming Wasm offline', async () => {
@@ -191,6 +275,23 @@ test('packing refuses opaque finite requests and cross-module fetch replacement 
   ]) {
     const f = fixture({'index.html': '<script type="module" src="main.mjs"></script>',
       'main.mjs': source, 'shim.mjs': 'globalThis.fetch=()=>Promise.resolve();', 'config.json': '{}'});
+    assert.throws(() => packHtml(f.entry, f.packed), {code: 'FETCH_URL'});
+    assert.equal(fs.existsSync(f.packed), false);
+  }
+});
+
+test('packing refuses Request replacement in other document modules or classic scripts', () => {
+  for (const [script, shim] of [
+    ['', 'globalThis.Request=class {};'],
+    ['<script>var Request=class {};</script>', ''],
+    ['<script>const Request=class {};</script>', ''],
+    ['<script>if(true){var Request=class extends Request {};}</script>', ''],
+    ['<script>for(var {Request} of [{Request:class {}}]){}</script>', ''],
+    ['<script>{function Request(){}}</script>', ''],
+  ]) {
+    const f = fixture({'index.html': script + '<script type="module" src="main.mjs"></script>',
+      'main.mjs': `import './shim.mjs';fetch(new Request('data.json'));`,
+      'shim.mjs': shim, 'data.json': '{}'});
     assert.throws(() => packHtml(f.entry, f.packed), {code: 'FETCH_URL'});
     assert.equal(fs.existsSync(f.packed), false);
   }

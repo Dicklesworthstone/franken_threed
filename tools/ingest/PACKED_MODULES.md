@@ -128,8 +128,14 @@ Wasm retains the exact `application/wasm` MIME needed by native streaming APIs.
 
 Locally bound or imported functions named `fetch` are not treated as the browser
 API. Known host replacement, non-GET methods and opaque options prevent embedding
-finite requests. `Request` objects, fetch aliases and runtime-selected URLs keep
-the existing host path; their closure is not newly proved. Remote and document-root
+finite requests. Direct native `fetch(new Request(url, init), overrides)` calls
+also close finite URL choices, including document classic scripts and native
+global-qualified constructors. Only the constructor's URL operand is rewritten;
+Request creation, inner and outer options, abort/integrity overrides and native
+constructor failures retain their source ordering and host implementation.
+Shadowed or replaced constructors, existing Request values, constructor/fetch
+aliases and runtime-selected URLs keep the existing host path; their closure is
+not newly proved. Remote and document-root
 requests still need ordinary deployment, and the packer's existing `<base>`
 refusal remains. Embedded Response URLs are data URLs; server HTTP headers, cache
 behavior and live endpoints are not reproduced by this static-resource mode.
@@ -140,6 +146,11 @@ trees unavailable. Native fetch checks raw bodies, cloned and streamed responses
 finite URL choices, abort reasons, invalid GET bodies and failed integrity, plus
 audio bytes and `WebAssembly.instantiateStreaming()`. This proves resource
 packaging and retained host execution, not rendering or acceleration.
+
+The Request extension uses the same source/emitted/packed execution comparison
+with actual native Request and fetch in packed output. It covers finite choices,
+classic scripts, response clones, failed construction, aborts and integrity,
+including outer fetch overrides. No new browser run is claimed for that extension.
 
 An independent Chrome 151.0.7922.34 run opens that packed HTML with the browser
 offline, both original trees unavailable, and no fetch or response interception.
