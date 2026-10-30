@@ -7,7 +7,7 @@
 export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
   if (!(attribute instanceof three.BufferAttribute) ||
       !(attribute.isStorageBufferAttribute === true || attribute.isStorageInstancedBufferAttribute === true) ||
-      attribute.isIndirectStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized ||
+      attribute.isInterleavedBufferAttribute || attribute.normalized ||
       ![Float32Array, Int32Array, Uint32Array].includes(attribute.array?.constructor) ||
       !(attribute.array.buffer instanceof ArrayBuffer) || attribute.array.buffer.resizable ||
       !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||

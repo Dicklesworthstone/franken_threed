@@ -149,10 +149,22 @@ test('shader storage supports normalized integer and instanced struct buffers wi
   }
 });
 
+test('indirect storage borrowing preserves the published GPU allocation and unrequested CPU history', () => {
+  const device = gpuDevice(), compute = createGpuCompute(device), source = attribute(new Uint32Array([3, 1, 0, 0]), 1);
+  source.isIndirectStorageBufferAttribute = true;
+  const lease = captureComputeStorage(device, source), buffer = compute.upload(source, source.array, 0);
+  new Uint32Array(buffer.bytes.buffer)[0] = 6; source.array[0] = 99;
+  assert.equal(lease.resolve().buffer, buffer); assert.equal(lease.resolve().size, 16);
+  assert.equal(buffer.usage & (128 | 256), 128 | 256);
+  assert.equal(new Uint32Array(buffer.bytes.buffer)[0], 6);
+  assert.equal(device.events.filter(event => event[0] === 'upload').length, 1); compute.dispose();
+  assert.throws(lease.resolve, /DISPOSED|STALE/);
+});
+
 test('shader storage rejects malformed source layouts and mismatched publications without GPU side effects', () => {
   const device = gpuDevice(), compute = createGpuCompute(device), source = attribute(new Float32Array(8), 4);
   for (const invalid of [{...source, normalized: true}, {...source, isInterleavedBufferAttribute: true},
-    {...source, isIndirectStorageBufferAttribute: true}, {...source, version: -1}, {...source, count: 0},
+    {...source, version: -1}, {...source, count: 0},
     {...source, itemSize: 3}, attribute(new Uint8Array(8), 4), attribute(new Float64Array(8), 4),
     attribute(new Float32Array(8), 4, false)])
     assert.throws(() => captureComputeStorage(device, invalid), /SHAPE/);

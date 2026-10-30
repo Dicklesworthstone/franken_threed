@@ -94,7 +94,7 @@ export function createComputeAttributeOwner(device) {
 export function captureComputeStorage(device, attribute) {
   const array = attribute?.array, stride = attribute?.itemSize, count = attribute?.count,
     version = attribute?.version;
-  if (!isComputeAttribute(attribute) || attribute.isIndirectStorageBufferAttribute ||
+  if (!isComputeAttribute(attribute) ||
       attribute.isInterleavedBufferAttribute || attribute.normalized ||
       !ArrayBuffer.isView(array) || ![Float32Array, Int32Array, Uint32Array].includes(array.constructor) ||
       !Number.isSafeInteger(stride) || stride < 1 || !Number.isSafeInteger(count) || count < 1 ||

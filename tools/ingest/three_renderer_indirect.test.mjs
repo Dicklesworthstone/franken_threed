@@ -110,6 +110,50 @@ test('compute and indirect drawing use one buffer without refreshing GPU-produce
   assert.equal(f.device.writes.filter(write => write.buffer === produced).length, uploads);
 });
 
+for (const indexed of [false, true])
+test(`${indexed ? 'indexed' : 'nonindexed'} indirect storage feeds vertex and fragment shaders from the computed argument allocation`, async t => {
+  const f = await fixture(t, {indexed}); f.geometry.indirectOffset = 0;
+  const material = new T.MeshBasicNodeMaterial(), data = N.storage(f.attribute, 'uint', f.attribute.count);
+  t.after(() => material.dispose()); f.mesh.material = material;
+  material.positionNode = N.positionLocal.add(N.vec3(data.element(0).toFloat().mul(.01), 0, 0));
+  material.colorNode = N.vec3(data.element(1).toFloat().mul(.1), .25, .5);
+  const kernel = N.Fn(() => { data.element(0).assign(6); data.element(1).assign(2); })().compute(1);
+  t.after(() => kernel.dispose());
+  let produced;
+  f.device.produce = groups => {
+    produced = groups.flatMap(group => group?.entries ?? []).find(entry => entry.resource.buffer.usage & 256).resource.buffer;
+    new Uint32Array(produced.data).set([6, 2]); // Explicit recording-device producer, not WGSL execution.
+  };
+  f.renderer.compute(kernel); f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const first = draws(f.device)[0], source = new T.WGSLNodeBuilder(f.mesh, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(first.pipeline.vertex.module.code), canonical(source.vertexShader));
+  assert.equal(canonical(first.pipeline.fragment.module.code), canonical(source.fragmentShader));
+  for (const shader of [source.vertexShader, source.fragmentShader]) assert.match(shader, /var<storage, read>/);
+  f.attribute.array.fill(99); f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  for (const draw of draws(f.device)) {
+    assert.equal(draw.indirect.buffer, produced); assert.deepEqual(argumentsOf(draw).slice(0, 2), [6, 2]);
+    const bound = [...draw.groups.values()].flatMap(({group}) => group.entries)
+      .filter(entry => entry.resource.buffer?.usage & 128);
+    assert.equal(bound.length, 2, 'each shader stage retains its source storage binding');
+    assert.ok(bound.every(entry => entry.resource.buffer === produced));
+  }
+  assert.equal(f.device.writes.filter(write => write.buffer === produced).length, 1);
+  assert.equal(f.device.buffers.filter(buffer => buffer.label === 'f3d-compute-buffer' && buffer.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('indirect arguments cannot alias writable fragment storage in the same native pass', async t => {
+  const f = await fixture(t), data = N.storage(f.attribute, 'uint', f.attribute.count).toAtomic();
+  const material = new T.MeshBasicNodeMaterial(); t.after(() => material.dispose()); f.mesh.material = material;
+  material.colorNode = N.Fn(() => N.vec3(N.atomicAdd(data.element(0), N.uint(1)).toFloat()))();
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_COMPUTE_STORAGE_CONFLICT'});
+  assert.equal(draws(f.device).length, 0);
+  assert.equal(f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('source zero draw range still issues indirect arguments, zero object instances and negative ranges do not', async t => {
   const f = await fixture(t); f.geometry.indirectOffset = 0;
   f.geometry.setDrawRange(0, 0); f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
@@ -228,9 +272,10 @@ for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARE
   assert.deepEqual(draws(f.device).map(draw => draw.indirect.offset), [0, 0, 0]);
 });
 
-for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARED'} fog storage aliases follow the captured indirect upload`, async t => {
+for (const bundle of [false, true]) for (const indirect of [false, true])
+test(`${bundle ? 'bundled' : 'ordinary SHARED'} ${indirect ? 'indirect' : 'ordinary'} fog storage aliases follow the captured indirect upload`, async t => {
   const f = await fixture(t, {bundle});
-  const attribute = new T.StorageBufferAttribute(f.attribute.array.slice(), 1);
+  const attribute = indirect ? f.attribute : new T.StorageBufferAttribute(f.attribute.array.slice(), 1);
   f.geometry.setIndirect(attribute, 0);
   const data = N.storage(attribute, 'uint', attribute.count);
   f.scene.fogNode = N.fog(N.vec3(data.element(0).toFloat().div(6)), N.float(.5));
@@ -254,9 +299,10 @@ for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARE
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-for (const bundle of [false, true]) test(`${bundle ? 'bundled' : 'ordinary SHARED'} generated vertex aliases follow captured indirect uploads`, async t => {
+for (const bundle of [false, true]) for (const indirect of [false, true])
+test(`${bundle ? 'bundled' : 'ordinary SHARED'} ${indirect ? 'indirect' : 'ordinary'} generated vertex aliases follow captured indirect uploads`, async t => {
   const f = await fixture(t, {bundle});
-  const attribute = new T.StorageBufferAttribute(f.attribute.array.slice(), 1);
+  const attribute = indirect ? f.attribute : new T.StorageBufferAttribute(f.attribute.array.slice(), 1);
   // F3D's combined buffer usages admit this alias. The pinned source allocates
   // mutually exclusive INDIRECT/VERTEX usages, so this is no parity claim.
   f.geometry.setIndirect(attribute, 0);

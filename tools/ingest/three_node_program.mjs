@@ -327,7 +327,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // observes it when storageBuffer is unavailable; native WGSL keeps the
     // ordinary shared storage allocation, including for authored PBO nodes.
     if ((!type && !struct) || node.isAtomic && !atomic ||
-        !['readOnly', 'readWrite'].includes(node.access) || attribute?.isIndirectStorageBufferAttribute ||
+        !['readOnly', 'readWrite'].includes(node.access) ||
         !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
         attribute.isInterleavedBufferAttribute || attribute.normalized ||
         !(struct ? [Float32Array, Int32Array, Uint32Array].some(Type => attribute.array instanceof Type) : attribute.array instanceof scalar) ||
@@ -336,6 +336,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
       fail('STORAGE', 'Native storage requires matching scalar/vector/matrix or flat-struct 32-bit attributes; mat3 columns require padding and atomics require scalar integers');
+    // IndirectStorageBufferAttribute is still source storage. Shader reads and
+    // draw arguments borrow its compute allocation; shared write conflicts are
+    // checked with the other captured uses before native submission.
     if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
       fail('HOOK', 'Native shader storage requires the source upload callback');
     const bytes = attribute.count * stride * 4;

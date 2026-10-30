@@ -736,6 +736,16 @@ remain unchanged. The H8 fluid particle record (`position: vec3`,
 `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written by compute and
 read directly in both vertex and fragment graphs.
 
+`IndirectStorageBufferAttribute` also participates in these native storage
+bindings. Vertex/fragment shader reads, compute kernels and indirect draw arguments
+share one allocation and the captured upload history. Later unrequested CPU edits
+do not replace GPU-produced arguments or shader inputs. Retained ordinary draws
+and bundles follow admitted indirect versions without scanning later CPU data;
+writable fragment storage cannot alias indirect arguments in the same pass.
+F3D's existing combined buffer usages also allow generated `.toAttribute()`
+inputs from this allocation. That additional vertex-fetch combination is an F3D
+extension: the pinned backend allocates `INDIRECT` and `VERTEX` usages separately.
+
 Source storage nodes marked with `.setPBO(true)` use that same native allocation.
 The flag enables a separate WebGL fallback in the pinned cloth, birds and
 skinning examples; `StorageArrayElementNode` only observes it when the builder
