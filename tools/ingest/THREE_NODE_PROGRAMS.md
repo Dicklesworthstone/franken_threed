@@ -1045,18 +1045,33 @@ after a fixed owner has accepted those attributes, even through another scene,
 still fails before invoking any hook. Transferring the fixed owner's existing
 upload history, including queued work and unversioned CPU edits, remains
 unimplemented. Hooks added to an already native scene retain
-its existing upload history. Callback replacement of selected geometry, custom
-BatchedMesh hooks, effectful attribute upload hooks and recursive GPU writes also
-require additional capture boundaries and fail explicitly. Callback exceptions
+its existing upload history. Custom BatchedMesh hooks, effectful attribute upload
+hooks and recursive GPU writes also require additional capture boundaries and
+fail explicitly. Callback exceptions
 retain earlier source mutations and do not replay updates or run later
 after-callbacks. These are remaining compatibility gaps, not source-invalid uses.
 
-Fifteen focused cases in `three_node_scene_capture.test.mjs` and
+Object hooks and custom dispatch can replace `object.geometry` with another
+admitted geometry. Hooks keep the projected geometry and group arguments, while
+each physical draw selects the object's current geometry and snapshots its
+streams, index and range through the existing immutable owner. A first alpha
+side's node after-updates can therefore select a different geometry for the
+second side. Queued draws retain their accepted bytes; hook removal and sharing
+replacement attributes with another scene preserve the same upload history.
+`compileAsync()` selects geometry after the object hooks, including
+`onAfterRender`, have completed. A replacement whose attributes already belong
+to a fixed owner remains refused, retaining the callback's completed source
+effects without silently recapturing unversioned CPU changes.
+
+Focused cases in `three_node_scene_capture.test.mjs` and
 `three_renderer_nodes.test.mjs` verify the ordinary/mixed lifecycle, source group
 and material identities, compile-only effects, exceptions, queued draw bytes,
-hook removal, cross-scene attribute history and the existing-owner boundary. The
-recording device verifies commands and uploaded bytes; this change has no new
-browser-pixel or performance measurement.
+hook removal, cross-scene attribute history and the existing-owner boundary.
+Five replacement cases additionally cover queued geometry, forwarded dispatch,
+alpha-side changes, compilation timing and history-preserving failure/recovery.
+All ninety selected facade, scene-capture and geometry-compute tests pass after
+the replacement change. The recording device verifies commands and uploaded
+bytes; this change has no new browser-pixel or performance measurement.
 
 ## Custom object dispatch
 
@@ -1087,10 +1102,12 @@ prerequisite even in an unlit pass; unused LTC tables are not uploaded.
 
 Install the dispatcher before the selected attributes acquire a fixed-path
 owner; the existing explicit history-transfer boundary above still applies.
-Forwarded calls must retain the selected object, scene, camera, geometry and
-group, along with the supplied light-node and clipping-context identities.
-Replacing these selections or issuing nested GPU writes requires another capture
-boundary and is refused. Removing the dispatcher retains the native upload
+Forwarded calls must retain the selected object, scene, camera and group, along
+with the supplied light-node and clipping-context identities. The projected
+geometry argument stays available to hooks while `object.geometry` can change
+between forwarded passes as described above. Replacing the other selections or
+issuing nested GPU writes requires another capture boundary and is refused.
+Removing the dispatcher retains the native upload
 history. Registered shadow selectors remain distinct: only the exact source
 function paired with its source override material receives shadow-pass access.
 

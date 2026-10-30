@@ -240,6 +240,30 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // same renderer history even when the application removes their callbacks.
     for (const object of hookCandidates) for (const owner of attributeOwners(object)) attributes.add(owner);
   }
+  const inspectGeometry = object => {
+    const geometry = object.geometry;
+    if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
+      fail('GEOMETRY', 'Native node meshes require bounded source BufferGeometry groups');
+    const owners = new Set(Object.values(geometry.attributes).map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
+    if (geometry.index) owners.add(geometry.index);
+    if (object.isInstancedMesh) {
+      if (object.instanceMatrix) owners.add(object.instanceMatrix);
+      if (object.instanceColor) owners.add(object.instanceColor);
+    }
+    for (const owner of owners) {
+      const prototype = owner.isInterleavedBuffer ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
+      if (owner.onUploadCallback !== prototype.onUploadCallback)
+        fail('HOOK', 'Native node attributes require the source upload callback');
+      if (nativeHookScene) {
+        if (fixedAttributeHistory.get(renderer)?.has(owner))
+          fail('HOOK', 'Object callbacks require native upload history; replacement attributes already reached a fixed owner');
+        // Replacement geometry keeps the same owner when hooks are removed or
+        // its attributes are subsequently shared with another scene.
+        hookAttributeHistory.get(renderer)?.add(owner);
+      }
+    }
+    return geometry;
+  };
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
   const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene || nativeHookScene
@@ -292,20 +316,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (typeof object.onBeforeRender !== 'function' || typeof object.onAfterRender !== 'function')
       fail('HOOK', 'Native object render callbacks must be callable');
     if (objectHooks(object)) hookedObjects.add(object);
-    const geometry = object.geometry;
-    if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
-      fail('GEOMETRY', 'Native node meshes require bounded source BufferGeometry groups');
-    const owners = new Set(Object.values(geometry.attributes).map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
-    if (geometry.index) owners.add(geometry.index);
-    if (object.isInstancedMesh) {
-      if (object.instanceMatrix) owners.add(object.instanceMatrix);
-      if (object.instanceColor) owners.add(object.instanceColor);
-    }
-    for (const owner of owners) {
-      const prototype = owner.isInterleavedBuffer ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
-      if (owner.onUploadCallback !== prototype.onUploadCallback)
-        fail('HOOK', 'Native node attributes require the source upload callback');
-    }
+    const geometry = inspectGeometry(object);
     const byMaterial = new Map();
     if (shadowPass) {
       for (const original of originals) if (original && !byMaterial.has(original)) {
@@ -545,6 +556,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (const binding of selectedBindings) {
       compiledBindings.add(binding);
       if (binding.nodeProgram !== null) continue;
+      // compileAsync queues object selections, then reads their geometry only
+      // after all object hooks, including onAfterRender, have completed.
+      if (!uniforms && nativeLifecycle) binding.geometry = inspectGeometry(binding.object);
       withBinding(binding, () => {
         binding.nodeProgram = programs.compile(binding.material, binding.object, context);
         if ((binding.material.envMap || binding.material.envNode) && ['MeshBasic', 'MeshLambert', 'MeshPhong'].some(name =>
@@ -962,9 +976,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
             fail('HOOK', 'An object callback changed its source draw selection');
           if (customRenderObject && (selectedLights !== lightsNode || clippingContext !== draw.binding.clippingContext))
             fail('HOOK', 'Custom object dispatch must retain the selected lights and clipping contexts');
-          if (object.geometry !== draw.geometry)
-            fail('CHANGED', 'An object callback replaced its selected geometry; prepare the scene again');
-          const binding = {...draw.binding, material, nodeProgram: null, raster: null, passId,
+          // Hooks receive the projected geometry, but each physical source
+          // draw reads object.geometry after those hooks and preceding passes.
+          const geometry = uniforms ? inspectGeometry(object) : draw.geometry;
+          const binding = {...draw.binding, geometry, material, nodeProgram: null, raster: null, passId,
             ...(lightsNode ? {lights: Object.freeze(lightsNode.getLights().slice())} : {}),
             clippingContext: clippingContext ?? draw.binding.clippingContext,
             ...(shadowPass ? {original: draw.sourceMaterial, shadowSide: material.side} : {colorSide: material.side}),
@@ -974,7 +989,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
             // including before/after callbacks, then constructs the pipelines.
             deferredHookBindings.push(binding); preparationBindings.add(binding); return;
           }
-          const current = {...draw, material};
+          const current = {...draw, geometry, material};
           const prepared = prepareBatchBindings(current, [binding])[0];
           captureDraw({...current, binding: prepared, hookCapture: true, transmissionBack});
         }, false);

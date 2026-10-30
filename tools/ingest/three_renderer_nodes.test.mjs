@@ -341,6 +341,96 @@ test('native object callbacks preserve prior upload history when hooks are added
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
+test('object callbacks replace queued draw geometry while retaining projected hook arguments and shared upload history',async t=>{
+  const f=fixture(t),projected=f.mesh.geometry,a=new T.PlaneGeometry(),b=new T.PlaneGeometry().toNonIndexed(),events=[];
+  f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  a.setDrawRange(3,3);a.attributes.position.array.fill(.125);b.attributes.position.array.fill(.75);
+  t.after(()=>{a.dispose();b.dispose();});let phase=0;
+  f.mesh.onBeforeRender=function(renderer,scene,camera,geometry){
+    events.push(['before',geometry]);this.geometry=phase===0?a:b;
+  };
+  f.mesh.onAfterRender=function(renderer,scene,camera,geometry){
+    events.push(['after',geometry]);this.geometry.attributes.position.array.fill(99);
+  };
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);phase=1;f.renderer.render(f.scene,f.camera);
+  assert.deepEqual(events,[['before',projected],['after',projected],['before',a],['after',a]]);
+  f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;f.mesh.onAfterRender=T.Object3D.prototype.onAfterRender;
+  const otherScene=new T.Scene(),other=new T.Mesh(b,new T.MeshBasicMaterial());other.frustumCulled=false;otherScene.add(other);
+  f.renderer.render(otherScene,f.camera);assert.equal(f.acquired(),0);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(draw=>[draw.indexed,draw.args[0],draw.args[2]]),[[true,3,3],[false,6,0],[false,6,0]]);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];}),[.125,.75,.75]);
+  assert.equal(events.length,4);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom object dispatch selects replacement geometry independently for each forwarded pass',async t=>{
+  const f=fixture(t),projected=f.mesh.geometry,replacement=new T.PlaneGeometry().toNonIndexed(),seen=[];
+  f.mesh.frustumCulled=false;replacement.attributes.position.array.fill(.75);t.after(()=>replacement.dispose());
+  f.mesh.onBeforeRender=function(renderer,scene,camera,geometry){seen.push([geometry,this.geometry]);};
+  f.renderer.setRenderObjectFunction(function(...args){
+    this.renderObject(...args);args[0].geometry=replacement;this.renderObject(...args);
+  });
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);replacement.attributes.position.array.fill(99);await drain(f.renderer);
+  assert.deepEqual(seen,[[projected,projected],[projected,replacement]]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);assert.deepEqual(draws.map(draw=>draw.indexed),[true,false]);
+  const bytes=draws[1].contents.get(draws[1].streams.get(0));
+  assert.equal(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0],.75);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('a completed DoubleSide pass can replace geometry for the following source pass',async t=>{
+  const f=fixture(t),projected=f.mesh.geometry,replacement=new T.PlaneGeometry().toNonIndexed(),events=[];
+  f.mesh.frustumCulled=false;f.material.transparent=true;f.material.side=T.DoubleSide;
+  replacement.attributes.position.array.fill(.75);t.after(()=>replacement.dispose());
+  f.mesh.onBeforeRender=(renderer,scene,camera,geometry)=>{events.push(['before',geometry]);};
+  f.mesh.onAfterRender=(renderer,scene,camera,geometry)=>{events.push(['after',geometry]);};
+  f.tint.updateAfterType='object';f.tint.updateAfter=()=>{
+    events.push(['node-after',f.material.side]);if(f.material.side===T.BackSide)f.mesh.geometry=replacement;
+  };
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(events,[['before',projected],['node-after',T.BackSide],['node-after',T.FrontSide],['after',projected]]);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(draws.every(draw=>draw.pipeline.primitive.cullMode==='back'));
+  assert.deepEqual(draws.map(draw=>[draw.indexed,draw.pipeline.primitive.frontFace]),[[true,'cw'],[false,'ccw']]);
+  const bytes=draws[1].contents.get(draws[1].streams.get(0));
+  assert.equal(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0],.75);
+  assert.equal(f.material.side,T.DoubleSide);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('compileAsync selects replacement geometry after object after-hooks without uploading the intermediate selection',async t=>{
+  const f=fixture(t),projected=f.mesh.geometry,before=new T.PlaneGeometry(),after=new T.PlaneGeometry().toNonIndexed(),events=[];
+  f.mesh.frustumCulled=false;before.attributes.position.array.fill(.25);after.attributes.position.array.fill(.625);
+  before.attributes.position.addUpdateRange(0,3);t.after(()=>{before.dispose();after.dispose();});
+  f.mesh.onBeforeRender=function(renderer,scene,camera,geometry){events.push(['before',geometry]);this.geometry=before;};
+  f.mesh.onAfterRender=function(renderer,scene,camera,geometry){events.push(['after',geometry]);this.geometry=after;};
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.deepEqual(events,[['before',projected],['after',projected]]);assert.equal(nativeDraws(f.device).length,0);
+  assert.deepEqual(before.attributes.position.updateRanges,[{start:0,count:3}]);
+  after.attributes.position.array.fill(99);f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;
+  f.mesh.onAfterRender=T.Object3D.prototype.onAfterRender;f.renderer.render(f.scene,f.camera);
+  f.mesh.geometry=before;before.attributes.position.array.fill(.375);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];}),[.625,.375]);
+  assert.equal(events.length,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('callback replacement cannot discard a fixed owner history and leaves the source mutation visible on failure',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  await f.renderer.compileAsync(f.scene,f.camera);
+  const otherScene=new T.Scene(),fresh=new T.PlaneGeometry(),other=new T.Mesh(fresh,new T.MeshBasicMaterial());
+  other.frustumCulled=false;otherScene.add(other);t.after(()=>fresh.dispose());let before=0,after=0;
+  other.onBeforeRender=()=>{before++;other.geometry=f.mesh.geometry;};other.onAfterRender=()=>{after++;};
+  assert.throws(()=>f.renderer.render(otherScene,f.camera),error=>
+    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
+  assert.equal(before,1);assert.equal(after,0);assert.equal(other.geometry,f.mesh.geometry);
+  assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  other.geometry=fresh;other.onBeforeRender=T.Object3D.prototype.onBeforeRender;
+  f.renderer.render(otherScene,f.camera);await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length,1);assert.equal(after,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 for(const firstUse of ['render','compileAsync'])test(`native selected inputs defer inactive color uploads after ${firstUse}`,async t=>{
   const f=fixture(t),position=f.mesh.geometry.attributes.position,original=position.array.slice();
   const color=new T.Uint8BufferAttribute(new Uint8Array(position.count*3).fill(64),3,true);
