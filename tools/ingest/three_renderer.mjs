@@ -437,8 +437,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         fail('UNSUPPORTED', 'Logarithmic and reversed depth require the native WebGPU renderer');
       if (this.stencil && !this.depth) fail('UNSUPPORTED', 'Stencil framebuffers currently require a depth attachment');
       const p = this._parameters;
-      if (p.outputType !== undefined && p.outputType !== THREE.UnsignedByteType)
-        fail('UNSUPPORTED', 'Extended-range canvas output types are not admitted');
+      if (p.outputType !== undefined && ![THREE.UnsignedByteType, THREE.HalfFloatType].includes(p.outputType))
+        fail('UNSUPPORTED', 'Native canvas output requires unsigned-byte or half-float storage');
       if (this.isWebGPURenderer && ![THREE.UnsignedByteType, THREE.HalfFloatType, THREE.FloatType].includes(this._outputBufferType))
         fail('UNSUPPORTED', 'Output buffers require unsigned-byte, half-float or float texture storage');
       // The renderer owns one device for its lifetime so the output path can be
@@ -454,7 +454,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._device = await adapter.requestDevice({requiredFeatures, requiredLimits: p.requiredLimits ?? {}});
         this._ownsDevice = true;
       }
-      this._preferredFormat = (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
+      this._preferredFormat = p.outputType === THREE.HalfFloatType ? 'rgba16float' :
+        p.outputType === THREE.UnsignedByteType ? 'bgra8unorm' :
+        (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
       await this._createSession(this._wantsHdr(this._toneMapping()));
       if (this._disposed) { this._release(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._initialized = true;
@@ -476,16 +478,22 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const [width, height] = canvasSize;
       const common = {device: this._device};
       const format = this._preferredFormat ? {format: this._preferredFormat} : {};
+      const extended = this._preferredFormat === 'rgba16float';
+      // Half-float presentation has no sRGB attachment view. Its output pass
+      // performs the selected transfer while keeping the source HDR range.
+      const presentation = {...format, srgbView: srgbView && !extended,
+        toneMappingMode: extended ? 'extended' : 'standard'};
       this._hdr = hdr;
       this._srgbView = srgbView;
       this._dispatcher = null;
       this._session = hdr
         ? await createGpuHdrCanvasRenderer(canvas, createDispatcher(this), {...common,
-          target: {width, height, ...format, srgbView, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
+          target: {width, height, ...presentation, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
           renderTarget: {depthFormat, sampleCount, format: this._outputBufferFormat()},
+          outputColorSpace: srgbView ? 'srgb' : 'linear', sourceOutput: extended,
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
-          target: {width, height, depthFormat, sampleCount, ...format, srgbView,
+          target: {width, height, depthFormat, sampleCount, ...presentation,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
       this._canvases.save();
       } finally { release(); }

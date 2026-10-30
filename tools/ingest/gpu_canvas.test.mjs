@@ -221,7 +221,8 @@ test('missing WebGPU context releases the reservation and never requests another
 
 test('unsupported compositing and formats fail before taking canvas ownership', () => {
   const f = fixture();
-  for (const options of [{format: 'rgba16float'}, {depthFormat: 'invalid-depth'},
+  for (const options of [{format: 'rgba32float'}, {format: 'rgba16float', srgbView: true},
+    {toneMappingMode: 'invalid'}, {depthFormat: 'invalid-depth'},
     {sampleCount: 8}, {alphaMode: 'straight'}, {alphaMode: 'transparent'}, {maxBytes: -1}, {unknown: true}])
     assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, options), GpuCanvasError);
   assert.equal(f.calls.length, 0); assert.equal(f.textures.length, 0);
@@ -231,6 +232,33 @@ test('premultiplied compositing configures the canvas for page-transparent outpu
   const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {alphaMode: 'premultiplied'});
   assert.equal(f.calls.find(c => c[0] === 'configure')[1].alphaMode, 'premultiplied');
   assert.equal(target.alphaMode, 'premultiplied'); target.dispose();
+});
+
+test('half-float canvas uses extended output, a linear view, and eight-byte multisample color storage', async () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas,
+    {format: 'rgba16float', toneMappingMode: 'extended', sampleCount: 4, maxBytes: 13000});
+  const configuration = f.calls.find(c => c[0] === 'configure')[1];
+  assert.equal(configuration.format, 'rgba16float');
+  assert.deepEqual(configuration.viewFormats, []);
+  assert.deepEqual(configuration.toneMapping, {mode: 'extended'});
+  assert.equal(configuration.colorSpace, 'srgb');
+  assert.deepEqual(target.rendererOptions, {format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 4});
+  target.withFrame(frame => {
+    assert.equal(frame.colorView.texture.descriptor.format, 'rgba16float');
+    assert.equal(frame.colorView.texture.descriptor.sampleCount, 4);
+    assert.equal(frame.resolveTarget.descriptor.format, 'rgba16float');
+  });
+  const before = f.textures.slice();
+  assert.equal(target.diagnostics.attachmentBytes, 16 * 8 * 4 * (8 + 4));
+  assert.throws(() => target.resize(32, 8), failCode('BUDGET'));
+  assert.equal(f.textures.length, 2, 'failed budget check does not allocate');
+  target.resize(8, 8);
+  assert.ok(before.every(texture => texture.destroyed === 0));
+  assert.equal(target.diagnostics.attachmentBytes, (16 * 8 + 8 * 8) * 4 * 12);
+  f.fences[0].resolve(); await tick();
+  assert.ok(before.every(texture => texture.destroyed === 1));
+  assert.equal(target.diagnostics.attachmentBytes, 8 * 8 * 4 * 12);
+  target.dispose();
 });
 
 test('lazy frames acquire the swapchain only when a view is read', () => {

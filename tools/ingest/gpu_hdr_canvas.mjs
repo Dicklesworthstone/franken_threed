@@ -25,9 +25,9 @@ const DEFAULTS = Object.freeze({toneMapping: 'aces-filmic', exposure: 1, inputAl
 
 export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options = {}) {
   const all = capture(options, ['device', 'gpu', 'powerPreference', 'requiredFeatures', 'requiredLimits',
-    'target', 'signal', 'renderTarget', 'output'], 'HDR canvas');
+    'target', 'signal', 'renderTarget', 'output', 'outputColorSpace', 'sourceOutput'], 'HDR canvas');
   if (typeof createRenderer !== 'function') fail('FACTORY', 'Expected a linear-scene renderer factory');
-  const {renderTarget = {}, output = {}, ...session} = all;
+  const {renderTarget = {}, output = {}, outputColorSpace, sourceOutput = false, ...session} = all;
   const hdr = {format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 1, maxBytes: 256 * 1024 * 1024,
     ...capture(renderTarget, ['format', 'depthFormat', 'sampleCount', 'maxBytes', 'label'], 'HDR target')};
   if (!['rgba8unorm', 'rgba16float', 'rgba32float'].includes(hdr.format))
@@ -37,7 +37,9 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
     fail('OPTIONS', 'Invalid HDR target budget or label');
   const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode', 'srgbView',
-    'maxBytes', 'width', 'height'], 'presentation target');
+    'maxBytes', 'width', 'height', 'toneMappingMode'], 'presentation target');
+  if (outputColorSpace !== undefined && !['linear', 'srgb'].includes(outputColorSpace) || typeof sourceOutput !== 'boolean')
+    fail('OPTIONS', 'Expected a linear/sRGB output transfer and boolean source-output selection');
   // A premultiplied canvas composites over the page. The linear scene target is
   // cleared/blended into premultiplied values (straight-alpha blending over a
   // premultiplied clear), so the output pass reads premultiplied input and
@@ -46,7 +48,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   if (target.alphaMode !== undefined && !['opaque', 'premultiplied'].includes(target.alphaMode))
     fail('OPTIONS', 'HDR canvas alpha mode must be opaque or premultiplied');
   const defaults = Object.freeze(animationOutputSettings(capture(output, OUTPUT_KEYS, 'output'),
-    transparent ? {...DEFAULTS, inputAlpha: 'premultiplied', outputAlpha: 'premultiplied'} : DEFAULTS));
+    transparent || sourceOutput ? {...DEFAULTS, inputAlpha: 'premultiplied', outputAlpha: 'premultiplied'} : DEFAULTS));
   if ((target.depthFormat !== undefined && target.depthFormat !== null) ||
       (target.sampleCount !== undefined && target.sampleCount !== 1))
     fail('OPTIONS', 'Use renderTarget for scene depth/MSAA; the output pass is single-sample and depthless');
@@ -109,7 +111,8 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
           if ((!Array.isArray(clear) && !ArrayBuffer.isView(clear)) || clear.length !== 4)
             fail('FRAME', 'Expected an opaque RGBA clear color');
           sceneFrame.clearColor = Array.from(clear);
-          if (sceneFrame.clearColor.some(v => typeof v !== 'number' || !Number.isFinite(Math.fround(v)) || v < 0) || sceneFrame.clearColor[3] > 1 ||
+          if (sceneFrame.clearColor.some((v, i) => typeof v !== 'number' || !Number.isFinite(Math.fround(v)) ||
+              v < 0 && (!sourceOutput || i === 3)) || sceneFrame.clearColor[3] > 1 ||
               (!transparent && sceneFrame.clearColor[3] !== 1)) fail('FRAME', 'Opaque HDR canvas clear alpha must be one');
           live();
           offscreen.resize(canvas.width, canvas.height);
@@ -171,7 +174,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
       if (signal.aborted) aborted(); live();
       offscreen = createGpuRenderTarget(device, {...hdr, width: canvas.width, height: canvas.height});
       const outputReady = createGpuAnimationOutput(device, {...defaults, format: presentation.format,
-        outputColorSpace: target.srgbView === false ? 'linear' : 'srgb', signal}).then(value => {
+        outputColorSpace: outputColorSpace ?? (target.srgbView === false ? 'linear' : 'srgb'), sourceOutput, signal}).then(value => {
         if (closed()) { value.dispose(); throw terminal; }
         finalOutput = value; return value;
       });

@@ -971,11 +971,11 @@ function array(value, length, label) {
   for (let i = 0; i < length; i++) finite(value[i], label);
   return value;
 }
-function color(value) {
+function color(value, signed = false) {
   array(value, 4, "Linear RGBA color");
   for (let i = 0; i < 4; i++)
-    if (value[i] < 0 || !Number.isFinite(Math.fround(value[i])))
-      fail("ANIMATION_RENDER_VALUE", "Color must be nonnegative finite f32");
+    if (value[i] < 0 && (!signed || i === 3) || !Number.isFinite(Math.fround(value[i])))
+      fail("ANIMATION_RENDER_VALUE", "Color must be finite f32 with nonnegative alpha and admitted RGB sign");
   if (value[3] > 1) fail("ANIMATION_RENDER_VALUE", "Alpha must be in [0,1]");
   return value;
 }
@@ -2619,7 +2619,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         if (!["clear", "load"].includes(stencilLoadOp)) fail("ANIMATION_RENDER_ATTACHMENT", "Invalid stencil load operation");
         integer(clearStencil, 0, 255, "clear stencil");
       }
-      color(clearColor);
+      color(clearColor, format?.endsWith('float') === true);
       for (const value of clearColors) {
         array(value, 4, "Attachment clear value");
         if (value.some(component => !Number.isFinite(Math.fround(component))))

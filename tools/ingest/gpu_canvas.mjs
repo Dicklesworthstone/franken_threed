@@ -21,16 +21,19 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected canvas options');
   for (const key of Object.keys(options))
-    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView'].includes(key))
+    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView', 'toneMappingMode'].includes(key))
       fail('OPTIONS', `Unknown canvas option: ${key}`);
   const {
     format: canvasFormat = 'bgra8unorm', depthFormat = 'depth24plus', sampleCount = 1,
     alphaMode = 'opaque', maxBytes = 128 * 1024 * 1024,
-    width: initialWidth = canvas?.width, height: initialHeight = canvas?.height, srgbView = true,
+    width: initialWidth = canvas?.width, height: initialHeight = canvas?.height,
+    srgbView = canvasFormat !== 'rgba16float', toneMappingMode = 'standard',
   } = options;
   if (typeof srgbView !== 'boolean') fail('OPTIONS', 'srgbView must be boolean');
-  if (!['rgba8unorm', 'bgra8unorm'].includes(canvasFormat))
-    fail('FORMAT', 'Canvas format must be rgba8unorm or bgra8unorm');
+  if (!['rgba8unorm', 'bgra8unorm', 'rgba16float'].includes(canvasFormat) || canvasFormat === 'rgba16float' && srgbView)
+    fail('FORMAT', 'Canvas format must be rgba8unorm, bgra8unorm or rgba16float without an sRGB view');
+  if (!['standard', 'extended'].includes(toneMappingMode))
+    fail('FORMAT', 'Canvas tone mapping must be standard or extended');
   if (![null, 'depth24plus', 'depth32float', 'depth24plus-stencil8'].includes(depthFormat) || ![1, 4].includes(sampleCount))
     fail('FORMAT', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four samples');
   // 'premultiplied' composites the canvas over the page. The explicit renderer
@@ -112,7 +115,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     // offscreen owner does; depth24plus alone uses four. Swapchain/driver
     // allocations are outside this owned-attachment budget.
     const depthBytes = depthFormat === 'depth24plus-stencil8' ? 8 : depthFormat ? 4 : 0;
-    const cost = w * h * sampleCount * (depthBytes + (sampleCount > 1 ? 4 : 0));
+    const colorBytes = canvasFormat === 'rgba16float' ? 8 : 4;
+    const cost = w * h * sampleCount * (depthBytes + (sampleCount > 1 ? colorBytes : 0));
     const overlap = bytes();
     if (!Number.isSafeInteger(cost) || cost > maxBytes - overlap)
       fail('BUDGET', 'Resize exceeds the attachment budget including in-flight old targets');
@@ -228,7 +232,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
       checked(() => {
         configured = true;
         context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC,
-          alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : []});
+          alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : [], toneMapping: {mode: toneMappingMode}});
       });
       resize(initialWidth, initialHeight);
     });

@@ -6,7 +6,8 @@
  * substitute for per-material toneMapped semantics or complete renderer parity.
  * Input is a single-sample linear RGBA8/BGRA8, RGBA16F or RGBA32F texture.
  * Source and destination extents must match; no implicit resize/filter/flip.
- * Negative radiance is clamped before mapping. Alpha is not tone mapped.
+ * Negative radiance is clamped before mapping unless sourceOutput retains
+ * the native r186 RenderOutputNode profile. Alpha is not tone mapped.
  */
 export class AnimationOutputError extends Error {
   constructor(code, message) {
@@ -157,6 +158,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
         "exposure",
         "inputAlpha",
         "outputAlpha",
+        "sourceOutput",
         "signal",
       ].includes(key)
     )
@@ -164,6 +166,8 @@ export async function createGpuAnimationOutput(device, options = {}) {
   const format = options.format ?? "bgra8unorm",
     outputColorSpace = options.outputColorSpace ?? "srgb",
     signal = options.signal;
+  if (options.sourceOutput !== undefined && typeof options.sourceOutput !== 'boolean')
+    fail("OPTIONS", "sourceOutput must be boolean");
   if (
     !formats.includes(format) ||
     !["linear", "srgb"].includes(outputColorSpace) ||
@@ -271,7 +275,20 @@ export async function createGpuAnimationOutput(device, options = {}) {
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     abort();
-    const code = ANIMATION_OUTPUT_WGSL.replace(
+    // The native renderer retains RenderOutputNode's signed RGB and exact
+    // source transfer and tone-expression grouping. The explicit helper keeps its
+    // original nonnegative-radiance profile unless that source mode is chosen.
+    const shader = options.sourceOutput === true ? ANIMATION_OUTPUT_WGSL
+      .replace('var color=max(pixel.rgb,vec3<f32>(0.0));', 'var color=pixel.rgb;')
+      .replace('return select(12.92*v,1.055*pow(max(v,vec3<f32>(0.0)),vec3<f32>(1.0/2.4))-0.055,v>vec3<f32>(0.0031308));',
+        'return mix(pow(v,vec3<f32>(0.41666))*vec3<f32>(1.055)-vec3<f32>(0.055),v*vec3<f32>(12.92),vec3<f32>(v<=vec3<f32>(0.0031308)));')
+      .replace('color*(0.983729*color+0.4329510)', 'color*((color+0.4329510)*0.983729)')
+      .replace('15.5*x4*x2-40.14*x4*color+31.96*x4-6.868*x2*color+0.4298*x2+0.1191*color-0.00232',
+        '(15.5*(x4*x2)-40.14*(x4*color))+((31.96*x4-6.868*(x2*color))+(0.4298*x2+(0.1191*color-0.00232)))')
+      .replace('x-6.25*x*x', 'x-6.25*(x*x)')
+      .replace('let d=0.24;', 'let d=1.0-0.76;')
+      .replace('(peak+d-0.76)', '(peak+(d-0.76))') : ANIMATION_OUTPUT_WGSL;
+    const code = shader.replace(
       "// OUTPUT_TRANSFER",
       outputColorSpace === "srgb" ? "color=linear_to_srgb(color);" : "",
     ).replace(

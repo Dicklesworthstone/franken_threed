@@ -141,6 +141,20 @@ test("allocates one 16-byte parameter block, no textures/samplers, and scopes ne
   assert.equal(output.allocatedBytes, 0);
   assert.equal(g.buffers[0].destroyed, 1);
 });
+
+test('native half-float output preserves signed RGB and the pinned source sRGB exponent', async () => {
+  const g = gpu(), out = await createGpuAnimationOutput(g.device,
+    {format: 'rgba16float', outputColorSpace: 'srgb', sourceOutput: true});
+  out.render({source: g.texture(), target: g.texture()});
+  const shader = g.calls.find(call => call[0] === 'shader')[1].code;
+  assert.match(shader, /var color=pixel.rgb;/);
+  assert.match(shader, /vec3<f32>\(0\.41666\)/);
+  assert.match(shader, /color=linear_to_srgb\(color\);/);
+  assert.doesNotMatch(shader, /color=srgb_to_linear\(color\);/);
+  assert.equal(g.calls.find(call => call[0] === 'pipeline')[1].fragment.targets[0].format, 'rgba16float');
+  assert.equal(g.calls.filter(call => call[0] === 'submit').length, 1);
+  out.dispose();
+});
 for (const [id, toneMapping] of ANIMATION_TONE_MAPPINGS.entries())
   test(`${toneMapping}: uploads frame-selected exposure, mode and alpha conventions`, async () => {
     const g = gpu(),

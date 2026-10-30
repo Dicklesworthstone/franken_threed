@@ -66,11 +66,43 @@ automatic application routing and do not establish an H1 acceleration claim.
 ## Supported surface
 
 `new WebGPURenderer({canvas, antialias, alpha, depth, samples, powerPreference,
-requiredLimits, requiredFeatures, device})`, `init()`, `render()` (throws the source
+requiredLimits, requiredFeatures, device, outputType, outputBufferType})`, `init()`, `render()` (throws the source
 error before `init()`), `renderAsync()`, `compileAsync()`, `setAnimationLoop()`,
 `setSize()`, `setPixelRatio()`, `setDrawingBufferSize()`, size getters, clear
 color/alpha/depth, `autoClear*`, `toneMapping`,
 `toneMappingExposure`, `shadowMap.enabled`, `info`, `dispose()`.
+
+Native `outputType: HalfFloatType` presents into `rgba16float` with the pinned
+extended canvas tone-mapping mode. Omitting the option keeps the browser's
+preferred format; explicit `UnsignedByteType` selects `bgra8unorm`, as r186 does.
+The intermediate scene precision remains independently controlled by
+`outputBufferType`. Direct working-linear draws support one or four samples,
+including half-float resolves. Converted output renders the sampled scene first
+and presents through a depthless, single-sample output pass.
+
+Half-float presentation preserves signed working-linear RGB and values above
+one. Its software output transfer follows the pinned native TSL alpha and tone
+equations without inventing an sRGB texture view. Canvas configuration retains
+the source's default sRGB color space. Queued color-space changes, canvas
+selection, resize retirement, framebuffer-copy storage and source-visible
+texture types use the existing owners. A copied half-float canvas may still have
+public `FramebufferTexture.type === UnsignedByteType`, following the source's
+separate public-type and GPU-format rules.
+
+Run `node tests/e2e/webgpu_renderer/native_hdr_output.mjs` with the existing
+Chromium/Playwright environment for raw half-float source/candidate comparisons
+before browser compositing. Recording-device coverage also exercises signed
+clears, MSAA, queued output transfers, independent scene precision and the
+eight-byte-per-texel multisample budget. HDR display behavior and physical-device
+performance require their own host evidence.
+
+Chromium 151.0.7922.34 / SwiftShader matched all 6,144 raw half-float words across
+twelve cases, including all seven tone operators, alpha, direct MSAA, signed
+clears and working-linear output. The tests retained values up to 7.75 and a
+negative clear of -0.5, with no GPU/browser errors. The canvas runner uses
+ordinary browser process separation: the in-process GPU combination used by
+older offscreen tests drops the WebGPU instance during canvas readback on this
+host, including in a renderer-free reference probe.
 
 Native `setOutputRenderTarget(target)` / `getOutputRenderTarget()` select a
 single-color 2D target for final output. Working-linear output renders directly;

@@ -8,7 +8,7 @@ import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
-function fixture(t) {
+function fixture(t, options = {}) {
   const device = geometryDevice(), events = [];
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxBindingsPerBindGroup: 1000});
   device.createTexture = desc => {
@@ -46,10 +46,10 @@ function fixture(t) {
           format: configured.format, usage: configured.usage}), {canvasName: name});
       },
     };
-    return {canvas: result, counts};
+    return {canvas: result, counts, get configuration() { return configured; }};
   }
   const main = canvas('main'), preview = canvas('preview', 32, 24);
-  const renderer = new Renderer({canvas: main.canvas, device});
+  const renderer = new Renderer({canvas: main.canvas, device, ...options});
   renderer.outputColorSpace = T.LinearSRGBColorSpace;
   t.after(() => renderer.dispose());
   const mainTarget = renderer.getCanvasTarget(), previewTarget = new T.CanvasTarget(preview.canvas);
@@ -60,6 +60,74 @@ function fixture(t) {
 }
 const presented = device => device.passes.filter(pass => pass.desc.colorAttachments[0]?.view?.texture?.canvasName);
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
+
+for (const antialias of [false, true])
+test(`half-float linear canvas keeps source output format and ${antialias ? 4 : 1}-sample attachments`, async t => {
+  const f = fixture(t, {outputType: T.HalfFloatType, antialias}), r = f.renderer;
+  r.setClearColor(new T.Color(-.25, 2, 4));
+  await r.init(); f.quad.render(r); await r.waitForGPU();
+  assert.equal(f.main.configuration.format, 'rgba16float');
+  assert.deepEqual(f.main.configuration.toneMapping, {mode: 'extended'});
+  assert.deepEqual(f.main.configuration.viewFormats, []);
+  const pass = f.device.passes.find(pass => pass.draws.length);
+  assert.equal(pass.desc.colorAttachments[0].view.texture.format, 'rgba16float');
+  assert.equal(pass.desc.colorAttachments[0].view.texture.sampleCount, antialias ? 4 : 1);
+  assert.deepEqual(pass.desc.colorAttachments[0].clearValue, {r: -.25, g: 2, b: 4, a: 1});
+  assert.equal(pass.draws[0].pipeline.multisample.count, antialias ? 4 : 1);
+  if (antialias) {
+    assert.equal(pass.desc.colorAttachments[0].resolveTarget.texture.canvasName, 'main');
+    assert.equal(pass.desc.colorAttachments[0].resolveTarget.texture.format, 'rgba16float');
+  }
+  r.autoClear = false; f.quad.render(r); await r.waitForGPU();
+  assert.equal(f.device.passes.at(-1).desc.colorAttachments[0].loadOp, 'load');
+});
+
+test('half-float output keeps queued color transfers and independent scene-buffer precision', async t => {
+  const f = fixture(t, {outputType: T.HalfFloatType, outputBufferType: T.UnsignedByteType, antialias: true}), r = f.renderer;
+  r.toneMapping = T.ReinhardToneMapping; r.outputColorSpace = T.SRGBColorSpace;
+  await r.init(); f.quad.render(r);
+  r.outputColorSpace = T.LinearSRGBColorSpace; f.quad.render(r);
+  r.outputColorSpace = T.SRGBColorSpace; f.quad.render(r);
+  await r.waitForGPU();
+  const output = presented(f.device).filter(pass => pass.draws.length);
+  assert.equal(output.length, 3);
+  assert.ok(output.every(pass => pass.desc.colorAttachments[0].view.texture.format === 'rgba16float'));
+  const shader = pass => pass.draws[0].pipeline.fragment.module.code;
+  assert.deepEqual(output.map(pass => shader(pass).includes('color=linear_to_srgb(color);')), [true, false, true]);
+  for (const pass of output) {
+    assert.match(shader(pass), /var color=pixel.rgb;/);
+    assert.match(shader(pass), /vec3<f32>\(0\.41666\)/);
+    assert.doesNotMatch(shader(pass), /color=srgb_to_linear\(color\);/);
+    const source = [...pass.draws[0].groups.values()].flatMap(({group}) => group.entries)
+      .map(entry => entry.resource?.texture).find(Boolean);
+    assert.equal(source.format, 'rgba8unorm', 'outputType does not replace outputBufferType');
+    assert.equal(source.sampleCount, 1);
+  }
+  const scene = f.device.passes.filter(pass => pass.draws.length && !pass.desc.colorAttachments[0].view.texture.canvasName);
+  assert.ok(scene.every(pass => pass.desc.colorAttachments[0].view.texture.sampleCount === 4));
+  assert.equal(r._nodeCaptureBytes, 0);
+});
+
+test('direct half-float framebuffer snapshots keep native storage and source public type', async t => {
+  const f = fixture(t, {outputType: T.HalfFloatType}), r = f.renderer;
+  const image = new T.FramebufferTexture(8, 8); t.after(() => image.dispose());
+  await r.init(); f.quad.render(r); r.copyFramebufferToTexture(image);
+  await r.waitForGPU();
+  assert.equal(image.type, T.UnsignedByteType);
+  const copy = f.events.find(event => event.copy);
+  assert.equal(copy.source.texture.format, 'rgba16float');
+  assert.equal(copy.destination.texture.format, 'rgba16float');
+  assert.equal(copy.source.texture.canvasName, 'main');
+});
+
+test('explicit byte output selects the pinned BGRA format; unsupported output types fail before configuration', async t => {
+  const f = fixture(t, {outputType: T.UnsignedByteType}); await f.renderer.init();
+  assert.equal(f.main.configuration.format, 'bgra8unorm');
+  assert.deepEqual(f.main.configuration.toneMapping, {mode: 'standard'});
+  const invalid = fixture(t, {outputType: T.FloatType});
+  await assert.rejects(invalid.renderer.init(), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(invalid.main.counts.configure, 0);
+});
 
 test('source CanvasTarget owns public size, pixel ratio, viewport and scissor state', t => {
   const f = fixture(t), r = f.renderer;
