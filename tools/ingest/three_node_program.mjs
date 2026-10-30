@@ -323,7 +323,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!Number.isSafeInteger(stride) || stride < 1 || stride === 3)
         fail('STORAGE', 'Native storage structs require a complete source stride without ambiguous three-word padding');
     }
-    if ((!type && !struct) || node.isAtomic && !atomic || node.isPBO ||
+    // PBO is a WebGL-fallback hint. The pinned StorageArrayElementNode only
+    // observes it when storageBuffer is unavailable; native WGSL keeps the
+    // ordinary shared storage allocation, including for authored PBO nodes.
+    if ((!type && !struct) || node.isAtomic && !atomic ||
         !['readOnly', 'readWrite'].includes(node.access) || attribute?.isIndirectStorageBufferAttribute ||
         !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
         attribute.isInterleavedBufferAttribute || attribute.normalized ||

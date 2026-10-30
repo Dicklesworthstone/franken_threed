@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
+import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage, captureComputeAttributeView, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
@@ -49,6 +50,78 @@ const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.
   .map(entry => entry.resource?.buffer).filter(buffer => buffer?.usage & 128);
 const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
 const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
+
+for (const [type, Type, stride] of [['float', Float32Array, 1], ['vec3', Float32Array, 3], ['uvec2', Uint32Array, 2]])
+test(`PBO-marked ${type} storage keeps the exact source WebGPU graph and ignores fallback-only toggles`, async t => {
+  const f = fixture(t), storage = N.instancedArray(new Type(2 * stride).fill(1), type).setPBO(true);
+  const element = storage.element(N.instanceIndex), value = N.float(stride === 1 ? element : element.x);
+  f.material.positionNode = N.positionLocal.add(N.vec3(value.mul(.01), 0, 0));
+  f.material.colorNode = N.vec3(value.mul(.01), .25, .5);
+  await f.renderer.init();
+  const context = {scene: f.scene, camera: f.camera, lights: []};
+  const source = () => {
+    const builder = new T.WGSLNodeBuilder(f.mesh, f.renderer);
+    builder.scene = f.scene; builder.camera = f.camera; builder.lightsNode = N.lights([]);
+    builder.build(); return builder;
+  };
+  const programs = createThreeNodePrograms({three: T, renderer: f.renderer}); t.after(() => programs.dispose());
+  const expected = source(), descriptor = programs.compile(f.material, f.mesh, context);
+  assert.equal(descriptor.vertex, expected.vertexShader); assert.equal(descriptor.fragment, expected.fragmentShader);
+  assert.match(descriptor.vertex, /var<storage, read>/); assert.match(descriptor.fragment, /var<storage, read>/);
+  storage.setPBO(false);
+  const ordinary = source();
+  assert.equal(ordinary.vertexShader, expected.vertexShader); assert.equal(ordinary.fragmentShader, expected.fragmentShader);
+  assert.equal(programs.compile(f.material, f.mesh, context), descriptor);
+  storage.setPBO(true);
+  assert.equal(programs.compile(f.material, f.mesh, context), descriptor);
+});
+
+test('PBO compute, generated vertex inputs and fragment storage share one allocation across queued flag changes', async t => {
+  const f = fixture(t), positions = N.instancedArray(3, 'vec3').setPBO(true), attribute = positions.value;
+  f.mesh.count = 3; f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  f.material.colorNode = positions.element(0).abs();
+  const compute = kernel(positions); t.after(() => compute.dispose());
+  f.device.onCompute = pass => new Float32Array(computeStorage(pass)[0].data).fill(.5);
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  f.renderer.render(f.scene, f.camera);
+  positions.setPBO(false); attribute.array.fill(99); // No upload request: keep the GPU-produced bytes.
+  f.renderer.render(f.scene, f.camera);
+  positions.setPBO(true); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  const selected = draws(f.device); assert.equal(selected.length, 3);
+  for (const draw of selected) {
+    assert.ok([...draw.streams.values()].includes(buffer)); assert.ok(shaderStorage(draw).includes(buffer));
+    assert.ok(words(draw, buffer).every(value => value === .5));
+  }
+  assert.equal(computeStorage(f.device.computePasses[0])[0], buffer);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(attribute.itemSize, 4, 'retain the pinned WebGPU vec3 storage padding');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.renderer.dispose(); assert.equal(buffer.destroyed, true);
+});
+
+test('PBO storage queued partial uploads preserve the GPU history outside each requested range', async t => {
+  const f = fixture(t), storage = N.instancedArray(new Uint32Array(4), 'uint').setPBO(true), attribute = storage.value;
+  f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01), .25, .5);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).assign(7); })().compute(4);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => new Uint32Array(computeStorage(pass)[0].data).fill(7);
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99); attribute.array[1] = 11; attribute.addUpdateRange(1, 1); attribute.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera); attribute.clearUpdateRanges();
+  storage.setPBO(false); attribute.array.fill(99); attribute.array[2] = 13;
+  attribute.addUpdateRange(2, 1); attribute.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera); attribute.array.fill(99);
+  await drain(f.renderer);
+  assert.deepEqual(draws(f.device).map(draw => words(draw, buffer, Uint32Array)),
+    [[7, 7, 7, 7], [7, 11, 7, 7], [7, 11, 13, 7]]);
+  assert.deepEqual(f.device.writes.filter(write => write.buffer === buffer).map(write => [write.offset, write.input.byteLength]),
+    [[0, 16], [4, 4], [8, 4]]);
+});
 
 const matrixGraph = (storage, dimension) => {
   const matrix = storage.element(N.instanceIndex);

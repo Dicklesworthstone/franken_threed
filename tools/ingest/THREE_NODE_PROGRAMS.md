@@ -731,6 +731,24 @@ remain unchanged. The H8 fluid particle record (`position: vec3`,
 `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written by compute and
 read directly in both vertex and fragment graphs.
 
+Source storage nodes marked with `.setPBO(true)` use that same native allocation.
+The flag enables a separate WebGL fallback in the pinned cloth, birds and
+skinning examples; `StorageArrayElementNode` only observes it when the builder
+has no storage-buffer support. Native WGSL therefore retains ordinary storage
+bindings, and changing the hint does not rebuild its graphics program or restore
+old CPU values. Source vec3 padding, generated `.toAttribute()` vertex inputs,
+fragment reads and queued partial uploads keep their existing owners. No PBO
+texture emulation or CPU readback is introduced into the native path, and the
+exact WebGL component is unchanged. Five new recording regressions in
+`three_renderer_storage_attributes.test.mjs` compare source shaders, queued
+bytes and allocation identity; all 26 storage-attribute cases pass.
+`native_pbo_storage.mjs` also runs GPU spring/vertex cloth kernels and generated
+instanced vertex/fragment consumers against the pinned renderer. Both cases
+match all seven RGBA checkpoints exactly (688,128 compared bytes total), with
+real storage readbacks, live hint toggles, native ownership and zero GPU/browser
+errors on Chromium 151.0.7922.34/SwiftShader. These are bounded compute/graphics
+workloads, not full official-example or hardware-performance certification.
+
 A non-atomic compute-writable source node can be read by graphics; the pinned builder
 supplies read-only graphics bindings. Member, matrix-column and whole-record
 writes are rejected, while explicit local copies remain writable. Struct names,
@@ -1585,7 +1603,7 @@ for those scenes; they do not measure hardware acceleration.
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
 graphics writes, atomics outside the scalar integer fragment profile above,
 matrix storage outside the padded Float32 profile, nested/boolean/atomic
-struct members, PBO storage and managed uniform arrays remain refused.
+struct members and managed uniform arrays remain refused.
 Render-triggered compute beyond the source geometry profile and resource ordering
 boundaries described above is unsupported; generated graphics writes still
 require an explicitly admitted graphics access profile.
