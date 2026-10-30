@@ -11,6 +11,7 @@ import * as walk from "acorn-walk";
 import { isInternalLibraryModule } from "./route_bridge.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { fbxAssetUris } from "./pack_fbx.mjs";
+import { colladaAssetUris } from "./pack_collada.mjs";
 
 const PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
 const CORE_LOADERS = new Set([
@@ -39,6 +40,7 @@ const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
   ["MTLLoader", new Set(["setMaterialOptions"])],
   ["FBXLoader", new Set()],
+  ["ColladaLoader", new Set()],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -50,6 +52,7 @@ const ADDON_USES = new Map([
   ["KTX2Loader", new Set(["parse", "init", "detectSupportAsync"])],
   ["MTLLoader", new Set(["parse"])],
   ["FBXLoader", new Set(["parse"])],
+  ["ColladaLoader", new Set(["parse"])],
   ["Rhino3dmLoader", new Set(["parse", "parseAsync", "decodeObjects"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
@@ -431,8 +434,8 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
         }
       }
       let materialGroup;
-      if (value.loader === "MTLLoader" || value.loader === "FBXLoader") {
-        // MTL/FBX capture their default path when load() starts, but resourcePath is
+      if (["MTLLoader", "FBXLoader", "ColladaLoader"].includes(value.loader)) {
+        // These loaders capture their default path when load() starts, but resourcePath is
         // read later by parse(). Each pending request keeps its own fallback.
         if (!materialLoads.has(value.origin)) materialLoads.set(value.origin, { paths: new Set(), requests: [], unknown: false });
         materialGroup = materialLoads.get(value.origin);
@@ -557,6 +560,21 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
   for (const request of requests) {
     const asset = add(request.url);
     if (!asset) continue;
+    if (request.loader === "ColladaLoader") {
+      if (!request.texturePaths) continue;
+      let uris;
+      try { uris = colladaAssetUris(asset.source); }
+      catch (error) {
+        // The original XML and native parser retain malformed-input behavior.
+        if (error.code === "COLLADA_XML") continue;
+        if (error.code === "COLLADA_BUDGET") fail?.(error.code, error.message);
+        throw error;
+      }
+      // Both the retained TextureLoader and TGALoader use literal setPath()
+      // concatenation; an image's URL is not resolved against the model URL.
+      for (const uri of uris) for (const base of request.texturePaths) add(base + uri);
+      continue;
+    }
     if (request.loader === "FBXLoader") {
       if (!request.texturePaths) continue;
       let uris;

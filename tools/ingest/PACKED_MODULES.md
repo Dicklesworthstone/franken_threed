@@ -381,6 +381,35 @@ decode, all material/geometry assertions pass, and there are no browser errors.
 This validates retained-loader packaging and native image decoding, not rendering
 or acceleration.
 
+## Collada scenes, textures and animation
+
+Pinned `ColladaLoader` imports, aliases and addon-aggregate imports now participate
+in finite standalone resource closure. The package preserves original DAE, image
+and TGA bytes, the path captured when loading starts, and resource-path changes
+while a model is pending. Image URLs retain the source's literal path-prefix
+concatenation, query/fragment identity and XML text semantics.
+
+A bounded metadata reader discovers the first direct image library and follows
+the pinned duplicate-ID and `init_from` rules. The original XML parser, geometry,
+skeletons, animation, kinematics, texture decoding and runtime `parse()` remain
+source-owned. Malformed documents retain their native error behavior. Valid DTD
+or custom-entity metadata is explicitly refused with `COLLADA_XML_UNSUPPORTED`
+when closing a standalone package; it is not silently classified as a closed
+resource graph or automatically redirected to another deployment mode. Unknown
+paths, custom managers and escaped loaders retain their existing host boundaries.
+
+Five focused loader cases cover discovery, metadata, texture bases, an actual
+animated-model build and the valid-DTD refusal; all 38 adjacent loader checks
+also pass. `node tools/ingest/collada_package.browser.mjs` compares the pinned
+source with a packed page after the source/build directories and server become
+unavailable. Chromium 151.0.7922.34 matches the skinned stormtrooper's 19,554
+vertices, 6,518 triangles and three animated poses, independent reloads, the
+42,624-vertex elf and four decoded 1024-by-1024 JPEG images, pending path resets,
+callbacks, runtime TGA parsing and malformed XML. There are no external requests
+or unexpected browser errors. The source's unsupported morph-animation warning
+is preserved; this is retained loader functionality, without a performance or
+complete loader-family claim.
+
 ## FBX scenes, textures and animation
 
 Finite pinned `FBXLoader.load()` and `loadAsync()` requests now package their

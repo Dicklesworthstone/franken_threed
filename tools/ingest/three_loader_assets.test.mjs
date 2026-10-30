@@ -10,6 +10,7 @@ import { buildApplication } from "./build_application.mjs";
 import { packHtml } from "./pack_html.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
+import { colladaAssetUris } from "./pack_collada.mjs";
 
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
 const coreUrl = rootUrl + "build/three.core.js";
@@ -19,6 +20,7 @@ const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
 const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
 const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
 const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
+const colladaUrl = rootUrl + "examples/jsm/loaders/ColladaLoader.js";
 const threeMfUrl = rootUrl + "examples/jsm/loaders/3MFLoader.js";
 const rhinoUrl = rootUrl + "examples/jsm/loaders/3DMLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
@@ -193,6 +195,49 @@ test("FBX animation option methods and unknown mutations cannot masquerade as bo
     destructured.load('destructured.fbx');
     new FBXLoader().load('ordinary.fbx');`);
   assert.deepEqual(requests.map(({url}) => url), ['ordinary.fbx']);
+});
+
+test("Collada discovery retains captured default paths, pending resource resets and original runtime parse", () => {
+  const requests = discover(`import { ColladaLoader as Source } from ${JSON.stringify(colladaUrl)};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const loader = new Source(); loader.parse(runtimeText, 'runtime/');
+    loader.load('first/model.dae'); loader.loadAsync('second/model.dae');
+    loader.setPath('models/'); loader.load('nested/model.dae'); loader.setResourcePath('shared/');
+    const reset = new Source().setResourcePath('before/'); reset.load('fallback/model.dae'); reset.setResourcePath('');
+    new Addons.ColladaLoader().setResourcePath('textures/').loadAsync('namespace.dae');
+    const late = new Source(); late.load('host.dae'); late.setResourcePath(runtimePath);
+    new Source(manager).load('managed.dae'); const escaped = new Source(); customize(escaped); escaped.load('escaped.dae');
+    const changed = new Source(); changed.path = runtimePath; changed.load('changed.dae');`);
+  assert.deepEqual(requests.map(({url,texturePaths}) => [url,texturePaths]), [
+    ['first/model.dae',['first/','shared/']], ['second/model.dae',['second/','shared/']],
+    ['models/nested/model.dae',['models/','shared/']], ['fallback/model.dae',['before/','fallback/']],
+    ['namespace.dae',['textures/']], ['host.dae',null],
+  ]);
+});
+
+test("Collada image metadata follows direct source libraries, XML text and duplicate identities", () => {
+  const text = `<?xml version="1.0"?><COLLADA><extra><library_images>
+      <image id="fake"><init_from>nested-library.png</init_from></image></library_images></extra>
+    <library_images>
+      <!-- <image id="fake"><init_from>comment.png</init_from></image> -->
+      <image id="same"><init_from>replaced.png</init_from></image>
+      <image id="same"><init_from>paint&#32;%23.png?variant=2&amp;channel=1#map</init_from></image>
+      <image id="data"><init_from><![CDATA[data:image/png;base64,A&B]]></init_from></image>
+      <image id="literal"><init_from> folder/<extra>nested</extra> image.tga </init_from><init_from>second.png</init_from></image>
+      <image id="unicode"><init_from>caf&#233;&#x1F343;.png</init_from></image>
+    </library_images>
+    <library_images><image id="later"><init_from>ignored.png</init_from></image></library_images>
+    <library_effects><effect><surface><init_from>sampler-id</init_from></surface></effect></library_effects>
+  </COLLADA>`;
+  assert.deepEqual(colladaAssetUris(Buffer.from(text)), [
+    'paint %23.png?variant=2&channel=1#map', 'data:image/png;base64,A&B', ' folder/nested image.tga ', 'café🍃.png',
+  ]);
+  for (const invalid of ['<COLLADA><library_images></COLLADA>',
+    '<COLLADA><library_images><image id="x"><init_from>&unknown;</init_from></image></library_images></COLLADA>'])
+    assert.throws(() => colladaAssetUris(Buffer.from(invalid)), {code:'COLLADA_XML'});
+  assert.throws(() => colladaAssetUris(Buffer.from('<!DOCTYPE COLLADA [<!ENTITY custom "image.png">]><COLLADA/>')),
+    {code:'COLLADA_XML_UNSUPPORTED'});
+  assert.throws(() => colladaAssetUris(Buffer.from('<COLLADA>' + '<a>'.repeat(128))), {code:'COLLADA_BUDGET'});
 });
 
 test("MTL and configured OBJ loaders retain finite model paths, material settings and namespace identity", () => {
@@ -433,6 +478,64 @@ function fixture(files) {
   }
   return root;
 }
+
+test("Collada assets preserve source path concatenation, TGA bytes, URL identities and pending bases", () => {
+  const model = Buffer.from(`<COLLADA><library_images>
+    <image id="paint"><init_from>paint%20%23.png?version=2&amp;quality=1#map</init_from></image>
+    <image id="tga"><init_from>normal.tga</init_from></image>
+    <image id="literal"><init_from>https://example.test/literal.png</init_from></image>
+    <image id="outside"><init_from>../../../../outside.png</init_from></image>
+  </library_images></COLLADA>`);
+  const names = ['paint #.png','normal.tga','https:/example.test/literal.png'];
+  const root = fixture({'index.html':'','site/models/nested/model.dae':model,
+    ...Object.fromEntries(['models','textures'].flatMap(base => names.map(name => [`site/${base}/${name}`,fbxPixel])))});
+  const requests = discover(`import {ColladaLoader} from ${JSON.stringify(colladaUrl)};
+    const loader=new ColladaLoader().setPath('models/');loader.load('nested/model.dae');loader.setResourcePath('textures/');`);
+  const logical=[], options={documentUrl:pathToFileURL(path.join(root,'index.html')).href,
+    documentBaseUrl:pathToFileURL(root+'/site/').href,onResource:(name,url)=>logical.push(url)};
+  const assets=collectThreeLoaderAssets(requests,options);
+  assert.deepEqual([...assets.keys()].sort(), ['site/models/nested/model.dae',
+    ...['models','textures'].flatMap(base=>names.map(name=>`site/${base}/${name}`))].sort());
+  assert.deepEqual(assets.get('site/models/nested/model.dae').source,model);
+  assert.ok(logical.some(url=>url.endsWith('paint%20%23.png?version=2&quality=1#map')));
+  for (const name of [...assets.keys()].filter(name=>!name.endsWith('.dae'))) assert.deepEqual(assets.get(name).source,fbxPixel);
+});
+
+test("Collada builds retain textured animated model bytes and native XML parse dependencies", async () => {
+  const base=new URL('../../upstream/three.js/examples/models/collada/stormtrooper/', import.meta.url);
+  const model=fs.readFileSync(new URL('stormtrooper.dae',base)), image=fs.readFileSync(new URL('Stormtrooper_D.jpg',base));
+  const root=fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import {ColladaLoader} from ${JSON.stringify(colladaUrl)};
+      export const load=()=>new ColladaLoader().setPath('models/').loadAsync('trooper%20%23.dae?version=2#rig');`,
+    'models/trooper #.dae':model, 'models/Stormtrooper_D.jpg':image});
+  const output=path.join(root,'dist');
+  await buildApplication(path.join(root,'index.html'),output,{prepareStandaloneLoaders:true});
+  for (const name of ['trooper #.dae','Stormtrooper_D.jpg'])
+    assert.deepEqual(fs.readFileSync(path.join(output,'models',name)),fs.readFileSync(path.join(root,'models',name)));
+  const resources=fs.readFileSync(path.join(output,'f3d-loader-resources.mjs'),'utf8');
+  assert.ok(resources.includes('models/trooper%20%23.dae?version=2'));
+  assert.ok(resources.includes(image.toString('base64')));
+  const packed=path.join(root,'packed.html');packHtml(path.join(output,'index.html'),packed);
+  assert.ok(fs.statSync(packed).size>model.length+image.length);
+});
+
+test("valid Collada DTD image entities cannot silently produce an incomplete standalone package", async () => {
+  const model = `<?xml version="1.0"?><!DOCTYPE COLLADA [<!ENTITY image "pixel.png">]>
+    <COLLADA version="1.4.1"><asset/><library_images><image id="pixel"><init_from>&image;</init_from></image></library_images>
+    <library_visual_scenes><visual_scene id="view"/></library_visual_scenes><scene><instance_visual_scene url="#view"/></scene></COLLADA>`;
+  const root = fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import {ColladaLoader} from ${JSON.stringify(colladaUrl)};
+      export const load=()=>new ColladaLoader().loadAsync('model.dae');`,
+    'model.dae':model, 'pixel.png':fbxPixel});
+  const requests=discover(fs.readFileSync(path.join(root,'app.mjs'),'utf8'));
+  assert.throws(()=>collectThreeLoaderAssets(requests,{
+    documentUrl:pathToFileURL(path.join(root,'index.html')).href,documentBaseUrl:pathToFileURL(root+'/').href,
+  }),{code:'COLLADA_XML_UNSUPPORTED'});
+  await assert.rejects(buildApplication(path.join(root,'index.html'),path.join(root,'dist'),{prepareStandaloneLoaders:true}),
+    /COLLADA_XML_UNSUPPORTED/);
+  // The input remains intact for the caller to choose a networked deployment.
+  assert.equal(fs.readFileSync(path.join(root,'model.dae'),'utf8'),model);
+});
 
 test("3MF application builds preserve complete source ZIP archives and their logical URL variants", async () => {
   const archive = fs.readFileSync(new URL('../../upstream/three.js/examples/models/3mf/facecolors.3mf', import.meta.url));
