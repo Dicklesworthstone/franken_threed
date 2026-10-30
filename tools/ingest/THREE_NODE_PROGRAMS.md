@@ -1161,6 +1161,50 @@ outside this entrance. The retained builder's module-global capability and
 nearest-neighbor wrapR helper caches are unchanged; the tests disclose those
 source constraints rather than presenting them as fixes.
 
+## Native raymarched volume materials
+
+The pinned `VolumeNodeMaterial` now selects native graphics automatically and
+retains `VolumetricLightingModel` construction. Its loop, front/back ray
+direction, Beer attenuation, source point/spot/rectangular-light scattering and
+emission execute as source-generated WGSL through the owned WebGPU submission
+path. `scatteringNode` and `scatteringEmissiveNode` retain callable JavaScript or
+TSL `Fn` construction with the source `positionRay` context; generated bindings
+still undergo ordinary native graph admission.
+
+Live `steps`, offset and density/emission uniforms use the source NodeFrame
+frequencies. Graph identity changes require a new program, and mutations during
+updates cannot publish an old graph with new dependencies. Sampled 3D density
+uses the shared texture owner. `depthNode` can borrow a preceding scene target's
+depth attachment, and source spot shadows share the existing shadow owner with
+ordinary opaque scene companions. These paths introduce no CPU pixel readback
+or substitute scattering shader.
+
+The source only constructs the volumetric loop when its selected lighting scope
+is nonempty (or a source material lighting contribution activates it). Empty or
+disabled lighting therefore leaves scattering/emission callbacks inert. An
+emissive volume can use a zero-intensity source light to activate the lighting
+model without adding direct scattering. The native path preserves this source
+behavior. Analytic light color/intensity updates remain FRAME updates even when
+multiple logical renders occur in one frame.
+
+Twelve `three_renderer_native_volume_material.test.mjs` cases cover exact source
+shader text, live and queued inputs, callable graphs, source update frequencies,
+structural rejection, inactive lighting, actual depth-target borrowing and spot
+shadows. The new suite plus existing sampled-volume and area-light renderer
+coverage passes 36 tests. Shader construction and material graph callbacks remain
+retained JavaScript; rendering uses the `general-webgpu` owner. Full material
+family closure and physical-device acceleration remain separate open work.
+
+`tests/e2e/webgpu_renderer/native_volume_material.mjs` compares emission, sampled
+3D density with point/spot scattering, and actual target-depth clipping against
+pinned r186. All three match exact RGBA at seven 128x96 checkpoints each under
+Chromium 151.0.7922.34 / SwiftShader, with visible nonconstant output, live-change
+checks and zero GPU/browser errors. The fixture advances the pinned NodeFrame
+identically for each logical main frame, retaining one epoch for nested depth
+renders; independent background animation timing cannot choose different FRAME
+light values. These software-GPU results establish correctness for the tested
+scenes, not hardware performance.
+
 ## Native read-only storage texture views
 
 Authored `TSL.storageTexture()` texel reads now retain the pinned builder's

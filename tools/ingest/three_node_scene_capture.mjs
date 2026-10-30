@@ -21,6 +21,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNativeMedia(material) || material?.isMaterial === true && (
   material.alphaHash === true ||
+  material.isVolumeNodeMaterial === true ||
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
   material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true || material.isLine2NodeMaterial === true ||
   material.isPointsMaterial === true && (material.map != null || material.alphaMap != null) ||
@@ -35,8 +36,8 @@ const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNati
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
       'anisotropyMap', 'retroreflectivityMap', 'transmissionMap', 'thicknessMap'].some(key => material[key] != null)));
 const litMaterial = material => material?.isMaterial === true && material.lights !== false &&
-  ['MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
-    material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true);
+  (material.isVolumeNodeMaterial === true || ['MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
+    material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true));
 
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,

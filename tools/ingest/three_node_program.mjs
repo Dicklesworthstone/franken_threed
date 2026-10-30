@@ -3,7 +3,8 @@
  * no GPU commands. Descriptors preserve the builder's native bind groups.
  *
  * The profile is rigid/skinned/morphed meshes, source sprites, points and lines,
- * including source Line2NodeMaterial wide-line mesh expansion,
+ * including source Line2NodeMaterial wide-line mesh expansion and VolumeNodeMaterial
+ * raymarched scattering/emission,
  * InstancedBufferGeometry and CPU/storage-backed InstancedMesh objects, unlit
  * or Toon/Lambert/Phong/Standard/Physical node materials and corresponding
  * built-in materials with authored slots, ordinary or registered direct analytic
@@ -50,6 +51,7 @@ const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode'
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
 const POINT_SLOTS = new Set(['sizeNode']);
 const DASH_SLOTS = new Set(['offsetNode', 'dashScaleNode', 'dashSizeNode', 'gapSizeNode']);
+const VOLUME_FUNCTION_SLOTS = new Set(['scatteringNode', 'scatteringEmissiveNode']);
 const LIT_SLOTS = new Set(['normalNode', 'emissiveNode']);
 const PHONG_SLOTS = new Set(['shininessNode', 'specularNode']);
 const STANDARD_SLOTS = new Set(['metalnessNode', 'roughnessNode', 'envNode']);
@@ -112,7 +114,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     three.Line2NodeMaterial]
     .filter(Boolean).map(Type => Type.prototype);
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
-    three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes];
+    three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes,
+    ...(three.VolumeNodeMaterial ? [three.VolumeNodeMaterial.prototype] : [])];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode],
     [three.LightProbe, three.LightProbeNode], [three.RectAreaLight, three.RectAreaLightNode]]);
@@ -837,6 +840,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return JSON.stringify([material.worldUnits, material.dashed, material.transparent, material.vertexColors,
       ...[...DASH_SLOTS].map(key => sourceId(material[key]))]);
   }
+  function volumeSignature(material) {
+    if (Object.getPrototypeOf(material) !== three.VolumeNodeMaterial?.prototype) return null;
+    // The source calls these graph constructors with positionRay while building
+    // its loop. Keep their identities/graphs structural; steps and captured
+    // uniforms remain live values at the source RENDER/OBJECT frequencies.
+    return JSON.stringify(['offsetNode', 'depthNode', ...VOLUME_FUNCTION_SLOTS].map(key => {
+      const node = material[key];
+      return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
+    }));
+  }
   const wideLineCoverage = material => Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype &&
     material.alphaToCoverage && renderer.currentSamples > 0;
   function transmissionSignature(material) {
@@ -893,12 +906,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
         ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...primitivePrototypes, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
-      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic, LineDashed, Line2 or unlit base NodeMaterial');
+      fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, Shadow, Sprite, Points, LineBasic, LineDashed, Line2, Volume or unlit base NodeMaterial');
     const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
       physical = prototype === three.MeshPhysicalNodeMaterial.prototype, points = prototype === three.PointsNodeMaterial?.prototype,
       sprite = prototype === three.SpriteNodeMaterial.prototype || points,
-      dashed = prototype === three.LineDashedNodeMaterial?.prototype || prototype === three.Line2NodeMaterial?.prototype;
+      dashed = prototype === three.LineDashedNodeMaterial?.prototype || prototype === three.Line2NodeMaterial?.prototype,
+      volume = prototype === three.VolumeNodeMaterial?.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
     const lights = sourceLights(material, context), lightsNode = authoredLightsNode(material);
@@ -947,6 +961,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
       if (key.endsWith('Node') && value != null && !SLOTS.has(key) && !(sprite && SPRITE_SLOTS.has(key)) && !(lit && LIT_SLOTS.has(key)) &&
           !(points && POINT_SLOTS.has(key)) && !(dashed && DASH_SLOTS.has(key)) &&
+          !(volume && (key === 'offsetNode' || VOLUME_FUNCTION_SLOTS.has(key))) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
           !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
@@ -955,6 +970,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const mrt = inspectThreeMRT(three, renderer, material);
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
+      ...(volume ? [...VOLUME_FUNCTION_SLOTS].map(key => material[key]).filter(node => typeof node === 'function' && node.isNode === true) : []),
       ...authoredNodes,
       ...[environmentGraph(material, context), fogGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
     while (stack.length) {
@@ -1072,7 +1088,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       wideLineCoverage(material),
       material.depthWrite, material.depthTest, material.lights, clippingKey,
-      spriteSignature(material, object), wideLineSignature(material),
+      spriteSignature(material, object), wideLineSignature(material), volumeSignature(material),
       primitiveLayout(object, material),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
@@ -1118,6 +1134,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
+    const volumeKey = volumeSignature(preparedMaterial);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
@@ -1171,6 +1188,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native MRT context changed during source graph construction');
     if (fogSignature(prepareMaterial(material), context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
     if ((material.alphaHash === true) !== alphaHash) fail('CHANGED', 'Native alpha hashing changed during source graph construction');
+    if (volumeSignature(prepareMaterial(material)) !== volumeKey)
+      fail('CHANGED', 'Native volume graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
@@ -1361,6 +1380,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       transmissionSignature: transmissionSignature(preparedMaterial),
       spriteSignature: spriteSignature(preparedMaterial, object),
       wideLineSignature: wideLineSignature(preparedMaterial),
+      volumeSignature: volumeKey,
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
@@ -1674,6 +1694,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (transmissionSignature(prepareMaterial(state.material)) !== state.transmissionSignature)
       fail('CHANGED', 'Native transmission or dispersion graph changed; compile the physical draw variant again');
   }
+  function checkVolume(state) {
+    if (volumeSignature(prepareMaterial(state.material)) !== state.volumeSignature)
+      fail('CHANGED', 'Native volume scattering, emission, offset or depth graphs changed; compile the volume graph again');
+  }
   function checkClipping(state, context) {
     if ((state.material.alphaHash === true) !== state.alphaHash)
       fail('CHANGED', 'Native alpha hashing changed; compile the material graph again');
@@ -1707,6 +1731,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native sprite attenuation or center reference changed; compile the billboard graph again');
     if (wideLineSignature(prepareMaterial(state.material)) !== state.wideLineSignature)
       fail('CHANGED', 'Native wide-line expansion, dashes, colors or transparency changed; compile the line graph again');
+    checkVolume(state);
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
@@ -1791,6 +1816,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkFog(state, context);
       checkEnvironment(state, context);
       checkTransmission(state);
+      checkVolume(state);
       checkAttributes(state);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -1818,6 +1844,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkFog(state, context);
       checkEnvironment(state, context);
       checkTransmission(state);
+      checkVolume(state);
       checkClipping(state, context);
       checkWireframe(state);
       const textures = readTextures(state);
