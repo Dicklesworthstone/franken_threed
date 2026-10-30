@@ -171,8 +171,9 @@ Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 carry authored node slots. Their exact pinned `StandardNodeLibrary` conversions
 supply the native graph while the builder, callbacks and disposal retain the
 original source material identity. Ordinary materials also enter this path when
-they use bump, displacement or baked light maps, or Physical sheen, iridescence, anisotropy,
-retroreflectivity, transmission or dispersion and their maps. They require no authored node slot or
+they use bump, displacement or baked light maps, Basic/Lambert/Phong material
+`envMap`, or Physical sheen, iridescence, anisotropy, retroreflectivity,
+transmission or dispersion and their maps. They require no authored node slot or
 application rewrite. Other materials keep their existing fixed rendering path.
 When one material group on a mesh needs native shading, its other groups use the
 same source library conversion and geometry owner. All selected groups must pass
@@ -359,6 +360,81 @@ the corresponding source shader branch; changing its live value keeps the
 program. The source's shared 16×16 RG16F DFG lookup texture goes through the same
 versioned texture owner as authored textures, preserving its aliasing across
 materials and clearcoat samples.
+
+### Native Basic/Lambert/Phong environments
+
+`MeshBasicMaterial`, `MeshLambertMaterial`, `MeshPhongMaterial` and their node
+material forms now render material-local environment reflections and refractions
+through the native source graph. Ready cube maps and equirectangular images/data
+are supported, including the `ReflectionColor` environment assigned by the
+retained FBX loader. Ordinary materials select the native path directly; an
+authored color slot is unnecessary. Once an environment material has entered
+that path, removing and restoring its environment retains the same source
+lighting and deformation owner, including for animated skinned meshes.
+
+The pinned `BasicEnvironmentNode`, `CubeMapNode` and `BasicLightingModel` retain
+Multiply, Mix and Add composition, reflectivity, specular-map strength,
+`refractionRatio`, environment rotation and source normal handling. Lambert and
+Phong retain their direct/baked lighting around that same environment finish.
+These materials use reflectivity as their environment-strength control;
+`envMapIntensity` remains a PBR control and does not acquire a new meaning.
+
+A texture or material-reference `envNode` takes precedence over `envMap`.
+Basic/Lambert/Phong do not fall back to `scene.environment` or
+`scene.environmentNode` when their material environment is absent. Source
+material rotation accessors still determine the rotation of an authored cube
+node. Disabling source lighting or supplying a complete `fragmentNode` leaves
+unused material environment maps inactive.
+
+Equirectangular conversion executes the retained source method through six
+F3D-owned cube render-target faces. The converted image is sampled through its
+native cube view, without a CPU replica or an additional PMREM filter. Repeated
+uses retain the source conversion cache; another panorama identity selects its
+own conversion. Reflection/refraction mapping changes preserve the source cube
+orientation and cached conversion. Compatible uniform changes reuse the graph.
+At a source rebuild boundary, combine mode, input mapping, source identity and
+graph changes select the corresponding variant. Callback-time structural
+changes reject a stale draw before its incompatible resources can be accepted.
+
+The pinned renderer has two relevant cache limitations: its material cache
+reduces numeric properties other than `side` to zero/nonzero, which aliases
+`MixOperation` and `AddOperation`, and a texture node's graph cache key excludes
+the texture's mapping. `material.needsUpdate = true` alone does not invalidate
+those source shaders. A retained Mix/Add transition therefore requires an
+explicit material-disposal or environment-graph replacement boundary; changing
+a texture `envNode`'s mapping requires replacing that node or disposing its
+material. Native preparation reports `THREE_NODE_PROGRAM_ENVIRONMENT_CACHE`
+for these unsupported live transitions instead of silently building a shader
+that the pinned renderer would not build. The browser fixtures use these actual
+source invalidation boundaries. General emulation of source builder-cache
+collisions across otherwise-identical distinct materials is outside this slice.
+
+Queued draws retain their environment textures, sampler/upload histories and
+uniform bytes through the existing owners. A later material replacement or live
+control edit cannot rewrite an earlier accepted draw. The active profile requires
+ready cube/equirectangular inputs and the pinned texture/material-reference
+`envNode` shapes. Arbitrary procedural environment nodes are not source-valid in
+this BasicEnvironmentNode path: the pinned CubeMapNode does not produce a cube
+texture for them. Standard/Physical procedural environment graphs keep their
+existing separate source semantics.
+
+Twenty-five focused `three_renderer_native_basic_environment.test.mjs` cases pass,
+including complete source WGSL equality for all six material forms in reflection
+and refraction modes, source precedence, combine variants, live controls,
+callback guards, pinned cache-key/refusal/recovery behavior, queued native draws,
+environment removal/restoration and actual six-face conversion commands.
+Seventeen directly affected PBR material/environment regression cases also pass.
+These record-device checks verify shader/resource behavior. The separate
+`native_basic_environment.mjs` browser comparisons execute WGSL for mixed
+Basic/Lambert/Phong cube materials, panorama conversion with an authored node,
+and an animated skinned Phong mesh. All three cases match the pinned source
+exactly at frames 1, 7, 8, 10, 12, 13 and 30: 21 checkpoints and 1,032,192 RGBA
+bytes. They verify visible output, live changes, the owned `general-webgpu`
+route and zero GPU/browser errors on Chromium 151.0.7922.34 with SwiftShader.
+The skinning case removes and restores its environment during animation; the
+other cases use the explicit source invalidation boundaries described above.
+The source JavaScript graph builder remains retained; no Rust implementation or
+hardware speedup is claimed.
 
 ### Native subsurface scattering materials
 

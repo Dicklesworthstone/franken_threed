@@ -113,6 +113,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const physicalPrototypes = [three.MeshPhysicalNodeMaterial.prototype,
     ...(three.MeshSSSNodeMaterial ? [three.MeshSSSNodeMaterial.prototype] : [])];
   const standardPrototypes = [three.MeshStandardNodeMaterial.prototype, ...physicalPrototypes];
+  const basicEnvironmentPrototypes = [three.MeshBasicNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
+    three.MeshPhongNodeMaterial.prototype];
   const normalPrototypes = [three.MeshNormalNodeMaterial.prototype, three.MeshMatcapNodeMaterial.prototype];
   const primitivePrototypes = [three.PointsNodeMaterial, three.LineBasicNodeMaterial, three.LineDashedNodeMaterial,
     three.Line2NodeMaterial]
@@ -582,10 +584,29 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // nodes: that would repeat FRAME updates across objects and recompiles.
     return lights.slice().sort((a, b) => a.id - b.id);
   }
-  const environmentEnabled = material => standardPrototypes.includes(Object.getPrototypeOf(material)) &&
+  const basicEnvironmentMaterial = material => basicEnvironmentPrototypes.includes(Object.getPrototypeOf(material));
+  const environmentEnabled = material => (standardPrototypes.includes(Object.getPrototypeOf(material)) || basicEnvironmentMaterial(material)) &&
     material.lights === true && material.fragmentNode == null && renderer.lighting?.enabled !== false;
   const environmentGraph = (material, {scene} = {}) => environmentEnabled(material)
-    ? material.envNode || (!material.envMap && scene?.environmentNode?.isNode ? scene.environmentNode : null) : null;
+    ? material.envNode || (!basicEnvironmentMaterial(material) && !material.envMap && scene?.environmentNode?.isNode ? scene.environmentNode : null) : null;
+  function basicEnvironmentSignature(material, environment) {
+    // BasicLightingModel chooses combine during construction; CubeTextureNode
+    // chooses reflection/refraction from its mapping. Both remain structural
+    // even when source callbacks mutate the same material or texture identity.
+    return basicEnvironmentMaterial(material) && environmentEnabled(material) && (material.envNode || environment)
+      ? JSON.stringify([material.combine, environment?.mapping ?? null]) : null;
+  }
+  function sourceBasicEnvironment(texture) {
+    const cube = texture?.isCubeTexture === true;
+    if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource ||
+        texture.isStorageTexture || texture.isDepthTexture || texture.isDataArrayTexture || texture.isData3DTexture ||
+        !(cube ? [three.CubeReflectionMapping, three.CubeRefractionMapping]
+          : [three.EquirectangularReflectionMapping, three.EquirectangularRefractionMapping]).includes(texture.mapping) ||
+        !cube && !(texture.image?.height > 0))
+      fail('ENVIRONMENT', 'Native Basic/Lambert/Phong environments require ready source cube or equirectangular reflection/refraction textures');
+    inspectTexture(texture);
+    return texture;
+  }
   function environmentGraphKey(material, context) {
     const node = environmentGraph(material, context);
     return node ? JSON.stringify([sourceId(node), node.getCacheKey()]) : null;
@@ -593,18 +614,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const materialEnvironment = (material, texture) => texture !== null && !material.envNode && material.envMap === texture;
   function sourceEnvironment(material, {scene} = {}) {
     if (!environmentEnabled(material)) return null;
-    const node = environmentGraph(material, {scene});
-    // EnvironmentNode turns these two source inputs into renderer-cached PMREM
-    // nodes. Include the resolved texture identity even when the authored node
-    // itself is unchanged; a compatible replacement needs fresh source setup.
-    if (node?.isTextureNode) return sourcePMREMTexture(node.value);
-    if (node?.isMaterialReferenceNode) return sourcePMREMTexture(material[node.property]);
-    if (node) return null;
+    const node = environmentGraph(material, {scene}), basic = basicEnvironmentMaterial(material);
+    const inspectEnvironment = basic ? sourceBasicEnvironment : sourcePMREMTexture;
+    // The source environment nodes resolve material/texture inputs while
+    // constructing PMREM or cube conversion nodes. A changed source identity
+    // needs fresh setup even if its authored node object remains unchanged.
+    if (node?.isTextureNode) return inspectEnvironment(node.value);
+    if (node?.isMaterialReferenceNode) return inspectEnvironment(material[node.property]);
+    if (node) {
+      if (basic) fail('ENVIRONMENT', 'Pinned BasicEnvironmentNode requires a texture or material-reference envNode');
+      return null;
+    }
     // A material environment overrides the scene, including its custom node.
     // Keep the source material reference in the builder so the pinned accessors
     // select envMapIntensity/envMapRotation at each logical draw.
-    const texture = material.envMap || scene?.environment || null;
-    return texture === null ? null : sourcePMREMTexture(texture);
+    // Basic/Lambert/Phong have material-local environments only. Unlike PBR,
+    // their source setup never substitutes the scene's environment or node.
+    const texture = material.envMap || (!basic && scene?.environment) || null;
+    return texture === null ? null : inspectEnvironment(texture);
   }
   function sourcePMREMTexture(texture) {
     if (!(texture instanceof three.Texture) || texture.isF3DSceneEnvironment || texture.isF3DPMREMSource || texture.isStorageTexture ||
@@ -984,8 +1011,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
-        // sourceEnvironment validates only the selected, active PBR input.
-        if (key === 'envMap' && standard) continue;
+        // sourceEnvironment validates only the selected, active input. An
+        // envNode or disabled lighting leaves an unused map unobserved.
+        if (key === 'envMap' && (standard || basicEnvironmentMaterial(material))) continue;
         if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
         if (integerTextureType(value))
           fail('TEXTURE', 'Native integer inputs require authored texel loads, not floating-point material map slots');
@@ -997,7 +1025,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !(points && POINT_SLOTS.has(key)) && !(dashed && DASH_SLOTS.has(key)) &&
           !(volume && (key === 'offsetNode' || VOLUME_FUNCTION_SLOTS.has(key))) &&
           !(key === 'normalNode' && normalPrototypes.includes(prototype)) &&
-          !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
+          !(phong && PHONG_SLOTS.has(key)) && !(standard && STANDARD_SLOTS.has(key)) &&
+          !(key === 'envNode' && basicEnvironmentMaterial(material)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !(sss && SSS_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
           !(key === 'contextNode' && pipelineContext !== null))
@@ -1024,7 +1053,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function sourceMaterialLighting(node, material) {
     if (!material || material.lights !== true || material.fragmentNode != null) return false;
     const prototype = Object.getPrototypeOf(node);
-    if (prototype === three.EnvironmentNode.prototype && standardPrototypes.includes(Object.getPrototypeOf(material))) {
+    if (prototype === three.EnvironmentNode.prototype && standardPrototypes.includes(Object.getPrototypeOf(material)) ||
+        prototype === three.BasicEnvironmentNode?.prototype && basicEnvironmentMaterial(material)) {
       const reference = node.envNode;
       if (material.envNode) return reference === material.envNode;
       return material.envMap?.isTexture === true && reference instanceof three.MaterialReferenceNode &&
@@ -1137,6 +1167,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       inspectThreePipelineContext(three, renderer, material, object, effects),
       inspectThreeLightingContext(three, renderer.contextNode),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
+      basicEnvironmentSignature(material, environment),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
       Object.entries(object.geometry.attributes).map(([name, a]) => [name,
@@ -1186,6 +1217,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // compiling one must not retire the other's accepted descriptor.
     const passId = context.passId ?? null, passes = byMaterial?.get(material);
     const previous = passes?.get(passId);
+    const previousState = previous && nodeStates.get(previous.descriptor);
+    if (previousState?.basicEnvironmentSignature !== null && previousState?.basicEnvironmentSignature !== undefined &&
+        basicEnvironmentSignature(preparedMaterial, environment) !== null) {
+      const [combine, mapping] = JSON.parse(previousState.basicEnvironmentSignature);
+      const sameGraph = environmentGraphKey(preparedMaterial, context) === previousState.environmentGraph;
+      // The pinned RenderObject reduces numeric material cache values to zero/
+      // nonzero, so needsUpdate cannot distinguish Mix from Add. TextureNode's
+      // graph key likewise excludes the input texture's mapping. Do not compile
+      // a new shader where that source renderer would keep its previous shader.
+      if (sameGraph && combine !== preparedMaterial.combine && combine !== 0 && preparedMaterial.combine !== 0)
+        fail('ENVIRONMENT_CACHE', 'Pinned Mix/Add changes require disposing the prior material or replacing its environment graph');
+      if (sameGraph && preparedMaterial.envNode?.isTextureNode && preparedMaterial.envMap !== environment && mapping !== environment?.mapping)
+        fail('ENVIRONMENT_CACHE', 'Pinned texture envNode mapping changes require replacing the environment node or disposing the material');
+    }
     if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
@@ -1438,6 +1483,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, shadowGraphs,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
+      basicEnvironmentSignature: basicEnvironmentSignature(preparedMaterial, environment),
       transmissionSignature: transmissionSignature(preparedMaterial),
       spriteSignature: spriteSignature(preparedMaterial, object),
       wideLineSignature: wideLineSignature(preparedMaterial),
@@ -1755,7 +1801,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const material = prepareMaterial(state.material), environmentContext = {scene: context.scene ?? state.builder.scene};
     const environment = sourceEnvironment(material, environmentContext);
     if (environment !== state.environment || materialEnvironment(material, environment) !== state.materialEnvironment ||
-        environmentGraphKey(material, environmentContext) !== state.environmentGraph)
+        environmentGraphKey(material, environmentContext) !== state.environmentGraph ||
+        basicEnvironmentSignature(material, environment) !== state.basicEnvironmentSignature)
       fail('CHANGED', 'Native material or scene environment changed; compile the graph again');
   }
   function checkTransmission(state) {

@@ -15,6 +15,7 @@ const fail = (code, message) => { throw new ThreeNodeProgramError(code, message)
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const transmissive = material => material.transmission > 0 || material.transmissionNode?.isNode === true;
 const transparent = material => material.transparent === true || transmissive(material) || material.backdropNode?.isNode === true;
+const environmentMaterialHistory = new WeakMap();
 
 // Additional source material features use the retained native shader builder.
 // Users must not add a dummy TSL slot to reach an existing implementation.
@@ -29,8 +30,8 @@ const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNati
     ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
       material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) ||
   material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
-  ((material.isMeshStandardMaterial === true || material.isMeshStandardNodeMaterial === true ||
-    material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && material.envMap != null) ||
+  (['MeshBasic', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
+    material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) && material.envMap != null) ||
   (material.isMeshPhysicalMaterial === true || material.isMeshPhysicalNodeMaterial === true) && (
     ['sheen', 'iridescence', 'anisotropy', 'retroreflectivity', 'transmission', 'dispersion'].some(key => material[key] > 0) ||
     ['sheenColorMap', 'sheenRoughnessMap', 'iridescenceMap', 'iridescenceThicknessMap',
@@ -47,6 +48,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const sortObjects = renderer?.sortObjects === true;
+  // Removing an admitted environment must keep the same source lighting and
+  // deformation path. The fixed shader has different rounding/normal behavior.
+  const nativeMaterialFeatures = material => nativeFeatures(material) || environmentMaterialHistory.get(renderer)?.has(material);
   // The facade supplies its source controls. Standalone capture callers retain
   // the complete-list default; each control is observed at its source phase.
   const listEnabled = key => renderLists === null || renderLists[key] === true;
@@ -166,7 +170,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
-          nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
+          nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
   const mrt = destination ? renderer?.getMRT?.() ?? null : null;
   const nativeMRTScene = mrt !== null || (destination?.textures?.length ?? 0) > 1;
@@ -198,7 +202,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
   const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene
-    ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
+    ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -451,6 +455,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (binding.nodeProgram !== null) continue;
       withBinding(binding, () => {
         binding.nodeProgram = programs.compile(binding.material, binding.object, context);
+        if ((binding.material.envMap || binding.material.envNode) && ['MeshBasic', 'MeshLambert', 'MeshPhong'].some(name =>
+          binding.material[`is${name}Material`] === true || binding.material[`is${name}NodeMaterial`] === true)) {
+          let retained = environmentMaterialHistory.get(renderer);
+          if (!retained) environmentMaterialHistory.set(renderer, retained = new WeakSet());
+          retained.add(binding.material);
+        }
         // Retain generated streams while this accepted render waits for submit.
         binding.programGeometry = programs.geometry?.(binding.nodeProgram) ?? binding.geometry;
         binding.raster = raster(binding.material, {mrt, textures: destination?.textures ?? null,
