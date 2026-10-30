@@ -34,8 +34,10 @@
  * whole point as GL does, and gl_PointCoord uses GL's upper-left origin.
  * Switch fallthrough expands reachable case suffixes without replacing native
  * break/continue targets; switch-local storage is shared across source labels.
- * Unsupported constructs (gl_ClipDistance, integer-texture filtering,
- * struct varyings, ...) throw EsslError; nothing is dropped.
+ * ESSL 3.00 struct varyings flatten numeric members into inter-stage locations,
+ * preserving matrix columns and smooth/flat/centroid interpolation.
+ * Unsupported constructs (gl_ClipDistance, integer-texture filtering, ...)
+ * throw EsslError; nothing is dropped.
  * No performance claim.
  */
 import {preprocess, EsslError, essError} from './essl_preprocess.mjs';
@@ -69,14 +71,16 @@ const isScalar = t => t.k === 's', isVec = t => t.k === 'v', isMat = t => t.k ==
 const isNumeric = t => (t.k === 's' || t.k === 'v') && t.s !== 'bool';
 const comps = t => t.k === 's' ? 1 : t.k === 'v' ? t.n : t.k === 'm' ? t.c * t.r : 0;
 const scalarOf = t => t.k === 's' || t.k === 'v' ? t.s : t.k === 'm' ? 'float' : t.k === 'a' ? scalarOf(t.of) : null;
-/** Inter-stage slots of one I/O variable: matrices by column, arrays by element. */
-function ioSlots(t) {
+/** Inter-stage slots: matrices by column, arrays by element, structs by member. */
+function ioSlots(t, shared) {
   const plain = x => x.k === 's' || x.k === 'v';
   if (plain(t)) return [{suffix: '', access: '', type: t}];
   if (t.k === 'm') return Array.from({length: t.c}, (_, i) => ({suffix: `_c${i}`, access: `[${i}]`, type: V('float', t.r)}));
   if (t.k === 'a' && plain(t.of)) return Array.from({length: t.n}, (_, i) => ({suffix: `_e${i}`, access: `[${i}]`, type: t.of}));
   if (t.k === 'a' && t.of.k === 'm') return Array.from({length: t.n * t.of.c}, (_, k) => ({suffix: `_e${Math.floor(k / t.of.c)}_c${k % t.of.c}`, access: `[${Math.floor(k / t.of.c)}][${k % t.of.c}]`, type: V('float', t.of.r)}));
-  essError(`Struct stage I/O is not supported (${glslName(t)})`);
+  if (t.k === 'st') return shared.structs.get(t.name).fields.flatMap((f, i) =>
+    ioSlots(f.type, shared).map(slot => ({...slot, suffix: `_f${i}${slot.suffix}`, access: `.${safe(f.name)}${slot.access}`})));
+  essError(`Invalid stage I/O type (${glslName(t)})`);
 }
 const withScalar = (t, s) => t.k === 's' ? S(s) : t.k === 'v' ? V(s, t.n) : t;
 const vecOf = (s, n) => n === 1 ? S(s) : V(s, n);
@@ -174,15 +178,19 @@ export function compileEsslProgram(vertexSource, fragmentSource, {defines = {}, 
   const varyings = [];
   for (const out of units.vertex.outputs) {
     if (out.builtin) continue;
-    varyings.push({name: out.name, type: out.type, flat: out.flat, location: null});
+    varyings.push({name: out.name, type: out.type, flat: out.flat, centroid: out.centroid, location: null});
   }
   let location = 0;
   for (const v of varyings) {
     const input = units.fragment.inputs.find(i => i.name === v.name);
     if (input && !same(input.type, v.type)) essError(`Varying ${v.name} type differs between stages`);
-    v.flat = v.flat || input?.flat || scalarOf(v.type) !== 'float';
+    if (input && v.type.k === 'st' && (input.flat !== v.flat || input.centroid !== v.centroid))
+      essError(`Varying ${v.name} interpolation differs between stages`);
+    const slots = ioSlots(v.type, shared);
+    v.flat = v.flat || input?.flat || slots.some(slot => scalarOf(slot.type) !== 'float');
+    v.centroid ||= input?.centroid ?? false;
     v.location = location;
-    location += ioSlots(v.type).length;
+    location += slots.length;
   }
   // GL links a fragment input without a vertex output only if the input is never
   // used; fragmentEntry() enforces that after translation (unused inputs vanish).
@@ -204,7 +212,11 @@ export function compileEsslStage(stage, source, {defines = {}, clipDepth = 'gl'}
   unit.declare();
   const io = stage === 'vertex' ? unit.outputs : unit.inputs;
   let location = 0;
-  const varyings = io.map(v => { const r = {name: v.name, type: v.type, flat: v.flat || scalarOf(v.type) !== 'float', location}; location += ioSlots(v.type).length; return r; });
+  const varyings = io.map(v => {
+    const slots = ioSlots(v.type, shared);
+    const r = {name: v.name, type: v.type, flat: v.flat || slots.some(slot => scalarOf(slot.type) !== 'float'), centroid: v.centroid, location};
+    location += slots.length; return r;
+  });
   return unit.emit({varyings, clipDepth});
 }
 
@@ -243,7 +255,7 @@ function reflect(shared, units, varyings) {
     textures,
     attributes: units.vertex.inputs.filter(i => !i.builtin).map(i => ({name: i.name, glslType: glslName(i.type), location: i.location,
       locations: i.type.k === 'm' ? i.type.c : 1, components: i.type.k === 'm' ? i.type.r : comps(i.type), scalar: scalarOf(i.type)})),
-    varyings: varyings.map(v => ({name: v.name, glslType: glslName(v.type), location: v.location, flat: v.flat})),
+    varyings: varyings.map(v => ({name: v.name, glslType: glslName(v.type), location: v.location, flat: v.flat, centroid: v.centroid})),
     outputs: units.fragment.outputs.filter(o => !o.builtin).map(o => ({name: o.name, glslType: glslName(o.type), location: o.location})),
     writesPointSize: units.vertex.used.has('gl_PointSize'),
     usesFragCoord: units.fragment.used.has('gl_FragCoord'),
@@ -476,10 +488,19 @@ class Unit {
       if (type.k === 'smp' || (type.k === 'a' && type.of.k === 'smp')) essError('Samplers must be uniforms', v.line);
       const w = safe(v.name);
       if (storage === 'in' || storage === 'out') {
-        if (type.k === 'st' || (type.k === 'a' && type.of.k === 'st')) essError(`Struct ${storage} variables are not supported (${v.name})`, v.line);
+        if (type.k === 'a' && type.of.k === 'st') essError('Arrays of structs are not ESSL stage I/O', v.line);
+        if (type.k === 'st') {
+          if (this.version !== 300 || (this.stage === 'vertex') !== (storage === 'out'))
+            essError('Struct stage I/O requires ESSL 3.00 vertex outputs or fragment inputs', v.line);
+          const fields = this.shared.structs.get(type.name).fields;
+          if (fields.some(f => !['s', 'v', 'm'].includes(f.type.k) || scalarOf(f.type) === 'bool'))
+            essError('ESSL struct varyings require numeric scalar, vector or matrix members', v.line);
+          if (fields.some(f => scalarOf(f.type) !== 'float') && d.q.interp !== 'flat')
+            essError('Integer struct varyings require flat interpolation', v.line);
+        }
         if (storage === 'in' && this.stage === 'vertex' && type.k === 'a') essError('Vertex inputs cannot be arrays', v.line);
         if (type.k === 's' && type.s === 'bool' || type.k === 'v' && type.s === 'bool') essError('Boolean stage I/O is not ESSL', v.line);
-        const io = {name: v.name, type, w, flat: d.q.interp === 'flat', location: d.q.layout?.location ?? null};
+        const io = {name: v.name, type, w, flat: d.q.interp === 'flat', centroid: d.q.centroid, location: d.q.layout?.location ?? null};
         (storage === 'in' ? this.inputs : this.outputs).push(io);
         this.privates.push(`var<private> ${w}: ${this.wgsl(type)};`);
         this.globals.set(v.name, {kind: 'global', type, w});
@@ -621,10 +642,12 @@ class Unit {
     const outFields = ['@builtin(position) f3d_position: vec4<f32>,'], outCopy = [];
     for (const v of varyings) {
       const o = this.outputs.find(x => x.name === v.name);
-      const interp = v.flat ? ' @interpolate(flat)' : '';
-      ioSlots(v.type).forEach((slot, k) => {
-        outFields.push(`@location(${v.location + k})${interp} ${o.w}${slot.suffix}: ${this.wgsl(slot.type)},`);
-        outCopy.push(`out.${o.w}${slot.suffix} = ${o.w}${slot.access};`);
+      const interp = v.flat ? ' @interpolate(flat)' : v.centroid ? ' @interpolate(perspective, centroid)' : '';
+      ioSlots(v.type, this.shared).forEach((slot, k) => {
+        // Generated member names cannot collide with user varying identifiers.
+        const field = v.type.k === 'st' ? `f3d_v${v.location + k}` : o.w + slot.suffix;
+        outFields.push(`@location(${v.location + k})${interp} ${field}: ${this.wgsl(slot.type)},`);
+        outCopy.push(`out.${field} = ${o.w}${slot.access};`);
       });
     }
     if (points) outFields.push(`@location(${pointCoordLocation}) f3d_point_coord: vec2<f32>,`);
@@ -662,10 +685,11 @@ class Unit {
       const v = varyings.find(x => x.name === i.name);
       if (!v) continue;
       i.location = v.location;
-      const interp = v.flat ? ' @interpolate(flat)' : '';
-      ioSlots(i.type).forEach((slot, k) => {
-        fields.push(`@location(${v.location + k})${interp} ${i.w}${slot.suffix}: ${this.wgsl(slot.type)},`);
-        copy.push(`${i.w}${slot.access} = input.${i.w}${slot.suffix};`);
+      const interp = v.flat ? ' @interpolate(flat)' : v.centroid ? ' @interpolate(perspective, centroid)' : '';
+      ioSlots(i.type, this.shared).forEach((slot, k) => {
+        const field = i.type.k === 'st' ? `f3d_v${v.location + k}` : i.w + slot.suffix;
+        fields.push(`@location(${v.location + k})${interp} ${field}: ${this.wgsl(slot.type)},`);
+        copy.push(`${i.w}${slot.access} = input.${field};`);
       });
     }
     if (this.used.has('gl_FragCoord')) {

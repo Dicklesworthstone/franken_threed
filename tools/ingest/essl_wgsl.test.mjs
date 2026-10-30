@@ -111,6 +111,107 @@ test('ESSL 1.00 sources: gl_FragColor and texture2D; texture() in vertex stages 
   assert.equal(r.reflection.textures.length, 1);
 });
 
+test('struct varyings preserve member values, matrix columns and neighboring locations', () => {
+  const type = 'struct Surface { float weight; vec3 normal; mat2x3 frame; };';
+  const r = program(V('lead = 1.0; payload = Surface(2.0, position, mat2x3(1.0)); tail = vec2(3.0); gl_Position = vec4(position, 1.0);',
+    type + 'out float lead; out Surface payload; out vec2 tail;'),
+  F('color = vec4(payload.normal.x, payload.frame[1].z, payload.weight, tail.x + lead);',
+    type + 'in Surface payload; in vec2 tail; in float lead;'));
+  assert.deepEqual(r.reflection.varyings.map(v => [v.name, v.location, v.flat]),
+    [['lead', 0, false], ['payload', 1, false], ['tail', 5, false]]);
+  for (const stage of [r.vertex, r.fragment]) {
+    assert.match(stage, /@location\(1\) f3d_v1: f32,/);
+    assert.match(stage, /@location\(2\) f3d_v2: vec3<f32>,/);
+    assert.match(stage, /@location\(3\) f3d_v3: vec3<f32>,/);
+    assert.match(stage, /@location\(4\) f3d_v4: vec3<f32>,/);
+    assert.match(stage, /@location\(5\) tail: vec2<f32>,/);
+    assert.doesNotMatch(stage, /@interpolate\(flat\)/);
+  }
+  // Execute the emitted inter-stage copy assignments with distinct column data.
+  // This checks packing/unpacking, not rasterization or WGSL validation.
+  const value = {weight: -0, normal: [2, 3, 5], frame: [[7, 11, 13], [17, 19, 23]]};
+  const packed = {}, unpacked = {frame: [[], []]};
+  const pack = r.vertex.split('\n').filter(line => /^\s*out\.f3d_v\d+ = payload\./.test(line)).join('\n');
+  const unpack = r.fragment.split('\n').filter(line => /^\s*payload\..* = input\.f3d_v\d+;/.test(line)).join('\n');
+  assert.equal(pack.split('\n').length, 4); assert.equal(unpack.split('\n').length, 4);
+  Function('payload', 'out', pack)(value, packed);
+  Function('payload', 'input', unpack)(unpacked, packed);
+  assert.deepEqual(unpacked, value);
+});
+
+test('flat struct varyings keep integer and float members in one flat interface', () => {
+  const type = 'struct Tag { vec2 uv; int kind; uvec2 ids; };';
+  const r = program(V('tag = Tag(position.xy, 4, uvec2(5u, 6u)); gl_Position = vec4(position, 1.0);', type + 'flat out Tag tag;'),
+    F('color = vec4(tag.uv, float(tag.kind), float(tag.ids.y));', type + 'flat in Tag tag;'));
+  assert.equal(r.reflection.varyings[0].flat, true);
+  for (const stage of [r.vertex, r.fragment]) {
+    assert.match(stage, /@location\(0\) @interpolate\(flat\) f3d_v0: vec2<f32>,/);
+    assert.match(stage, /@location\(1\) @interpolate\(flat\) f3d_v1: i32,/);
+    assert.match(stage, /@location\(2\) @interpolate\(flat\) f3d_v2: vec2<u32>,/);
+  }
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + 'out Tag tag;'), F('color = vec4(1.0);')),
+    /Integer struct varyings require flat/);
+});
+
+test('centroid interpolation survives parsing for struct and ordinary varyings', () => {
+  const type = 'struct Sample { vec2 uv; float weight; };';
+  for (const flat of [false, true]) {
+    const q = flat ? 'flat centroid ' : 'centroid ';
+    const r = program(V('value = Sample(position.xy, 1.0); normal = position; gl_Position = vec4(position, 1.0);',
+      type + q + 'out Sample value; ' + q + 'out vec3 normal;'),
+    F('color = vec4(value.uv, value.weight + normal.z, 1.0);', type + q + 'in Sample value; ' + q + 'in vec3 normal;'));
+    assert.deepEqual(r.reflection.varyings.map(v => [v.flat, v.centroid]), [[flat, true], [flat, true]]);
+    const interpolation = flat ? '@interpolate(flat)' : '@interpolate(perspective, centroid)';
+    for (const stage of [r.vertex, r.fragment]) assert.equal(stage.split(interpolation).length - 1, 3);
+  }
+});
+
+test('struct varying slots escape fields and avoid user varying name collisions', () => {
+  const type = 'struct Data { float alias; mat2 matrix; };';
+  const vs = V('payload = Data(1.0, mat2(2.0)); payload_f0 = 3.0; f3d_v0 = 4.0; gl_Position = vec4(position, 1.0);',
+    type + 'out Data payload; out float payload_f0; out float f3d_v0;');
+  const fs = F('color = vec4(payload.alias, payload.matrix[1], payload_f0 + f3d_v0);',
+    type + 'in Data payload; in float payload_f0; in float f3d_v0;');
+  const r = program(vs, fs);
+  assert.match(r.vertex, /out\.f3d_v0 = payload\.alias_;/);
+  assert.match(r.fragment, /payload\.alias_ = input\.f3d_v0;/);
+  assert.match(r.fragment, /@location\(3\) payload_f0: f32,/);
+  assert.match(r.fragment, /@location\(4\) f3d_v0_: f32,/);
+  const declarations = /struct F3DFragmentIn \{([\s\S]*?)\};/.exec(r.fragment)[1];
+  const names = [...declarations.matchAll(/\s(\w+): /g)].map(m => m[1]);
+  assert.equal(new Set(names).size, names.length);
+  assert.match(compileEsslStage('vertex', vs), /@location\(2\) f3d_v2: vec2<f32>,/);
+  assert.match(compileEsslStage('fragment', fs), /payload\.matrix\[1\] = input\.f3d_v2;/);
+});
+
+test('struct stage interfaces enforce ESSL shape, stage and link requirements', () => {
+  for (const field of ['bool enabled;', 'bvec2 enabled;', 'float weights[2];', 'sampler2D image;']) {
+    assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', `struct Bad { ${field} }; out Bad value;`), F('color = vec4(1.0);')),
+      /struct varyings require numeric/);
+  }
+  const type = 'struct Data { vec2 uv; };';
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + 'struct Outer { Data inner; }; out Outer value;'), F('color = vec4(1.0);')),
+    /struct varyings require numeric/);
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + 'out Data value[2];'), F('color = vec4(1.0);')), /Arrays of structs/);
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + 'in Data value;'), F('color = vec4(1.0);')), /vertex outputs or fragment inputs/);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);', type + 'out Data value;')), /vertex outputs or fragment inputs/);
+  assert.throws(() => compileEsslStage('vertex', type + 'varying Data value; void main() { gl_Position = vec4(1.0); }'), /requires ESSL 3.00/);
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', 'struct Bad { centroid float value; }; out Bad data;'), F('color = vec4(1.0);')),
+    /Qualifiers are not allowed on struct members/);
+  for (const q of ['flat ', 'centroid ']) {
+    assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + q + 'out Data value;'),
+      F('color = vec4(value.uv, 0.0, 1.0);', type + 'in Data value;')), /interpolation differs/);
+  }
+  assert.throws(() => program(V('gl_Position = vec4(position, 1.0);', type + 'out Data value;'),
+    F('color = vec4(value.uv, 1.0);', 'struct Data { vec3 uv; }; in Data value;')), /differs between declarations/);
+});
+
+test('unused unlinked struct inputs disappear, while used ones remain link errors', () => {
+  const decl = 'struct Data { vec2 uv; }; in Data missing;';
+  assert.doesNotMatch(program(minimalVS, F('color = vec4(1.0);', decl)).fragment, /@location\(\d+\) f3d_v/);
+  assert.throws(() => program(minimalVS, F('color = vec4(missing.uv, 0.0, 1.0);', decl)), /not written by the vertex stage/);
+});
+
 test('invalid ESSL fails explicitly instead of being dropped', () => {
   assert.match(program(minimalVS, F('color = vec4(1);')).fragment, /vec4<f32>\(f32\(1\)\)/, 'constructors convert');
   assert.throws(() => program(minimalVS, F('float x = 1;')), /Type mismatch/);

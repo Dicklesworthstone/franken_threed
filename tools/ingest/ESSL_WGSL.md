@@ -24,7 +24,23 @@ not shipped), and the browser's own WGSL compiler is the final check.
 
 Attributes keep declaration order (`layout(location)` honored; matrices take one
 location per column). Varyings link by name; arrays/matrices take one location
-per element/column; integer varyings are flat.
+per element/column; integer varyings are flat. ESSL 3.00 struct varyings flatten
+numeric scalar/vector members and matrix columns into consecutive locations,
+then reconstruct the original private struct before fragment code executes.
+Generated slot names avoid collisions with application varying names, and field
+access retains WGSL identifier escaping. Reflection keeps the source struct type
+and first location. Smooth, flat and centroid interpolation survive this mapping;
+centroid is also preserved for ordinary varying declarations.
+
+Struct interface validation follows ESSL 3.00 sections 4.3.4 and 4.3.6: vertex
+outputs and fragment inputs may be structs, while vertex attributes and fragment
+outputs may not. Structs may contain numeric scalars, vectors and matrices, but
+not arrays, nested structs, booleans or opaque members; arrays of structs are
+also invalid. An integer member requires the whole varying to be flat. Matching
+struct interfaces must agree on type and interpolation qualification. These
+checks reject source-invalid declarations; ESSL 1.00 struct varyings are not
+admitted. The source rules are in the
+[Khronos ESSL 3.00 specification](https://registry.khronos.org/OpenGL/specs/es/3.0/GLSL_ES_Specification_3.00.pdf).
 
 ## Semantics preserved
 
@@ -61,7 +77,7 @@ per element/column; integer varyings are flat.
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
-filtered sampling of integer textures, struct stage I/O, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
+filtered sampling of integer textures, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
 
 ## Evidence
@@ -70,6 +86,11 @@ conversions).
   emitted scalar helper control flow through a small test-only JS syntax adapter
   and check loop targets and scope diagnostics. These checks do not validate
   WGSL or establish rendered parity; Naga/browser validation remains separate.
+- Struct-interface regressions execute the generated pack/unpack assignments
+  with distinct scalar, vector and matrix-column values, and check locations,
+  smooth/flat/centroid interpolation, identifier collisions, independent stage
+  compilation and source/link errors. These tests do not execute a GPU or prove
+  interpolation pixel parity.
 - Corpus: every program r186 `WebGLRenderer` compiled across the 299 upstream
   `webgl_*` examples (578 unique stages, built-in materials included):
   570 translate and validate with Naga and compile in Chrome; the 8 others are

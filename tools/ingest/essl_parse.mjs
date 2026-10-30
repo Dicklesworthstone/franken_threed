@@ -31,12 +31,12 @@ export function parse(tokens) {
   const isTypeName = t => t?.t === 'id' && (BASIC_TYPES.has(t.v) || structs.has(t.v));
 
   function qualifiers() {
-    const q = {storage: null, interp: null, layout: null, invariant: false, precision: null};
+    const q = {storage: null, interp: null, layout: null, invariant: false, precision: null, centroid: false};
     for (;;) {
       const t = peek(); if (t?.t !== 'id') break;
       if (STORAGE.has(t.v)) {
         next();
-        if (t.v === 'centroid') continue;
+        if (t.v === 'centroid') { q.centroid = true; continue; }
         const storage = t.v === 'attribute' ? 'in' : t.v === 'varying' ? null : t.v;
         // `varying` resolves from the stage (three defines it as in/out anyway).
         q.storage = t.v === 'varying' ? 'varying' : storage;
@@ -69,7 +69,7 @@ export function parse(tokens) {
     structs.add(name);
     expect('{'); const fields = [];
     while (!at('}')) {
-      const q = qualifiers(); if (q.storage || q.interp) essError('Qualifiers are not allowed on struct members', line());
+      const q = qualifiers(); if (q.storage || q.interp || q.centroid) essError('Qualifiers are not allowed on struct members', line());
       const type = typeSpecifier();
       for (;;) {
         const field = {type, name: ident(), array: null, line: line()};
