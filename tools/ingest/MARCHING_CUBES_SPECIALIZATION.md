@@ -135,3 +135,30 @@ Run `node tools/ingest/geometry_transforms.test.mjs` for actual emitted Wasm
 differentials against pinned r186, including normal/position composition through
 BufferGeometry, scratch-vector observations, conservative callbacks and bounded
 execution failure. This remains a copying baseline with no measured speedup.
+
+## Source-library tangent generation
+
+The numeric opt-in also lowers `BufferGeometry.computeTangents` from the pinned
+geometry, Vector2, Vector3 and BufferAttribute bodies. Both source group passes,
+triangle accumulation, Gram–Schmidt orthogonalization and handedness execute in
+one import-free Wasm invocation. Float64 scratch preserves the source's Number
+accumulators; each tangent store keeps its original Float32/Float64 rounding.
+All combinations of Float32/Float64 position, normal, UV and tangent attributes
+with Uint16/Uint32 indices are supported, including typed subviews and repeated
+or overlapping groups created through the source `addGroup` method.
+
+Source validation, tangent allocation/replacement, `setAttribute` callbacks and
+the final `_transformed` assignment retain their positions. The public attribute
+and array identities stay unchanged. Witnessed group arrays and objects,
+unchanged vector/attribute methods, native `isFinite`/`Math.sqrt`, fixed buffers,
+non-overlapping writable storage and valid group bounds authorize the numeric
+block. Unknown or observable objects, normalized/interleaved attributes, invalid
+bounds, NaN results and exhausted budgets resume the original block before any
+tangent bytes are published. NaN results use the source to preserve its payload
+bits. This remains a copying baseline without a measured acceleration claim.
+
+`numericSpecialization.libraryKernels.geometryTangents` reports source-derived
+compilation; `geometryTangentsDiagnostics` records actual native calls and
+fallbacks. `geometry_tangents.test.mjs` compares emitted source-tree and package
+builds against the pinned implementation, including storage rounding, groups,
+allocation/callback order, proxies, constructor observations and failure rollback.

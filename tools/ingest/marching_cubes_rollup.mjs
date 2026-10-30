@@ -9,6 +9,7 @@ import {specializeInstancedMatrixBase,specializeInstancedMatrixLoops} from './in
 import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
 import {specializeQuaternionFlat} from './quaternion_flat_specialization.mjs';
 import {geometryBoundsSourceRole,specializeGeometryBounds} from './geometry_bounds_specialization.mjs';
+import {specializeGeometryTangents} from './geometry_tangents_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
 const MATRICES='\0f3d-matrix-multiply-adapter',TRANSFORMS='\0f3d-transform-batch-adapter';
@@ -17,6 +18,7 @@ const EULER_UPDATES='\0f3d-euler-update-adapter';
 const INSTANCE_UPDATES='\0f3d-instanced-matrix-update-adapter';
 const QUATERNIONS='\0f3d-quaternion-flat-adapter';
 const BOUNDS='\0f3d-geometry-bounds-adapter';
+const TANGENTS='\0f3d-geometry-tangents-adapter';
 
 /**
  * Place before generic URL resolvers so these private virtual IDs never become
@@ -34,17 +36,17 @@ export function marchingCubesRollupPlugin(options={}) {
       !Number.isInteger(maxIterations) || maxIterations<1 || maxIterations>1000000000) {
     throw new RangeError('Invalid marching-cubes memory or iteration budget');
   }
-  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[];let registrations=0,colorRegistrations=0;
+  const reports=[],normalReports=[],matrixReports=[],transformReports=[],attributeReports=[],eulerReports=[],instanceReports=[],quaternionReports=[],boundsReports=[],tangentReports=[];let registrations=0,colorRegistrations=0;
   return {
     name:'f3d-marching-cubes',
-    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;registrations=0;colorRegistrations=0;},
+    buildStart() {reports.length=0;normalReports.length=0;matrixReports.length=0;transformReports.length=0;attributeReports.length=0;eulerReports.length=0;instanceReports.length=0;quaternionReports.length=0;boundsReports.length=0;tangentReports.length=0;registrations=0;colorRegistrations=0;},
     resolveId(source,importer) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(source)) return source;
-      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
-      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS].includes(source)) return source;
+      if ([ADAPTER,NORMALS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_kernel_runtime.mjs') return RUNTIME;
+      if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
       if (importer===INSTANCE_UPDATES && source==='./euler_update_adapter.mjs') return EULER_UPDATES;
-      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
+      if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
     load(id) {
@@ -58,11 +60,12 @@ export function marchingCubesRollupPlugin(options={}) {
       if (id===INSTANCE_UPDATES) return fs.readFileSync(new URL('./instanced_matrix_update_adapter.mjs',import.meta.url),'utf8');
       if (id===QUATERNIONS) return fs.readFileSync(new URL('./quaternion_flat_adapter.mjs',import.meta.url),'utf8');
       if (id===BOUNDS) return fs.readFileSync(new URL('./geometry_bounds_adapter.mjs',import.meta.url),'utf8');
+      if (id===TANGENTS) return fs.readFileSync(new URL('./geometry_tangents_adapter.mjs',import.meta.url),'utf8');
       if (id===OBJECTS) return fs.readFileSync(new URL('./numeric_objects.mjs',import.meta.url),'utf8');
       return null;
     },
     transform(code,id) {
-      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS].includes(id) || typeof code!=='string') return null;
+      if ([ADAPTER,RUNTIME,NORMALS,OBJECTS,MATRICES,TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS].includes(id) || typeof code!=='string') return null;
       // Cheap discovery only. Complete source hashes, never this spelling or
       // the application's filename, authorize the transformation below.
       if (code.includes('class MarchingCubes')) {
@@ -86,6 +89,11 @@ export function marchingCubesRollupPlugin(options={}) {
           const normals=specializeGeometryNormals(code,{...sources,runtimeModule:NORMALS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
           if(normals.report)normalReports.push({id,...normals.report});
           if(normals.changed){edits.push(...normals.edits);headers.push(normals.header);tail=normals.tail;}
+        }
+        if(normalCandidate || code.includes('class Vector2')) {
+          const tangents=specializeGeometryTangents(code,{...sources,runtimeModule:TANGENTS,maxMemoryPages,maxIterations});
+          if(tangents.report)tangentReports.push({id,...tangents.report});
+          if(tangents.changed){edits.push(...tangents.edits);headers.push(tangents.header);tail+=tangents.tail;}
         }
         if(normalCandidate || code.includes('class Box3')) {
           const bounds=specializeGeometryBounds(code,{...sources,runtimeModule:BOUNDS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
@@ -130,7 +138,7 @@ export function marchingCubesRollupPlugin(options={}) {
         return {code:headers.join('')+transformed+tail,map:null};
       };
       if(normalCandidate && geometryNormalSourceRole(code)==='geometry') {
-        return Promise.all([['vectorSource','../math/Vector3.js'],['attributeSource','./BufferAttribute.js']].map(async([key,specifier])=>{
+        return Promise.all([['vectorSource','../math/Vector3.js'],['vector2Source','../math/Vector2.js'],['attributeSource','./BufferAttribute.js']].map(async([key,specifier])=>{
           const resolved=await this.resolve(specifier,id,{skipSelf:true});
           if(resolved && !resolved.external)try {
             return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];
@@ -163,6 +171,8 @@ export function marchingCubesRollupPlugin(options={}) {
       compiledFieldKernels:reports.reduce((sum,report)=>sum+(report.compiledFieldKernels??0),0),accelerationClaim:false,modules:reports.map(x=>({...x}))};},
       getGeometryNormalsReport(){return {version:1,accelerationClaim:false,
         compiledModules:normalReports.filter(report=>report.compiledMethods.length).length,modules:normalReports.map(report=>({...report}))};},
+      getGeometryTangentsReport(){return {version:1,accelerationClaim:false,
+        compiledModules:tangentReports.filter(report=>report.compiledMethods.length).length,modules:tangentReports.map(report=>({...report}))};},
       getMatrixMultiplicationReport(){return {version:1,accelerationClaim:false,
         compiledModules:matrixReports.length,modules:matrixReports.map(report=>({...report}))};},
       getQuaternionFlatReport(){return {version:1,accelerationClaim:false,
