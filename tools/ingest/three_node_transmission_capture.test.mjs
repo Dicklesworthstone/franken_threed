@@ -18,7 +18,8 @@ function rig(t) {
     hasFeature: () => false, getRenderTarget: () => null,
     getCanvasTarget: () => null, getDrawingBufferSize: size => size.set(32, 16),
     getViewport: value => value.set(0, 0, 32, 16), getPixelRatio: () => 1,
-    _getSampledTextureInputs: () => ({layoutOf: ({texture}) => texture.isFramebufferTexture
+    _getSampledTextureInputs: () => ({prepareFramebuffer(texture, type) { texture.type = type; },
+      layoutOf: ({texture}) => texture.isFramebufferTexture
       ? {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}} : null}),
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: frame}, info: {calls: 3},
     copyFramebufferToTexture(texture) {

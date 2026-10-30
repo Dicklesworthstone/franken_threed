@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.module.js';
+import {WebGLRenderList} from '../../upstream/three.js/src/renderers/webgl/WebGLRenderLists.js';
 import {createWebGLRendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -235,11 +236,181 @@ test('later view callbacks cannot rewrite fixed draws captured for an earlier vi
   assert.equal(solid.matrixWorld.elements[12], .7);
 });
 
-test('transmission remains an explicit per-view binding boundary before GPU draws', async t => {
-  const f = fixture(t); mesh(f.scene, 0, 1, new T.MeshPhysicalMaterial({transmission: .5}));
+const transmissionPasses = device => drawPasses(device).filter(pass => pass.desc.label === 'f3d-program-transmission');
+const sampledTextures = draw => [...draw.groups.values()].flatMap(({group}) => group.entries ?? [])
+  .map(entry => entry.resource?.texture).filter(Boolean);
+
+test('WebGL ArrayCamera transmission prepares every child before source callbacks and binds each child target', async t => {
+  const f = fixture(t), events = [], targets = new Map();
+  f.renderer.transmissionResolutionScale = .5; f.renderer.toneMapping = T.LinearToneMapping;
+  f.renderer.setClearColor(0x204080, .25);
+  f.camera.cameras[1].viewport.set(35, 0, 20, 24);
+  const solid = mesh(f.scene, 0xff0000, 0);
+  const material = new T.MeshPhysicalMaterial({transmission: .75, thickness: .25, side: T.DoubleSide});
+  const glass = mesh(f.scene, 0, 1, material);
+  f.scene.add(new T.AmbientLight(0xffffff, .5));
+  const version = material.version;
+  for (const object of [solid, glass]) object.onBeforeRender = (renderer, _scene, camera) => {
+    assert.ok(f.camera.cameras.includes(camera), 'callbacks receive the original child camera');
+    const target = renderer.getRenderTarget(), transmission = target !== null;
+    events.push([transmission ? 'transmission' : 'main', camera.name, object.name, object.material.side]);
+    if (transmission) {
+      assert.equal(camera.viewport, undefined); assert.equal(renderer.toneMapping, T.NoToneMapping);
+      assert.equal(renderer.getClearAlpha(), .5);
+      assert.equal(renderer.getActiveMipmapLevel(), 0); assert.equal(renderer.getActiveCubeFace(), 0);
+      assert.ok(target.isWebGLRenderTarget);
+      if (targets.has(camera)) assert.equal(target, targets.get(camera)); else targets.set(camera, target);
+    } else {
+      assert.ok(camera.viewport); assert.equal(renderer.toneMapping, T.LinearToneMapping);
+      assert.equal(renderer.getClearAlpha(), .25);
+    }
+  };
+  await render(f);
+  assert.deepEqual(events, [
+    ['transmission', '0', '0', T.FrontSide], ['transmission', '0', '1', T.BackSide],
+    ['transmission', '1', '0', T.FrontSide], ['transmission', '1', '1', T.BackSide],
+    ['main', '0', '0', T.FrontSide], ['main', '0', '1', T.DoubleSide],
+    ['main', '1', '0', T.FrontSide], ['main', '1', '1', T.DoubleSide],
+  ]);
+  assert.equal(material.version, version + 4);
+  assert.deepEqual([...targets.values()].map(target => [target.width, target.height]), [[15, 20], [10, 12]]);
+  const passes = transmissionPasses(f.device), main = drawPasses(f.device).filter(pass => !passes.includes(pass));
+  assert.equal(passes.length, 4); assert.equal(main.length, 2);
+  const resolved = [passes[0], passes[2]].map(pass => pass.desc.colorAttachments[0].resolveTarget.texture);
+  assert.notEqual(resolved[0], resolved[1]);
+  for (let view = 0; view < 2; view++) {
+    assert.ok(sampledTextures(passes[view * 2 + 1].draws[0]).includes(resolved[view]));
+    assert.ok(sampledTextures(main[view].draws.at(-1)).includes(resolved[view]));
+    assert.ok(!sampledTextures(main[view].draws.at(-1)).includes(resolved[1 - view]));
+  }
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(material.side, T.DoubleSide);
+});
+
+test('WebGL transmission child layers are tested at each opaque and back-face draw', async t => {
+  const f = fixture(t), events = [];
+  f.camera.layers.enable(1); f.camera.layers.enable(2);
+  f.camera.cameras[0].layers.set(1); f.camera.cameras[1].layers.set(2);
+  const first = mesh(f.scene, 0xff0000, 0), later = mesh(f.scene, 0x0000ff, 1);
+  first.layers.set(1); later.layers.set(2);
+  const glass = mesh(f.scene, 0, 2, new T.MeshPhysicalMaterial({transmission: .5, side: T.DoubleSide}));
+  glass.layers.enable(1); glass.layers.enable(2);
+  for (const object of [first, later, glass]) object.onBeforeRender = (renderer, _scene, camera) => {
+    if (!renderer.getRenderTarget()) return;
+    events.push([camera.name, object.name]);
+    if (object === first) later.layers.enable(1);
+  };
+  await render(f);
+  assert.deepEqual(events, [['0', '0'], ['0', '1'], ['0', '2'], ['1', '1'], ['1', '2']]);
+  assert.deepEqual(transmissionPasses(f.device).map(pass => pass.draws.length), [2, 1, 1, 1]);
+});
+
+test('WebGL transmission custom sort callbacks run once before every child pass despite asynchronous preparation', async t => {
+  const f = fixture(t), expected = [], observed = [], events = [];
+  const objects = [mesh(f.scene, 0xff0000, 0), mesh(f.scene, 0x0000ff, 1),
+    mesh(f.scene, 0, 2, new T.MeshPhysicalMaterial({transmission: .5, side: T.DoubleSide})),
+    mesh(f.scene, 0, 3, new T.MeshPhysicalMaterial({transmission: .5, side: T.DoubleSide}))];
+  const compare = (trace, label) => (a, b) => {
+    trace.push([label, a.object.name, b.object.name]);
+    return b.renderOrder - a.renderOrder;
+  };
+  const reference = WebGLRenderList(); reference.init();
+  for (const object of objects) reference.push(object, object.geometry, object.material, 0, 0, null, f.camera);
+  reference.finish(); reference.sort(compare(expected, 'opaque'), compare(expected, 'transmissive'));
+  for (const object of objects) object.onBeforeRender = (renderer, _scene, camera) => {
+    events.push([renderer.getRenderTarget() ? 'transmission' : 'main', camera.name, object.name]);
+    assert.deepEqual(observed, expected, 'every comparator completed before the first source draw callback');
+  };
+  f.renderer.setOpaqueSort(compare(observed, 'opaque'));
+  f.renderer.setTransparentSort(compare(observed, 'transmissive'));
+  await render(f);
+  assert.deepEqual(observed, expected);
+  const names = [...reference.opaque, ...reference.transmissive].map(item => item.object.name);
+  assert.deepEqual(events, ['transmission', 'main'].flatMap(phase => ['0', '1'].flatMap(camera =>
+    names.map(name => [phase, camera, name]))));
+});
+
+test('WebGL transmission preflight does not invoke shader hooks for unused BackSide variants', async t => {
+  const f = fixture(t), sides = [], material = new T.MeshPhysicalMaterial({transmission: .5});
+  material.onBeforeCompile = parameters => sides.push([parameters.doubleSided, parameters.flipSided]);
+  mesh(f.scene, 0xff0000, 0); mesh(f.scene, 0, 1, material);
+  await render(f);
+  assert.deepEqual(sides, [[false, false]]);
+  assert.equal(transmissionPasses(f.device).length, 2);
+});
+
+test('WebGL single-camera transmission retains its source pass order through shared preflight', async t => {
+  const f = fixture(t), events = []; f.camera = f.camera.cameras[0];
+  const solid = mesh(f.scene, 0xff0000, 0), glass = mesh(f.scene, 0, 1,
+    new T.MeshPhysicalMaterial({transmission: .5, side: T.DoubleSide}));
+  for (const object of [solid, glass]) object.onBeforeRender = (renderer, _scene, camera) => {
+    assert.equal(camera, f.camera);
+    events.push([renderer.getRenderTarget() ? 'transmission' : 'main', object.name, object.material.side]);
+  };
+  await render(f);
+  assert.deepEqual(events, [['transmission', '0', T.FrontSide], ['transmission', '1', T.BackSide],
+    ['main', '0', T.FrontSide], ['main', '1', T.DoubleSide]]);
+});
+
+test('WebGL transmission child targets resize between frames and remain distinct on an explicit target', async t => {
+  const f = fixture(t), sizes = [], targets = new Map();
+  const solid = mesh(f.scene, 0xff0000, 0);
+  mesh(f.scene, 0, 1, new T.MeshPhysicalMaterial({transmission: .5}));
+  solid.onBeforeRender = (renderer, _scene, camera) => {
+    const target = renderer.getRenderTarget();
+    if (!target || target === destination) return;
+    sizes.push([camera.name, target.width, target.height]);
+    if (targets.has(camera)) assert.equal(target, targets.get(camera)); else targets.set(camera, target);
+  };
+  const destination = new T.WebGLRenderTarget(64, 32); t.after(() => destination.dispose());
+  await render(f);
+  const old = transmissionPasses(f.device).map(pass => pass.desc.colorAttachments[0].resolveTarget.texture);
+  f.camera.cameras[0].viewport.set(0, 0, 12, 16); f.camera.cameras[1].viewport.set(12, 0, 20, 10);
+  f.renderer.setRenderTarget(destination); await render(f);
+  assert.deepEqual(sizes, [['0', 30, 40], ['1', 30, 40], ['0', 12, 16], ['1', 20, 10]]);
+  assert.ok(old.every(texture => texture.destroyed)); assert.equal(f.renderer.getRenderTarget(), destination);
+  const passes = transmissionPasses(f.device).slice(-2), main = drawPasses(f.device).filter(pass => pass.desc.label !== 'f3d-program-transmission').slice(-2);
+  for (let view = 0; view < 2; view++) assert.ok(sampledTextures(main[view].draws.at(-1)).includes(passes[view].desc.colorAttachments[0].resolveTarget.texture));
+  // Pinned WebGLRenderStates selects a separate camera-target map per scene.
+  // Changing the destination preserves it; rendering another scene does not.
+  const otherScene = new T.Scene(), otherTargets = new Map();
+  const other = mesh(otherScene, 0x0000ff, 0);
+  mesh(otherScene, 0, 1, new T.MeshPhysicalMaterial({transmission: .5}));
+  other.onBeforeRender = (renderer, _scene, camera) => {
+    const target = renderer.getRenderTarget();
+    if (target !== destination) otherTargets.set(camera, target);
+  };
+  f.renderer.render(otherScene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(otherTargets.size, 2);
+  for (const child of f.camera.cameras) assert.notEqual(otherTargets.get(child), targets.get(child));
+  await render(f);
+});
+
+test('WebGL transmission skips empty arrays and scene overrides without parent-camera fallback', async t => {
+  for (const empty of [true, false]) {
+    const f = fixture(t), object = mesh(f.scene, 0, 1, new T.MeshPhysicalMaterial({transmission: .5}));
+    let callbacks = 0; object.onBeforeRender = () => callbacks++;
+    if (empty) f.camera.cameras.length = 0;
+    else f.scene.overrideMaterial = new T.MeshBasicMaterial();
+    await render(f);
+    assert.equal(transmissionPasses(f.device).length, 0); assert.equal(callbacks, empty ? 0 : 2);
+    assert.equal(snapshots(f.device).length, empty ? 0 : 2);
+  }
+});
+
+test('WebGL transmission callback errors restore child and renderer state without replaying earlier views', async t => {
+  const f = fixture(t), events = [], failure = new Error('second transmission view failed');
+  const solid = mesh(f.scene, 0xff0000, 0), material = new T.MeshPhysicalMaterial({transmission: .5});
+  mesh(f.scene, 0, 1, material);
+  const viewports = f.camera.cameras.map(camera => camera.viewport);
+  solid.onBeforeRender = (renderer, _scene, camera) => {
+    assert.ok(renderer.getRenderTarget()); events.push(camera.name);
+    if (camera === f.camera.cameras[1]) throw failure;
+  };
   f.renderer.render(f.scene, f.camera);
-  await assert.rejects(f.renderer.waitForGPU(), /per-view transmission target bindings/);
-  assert.equal(snapshots(f.device).length, 0);
+  await assert.rejects(f.renderer.waitForGPU(), error => error === failure);
+  assert.deepEqual(events, ['0', '1']); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.deepEqual(f.camera.cameras.map(camera => camera.viewport), viewports);
+  assert.equal(transmissionPasses(f.device).length, 1);
 });
 
 test('WebGL batched multiview refuses unsnapshotted per-camera indirect textures', async t => {

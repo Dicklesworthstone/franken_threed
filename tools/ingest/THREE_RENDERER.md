@@ -248,6 +248,38 @@ the pinned render-list callback traces and recorded GPU draw order, including
 material groups, canvas/target queues, reset, disabled sorting and errors.
 These are source/command correctness checks, not pixel or performance results.
 
+## WebGL-authored ArrayCamera transmission
+
+Ordinary WebGL `ArrayCamera` scenes support the existing physical-material
+transmission profile through each child camera. Each child has a source
+transmission target sized from its viewport and `transmissionResolutionScale`.
+All child transmission passes precede all main child draws, following pinned
+r186 order. Back-face and main draws sample their own child's resolved image;
+sharing a material across views does not share the wrong sampler binding.
+
+Target identity is shared across canvas and explicit-target scene bridges for
+the same public renderer, source scene and camera. Different source scenes retain
+separate maps, as `WebGLRenderStates` does. Destination-specific programs remain
+local, and shared target storage is released after the last scene bridge.
+
+Preparation finishes before custom sort callbacks and draw callbacks execute.
+Comparators run once; offscreen callbacks receive the original child camera,
+the selected transmission target, source clear/tone state and the temporary
+viewport state. Object layers are checked at each draw. Renderer state, child
+viewports and temporary material-side changes are restored after failures;
+accepted callback effects are never retried. A callback that introduces an
+unprepared child identity, target extent or back-face variant encounters an
+explicit preparation boundary. Resizing between render calls is supported.
+Empty arrays and scene overrides skip transmission passes.
+
+`three_renderer_webgl_arrays.test.mjs` exercises distinct per-child GPU bindings,
+source callback and custom-sort order, live layers, viewport resizing, target
+identity across destinations, scene separation, front-face shader hooks and error
+restoration using pinned source objects and the real scene bridge. These are
+recorded-command and source integration checks; this addition has no browser
+pixel or performance result. Existing shader/material and BatchedMesh
+transmission boundaries remain in force.
+
 ## WebGL-authored batched ArrayCamera draws
 
 The WebGL-authored route supports `BatchedMesh` through each child camera's
@@ -269,8 +301,8 @@ memory limits. `node tests/e2e/webgpu_renderer/program_array_batching.mjs`
 matches eight source checkpoints exactly: opposite/reordered views, culling,
 layers, callback updates, versionless edits, an empty final view and resize.
 Chromium 151.0.7922.34 / SwiftShader matched all 210,432 RGBA bytes and callback
-traces with 73 native draws and zero GPU/browser errors. ArrayCamera transmission
-and the existing BatchedMesh shadow boundaries remain outside this addition.
+traces with 73 native draws and zero GPU/browser errors. The existing BatchedMesh
+transmission and shadow boundaries remain outside this addition.
 
 ## Logarithmic depth for WebGL-authored programs
 

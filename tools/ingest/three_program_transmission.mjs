@@ -37,6 +37,24 @@ export class ThreeProgramTransmissionError extends Error {
 }
 const fail = (code, message) => { throw new ThreeProgramTransmissionError(code, message); };
 const COLOR_FORMAT = 'rgba16float', DEPTH_FORMAT = 'depth24plus', SAMPLES = 4;
+// WebGLRenderStates owns these by scene/render depth and camera id, independently
+// of the current canvas or render target. Destination bridges keep their own
+// programs, but borrow the same source target identity and GPU image.
+const rendererTargets = new WeakMap();
+function acquireTargets(renderer, scene) {
+  let scenes = renderer && scene ? rendererTargets.get(renderer) : null;
+  if (renderer && scene && !scenes) rendererTargets.set(renderer, scenes = new WeakMap());
+  let pool = scenes?.get(scene);
+  if (!pool) {
+    pool = {targets: new Map(), bindings: new Map(), owners: 0};
+    scenes?.set(scene, pool);
+  }
+  pool.owners++;
+  return {pool, release() {
+    if (--pool.owners !== 0) return false;
+    scenes?.delete(scene); return true;
+  }};
+}
 
 function scoped(device, operation) {
   device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory');
@@ -53,12 +71,14 @@ function scoped(device, operation) {
 /** items given to prepare/render: {object, material, group, side, gpu, compile(), refresh(), pack(bytes, camera, size)}
  * where compile() returns the render-target program variant for (material, object, side),
  * gpu is the program geometry residency it reads, and bindingOf(texture) resolves samplers. */
-export function createThreeProgramTransmission({three: T, device, support, bindingOf, label = 'f3d-program-transmission', maxDraws = 4096}) {
-  const targets = new Map(), records = new Map(), bindings = new Map(), lost = new Promise(() => {});
+export function createThreeProgramTransmission({three: T, device, support, bindingOf, scene = null, label = 'f3d-program-transmission', maxDraws = 4096}) {
+  const records = new Map(), lost = new Promise(() => {});
   const meshes = createProgramMeshes({device, format: COLOR_FORMAT, depthFormat: DEPTH_FORMAT, sampleCount: SAMPLES, maxDraws, label,
     fail: (code, message) => { throw new ThreeProgramTransmissionError(code.replace(/^ANIMATION_RENDER_/, ''), message); }, scoped, lost});
   const sampler = device.createSampler({label, magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
+  const shared = acquireTargets(support.state?.().renderer, scene);
+  const {targets, bindings} = shared.pool;
   const clearColor = new T.Color();
   let disposed = false, mipper = null, pending = [];
   const live = () => { if (disposed) fail('DISPOSED', 'Transmission owner is disposed'); };
@@ -129,29 +149,43 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
     }
   }
 
+  /** Inspect every camera before any pass runs source callbacks. A later view
+   * may need new sampler bindings even when an earlier view is already ready. */
+  function preflight(opaqueItems, transmissiveItems, camera, {width, height}) {
+    live();
+    const state = targetFor(camera, width, height);
+    allocate(state);
+    // Do not speculatively compile absent back-face programs: onBeforeCompile
+    // observes a different shader key for BackSide. Eligibility is checked
+    // again at the actual draw, after preceding opaque callbacks.
+    const back = transmissiveItems.filter(item => item.material.side === T.DoubleSide && item.object.layers.test(camera.layers));
+    const found = new Map([...opaqueItems, ...back.map(item => item.backSide)].map(item => {
+      const result = lookup(item);
+      if (!result.entry) pending.push(item);
+      return [item, result];
+    }));
+    return [...found.values()].some(result => !result.entry) ? null : {state, gpu: state.gpu, found};
+  }
+
   /** renderTransmissionPass for this frame. Source-visible effects (target size,
    * callbacks, side/needsUpdate toggles) happen now; the returned function
    * submits the pass (after this frame's uploads, before the main pass). */
-  function render(opaqueItems, transmissiveItems, camera, {width, height, background, renderer, sourceScene}) {
+  function render(opaqueItems, transmissiveItems, camera, {width, height, background, renderer, sourceScene, prepared = null}) {
     live();
-    const state = targetFor(camera, width, height);
-    if (allocate(state)) fail('PREPARE', 'Transmission target was (re)allocated; call prepare()');
-    const back = transmissiveItems.filter(item => item.material.side === T.DoubleSide && item.object.layers.test(camera.layers));
-    // Every record before any callback: a PREPARE boundary must not replay effects.
-    const found = [...opaqueItems, ...back.map(item => item.backSide)].map(item => {
-      const r = lookup(item);
-      if (!r.entry) pending.push(item);
-      return r;
-    });
-    if (pending.length) fail('PREPARE', 'Transmission pass programs need prepare()');
+    prepared ??= preflight(opaqueItems, transmissiveItems, camera, {width, height});
+    if (!prepared) fail('PREPARE', 'Transmission pass programs need prepare()');
+    const {state, found} = prepared;
+    if (state.gpu !== prepared.gpu || state.target.width !== width || state.target.height !== height)
+      fail('PREPARE', 'Transmission target changed after pass preparation');
     meshes.begin();
     const draw = (item, r, commands) => {
+      if (!r?.entry) fail('PREPARE', 'Transmission side or layers introduced an unprepared back-face program');
       const object = item.object, geometry = object.geometry;
       const hooked = object.onBeforeRender !== T.Object3D.prototype.onBeforeRender || object.onAfterRender !== T.Object3D.prototype.onAfterRender;
       if (hooked) object.onBeforeRender(renderer, sourceScene, camera, geometry, item.material, item.group);
-      if (item.material.onBeforeRender !== T.Material.prototype.onBeforeRender) item.material.onBeforeRender(renderer, sourceScene, camera, geometry, object, item.group);
       object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
       object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+      if (item.material.onBeforeRender !== T.Material.prototype.onBeforeRender) item.material.onBeforeRender(renderer, sourceScene, camera, geometry, object, item.group);
       const reflection = r.entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
       const current = item.pack(bytes, camera, [state.gpu.width, state.gpu.height, state.gpu.width, state.gpu.height], reflection);
       if (current.some((t, k) => (t ?? null) !== r.entry.textures[k].texture)) fail('PREPARE', 'Transmission pass textures changed; call prepare()');
@@ -162,16 +196,6 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
       commands.push(command);
       if (hooked) object.onAfterRender(renderer, sourceScene, camera, geometry, item.material, item.group);
     };
-    const opaqueCommands = [], backCommands = [];
-    opaqueItems.forEach((item, i) => draw(item, found[i], opaqueCommands));
-    back.forEach((item, i) => {
-      const material = item.material, currentSide = material.side;
-      material.side = T.BackSide; material.needsUpdate = true;
-      item.backSide.beforeDraw?.();
-      draw(item.backSide, found[opaqueItems.length + i], backCommands);
-      material.side = currentSide; material.needsUpdate = true;
-      item.backSide.afterDraw?.();
-    });
     // _this.clear() then background.render(scene): see the header for the color rules.
     let clear;
     if (background?.isColor) clear = [background.r, background.g, background.b, 1];
@@ -180,6 +204,39 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
       let alpha = renderer.getClearAlpha();
       if (alpha < 1) { clearColor.setRGB(1, 1, 1); alpha = 0.5; }
       clear = [clearColor.r * alpha, clearColor.g * alpha, clearColor.b * alpha, alpha];
+    }
+    const opaqueCommands = [], backCommands = [];
+    const previousTarget = renderer._renderTarget, previousFace = renderer._activeCubeFace,
+      previousMip = renderer._activeMipmapLevel, previousToneMapping = renderer.toneMapping,
+      previousViewport = camera.viewport, previousClear = renderer.getClearColor(new T.Color()), previousAlpha = renderer.getClearAlpha();
+    try {
+      // This target is owned here, not by the facade's ordinary target pool.
+      // Publish its source identity while its callbacks run, as the pinned
+      // renderer does when it selects the transmission target.
+      renderer._renderTarget = state.target; renderer._activeCubeFace = 0; renderer._activeMipmapLevel = 0;
+      renderer.toneMapping = T.NoToneMapping;
+      if (previousAlpha < 1) renderer.setClearColor(0xffffff, 0.5);
+      if (previousViewport !== undefined) camera.viewport = undefined;
+      opaqueItems.forEach(item => {
+        if (item.object.layers.test(camera.layers)) draw(item, found.get(item), opaqueCommands);
+      });
+      transmissiveItems.forEach(item => {
+        const material = item.material, currentSide = material.side;
+        if (currentSide !== T.DoubleSide || !item.object.layers.test(camera.layers)) return;
+        try {
+          material.side = T.BackSide; material.needsUpdate = true;
+          item.backSide.beforeDraw?.();
+          draw(item.backSide, found.get(item.backSide), backCommands);
+        } finally {
+          material.side = currentSide; material.needsUpdate = true;
+          item.backSide.afterDraw?.();
+        }
+      });
+    } finally {
+      renderer._renderTarget = previousTarget; renderer._activeCubeFace = previousFace; renderer._activeMipmapLevel = previousMip;
+      renderer.toneMapping = previousToneMapping;
+      renderer.setClearColor(previousClear, previousAlpha);
+      if (previousViewport !== undefined) camera.viewport = previousViewport;
     }
     const gpu = state.gpu;
     return () => submit(gpu, clear, opaqueCommands, backCommands);
@@ -237,7 +294,7 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
     }
   }
   return Object.freeze({
-    prepare, render,
+    prepare, preflight, render,
     /** r186's transmissionRenderTarget for a camera, created/sized as the pass does (uniform refresh reads it). */
     target(camera, width, height) { live(); const state = targetFor(camera, width, height); allocate(state); return state.target; },
     /** Receiver binding of a transmission target texture, or undefined. */
@@ -246,8 +303,11 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const state of targets.values()) { if (state.gpu) release(state); state.target.dispose(); }
-      targets.clear(); records.clear(); meshes.dispose(); pending = [];
+      if (shared.release()) {
+        for (const state of targets.values()) { if (state.gpu) release(state); state.target.dispose(); }
+        targets.clear();
+      }
+      records.clear(); meshes.dispose(); pending = [];
     },
   });
 }

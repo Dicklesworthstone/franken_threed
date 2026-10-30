@@ -201,7 +201,7 @@ export async function createGpuThreeScene(device,scene,{
   const batchHistoryBuffers=new Map();
   let batchHistoryBytes=0,batchHistoryValidation=Promise.resolve();
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false,nativeLightMode=false;
-  let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null;
+  let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null,transmissionView=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
   const textureBindings=createThreeTextureBindings(device,{
     three,textures,autoTextures,ownedTextures,fail,
@@ -779,7 +779,7 @@ export async function createGpuThreeScene(device,scene,{
   const shadowRenderer=()=>programSupport.state?.().renderer??null;
   const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
   const shadowBoundary=error=>{if(error?.code==='THREE_PROGRAM_SHADOW_PREPARE')fail('PREPARE',error.message);throw error;};
-  const transmission=()=>transmissionOwner??=(programSupport.createTransmission?.(device,{bindingOf:t=>t?textureBinding(t):placeholderBinding()})??
+  const transmission=()=>transmissionOwner??=(programSupport.createTransmission?.(device,{scene:root,bindingOf:t=>t?textureBinding(t):placeholderBinding()})??
     fail('MATERIAL','Transmission needs the program transmission owner'));
   /** r186 transmissionRenderTarget[camera.id]: (camera.viewport || current viewport) x transmissionResolutionScale. */
   function transmissionSize(camera){
@@ -788,9 +788,13 @@ export async function createGpuThreeScene(device,scene,{
     return [w*scale,h*scale];
   }
   const transmissionTarget=()=>{
-    const camera=programCamera??(transmissionCamera??=new three.Camera());
+    const camera=transmissionView??(programCamera?.isArrayCamera?programCamera.cameras[0]:programCamera)??(transmissionCamera??=new three.Camera());
     return transmission().target(camera,...transmissionSize(camera));
   };
+  function inTransmissionView(camera,run){
+    const previous=transmissionView;transmissionView=camera;
+    try{return run();}finally{transmissionView=previous;}
+  }
   // WebGLClipping inputs for programs: the source Plane objects, not snapshots.
   const programClippingControls=()=>clippingEnabled?{planes:clippingValue(clipping,'planes',[]),localClippingEnabled:clippingValue(clipping,'localClippingEnabled',false)===true}:null;
   const pmrem=()=>pmremOwner??=(programSupport.createPMREM?.(device,t=>textureBinding(t))??fail('MATERIAL','PMREM environments need the program PMREM owner'));
@@ -1140,7 +1144,15 @@ export async function createGpuThreeScene(device,scene,{
     const get=(m,topology='triangles',object=null)=>{
       let byTopology=descriptions.get(m);if(!byTopology)descriptions.set(m,byTopology=new Map());
       const key=programCapable(m)&&object?topology+'|'+programVariant(object):topology;
-      if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
+      if(!byTopology.has(key)){
+        const describe=()=>materialDescription(m,clippingFrame,topology,object);
+        // Every child needs its own transmission sampler group even when it
+        // shares a material and shader with all other views. Keep these variants
+        // together so preparing a later child cannot evict an earlier binding.
+        const cameras=programCamera?.isArrayCamera&&m.transmission>0?programCamera.cameras:null;
+        byTopology.set(key,cameras?.length?cameras.flatMap(child=>inTransmissionView(child,describe)):describe());
+      }
+      return byTopology.get(key);
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
@@ -1524,8 +1536,6 @@ export async function createGpuThreeScene(device,scene,{
     // Modern WebGPU sources draw object-major and share the parent's list.
     if(camera.isMultiViewCamera||!Array.isArray(camera.cameras)||camera.cameras.length>256)
       fail('CAMERA','Expected an ordinary ArrayCamera with at most 256 views');
-    if(programRoute()&&programTransmissionMode)
-      fail('CAMERA','WebGL ArrayCamera transmission needs per-view transmission target bindings');
     const pixelRatio=profile.pixelRatio??1;
     finite(pixelRatio,'array camera pixel ratio');if(pixelRatio<=0)fail('CAMERA','Expected positive camera pixel ratio');
     // WebGL reads each child at renderScene entry, after callbacks in earlier
@@ -1735,6 +1745,7 @@ export async function createGpuThreeScene(device,scene,{
         else if(packet.background)nativeBackground=draw;
         else (packet.transmissionBack?transmissionBacks:packet.listMaterial.transparent?transparent:opaque).push(draw);
       }
+      const sortLists=()=>{
       if(sorting&&!passNodeFrame?.sortCaptured){
         const order=(a,b)=>a.groupOrder-b.groupOrder||(a.renderOrder??a.object.renderOrder)-(b.renderOrder??b.object.renderOrder);
         const variant=item=>(item.object.isInstancedMesh?2:0)+(item.object.isSkinnedMesh?1:0);
@@ -1764,6 +1775,9 @@ export async function createGpuThreeScene(device,scene,{
         const order=(a,b)=>projectionOrder.get(a.object)-projectionOrder.get(b.object);
         opaque.sort(order);transparent.sort(order);transmissionBacks.sort(order);
       }
+      };
+      const deferTransmissionSort=programRoute()&&transmissive.length>0&&passOverride===null;
+      if(!deferTransmissionSort)sortLists();
       // Native sky draws lead even when fixed meshes share this scene or sorting is disabled.
       if(nativeBackground)opaque.unshift(nativeBackground);
       // WebGLBackground.addToRenderList: after sorting, the background mesh leads.
@@ -1775,6 +1789,21 @@ export async function createGpuThreeScene(device,scene,{
         opaque.unshift({object:bg,geometry:bg.geometry,material:bg.material,listMaterial:bg.material,group:null,groupOrder:0,z:0,desc,bindings,shadowPass:false,program:true});
       }
       const items=[...opaque,...transmissive,...transmissionBacks,...transparent,...bundleTail],draws=[],drawObjects=[],framebufferCopies=[];
+      const transmissionVariants=new Map();
+      function itemForView(item,child){
+        if(!programArray||!item.program||!(item.material.transmission>0))return item;
+        let variants=transmissionVariants.get(child);
+        if(!variants)transmissionVariants.set(child,variants=new Map());
+        if(!variants.has(item)){
+          const desc=inTransmissionView(child,()=>programDescription(item.material,item.desc[0].options.topology,item.object));
+          const records=lookup.get(programKeyOf(item.object))?.get(item.material);
+          const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.programGeometry&&same(e.structural,d.structural)));
+          if(bindings.some(entry=>!entry))fail('PREPARE','ArrayCamera transmission sampler bindings need preparation');
+          variants.set(item,{...item,desc,bindings});
+        }
+        return variants.get(item);
+      }
+      if(programArray)for(const child of camera.cameras)for(const item of items)itemForView(item,child);
       const copiesAtDraw = copies => {
         if(copies?.length)framebufferCopies.push({index:draws.length,copies});
       };
@@ -1786,16 +1815,11 @@ export async function createGpuThreeScene(device,scene,{
       // valid; changing a sampler/storage description requires prepare().
       // WebGLRenderer order: shadow maps render after the render list is built,
       // then setupLights() reads their state; depth passes submit after uploads.
-      let submitShadows=null;
-      if(programShadowMode){
-        try{submitShadows=programShadows().render(castingLights(camera),root,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
-        programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
-      }
-      textureOwner?.update(frameTextures);
-      submitShadows?.();
       const updated=new Set(),activeDeformations=new Set();
+      const transmissionPasses=[],transmissionCameras=programArray?camera.cameras:[camera];
       // renderTransmissionPass (skipped under overrideMaterial, as r186 does):
-      // after shadow maps and uploads, before the main opaque draws.
+      // prepare every child before callbacks, then run all children after the
+      // shadow maps and uploads and before any main-camera opaque draws.
       if(transmissive.length&&passOverride===null){
         const passItem=(item,d,i,side=d.programSide)=>{
           const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
@@ -1803,20 +1827,63 @@ export async function createGpuThreeScene(device,scene,{
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
           return {object,material:m,group:item.group,side,gpu,sourceObject:programObject(object),topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
             compile:()=>programSupport.compile(m,programObject(object),{...d.compileOptions,side,renderTarget:true}),
-            refresh:()=>programSupport.uniformsFor(m),
+            refresh:()=>programSupport.refresh(m,d.refreshOptions),
             pack:(bytes,cam,size,reflection)=>{
               const clip=programSupport.clippingState(programClippingControls(),m,cam);
-              return programSupport.pack(reflection,programSupport.uniformsFor(m),programObject(object),cam,bytes,{targetSize:size,material:m,
+              return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),programObject(object),cam,bytes,{targetSize:size,material:m,
                 values:programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:null});
             }};
         };
-        const passItems=opaque.flatMap(item=>item.program?item.desc.map((d,i)=>passItem(item,d,i)):fail('MATERIAL','Transmission passes re-render opaque draws through programs'));
         // r186 refreshes the material for the BackSide draw and again for its next draw.
         const refreshed=item=>()=>programSupport.refresh(item.material,item.desc[0].refreshOptions);
-        const transmissiveItems=transmissive.map(item=>({object:item.object,material:item.material,
-          backSide:{...passItem(item,item.desc[0],0,three.BackSide),beforeDraw:refreshed(item),afterDraw:refreshed(item)}}));
-        const [width,height]=transmissionSize(camera);
-        try{transmission().render(passItems,transmissiveItems,camera,{width,height,background:scene.background,renderer:shadowRenderer(),sourceScene:root})();}
+        for(const child of transmissionCameras){
+          checkCamera(child);if(child.isArrayCamera&&programArray)fail('CAMERA','Nested ArrayCamera views are not admitted');
+          const passItems=opaque.flatMap(original=>{
+            const item=itemForView(original,child);
+            return item.program?item.desc.map((d,i)=>({...passItem(item,d,i),listItem:original})):fail('MATERIAL','Transmission passes re-render opaque draws through programs');
+          });
+          const transmissiveItems=transmissive.map(original=>{
+            const item=itemForView(original,child);
+            return {object:item.object,material:item.material,listItem:original,
+              backSide:{...passItem(item,item.desc[0],0,three.BackSide),beforeDraw:refreshed(item),afterDraw:refreshed(item)}};
+          });
+          const [width,height]=transmissionSize(child);
+          programSupport.setLightsView(child);
+          const prepared=transmission().preflight(passItems,transmissiveItems,child,{width,height});
+          transmissionPasses.push({child,passItems,transmissiveItems,prepared});
+        }
+        programSupport.setLightsView(camera);
+        if(transmissionPasses.some(pass=>!pass.prepared))fail('PREPARE','Transmission pass programs need preparation');
+      }
+      if(deferTransmissionSort){
+        // User comparators are observable. Missing offscreen or per-view
+        // bindings must finish preparation before a comparator can run once.
+        const background=bg?opaque.shift():null;
+        sortLists();
+        if(background)opaque.unshift(background);
+        items.splice(0,items.length,...opaque,...transmissive,...transmissionBacks,...transparent,...bundleTail);
+        const order=new Map(items.map((item,index)=>[item,index]));
+        for(const pass of transmissionPasses){
+          pass.passItems.sort((a,b)=>order.get(a.listItem)-order.get(b.listItem));
+          pass.transmissiveItems.sort((a,b)=>order.get(a.listItem)-order.get(b.listItem));
+        }
+      }
+      let submitShadows=null;
+      if(programShadowMode){
+        try{submitShadows=programShadows().render(castingLights(camera),root,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
+        programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
+      }
+      textureOwner?.update(frameTextures);
+      submitShadows?.();
+      for(const [index,pass] of transmissionPasses.entries()){
+        if(transmissionCameras[index]!==pass.child)fail('CAMERA','A transmission callback replaced an unprepared child camera');
+        const [width,height]=transmissionSize(pass.child);
+        programSupport.setLightsView(pass.child);
+        // Once callbacks start, a later resource mutation must never retry and
+        // replay their effects or an already-submitted transmission prefix.
+        backgroundSubmitted=true;
+        try{transmission().render(pass.passItems,pass.transmissiveItems,pass.child,{width,height,prepared:pass.prepared,
+          background:scene.background,renderer:shadowRenderer(),sourceScene:root})();}
         catch(error){if(error?.code==='THREE_PROGRAM_TRANSMISSION_PREPARE')fail('PREPARE',error.message);throw error;}
       }
       // WebGL builds and sorts one parent-frustum list, then renders each
@@ -1955,7 +2022,7 @@ export async function createGpuThreeScene(device,scene,{
             if(!item.object.layers.test(view.camera.layers))continue;
             const instances=item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1;
             if(draws.length+item.bindings.length*instances>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
-            programSourceDraws++;yield {item,view};
+            programSourceDraws++;yield {item:itemForView(item,view.camera),view};
           }
         }
       }
