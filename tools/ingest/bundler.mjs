@@ -17,6 +17,7 @@ import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
+import { moduleSourcesFor } from "./module_sources.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 import {
@@ -99,6 +100,7 @@ function isExternalUrl(url) {
  * @returns {import('rollup').Plugin}
  */
 export function f3dRollupPlugin(options = {}) {
+  const moduleSources = moduleSourcesFor(options);
   const importMap = options.importMap || { imports: {}, scopes: {} };
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
@@ -290,12 +292,11 @@ export function f3dRollupPlugin(options = {}) {
 
     load(id) {
       if (inlineModules.has(id)) {
-        return inlineModules.get(id);
+        return moduleSources.read(id, {source: inlineModules.get(id)}).code;
       }
 
       if (id.startsWith("file://")) {
-        const filePath = urlToFilePath(id);
-        const source = fs.readFileSync(filePath, "utf-8");
+        const source = moduleSources.read(id).code;
         if (retainedModuleUrls.has(id)) {
           // Rollup entry points cannot be external. Forward an HTML entry to its
           // retained module without evaluating a second copy of its body.
@@ -654,6 +655,7 @@ export function rendererRoutePlugin({ targets, exactSites = [] }) {
 }
 
 export async function bundleWithRollup(entryPath, options = {}) {
+  const moduleSources = moduleSourcesFor(options);
   const specialization = options.specializeNumeric;
   const numericPlugin =
     specialization === undefined || specialization === false
@@ -764,12 +766,14 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
+          _moduleSources: moduleSources,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             packageRootUrl: options.packageRootUrl,
           }),
         }),
         f3dRollupPlugin({
+          _moduleSources: moduleSources,
           importMap,
           mapBaseUrl,
           inlineModules,

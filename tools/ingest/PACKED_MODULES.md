@@ -4,6 +4,55 @@
 The ordinary multi-file build is not modified. This is retained-JavaScript
 packaging (F3D-10), not a renderer, compiler specialization or speedup claim.
 
+## Project transforms before bundling
+
+The Node build API accepts the project's existing synchronous TypeScript, JSX
+or other JavaScript frontend before module analysis and Rollup linking:
+
+```js
+await buildApplication('./src/main.ts', './dist', {
+  transformModule(source, { url, sourceType }) {
+    // frontend is the application's already configured transformer.
+    return frontend.transformSync(source, { filename: fileURLToPath(url), sourceType });
+  },
+  specializeNumeric: true,
+  routeWebGPURenderer: true,
+});
+```
+
+Return a JavaScript string, `{ code }`, or `null`/`undefined` to retain the input.
+`buildModuleGraph`, `bundleWithRollup` and worker-graph APIs accept the same
+option. A build caches one normalized source per exact URL and module/script
+kind; analysis, source hashes, renderer decisions, retained file copies and
+emission use that same snapshot. Query and fragment identities remain distinct.
+Inline module entries, finite lazy dependencies, module workers and classic
+worker `importScripts` dependencies participate. External classic scripts also
+use their normalized bytes; inline classic HTML scripts remain source-owned.
+Unchanged retained scripts and JSON/binary resources preserve their bytes.
+
+Imports and assets keep their original filesystem URL bases. Frontend-generated
+assets must exist at the referenced paths, and imports must remain resolvable
+through the existing file/package/import-map resolver. This handoff does not
+implement Vite virtual modules, arbitrary plugin resolution, a TypeScript
+compiler, or a source-map merger. Diagnostics and graph spans describe normalized
+JavaScript. An asynchronous frontend can complete its work first and return
+cached code through this synchronous hook; returning a Promise fails before
+output publication.
+
+Native renderer routing requires unchanged Three.js library input. A frontend
+edit to an admitted build/core module preserves that actual transformed library
+and prevents native substitution. Exact loader and numeric-library recognition
+continues to use source hashes. Unchanged pinned imports retain their original
+module identities, so typed applications can select the existing native renderer
+and numeric Wasm routes before bundling removes those boundaries.
+
+The focused integration executes real TypeScript normalization, numeric Wasm
+calls, lazy/live bindings, assets, module workers and repeated classic imports.
+Its packed application also runs with both source and emitted directories
+unavailable. Separate checks construct the native renderer from typed source and
+execute a modified pinned core through the retained route. These establish input
+integration and execution ownership; they do not establish a rendering speedup.
+
 ## Typed imports and source errors
 
 Static imports, reexports and bounded lazy imports retain their original import

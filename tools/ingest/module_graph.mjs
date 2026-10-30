@@ -15,6 +15,7 @@ import { verifiedRendererConsumerContracts } from "./renderer_consumer_contracts
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
+import { moduleSourcesFor } from "./module_sources.mjs";
 
 /**
  * Computes SHA-256 hash of a string.
@@ -94,6 +95,7 @@ function findCycles(adj) {
  * @returns {Promise<Object>} The versioned module graph bundle
  */
 export async function buildModuleGraph(entryPath, options = {}) {
+  const moduleSources = moduleSourcesFor(options);
   const resolvedEntryAbs = path.resolve(entryPath);
   if (!fs.existsSync(resolvedEntryAbs)) {
     throw new Error(`Entry file does not exist: "${resolvedEntryAbs}"`);
@@ -173,13 +175,15 @@ export async function buildModuleGraph(entryPath, options = {}) {
     let sourcePath = null;
 
     if (item.isInline) {
-      sourceCode = item.inlineContent;
+      sourceCode = moduleSources.read(sourceUrl, {source: item.inlineContent}).code;
       sourcePath = resolvedEntryAbs;
     } else {
       sourcePath = urlToFilePath(sourceUrl);
       try {
-        sourceCode = fs.readFileSync(sourcePath, "utf-8");
+        sourceCode = moduleType === "json" ? fs.readFileSync(sourcePath, "utf-8")
+          : moduleSources.read(sourceUrl).code;
       } catch (err) {
+        if (err.code === "F3D_SOURCE_TRANSFORM") throw err;
         throw new IngestionResolutionError(
           `Failed to read module source file "${sourcePath}": ${err.message}`,
           moduleId,

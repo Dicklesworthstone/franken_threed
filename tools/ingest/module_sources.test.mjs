@@ -1,0 +1,228 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import * as nodeModule from 'node:module';
+import test from 'node:test';
+import {pathToFileURL} from 'node:url';
+import {Worker as Thread} from 'node:worker_threads';
+import {createModuleSources} from './module_sources.mjs';
+import {buildModuleGraph} from './module_graph.mjs';
+import {buildApplication} from './build_application.mjs';
+import {packHtml} from './pack_html.mjs';
+
+const typescript = {skip: typeof nodeModule.stripTypeScriptTypes !== 'function'};
+const data = source => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+function fixture(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-source-transform-'));
+  const source = path.join(root, 'source'), out = path.join(root, 'out');
+  for (const [name, text] of Object.entries({'package.json': '{"type":"module"}', ...files})) {
+    const filename = path.join(source, name);
+    fs.mkdirSync(path.dirname(filename), {recursive: true});
+    fs.writeFileSync(filename, text, {flag: 'wx'});
+  }
+  return {root, source, out, entry: path.join(source, 'index.html')};
+}
+function frontend(calls = new Map()) {
+  return (code, {url, sourceType}) => {
+    const key = JSON.stringify([url, sourceType]);
+    calls.set(key, (calls.get(key) ?? 0) + 1);
+    assert.ok(!new URL(url).pathname.endsWith('.json'), 'JSON is not JavaScript input');
+    if (new URL(url).pathname.endsWith('.ts'))
+      return {code: nodeModule.stripTypeScriptTypes(code, {mode: 'transform'})};
+    return code.includes('__FRONTEND_DEFINE__') ? code.replaceAll('__FRONTEND_DEFINE__', '7') : null;
+  };
+}
+const folderBytes = folder => fs.readdirSync(folder, {withFileTypes: true}).reduce((bytes, item) =>
+  bytes + (item.isDirectory() ? folderBytes(path.join(folder, item.name)) : fs.statSync(path.join(folder, item.name)).size), 0);
+
+// Native ESM and worker threads execute production output. The only adapters
+// supply browser Worker/importScripts and local-file fetch hosting in Node.
+const workerBootstrap = data(`
+  import fs from 'node:fs'; import vm from 'node:vm';
+  import {parentPort,workerData} from 'node:worker_threads';
+  globalThis.self=globalThis;
+  globalThis.postMessage=value=>parentPort.postMessage(value);
+  const bytes=url=>url.startsWith('data:')?Buffer.from(url.slice(url.indexOf(',')+1).split('#')[0],'base64'):fs.readFileSync(new URL(url));
+  const nativeFetch=fetch;
+  globalThis.fetch=(input,options)=>String(input).startsWith('file:')
+    ?Promise.resolve(new Response(bytes(String(input)))):nativeFetch(input,options);
+  globalThis.importScripts=(...urls)=>{for(const url of urls)
+    vm.runInThisContext(bytes(new URL(url,workerData.url).href).toString(),{filename:url});};
+  if(workerData.kind==='classic')vm.runInThisContext(bytes(workerData.url).toString(),{filename:workerData.url});
+  else await import(workerData.url);
+`);
+const runner = new URL(data(`
+  import fs from 'node:fs';
+  import {registerHooks} from 'node:module';
+  import {parentPort,workerData,Worker} from 'node:worker_threads';
+  registerHooks({resolve(specifier,context,next){return next(workerData.imports?.[specifier]??specifier,context);}});
+  const nativeFetch=fetch;
+  globalThis.fetch=(input,options)=>String(input).startsWith('file:')
+    ?Promise.resolve(new Response(fs.readFileSync(new URL(input)))):nativeFetch(input,options);
+  const threads=[];
+  globalThis.Worker=class {
+    constructor(input,options={}) {
+      this.result=(async()=>{
+        let url=new URL(String(input),workerData.url).href;
+        if(url.startsWith('blob:'))url='data:text/javascript;base64,'+Buffer.from(await(await fetch(url)).text()).toString('base64');
+        const thread=new Worker(new URL(workerData.workerBootstrap),{workerData:{url,kind:options.type??'classic'}});
+        threads.push(thread);
+        return new Promise((resolve,reject)=>{thread.once('message',resolve);thread.once('error',reject);});
+      })();
+    }
+  };
+  let wasmCalls=0;
+  const Native=WebAssembly.Instance;
+  WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,
+    run(...values){wasmCalls++;return instance.exports.run(...values);}}};};
+  try {
+    const app=await import(workerData.url), values=new Float64Array([1,2,3]);
+    const first=app.run(values), left=await app.lazy(true), right=await app.lazy(false);
+    const second=app.run(values), asset=await(await fetch(app.asset)).json();
+    const workers=await Promise.all([app.moduleWorker().result,app.classicWorker().result]);
+    parentPort.postMessage({first,second,lazy:[left.read(),right.read()],asset,workers,wasmCalls});
+  } finally {await Promise.all(threads.map(thread=>thread.terminate()));}
+`));
+async function execute(input) {
+  const thread = new Thread(runner, {workerData: {...input, workerBootstrap}});
+  let timer;
+  try {
+    return await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('Transformed application timed out')), 10000);
+      thread.once('message', resolve); thread.once('error', reject);
+    });
+  } finally {clearTimeout(timer); await thread.terminate();}
+}
+
+test('source snapshots preserve URL/kind identity and reject asynchronous or invalid frontends', async () => {
+  const calls = [], sources = createModuleSources((source, meta) => {calls.push(meta); return {code: source + '\n// normalized'};});
+  const url = new URL('./fixture.ts', import.meta.url).href;
+  const first = sources.read(url, {source: 'export const value=1;'});
+  assert.strictEqual(sources.read(url, {source: 'changed after ingestion'}), first);
+  assert.notEqual(first.originalHash, first.contentHash);
+  assert.equal(sources.changed(url), true);
+  sources.read(url + '?other#view', {source: 'export const value=1;'});
+  sources.read(url, {sourceType: 'script', source: 'globalThis.value=1;'});
+  assert.equal(calls.length, 3);
+  for (const transform of [() => Promise.resolve(''), () => Promise.reject(new Error('frontend failed')),
+    () => ({code: 3}), () => {throw null;}])
+    assert.throws(() => createModuleSources(transform).read(url, {source: ''}), {code: 'F3D_SOURCE_TRANSFORM'});
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test('real TypeScript frontend reaches numeric Wasm, lazy live bindings, assets and both worker kinds', typescript, async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="./main.ts"></script>',
+    'main.ts': `import {update,count,bump} from './state.ts';import {read} from './reader.ts';
+      export function run(values:Float64Array){update(values,2);bump();return [[...values],count,read()];}
+      export const lazy=(left:boolean)=>import(left?'./features/left.ts':'./features/right.ts');
+      export const asset=new URL('./config.json',import.meta.url);
+      export const moduleWorker=()=>new Worker(new URL('./worker.ts',import.meta.url),{type:'module'});
+      export const classicWorker=()=>new Worker(new URL('./classic.js',import.meta.url));`,
+    'state.ts': `export let count:number=0;export function bump(){count++;}
+      export function update(values:Float64Array,delta:number){for(let i=0;i<values.length;i++)values[i]+=delta;}`,
+    'reader.ts': `import {count} from './state.ts';export function read():number{return count;}`,
+    'features/left.ts': `export {read} from '../reader.ts';`,
+    'features/right.ts': `export function read():number{return 99;}`,
+    'worker.ts': `import {count,bump} from './state.ts';bump();
+      const config: {value:number}=await(await fetch(new URL('./config.json',import.meta.url))).json();
+      postMessage([count,config.value]);`,
+    'classic.js': `importScripts('./classic-helper.js');importScripts('./classic-helper.js');postMessage(globalThis.frontendValue);`,
+    'classic-helper.js': 'globalThis.frontendValue=(globalThis.frontendValue??0)+__FRONTEND_DEFINE__;',
+    'config.json': '{"value":73}',
+  });
+  const calls = new Map();
+  const built = await buildApplication(f.entry, f.out, {transformModule: frontend(calls),
+    specializeNumeric: true, routeWebGPURenderer: true});
+  assert.ok(built.numericSpecialization.compiledKernels > 0);
+  assert.equal(built.numericSpecialization.accelerated, false);
+  assert.ok([...calls.values()].every(count => count === 1), 'analysis, output and worker realms share one normalization');
+  assert.equal(calls.get(JSON.stringify([pathToFileURL(path.join(f.source, 'state.ts')).href, 'module'])), 1);
+  const expected = {first: [[3,4,5],1,1], second: [[5,6,7],2,2], lazy: [2,99], asset: {value:73}, workers: [[1,73],14]};
+  const ordinary = await execute({url: pathToFileURL(path.join(f.out, built.entryFiles[0])).href});
+  assert.ok(ordinary.wasmCalls >= 2, 'real native Wasm entry executed');
+  const {wasmCalls, ...observed} = ordinary;
+  assert.deepEqual(observed, expected);
+  const packed = path.join(f.root, 'packed.html');
+  packHtml(path.join(f.out, 'index.html'), packed);
+  const html = fs.readFileSync(packed, 'utf8');
+  const imports = JSON.parse(/<script type="importmap">(.*?)<\/script>/s.exec(html)[1]).imports;
+  const url = /<script type="module" src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'out-unavailable'));
+  assert.deepEqual(await execute({url, imports}), ordinary, 'packed native modules execute without source/output trees');
+  assert.ok(folderBytes(f.root) < 1024 * 1024, 'small fixture artifact budget');
+});
+
+test('normalization errors abort before output and the graph hashes actual normalized code', typescript, async () => {
+  const f = fixture({'index.html': '<script type="module" src="./entry.ts"></script>',
+    'entry.ts': 'export const value:number=42;'});
+  await assert.rejects(buildApplication(f.entry, f.out, {transformModule: async () => ''}),
+    error => (error.pluginCode ?? error.code) === 'F3D_SOURCE_TRANSFORM');
+  assert.equal(fs.existsSync(f.out), false);
+  const graph = await buildModuleGraph(f.entry, {transformModule: frontend()});
+  const url = pathToFileURL(path.join(f.source, 'entry.ts')).href;
+  assert.equal(graph.modules[url].content_hash,
+    createModuleSources(frontend()).read(url).contentHash);
+});
+
+test('retained classic imports and bundled modules share the normalized source and live binding', async () => {
+  const f = fixture({
+    'index.html': '<script src="classic.js"></script><script src="raw.js"></script><script type="module" src="main.js"></script>',
+    'classic.js': 'globalThis.frontendClassic=__FRONTEND_DEFINE__;globalThis.lazy=()=>import("./shared.js");',
+    'main.js': 'export {value,bump} from "./shared.js";',
+    'shared.js': 'export let value=__FRONTEND_DEFINE__;export function bump(){value++;}',
+    'raw.js': Buffer.from([47,47,32,255,10]),
+  });
+  const calls = new Map(), built = await buildApplication(f.entry, f.out, {transformModule: frontend(calls)});
+  assert.match(fs.readFileSync(path.join(f.out, 'classic.js'), 'utf8'), /frontendClassic=7/);
+  assert.ok(!fs.readFileSync(path.join(f.out, 'shared.js'), 'utf8').includes('__FRONTEND_DEFINE__'));
+  assert.deepEqual(fs.readFileSync(path.join(f.out, 'raw.js')), fs.readFileSync(path.join(f.source, 'raw.js')),
+    'unchanged retained scripts keep their exact bytes');
+  const main = await import(pathToFileURL(path.join(f.out, built.entryFiles[0])).href);
+  const shared = await import(pathToFileURL(path.join(f.out, 'shared.js')).href);
+  assert.equal(main.value, 7); main.bump(); assert.equal(shared.value, 8);
+  assert.ok([...calls.values()].every(count => count === 1));
+});
+
+test('typed renderer construction keeps pinned Three identities and selects the actual native class', typescript, async () => {
+  const f = fixture({'index.html': '<script type="module" src="./main.ts"></script>',
+    'main.ts': `import * as THREE from 'three/webgpu';
+      const options: {antialias:boolean}={antialias:false};
+      const renderer=new THREE.WebGPURenderer({antialias:false});
+      export const flags=[renderer.isF3DRenderer,renderer.info.f3d?.route,THREE.REVISION];
+      export const Scene=THREE.Scene;export const scene=new THREE.Scene();`});
+  const calls = new Map();
+  const built = await buildApplication(f.entry, f.out, {transformModule: frontend(calls), routeWebGPURenderer: true});
+  assert.equal(built.rendererRoute.routed, true);
+  assert.ok(built.rendererRoute.substitutedModules.some(url => url.endsWith('/build/three.webgpu.js')));
+  const oldDocument = globalThis.document;
+  globalThis.document = {createElementNS: () => ({width: 32, height: 32, style: {}})};
+  try {
+    const app = await import(pathToFileURL(path.join(f.out, built.entryFiles[0])).href);
+    assert.deepEqual(app.flags, [true, 'general-webgpu', '186']);
+    assert.ok(app.scene instanceof app.Scene);
+  } finally {globalThis.document = oldDocument;}
+  assert.ok([...calls.values()].every(count => count === 1));
+  assert.ok(folderBytes(f.root) < 6 * 1024 * 1024, 'single native output budget');
+});
+
+test('a frontend-modified pinned core stays executable and cannot be native-substituted or restored', typescript, async () => {
+  const core = new URL('../../upstream/three.js/build/three.core.js', import.meta.url).href;
+  const f = fixture({'index.html': '<script type="module" src="./main.ts"></script>',
+    'main.ts': `import {WebGPURenderer} from 'three/webgpu';
+      import {frontendMarker} from ${JSON.stringify(core)};
+      if(false)new WebGPURenderer();export const observed:string=frontendMarker;`});
+  const transform = frontend();
+  const built = await buildApplication(f.entry, f.out, {routeWebGPURenderer: true,
+    transformModule(code, meta) {
+      return meta.url === core ? code + '\nexport const frontendMarker="kept actual transformed core";' : transform(code, meta);
+    }});
+  assert.equal(built.rendererRoute.routed, false);
+  assert.equal(built.rendererRoute.reason, 'transformed-three-module');
+  assert.deepEqual(built.rendererRoute.substitutedModules, []);
+  const app = await import(pathToFileURL(path.join(f.out, built.entryFiles[0])).href);
+  assert.equal(app.observed, 'kept actual transformed core');
+  assert.ok(folderBytes(f.root) < 1024 * 1024, 'modified library is tree-shaken without a second native bundle');
+});

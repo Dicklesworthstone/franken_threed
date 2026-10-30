@@ -14,6 +14,7 @@ import {createHash} from 'node:crypto';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
+import {moduleSourcesFor} from './module_sources.mjs';
 
 export class ModuleWorkerBuildError extends Error {
   constructor(code, message, url = null) {
@@ -247,7 +248,9 @@ export function buildWorkerGraph(entryUrl, {
   workerType = 'module',
   resolveModule = resolveLocal, maxModules = 4096, maxAssets = 4096, maxBytes = 64 * 1024 * 1024,
   requireClosedRuntimeUrls = false,
+  transformModule, _moduleSources,
 } = {}) {
+  const moduleSources = moduleSourcesFor({transformModule, _moduleSources});
   if (!['classic', 'module'].includes(workerType)) fail('OPTIONS', 'Expected classic or module workerType');
   if (typeof resolveModule !== 'function' || ![maxModules, maxAssets, maxBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Expected a synchronous resolver and positive graph limits');
@@ -334,7 +337,9 @@ export function buildWorkerGraph(entryUrl, {
   if (entry.external) fail('ENTRY', 'Worker graph entry must be a local file', entryUrl);
   for (let index = 0; index < queue.length; index++) {
     const record = queue[index], bytes = read(record.url);
-    analyzedBytes += bytes.length;
+    const source = record.sourceType === 'json' ? null : moduleSources.read(record.url,
+      {sourceType: record.sourceType, source: bytes}).code;
+    analyzedBytes += source === null ? bytes.length : Buffer.byteLength(source);
     if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
     if (record.sourceType === 'json') {
       // JSON is a native module, not a JavaScript object-literal wrapper. Keep
@@ -344,7 +349,6 @@ export function buildWorkerGraph(entryUrl, {
       record.signature = digest(JSON.stringify([record.key, digest(bytes)]));
       continue;
     }
-    const source = bytes.toString('utf8');
     const ast = parse(source, record.url, record.sourceType), changed = changedGlobals(ast), edits = [];
     const root = roots.get(record.realm);
     record.changed = changed;
@@ -571,6 +575,7 @@ export function buildWorkerGraph(entryUrl, {
 
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
 export function moduleWorkerRollupPlugin(options = {}) {
+  options = {...options, _moduleSources: moduleSourcesFor(options)};
   const emitted = new Map(), references = new Map(), filesByName = new Map();
   const closedRealmEntries = new Set();
   let totalBytes = 0, totalModules = 0, totalAssets = 0;

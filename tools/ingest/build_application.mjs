@@ -45,6 +45,7 @@ import {
 } from "./html_parser.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
+import { moduleSourcesFor } from "./module_sources.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 
@@ -917,6 +918,7 @@ function pathExistsOrSymlink(targetPath) {
  * @param {string} outDir - Destination directory for emitted application (must be fresh)
  * @param {Object} [options]
  * @param {string} [options.packageRootUrl] - Base URL or directory for package fallback
+ * @param {Function} [options.transformModule] - Synchronous project frontend: (source, {url, sourceType}) => code | {code} | null
  * @param {boolean} [options.prepareStandaloneLoaders] - Embed finite pinned-loader resources for a following packHtml call; unknown routes remain networked
  * @returns {Promise<{
  *   entryPoint: string,
@@ -931,6 +933,7 @@ function pathExistsOrSymlink(targetPath) {
  * }>}
  */
 export async function buildApplication(entryPath, outDir, options = {}) {
+  const moduleSources = moduleSourcesFor(options);
   if (!entryPath || typeof entryPath !== "string") {
     throw new Error("buildApplication requires a valid entryPath string");
   }
@@ -1141,8 +1144,15 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         );
       }
 
-      // Copy asset/module into bounded closure targetFiles
-      const assetData = targetFiles.get(relFromEntryDir) || fs.readFileSync(srcAssetAbs);
+      const javascript = item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
+        (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
+      // Retained scripts must use the same frontend output as bundled imports.
+      // URL variants can share a physical output only when their bytes agree.
+      const assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
+        {sourceType: item.isModuleSpecifier ? "module" : "script"}).bytes : fs.readFileSync(srcAssetAbs);
+      const previous = targetFiles.get(relFromEntryDir);
+      if (previous !== undefined && !Buffer.from(previous).equals(assetData))
+        throw new Error(`Source transforms disagree for retained resource ${JSON.stringify(relFromEntryDir)}`);
       targetFiles.set(relFromEntryDir, assetData);
 
       // If asset is a CSS file, scan for transitive child url() and @import resources
@@ -1164,11 +1174,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       // If resource is a module or JS/MJS/CJS file (retained classic script),
       // scan for transitive module dependencies (static/dynamic imports, exports) and asset references
       if (
-        item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
-        (item.isModuleSpecifier ||
-          srcAssetAbs.endsWith(".js") ||
-          srcAssetAbs.endsWith(".mjs") ||
-          srcAssetAbs.endsWith(".cjs")) &&
+        javascript &&
         !visitedJsUrls.has(moduleUrl || pathToFileURL(srcAssetAbs).href)
       ) {
         const fileUrl = moduleUrl || pathToFileURL(srcAssetAbs).href;
@@ -1209,9 +1215,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       ? await decideRendererRoutes(resolvedEntryAbs, options.packageRootUrl, {
           webgpu: Boolean(options.routeWebGPURenderer),
           webgl: Boolean(options.routeWebGLRenderer),
-        })
+        }, moduleSources)
       : null;
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
+    _moduleSources: moduleSources,
     packageRootUrl: options.packageRootUrl,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
@@ -1328,8 +1335,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
  * this route cannot provide. Anything else keeps the retained upstream build
  * unchanged, with the reason recorded.
  */
-async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
-  const graph = await buildModuleGraph(entryAbs, { packageRootUrl });
+async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources) {
+  const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources });
   const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
     generalWebGPUAvailable: enabled.webgpu,
     generalWebGLAvailable: enabled.webgl,
@@ -1349,6 +1356,10 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
   ].filter(Boolean);
   const targets = [];
   const reasons = [];
+  // A frontend may change a library as well as application code. The source
+  // path alone cannot authorize replacing that changed implementation. Keep
+  // the actual normalized library on its ordinary route, including core edits.
+  const changedThree = fileIds.some(id => isInternalLibraryModule(id, packageRootUrl) && moduleSources.changed(id));
   // An explicit source selection can coexist with native sites: the bundler
   // preserves its original constructor call without reading any options first.
   // A native site is still required to prove the global escape/closure guards.
@@ -1368,7 +1379,8 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled) {
     else if (urls.length === 0) reason = gl ? "no-three-module-import" : "no-three-webgpu-import";
     else if (!urls.every((id) => isInternalLibraryModule(id, packageRootUrl)))
       reason = gl ? "unpinned-three-module" : "unpinned-three-webgpu-module";
-    else if (gl && readsGlContextState(graph, entryAbs, packageRootUrl)) reason = "gl-context-state-read";
+    else if (changedThree) reason = "transformed-three-module";
+    else if (gl && readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources)) reason = "gl-context-state-read";
     if (reason) reasons.push(reason);
     else for (const url of urls) targets.push({ url, exportName });
   }
@@ -1388,7 +1400,7 @@ const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttri
 // Fields the routed WebGLRenderer serves truthfully (three_renderer.mjs).
 const SERVED_CAPABILITIES = new Set(["getMaxAnisotropy", "logarithmicDepthBuffer", "reversedDepthBuffer", "precision", "getMaxPrecision", "isWebGL2"]);
 /** True when an application (non-pinned-library) module reads GL-context state. */
-function readsGlContextState(graph, entryAbs, packageRootUrl) {
+function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources) {
   const inline = new Map();
   if (/\.html?$/.test(entryAbs)) {
     const entryUrl = pathToFileURL(entryAbs).href;
@@ -1402,7 +1414,7 @@ function readsGlContextState(graph, entryAbs, packageRootUrl) {
     if (/\/upstream\/three\.js\/(examples\/jsm|src)\//.test(new URL(id).pathname)) continue;
     let ast;
     try {
-      const source = inline.get(id) ?? fs.readFileSync(fileURLToPath(id), "utf8");
+      const source = moduleSources.read(id, {source: inline.get(id)}).code;
       ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
     } catch {
       return true; // Unparseable application code cannot be cleared.
