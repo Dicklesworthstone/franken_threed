@@ -837,6 +837,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           geometryBounds: marchingPlugin.api.getGeometryBoundsReport(),
           matrixMultiplication: marchingPlugin.api.getMatrixMultiplicationReport(),
           quaternionFlat: marchingPlugin.api.getQuaternionFlatReport(),
+          animationInterpolants: marchingPlugin.api.getAnimationInterpolantsReport(),
           transformBatches: marchingPlugin.api.getTransformBatchesReport(),
           eulerUpdates: marchingPlugin.api.getEulerUpdatesReport(),
           instancedMatrixUpdates: marchingPlugin.api.getInstancedMatrixUpdatesReport() },
