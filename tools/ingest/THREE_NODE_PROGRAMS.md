@@ -999,8 +999,35 @@ semantics remain in force.
 Point lights under global VSM keep the source six-face cube comparison filter
 and do not create moment passes. Registered SunLight keeps the source two-tile
 PCF atlas fallback and warning; its source vsmPass is empty. This does not add
-variance filtering to the SunLight atlas. Custom shadow replacement nodes remain
+variance filtering to the SunLight atlas.
+
+The pinned `CSMShadowNode` addon now executes its cascade depth and VSM moment
+passes through the same native owner. Actual source builder ancestry authorizes
+its private Object3D casters under the selected analytic light's shadow graph;
+type flags do not grant that access. Captured caster/shadow identities and the
+pinned camera, material and caster-selection helpers are checked again before
+updates. Source ShadowBaseNode compositions retain their graph construction and
+ordinary node admission; arbitrary backend or replacement caster hooks remain
 outside the admitted profile.
+
+CSM supports uniform, logarithmic, practical and custom splits, faded/standard
+graphs, perspective/orthographic cameras, and Basic/PCF/VSM filtering. Ordinary
+materials select native rendering for the whole CSM scene. The retained root
+fits cascades before its generated ShadowNodes run; public compilation reuses
+the existing source precompilation lifecycle without rendering shadow passes.
+Per-cascade update/freeze flags, callbacks and queued resize generations remain
+with the existing shadow/resource owners.
+
+Ten CSM recording cases in `three_renderer_native_shadows.test.mjs` cover these
+contracts and reject invented ancestry, changed identities and replaced camera
+helpers. `native_csm_shadows.mjs` compares three actual source/candidate browser
+cases: ordinary PCF, faded VSM and orthographic Basic. All 21 checkpoints and
+1,032,192 RGBA bytes match exactly in Chromium 151/SwiftShader, with zero GPU or
+browser errors. Intensity toggles assert visible shadow changes. Browser map
+dimensions stay fixed because the pinned source itself submits a destroyed
+depth image after a live CSM mapSize change in this setup; queued resize
+ownership has separate recording coverage. Construction and camera fitting
+remain source JavaScript; this is native GPU execution without a speedup claim.
 
 `renderer.shadowMap.transmitted = true` now routes ordinary materials through
 the same native shadow owner. Directional and spot receivers sample the source
@@ -1036,8 +1063,8 @@ replacement, callable admission and rejection of generated writes.
 
 Seven focused recording-device cases cover directional and spot moments,
 queued resize/uniform history, explicit disposal, ordinary-material routing,
-side overrides and the Point/Sun fallbacks. Native VSM browser pixels have not
-been compared with the pinned reference.
+side overrides and the Point/Sun fallbacks. The CSM VSM browser comparison above
+does not establish separate spot-light VSM pixel coverage.
 
 ## Native ArrayCamera views
 

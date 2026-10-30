@@ -31,7 +31,7 @@
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
 import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
-import {inspectThreeNativeShadowFilter, installThreeNativeShadowTargets,
+import {inspectThreeNativeShadowFilter, inspectThreeNativeShadowGraph, captureThreeNativeShadowGraphs, installThreeNativeShadowTargets,
   registerThreeNativeShadow, updateThreeNativeShadow, withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
@@ -508,16 +508,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const authored = color ? [sourceId(color), color.getCacheKey()] : null;
       const shadow = light.castShadow && renderer.shadowMap?.enabled === true ? light.shadow : null;
       const filter = shadow ? inspectThreeNativeShadowFilter(shadow) : null;
+      const shadowGraph = shadow ? inspectThreeNativeShadowGraph(three, shadow.shadowNode, light) : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
           ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) ||
-          shadow.shadowNode != null ||
           ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
         fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF/VSM maps');
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
         id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
-        filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null, projected, authored];
+        filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null,
+        shadowGraph ? [sourceId(shadowGraph), shadowGraph.getCacheKey()] : null, projected, authored];
     }));
   }
   function checkAnalyticLight(node, lights) {
@@ -1039,7 +1040,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? prototype === three.BasicLightMapNode.prototype && node.lightMapNode === three.TSL.materialLightMap
       : prototype === three.IrradianceNode.prototype && node.node === three.TSL.materialLightMap;
   }
-  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null) {
+  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null, shadowGraphs = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isComputeNode) { inspectCompute(node); return; }
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
@@ -1103,11 +1104,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (target.targetNode) targets.push(target.targetNode);
       }
     }
-    if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight) {
+    if (node.isLightingNode || node.isLightsNode || node.isLightingContextNode || node.light?.isLight || node instanceof three.ShadowNode) {
       const admitted = lightsNode && (node === lightsNode || sourceMaterialLighting(node, material) ||
         contextLightings?.has(node) && !node.isAnalyticLightNode && !node.light?.isLight ||
         environmentNode && node.constructor === three.EnvironmentNode && node.envNode === environmentNode ||
-        checkAnalyticLight(node, lights) || lights.includes(node.light) && registerThreeNativeShadow(three, renderer, node));
+        checkAnalyticLight(node, lights) || shadowGraphs?.roots.has(node) && !(node instanceof three.ShadowNode) ||
+        (lights.includes(node.light) || shadowGraphs?.children.has(node)) &&
+          registerThreeNativeShadow(three, renderer, node, shadowGraphs?.children.get(node)));
       if (!admitted) fail('LIGHTS', 'Only the captured source scene light and environment context is admitted');
     }
     if (node.isOutputStructNode && Object.getPrototypeOf(node) !== three.OutputStructNode.prototype &&
@@ -1198,6 +1201,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     assertEnvironmentVersion(environment);
     for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
     const builder = new three.WGSLNodeBuilder(object, renderer);
+    const captureShadowGraphs = captureThreeNativeShadowGraphs(three, builder);
     effects.installBuilder(builder);
     installThreeNativeShadowTargets(renderer, builder);
     builder.material = material; builder.context.material = material;
@@ -1258,6 +1262,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const bindings = builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
+    const analyticLightNodes = [...builder.nodes].filter(node => checkAnalyticLight(node, lights));
+    const shadowGraphs = captureShadowGraphs(analyticLightNodes);
     // Explicit contributors and AO/GI hooks share the retained source context.
     // Their generated graphs still pass every ordinary node/resource check.
     const contextLightings = new Set(authoredLightings(authored));
@@ -1271,7 +1277,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     for (const node of builder.nodes) {
       if (!graphicsNode(node)) continue;
-      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings);
+      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings, shadowGraphs);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
     }
     // Producer inspection above registers source-owned pipeline state created
@@ -1416,7 +1422,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
     const uniformNodes = [...graphNodes].filter(nativeUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
-    const analyticLightNodes = [...builder.nodes].filter(node => node.isAnalyticLightNode);
     const attributeNodes = [...graphNodes].filter(node => node instanceof three.BufferAttributeNode && node.attribute);
     const attributeKey = attributeSignature(attributeNodes, object);
     // Instance.js caches derived color/interleaved attributes by the original
@@ -1431,7 +1436,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (descriptor.wireframe) wireframes.register(descriptor, object.geometry,
       generated.length ? generatedAttributes.geometry(descriptor) : object.geometry);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
-    nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes,
+    nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, shadowGraphs,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       transmissionSignature: transmissionSignature(preparedMaterial),
       spriteSignature: spriteSignature(preparedMaterial, object),
@@ -1658,6 +1663,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native light selection, registrations or authored lighting graphs changed; compile the graph again');
     for (const node of state.analyticLightNodes) if (!checkAnalyticLight(node, state.lights))
       fail('LIGHTS', 'Native analytic light identity changed after source construction');
+    for (const [node, light] of state.shadowGraphs.roots) inspectThreeNativeShadowGraph(three, node, light);
   }
   function checkMaterialMaps(state) {
     if (materialMapSignature(state.material) !== state.materialMapSignature)
@@ -1833,8 +1839,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function runBefore(state) {
     for (const node of state.builder.updateBeforeNodes) {
       if (node instanceof three.ShadowNode) {
-        if (!state.lights.includes(node.light)) fail('SHADOW', 'A source shadow node changed its captured light identity');
-        registerThreeNativeShadow(three, renderer, node);
+        const provenance = state.shadowGraphs.children.get(node);
+        if (!state.lights.includes(node.light) && !provenance) fail('SHADOW', 'A source shadow node changed its captured light identity');
+        registerThreeNativeShadow(three, renderer, node, provenance);
         updateThreeNativeShadow(three, renderer, node, frame);
       } else if (node.isPassNode === true) updateThreeNativePass(three, renderer, node, frame);
       else if (node.isComputeNode) {
@@ -1958,7 +1965,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
   const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
-    hasGeometryCompute(descriptor) { return stateOf(descriptor).builder.updateBeforeNodes.some(node => node.isComputeNode); },
+    hasCompilationUpdates(descriptor) {
+      const state = stateOf(descriptor);
+      return state.builder.updateBeforeNodes.some(node => node.isComputeNode ||
+        state.shadowGraphs.roots.has(node) && !(node instanceof three.ShadowNode));
+    },
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
       : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
     attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)

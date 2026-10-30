@@ -19,6 +19,53 @@ export function inspectThreeNativeShadowFilter(shadow) {
   return filter;
 }
 
+/** Authored shadow compositions retain their own graph construction and node
+ * updates. Only the pinned base owns caster selection and shadow materials;
+ * arbitrary renderer/backend hooks do not acquire that privilege here. */
+export function inspectThreeNativeShadowGraph(three, node, light) {
+  if (node == null) return null;
+  const base = three.ShadowBaseNode.prototype;
+  if (!(node instanceof three.ShadowBaseNode) || node.light !== light ||
+      ['getShadowMaterial', 'disposeShadowMaterial', 'getShadowRenderObjectFunction', 'setupShadowPosition']
+        .some(key => node[key] !== base[key]))
+    reject('Authored shadow compositions require a source ShadowBaseNode coupled to their selected light and the pinned caster/material helpers');
+  return node;
+}
+
+/** CSM's private casters are Object3D instances, not scene Light instances.
+ * Record actual source builder ancestry before those ShadowNodes are expanded.
+ * A type/name flag alone never authorizes a virtual caster: its ancestor must
+ * subsequently be the shadow graph selected by an admitted analytic light.
+ * Cached source analytic nodes may retain an earlier authored graph, so use
+ * their actual selected identity rather than the later public shadow slot. */
+export function captureThreeNativeShadowGraphs(three, builder) {
+  const ancestors = new Map(), addChain = builder.addChain;
+  builder.addChain = function(node) {
+    if (node instanceof three.ShadowNode && !(node.light instanceof three.Light)) {
+      let roots = ancestors.get(node);
+      if (!roots) ancestors.set(node, roots = new Set());
+      for (const parent of this.chaining) if (parent instanceof three.ShadowBaseNode && !(parent instanceof three.ShadowNode))
+        roots.add(parent);
+    }
+    return addChain.call(this, node);
+  };
+  return analyticNodes => {
+    const roots = new Map(), children = new Map();
+    for (const analytic of analyticNodes) {
+      const root = analytic.shadowNode;
+      if (root instanceof three.ShadowBaseNode) {
+        inspectThreeNativeShadowGraph(three, root, analytic.light);
+        roots.set(root, analytic.light);
+      }
+    }
+    for (const [node, candidates] of ancestors) {
+      const root = [...candidates].find(candidate => roots.has(candidate));
+      if (root) children.set(node, Object.freeze({root, parentLight: roots.get(root), light: node.light, shadow: node.shadow}));
+    }
+    return {roots, children};
+  };
+}
+
 /** The source cube constructor replaces its color texture without an owner
  * pointer. Register that private target before WGSL asks for its sample layout;
  * capture() records metadata only and observes the final depth attachment later.
@@ -38,7 +85,7 @@ export function installThreeNativeShadowTargets(renderer, builder) {
  * registered SunLight addon does; their constructed graphs are still admitted
  * by the ordinary native compiler and their draws by the native scene capture.
  */
-export function registerThreeNativeShadow(three, renderer, node) {
+export function registerThreeNativeShadow(three, renderer, node, provenance = null) {
   if (!(node instanceof three.ShadowNode)) return false;
   const source = three.ShadowNode.prototype, base = three.ShadowBaseNode.prototype;
   const prototype = Object.getPrototypeOf(node), ordinary = prototype === source;
@@ -46,9 +93,21 @@ export function registerThreeNativeShadow(three, renderer, node) {
     node.shadow?.isPointLightShadow === true;
   const sun = !ordinary && Object.getPrototypeOf(prototype) === source &&
     node.light?.isSunLight === true && node.shadow?.isSunLightShadow === true;
-  if ((!ordinary && !sun && !point) || !(node.light instanceof three.Light) || node.shadow !== node.light.shadow ||
+  const virtual = provenance !== null && ordinary;
+  if (virtual) {
+    inspectThreeNativeShadowGraph(three, provenance.root, provenance.parentLight);
+    if (node.light !== provenance.light || node.shadow !== provenance.shadow ||
+        !(node.light instanceof three.Object3D) || node.light instanceof three.Light ||
+        !(node.light.target instanceof three.Object3D) || provenance.parentLight.constructor !== three.DirectionalLight ||
+        node.shadow?.isDirectionalLightShadow !== true ||
+        Object.getPrototypeOf(Object.getPrototypeOf(node.shadow)) !== three.LightShadow.prototype ||
+        ['updateMatrices', 'getViewportCount', 'getViewport', 'getFrameExtents']
+          .some(key => node.shadow[key] !== three.LightShadow.prototype[key]))
+      reject('Virtual cascade casters require their captured source Object3D, directional shadow and pinned shadow camera lifecycle');
+  }
+  if ((!ordinary && !sun && !point) || !virtual && !(node.light instanceof three.Light) || node.shadow !== node.light.shadow ||
       !(node.shadow instanceof three.LightShadow) || !point && node.shadow.isPointLightShadow ||
-      ordinary && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
+      ordinary && !virtual && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
     reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
   if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type))
     reject('Native shadow maps require Basic, PCF or VSM filtering');

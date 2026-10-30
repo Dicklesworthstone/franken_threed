@@ -8,6 +8,7 @@ import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
+import {CSMShadowNode} from './fixtures/three_csm_shadow.mjs';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
@@ -104,6 +105,139 @@ function recordCompute(device) {
     }, finish() { return [...encoder.finish(), ...passes]; }};
   };
 }
+
+test('pinned CSM renders source virtual cascade casters before their native receiver', async t => {
+  const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 3, maxFar: 20, lightMargin: 2});
+  f.light.shadow.shadowNode = csm;
+  const events = [];
+  f.caster.onBeforeShadow = (_renderer, _object, _camera, shadowCamera) => events.push(shadowCamera);
+  t.after(() => csm.dispose());
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(csm.lights.length, 3); assert.equal(csm._shadowNodes.length, 3);
+  assert.ok(csm.lights.every(light => !light.isLight && light.parent === f.scene && light.target.parent === f.scene));
+  assert.ok(csm.lights.every(light => events.includes(light.shadow.camera)), 'source cascades preserve per-caster callbacks');
+  const receiver = receiverDraws(f.device).at(-1); assert.ok(receiver);
+  const maps = csm._shadowNodes.map(node => node.shadowMap.depthTexture);
+  assert.equal(new Set(maps).size, 3);
+  const depthViews = textureResources(receiver).filter(view => view.texture.format?.startsWith('depth'));
+  assert.equal(new Set(depthViews.map(view => view.texture)).size, 3);
+  const passes = targetPasses(f.device); assert.equal(passes.length, 3);
+  const receiverPass = f.device.passes.findIndex(pass => pass.draws?.some(draw => shader(draw).includes('nativeShadowReceiver')));
+  assert.ok(receiverPass >= 0 && passes.every(pass => f.device.passes.indexOf(pass) < receiverPass));
+  assert.match(shader(receiver), /cascades/); assert.match(shader(receiver), /linearDepth/);
+  assert.equal(f.renderer.info.f3d.route, 'general-webgpu');
+});
+
+test('ordinary source materials select native CSM without an unrelated authored material slot', async t => {
+  const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 2, maxFar: 20, lightMargin: 2});
+  f.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  f.receiver.material = new T.MeshStandardMaterial({color: 0x806040});
+  f.caster.material = new T.MeshBasicMaterial({color: 0xd58142});
+  f.noncaster.material = new T.MeshBasicMaterial({color: 0x4b8abe});
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(targetPasses(f.device).length, 2);
+  const receiver = nativeDraws(f.device).find(draw => shader(draw).includes('cascades'));
+  assert.ok(receiver); assert.equal(f.renderer.info.f3d.route, 'general-webgpu');
+  assert.equal(new Set(textureResources(receiver).filter(view => view.texture.format?.startsWith('depth'))
+    .map(view => view.texture)).size, 2);
+});
+
+for (const [mode, type, fade] of [['uniform', T.BasicShadowMap, false], ['logarithmic', T.PCFShadowMap, true],
+  ['practical', T.VSMShadowMap, false], ['custom', T.PCFShadowMap, true]])
+test(`pinned CSM ${mode} splits retain ${fade ? 'faded' : 'standard'} source graphs and shadow type ${type}`, async t => {
+  const f = fixture(t), calls = [];
+  f.renderer.shadowMap.type = type;
+  const csm = new CSMShadowNode(f.light, {cascades: 2, maxFar: 20, lightMargin: 2, mode,
+    customSplitsCallback(count, near, far, breaks) { calls.push([count, near, far]); breaks.push(.4, 1); }});
+  csm.fade = fade; f.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const receiver = receiverDraws(f.device).at(-1); assert.ok(receiver);
+  assert.equal(csm.breaks.length, 2); assert.equal(csm.breaks[1], 1);
+  if (mode === 'custom') assert.deepEqual(calls, [[2, .1, 20]]);
+  assert.equal(shader(receiver).includes('csmX'), fade);
+  assert.equal(csm._shadowNodes.every(node => node.vsmShadowMapHorizontal !== null), type === T.VSMShadowMap);
+  const sampled = textureResources(receiver).map(view => view.texture).filter(texture => texture.width === 32 && texture.height === 16);
+  assert.equal(new Set(sampled).size, 2, 'each selected cascade keeps its own sampled map');
+  const old = csm.breaks.slice(); f.camera.far = 12; csm.updateFrustums();
+  if (mode !== 'custom') assert.notDeepEqual(csm.breaks, old);
+  f.renderer._nodes.nodeFrame.frameId++;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(receiverDraws(f.device).filter(draw => shader(draw).includes('cascades')).length, 2);
+});
+
+test('CSM compilation and repeated receivers keep source sequential update and freeze semantics', async t => {
+  const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 2, maxFar: 20, lightMargin: 2}), events = [];
+  f.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  const before = csm.updateBefore;
+  csm.updateBefore = function(frame) { events.push(['fit', frame.renderId]); return before.call(this, frame); };
+  const second = new T.Mesh(f.receiver.geometry, f.material); second.receiveShadow = true;
+  second.position.x = .25; f.scene.add(second);
+  f.caster.onBeforeShadow = (_renderer, _object, _camera, camera) => events.push(['caster', camera]);
+  // The pinned compile restores the previous renderId before node updates.
+  // Its initial zero equals NodeFrame's default marker and skips RENDER nodes.
+  f.renderer._nodes.nodeFrame.renderId = 9;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(targetPasses(f.device).length, 0, 'precompilation fits cascades but skips shadow drawing');
+  assert.ok(csm.lights.every(light => light.parent === f.scene));
+  events.length = 0; f.renderer._nodes.nodeFrame.frameId++;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(events.filter(([kind]) => kind === 'fit').length, 1);
+  assert.equal(events[0][0], 'fit'); assert.equal(events.filter(([kind]) => kind === 'caster').length, 2);
+  const passes = targetPasses(f.device).length;
+  for (const light of csm.lights) { light.shadow.autoUpdate = false; light.shadow.needsUpdate = false; }
+  f.caster.position.x += .5; f.renderer._nodes.nodeFrame.frameId++;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(targetPasses(f.device).length, passes, 'CSM fitting does not bypass per-cascade source update flags');
+  csm.lights[1].shadow.needsUpdate = true; f.renderer._nodes.nodeFrame.frameId++;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(targetPasses(f.device).length, passes + 1);
+  csm.dispose(); assert.ok(csm.lights.every(light => light.parent === null && light.target.parent === null));
+});
+
+test('queued CSM resizes retain each cascade generation sampled by its own receiver', async t => {
+  const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 2, maxFar: 20, lightMargin: 2});
+  f.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  await f.renderer.compileAsync(f.scene, f.camera);
+  for (const width of [32, 64, 16]) {
+    for (const light of csm.lights) light.shadow.mapSize.set(width, 16);
+    f.renderer._nodes.nodeFrame.frameId++;
+    f.renderer.render(f.scene, f.camera);
+  }
+  await drain(f.renderer);
+  const receivers = receiverDraws(f.device); assert.equal(receivers.length, 3);
+  assert.deepEqual(receivers.map(draw => textureResources(draw).filter(view => view.texture.format?.startsWith('depth'))
+    .map(view => view.texture.width)), [[32, 32], [64, 64], [16, 16]]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('virtual source shadow nodes need actual authored-graph ancestry and stable caster identities', async t => {
+  const f = fixture(t), fake = new T.Object3D(); fake.target = new T.Object3D(); fake.shadow = f.light.shadow.clone();
+  f.material.colorNode = N.shadow(fake, fake.shadow);
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  assert.equal(nativeDraws(f.device).length, 0);
+  const g = fixture(t), csm = new CSMShadowNode(g.light, {cascades: 2, maxFar: 20, lightMargin: 2});
+  g.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  await g.renderer.compileAsync(g.scene, g.camera);
+  csm._shadowNodes[0].light = new T.Object3D();
+  g.renderer._nodes.nodeFrame.frameId++;
+  await assert.rejects(g.renderer.renderAsync(g.scene, g.camera), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+  assert.equal(nativeDraws(g.device).length, 0);
+});
+
+test('CSM graphs cannot replace native caster selectors or the source directional camera lifecycle', async t => {
+  const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 2});
+  f.light.shadow.shadowNode = csm; t.after(() => csm.dispose());
+  csm.getShadowRenderObjectFunction = () => () => {};
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+  assert.equal(nativeDraws(f.device).length, 0);
+  const g = fixture(t), csm2 = new CSMShadowNode(g.light, {cascades: 2, maxFar: 20, lightMargin: 2});
+  g.light.shadow.shadowNode = csm2; t.after(() => csm2.dispose());
+  await g.renderer.compileAsync(g.scene, g.camera);
+  csm2.lights[0].shadow.updateMatrices = () => {};
+  g.renderer._nodes.nodeFrame.frameId++;
+  await assert.rejects(g.renderer.renderAsync(g.scene, g.camera), {code: 'THREE_NODE_PROGRAM_SHADOW'});
+  assert.equal(nativeDraws(g.device).length, 0);
+});
 
 test('authored sprite casters retain the pinned modern shadow selector and material override', async t => {
   const f = fixture(t), material = new T.SpriteNodeMaterial(), events = [];

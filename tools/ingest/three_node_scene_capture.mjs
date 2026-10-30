@@ -157,12 +157,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // A native shadow receiver must share one shadow owner with every caster and
   // ordinary material in its scene. Keep genuinely fixed-only scenes on their
   // established route; explicit node materials, ShadowMaterial, transmitted
-  // shadows and point-light cubes opt the complete scene into native compilation. Mixed material
+  // shadows, authored shadow graphs and point-light cubes opt the complete scene into native compilation. Mixed material
   // classes then fail at the compiler instead of creating a second shadow map.
   const nativeShadowScene = !shadowPass && renderer?.shadowMap?.enabled === true &&
     [...hierarchy.keys()].some(object => visibility.get(object) && object !== backgroundMesh &&
       ((object.isPointLight === true || object.isLight === true &&
-        (renderer.shadowMap.type === three.VSMShadowMap || renderer.shadowMap.transmitted === true)) &&
+        (renderer.shadowMap.type === three.VSMShadowMap || renderer.shadowMap.transmitted === true || object.shadow?.shadowNode != null)) &&
         object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
@@ -1047,8 +1047,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!uniforms && preparedAttributes === null) {
       preparedAttributes = []; const ready = [];
       for (const binding of preparationBindings) {
-        const compute = updates && programs.hasGeometryCompute?.(binding.nodeProgram);
-        const updateContext = {...frameContext, ...(compute ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
+        const updateNodes = updates && programs.hasCompilationUpdates?.(binding.nodeProgram);
+        const updateContext = {...frameContext, ...(updateNodes ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
           object: binding.object, material: binding.material, clippingContext: binding.clippingContext, captureVertexAttribute,
           captureIndirect: () => captureIndirectUpload(binding.object, binding.geometry),
           ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
@@ -1056,10 +1056,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           // Public source compilation executes before -> geometry -> current;
           // raw graph/pipeline preparation remains inert. Keep the immutable
           // geometry upload before current callbacks can mutate its CPU arrays.
-          const captured = compute ? precompile(() => programs.captureDraw(binding.nodeProgram, updateContext)) : null;
-          const attributes = compute ? captured.attributes : programs.captureAttributes?.(binding.nodeProgram, updateContext);
+          const captured = updateNodes ? precompile(() => programs.captureDraw(binding.nodeProgram, updateContext)) : null;
+          const attributes = updateNodes ? captured.attributes : programs.captureAttributes?.(binding.nodeProgram, updateContext);
           if (attributes) { preparedAttributes.push(attributes); attributes.install(); }
-          const indirect = compute ? captured.indirect : captureIndirectUpload(binding.object, binding.geometry);
+          const indirect = updateNodes ? captured.indirect : captureIndirectUpload(binding.object, binding.geometry);
           if (indirect) preparedIndirectUses.push(indirect.lease);
           if (bundles) {
             const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
@@ -1068,7 +1068,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           } else ready.push(binding);
         });
         preparedBindings = Object.freeze(ready.slice()); dirty = true;
-        if (compute) {
+        if (updateNodes) {
           publishAttributes(); yield; dirty = false;
           // Pinned compileAsync completes this object's pipeline and after
           // callbacks before advancing to the next render object. No await may
@@ -1079,13 +1079,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     if (dirty) { publishAttributes(); yield; }
   }
-  const geometryCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasGeometryCompute?.(binding.nodeProgram));
+  const nodeCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram));
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
     sortObjects, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
     get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() { for (const step of preparationSteps(false)) { /* publish without node updates */ } },
-    ...(geometryCompilation ? {async compileAttributes(prepare) { for (const step of preparationSteps(true)) await prepare(); }} : {}),
+    ...(nodeCompilation ? {async compileAttributes(prepare) { for (const step of preparationSteps(true)) await prepare(); }} : {}),
     installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
     textureOwner, textureUses: Object.freeze(textureUses), storageOwner,
     get storageUses() { return Object.freeze(storageUses.slice()); }});
