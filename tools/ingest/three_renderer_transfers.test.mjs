@@ -378,7 +378,7 @@ test('byte/request admission is shared, bounded and retryable after cancellation
 });
 
 test('a full render FIFO rejects transfers without retaining upload snapshots', async () => {
-  const f = fixture(), r = f.renderer;
+  const f = fixture({maxPendingRenders: 64}), r = f.renderer;
   for (let i = 0; i < 64; i++) r._enqueue({readback: true, issue() {}, resolve() {}, reject() {}});
   await assert.rejects(r.writeRenderTargetPixelsAsync(target(), new Uint8Array(24)), /Too many render operations/);
   counts(r, 0, 0); r.dispose(); f.init.resolve(); await r._drain?.catch(() => {});

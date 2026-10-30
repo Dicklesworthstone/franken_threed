@@ -272,8 +272,36 @@ automatically; disabled or excluded probes retain each request's inactive state.
 Unlit meshes, sprites, lines and points keep their fixed path in mixed scenes,
 and probe children remain independently traversable. Probe-lit shadow receivers
 and casters use the existing shared native shadow owner; skipping a probe in the
-fixed path does not shift another light's shadow index. This does not implement
-light-probe grids or additional custom light models.
+fixed path does not shift another light's shadow index.
+
+The pinned `LightProbeGrid` addon also retains its registered analytic light
+node, packed 3D spherical-harmonic atlas and source FRAME updates. Visible grids
+automatically select native shading for ordinary and Node lit materials. Bounds,
+resolution, intensity and positive falloff changes stay live; atlas replacement,
+first bake and the zero/positive falloff branch rebuild the source graph. Inactive
+and unlit grids do not require registration or hide their ordinary children.
+
+The addon's unmodified `bake(renderer, scene, options)` runs through the owned
+cube, float render-target, 3D slice and texture-copy paths. CubeCamera captures,
+GPU SH projection, padded atlas packing, ranged baking and indirect-pass
+snapshots retain their original order without CPU texture readback. Renderer
+targets, viewport, visibility, XR and scene update controls are restored by the
+source bake. The default 2×2×2 bake issues 84 render operations, so the bounded
+renderer FIFO now admits 1024 pending operations by default. Larger synchronous
+batches can use `createWebGPURendererClass(THREE, {maxPendingRenders: ...})` or the
+source ranged-bake API; independent captured-byte budgets remain enforced.
+`three_node_light_probe_grid.test.mjs` checks source shader equivalence, FRAME
+uniform capture, structural changes, full/ranged GPU command ownership, inactive
+selection and explicit queue-limit refusal. This profile does not implement
+the separate `LightProbeGridWebGL` addon or arbitrary custom lighting models.
+
+The `native_light_probe_grid.mjs` browser comparison exercises complete and
+ranged bakes, indirect-pass atlas snapshots, live grid controls and a later
+rebake with changed incident light. Both scenarios exactly matched pinned r186
+at frames 1, 7, 8, 10, 12, 13 and 30: 344,064 RGBA bytes each, with zero GPU
+validation errors on Chrome 151 software Vulkan. A zero-intensity checkpoint
+verifies that baked irradiance visibly contributes to the final scene. This is
+correctness evidence for the native path, not a hardware performance claim.
 
 Source `RectAreaLight` now uses the pinned `RectAreaLightNode` and LTC lookup
 textures on ordinary and Node Standard/Physical materials. Applications retain
@@ -854,8 +882,8 @@ uniform-only changes retain the program and capture new per-draw values. Nine
 `three_renderer_lights_graph.test.mjs` cases compare source WGSL and queued
 lighting packets, explicit selection and disable flags, shadows and rejection
 of generated unsupported writes. The root composition must retain the pinned
-`LightsNode` methods; custom lighting-manager subclasses and probe grids remain
-separate work. These command/resource checks do not establish pixel parity.
+`LightsNode` methods; custom lighting-manager subclasses remain separate work.
+These command/resource checks do not establish pixel parity.
 
 Graphics and compute share the renderer's existing sampled-texture snapshot
 adapter and upload pool. Each draw leases its post-update texture identities,
@@ -1561,7 +1589,7 @@ struct members, PBO storage and managed uniform arrays remain refused.
 Render-triggered compute beyond the source geometry profile and resource ordering
 boundaries described above is unsupported; generated graphics writes still
 require an explicitly admitted graphics access profile.
-Light-probe grids, other custom light models, custom shadow replacement nodes
+Other custom light models, custom shadow replacement nodes
 and custom lighting-manager subclasses remain missing.
 Media, compressed, depth/comparison, array, volume, storage,
 unfilterable or integer profiles beyond those admitted above still require

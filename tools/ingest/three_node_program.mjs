@@ -18,7 +18,8 @@
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
  * Source Fog/FogExp2 and directional/spot/point Basic/PCF/VSM shadows retain
  * native material composition, including source Point/Sun VSM fallbacks.
- * Registered SunLight cascades retain source nodes and ShadowMaterial receivers. Single-output source
+ * Registered SunLight cascades and LightProbeGrid irradiance retain source nodes
+ * and their update lifecycle; ShadowMaterial retains source receivers. Single-output source
  * RenderPipeline graphs retain their PassNode lifecycle and output context.
  * Named MRT outputs share native attachments and retain source graph construction.
  * ClippingGroup planes retain source union/intersection and alpha-to-coverage
@@ -472,17 +473,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (Native !== builtin) fail('LIGHTS', 'Native built-in lights require their pinned node-library mappings');
       return Native;
     }
-    // Addons such as r186 SunLight register a direct AnalyticLightNode subclass.
-    // Admit that public extension point without cloning the light or replacing
-    // the source analytic node's FRAME lifecycle. Other light models stay gated.
+    // SunLight contributes through setupDirect; LightProbeGrid contributes
+    // irradiance from its atlas through setup and updates its own uniforms.
+    // Both use the source cached AnalyticLightNode and its FRAME scheduling.
     const prototype = Native?.prototype;
     const direct = prototype && Object.getOwnPropertyDescriptor(prototype, 'setupDirect');
+    const grid = light.isLightProbeGrid === true;
+    const methods = grid ? ['constructor', 'setup', 'update'] : ['constructor', 'setupDirect', 'setupShadowNode'];
     if (renderer.library.getLightNodeClass !== three.StandardNodeLibrary.prototype.getLightNodeClass ||
         Object.getPrototypeOf(Source.prototype) !== three.Light.prototype ||
         !prototype || Object.getPrototypeOf(prototype) !== three.AnalyticLightNode.prototype ||
-        prototype.constructor !== Native || typeof direct?.value !== 'function' ||
-        Object.getOwnPropertyNames(prototype).some(key => !['constructor', 'setupDirect', 'setupShadowNode'].includes(key)))
+        prototype.constructor !== Native || (grid
+          ? ['setup', 'update'].some(key => typeof Object.getOwnPropertyDescriptor(prototype, key)?.value !== 'function')
+          : typeof direct?.value !== 'function') ||
+        Object.getOwnPropertyNames(prototype).some(key => !methods.includes(key)))
       fail('LIGHTS', 'Registered native lights require a direct analytic node with the pinned source lifecycle');
+    if (grid && (!(light.boundingBox instanceof three.Box3) || !(light.resolution instanceof three.Vector3) ||
+        light.texture !== null && (inspectTexture(light.texture).viewDimension !== '3d' || integerTextureType(light.texture))))
+      fail('LIGHTS', 'Native probe grids require source bounds, resolution and a floating-point 3D SH atlas');
     return Native;
   }
   function lightSignature(lights) {
@@ -516,11 +524,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
         fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF/VSM maps');
-      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setupDirect),
+      // The grid's setup closes over the atlas identity and its falloff branch.
+      // Bounds, resolution, positive falloff and intensity remain live uniforms.
+      const grid = light.isLightProbeGrid === true ? [light.texture ?
+        [sourceId(light.texture), textureSignature([{value: light.texture}])] : null, light.falloff > 0] : null;
+      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setup), id(Native.prototype.update), id(Native.prototype.setupDirect),
         id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
         filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null,
-        shadowGraph ? [sourceId(shadowGraph), shadowGraph.getCacheKey()] : null, projected, authored];
+        shadowGraph ? [sourceId(shadowGraph), shadowGraph.getCacheKey()] : null, projected, authored, grid];
     }));
   }
   function checkAnalyticLight(node, lights) {
@@ -529,11 +541,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (Object.getPrototypeOf(node) !== Native.prototype) return false;
     if (!lightClasses.has(node.light.constructor)) {
       const source = three.AnalyticLightNode.prototype;
+      const grid = node.light.isLightProbeGrid === true;
       if (node.updateType !== 'frame' || node.updateBeforeType !== 'none' || node.updateAfterType !== 'none' ||
           node.setupDirect !== Native.prototype.setupDirect ||
           ['build', 'setup', 'analyze', 'generate', 'getHash', 'updateReference', 'getUpdateType',
             'getUpdateBeforeType', 'getUpdateAfterType', 'update', 'updateBefore', 'updateAfter']
-            .some(key => node[key] !== source[key]))
+            .some(key => node[key] !== (grid && (key === 'setup' || key === 'update') ? Native.prototype[key] : source[key])))
         fail('LIGHTS', 'Registered analytic nodes must retain the pinned source setup and update lifecycle');
     }
     return true;

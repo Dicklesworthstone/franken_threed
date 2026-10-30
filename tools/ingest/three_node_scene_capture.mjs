@@ -137,11 +137,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // decides each material's contributions; no fixed frame can drop a tail or
   // reinterpret a shadow's index in a partially filtered light list.
   const nativeManyLightScene = !shadowPass && projectedLights.size > 8;
-  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isRectAreaLight === true ||
+  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isLightProbeGrid === true || object.isRectAreaLight === true ||
     authoredLight(object) || nativeManyLightScene && object.isLight === true));
   const selectedLight = object => !shadowPass && renderer?.lighting?.enabled !== false &&
     projectedLights.has(object);
-  const nativeProbeScene = [...nativeLights].some(object => object.isLightProbe === true && selectedLight(object));
+  const nativeProbeScene = [...nativeLights].some(object => (object.isLightProbe === true || object.isLightProbeGrid === true) && selectedLight(object));
   const nativeAreaScene = [...nativeLights].some(object => object.isRectAreaLight === true && selectedLight(object));
   const nativeAuthoredScene = [...nativeLights].some(object => authoredLight(object) && selectedLight(object));
   // Non-PBR lighting models have no rectangular-light contribution, but their

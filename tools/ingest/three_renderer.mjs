@@ -74,7 +74,10 @@ const TONE_MAPPINGS = new Map([[0, 'none'], [1, 'linear'], [2, 'reinhard'], [3, 
 const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth', 'stencil', 'samples', 'forceWebGL',
   'logarithmicDepthBuffer', 'reversedDepthBuffer', 'powerPreference', 'requiredLimits', 'requiredFeatures',
   'device', 'outputBufferType', 'multiview', 'trackTimestamp', 'colorBufferType', 'getFallback', 'context']);
-const MAX_PENDING = 64;
+// Source GPU bakers issue whole batches synchronously before preparation can
+// yield: even LightProbeGrid's default 2x2x2 bake submits 84 render operations.
+// Keep a bounded FIFO; captured uniform/material bytes have separate limits.
+const MAX_PENDING = 1024;
 const MAX_NODE_CAPTURE_BYTES = 64 * 1024 * 1024;
 const MAX_MATERIAL_CAPTURE_VALUES = 1024 * 1024;
 const SOURCE_RENDERER_CONSTRUCTORS = new WeakMap();
@@ -99,9 +102,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       typeof THREE.Vector2 !== 'function') fail('SOURCE', 'Supply the pinned r186 three module namespace');
   if (!classOptions || typeof classOptions !== 'object' || Array.isArray(classOptions)) fail('OPTIONS', 'Expected class options');
   const {gpu: defaultGpu, maxDraws = 16384, maxBindings = 16384, scene: sceneLimits = {}, exactBackend = null,
-    maxTransferBytes = 128 * 1024 * 1024, maxTransfers = 64, targetTextureFlipY = false} = classOptions;
+    maxTransferBytes = 128 * 1024 * 1024, maxTransfers = 64, maxPendingRenders = MAX_PENDING, targetTextureFlipY = false} = classOptions;
   if (![maxTransferBytes, maxTransfers].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Expected positive renderer transfer byte and request limits');
+  if (!Number.isSafeInteger(maxPendingRenders) || maxPendingRenders < 1)
+    fail('OPTIONS', 'Expected a positive pending renderer request limit');
   if (exactBackend !== null && typeof exactBackend !== 'function') fail('OPTIONS', 'exactBackend must be a renderer constructor');
   if (typeof targetTextureFlipY !== 'boolean') fail('OPTIONS', 'Expected a target sampling orientation');
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
@@ -1273,7 +1278,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _enqueue(request) {
       // A later clear is NOT a license to discard an earlier target write,
       // source callback or readback. All destinations share this submission FIFO.
-      if (this._pending.length >= MAX_PENDING) fail('LIMIT', 'Too many render operations are waiting for preparation');
+      if (this._pending.length >= maxPendingRenders) fail('LIMIT', 'Too many render operations are waiting for preparation');
       this._pending.push(request);
       this._startDrain();
     }
