@@ -57,6 +57,69 @@ test('source version increases, partial ranges and DynamicDrawUsage obey one upl
   for (const packet of [first, sameRender, second, decreased, dynamic, repeated, next]) packet.release();
 });
 
+test('selected native inputs leave unused attributes and their pending ranges fresh until first use', t => {
+  const owner = histories(t), source = geometry();
+  const color = new T.BufferAttribute(new Uint8Array([10,20,30,40,50,60,70,80,90]), 3, true);
+  source.setAttribute('color', color); color.addUpdateRange(0, 3); color.needsUpdate = true;
+  const first = owner.capture(source, 1, ['position']);
+  assert.deepEqual(Object.keys(first.geometry.attributes), ['position']);
+  assert.equal(owner.diagnostics.owners, 1); assert.equal(first.bytes, 36);
+  color.array.fill(90); source.attributes.position.array[0] = 7;
+  const second = owner.capture(source, 2, ['position', 'color']);
+  assert.ok(second.geometry.attributes.color.array instanceof Uint8Array);
+  assert.equal(second.geometry.attributes.color.normalized, true);
+  assert.deepEqual([...second.geometry.attributes.color.array], Array(9).fill(90));
+  assert.equal(second.geometry.attributes.position.array[0], 0);
+  assert.deepEqual(color.updateRanges, [{start: 0, count: 3}], 'first upload keeps source ranges');
+  color.array.fill(120); color.needsUpdate = true;
+  const inactive = owner.capture(source, 3, ['position']);
+  assert.deepEqual(color.updateRanges, [{start: 0, count: 3}], 'inactive inputs consume neither versions nor ranges');
+  const active = owner.capture(source, 4, ['position', 'color']);
+  assert.deepEqual([...active.geometry.attributes.color.array], [120,120,120,90,90,90,90,90,90]);
+  assert.deepEqual(color.updateRanges, []);
+  for (const packet of [first, second, inactive, active]) packet.release();
+});
+
+test('a selected interleaved input uploads the whole owner and preserves stale bytes for later views', t => {
+  const owner = histories(t), source = new T.BufferGeometry();
+  const data = new T.InterleavedBuffer(new Float32Array([0,0,0,.25,.5,1,1,0,0,.5,.75,1]), 6);
+  source.setAttribute('position', new T.InterleavedBufferAttribute(data, 3, 0));
+  source.setAttribute('normal', new T.InterleavedBufferAttribute(data, 3, 3));
+  const first = owner.capture(source, 1, ['position']);
+  data.array[3] = 99;
+  const second = owner.capture(source, 2, ['normal']);
+  assert.equal(second.geometry.attributes.position, undefined);
+  assert.equal(second.geometry.attributes.normal.data.array, first.geometry.attributes.position.data.array);
+  assert.equal(second.geometry.attributes.normal.getX(0), .25);
+  assert.equal(second.geometry.vertexCount, 2); assert.equal(second.bytes, data.array.byteLength);
+  assert.equal(owner.diagnostics.owners, 1);
+  first.release(); second.release();
+});
+
+test('vertex-index programs retain source nonindexed draw counts without capturing position bytes', t => {
+  const owner = histories(t), source = geometry(), first = owner.capture(source, 1, []), device = geometryDevice();
+  assert.deepEqual(Object.keys(first.geometry.attributes), []); assert.equal(first.bytes, 0);
+  assert.equal(owner.diagnostics.owners, 0); assert.equal(first.geometry.vertexCount, 3);
+  const gpu = createGpuProgramGeometry(device, first.geometry, [], {attributeTypes: 'webgpu'});
+  t.after(() => gpu.dispose()); assert.equal(programGeometrySnapshot(gpu, device).vertexCount, 3);
+  source.attributes.position.array.fill(7);
+  const selected = owner.capture(source, 2, ['position']);
+  assert.deepEqual([...selected.geometry.attributes.position.array], Array(9).fill(7));
+  first.release(); selected.release();
+});
+
+test('disposing a geometry invalidates shared attributes that were unused by its own shader', t => {
+  const owner = histories(t), a = geometry(), b = geometry();
+  const color = new T.Float32BufferAttribute(Array(9).fill(.25), 3);
+  a.setAttribute('color', color); b.setAttribute('color', color);
+  const first = owner.capture(a, 1, ['position']), shared = owner.capture(b, 1, ['position', 'color']);
+  color.array.fill(.75); a.dispose();
+  const next = owner.capture(b, 2, ['position', 'color']);
+  assert.deepEqual([...shared.geometry.attributes.color.array], Array(9).fill(.25));
+  assert.deepEqual([...next.geometry.attributes.color.array], Array(9).fill(.75));
+  first.release(); shared.release(); next.release();
+});
+
 test('interleaved, integer, index and instance layouts reach the existing GPU geometry owner', t => {
   const owner = histories(t), source = new T.InstancedBufferGeometry();
   const data = new T.InterleavedBuffer(new Float32Array([0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0]), 6);

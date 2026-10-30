@@ -69,11 +69,11 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
       if (!passes.has(passId)) passes.set(passId, {});
       return passes.get(passId);
     },
-    captureGeometry(view, attributes, renderId) {
+    captureGeometry(view, attributes, renderId, inputs = null) {
       // Generated streams install into private views only. Freeze all streams
       // at the same upload boundary, before ordinary NodeFrame updates.
       attributes?.install();
-      return geometry.capture(view, renderId);
+      return geometry.capture(view, renderId, inputs?.map(input => input.name) ?? null);
     },
     commit(selection, draws, version = selection.group.version) {
       const retained = [], undo = [];

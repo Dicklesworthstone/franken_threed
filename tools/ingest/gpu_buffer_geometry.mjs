@@ -483,7 +483,8 @@ function describeProgram(program, attributeTypes) {
     // Programs read morph targets from WebGLMorphtargets' texture, not streams.
     const owners = new Map(), missing = [];
     const instanced = geometry.isInstancedBufferGeometry === true;
-    let vertexCount = attributes.position ? integer(attributes.position.count, 0, 0xffffffff, 'vertex count') : null, instanceCapacity = Infinity;
+    let vertexCount = attributes.position || geometry.vertexCount !== undefined
+      ? integer(attributes.position?.count ?? geometry.vertexCount, 0, 0xffffffff, 'vertex count') : null, instanceCapacity = Infinity;
     for (const a of program) {
       const attribute = attributes[a.name];
       const integerInput = a.scalar !== 'float';

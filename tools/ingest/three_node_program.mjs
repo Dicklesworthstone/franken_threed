@@ -1973,7 +1973,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // subsequently mutates the source geometry. The scene owner owns the
       // geometry/lease snapshot; compilation and shared refresh never invoke it.
       bundleGeometry = context.captureGeometry?.(attributes?.geometry ??
-        (state.generated ? generatedAttributes.geometry(descriptor) : state.geometry), attributes);
+        (state.generated ? generatedAttributes.geometry(descriptor) : state.geometry), attributes, descriptor.attributes);
       const indirect = context.captureIndirect?.() ?? null;
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);

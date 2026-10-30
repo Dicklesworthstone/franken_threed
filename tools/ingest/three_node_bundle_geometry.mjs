@@ -79,11 +79,16 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         attribute.isFloat16BufferAttribute === true, attribute.isInstancedBufferAttribute === true,
         owner.isInstancedInterleavedBuffer === true, owner.meshPerAttribute]};
   }
-  function capture(geometry, renderId) {
+  function capture(geometry, renderId, attributeNames = null) {
     live();
     if (!geometry?.attributes || !Number.isSafeInteger(renderId) || renderId < 0)
       reject('GEOMETRY', 'Bundle geometry capture needs attributes and a logical render id');
-    const selection = Object.entries(geometry.attributes).map(([name, attribute]) => ({name, ...inspect(attribute)}));
+    // Geometries.updateAttributes uploads only the RenderObject's shader inputs.
+    // An unused attribute must remain fresh until its first selected draw; one
+    // selected interleaved view still uploads its complete shared owner.
+    const attributes = attributeNames === null ? Object.entries(geometry.attributes)
+      : [...new Set(attributeNames)].map(name => [name, geometry.attributes[name]]).filter(([, attribute]) => attribute !== undefined);
+    const selection = attributes.map(([name, attribute]) => ({name, ...inspect(attribute)}));
     if (geometry.index) selection.push({name: null, ...inspect(geometry.index)});
     if (selection.some(source => source.gpu && source.name === null))
       reject('ATTRIBUTE', 'Captured node storage views are vertex inputs, not indices');
@@ -126,7 +131,13 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       state = {source, owned: new Set(), latest: null};
       state.onDispose = () => {
         if (state.latest) { dropView(state.latest); state.latest = null; }
-        for (const owner of state.owned) {
+        // Source disposal invalidates every current attribute, even one this
+        // geometry never uploaded but another geometry shares. Inspect only
+        // identities here; unused arrays must not acquire an upload history.
+        const current = Object.values(source.attributes ?? {}).map(attribute =>
+          attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+        if (source.index) current.push(source.index);
+        for (const owner of new Set([...state.owned, ...current])) {
           const record = owners.get(owner); if (!record) continue;
           if (record.generation) { drop(record.generation); record.generation = null; }
           record.version = -1; record.renderId = null; record.geometries.delete(state);
@@ -139,13 +150,16 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     for (const owner of unique.keys()) { state.owned.add(owner); owners.get(owner).geometries.add(state); }
     const selected = selection.map(source => ({...source, generation: source.gpu ? source.attribute : owners.get(source.owner).generation}));
     const range = geometry.drawRange ?? {start: 0, count: Infinity};
+    // A vertex-index shader can omit position while source draw counts still
+    // come from that attribute. Preserve the count without uploading its bytes.
+    const vertexCount = geometry.attributes.position?.count ?? geometry.vertexCount;
     const key = JSON.stringify([selection.map(source => [source.name, ...source.shape]), range.start, range.count,
-      geometry.isInstancedBufferGeometry === true]);
+      geometry.isInstancedBufferGeometry === true, vertexCount]);
     if (state.latest?.key === key && selected.every((source, i) => source.owner === state.latest.selected[i].owner &&
         source.generation === state.latest.selected[i].generation)) return lease(state.latest);
-    const privateOwners = new Map(), attributes = {}; let index = null;
+    const privateOwners = new Map(), capturedAttributes = {}; let index = null;
     for (const source of selected) {
-      if (source.gpu) { attributes[source.name] = source.attribute; continue; }
+      if (source.gpu) { capturedAttributes[source.name] = source.attribute; continue; }
       let owner = privateOwners.get(source.owner);
       if (!owner) {
         const array = source.generation.array, divisor = source.owner.meshPerAttribute ?? 1;
@@ -159,13 +173,13 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       }
       const attribute = source.interleaved ? new three.InterleavedBufferAttribute(owner, source.attribute.itemSize, source.offset, source.attribute.normalized) : owner;
       if (source.interleaved && source.attribute.gpuType !== undefined) attribute.gpuType = source.attribute.gpuType;
-      if (source.name === null) index = attribute; else attributes[source.name] = attribute;
+      if (source.name === null) index = attribute; else capturedAttributes[source.name] = attribute;
     }
     const generations = new Set(selected.filter(source => !source.gpu).map(source => source.generation));
     for (const generation of generations) keep(generation);
     const view = {refs: 1, key, selected, generations,
       bytes: [...generations].reduce((sum, generation) => sum + generation.array.byteLength, 0),
-      geometry: Object.freeze({attributes: Object.freeze(attributes), index, drawRange: Object.freeze({...range}),
+      geometry: Object.freeze({attributes: Object.freeze(capturedAttributes), index, drawRange: Object.freeze({...range}), vertexCount,
         isInstancedBufferGeometry: geometry.isInstancedBufferGeometry === true,
         addEventListener: (...args) => state.source.addEventListener?.(...args),
         removeEventListener: (...args) => state.source.removeEventListener?.(...args)})};

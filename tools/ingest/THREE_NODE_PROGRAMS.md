@@ -983,6 +983,25 @@ valid. Disposed or lost owners cannot publish pending pipelines, including
 programs with no uniform groups. Pending captured bytes share the facade's
 bounded budget and are released when the request finishes.
 
+Geometry upload capture now follows the compiled shader's selected inputs, as
+pinned `RenderObject.getAttributes()` and `Geometries.updateAttributes()` do.
+Unused separate attributes acquire no upload history and consume no pending
+update ranges. Enabling vertex colors after an earlier render or
+`compileAsync()` therefore takes the color attribute's current bytes on its
+first actual use. An active interleaved view still captures its complete backing
+owner, so unversioned edits to another view of that same owner remain stale.
+Source geometry disposal invalidates current shared attributes even when that
+geometry's own shader never selected them; accepted older packets retain their
+bytes until released.
+
+Shaders driven by `vertexIndex` can omit position entirely. Their captured
+geometry retains the source vertex count separately, preserving nonindexed draw
+counts and callback/indirect range checks without uploading unused positions.
+The complete geometry-history owner suite passes thirteen cases, and eighteen
+focused facade/callback cases pass, including queued color first-use after
+render and compilation and an object-hook vertex-index draw. These checks use
+the recording device and do not add a browser-pixel or performance result.
+
 Native object callbacks and scene overrides execute the pinned
 `Renderer.renderObject` lifecycle with an owned draw handler. `onBeforeRender`
 runs before effective shader construction, both alpha sides receive their node

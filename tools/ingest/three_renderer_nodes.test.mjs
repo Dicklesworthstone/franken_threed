@@ -190,6 +190,44 @@ test('native object callbacks preserve prior upload history when hooks are added
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
+for(const firstUse of ['render','compileAsync'])test(`native selected inputs defer inactive color uploads after ${firstUse}`,async t=>{
+  const f=fixture(t),position=f.mesh.geometry.attributes.position,original=position.array.slice();
+  const color=new T.Uint8BufferAttribute(new Uint8Array(position.count*3).fill(64),3,true);
+  f.mesh.geometry.setAttribute('color',color);f.mesh.frustumCulled=false;
+  color.addUpdateRange(0,3);color.needsUpdate=true;
+  await f.renderer.init();
+  if(firstUse==='compileAsync')await f.renderer.compileAsync(f.scene,f.camera);
+  else f.renderer.render(f.scene,f.camera);
+  assert.deepEqual(color.updateRanges,[{start:0,count:3}]);
+  color.array.fill(128);position.array.fill(99);
+  f.material.vertexColors=true;f.material.needsUpdate=true;
+  f.renderer.render(f.scene,f.camera);
+  color.array.fill(0);position.array.fill(-99);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,firstUse==='render'?2:1);
+  const draw=draws.at(-1),stream=name=>{
+    const match=new RegExp('@location\\(\\s*(\\d+)\\s*\\)\\s+'+name+'\\s*:').exec(draw.pipeline.vertex.module.code);
+    assert.ok(match,`source shader input ${name}`);
+    const slot=draw.pipeline.vertex.buffers.findIndex(layout=>layout.attributes.some(a=>a.shaderLocation===Number(match[1])));
+    return draw.contents.get(draw.streams.get(slot));
+  };
+  const bytes=stream('color');
+  assert.deepEqual([...new Float32Array(bytes.buffer,bytes.byteOffset,color.count*3)],Array(color.count*3).fill(Math.fround(128/255)));
+  const positions=stream('position');
+  assert.deepEqual(new Float32Array(positions.buffer,positions.byteOffset,original.length),original);
+  assert.deepEqual(color.updateRanges,[{start:0,count:3}],'first selected upload leaves its initial ranges pending');
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('native vertex-index shaders with object hooks keep nonindexed draw counts without a position upload',async t=>{
+  const f=fixture(t);f.mesh.geometry=f.mesh.geometry.toNonIndexed();f.mesh.frustumCulled=false;
+  f.material.vertexNode=T.TSL.vec4(T.TSL.vertexIndex.toFloat().mul(.25),0,0,1);
+  let callbacks=0;f.mesh.onBeforeRender=()=>{callbacks++;};
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draw=nativeDraws(f.device)[0];assert.equal(draw.indexed,false);assert.equal(draw.args[0],6);
+  assert.equal(draw.streams.size,0);assert.equal(draw.pipeline.vertex.buffers.length,0);
+  assert.equal(callbacks,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('ordinary object hooks capture queued draws and retain upload history after callbacks are removed',async t=>{
   const f=fixture(t),material=new T.MeshBasicMaterial(),companionMaterial=new T.MeshBasicMaterial({color:0xffffff});
   f.mesh.material=material;f.mesh.frustumCulled=false;

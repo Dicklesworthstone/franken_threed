@@ -664,7 +664,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         ...(draw.nodeBundle ? {bundle: draw.binding.bundle, bundleToken: draw.binding.bundleToken,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
-        ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
+        ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs)} : {})};
       if (draw.nodeBundle || updateContext.fogRenderContext !== undefined)
         updateContext.refreshType = programs.refresh(draw.binding.nodeProgram, updateContext);
       // ShadowNode recursively renders here. Keep the complete source before
@@ -715,7 +715,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (draw.hookCapture && !draw.binding.nodeProgram.wireframe && !draw.object.isBatchedMesh) {
         const range = draw.sourceRange, group = draw.sourceGroup;
         const geometry = capturedGeometry ?? draw.geometry;
-        const extent = geometry.index?.count ?? geometry.attributes.position?.count;
+        const extent = geometry.index?.count ?? geometry.attributes.position?.count ?? geometry.vertexCount;
         if (!integer(extent) || !integer(range?.start) || !(range.count === Infinity || integer(range.count)) ||
             group && (!integer(group.start) || !(group.count === Infinity || integer(group.count))))
           fail('GEOMETRY', 'Native callback draw ranges must fit nonnegative source ranges');
@@ -802,7 +802,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
             fail('INDIRECT', 'Indirect draw offsets require aligned, in-bounds 16-byte or indexed 20-byte records');
           const factor = draw.binding.nodeProgram.wireframe ? 2 : 1;
           const range = draw.sourceRange, group = draw.sourceGroup;
-          const extent = index?.count ?? geometry.attributes.position?.count;
+          const extent = index?.count ?? geometry.attributes.position?.count ?? geometry.vertexCount;
           const start = Math.max(range.start, group?.start ?? 0) * factor;
           const end = Math.min(extent, (range.start + range.count) * factor,
             group ? (group.start + group.count) * factor : Infinity);
@@ -1137,7 +1137,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         const updateContext = {...frameContext, ...(updateNodes ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
           object: binding.object, material: binding.material, clippingContext: binding.clippingContext, captureVertexAttribute,
           captureIndirect: () => captureIndirectUpload(binding.object, binding.geometry),
-          ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
+          ...(bundles ? {captureGeometry: (view, attributes, inputs) => bundles.captureGeometry(view, attributes, renderId, inputs)} : {})};
         withBinding(binding, () => {
           // Public source compilation executes before -> geometry -> current;
           // raw graph/pipeline preparation remains inert. Keep the immutable
@@ -1148,7 +1148,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           const indirect = updateNodes ? captured.indirect : captureIndirectUpload(binding.object, binding.geometry);
           if (indirect) preparedIndirectUses.push(indirect.lease);
           if (bundles) {
-            const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
+            const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId, binding.nodeProgram.attributes);
             bundleGeometries.push(lease);
             ready.push(Object.freeze({...binding, programGeometry: lease.geometry}));
           } else ready.push(binding);
