@@ -26,8 +26,9 @@ sample vectors and applicable tangent controls are packed, independent of the
 complete track or public result-buffer length.
 
 Interval searching and cache state, cubic ending settings, action scheduling,
-crossfades, additive blending, loop/finish events and property binding remain in
-the original JavaScript. Source property reads and coercive prefixes keep their
+crossfade control, loop/finish events and property binding remain in the original
+JavaScript. Numeric property accumulation and blending have a separate
+[PropertyMixer route](./PROPERTY_MIXER.md). Source property reads and coercive prefixes keep their
 original order and execute once. A mixer listener may still stop a later action
 within the same update. Public interpolants, methods and result buffers keep
 their identities, names and synchronous behavior.
