@@ -4,6 +4,18 @@
 The ordinary multi-file build is not modified. This is retained-JavaScript
 packaging (F3D-10), not a renderer, compiler specialization or speedup claim.
 
+## Classic-only HTML applications
+
+An HTML application does not need an ESM script entry. With only classic scripts,
+graph ingestion returns an empty ESM root set and the build uses its existing
+retained-script and resource closure. Inline/external scripts keep their original
+global scope, execution attributes and repeated script references. Relative lazy
+module dependencies, stylesheets and their assets are emitted as before. The CLI
+can build and then pack this application without injecting a synthetic module.
+These scripts remain source-owned; an empty module graph claims no renderer
+substitution or numeric specialization. Dedicated workers created by document
+classic scripts still need the existing networked route at this boundary.
+
 ## Project transforms before bundling
 
 The Node build API accepts the project's existing synchronous TypeScript, JSX

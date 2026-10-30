@@ -11,6 +11,7 @@ import {createModuleSources} from './module_sources.mjs';
 import {buildModuleGraph} from './module_graph.mjs';
 import {buildApplication} from './build_application.mjs';
 import {packHtml} from './pack_html.mjs';
+import {parseTagAttributes} from './html_parser.mjs';
 
 const typescript = {skip: typeof nodeModule.stripTypeScriptTypes !== 'function'};
 const data = source => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
@@ -55,6 +56,7 @@ const workerBootstrap = data(`
 `);
 const runner = new URL(data(`
   import fs from 'node:fs';
+  import vm from 'node:vm';
   import {registerHooks} from 'node:module';
   import {parentPort,workerData,Worker} from 'node:worker_threads';
   registerHooks({resolve(specifier,context,next){return next(workerData.imports?.[specifier]??specifier,context);}});
@@ -78,6 +80,11 @@ const runner = new URL(data(`
   WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,
     run(...values){wasmCalls++;return instance.exports.run(...values);}}};};
   try {
+    if(workerData.classicScripts){
+      for(const script of workerData.classicScripts)vm.runInThisContext(script.source,
+        {filename:script.filename,importModuleDynamically:vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER});
+      parentPort.postMessage(await globalThis.runClassic());
+    } else {
     const app=await import(workerData.url);
     if(workerData.nativeModule)parentPort.postMessage(await app.run());
     else {
@@ -86,6 +93,7 @@ const runner = new URL(data(`
       const second=app.run(values), asset=await(await fetch(app.asset)).json();
       const workers=await Promise.all([app.moduleWorker().result,app.classicWorker().result]);
       parentPort.postMessage({first,second,lazy:[left.read(),right.read()],asset,workers,wasmCalls});
+    }
     }
   } finally {await Promise.all(threads.map(thread=>thread.terminate()));}
 `));
@@ -99,6 +107,57 @@ async function execute(input) {
     });
   } finally {clearTimeout(timer); await thread.terminate();}
 }
+
+async function executeClassicDocument(entry) {
+  const html=fs.readFileSync(entry,'utf8'),imports={},classicScripts=[];
+  for(const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)){
+    const attrs=parseTagAttributes(match[1]);
+    if(attrs.type==='importmap'){Object.assign(imports,JSON.parse(match[2]).imports);continue;}
+    if(attrs.type && attrs.type!=='text/javascript')continue;
+    const url=attrs.src?new URL(attrs.src,pathToFileURL(entry)).href:null;
+    const source=url?.startsWith('data:')?Buffer.from(url.slice(url.indexOf(',')+1).split('#')[0],'base64').toString()
+      :url?fs.readFileSync(new URL(url),'utf8'):match[2];
+    classicScripts.push({source,filename:url?.startsWith('file:')?fileURLToPath(url):entry});
+  }
+  return execute({url:pathToFileURL(entry).href,imports,classicScripts});
+}
+
+test('classic-only HTML builds preserve script globals, repeated execution, lazy modules and asset closure',async()=>{
+  const html=`<link rel="stylesheet" href="style.css"><script>const seed=21;globalThis.events=['inline'];</script>
+    <script src="classic.js" data-label="retained"></script><script src="classic.js"></script>
+    <script>globalThis.runClassic=async()=>{const a=await load(),b=await load();
+      return [events,runs,seed,this===globalThis,a===b,a.value,globalThis.evaluations];};</script>`;
+  const f=fixture({'index.html':html,
+    'classic.js':`var runs=(globalThis.runs||0)+1;events.push('external'+runs);var load=()=>import('./lazy.mjs');`,
+    'lazy.mjs':`import {value} from './dependency.mjs';globalThis.evaluations=(globalThis.evaluations||0)+1;export {value};`,
+    'dependency.mjs':'export const value=42;', 'style.css':'body{background:url("./pixel.bin")}',
+    'pixel.bin':Buffer.from([1,2,3,4])});
+  const graph=await buildModuleGraph(f.entry);
+  assert.deepEqual(Object.keys(graph.modules),[]);
+  const built=await buildApplication(f.entry,f.out,{routeWebGPURenderer:true,routeWebGLRenderer:true});
+  assert.deepEqual(built.entryFiles,[]);assert.deepEqual(built.chunks,[]);assert.equal(built.rendererRoute.routed,false);
+  assert.equal(fs.readFileSync(path.join(f.out,'index.html'),'utf8'),html);
+  assert.deepEqual(fs.readFileSync(path.join(f.out,'pixel.bin')),Buffer.from([1,2,3,4]));
+  assert.ok(built.emittedFiles.includes('lazy.mjs')&&built.emittedFiles.includes('dependency.mjs'));
+  const packed=path.join(f.root,'packed.html');packHtml(path.join(f.out,'index.html'),packed);
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  const expected=[['inline','external1','external2'],2,21,true,true,42,1];
+  assert.deepEqual(await executeClassicDocument(path.join(f.out,'index.html')),expected);
+  assert.deepEqual(await executeClassicDocument(packed),expected);
+});
+
+test('classic-only HTML CLI builds and packs without a synthetic module entry',async()=>{
+  const f=fixture({'index.html':'<script src="main.js" async data-original="yes"></script>',
+    'main.js':'globalThis.runClassic=()=>[this===globalThis,42];'});
+  const packed=path.join(f.root,'packed.html');
+  const result=spawnSync(process.execPath,['--max-old-space-size=128',fileURLToPath(new URL('./cli.mjs',import.meta.url)),
+    '--entry',f.entry,'--build-app',f.out,'--pack-html',packed],{encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(fs.readFileSync(path.join(f.out,'index.html'),'utf8'),fs.readFileSync(f.entry,'utf8'));
+  assert.ok(!fs.readFileSync(packed,'utf8').includes('type="module"'));
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  assert.deepEqual(await executeClassicDocument(packed),[true,42]);
+});
 
 test('source snapshots preserve URL/kind identity and reject asynchronous or invalid frontends', async () => {
   const calls = [], sources = createModuleSources((source, meta) => {calls.push(meta); return {code: source + '\n// normalized'};});

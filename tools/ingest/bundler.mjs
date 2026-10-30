@@ -712,16 +712,13 @@ export async function bundleWithRollup(entryPath, options = {}) {
     importMap = parsed.importMap;
     mapBaseUrl = parsed.baseUrl;
 
-    if (parsed.moduleScripts.length === 0) {
-      throw new Error(`No module scripts found in ${entryPath}`);
-    }
-
     // Empty src is a browser script error, never an inline module or an HTML import.
     const localModuleScripts = parsed.moduleScripts.filter(
       (s) => s.src !== "" && !isExternalUrl(s.id),
     );
 
-    // Browser-owned external/empty-src scripts do not emit Rollup chunks.
+    // Classic-only documents use the retained script/resource closure in the
+    // application builder. External and empty-src modules also emit no chunks.
     if (localModuleScripts.length === 0) {
       return {
         code: "",

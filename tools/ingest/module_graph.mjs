@@ -141,9 +141,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
       });
     }
 
-    if (parsedHtml.moduleScripts.length === 0) {
-      throw new Error(`No <script type="module"> entry points found in HTML: "${entryPath}"`);
-    }
+    // Classic-only documents have no ESM roots. Their scripts and resources
+    // remain source-owned and are collected by the application builder.
   } else {
     rootEntryIds.push(entryUrl);
     queue.push({
