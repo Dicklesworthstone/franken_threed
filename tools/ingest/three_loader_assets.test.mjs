@@ -20,6 +20,7 @@ const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
 const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
 const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
 const threeMfUrl = rootUrl + "examples/jsm/loaders/3MFLoader.js";
+const rhinoUrl = rootUrl + "examples/jsm/loaders/3DMLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -351,6 +352,53 @@ test("direct KTX2 requests and parse-time codecs retain paths while empty KTX2 p
   ]);
 });
 
+test("Rhino3DM closes authored and default decoder libraries for loads and runtime parse inputs", () => {
+  const requests = discover(`import { Rhino3dmLoader as CAD } from ${JSON.stringify(rhinoUrl)};
+    import * as Models from ${JSON.stringify(rhinoUrl)};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const loader = new CAD().setLibraryPath('codec-prefix-').setWorkerLimit(1).setSubdivisionLevel(2);
+    loader.setPath('models/'); loader.loadAsync('cad%20%23.3dm?version=2#assembly');
+    loader.parse(bytes, onLoad, onError); loader.parseAsync(otherBytes); loader.dispose();
+    new Models.Rhino3dmLoader().parseAsync(runtimeBytes);
+    const version = next ? 'v2/' : 'v1/';
+    new Addons.Rhino3dmLoader().setLibraryPath('codecs/'+version).decodeObjects(input, '');`);
+  assert.deepEqual(requests.map(request => request.url), [
+    'models/cad%20%23.3dm?version=2#assembly', 'codec-prefix-rhino3dm.js', 'codec-prefix-rhino3dm.wasm',
+    'rhino3dm.js', 'rhino3dm.wasm', 'codecs/v2/rhino3dm.js', 'codecs/v2/rhino3dm.wasm',
+    'codecs/v1/rhino3dm.js', 'codecs/v1/rhino3dm.wasm',
+  ]);
+});
+
+test("Rhino3DM includes finite library changes while loads are pending and keeps unknown libraries on the host route", () => {
+  const requests = discover(`import { Rhino3dmLoader } from ${JSON.stringify(rhinoUrl)};
+    const loader = new Rhino3dmLoader().setLibraryPath('before/');
+    const pending = loader.loadAsync('models/pending.3dm');
+    loader.setLibraryPath('after/');
+    loader.parseAsync(otherBytes);
+    const unknown = new Rhino3dmLoader().setLibraryPath('known/');
+    unknown.load('models/unknown.3dm'); unknown.setLibraryPath(runtimePath);
+    new Rhino3dmLoader().setLibraryPath('unused/');`);
+  assert.deepEqual(requests.map(request => request.url), [
+    'models/pending.3dm', 'models/unknown.3dm',
+    'before/rhino3dm.js', 'before/rhino3dm.wasm', 'after/rhino3dm.js', 'after/rhino3dm.wasm',
+  ]);
+});
+
+test("Rhino3DM custom managers, altered receivers and dynamic paths do not gain asset closure", () => {
+  const requests = discover(`import { Rhino3dmLoader } from ${JSON.stringify(rhinoUrl)};
+    import { Rhino3dmLoader as Foreign } from 'file:///foreign/3DMLoader.js';
+    import { Rhino3dmLoader as Invented } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/Rhino3dmLoader.js')};
+    new Foreign().load('foreign.3dm'); new Invented().load('invented.3dm');
+    new Rhino3dmLoader(manager).setLibraryPath('managed/').load('managed.3dm');
+    new Rhino3dmLoader().setLibraryPath(runtimePath).parseAsync(bytes);
+    const escaped = new Rhino3dmLoader(); customize(escaped); escaped.load('escaped.3dm');
+    const changed = new Rhino3dmLoader(); changed.libraryPath='custom/'; changed.load('changed.3dm');
+    const conditional = new Rhino3dmLoader();
+    if (choose) conditional.setLibraryPath('conditional/'); conditional.load('conditional.3dm');
+    function shadow(Rhino3dmLoader) { new Rhino3dmLoader().load('shadow.3dm'); }`);
+  assert.deepEqual(requests, []);
+});
+
 test("custom managers, unproved receivers, dynamic codec paths and escaping codecs retain their host routes", () => {
   const requests = discover(`import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
     import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
@@ -403,6 +451,29 @@ test("3MF application builds preserve complete source ZIP archives and their log
   const packed = path.join(root, 'packed.html');
   packHtml(path.join(output, 'index.html'), packed);
   assert.ok(fs.statSync(packed).size > archive.length);
+});
+
+test("Rhino3DM builds preserve model, decoder JS and Wasm bytes and pack the source worker", async () => {
+  const model = fs.readFileSync(new URL('../../upstream/three.js/examples/models/3dm/Rhino_Logo.3dm', import.meta.url));
+  const wrapper = '/* Original codec response: </script> */\nvar rhino3dm = function () {};\n';
+  const wasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+  const root = fixture({
+    'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import { Rhino3dmLoader } from ${JSON.stringify(rhinoUrl)};
+      export const load=()=>new Rhino3dmLoader().setLibraryPath('codecs/').setPath('models/')
+        .loadAsync('cad%20%23.3dm?version=2#assembly');`,
+    'models/cad #.3dm': model, 'codecs/rhino3dm.js': wrapper, 'codecs/rhino3dm.wasm': wasm,
+  });
+  const output = path.join(root, 'dist');
+  await buildApplication(path.join(root, 'index.html'), output, {prepareStandaloneLoaders: true});
+  for (const name of ['models/cad #.3dm', 'codecs/rhino3dm.js', 'codecs/rhino3dm.wasm'])
+    assert.deepEqual(fs.readFileSync(path.join(output, name)), fs.readFileSync(path.join(root, name)));
+  const resources = fs.readFileSync(path.join(output, 'f3d-loader-resources.mjs'), 'utf8');
+  assert.ok(resources.includes('models/cad%20%23.3dm?version=2'));
+  for (const bytes of [model, Buffer.from(wrapper), wasm]) assert.ok(resources.includes(bytes.toString('base64')));
+  const packed = path.join(root, 'packed.html');
+  packHtml(path.join(output, 'index.html'), packed);
+  assert.ok(fs.statSync(packed).size > model.length);
 });
 
 for (const encoding of [{binary:false}, {binary:true,version:7400}, {binary:true,version:7500}]) {

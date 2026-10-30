@@ -314,6 +314,39 @@ reports zero external requests or browser errors. This proves retained-loader
 packaging and browser image decoding; it does not claim new GPU execution or a
 decoder speedup.
 
+## Rhino3DM CAD models and runtime decoding
+
+Finite `Rhino3dmLoader` requests from the pinned `3DMLoader.js` module or addon
+aggregate include the original 3DM file and both runtime dependencies,
+`rhino3dm.js` and `rhino3dm.wasm`. `setLibraryPath()` retains its literal prefix
+semantics; the default empty path resolves from the document. Finite library
+changes while a model request is pending are included because the retained loader
+initializes its decoder after the model response arrives. `setPath()`, worker
+limits and subdivision settings keep their source behavior.
+
+The codec is also included for `parse()`, `parseAsync()` and `decodeObjects()`
+with runtime bytes, so an offline application can open models that were not known
+when it was built. Model and decoder bytes are unchanged. The source loader and
+the application's actual rhino3dm library own geometry, curves, SubD processing,
+instance definitions, material/image decoding, document metadata and errors;
+this route does not preconvert the model or replace the CAD engine.
+
+With `prepareStandaloneLoaders`, the exact pinned loader's Blob-worker constructor
+uses the existing native worker forwarding boundary. Worker payload creation,
+Wasm initialization, transferable buffers, task caching, worker pools and disposal
+remain source-owned. Modified or foreign loader source receives no worker hook.
+Custom managers, escaped receivers and unproved library paths retain their host
+routes; a remote library path still requires the corresponding network deployment.
+
+The focused browser comparison uses the source-recommended rhino3dm 8.32.1,
+verified against its original JS and Wasm hashes. It compares the upstream Rhino
+logo's CAD geometry, materials, layers and document metadata with packed offline
+execution after the source and build directories become unavailable. A second
+model, created after packing, exercises runtime mesh/curve parsing, an embedded
+PNG, independent decoders, buffer transfer, malformed input and worker recreation
+after disposal. This is retained CAD/runtime functionality, not Rust ownership or
+renderer acceleration evidence.
+
 ## OBJ material libraries
 
 Finite `MTLLoader.load()` and `loadAsync()` requests include their material

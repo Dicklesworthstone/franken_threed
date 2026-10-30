@@ -26,12 +26,14 @@ const MODULES = new Map([
   ["src/loaders/ImageBitmapLoader.js", "466fc2172c6d1c8d4ee40dc041785a783e09bbef79c3017a945024b8d2166c30"],
   ["examples/jsm/loaders/DRACOLoader.js", "fdafdf4aa11bbc65d89adb338efd844bedf94073702f9049240ff1f1ea48ad5f"],
   ["examples/jsm/loaders/KTX2Loader.js", "3a3233ce3409443076d3414b78832e1405fcfac5ecb34d367365fd0781127d6c"],
+  ["examples/jsm/loaders/3DMLoader.js", "18d44a9b6e28c52f3d2fe8d9706eaffe0342961fde88f73cd497fa673dd8c40a"],
   ["examples/jsm/libs/meshopt_decoder.module.js", "d428e73a000057c6c94bfcedc3412d0c2dc14ca8800e88553aab05113ad2bf19"],
 ]);
 const CLASSES = new Set(["FileLoader", "ImageLoader", "ImageBitmapLoader"]);
 const WORKER_ARGUMENTS = new Map([
   ["examples/jsm/loaders/DRACOLoader.js", "this.workerSourceURL"],
   ["examples/jsm/loaders/KTX2Loader.js", "this.workerSourceURL"],
+  ["examples/jsm/loaders/3DMLoader.js", "this.workerSourceURL"],
   ["examples/jsm/libs/meshopt_decoder.module.js", "url"],
 ]);
 const hash = value => createHash("sha256").update(value).digest("hex");

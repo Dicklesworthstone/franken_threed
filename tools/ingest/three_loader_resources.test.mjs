@@ -489,10 +489,11 @@ test("host-call transformation requires both pinned module identity and exact so
   assert.deepEqual(threeLoaderResourceEdits(shadowed, parse(shadowed, { ecmaVersion: "latest", sourceType: "module" }), core.href), []);
 });
 
-test("only exact pinned Draco, KTX2 and Meshopt source constructors gain the native worker host hook", () => {
+test("only exact pinned Draco, KTX2, Rhino3DM and Meshopt source constructors gain the native worker host hook", () => {
   for (const [file, argument, original] of [
     ["loaders/DRACOLoader.js", "this.workerSourceURL", "new Worker( this.workerSourceURL )"],
     ["loaders/KTX2Loader.js", "this.workerSourceURL", "new Worker( this.workerSourceURL )"],
+    ["loaders/3DMLoader.js", "this.workerSourceURL", "new Worker( this.workerSourceURL )"],
     ["libs/meshopt_decoder.module.js", "url", "new Worker(url)"],
   ]) {
     const url = new URL(`../../upstream/three.js/examples/jsm/${file}`, import.meta.url);

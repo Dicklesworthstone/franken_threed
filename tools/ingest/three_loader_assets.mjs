@@ -33,7 +33,8 @@ const SINGLE_FILE_ADDONS = new Map([
   // their Blob URLs; no ZIP contents are extracted or rewritten by packaging.
   ["ThreeMFLoader", new Set()],
 ]);
-const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"]]);
+const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"], ["Rhino3dmLoader", "3DMLoader.js"]]);
+const RHINO_LIBRARIES = ["rhino3dm.js", "rhino3dm.wasm"];
 const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
   ["MTLLoader", new Set(["setMaterialOptions"])],
@@ -41,6 +42,7 @@ const ADDON_SETTINGS = new Map([
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
+  ["Rhino3dmLoader", new Set(["setLibraryPath", "setWorkerLimit", "setSubdivisionLevel"])],
 ]);
 const ADDON_USES = new Map([
   ["GLTFLoader", new Set(["parse", "parseAsync"])],
@@ -48,6 +50,7 @@ const ADDON_USES = new Map([
   ["KTX2Loader", new Set(["parse", "init", "detectSupportAsync"])],
   ["MTLLoader", new Set(["parse"])],
   ["FBXLoader", new Set(["parse"])],
+  ["Rhino3dmLoader", new Set(["parse", "parseAsync", "decodeObjects"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
 const isSetting = (loader, method) => SETTINGS.has(method) || ADDON_SETTINGS.get(loader)?.has(method);
@@ -289,6 +292,13 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       // ordinary new URL(..., import.meta.url) asset path.
       value.codecUrls = prefixes.filter(Boolean).flatMap(prefix => ["basis_transcoder.js", "basis_transcoder.wasm"].map(name => prefix + name));
       if (value.codecUrls.length > LIMIT) return null;
+    } else if (method === "setLibraryPath") {
+      const prefixes = finite(call.arguments[0]);
+      if (!prefixes) return null;
+      // Rhino's FileLoaders concatenate this prefix; an empty path requests
+      // both libraries from the document, rather than module-relative defaults.
+      value.codecUrls = prefixes.flatMap(prefix => RHINO_LIBRARIES.map(name => prefix + name));
+      if (value.codecUrls.length > LIMIT) return null;
     }
     return value;
   };
@@ -298,7 +308,8 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       // An application-supplied manager can map a logical URL to an unrelated
       // runtime resource. Keep that authored route without assuming disk files.
       return loader && node.arguments.length === 0
-        ? { loader, origin: node, paths: [""], resourcePaths: [""], codecs: new Map(), codecUrls: [] } : null;
+        ? { loader, origin: node, paths: [""], resourcePaths: [""], codecs: new Map(),
+          codecUrls: loader === "Rhino3dmLoader" ? [...RHINO_LIBRARIES] : [] } : null;
     }
     if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee))) {
       const value = instance(node.callee.object, use, active);
@@ -392,10 +403,10 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     return binding?.kind === "const" && !active.has(binding)
       ? instanceOrigin(binding.init, new Set(active).add(binding)) : null;
   };
-  const requests = [], objectLoads = new Map(), materialLoads = new Map(), unresolvedLoads = new Set();
+  const requests = [], objectLoads = new Map(), materialLoads = new Map(), rhinoLoads = new Map(), unresolvedLoads = new Set();
   for (const call of calls) {
     const method = memberName(call.callee);
-    if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile"].includes(method)) continue;
+    if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile", "decodeObjects"].includes(method)) continue;
     const value = instance(call.callee.object, call);
     if (!value) {
       if (["load", "loadAsync"].includes(method)) unresolvedLoads.add(instanceOrigin(call.callee.object));
@@ -438,11 +449,27 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     } else if (!isUse(value.loader, method) && !(value.loader === "DRACOLoader" && method === "preload")) continue;
     const codecs = value.loader === "GLTFLoader"
       ? [...value.codecs.values()].map(node => instance(node, call)).filter(Boolean) : [value];
+    if (value.loader === "Rhino3dmLoader") {
+      // Initialization starts after the model response arrives and remains
+      // cached across loads. Include every finite library selection below,
+      // including a setter that runs while an earlier model is still pending.
+      if (!rhinoLoads.has(value.origin)) rhinoLoads.set(value.origin, { urls: new Set(), unknown: false });
+      for (const url of value.codecUrls) rhinoLoads.get(value.origin).urls.add(url);
+      continue;
+    }
     for (const codec of codecs) for (const url of codec.codecUrls) {
       requests.push({ loader: codec.loader, url, resourcePath: "", path: "", originalUrl: url });
     }
   }
   for (const call of calls) {
+    if (memberName(call.callee) === "setLibraryPath") {
+      const group = rhinoLoads.get(instanceOrigin(call.callee.object));
+      if (group) {
+        const paths = finite(call.arguments[0]);
+        if (!paths) group.unknown = true;
+        else for (const prefix of paths) for (const name of RHINO_LIBRARIES) group.urls.add(prefix + name);
+      }
+    }
     if (memberName(call.callee) !== "setResourcePath") continue;
     const origin = instanceOrigin(call.callee.object);
     const paths = finite(call.arguments[0]);
@@ -459,6 +486,10 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   for (const group of materialLoads.values()) {
     for (const request of group.requests) request.texturePaths = group.unknown || group.paths.size > LIMIT
       ? null : [...new Set([...group.paths].map(prefix => prefix || request.path || extractUrlBase(request.originalUrl)))];
+  }
+  for (const group of rhinoLoads.values()) {
+    if (group.unknown || group.urls.size > LIMIT) continue;
+    for (const url of group.urls) requests.push({ loader: "Rhino3dmLoader", url, resourcePath: "", path: "", originalUrl: url });
   }
   return requests;
 }
