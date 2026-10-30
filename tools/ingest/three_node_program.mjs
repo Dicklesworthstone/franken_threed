@@ -13,7 +13,7 @@
  * sampled 2D/data-array/3D/cube textures, native cube render-target color,
  * GPU-authored 2D/array/3D storage inputs, including lossless signed/unsigned texel loads,
  * target-owned depth comparisons and read-only
- * scalar/vector/mat4 or flat-struct storage buffers.
+ * scalar/vector/matrix or flat-struct storage buffers.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
  * Source Fog/FogExp2 and directional/spot/point Basic/PCF/VSM shadows retain
@@ -298,11 +298,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const atomic = node.isAtomic === true;
     if (atomic && (struct || !['int', 'uint'].includes(node.nodeType)))
       fail('STORAGE', 'Native fragment atomics require scalar signed or unsigned 32-bit storage');
-    const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat4))$/.exec(node.nodeType ?? '');
-    const components = type?.[3] === 'mat4' ? 16 : type?.[2] ? Number(type[2]) : 1;
+    const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat[234]))$/.exec(node.nodeType ?? '');
+    const matrix = /^mat([234])$/.exec(node.nodeType ?? '')?.[1];
+    const components = matrix ? Number(matrix) ** 2 : type?.[2] ? Number(type[2]) : 1;
     const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
       : type?.[1] === 'u' || type?.[3] === 'uint' ? Uint32Array : Float32Array;
-    let stride = components === 3 ? 4 : components;
+    // Storage matrices use aligned column vectors: mat2 is four words, mat3
+    // is twelve (three padded vec3 columns), and mat4 is sixteen. The source
+    // attribute uploader only pads itemSize=3, not a packed nine-word mat3;
+    // require the authored matrix stride rather than rewriting its CPU bytes.
+    let stride = matrix === '3' ? 12 : components === 3 ? 4 : components;
     if (struct) {
       if (node.nodeType !== 'struct' || struct.isStructTypeNode !== true ||
           !Array.isArray(struct.membersLayout) || !struct.membersLayout.length || struct.membersLayout.length > maxNodes ||
@@ -321,10 +326,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         attribute.isInterleavedBufferAttribute || attribute.normalized ||
         !(struct ? [Float32Array, Int32Array, Uint32Array].some(Type => attribute.array instanceof Type) : attribute.array instanceof scalar) ||
         !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
-        !(struct ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
+        !(struct || matrix ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
-      fail('STORAGE', 'Native storage requires matching scalar/vector/mat4 or flat-struct 32-bit attributes; atomics require scalar integers');
+      fail('STORAGE', 'Native storage requires matching scalar/vector/matrix or flat-struct 32-bit attributes; mat3 columns require padding and atomics require scalar integers');
     if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
       fail('HOOK', 'Native shader storage requires the source upload callback');
     const bytes = attribute.count * stride * 4;

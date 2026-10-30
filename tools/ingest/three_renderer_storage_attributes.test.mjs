@@ -50,6 +50,90 @@ const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.
 const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
 const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
 
+const matrixGraph = (storage, dimension) => {
+  const matrix = storage.element(N.instanceIndex);
+  if (dimension === 2) return N.vec3(matrix.mul(N.positionLocal.xy), N.positionLocal.z);
+  if (dimension === 3) return matrix.mul(N.positionLocal);
+  return matrix.mul(N.vec4(N.positionLocal, 1)).xyz;
+};
+const matrixColor = (storage, dimension) => {
+  const matrix = storage.element(0);
+  if (dimension === 2) return N.vec3(matrix.mul(N.vec2(.5, .25)), .5);
+  return matrix.mul(dimension === 3 ? N.vec3(.5, .25, .5) : N.vec4(.5, .25, .5, 1)).xyz;
+};
+
+for (const dimension of [2, 3, 4]) test(`standalone mat${dimension} storage shares source-aligned compute and graphics bytes`, async t => {
+  const f = fixture(t), stride = dimension === 3 ? 12 : dimension ** 2;
+  const attribute = new T.StorageBufferAttribute(new Float32Array(2 * stride).fill(.125), stride);
+  const storage = N.storage(attribute, `mat${dimension}`, 2), original = attribute.array;
+  // Padding is storage too: keep its original bit pattern through capture and
+  // reuse instead of rebuilding matrices from individual JavaScript numbers.
+  const raw = new Uint32Array(original.buffer); if (dimension === 3) raw[3] = 0x7fc01234;
+  const initial = raw.slice(), generated = raw.slice();
+  new Float32Array(generated.buffer)[0] = .75;
+  f.mesh.count = 2; f.material.positionNode = matrixGraph(storage, dimension);
+  f.material.colorNode = matrixColor(storage, dimension);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).assign(N[`mat${dimension}`](1)); })().compute(2, [2]);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => { new Uint32Array(computeStorage(pass)[0].data).set(generated); };
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const selected = draws(f.device); assert.equal(selected.length, 1);
+  assert.ok(shaderStorage(selected[0]).includes(buffer));
+  assert.deepEqual(words(selected[0], buffer, Uint32Array), [...generated]);
+  assert.deepEqual([...raw], [...initial]);
+  assert.equal(attribute.array, original); assert.equal(attribute.itemSize, stride); assert.equal(attribute.count, 2);
+  assert.equal(buffer.size, stride * 2 * 4);
+  const descriptor = selected[0].pipeline;
+  assert.match(descriptor.vertex.module.code, new RegExp(`array< mat${dimension}x${dimension}<f32>`));
+  assert.match(descriptor.fragment.module.code, new RegExp(`array< mat${dimension}x${dimension}<f32>`));
+  assert.match(descriptor.fragment.module.code, /var<storage, read>/);
+  assert.match(f.device.computePasses[0].pipeline.compute.module.code, /var<storage, read_write>/);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(words(draws(f.device)[1], buffer, Uint32Array), [...generated]);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 1);
+  f.renderer.dispose(); assert.equal(buffer.destroyed, true);
+});
+
+test('queued padded mat3 draws preserve partial host updates and untouched GPU-produced columns', async t => {
+  const f = fixture(t), attribute = new T.StorageBufferAttribute(new Float32Array(24).fill(.125), 12);
+  const storage = N.storage(attribute, 'mat3', 2);
+  f.material.positionNode = matrixGraph(storage, 3); f.material.colorNode = matrixColor(storage, 3);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).assign(N.mat3(1)); })().compute(2, [2]);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => { new Float32Array(computeStorage(pass)[0].data).fill(.5); };
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99); attribute.array[4] = .75; attribute.addUpdateRange(4, 1); attribute.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  attribute.clearUpdateRanges();
+  attribute.array.fill(99); attribute.array[12] = .25; attribute.addUpdateRange(12, 1); attribute.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera); attribute.array.fill(99);
+  await drain(f.renderer);
+  const observed = draws(f.device).map(draw => words(draw, buffer));
+  assert.equal(observed.length, 3);
+  assert.deepEqual(observed.map(values => [values[0], values[4], values[12], values[15]]),
+    [[.5, .5, .5, .5], [.5, .75, .5, .5], [.5, .75, .25, .5]]);
+  const writes = f.device.writes.filter(write => write.buffer === buffer);
+  assert.deepEqual(writes.map(write => [write.offset, write.input.byteLength]), [[0, 96], [16, 4], [48, 4]]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const profile of ['packed mat3', 'integer matrix', 'atomic matrix']) test(`${profile} refuses before native storage effects`, async t => {
+  const f = fixture(t), stride = profile === 'packed mat3' ? 9 : 12;
+  const array = profile === 'integer matrix' ? new Uint32Array(24) : new Float32Array(stride * 2);
+  const storage = N.storage(new T.StorageBufferAttribute(array, stride), 'mat3', 2);
+  if (profile === 'atomic matrix') storage.toAtomic();
+  f.material.positionNode = matrixGraph(storage, 3); f.material.colorNode = matrixColor(storage, 3);
+  await f.renderer.init();
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length, 0);
+  assert.equal(draws(f.device).length, 0);
+});
+
 test('compute-authored sprites draw their full source count from one shared instanced allocation', async t => {
   const f = fixture(t), positions = N.instancedArray(200000, 'vec3');
   const material = new T.SpriteNodeMaterial();

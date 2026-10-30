@@ -533,7 +533,11 @@ Authored `storage(attribute, type, count).element(index)` reads in vertex and
 fragment graphs share the renderer's compute allocation. Float32, Int32 and
 Uint32 scalar/vector `StorageBufferAttribute` and
 `StorageInstancedBufferAttribute` arrays are admitted, including source vec3
-padding. Standalone Float32 `mat4` storage arrays use a 16-word stride. Flat
+padding. Standalone Float32 `mat2`, `mat3` and `mat4` storage arrays use 4-, 12-
+and 16-word strides. A `mat3` requires three authored padded columns; packed
+nine-word matrices are not silently repacked. Compute-produced matrices share
+the same GPU allocation with vertex and fragment consumers, including queued
+partial host uploads. Flat
 non-atomic `struct()` records also work with scalar/vector 32-bit
 members and `mat2`, `mat3` or `mat4` fields. The pinned `StructTypeNode` defines
 their padded stride; mixed integer/float backing bytes and matrix-column padding
@@ -1360,7 +1364,7 @@ for those scenes; they do not measure hardware acceleration.
 
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
 graphics writes, atomics outside the scalar integer fragment profile above,
-standalone `mat2`/`mat3` storage arrays, nested/boolean/atomic
+matrix storage outside the padded Float32 profile, nested/boolean/atomic
 struct members, PBO storage, managed uniform arrays, compute nodes inside
 graphics graphs and multiple-render-target graphics graphs are refused.
 Light-probe grids, other custom light models, custom shadow replacement nodes
