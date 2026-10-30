@@ -48,6 +48,7 @@ import {createThreeNodePrograms} from './three_node_program.mjs';
 import {inspectThreeMRT} from './three_node_passes.mjs';
 import {captureThreeNodeScene} from './three_node_scene_capture.mjs';
 import {createThreeNodeBundles} from './three_node_bundles.mjs';
+import {createThreeOcclusionQueries} from './three_occlusion_queries.mjs';
 import {assertThreeNativeTargetWrite, captureThreeShadowMaterialState} from './three_node_shadows.mjs';
 import {createThreeNodeBackgrounds} from './three_node_background.mjs';
 import {createThreeSceneRaster} from './three_scene_raster.mjs';
@@ -357,6 +358,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeBackgrounds = null;
       this._nodeBundles = null;
       this._nodeCaptureDepth = 0;
+      this._occlusionContext = null;
+      this._occlusionContexts = new WeakMap();
+      this._occlusionObjects = new WeakSet();
       this._nodeCaptureBytes = 0;
       this._materialCaptureValues = 0;
       this._nodeRaster = new Map();
@@ -501,6 +505,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeProgramSupport?.dispose();
       this._nodeProgramSupport = null;
       this._nodeBundles?.dispose(); this._nodeBundles = null;
+      this._occlusionQueries?.dispose();
       this._canvasTarget?.dispose();
       if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
     }
@@ -847,6 +852,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return this._renderCall(scene, camera);
     }
     _beforeRender() {}
+    isOccluded(object) { return this._occlusionContext && this._occlusionContext.occluded?.has(object); }
     getRenderObjectFunction() { return this._renderObjectFunction; }
     setRenderObjectFunction(value) {
       if (value !== null && typeof value !== 'function') fail('SOURCE', 'A render object function must be callable or null');
@@ -1073,6 +1079,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const previousOutput = outputTransform ? {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
         outputColorSpace: this.outputColorSpace} : null;
       let captured;
+      const previousOcclusion = this._occlusionContext;
       const bundleDepth = this._nodeCaptureDepth++;
       try {
         // Direct default output and clear() output quads leave the source's
@@ -1087,6 +1094,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           this.getCanvasTarget(); this._frameBufferTargets ??= new Map();
           this._renderTarget = THREE.Renderer.prototype._getFrameBufferTarget.call(this);
         }
+        const queries = this._occlusionQueries ??= createThreeOcclusionQueries({getDevice: () => this._device,
+          maxQueries: maxDraws, maxContexts: maxBindings, fail});
+        this._occlusionContext = queries.context(destination === this ? this._renderTarget : target, mrt,
+          captureCameras ? bundleDepth : 0);
         captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId,
           bundles: this._nodeBundles ??= createThreeNodeBundles(THREE, {maxEntries: maxDraws, fail}),
           bundleDepth,
@@ -1099,8 +1110,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           },
           maxNodes: sceneLimits.maxNodes ?? 16384, maxDraws, uniforms: captureCameras,
           maxUniformBytes: MAX_NODE_CAPTURE_BYTES - this._nodeCaptureBytes});
+        if (captured) this._occlusionContexts.set(captured, this._occlusionContext);
       } finally {
         this._nodeCaptureDepth--;
+        this._occlusionContext = previousOcclusion;
         this._renderTarget = previousTarget; this._mrt = previousMRT;
         if (restoreCanvas) this._canvases.select(previousCanvas);
         if (previousOutput) Object.assign(this, previousOutput);
@@ -1165,6 +1178,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         entry.bridge.assertNativePrepared(nodeFrame);
       }
       const previous = this._programFrame;
+      const occlusion = nodeFrame && !clearOnly ? this._occlusionQueries?.begin(this._occlusionContexts.get(nodeFrame),
+        {requested: nodeFrame.occlusionRequested, arrayCamera: camera.isArrayCamera === true && camera.cameras.length > 0}) : null;
+      if (occlusion) frame = {...frame, occlusion};
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : undefined;
@@ -1204,7 +1220,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           textures.validateDispatch(nodeFrame.textureUses);
           textures.withDispatch(nodeFrame.textureUses, readStorage);
         } else readStorage();
-      } finally { this._programFrame = previous; }
+        occlusion?.commit();
+      } catch (error) { occlusion?.cancel(); throw error; }
+      finally { this._programFrame = previous; }
       if (initializeOutputDepth) this._targetDepthInitialized.add(initializeOutputDepth);
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -1429,6 +1447,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       await this._canvases.whenIdle();
       await this._transfers.whenIdle();
       await this._targets.whenIdle();
+      await this._occlusionQueries?.whenIdle();
     }
 
     // ---- animation loop (source Animation semantics: callback(time, xrFrame)) ----
@@ -1526,6 +1545,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._disposed) return;
       this.setAnimationLoop(null);
       this._disposed = true;
+      this._occlusionQueries?.dispose();
       if (this._animationStarted) {
         this._animationStarted = false;
         if (this._animationHandle !== null) this._animationHost?.cancelAnimationFrame?.(this._animationHandle);

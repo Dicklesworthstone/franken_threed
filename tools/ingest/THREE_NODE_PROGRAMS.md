@@ -12,6 +12,42 @@ acceleration or a Rust implementation of node evaluation.
 
 ## Implemented graph surface
 
+### Native occlusion queries
+
+Objects with `occlusionTest = true` now issue GPU occlusion queries through the
+owned native renderer. `renderer.isOccluded(object)` preserves the source API:
+`null` outside an active render, `undefined` before results arrive, then a
+boolean during object or node callbacks. Finishing the next render with the
+same source context starts mapping the previous query frame. `waitForGPU()`
+waits for mappings already started; it does not publish the latest frame early.
+
+Contexts follow the pinned attachment signature, MRT identity and nesting depth.
+Different scenes, cameras and equally configured targets share history as they
+do in r186. Material groups and BatchedMesh subdraws share their object's query.
+Internal command bundles execute inside the appropriate query spans, keeping
+separate objects' results even when their drawing state is compatible. Queued
+requests retain the accepted flags and object identities. Disabling the last
+query retains its object's callback path and completed result history. Compilation
+runs its source callbacks without submitting or advancing query history.
+
+The source ArrayCamera branch does not encode object queries, and source
+BundleGroup draws retain its warning and query omission. Requested empty frames
+still resolve unused query slots so their empty result keeps a real GPU mapping
+boundary. Disposal, device loss and failed mapping retire owned buffers/query
+sets and prevent delayed result publication. Nested object-hook GPU writes keep
+their existing separate-pass requirement; admitted nested node passes restore
+the enclosing context. Copies inside an active query remain an unverified
+source combination.
+
+The three `native_occlusion.mjs` browser cases compare actual visible/hidden
+geometry, grouped and batched objects, moving occluders, shared target history
+and ArrayCamera's unused-query behavior. Observed callback results are also
+rendered into comparison pixels. Chrome 151.0.7922.34 / SwiftShader matches all
+1,032,192 RGBA bytes at twenty-one checkpoints with zero GPU errors. Hardware
+performance remains unmeasured.
+
+### Materials and node graphs
+
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 `MeshPhongMaterial`, `MeshStandardMaterial`, `MeshPhysicalMaterial`,
 `MeshNormalMaterial`, `MeshMatcapMaterial`, `SpriteMaterial`, `PointsMaterial`,

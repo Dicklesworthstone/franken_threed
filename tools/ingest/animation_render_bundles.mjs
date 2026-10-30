@@ -230,16 +230,24 @@ function samePassState(a, b) {
  * identical bundles; changing run boundaries creates bounded new schedules.
  */
 export function encodeAnimationRenderSpans(pass, commands, length, parameters, cache = null) {
-  let calls = 0;
+  let calls = 0, activeQuery = null;
+  const queryIndices = parameters.queryIndices;
   for (let start = 0; start < length;) {
     const command = commands[start];
+    const query = queryIndices?.[start] ?? null;
+    if (query !== activeQuery) {
+      if (activeQuery !== null) pass.endOcclusionQuery();
+      if (query !== null) pass.beginOcclusionQuery(query);
+      activeQuery = query;
+    }
     let end = start + 1;
-    while (end < length && samePassState(command, commands[end])) end++;
+    while (end < length && samePassState(command, commands[end]) && (queryIndices?.[end] ?? null) === query) end++;
     if (command.blendConstant != null) pass.setBlendConstant(command.blendConstant);
     if (command.stencilReference != null) pass.setStencilReference(command.stencilReference);
     calls += cache ? cache.execute(pass, commands, end - start, parameters.lightGroup, start)
       : encodeAnimationDraws(pass, commands, end - start, {...parameters, start});
     start = end;
   }
+  if (activeQuery !== null) pass.endOcclusionQuery();
   return calls;
 }

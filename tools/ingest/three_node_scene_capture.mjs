@@ -180,7 +180,17 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeWideLineScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.layers.test(camera.layers) && (Array.isArray(object.material) ? object.material : [object.material])
       .some(material => material?.visible !== false && material && Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype));
-  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene
+  // Occlusion results are read during source callbacks. Capture the complete
+  // ordered scene so tested and ordinary companions share that boundary.
+  let nativeOcclusionScene = false;
+  for (const object of hierarchy.keys()) if (visibility.get(object) && object.layers.test(camera.layers)) {
+    if (object.occlusionTest === true) {
+      renderer?._occlusionObjects?.add(object); nativeOcclusionScene = true;
+    } else if (renderer?._occlusionObjects?.has(object)) nativeOcclusionScene = true;
+  }
+  // Once queried, an object's callbacks may keep observing its last completed
+  // result after the application disables queries. Retain that capture route.
+  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeOcclusionScene
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -421,6 +431,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   if (nativeLifecycle && fixedDrawCandidates)
     fail('HOOK', 'Object callbacks in mixed fixed/native lists require one shared source draw capture');
+  // RenderList counts requests during projection, before object/node updates
+  // and independently of the renderer's opaque/transparent phase switches.
+  const occlusionRequested = draws.some(draw => draw.object.occlusionTest === true);
   // The source projects lights for compileAsync as well as rendering. Keep the
   // selected source objects (including LOD visibility), not packed radiance;
   // its shared LightsNode/NodeFrame own light uniforms and update frequencies.
@@ -760,6 +773,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         }));
       }
       copies = afterCopies;
+      draw.occlusionTest = draw.object.occlusionTest === true;
+      if (draw.nodeBundle && !draw.bundleWarm && draw.occlusionTest && !(camera.isArrayCamera && camera.cameras.length))
+        three.warnOnce('WebGPUBackend: Occlusion queries can not be recorded into render bundles.');
       programs.after(draw.binding.nodeProgram, updateContext);
       draw.nodeFramebufferCopies = Object.freeze(beforeCopies);
       draw.nodeFramebufferAfterCopies = Object.freeze(afterCopies);
@@ -987,7 +1003,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const acceptedBindings = Object.freeze([...compiledBindings]);
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
-    sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases),
+    sortObjects, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
     get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
     prepareAttributes() {
       if (!uniforms) {

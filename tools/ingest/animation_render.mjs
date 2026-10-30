@@ -2562,6 +2562,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           "fog",
           "renderBundles",
           "clippingPlanes",
+          "occlusion",
         ],
         "frame",
       );
@@ -2984,8 +2985,10 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
             depth: depthFormat && depthLoadOp === "clear" ? clearDepth : null, stencil: stencilAttachment && stencilLoadOp === "clear" ? clearStencil : null});
           clearPass.end();
         }
+        const queryPlan = frame.occlusion?.session.plan(frame.occlusion.objects, commands, draws.length);
         const pass = encoder.beginRenderPass({
           label,
+          ...(queryPlan ? {occlusionQuerySet: queryPlan.querySet} : {}),
           colorAttachments: colorViews.map((view, index) => ({view,
             ...(depthSlice === undefined ? {} : {depthSlice}),
             ...(resolveTargets[index] ? {resolveTarget: resolveTargets[index]} : {}),
@@ -3009,9 +3012,10 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         // Bundle keys record structural inputs only. All live uniform/geometry
         // updates and immediate queue submission below remain unchanged.
         submittedDrawCalls = encodeAnimationRenderSpans(pass, commands, draws.length, {
-          bindGroup, lightGroup: frameLightGroup, stride, instancing,
+          bindGroup, lightGroup: frameLightGroup, stride, instancing, queryIndices: queryPlan?.indices,
         }, useBundles ? bundleCache : null);
         pass.end();
+        queryPlan?.resolve(encoder);
         const command = encoder.finish();
         if (draws.length)
           device.queue.writeBuffer(

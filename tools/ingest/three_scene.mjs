@@ -1482,11 +1482,12 @@ export async function createGpuThreeScene(device,scene,{
       programTargetSize=frame.targetSize??null;
       programViewportSize=frame.viewportSize??null;
       const arrayProfile=frame.arrayCamera??{};
-      if(['targetSize','viewportSize','arrayCamera'].some(key=>Object.hasOwn(frame,key))){
+      const occlusion=frame.occlusion??null;
+      if(['targetSize','viewportSize','arrayCamera','occlusion'].some(key=>Object.hasOwn(frame,key))){
         // Keep canvas attachment getters lazy until preparation checks pass.
         // Spreading here acquires an image even when this draw must be deferred.
         const descriptors=Object.getOwnPropertyDescriptors(frame);
-        delete descriptors.targetSize;delete descriptors.viewportSize;delete descriptors.arrayCamera;
+        delete descriptors.targetSize;delete descriptors.viewportSize;delete descriptors.arrayCamera;delete descriptors.occlusion;
         frame=Object.defineProperties({},descriptors);
       }
       for(const key of ['draws','viewProjection','lighting','fog','clippingPlanes',...(shadowEnabled?['shadow']:[]),...(environmentEnabled?['environment']:[]),...(backgroundEnabled?['background']:[])])if(Object.hasOwn(frame,key))fail('FRAME',`${key} belongs to the source scene/camera`);
@@ -1703,7 +1704,8 @@ export async function createGpuThreeScene(device,scene,{
           if(item.bindings[0].signature!==programSignature(programGeometrySnapshot(gpu,device),true,item.bindings[0].topology))
             fail('PREPARE','Native node geometry layout changed; prepare the captured program again');
           copiesAtDraw(item.nodeFramebufferCopies);
-          drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews});
+          drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews,
+            tested:item.occlusionTest===true,bundle:!!item.nodeBundle});
           draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,nodeIndirect:item.nodeIndirect,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           copiesAtDraw(item.nodeFramebufferAfterCopies);
@@ -1826,6 +1828,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       const prepared={...frame,viewProjection:clip.elements,lighting,draws,
         ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
+      if(occlusion)prepared.occlusion={session:occlusion,objects:drawObjects};
       if(fogEnabled)prepared.fog=fogFrame;
       if(environmentEnabled)prepared.environment=environmentFrame;
       if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
@@ -1844,7 +1847,7 @@ export async function createGpuThreeScene(device,scene,{
         // One attachment clear precedes every view. A pass per ordered view span
         // keeps camera/lighting uniforms immutable until its immediate submit,
         // including overlapping viewports and transparent double-sided draws.
-        renderer.render({...prepared,draws:[]});backgroundSubmitted=true;live();
+        renderer.render({...prepared,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});backgroundSubmitted=true;live();
         const loaded={...prepared,loadOp:'load',depthLoadOp:'load',...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})};
         let activeViewport=frame.viewport??null,passes=renderer.colorPassCount??1,logical=0,calls=0,backgrounds=0,geometrySubmitted=false;
         for(const view of arrayViews)if(view.background){
@@ -1884,7 +1887,8 @@ export async function createGpuThreeScene(device,scene,{
           // overlapping translucent viewports make that order observable.
           for(let instance=0;instance<repetitions;instance++){
             renderer.render({...loaded,viewport:activeViewport,viewProjection:native?prepared.viewProjection:view.viewProjection,
-              lighting:native?lighting:{...view.lighting,lights:lighting.lights},draws:[draw],...(fogEnabled?{fog:native?null:view.fog}:{})});
+              lighting:native?lighting:{...view.lighting,lights:lighting.lights},draws:[draw],
+              ...(occlusion?{occlusion:{session:occlusion,objects:[drawObjects[i]]}}:{}),...(fogEnabled?{fog:native?null:view.fog}:{})});
             geometrySubmitted=true;logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
           }
           }
@@ -1894,7 +1898,7 @@ export async function createGpuThreeScene(device,scene,{
         // The initial clear resolves before the background writes. If no view
         // submits geometry afterwards, publish the final multisample image now.
         if(backgrounds&&!geometrySubmitted&&prepared.resolveTarget){
-          renderer.render({...loaded,draws:[]});passes+=renderer.colorPassCount??1;live();
+          renderer.render({...loaded,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});passes+=renderer.colorPassCount??1;live();
         }
         logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+(item.nodeProgram?
           item.instanceCount===0||item.nodeIndirect?.skip?0:item.nodeViews?.length??1:arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length),0);
@@ -1919,7 +1923,8 @@ export async function createGpuThreeScene(device,scene,{
         let first=0,loaded=false;
         logicalDraws=0;drawCalls=0;
         const span=end=>{
-          renderer.render({...prepared,draws:draws.slice(first,end),...(loaded?{loadOp:'load',depthLoadOp:'load',
+          renderer.render({...prepared,draws:draws.slice(first,end),
+            ...(occlusion?{occlusion:{session:occlusion,objects:drawObjects.slice(first,end)}}:{}),...(loaded?{loadOp:'load',depthLoadOp:'load',
             ...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})}:{})});
           backgroundSubmitted=true;loaded=true;first=end;
           logicalDraws+=renderer.drawCount;drawCalls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
