@@ -640,6 +640,11 @@ export function withThreeCompute(Base, THREE) {
         framebufferFactory: () => createThreeFramebufferTextures({three: THREE, device: this._device,
           getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal, webgl: this._shaderEncodedOutput === true,
           submitInitialization: request => {
+            if (this._programDrawContext) {
+              this._programDrawContext.flush();
+              try { request.issue(); } finally { this._releaseRequest(request); }
+              return;
+            }
             if (this._webglSubmissionDepth > 0 || !this._drain && !this._preparing && !this._pending.length) {
               try { request.issue(); } finally { this._releaseRequest(request); }
             } else this._enqueue(request);

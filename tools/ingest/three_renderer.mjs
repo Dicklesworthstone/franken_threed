@@ -676,7 +676,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!this._initialized) fail('SOURCE', 'Initialize the renderer before copying its framebuffer');
       const webgl = this._shaderEncodedOutput === true;
-      if (webgl && this._webglSubmissionDepth > 0)
+      const drawContext = webgl && this._webglSubmissionDepth > 0 ? this._programDrawContext : null;
+      if (webgl && this._webglSubmissionDepth > 0 && !drawContext)
         fail('UNSUPPORTED', 'WebGL framebuffer copies inside rendering callbacks require draw-boundary interleaving');
       const depth = texture instanceof THREE.DepthTexture && texture.isDepthTexture === true;
       if (!(texture instanceof THREE.FramebufferTexture) && !depth)
@@ -699,8 +700,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       else if (rectangle.isVector2) region = [rectangle.x, rectangle.y, texture.image.width, texture.image.height].map(Math.floor);
       else if (rectangle.isVector4) region = [rectangle.x, rectangle.y, rectangle.z, rectangle.w].map(Math.floor);
       else { (THREE.error ?? console.error)('Renderer.copyFramebufferToTexture: Invalid rectangle.'); return; }
+      // Source draws preceding this call have already issued their GPU effects.
+      // Flush before initialization: onUpdate can throw or recursively copy.
+      drawContext?.flush();
       const textures = this._getSampledTextureInputs();
       textures.prepareFramebuffer(texture, this._renderTarget?.texture.type ?? THREE.UnsignedByteType);
+      drawContext?.check();
       // WebGL initializes the destination before choosing its read framebuffer:
       // onUpdate can throw or change the current target. Keep the earlier extent.
       if (webgl && !this._renderTarget && this._wantsHdr(this._toneMapping()))
@@ -717,7 +722,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const lease = textures.captureFramebuffer(texture, {format,
         rectangle: {x: region[0], y: region[1], z: region[2], w: region[3]},
         ...(webgl ? {level, sourceLevel, sourceFace} : {})});
-      if (this._nodeFramebufferCopyRecorder) {
+      if (drawContext) {
+        try { drawContext.copy(textures, lease); }
+        finally { textures.release(lease); }
+      } else if (this._nodeFramebufferCopyRecorder) {
         try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
         catch (error) { textures.release(lease); throw error; }
       } else {

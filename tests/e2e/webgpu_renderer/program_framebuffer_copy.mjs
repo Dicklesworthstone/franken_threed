@@ -101,12 +101,16 @@ async function capture(mode) {
         renderer.setRenderTarget(destination);sampler.uniforms.captured.value = texture;sampler.uniforms.lod.value = lod;
         renderer.render(useBasic ? ordinary : consumer, camera);
       };
-      const read = async (name, destination = output) => {
-        if (mode === 'candidate') await renderer.waitForGPU();
+      const read = async (name, destination = output, acceptedRenderFailure = null) => {
+        if (mode === 'candidate') {
+          try {await renderer.waitForGPU();}
+          catch (error) {if (acceptedRenderFailure === null || error.message !== acceptedRenderFailure) throw error;}
+        }
         const pixels = new Uint8Array(width * height * 4);
         await renderer.readRenderTargetPixelsAsync(destination, 0, 0, width, height, pixels);
         frames.push({name, pixels: Array.from(pixels)});
       };
+      const drawTrace = [];
       let callbackCount = 0, callbackArgument = false, callbackImmediate = false, selectedAfterCallback = false, floatToHalfError;
       try {
         if (mode === 'candidate') {
@@ -153,10 +157,44 @@ async function capture(mode) {
         copy('onupdate-retarget', retargeted, new T.Vector2(14, 9));
         callbackImmediate = callbackCount === 1;selectedAfterCallback = renderer.getRenderTarget() === alternate;
         show(retargeted);await read('initialization-retarget');
+        // Public copies inside real draw callbacks see the preceding draws in
+        // this same render call, and later draws sample the copied GPU image.
+        const callbackScene = new T.Scene();callbackScene.add(producer, consumer);
+        producer.renderOrder = 0;consumer.renderOrder = 1;
+        sampler.uniforms.captured.value = copied;sampler.uniforms.lod.value = 0;producerMaterial.uniforms.phase.value = 0;
+        renderer.setRenderTarget(output);await renderer.compileAsync(callbackScene, camera);
+        consumer.onBeforeRender = () => {
+          drawTrace.push('consumer-before-copy');renderer.copyFramebufferToTexture(copied, new T.Vector2(10, 7));
+        };
+        renderer.render(callbackScene, camera);await read('draw-before-copy');
+        consumer.onBeforeRender = () => {};
+        producer.onAfterRender = () => {
+          drawTrace.push('producer-after-copy');renderer.copyFramebufferToTexture(copied, new T.Vector2(10, 7));
+        };
+        producerMaterial.uniforms.phase.value = 1;
+        renderer.render(callbackScene, camera);await read('draw-after-copy');
+        producer.onAfterRender = () => {};
+        // Even an empty prefix must apply the current clear before its copy.
+        renderer.setClearColor(new T.Color(.125, .25, .5), 1);
+        producer.onBeforeRender = () => {
+          drawTrace.push('first-before-copy');renderer.copyFramebufferToTexture(copied);
+        };
+        renderer.render(callbackScene, camera);await read('draw-clear-prefix');
+        producer.onBeforeRender = () => {};
+        const rejected = framebuffer(4, 4);
+        rejected.onUpdate = () => {drawTrace.push('initialization-throws');throw new Error('draw-copy-initialization');};
+        consumer.onBeforeRender = () => renderer.copyFramebufferToTexture(rejected);
+        let copyError;
+        try {renderer.render(callbackScene, camera);} catch (error) {copyError = error.message;}
+        if (copyError !== 'draw-copy-initialization') throw new Error(`Missing synchronous copy error: ${copyError}`);
+        // F3D's extra queue fence reports the accepted failed operation too;
+        // the source-shaped read must still observe its completed draw prefix.
+        await read('draw-prefix-after-error', output, copyError);
+        consumer.onBeforeRender = () => {};
         if (mode === 'source') {
           const gl = renderer.getContext();if (gl.getError() !== gl.NO_ERROR) throw new Error('Source WebGL framebuffer copy error');
         }
-        return {frames, states, errors, callbackCount, callbackArgument, callbackImmediate, selectedAfterCallback, floatToHalfError,
+        return {frames, states, errors, drawTrace, callbackCount, callbackArgument, callbackImmediate, selectedAfterCallback, floatToHalfError,
           halfType: half.type, expectedHalfType: T.HalfFloatType, route: renderer.info.f3d?.route,
           nativeDrawCalls: renderer.info.f3d?.nativeDrawCalls};
       } finally {
@@ -176,6 +214,8 @@ try {
   assert.equal(source.floatToHalfError, 1282, 'source rejects FloatType -> HalfFloatType after a valid producer');
   assert.equal(candidate.route, 'general-webgpu');assert.ok(candidate.nativeDrawCalls > 0);
   assert.deepEqual(candidate.states, source.states);
+  assert.deepEqual(candidate.drawTrace, source.drawTrace);
+  assert.deepEqual(source.drawTrace, ['consumer-before-copy', 'producer-after-copy', 'first-before-copy', 'initialization-throws']);
   for (const state of source.states) {assert.deepEqual(state.after, state.before, `${state.name} public type/version`);assert.equal(state.returnedUndefined, true);}
   for (const result of [source, candidate]) {
     assert.equal(result.halfType, result.expectedHalfType);assert.equal(result.callbackCount, 1);
@@ -186,7 +226,7 @@ try {
     ['canvas-crop-basic', false], ['target-vector4-position', true], ['selected-cube-face', false],
     ['selected-array-layer', false], ['queued-first-consumer', false], ['queued-second-consumer', true],
     ['resized-source', false], ['explicit-destination-mip', false], ['lower-mip-preserved', false],
-    ['half-float-destination', false], ['initialization-retarget', true],
+    ['half-float-destination', false], ['initialization-retarget', true], ['draw-before-copy', false], ['draw-after-copy', true],
   ]) for (let index = 0; index < corners.length; index++) {
     const expected = colors[index].map((value, channel) => inverted && channel < 3 ? 255 - value : value);
     assert.deepEqual(pixel(frames[name], ...corners[index]), expected, `${name}: source quadrant ${index}`);

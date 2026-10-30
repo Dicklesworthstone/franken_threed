@@ -128,14 +128,56 @@ test('requested mip generation precedes copying and sRGB storage uses raw views'
   assert.equal(copy.desc.colorAttachments[0].view.texture.format, 'rgba8unorm-srgb');
 });
 
-test('in-render framebuffer copies fail explicitly before initialization or misplaced submission', async t => {
+test('draw callbacks copy after the preceding draw prefix and resume with loaded attachments', async t => {
   const f = await fixture(t), image = new T.FramebufferTexture(4, 4), scene = f.scene(new T.MeshBasicMaterial());
-  let initialized = false;
-  image.onUpdate = () => { initialized = true; };
-  scene.children[0].onBeforeRender = () => f.renderer.copyFramebufferToTexture(image);
+  const second = new T.Mesh(scene.children[0].geometry, new T.MeshBasicMaterial());
+  scene.add(second); second.renderOrder = 1; t.after(() => second.material.dispose());
+  let initialized = 0; const callbacks = [];
+  image.onUpdate = () => { initialized++; callbacks.push('upload'); };
+  second.onBeforeRender = () => { callbacks.push('before'); f.renderer.copyFramebufferToTexture(image); };
+  second.onAfterRender = () => { callbacks.push('after'); f.renderer.copyFramebufferToTexture(image); };
   await f.renderer.compileAsync(scene, f.camera);
-  assert.throws(() => f.renderer.render(scene, f.camera), /draw-boundary interleaving/);
-  assert.equal(initialized, false); assert.equal(blits(f).length, 0);
+  f.renderer.render(scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(initialized, 1); assert.deepEqual(callbacks, ['before', 'upload', 'after']);
+  const copies = blits(f); assert.equal(copies.length, 2);
+  const first = f.events.indexOf(copies[0]), last = f.events.indexOf(copies[1]);
+  const earlier = f.events.slice(0, first).filter(event => event.draws.some(value => value.indexed));
+  const between = f.events.slice(first + 1, last).filter(event => event.draws.some(value => value.indexed));
+  assert.equal(earlier.length, 1); assert.equal(earlier[0].draws.length, 1);
+  assert.equal(between.length, 1); assert.equal(between[0].draws.length, 1);
+  assert.equal(between[0].desc.colorAttachments[0].loadOp, 'load');
+  assert.equal(between[0].desc.depthStencilAttachment.depthLoadOp, 'load');
+  assert.equal(f.events.slice(last + 1).some(event => event.draws.some(value => value.indexed)), false);
+  assert.equal(f.renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+  assert.equal(f.renderer._programDrawContext, undefined);
+});
+
+test('draw-time initialization failures preserve the already submitted color prefix', async t => {
+  const f = await fixture(t), image = new T.FramebufferTexture(4, 4), scene = f.scene(new T.MeshBasicMaterial());
+  const failure = new Error('source initialization failed'), second = new T.Mesh(scene.children[0].geometry, new T.MeshBasicMaterial());
+  scene.add(second); second.renderOrder = 1; t.after(() => second.material.dispose());
+  image.onUpdate = () => { throw failure; };
+  second.onBeforeRender = () => f.renderer.copyFramebufferToTexture(image);
+  await f.renderer.compileAsync(scene, f.camera);
+  assert.throws(() => f.renderer.render(scene, f.camera), error => error === failure);
+  assert.equal(blits(f).length, 0);
+  assert.equal(f.events.filter(event => event.draws.some(value => value.indexed)).length, 1);
+  assert.equal(f.renderer._programDrawContext, undefined);
+  assert.equal(f.renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
+test('draw-time requested mip initialization follows the preceding draw and precedes its copy', async t => {
+  const f = await fixture(t), image = new T.FramebufferTexture(8, 8), scene = f.scene(new T.MeshBasicMaterial());
+  image.generateMipmaps = true; image.minFilter = T.LinearMipmapLinearFilter; image.needsUpdate = true;
+  scene.children[0].onAfterRender = () => f.renderer.copyFramebufferToTexture(image);
+  await f.renderer.compileAsync(scene, f.camera);
+  f.renderer.render(scene, f.camera); await f.renderer.waitForGPU();
+  const copy = blits(f)[0], copyIndex = f.events.indexOf(copy);
+  const mipIndices = f.events.map((event, index) => event.label === 'f3d-webgl-framebuffer-initialize' ? index : -1).filter(index => index !== -1);
+  assert.equal(mipIndices.length, 3);
+  assert.ok(f.events.slice(0, mipIndices[0]).some(event => event.draws.some(value => value.indexed)));
+  assert.ok(mipIndices.every(index => index < copyIndex));
+  assert.equal(f.renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
 });
 
 test('queued consumers retain the framebuffer generation preceding a later sampler and version change', async t => {

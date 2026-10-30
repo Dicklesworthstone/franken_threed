@@ -1557,6 +1557,8 @@ export async function createGpuThreeScene(device,scene,{
   function render(camera,frame,options={}){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     let backgroundSubmitted=false;
+    const publicRenderer=programRoute()?shadowRenderer():null;
+    const previousDrawContext=publicRenderer?._programDrawContext;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
       if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','framebuffer','depthbuffer'].includes(k)))
@@ -1791,6 +1793,61 @@ export async function createGpuThreeScene(device,scene,{
       // child's entire list. Pack uniforms and run callbacks in that same order;
       // overlapping views and shared mutable uniforms make it observable.
       let programSourceDraws=0;
+      const preparedDeformations=new Set();
+      let shadowSubmitted=false;
+      const preparedFrame=()=>{
+        const added=[...activeDeformations].filter(owner=>!preparedDeformations.has(owner));
+        if(added.length){live();updateGpuThreeDeformations(added);live();for(const owner of added)preparedDeformations.add(owner);}
+        const prepared={...frame,viewProjection:clip.elements,lighting,draws,
+          ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
+        if(occlusion)prepared.occlusion={session:occlusion,objects:drawObjects};
+        if(fogEnabled)prepared.fog=fogFrame;
+        if(environmentEnabled)prepared.environment=environmentFrame;
+        if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
+          prepared.clearColor=rgba(backgroundScene().background);prepared.loadOp='clear';
+          if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];
+        }
+        if(shadowEnabled){
+          prepared.shadow=null;
+          if(shadowFrame){
+            if(!shadowSubmitted){shadowOwner.render(shadowFrame,shadowDraws);shadowSubmitted=true;live();}
+            prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
+          }
+        }
+        return prepared;
+      };
+      // A source callback can read the color produced by the preceding draws.
+      // Submit that prefix now, then resume with load operations; no callback
+      // replay or CPU readback is involved. The same boundary serves hidden
+      // renderBufferDirect draws discovered during an addon callback.
+      const boundary={first:0,started:false,logical:0,calls:0,passes:0};
+      if(publicRenderer?._shaderEncodedOutput&&!programArray){
+        const target=publicRenderer.getRenderTarget(),face=publicRenderer._activeCubeFace,mip=publicRenderer._activeMipmapLevel;
+        const check=()=>{
+          if(publicRenderer.getRenderTarget()!==target||publicRenderer._activeCubeFace!==face||publicRenderer._activeMipmapLevel!==mip)
+            fail('FRAME','Draw-time framebuffer operations require the active render attachment');
+        };
+        const flush=()=>{
+          check();
+          if(boundary.started&&boundary.first===draws.length)return;
+          const prepared=preparedFrame();
+          renderer.render({...prepared,draws:draws.slice(boundary.first),...(boundary.started?{loadOp:'load',depthLoadOp:'load',
+            ...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})}:{})});
+          backgroundSubmitted=true;boundary.started=true;boundary.first=draws.length;
+          boundary.logical+=renderer.drawCount;boundary.calls+=renderer.drawCallCount;boundary.passes+=renderer.colorPassCount??1;live();
+        };
+        publicRenderer._programDrawContext={check,flush,copy(owner,lease){
+          check();
+          const source=typeof options.framebuffer==='function'?options.framebuffer():options.framebuffer;
+          if(!source)fail('FRAME','Draw-time framebuffer copies require the borrowed resolved color texture');
+          owner.validateDispatch([lease]);
+          owner.withDispatch([lease],()=>{
+            const encoder=device.createCommandEncoder({label:'f3d-public-framebuffer-copy'});
+            if(owner.encodeFramebufferCopy(lease,encoder,source)!==false)device.queue.submit([encoder.finish()]);
+          });
+          live();
+        }};
+      }
       function* executions(){
         for(const item of casterItems)yield {item,view:null};
         if(!programArray){for(const item of items)yield {item,view:null};return;}
@@ -1954,9 +2011,6 @@ export async function createGpuThreeScene(device,scene,{
         }
         if(programArray&&item.bindings.length===2&&!item.shadowPass)item.material.side=three.DoubleSide;
       }
-      // One fused core batch precedes all consuming material/group draws. No
-      // source animation clock or CPU per-vertex deformation runs here.
-      live();updateGpuThreeDeformations([...activeDeformations]);live();
       // The retained WebGL behavior updates public versions twice per double-
       // sided transparent item. Native ArrayCamera rendering selects its side
       // pipelines without incrementing those source material versions.
@@ -1965,23 +2019,7 @@ export async function createGpuThreeScene(device,scene,{
         item.material.side=three.FrontSide;item.material.needsUpdate=true;
         item.material.side=three.DoubleSide;
       }
-      const prepared={...frame,viewProjection:clip.elements,lighting,draws,
-        ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
-      if(occlusion)prepared.occlusion={session:occlusion,objects:drawObjects};
-      if(fogEnabled)prepared.fog=fogFrame;
-      if(environmentEnabled)prepared.environment=environmentFrame;
-      if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
-        prepared.clearColor=rgba(backgroundScene().background);prepared.loadOp='clear';
-        // Shader-side sRGB output: the attachment stores encoded values.
-        if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];
-      }
-      if(shadowEnabled){
-        prepared.shadow=null;
-        if(shadowFrame){
-          shadowOwner.render(shadowFrame,shadowDraws);live();
-          prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
-        }
-      }
+      const prepared=preparedFrame();
       if(programArray){
         // Clear once, then submit each camera's span with immutable packed
         // uniforms. Empty arrays still clear, but never fall back to the parent.
@@ -2081,7 +2119,10 @@ export async function createGpuThreeScene(device,scene,{
         prepared.loadOp='load';
       }
       let passes=0;
-      if(framebufferCopies.length){
+      if(boundary.started){
+        publicRenderer._programDrawContext.flush();
+        logicalDraws=boundary.logical;drawCalls=boundary.calls;passes=boundary.passes;
+      }else if(framebufferCopies.length){
         // Source ViewportTextureNode updates execute during synchronous capture,
         // but their reads belong here: after the preceding color draws. Every
         // span submits before its copy, and copy plus mip generation share one
@@ -2119,7 +2160,10 @@ export async function createGpuThreeScene(device,scene,{
       // Do not expose a partially submitted owner as safe for accidental retry.
       if(backgroundSubmitted){terminal??=error;rejectStopped(terminal);}
       return failed(error);
-    }finally{busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;if(disposed||terminal)release();}
+    }finally{
+      if(publicRenderer)publicRenderer._programDrawContext=previousDrawContext;
+      busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;if(disposed||terminal)release();
+    }
   }
   const bridge=Object.freeze({scene:root,prepare,render,assertNativePrepared,
     get disposed(){return disposed;},get failed(){return terminal!==null||resourceFailed();},

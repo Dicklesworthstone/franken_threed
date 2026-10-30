@@ -338,19 +338,28 @@ The destination's `onUpdate` runs synchronously during requested initialization.
 It can change the selected source target or prevent the copy by throwing; copy
 position and extent retain their earlier source reads. Acknowledged texture
 versions follow the source, including a version change inside that callback.
-This does not admit copies from inside draw callbacks, including Lensflare's
-occlusion sequence. WebGL depth snapshots, unmatched color precision/encoding and the
-whole-image linear HDR fallback also retain explicit admission errors.
+Ordinary-camera draw callbacks can also copy the currently bound framebuffer.
+The renderer submits the preceding draw prefix before initialization or copying,
+then resumes later draws with color/depth/stencil load operations. A first-draw
+copy observes the current clear. Earlier draws remain readable when initialization
+throws; the extra F3D queue fence also reports that failed operation. Callbacks
+execute once and no CPU readback is involved. Changing the active attachment
+during this operation, ArrayCamera callback copies and Lensflare's separate
+direct-draw API remain outside this slice. WebGL depth snapshots, unmatched color
+precision/encoding and the whole-image linear HDR fallback also retain explicit
+admission errors.
 
-`three_renderer_program_framebuffer_copy.test.mjs` has ten focused cases for
+`three_renderer_program_framebuffer_copy.test.mjs` has twelve focused cases for
 ordering, generation lifetime, callback effects, source versions, mip timing and
 format refusal. The affected framebuffer, canvas and target suites pass 174
 additional checks. `node tests/e2e/webgpu_renderer/program_framebuffer_copy.mjs`
-matches 15 source checkpoints and all 46,080 RGBA bytes exactly in Chromium
+matches 19 source checkpoints and all 58,368 RGBA bytes exactly in Chromium
 151.0.7922.34 / SwiftShader, with zero GPU/browser errors. This includes ordinary
 material consumption, two producer-copy-consumer chains without intervening
 waits, source resize, cube/array selection, matching half-float storage, raw sRGB
-copies and initialization retargeting. No hardware-performance claim is made.
+copies, initialization retargeting, before/after-draw copies, a clear-only prefix
+and source-visible partial drawing after an initialization exception. No
+hardware-performance claim is made.
 
 ## Explicit differences
 
