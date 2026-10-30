@@ -53,13 +53,16 @@ resolves, including when a later source callback rejects the parent. Internal
 shader construction and ordinary pipeline preparation do not independently
 execute geometry kernels.
 
-There is a remaining public-compilation construction boundary: accepted source
-Fn graphs are built eagerly before the per-object update/pipeline sequence. A
-later object's constructor that depends on side effects from an earlier object's
-compile callbacks is not yet source-compatible. This profile supports the
-ordinary lazy constructor and shared-kernel patterns; it does not establish
-complete general `compileAsync()` parity or change the existing compilation
-lifecycle of unrelated material graphs.
+Public compilation now constructs geometry-scene graphs in that same per-object
+sequence. A later lazy Fn constructor observes earlier geometry-program current
+and after-callback effects and the completed pipeline. Capturing compilation
+selections alone does not construct the graphs. A failed pipeline leaves later
+constructors inactive; a later constructor failure retains completed earlier
+effects and drains already accepted kernels. Storage and texture owners acquired
+during construction remain available to the existing request cleanup. This
+profile supports ordinary lazy constructors and shared kernels; it does not
+establish complete general `compileAsync()` parity or change the existing
+compilation callback lifecycle of unrelated material graphs.
 
 Geometry kernels use the existing render prerequisite FIFO. Disjoint earlier
 native draws are admitted; a background or companion mesh does not itself block
@@ -72,14 +75,16 @@ render encoder. This change does not introduce interleaved draw/compute passes
 or claim support for every source-valid aliasing combination. Accepted child
 kernels survive a later parent capture failure, with no parent draw submitted.
 
-Sixteen `three_renderer_geometry_compute.test.mjs` cases cover exact pinned
+Eighteen `three_renderer_geometry_compute.test.mjs` cases cover exact pinned
 vertex/fragment and compute WGSL, constructor/cache stability, shared-frame
 updates, queued uniforms and GPU-buffer identity, compilation callback ordering
-and IDs, pre-init compilation through a tone-mapped output target, compute
+and IDs, dependent lazy constructors, pipeline/constructor failures, pre-init
+compilation through a tone-mapped output target, compute
 context restoration, late failures and buffer/texture overlap refusals. The
-record device verifies commands and bytes; it does not execute WGSL. Adjacent
-storage-attribute and storage-texture suites pass all 32 tests after reconciliation
-with concurrent matrix-storage and HDR-output changes (48 focused cases total). The native-shadow
+record device verifies commands and bytes; it does not execute WGSL. All eighteen
+geometry cases pass after the construction-order change. Earlier adjacent
+storage-attribute and storage-texture suites passed all 32 tests after reconciliation
+with concurrent matrix-storage and HDR-output changes. The native-shadow
 suite passes 25 of 29; its four target-generation-count and malformed hidden-skin
 fixture failures also reproduce with unchanged main product modules. They remain
 pre-existing failures, rather than a claim that every adjacent suite is green.

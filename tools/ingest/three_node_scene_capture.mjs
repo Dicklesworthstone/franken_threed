@@ -373,6 +373,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
+  // Source public compilation constructs each geometry graph only after the
+  // preceding object's update/pipeline/after sequence has completed.
+  const deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null);
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {
@@ -598,6 +601,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         if (!lifecycleDraw(draw)) preparationBindings.add(binding);
         if (lifecycleDraw(draw) || uniforms && draw.object.isBatchedMesh) deferred.add(binding);
       }
+    if (deferredCompilation) return;
     for (const binding of selectedBindings)
       if (!nativeLifecycle || !deferred.has(binding)) withBinding(binding, () => programs.inspect(binding.material, binding.object, context));
     const readyBindings = selectedBindings.filter(binding => !deferred.has(binding));
@@ -1124,7 +1128,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (fixedDrawCandidates) markThreeNativeDrawCaptured(renderer);
       capture();
       if (!uniforms) {
-        compileBindings(deferredHookBindings);
+        if (!deferredCompilation) compileBindings(deferredHookBindings);
         const captureStorage = () => storageOwner ? storageOwner.captureDispatch(() => {}) : undefined;
         if (textureOwner) textureOwner.captureDispatch(captureStorage);
         else captureStorage();
@@ -1169,6 +1173,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!uniforms && preparedAttributes === null) {
       preparedAttributes = []; const ready = [];
       for (const binding of preparationBindings) {
+        if (binding.nodeProgram === null) withThreeNativeCapture(renderer, (record, buffer) => {
+          recordTexture = record; recordBuffer = buffer;
+          compileBindings([binding]);
+        }, destination);
         const updateNodes = updates && programs.hasCompilationUpdates?.(binding.nodeProgram);
         const updateContext = {...frameContext, ...(updateNodes ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
           object: binding.object, material: binding.material, clippingContext: binding.clippingContext, captureVertexAttribute,
@@ -1190,18 +1198,19 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           } else ready.push(binding);
         });
         preparedBindings = Object.freeze(ready.slice()); dirty = true;
-        if (updateNodes) {
+        if (updateNodes || updates && deferredCompilation) {
           publishAttributes(); yield; dirty = false;
           // Pinned compileAsync completes this object's pipeline and after
           // callbacks before advancing to the next render object. No await may
           // leave the renderer's precompilation flag installed.
-          withBinding(binding, () => precompile(() => programs.after(binding.nodeProgram, updateContext)));
+          if (updateNodes) withBinding(binding, () => precompile(() => programs.after(binding.nodeProgram, updateContext)));
         }
       }
     }
     if (dirty) { publishAttributes(); yield; }
   }
-  const nodeCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram));
+  const nodeCompilation = !uniforms && (deferredCompilation ||
+    [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram)));
   rememberFixedAttributes(phases);
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
@@ -1210,6 +1219,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     prepareAttributes() { for (const step of preparationSteps(false)) { /* publish without node updates */ } },
     ...(nodeCompilation ? {async compileAttributes(prepare) { for (const step of preparationSteps(true)) await prepare(); }} : {}),
     installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
-    textureOwner, textureUses: Object.freeze(textureUses), storageOwner,
+    get textureOwner() { return textureOwner; }, textureUses: Object.freeze(textureUses),
+    get storageOwner() { return storageOwner; },
     get storageUses() { return Object.freeze(storageUses.slice()); }});
 }

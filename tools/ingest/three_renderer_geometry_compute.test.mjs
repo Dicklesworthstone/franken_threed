@@ -83,7 +83,8 @@ test('geometry constructors run once, public compilation computes, and named sto
   t.after(() => { companion.geometry.dispose(); companionMaterial.dispose(); });
   await f.renderer.init();
   const raw = f.renderer._makeOutputRequests(f.scene, f.camera, null, false);
-  assert.equal(state.builds, 1); assert.equal(state.initializations, 0); assert.equal(f.computes.length, 0);
+  assert.equal(state.builds, 0, 'capturing compilation selections does not construct later geometry graphs');
+  assert.equal(state.initializations, 0); assert.equal(f.computes.length, 0);
   for (const request of raw) f.renderer._releaseRequest(request);
   await f.renderer.compileAsync(f.scene, f.camera);
   assert.equal(state.builds, 1); assert.equal(state.initializations, 1); assert.equal(f.computes.length, 2);
@@ -256,15 +257,28 @@ test('geometry compute uses source compute callback contexts and restores its pa
 });
 
 test('public geometry compile preserves sequential pipeline callbacks, live frame, and restored render ID', async t => {
-  const f = fixture(t, {background: false}), order = [], contexts = [];
+  const f = fixture(t, {background: false}), order = [], contexts = [], constructed = [];
+  let stage = 0, prepared = false;
   const make = (object, name) => {
     const values = N.instancedArray(1, 'float');
-    object.material.geometryNode = N.Fn(() => { values.element(0).addAssign(.125); })().compute(1).setName(name);
-    object.material.geometryNode.updateBeforeType = 'render';
-    const gain = N.uniform(.5).onObjectUpdate(frame => { order.push(name + ':current'); contexts.push([frame.renderId, frame.frameId]); return .5; });
+    object.material.geometryNode = N.Fn(() => {
+      order.push(name + ':construct'); constructed.push([name, stage, prepared]);
+      const kernel = N.Fn(() => { values.element(0).addAssign(.125); })().compute(1).setName(name);
+      kernel.updateBeforeType = 'render'; return kernel;
+    })();
+    const gain = N.uniform(.5).onObjectUpdate(frame => {
+      order.push(name + ':current'); contexts.push([frame.renderId, frame.frameId]);
+      if (name === 'first') stage = 2; return .5;
+    });
     gain.updateBeforeType = gain.updateAfterType = 'object';
-    gain.updateBefore = frame => { assert.equal(frame.renderer._isPreCompiling, true); order.push(name + ':before'); };
-    gain.updateAfter = frame => { assert.equal(frame.renderer._isPreCompiling, true); order.push(name + ':after'); };
+    gain.updateBefore = frame => {
+      assert.equal(frame.renderer._isPreCompiling, true); order.push(name + ':before');
+      if (name === 'first') stage = 1;
+    };
+    gain.updateAfter = frame => {
+      assert.equal(frame.renderer._isPreCompiling, true); order.push(name + ':after');
+      if (name === 'first') stage = 3;
+    };
     object.material.colorNode = N.vec3(gain);
   };
   make(f.object, 'first'); f.object.renderOrder = -1;
@@ -274,14 +288,17 @@ test('public geometry compile preserves sequential pipeline callbacks, live fram
   const pipeline = f.device.createRenderPipelineAsync;
   f.device.createRenderPipelineAsync = async descriptor => {
     assert.notEqual(f.renderer._isPreCompiling, true, 'precompilation state does not escape across awaits');
-    order.push('pipeline'); return pipeline(descriptor);
+    order.push('pipeline'); const result = await pipeline(descriptor); prepared = true; return result;
   };
   await f.renderer.init();
   f.renderer.info.calls = 91; f.renderer._nodes.nodeFrame.renderId = 7;
   const initialFrame = f.renderer._nodes.nodeFrame.frameId;
   await f.renderer.compileAsync(f.scene, f.camera);
   assert.deepEqual(order.filter(value => value !== 'pipeline'),
-    ['first:before', 'first:current', 'first:after', 'second:before', 'second:current', 'second:after']);
+    ['first:construct', 'first:before', 'first:current', 'first:after',
+      'second:construct', 'second:before', 'second:current', 'second:after']);
+  assert.deepEqual(constructed, [['first', 0, false], ['second', 3, true]],
+    'the later lazy constructor observes the earlier current/after and completed pipeline effects');
   assert.ok(order.indexOf('pipeline') > order.indexOf('first:current'));
   assert.ok(order.indexOf('pipeline') < order.indexOf('first:after'));
   assert.ok(contexts.every(([renderId, frameId]) => renderId === 7 && frameId > initialFrame));
@@ -289,7 +306,47 @@ test('public geometry compile preserves sequential pipeline callbacks, live fram
   assert.notEqual(f.renderer._isPreCompiling, true); assert.equal(draws(f).length, 0);
   await f.renderer.compileAsync(f.scene, f.camera);
   assert.equal(f.computes.length, 2, 'RENDER kernels retain the source restored render epoch across compiles');
+  assert.equal(constructed.length, 2, 'cached graphs do not repeat their lazy constructors');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('later geometry constructor failure retains completed compile effects and accepted kernels', async t => {
+  const f = fixture(t, {background: false}), state = jelly(f), seen = [];
+  const gain = N.uniform(.5); gain.updateAfterType = 'object';
+  gain.updateAfter = () => { seen.push('first:after'); };
+  f.material.colorNode = N.vec3(gain);
+  const material = new T.MeshBasicNodeMaterial(), other = new T.Mesh(new T.PlaneGeometry(), material);
+  other.frustumCulled = false; f.scene.add(other);
+  t.after(() => { material.dispose(); other.geometry.dispose(); });
+  material.geometryNode = N.Fn(() => {
+    seen.push('second:construct'); assert.deepEqual(seen, ['first:after', 'second:construct']);
+    throw Error('later geometry constructor');
+  })();
+  await f.renderer.init();
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /later geometry constructor/);
+  assert.deepEqual(seen, ['first:after', 'second:construct']);
+  assert.equal(state.builds, 1); assert.equal(state.initializations, 1);
+  assert.deepEqual(f.events, ['geometry-init', 'geometry-step']);
+  assert.equal(draws(f).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.notEqual(f.renderer._isPreCompiling, true);
+});
+
+test('failed geometry pipeline leaves later lazy constructors inactive', async t => {
+  const f = fixture(t, {background: false}), state = jelly(f); let laterBuilds = 0, after = 0;
+  const gain = N.uniform(.5); gain.updateAfterType = 'object'; gain.updateAfter = () => { after++; };
+  f.material.colorNode = N.vec3(gain);
+  const material = new T.MeshBasicNodeMaterial(), other = new T.Mesh(new T.PlaneGeometry(), material);
+  other.frustumCulled = false; f.scene.add(other);
+  t.after(() => { material.dispose(); other.geometry.dispose(); });
+  material.geometryNode = N.Fn(() => { laterBuilds++; return N.Fn(() => {})().compute(1); })();
+  await f.renderer.init();
+  f.device.createRenderPipelineAsync = async () => { throw Error('geometry pipeline rejected'); };
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /geometry pipeline rejected/);
+  assert.equal(state.builds, 1); assert.equal(state.initializations, 1);
+  assert.equal(laterBuilds, 0); assert.equal(after, 0);
+  assert.deepEqual(f.events, ['geometry-init', 'geometry-step']);
+  assert.equal(draws(f).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.notEqual(f.renderer._isPreCompiling, true);
 });
 
 test('public geometry compile drains accepted kernels after a later source callback rejects', async t => {
