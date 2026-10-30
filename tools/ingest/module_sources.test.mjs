@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import * as nodeModule from 'node:module';
 import test from 'node:test';
-import {pathToFileURL} from 'node:url';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import {Worker as Thread} from 'node:worker_threads';
 import {createModuleSources} from './module_sources.mjs';
 import {buildModuleGraph} from './module_graph.mjs';
@@ -101,6 +102,7 @@ test('source snapshots preserve URL/kind identity and reject asynchronous or inv
   const first = sources.read(url, {source: 'export const value=1;'});
   assert.strictEqual(sources.read(url, {source: 'changed after ingestion'}), first);
   assert.notEqual(first.originalHash, first.contentHash);
+  assert.equal(first.frontendHandled, true);
   assert.equal(sources.changed(url), true);
   sources.read(url + '?other#view', {source: 'export const value=1;'});
   sources.read(url, {sourceType: 'script', source: 'globalThis.value=1;'});
@@ -109,6 +111,122 @@ test('source snapshots preserve URL/kind identity and reject asynchronous or inv
     () => ({code: 3}), () => {throw null;}])
     assert.throws(() => createModuleSources(transform).read(url, {source: ''}), {code: 'F3D_SOURCE_TRANSFORM'});
   await new Promise(resolve => setImmediate(resolve));
+});
+
+test('package frontend preserves linked typed exports, lazy identity and worker source snapshots', typescript, async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="main.ts"></script>',
+    'main.ts': `import {count,bump,read,label} from '@app/state';
+      import {token} from '@app/state/state';import {token as other} from '@app/state/variant';
+      export function run(){bump();return [count,read(),token!==other,label];}
+      export const lazy=(left:boolean)=>import(left?'@app/state/left':'@app/state/right');
+      export const asset=new URL('./config.json',import.meta.url);
+      export const moduleWorker=()=>new Worker(new URL('./worker.ts',import.meta.url),{type:'module'});
+      export const classicWorker=()=>new Worker(new URL('./classic.js',import.meta.url));`,
+    'worker.ts': `import {count,bump} from '@app/state';bump();postMessage([count,73]);`,
+    'classic.js': 'postMessage(14);',
+    'config.json': '{"value":73}',
+    'packages/state/package.json': JSON.stringify({name: '@app/state', type: 'module',
+      exports: {'.': {browser: './entry.ts', default: './server.ts'}, './state': './state.ts',
+        './variant': './state.ts?variant#copy', './left': './left.ts', './right': './right.ts'},
+      imports: {'#state': './state.ts'}, browser: {'./server-value.ts': './browser-value.ts'}}),
+    'packages/state/entry.ts': "export {count,bump,read} from '#state';export {label} from './server-value.ts';",
+    'packages/state/state.ts': 'export let count:number=0;export const token={};export function bump(){count++;}export const read=()=>count;',
+    'packages/state/left.ts': "export {read} from '@app/state';",
+    'packages/state/right.ts': 'export const read=():number=>99;',
+    'packages/state/browser-value.ts': "export const label:string='browser';",
+    'packages/state/server-value.ts': "throw new Error('wrong browser file');",
+    'packages/state/server.ts': "throw new Error('wrong export condition');",
+  });
+  fs.mkdirSync(path.join(f.source, 'node_modules/@app'), {recursive: true});
+  fs.symlinkSync('../../packages/state', path.join(f.source, 'node_modules/@app/state'), 'dir');
+  const calls = new Map();
+  const built = await buildApplication(f.entry, f.out, {transformModule: frontend(calls), routeWebGPURenderer: true});
+  assert.ok([...calls.values()].every(count => count === 1), 'resolution, analysis, bundling and workers share one frontend result');
+  const state = pathToFileURL(path.join(f.source, 'packages/state/state.ts')).href;
+  assert.equal(calls.get(JSON.stringify([state, 'module'])), 1);
+  assert.equal(calls.get(JSON.stringify([state + '?variant#copy', 'module'])), 1);
+  assert.ok(![...calls.keys()].some(key => key.includes('server.ts') || key.includes('server-value.ts')));
+  assert.deepEqual(await execute({url: pathToFileURL(path.join(f.out, built.entryFiles[0])).href}), {
+    first: [1,1,true,'browser'], second: [2,2,true,'browser'], lazy: [2,99],
+    asset: {value:73}, workers: [[1,73],14], wasmCalls: 0,
+  });
+  assert.ok(folderBytes(f.root) < 128 * 1024, 'small source-package build');
+});
+
+test('package frontend accepts unchanged handled sources and refuses unhandled formats without evaluating them', async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="main.mjs"></script>',
+    'main.mjs': "export {value} from 'typed';export {jsx} from 'typed/jsx';",
+    'node_modules/typed/package.json': JSON.stringify({name: 'typed', type: 'module',
+      exports: {'.': './value.ts', './jsx': './value.jsx'}}),
+    'node_modules/typed/value.ts': 'export const value=42;',
+    'node_modules/typed/value.jsx': 'export const jsx="already JavaScript";',
+  });
+  const calls = [], transformModule = (code, {url}) => {
+    calls.push(url); return /\.(?:ts|jsx)$/.test(new URL(url).pathname) ? code : null;
+  };
+  const built = await buildApplication(f.entry, f.out, {transformModule});
+  assert.equal(new Set(calls).size, calls.length);
+  const app = await import(pathToFileURL(path.join(f.out, built.entryFiles[0])).href);
+  assert.equal(app.value, 42); assert.equal(app.jsx, 'already JavaScript');
+  for (const transform of [undefined, () => null])
+    await assert.rejects(buildModuleGraph(f.entry, {transformModule: transform}), {code: 'F3D_PACKAGE_FORMAT'});
+  await assert.rejects(buildModuleGraph(f.entry, {transformModule: (code, {url}) =>
+    url.endsWith('/value.ts') ? {code: 'export const = ;'} : null}));
+  for (const [extension, bytes] of [['cjs', 'throw new Error("never execute CommonJS");'],
+    ['json', '{"value":42}'], ['wasm', Buffer.from([0,97,115,109])]]) {
+    const source = fixture({'index.html': '<script type="module" src="main.mjs"></script>',
+      'main.mjs': "import 'unhandled';",
+      'node_modules/unhandled/package.json': JSON.stringify({name: 'unhandled', exports: './input.' + extension}),
+      ['node_modules/unhandled/input.' + extension]: bytes});
+    await assert.rejects(buildModuleGraph(source.entry, {transformModule(code, {url}) {
+      assert.ok(!/\.(?:json|wasm)$/.test(new URL(url).pathname), 'resources never enter the JavaScript frontend');
+      return null;
+    }}), {code: 'F3D_PACKAGE_FORMAT'});
+  }
+});
+
+test('CLI project frontend executes typed package builds and graph ingestion', typescript, async () => {
+  const f = fixture({
+    'index.html': '<script type="module" src="main.ts"></script>',
+    'main.ts': "import {value} from 'typed';export const result:number=value+1;",
+    'node_modules/typed/package.json': '{"name":"typed","exports":"./value.ts"}',
+    'node_modules/typed/value.ts': 'export const value:number=41;',
+    'project frontend.mjs': `import {stripTypeScriptTypes} from 'node:module';await Promise.resolve();
+      export function transformModule(source,{url}) {
+        return new URL(url).pathname.endsWith('.ts')?stripTypeScriptTypes(source,{mode:'transform'}):null;
+      }`,
+  });
+  const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+  const args = ['--entry', f.entry, '--transform-module', path.join(f.source, 'project frontend.mjs')];
+  const run = extra => spawnSync(process.execPath, ['--max-old-space-size=128', cli, ...args, ...extra], {encoding: 'utf8'});
+  const graph = run([]); assert.equal(graph.status, 0, graph.stderr);
+  assert.equal(JSON.parse(graph.stdout).summary.total_modules, 2);
+  const packed = path.join(f.root, 'packed.html'), report = path.join(f.root, 'report.json');
+  const build = run(['--build-app', f.out, '--pack-html', packed, '--output', report]);
+  assert.equal(build.status, 0, build.stderr);
+  const result = JSON.parse(fs.readFileSync(report, 'utf8'));
+  assert.equal((await import(pathToFileURL(path.join(f.out, result.entryFiles[0])).href)).result, 42);
+  const entry = /<script type="module" src="([^"]+)"/.exec(fs.readFileSync(packed, 'utf8'))[1];
+  assert.equal((await import(entry)).result, 42);
+  assert.ok(folderBytes(f.root) < 32 * 1024);
+});
+
+test('CLI project frontend validates the export and synchronous handoff before output', () => {
+  const f = fixture({'index.html': '<script type="module" src="main.mjs"></script>', 'main.mjs': 'export const value=1;',
+    'missing.mjs': 'export default source=>source;',
+    'async.mjs': 'export async function transformModule(source){return source;}'});
+  const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+  const run = args => spawnSync(process.execPath, ['--max-old-space-size=128', cli, '--entry', f.entry, ...args], {encoding: 'utf8'});
+  for (const [name, message] of [['missing.mjs', /must export a transformModule function/],
+    ['async.mjs', /Asynchronous transforms/]]) {
+    const result = run(['--transform-module', path.join(f.source, name), '--build-app', f.out]);
+    assert.equal(result.status, 1); assert.match(result.stderr, message); assert.equal(fs.existsSync(f.out), false);
+  }
+  assert.match(run(['--transform-module']).stderr, /requires a frontend module path/);
+  assert.match(run(['--transform-module', path.join(f.source, 'missing.mjs'), '--pack-html', path.join(f.root, 'packed.html')]).stderr,
+    /require --build-app when packing/);
 });
 
 test('real TypeScript frontend reaches numeric Wasm, lazy live bindings, assets and both worker kinds', typescript, async () => {

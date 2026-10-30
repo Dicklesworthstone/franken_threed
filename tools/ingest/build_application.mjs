@@ -1066,6 +1066,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         try {
           resolvedUrl = resolveModuleSpecifier(trimmedSpecifier, item.referrerUrl, importMap, {
             mapBaseUrl: parsedHtml.baseUrl,
+            _moduleSources: moduleSources,
             packageRootUrl: options.packageRootUrl,
           });
         } catch (err) {

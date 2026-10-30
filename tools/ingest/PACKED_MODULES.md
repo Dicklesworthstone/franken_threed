@@ -30,6 +30,30 @@ worker `importScripts` dependencies participate. External classic scripts also
 use their normalized bytes; inline classic HTML scripts remain source-owned.
 Unchanged retained scripts and JSON/binary resources preserve their bytes.
 
+Installed and linked workspace packages can export `.ts`, `.tsx`, `.mts`,
+`.cts` or `.jsx` sources through their normal `exports`, `imports` and browser
+maps. The selected canonical URL reaches the same cached frontend before the
+package format check. Return JavaScript explicitly to handle that source;
+returning `null`/`undefined` leaves an unsupported package format rejected.
+An explicit unchanged string is accepted, so a type-free source module does not
+need a cosmetic edit. The hook must preserve the intended module semantics;
+CommonJS is not automatically converted. JSON and binary package targets do not
+enter the JavaScript frontend, and package export selection is unchanged.
+
+The CLI loads an explicitly selected local frontend module:
+
+```sh
+node tools/ingest/cli.mjs --entry ./src/main.ts --build-app ./dist \
+  --transform-module ./frontend.mjs
+```
+
+That module must have a named `transformModule` function export with the same
+signature and return contract as the Node API. It may await frontend setup at
+module scope; each transform call must remain synchronous. The option also
+works for graph-only ingestion and with `--build-app --pack-html`. Standalone
+packing without a build, animation export and individual kernel compilation do
+not consume this frontend option.
+
 Imports and assets keep their original filesystem URL bases. Frontend-generated
 assets must exist at the referenced paths, and imports must remain resolvable
 through the existing file/package/import-map resolver. This handoff does not

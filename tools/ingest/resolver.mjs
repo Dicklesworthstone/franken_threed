@@ -292,6 +292,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   let candidateUrl = null;
   const packageOptions = {
     span, browserSkip: options.browserSkip, browserTrail: options.browserTrail,
+    _moduleSources: options._moduleSources,
     // Replacement dependencies and #imports originate at the owner, but keep
     // the HTML map base, scoped host adapters and the pinned Three.js policy.
     resolveExternal: (target, from, state = {}) =>

@@ -282,6 +282,7 @@ export function f3dRollupPlugin(options = {}) {
 
       const resolvedUrl = resolveModuleSpecifier(source, referrerUrl, importMap, {
         mapBaseUrl,
+        _moduleSources: moduleSources,
         packageRootUrl: options.packageRootUrl,
       });
       if (importer && retainedModuleUrls.has(resolvedUrl)) {
@@ -421,7 +422,7 @@ export function f3dRollupPlugin(options = {}) {
           const requests = findThreeLoaderRequests(ast, {
             moduleUrl: id, source: code,
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
-              mapBaseUrl, packageRootUrl: options.packageRootUrl,
+              mapBaseUrl, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
             }),
             packageRootUrl: options.packageRootUrl,
             onDefaultManagerExposure: () => { defaultManagerExposed = true; },
@@ -448,6 +449,7 @@ export function f3dRollupPlugin(options = {}) {
             for (const cand of uniqueBranches) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
                 mapBaseUrl,
+                _moduleSources: moduleSources,
                 packageRootUrl: options.packageRootUrl,
               });
 
@@ -782,6 +784,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             packageRootUrl: options.packageRootUrl,
+            _moduleSources: moduleSources,
           }),
         }),
         f3dRollupPlugin({

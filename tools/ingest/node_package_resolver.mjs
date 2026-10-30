@@ -11,6 +11,9 @@ import { resolvePackageExports, resolvePackageImports } from "./package_exports.
 import { IngestionResolutionError } from "./types.mjs";
 
 const EMPTY_BROWSER_MODULE = new URL("./browser_empty.mjs", import.meta.url).href;
+// Only source-language files may enter the project frontend. Native JSON and
+// binary resources never become JavaScript merely because a hook is present.
+const FRONTEND_SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".cjs"]);
 
 export function resolveInstalledPackage(specifier, referrerUrl, options = {}) {
   return resolvePackageRequest(specifier, referrerUrl, options, false);
@@ -25,7 +28,7 @@ export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {
 }
 
 function resolvePackageRequest(specifier, referrerUrl, {
-  span = null, resolveExternal = null, browserSkip = null, browserTrail = [],
+  span = null, resolveExternal = null, browserSkip = null, browserTrail = [], _moduleSources = null,
 } = {}, browserOnly) {
   const fail = (code, message) => {
     const error = new IngestionResolutionError(
@@ -132,10 +135,15 @@ function resolvePackageRequest(specifier, referrerUrl, {
     try { filename = fs.realpathSync(filename); }
     catch (error) { fail("F3D_PACKAGE_IO", `Cannot canonicalize "${filename}": ${error.message}`); }
     const extension = path.extname(filename);
-    if (extension !== ".mjs" && !(extension === ".js" && (declaredEsmEntry || scope(path.dirname(filename))?.value.type === "module")))
-      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM (.mjs, a declared module entry, or .js in a type:module package); CommonJS and non-JavaScript loaders need a separate route`);
     const canonical = pathToFileURL(filename);
     canonical.search = url.search; canonical.hash = url.hash;
+    const esm = extension === ".mjs" || extension === ".js" && (declaredEsmEntry || scope(path.dirname(filename))?.value.type === "module");
+    // Resolve first, then normalize the exact selected URL once. A successful
+    // hook may return identical bytes; null means it did not handle this format.
+    // Graph analysis, emission and workers reuse this same source snapshot.
+    if (!esm && !(FRONTEND_SOURCE_EXTENSIONS.has(extension) &&
+        _moduleSources?.read(canonical.href).frontendHandled === true))
+      fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM or JavaScript supplied by the project frontend; CommonJS and non-JavaScript loaders need a separate route`);
     return canonical.href;
   }
 
@@ -186,7 +194,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
       const state = { browserSkip: packageJsonPath, browserTrail: [...browserTrail, visit] };
       return resolveExternal
         ? resolveExternal(target, packageUrl, state)
-        : resolveInstalledPackage(target, packageUrl, { span, ...state });
+        : resolveInstalledPackage(target, packageUrl, { span, _moduleSources, ...state });
     } catch (cause) {
       if (!(cause instanceof IngestionResolutionError)) throw cause;
       const error = new IngestionResolutionError(
@@ -211,7 +219,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
     const packageUrl = pathToFileURL(packageJsonPath).href;
     const external = target => resolveExternal
       ? resolveExternal(target, packageUrl)
-      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail });
+      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail, _moduleSources });
     const target = resolvePackageImports(specifier, own.value.imports, packageJsonPath, referrerUrl, span, external);
     if (!target.startsWith("./")) return target;
     return browserTarget(own, target, new URL(target, pathToFileURL(own.directory + path.sep)))

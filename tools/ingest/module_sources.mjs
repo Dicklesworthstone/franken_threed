@@ -22,7 +22,7 @@ export function createModuleSources(transformModule) {
       if (records.has(key)) return records.get(key);
       const input = source ?? fs.readFileSync(fileURLToPath(url));
       const original = typeof input === 'string' ? input : input.toString('utf8');
-      let code = original;
+      let code = original, frontendHandled = false;
       if (transformModule) {
         try {
           const result = transformModule(original, Object.freeze({url, sourceType}));
@@ -35,6 +35,7 @@ export function createModuleSources(transformModule) {
             }
             code = typeof result === 'string' ? result : result.code;
             if (typeof code !== 'string') throw new TypeError('Expected JavaScript code, {code}, or null');
+            frontendHandled = true;
           }
         } catch (cause) {
           const error = new Error(`Source transform failed for ${url}: ${cause?.message ?? String(cause)}`, {cause});
@@ -42,7 +43,7 @@ export function createModuleSources(transformModule) {
           throw error;
         }
       }
-      const record = Object.freeze({code, changed: code !== original,
+      const record = Object.freeze({code, frontendHandled, changed: code !== original,
         bytes: code === original && Buffer.isBuffer(input) ? input : Buffer.from(code),
         originalHash: hash(input), contentHash: hash(code)});
       records.set(key, record);

@@ -5,6 +5,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 function printHelp() {
   console.log(`
@@ -31,6 +32,8 @@ Options:
   --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
   --output <path>       Output JSON file path (default: stdout)
   --package-root <url>  Base URL or directory for Three.js package fallback
+  --transform-module <file>  Project frontend module exporting synchronous transformModule
+                       Applies to graph analysis and --build-app, including package sources
   --help, -h            Show this help message
 `);
 }
@@ -56,6 +59,7 @@ async function main() {
   let entry = null;
   let output = null;
   let packageRoot = null;
+  let transformModulePath = null;
   let buildAppDir = null;
   let packHtmlFile = null;
   let specializeNumeric = false;
@@ -133,6 +137,12 @@ async function main() {
         process.exit(1);
       }
       packageRoot = args[++i];
+    } else if (arg === "--transform-module") {
+      if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
+        console.error("Error: --transform-module requires a frontend module path.");
+        process.exit(1);
+      }
+      transformModulePath = args[++i];
     } else if (!arg.startsWith("-") && !entry) {
       entry = arg;
     } else {
@@ -167,6 +177,7 @@ async function main() {
       maxMemoryPages !== undefined ||
       output ||
       packageRoot ||
+      transformModulePath ||
       !/\.gl(?:tf|b)$/i.test(entry))
   ) {
     console.error(
@@ -185,9 +196,9 @@ async function main() {
     );
     process.exit(1);
   }
-  if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot)) {
+  if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot || transformModulePath)) {
     console.error(
-      "Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output or --package-root.",
+      "Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output, --package-root or --transform-module.",
     );
     process.exit(1);
   }
@@ -203,10 +214,10 @@ async function main() {
 
   if (
     packHtmlFile &&
-    (buildKernelDir || !/\.html?$/i.test(entry) || (!buildAppDir && packageRoot))
+    (buildKernelDir || !/\.html?$/i.test(entry) || (!buildAppDir && (packageRoot || transformModulePath)))
   ) {
     console.error(
-      "Error: --pack-html requires an HTML entry and cannot be combined with --build-kernel; --package-root requires --build-app.",
+      "Error: --pack-html requires an HTML entry and cannot be combined with --build-kernel; --package-root and --transform-module require --build-app when packing.",
     );
     process.exit(1);
   }
@@ -315,6 +326,12 @@ async function main() {
   }
 
   try {
+    let transformModule;
+    if (transformModulePath) {
+      ({ transformModule } = await import(pathToFileURL(path.resolve(transformModulePath)).href));
+      if (typeof transformModule !== "function")
+        throw new TypeError("The --transform-module frontend must export a transformModule function");
+    }
     if (buildAnimationDir) {
       const { buildAnimation } = await import("./build_animation.mjs");
       const result = buildAnimation(entry, buildAnimationDir, { webgpu: animationWebGpu, threeScene: animationThreeScene });
@@ -350,6 +367,7 @@ async function main() {
       const { buildApplication } = await import("./build_application.mjs");
       const appResult = await buildApplication(entry, buildAppDir, {
         packageRootUrl: packageRoot,
+        transformModule,
         specializeNumeric: specializeNumeric ? { maxMemoryPages } : false,
         routeWebGPURenderer,
         routeWebGLRenderer,
@@ -409,6 +427,7 @@ async function main() {
     const { buildModuleGraph } = await import("./module_graph.mjs");
     const bundle = await buildModuleGraph(entry, {
       packageRootUrl: packageRoot,
+      transformModule,
     });
 
     const jsonStr = JSON.stringify(bundle, null, 2);

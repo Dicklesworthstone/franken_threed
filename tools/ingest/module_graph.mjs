@@ -237,6 +237,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       const targetType = imp.module_type ?? "javascript";
       const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
         mapBaseUrl,
+        _moduleSources: moduleSources,
         packageRootUrl: options.packageRootUrl,
         span: imp.sourceSpan,
       });
@@ -286,6 +287,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         try {
           resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
             mapBaseUrl,
+            _moduleSources: moduleSources,
             packageRootUrl: options.packageRootUrl,
             span: dyn.sourceSpan,
           });
@@ -341,6 +343,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           try {
             const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
               mapBaseUrl,
+              _moduleSources: moduleSources,
               packageRootUrl: options.packageRootUrl,
               span: dyn.sourceSpan,
             });
