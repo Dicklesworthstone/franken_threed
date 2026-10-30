@@ -380,6 +380,7 @@ export function createGpuRenderTarget(device, options = {}) {
         pair.views = []; pair.multisampleViews = [];
         for (const [index, attachmentFormat] of colorFormats.entries()) {
           const color = device.createTexture({label: `${label} color ${index}`, size, format: attachmentFormat,
+            ...(attachmentFormat.endsWith('-srgb') ? {viewFormats: [attachmentFormat.replace(/-srgb$/, '')]} : {}),
             dimension: volume ? '3d' : '2d', sampleCount: 1, mipLevelCount: pair.mipLevelCount, usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
           pair.colors.push(color);
           pair.views.push(color.createView({baseMipLevel: 0, mipLevelCount: 1, ...colorView(0)}));
@@ -434,6 +435,7 @@ export function createGpuRenderTarget(device, options = {}) {
   function allocateHistory(pair, index, w, h) {
     const size = {width: w, height: h, depthOrArrayLayers: 1}, attachmentFormat = colorFormats[index];
     const color = device.createTexture({label: `${label} history color ${index}`, size, format: attachmentFormat,
+      ...(attachmentFormat.endsWith('-srgb') ? {viewFormats: [attachmentFormat.replace(/-srgb$/, '')]} : {}),
       dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
     pair.historyColors.set(index, color); pair.historyViews.set(index, color.createView());
     if (sampleCount === 4) {

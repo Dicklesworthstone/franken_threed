@@ -23,7 +23,7 @@ function fixture() {
       if (textures.length === throwAt) throw new Error('allocation failed');
       assert.ok(d.size.every(x => x > 0));
       assert.ok([1, 4].includes(d.sampleCount));
-      assert.equal(d.usage, d.format.startsWith('depth') || d.label === 'f3d-canvas-preserved' ? 17 : 16);
+      assert.equal(d.usage, d.label === 'f3d-canvas-preserved' ? 21 : d.format.startsWith('depth') ? 17 : 16);
       const t = texture(d); textures.push(t); return t;
     },
     pushErrorScope(type) { scopes.push(type); },
@@ -95,7 +95,7 @@ test('preserved canvas uses one owned color history and copies raw texels into e
   const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas,
     {preserveDrawingBuffer: true, srgbView: false}), frames = [], sources = [];
   const configuration = f.calls.find(c => c[0] === 'configure')[1];
-  assert.equal(configuration.usage, 19); assert.deepEqual(configuration.viewFormats, []);
+  assert.equal(configuration.usage, 23); assert.deepEqual(configuration.viewFormats, []);
   for (let i = 0; i < 3; i++) target.withFrame((frame, source) => { frames.push(frame); sources.push(source); });
   assert.equal(new Set(frames.map(frame => frame.colorView.texture)).size, 1);
   assert.ok(frames.every(frame => frame.colorView.texture === sources[0]));

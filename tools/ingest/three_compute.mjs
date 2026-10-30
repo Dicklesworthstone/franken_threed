@@ -627,7 +627,10 @@ export function withThreeCompute(Base, THREE) {
      * This owner reuses the existing uploader and borrows target/storage images;
      * shader compilation does not initialize a compute pipeline or executor. */
     _getSampledTextureInputs() {
-      check(this);
+      // The owned texture adapter also serves WebGL-authored framebuffer maps;
+      // public compute entry points still enforce the native renderer surface.
+      if (this._shaderEncodedOutput) { if (this._disposed) fail('DISPOSED', 'Renderer is disposed'); }
+      else check(this);
       if (!this._device) fail('DEVICE', 'Initialize the renderer before capturing sampled texture inputs');
       return this._sampledTextureInputs ??= createThreeComputeTextures({storage: this._storageTextures,
         poolFactory: ({imageSnapshots, mediaSnapshots}) => createGpuThreeTextures(this._device, {three: THREE, imageSnapshots, mediaSnapshots,
@@ -635,7 +638,12 @@ export function withThreeCompute(Base, THREE) {
         targetFactory: () => createThreeComputeTargets({targets: this._targets, device: this._device,
           signal: this._targetLifetime.signal}),
         framebufferFactory: () => createThreeFramebufferTextures({three: THREE, device: this._device,
-          getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal}),
+          getFormat: () => this._framebufferFormat(), signal: this._targetLifetime.signal, webgl: this._shaderEncodedOutput === true,
+          submitInitialization: request => {
+            if (this._webglSubmissionDepth > 0 || !this._drain && !this._preparing && !this._pending.length) {
+              try { request.issue(); } finally { this._releaseRequest(request); }
+            } else this._enqueue(request);
+          }}),
         depthFactory: () => createThreeDepthTextures({three: THREE, device: this._device,
           getSamples: () => this.currentSamples, signal: this._targetLifetime.signal})});
     }

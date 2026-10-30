@@ -310,6 +310,48 @@ empty loads, changed dimensions, same-size `setSize` and same-value pixel ratio.
 There were zero GPU/browser errors. These are rendering-correctness results,
 not physical-device performance measurements.
 
+## WebGL-authored framebuffer snapshots
+
+`renderer.copyFramebufferToTexture(texture, position = null, level = 0)` now
+copies post-render color into an ordinary `THREE.FramebufferTexture` on the
+WebGL-authored route. Later MeshBasicMaterial maps and ShaderMaterial samplers
+read the same owned GPU image. Canvas and admitted render-target sources retain
+their selected face/layer and mip; `level` selects the destination mip. Positions
+use physical bottom-left pixels and only their `x`/`y` fields, while the copy
+extent comes from the destination image at that mip.
+
+Copies preserve the destination's public type and versions. The admitted RGBA
+channel precision and storage color encoding must match the source: byte color,
+half-float color or float color, with matching linear/sRGB storage. Native BGRA
+canvas storage is copied as RGBA channels. Integer-coordinate
+GPU texel reads preserve the source row convention and raw encoded values without
+CPU readback, tone mapping or a second color conversion.
+
+Producer draws, copies, requested mip initialization and consumers share the
+existing submission queue. A queued consumer retains its original framebuffer
+generation when later calls replace that allocation. The owner captures only
+its private generations; it does not traverse application metadata to find them.
+Explicit borrowed texture bindings retain precedence. Copies do not regenerate
+lower mip levels; source-requested initialization generates them before its copy.
+
+The destination's `onUpdate` runs synchronously during requested initialization.
+It can change the selected source target or prevent the copy by throwing; copy
+position and extent retain their earlier source reads. Acknowledged texture
+versions follow the source, including a version change inside that callback.
+This does not admit copies from inside draw callbacks, including Lensflare's
+occlusion sequence. WebGL depth snapshots, unmatched color precision/encoding and the
+whole-image linear HDR fallback also retain explicit admission errors.
+
+`three_renderer_program_framebuffer_copy.test.mjs` has ten focused cases for
+ordering, generation lifetime, callback effects, source versions, mip timing and
+format refusal. The affected framebuffer, canvas and target suites pass 174
+additional checks. `node tests/e2e/webgpu_renderer/program_framebuffer_copy.mjs`
+matches 15 source checkpoints and all 46,080 RGBA bytes exactly in Chromium
+151.0.7922.34 / SwiftShader, with zero GPU/browser errors. This includes ordinary
+material consumption, two producer-copy-consumer chains without intervening
+waits, source resize, cube/array selection, matching half-float storage, raw sRGB
+copies and initialization retargeting. No hardware-performance claim is made.
+
 ## Explicit differences
 
 - Structural edits (new objects/materials, material structure, enabling fog,

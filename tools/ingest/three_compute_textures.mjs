@@ -568,6 +568,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       } finally { resolving = false; if (poolDirty) syncPool(); }
     },
     prepareFramebuffer(texture, type) { live(); if (!isDetachedDepth({texture})) framebuffers().prepareFramebuffer(texture, type); },
+    framebufferBinding(texture, options) { live(); return framebuffers().binding(texture, options); },
+    captureFramebufferBindings() { live(); return framebufferInputs?.captureProgramBindings() ?? null; },
     captureFramebuffer(texture, options) {
       live(); return (isDetachedDepth({texture}) ? depths() : framebuffers()).captureFramebuffer(texture, options);
     },

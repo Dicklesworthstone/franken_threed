@@ -17,6 +17,7 @@ const owners = new WeakMap();
 const RENDER_ATTACHMENT = 16;
 const COPY_SRC = 1;
 const COPY_DST = 2;
+const TEXTURE_BINDING = 4;
 
 export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
@@ -143,7 +144,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
           if (preserveDrawingBuffer) {
             next.preserved = device.createTexture({size: [w, h], sampleCount: 1,
               format: canvasFormat, viewFormats: srgbView ? [format] : [],
-              usage: RENDER_ATTACHMENT | COPY_SRC, label: 'f3d-canvas-preserved'});
+              usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING, label: 'f3d-canvas-preserved'});
             next.preservedView = next.preserved.createView({format});
           }
         }
@@ -279,7 +280,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     exclusive(() => {
       checked(() => {
         configured = true;
-        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC | (preserveDrawingBuffer ? COPY_DST : 0),
+        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING | (preserveDrawingBuffer ? COPY_DST : 0),
           alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : [], toneMapping: {mode: toneMappingMode}});
       });
       resize(initialWidth, initialHeight);

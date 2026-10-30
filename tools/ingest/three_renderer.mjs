@@ -210,7 +210,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
               backgroundState: passOptions?.backgroundState, materialFrame: passOptions?.materialFrame,
-              textures: owner._targets.bindingsFor(destination === owner ? null : destination.target, sceneLimits.textures),
+              textures: owner._targets.bindingsFor(destination === owner ? null : destination.target,
+                owner._shaderEncodedOutput ? owner._framebufferBindings(sceneLimits.textures) : sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
@@ -649,36 +650,73 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!this._shaderEncodedOutput && this.needsFrameBufferTarget) this._nativeFramebufferOutput = true;
       return this._wantsHdr(this._toneMapping()) ? this._outputBufferFormat() : this._preferredFormat ?? 'bgra8unorm';
     }
-    copyFramebufferToTexture(texture, rectangle = null) {
+    _framebufferBindings(retained = new Map()) {
+      if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
+      const renderer = this;
+      return new class extends Map {
+        has(texture) { return texture?.isFramebufferTexture === true || retained.has(texture); }
+        get(texture) {
+          if (retained.has(texture)) return retained.get(texture);
+          return texture?.isFramebufferTexture === true
+            ? renderer._getSampledTextureInputs().framebufferBinding(texture, {initialize: renderer._webglSubmissionDepth > 0,
+              snapshot: renderer._programFramebufferFrame?.bindings.get(texture) ?? null})
+            : retained.get(texture);
+        }
+      }();
+    }
+    _captureFramebufferBindings() {
+      if (!this._shaderEncodedOutput) return null;
+      const owner = this._sampledTextureInputs, bindings = owner?.captureFramebufferBindings();
+      // Snapshot only the private generations already admitted by this owner.
+      // Ordinary materials/custom properties must not be traversed or observed.
+      return bindings?.size ? {owner, bindings} : null;
+    }
+    copyFramebufferToTexture(texture, rectangle = null, level = 0) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!this._initialized) fail('SOURCE', 'Initialize the renderer before copying its framebuffer');
-      if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Public framebuffer copies require the native WebGPU route');
+      const webgl = this._shaderEncodedOutput === true;
+      if (webgl && this._webglSubmissionDepth > 0)
+        fail('UNSUPPORTED', 'WebGL framebuffer copies inside rendering callbacks require draw-boundary interleaving');
       const depth = texture instanceof THREE.DepthTexture && texture.isDepthTexture === true;
       if (!(texture instanceof THREE.FramebufferTexture) && !depth)
         fail('SOURCE', 'Expected a source FramebufferTexture or detached DepthTexture');
+      if (webgl && depth) fail('UNSUPPORTED', 'WebGL framebuffer snapshots currently require a color FramebufferTexture');
       if (depth) {
         const shape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
         if (this._activeMipmapLevel !== 0 || shape && (shape.cube || shape.array || shape.volume))
           fail('COPY', 'Depth framebuffer snapshots require base-level ordinary 2D attachments');
       }
       let region;
-      if (rectangle === null) region = [0, 0, texture.image.width, texture.image.height];
+      if (webgl) {
+        if (!Number.isSafeInteger(level) || level < 0 || level > 31) fail('COPY', 'Expected a non-negative destination mip level');
+        region = [rectangle === null ? 0 : Math.trunc(rectangle.x), rectangle === null ? 0 : Math.trunc(rectangle.y),
+          Math.floor(texture.image.width / 2 ** level), Math.floor(texture.image.height / 2 ** level)];
+        if (!region.every(Number.isSafeInteger) || region[0] < 0 || region[1] < 0 || region[2] < 1 || region[3] < 1)
+          fail('COPY', 'Framebuffer copy coordinates and mip extent must fit the source');
+      }
+      else if (rectangle === null) region = [0, 0, texture.image.width, texture.image.height];
       else if (rectangle.isVector2) region = [rectangle.x, rectangle.y, texture.image.width, texture.image.height].map(Math.floor);
       else if (rectangle.isVector4) region = [rectangle.x, rectangle.y, rectangle.z, rectangle.w].map(Math.floor);
       else { (THREE.error ?? console.error)('Renderer.copyFramebufferToTexture: Invalid rectangle.'); return; }
       const textures = this._getSampledTextureInputs();
       textures.prepareFramebuffer(texture, this._renderTarget?.texture.type ?? THREE.UnsignedByteType);
+      // WebGL initializes the destination before choosing its read framebuffer:
+      // onUpdate can throw or change the current target. Keep the earlier extent.
+      if (webgl && !this._renderTarget && this._wantsHdr(this._toneMapping()))
+        fail('UNSUPPORTED', 'WebGL framebuffer copies require encoded canvas color, unavailable in the HDR fallback');
       const format = depth ? undefined : this._framebufferFormat();
       const source = !this._nodeFramebufferCopyRecorder && this._renderTarget
         ? this._targets.capture(this._renderTarget) : null;
-      const [width, height] = source ? [source.shape.width, source.shape.height] : this._bufferSize();
+      const sourceLevel = webgl ? this._activeMipmapLevel : 0, sourceFace = webgl ? this._activeCubeFace : 0;
+      const [width, height] = source ? [Math.max(1, source.shape.width >> sourceLevel), Math.max(1, source.shape.height >> sourceLevel)] : this._bufferSize();
       const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement;
       if (!this._nodeFramebufferCopyRecorder &&
           (region[0] + region[2] > width || region[1] + region[3] > height))
         fail('COPY', 'Framebuffer copy rectangle exceeds the selected source');
       const lease = textures.captureFramebuffer(texture, {format,
-        rectangle: {x: region[0], y: region[1], z: region[2], w: region[3]}});
+        rectangle: {x: region[0], y: region[1], z: region[2], w: region[3]},
+        ...(webgl ? {level, sourceLevel, sourceFace} : {})});
       if (this._nodeFramebufferCopyRecorder) {
         try { this._nodeFramebufferCopyRecorder(Object.freeze({lease})); }
         catch (error) { textures.release(lease); throw error; }
@@ -974,6 +1012,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true}});
+        request.programTextures = this._captureFramebufferBindings();
         request.releaseDestination = destination === this ? null : this._targets.retainGeneration(destination);
         request.releaseCanvas = this._canvases.retain(canvasTarget, canvas);
         return request;
@@ -1163,6 +1202,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _releaseRequest(request) {
       request.releaseFramebuffer?.(); request.releaseFramebuffer = null;
+      if (request.programTextures) {
+        for (const lease of request.programTextures.bindings.values()) request.programTextures.owner.release(lease);
+        request.programTextures = null;
+      }
       request.snapshot?.release();
       if (request.materialFrame) {
         this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
@@ -1197,7 +1240,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, clearOnly, outputPass = false, initializeOutputDepth = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1211,6 +1254,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         entry.bridge.assertNativePrepared(nodeFrame);
       }
       const previous = this._programFrame;
+      const previousFramebufferFrame = this._programFramebufferFrame;
+      this._programFramebufferFrame = programTextures;
+      const previousSubmissionDepth = this._webglSubmissionDepth ?? 0;
+      if (this._shaderEncodedOutput) this._webglSubmissionDepth = previousSubmissionDepth + 1;
       const occlusion = nodeFrame && !clearOnly ? this._occlusionQueries?.begin(this._occlusionContexts.get(nodeFrame),
         {requested: nodeFrame.occlusionRequested, arrayCamera: camera.isArrayCamera === true && camera.cameras.length > 0}) : null;
       if (occlusion) frame = {...frame, occlusion};
@@ -1257,7 +1304,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         } else readStorage();
         occlusion?.commit();
       } catch (error) { occlusion?.cancel(); throw error; }
-      finally { this._programFrame = previous; }
+      finally { this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth; }
       if (initializeOutputDepth) this._targetDepthInitialized.add(initializeOutputDepth);
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
       if (d) {
@@ -1429,6 +1476,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (textureReady) await textureReady;
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         const previous = this._programFrame, previousRoot = destination._preparationRoot;
+        const previousFramebufferFrame = this._programFramebufferFrame;
+        this._programFramebufferFrame = request?.programTextures;
         const previousOptions = destination._preparationOptions;
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
@@ -1491,7 +1540,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           };
           if (captured?.compileAttributes) await captured.compileAttributes(prepare);
           else { captured?.prepareAttributes?.(); await prepare(); }
-        } finally { this._programFrame = previous; destination._preparationRoot = previousRoot; destination._preparationOptions = previousOptions; }
+        } finally { this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; destination._preparationRoot = previousRoot; destination._preparationOptions = previousOptions; }
       });
       this._preparing = run;
       run.finally(() => { if (this._preparing === run) this._preparing = null; }).catch(() => {});
