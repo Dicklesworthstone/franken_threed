@@ -72,7 +72,7 @@ const topologyOf = (object, material) => object.isPoints === true ? 'points'
 const primitiveLayout = (object, material) => {
   const topology = topologyOf(object, material), index = object.geometry.index;
   return {topology, stripIndexFormat: topology === 'line-strip' && index
-    ? index.array instanceof Uint32Array ? 'uint32' : 'uint16' : null,
+    ? index.array instanceof Uint16Array ? 'uint16' : 'uint32' : null,
     wireframe: object.isMesh === true && material.wireframe === true};
 };
 // These source material accessors lower to ordinary 2D texture bindings. AO and

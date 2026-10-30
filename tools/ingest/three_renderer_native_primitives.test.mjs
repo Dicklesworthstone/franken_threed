@@ -168,6 +168,47 @@ test('queued indexed strips retain each captured index width and source upload b
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+test('queued byte-indexed strips widen without losing captured versions or native vertex 255', async t => {
+  const f = fixture(t), material = new T.LineBasicNodeMaterial(), source = geometry(Uint8Array);
+  source.setAttribute('position', new T.BufferAttribute(new Float32Array(256 * 3), 3));
+  source.index.array.set([0, 1, 255, 3]);
+  const object = new T.Line(source, material); object.frustumCulled = false; f.scene.add(object);
+  const bytes = source.index.array;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  bytes.set([3, 255, 1, 0]); source.index.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  source.setIndex(new T.BufferAttribute(new Uint16Array([1, 0, 3, 2]), 1)); f.renderer.render(f.scene, f.camera);
+  bytes.fill(73); source.index.array.fill(73); await f.renderer.waitForGPU();
+  const draws = f.device.snapshots.flat().filter(draw => draw.pipeline.primitive.topology === 'line-strip');
+  assert.deepEqual(draws.map(draw => [draw.index.format, draw.pipeline.primitive.stripIndexFormat]),
+    [['uint32', 'uint32'], ['uint32', 'uint32'], ['uint16', 'uint16']]);
+  assert.deepEqual(draws.map(draw => {
+    const data = draw.contents.get(draw.index.buffer), Type = draw.index.format === 'uint16' ? Uint16Array : Uint32Array;
+    return [...new Type(data.buffer, data.byteOffset, 4)];
+  }), [[0, 1, 255, 3], [3, 255, 1, 0], [1, 0, 3, 2]]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const Material of [T.MeshBasicMaterial, T.MeshLambertMaterial, T.MeshPhongMaterial])
+test(`ordinary ${Material.name} byte indices use native vertex 255 and immutable queued uploads`, async t => {
+  const f = fixture(t), source = geometry();
+  source.setAttribute('position', new T.BufferAttribute(new Float32Array(256 * 3), 3));
+  source.setIndex(new T.BufferAttribute(new Uint8Array([0, 1, 255]), 1));
+  const object = new T.Mesh(source, new Material()); object.frustumCulled = false; f.scene.add(object);
+  const bytes = source.index.array;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  assert.ok(f.captures.at(-1).draws.find(draw => draw.object === object)?.binding.nodeProgram,
+    'ordinary byte-index materials must reach the source WebGPU owner');
+  bytes.set([255, 1, 0]); source.index.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  bytes.fill(73); await f.renderer.waitForGPU();
+  const draws = f.device.snapshots.flat().filter(draw => draw.index && draw.streams.size);
+  assert.deepEqual(draws.map(draw => draw.index.format), ['uint32', 'uint32']);
+  assert.deepEqual(draws.map(draw => {
+    const data = draw.contents.get(draw.index.buffer);
+    return [...new Uint32Array(data.buffer, data.byteOffset, 3)];
+  }), [[0, 1, 255], [255, 1, 0]]);
+  assert.equal(source.index.array, bytes); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('sized point sprites retain source instancing and live viewport, pixel ratio and size uniforms', async t => {
   const f = fixture(t), material = new T.PointsNodeMaterial();
   material.sizeNode = N.uniform(new T.Vector2(7, 11)).setName('spritePointSize');

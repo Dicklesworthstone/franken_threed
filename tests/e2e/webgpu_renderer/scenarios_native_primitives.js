@@ -3,6 +3,8 @@ import {Line2} from '../../../upstream/three.js/examples/jsm/lines/webgpu/Line2.
 import {LineSegments2} from '../../../upstream/three.js/examples/jsm/lines/webgpu/LineSegments2.js';
 import {LineGeometry} from '../../../upstream/three.js/examples/jsm/lines/LineGeometry.js';
 import {LineSegmentsGeometry} from '../../../upstream/three.js/examples/jsm/lines/LineSegmentsGeometry.js';
+import {GLTFLoader} from '../../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js';
+import {byteIndexedGLB} from '../../../tools/ingest/fixtures/gltf_byte_indices.mjs';
 
 function camera(T, orthographic = false) {
   const result = orthographic ? new T.OrthographicCamera(-2.4, 2.4, 1.8, -1.8, .1, 50)
@@ -133,6 +135,62 @@ function wideLines(T, renderer, multisampled) {
   return {scene: world, camera: view};
 }
 export const nativePrimitiveScenarios = {
+  native_gltf_byte_indices(T, renderer) {
+    const world = new T.Scene(); world.background = new T.Color(0x182435);
+    const view = camera(T, true), compile = renderer.compileAsync.bind(renderer);
+    let mesh, line, currentFrame = 0;
+    // Load the same real GLB through the retained source loader before either
+    // renderer compiles. No geometry/index substitute participates in this case.
+    renderer.compileAsync = async (...args) => {
+      if (!mesh) {
+        const asset = await new GLTFLoader().parseAsync(byteIndexedGLB(), '');
+        mesh = asset.scene.children[0];
+        if (!(mesh.geometry.index.array instanceof Uint8Array)) throw Error('GLTFLoader did not retain the byte accessor');
+        mesh.position.set(-.95, .2, 0); world.add(mesh);
+        line = new T.Line(mesh.geometry.clone(), new T.LineBasicNodeMaterial({vertexColors: true}));
+        line.position.set(.95, .2, 0); world.add(line);
+        // Vertex 255 is a legal native byte index; source WebGPU widens it as
+        // an ordinary vertex. A fixed-restart conversion would erase this line.
+        const vertices = new Float32Array(256 * 3);
+        vertices.set([-1.8, -1.15, 0], 0); vertices.set([1.8, -1.15, 0], 255 * 3);
+        const edge = new T.BufferGeometry().setAttribute('position', new T.BufferAttribute(vertices, 3));
+        edge.setIndex(new T.BufferAttribute(new Uint8Array([0, 255]), 1));
+        world.add(new T.Line(edge, new T.LineBasicMaterial({color: 0x80e1ff})));
+      }
+      return compile(...args);
+    };
+    installChanges(renderer, frame => {
+      currentFrame = frame;
+      if (frame === 8) for (const object of [mesh, line]) {
+        object.geometry.index.array.set([0, 1, 2, 0, 0, 0]); object.geometry.index.needsUpdate = true;
+      }
+      if (frame === 10) for (const object of [mesh, line]) {
+        const index = object.geometry.index;
+        index.array.set([0, 2, 3], 3); index.addUpdateRange(3, 3); index.needsUpdate = true;
+      }
+      if (frame === 12) {
+        mesh.material.wireframe = true; mesh.material.needsUpdate = true;
+      }
+      if (frame === 13) {
+        mesh.material.wireframe = false; mesh.material.needsUpdate = true;
+        mesh.geometry.setIndex(new T.BufferAttribute(new Uint8Array([3, 2, 1, 3, 1, 0]), 1));
+        line.geometry.setIndex(new T.BufferAttribute(new Uint16Array([3, 2, 1, 0]), 1));
+      }
+    });
+    const render = renderer.render.bind(renderer);
+    renderer.render = (...args) => {
+      try { return render(...args); }
+      catch (error) { throw new Error(`Byte-index GLB frame ${currentFrame}: ${error.message}`, {cause: error}); }
+    };
+    const read = renderer.readRenderTargetPixelsAsync.bind(renderer);
+    renderer.readRenderTargetPixelsAsync = async (...args) => {
+      const pixels = await read(...args), colors = new Set();
+      for (let i = 0; i < pixels.length; i += 4) colors.add((pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2]);
+      if (colors.size < 16) throw Error(`Byte-index GLB frame ${currentFrame} did not draw the colored asset`);
+      return pixels;
+    };
+    return {scene: world, camera: view};
+  },
   native_wide_lines(T, renderer) { return wideLines(T, renderer, false); },
   native_wide_lines_msaa(T, renderer) { return wideLines(T, renderer, true); },
   native_indirect_vertex_alias(T, renderer) { return indirectVertexAlias(T, renderer, false); },

@@ -1,6 +1,6 @@
 /** Mutable CPU-authored BufferGeometry residency for the explicit GPU renderer.
  *
- * Float32 position/normal/tangent/uv/RGB(A) streams and Uint16/Uint32 indices are
+ * Float32 position/normal/tangent/uv/RGB(A) streams and Uint8/Uint16/Uint32 indices are
  * borrowed from ordinary Three.js BufferGeometry objects. Interleaved attributes
  * share one upload history, GPU allocation and vertex slot. Float32 streams are
  * uploaded byte-for-byte. Other element types (8/16/32-bit integers, normalized
@@ -9,6 +9,8 @@
  * non-normalized integers as their value, halves decoded exactly; each stays
  * one f32 per element, so strides/offsets and upload ranges keep element units.
  * The converted shadow is the GPU-visible history; no source array is replaced.
+ * Byte indices widen into uint32 storage. WebGL's fixed restart value 255 maps
+ * to 0xffffffff; native WebGPU keeps 255 as a vertex, matching its source upload.
  *
  * update() observes the pinned WebGLAttributes upload contract, NOT arbitrary
  * CPU edits: first use uploads all bytes without clearing ranges; later uploads
@@ -100,6 +102,16 @@ function integerConversionOf(array, scalar) {
   if (!type || type[0] === Uint8ClampedArray) fail('FORMAT', 'Integer attributes require 8/16/32-bit integer storage');
   return {key: `int:${type[0].name}:${scalar}`, element: v => v, integer: scalar === 'uint' ? Uint32Array : Int32Array};
 }
+function indexProfile(array, attributeTypes = 'webgl') {
+  if (array instanceof Uint8Array) return {format: 'uint32', bytes: 4,
+    conversion: {key: `index:Uint8Array:${attributeTypes}`, integer: Uint32Array,
+      // WebGL2 enables fixed-index restart for every indexed topology. The
+      // pinned WebGPU uploader widens bytes without interpreting 255 as restart.
+      element: attributeTypes === 'webgpu' ? v => v : v => v === 255 ? 0xffffffff : v}};
+  if (array instanceof Uint16Array) return {format: 'uint16', bytes: 2, conversion: null};
+  if (array instanceof Uint32Array) return {format: 'uint32', bytes: 4, conversion: null};
+  fail('FORMAT', 'Indices require Uint8Array, Uint16Array or Uint32Array');
+}
 const halfView = new DataView(new ArrayBuffer(4));
 function halfToFloat(h) {
   const sign = h & 0x8000 ? -1 : 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
@@ -151,11 +163,11 @@ function describe(geometry, device) {
       owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [],
         requiredBytes: indexCount * 4, conversion: null, borrowed});
     } else {
-      if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-      indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+      const profile = indexProfile(source.kind);
+      indexFormat = profile.format;
       indexCount = integer(index.count, 0, source.length, 'index count');
       if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+      owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * profile.bytes, conversion: profile.conversion});
     }
   }
   const streams = [...owners.values()].filter(e => e.stride !== 0);
@@ -528,11 +540,11 @@ function describeProgram(program, attributeTypes) {
         if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
         owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * 4, conversion: null, borrowed});
       } else {
-        if (!(source.kind instanceof Uint16Array) && !(source.kind instanceof Uint32Array)) fail('FORMAT', 'Indices require Uint16Array or Uint32Array');
-        indexOwner = index; indexFormat = source.kind instanceof Uint16Array ? 'uint16' : 'uint32';
+        const profile = indexProfile(source.kind, attributeTypes);
+        indexOwner = index; indexFormat = profile.format;
         indexCount = integer(index.count, 0, source.length, 'index count');
         if (owners.has(index)) fail('SHAPE', 'Index and vertex source identities must be distinct');
-        owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * source.kind.BYTES_PER_ELEMENT, conversion: null});
+        owners.set(index, {owner: index, array: source.array, source, stride: 0, attributes: [], requiredBytes: indexCount * profile.bytes, conversion: profile.conversion});
       }
     }
     const streams = [...owners.values()].filter(e => e.stride !== 0);

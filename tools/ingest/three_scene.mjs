@@ -818,7 +818,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       const raster=programSupport.raster(m,{side,topology});
       const options={program:compiled.program,textures:bindings,raster,topology,
-        ...(topology==='line-strip'&&programSource(object).index?{stripIndexFormat:programSource(object).index.array instanceof Uint32Array?'uint32':'uint16'}:{})};
+        ...(topology==='line-strip'&&programSource(object).index?{stripIndexFormat:programSource(object).index.array instanceof Uint16Array?'uint16':'uint32'}:{})};
       const structural=[epoch,'program',compiled.key,topology,side,JSON.stringify(raster),...textureKey];
       return {options,values:{},structural,clipped:null,program:compiled,programTextures:sourceTextures,programSide:side,programEnv:{envMap,envMapRotation},compileOptions,refreshOptions};
     });

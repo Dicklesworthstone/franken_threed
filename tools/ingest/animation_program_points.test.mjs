@@ -58,7 +58,7 @@ function fixture(t, {data = [4,5,1,1,2,0], C = Uint16Array, vertices = 8, indexe
   return {device, gpu, source, owner, add, stage, render, cache, buffers, pipelines, uploads, encoded};
 }
 const ids = ({events}) => events.flatMap(({args: [, count, , first]}) => Array.from({length: count}, (_, i) => first + i));
-for (const C of [Uint16Array, Uint32Array]) for (const bundled of [false, true]) {
+for (const C of [Uint8Array, Uint16Array, Uint32Array]) for (const bundled of [false, true]) {
   test(`${C.name}/${bundled ? 'bundled' : 'direct'}: indexed particles preserve IDs, duplicates and order`, async t => {
     const f = fixture(t, {C}), r = await f.add(), c = f.stage(r), before = [f.buffers.length, f.uploads.length];
     assert.deepEqual(c.program.pointRuns, [4,2,1,1,1,2,0,1]); assert.equal(c.pointCount, 6);
@@ -71,8 +71,8 @@ for (const C of [Uint16Array, Uint32Array]) for (const bundled of [false, true])
     assert.equal(c.vertexBuffers[0], programGeometrySnapshot(f.gpu, f.device).vertexBuffers[0]);
   });
 }
-for (const C of [Uint16Array, Uint32Array]) {
-  const restart = C === Uint16Array ? 65535 : 4294967295;
+for (const C of [Uint8Array, Uint16Array, Uint32Array]) {
+  const restart = 2 ** (8 * C.BYTES_PER_ELEMENT) - 1;
   test(`${C.name}: fixed-index restart values never become point IDs`, async t => {
     const f = fixture(t, {C, data: [restart,0,1,restart,2,3,restart]}), r = await f.add();
     const c = f.stage(r); assert.deepEqual(c.program.pointRuns, [0,2,2,2]);

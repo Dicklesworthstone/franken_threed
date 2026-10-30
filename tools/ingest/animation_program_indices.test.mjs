@@ -38,7 +38,7 @@ function fixture(t, {data = [0,1,2,3,4,5], C = Uint16Array, indexed = true, maxB
     breakMapping() { failMapping = true; }};
 }
 const words = c => c.indexBuffer ? [...new Uint32Array(c.indexBuffer.bytes.buffer)].slice(c.first, c.first + c.count) : [];
-for (const indexed of [false, true]) for (const C of [Uint16Array, Uint32Array]) {
+for (const indexed of [false, true]) for (const C of [Uint8Array, Uint16Array, Uint32Array]) {
   for (const [topology, expected] of [['triangles', [2,0,1,5,3,4]], ['lines', [1,0,3,2,5,4]], ['line-strip', [1,0,2,1,3,2,4,3,5,4]]]) {
     test(`${topology}/${C.name}/${indexed}: preserves primitive order and last-vertex values`, async t => {
       const f = fixture(t, {indexed, C}); const r = await f.add(topology); f.owner.begin(); const c = f.stage(r);
@@ -48,8 +48,8 @@ for (const indexed of [false, true]) for (const C of [Uint16Array, Uint32Array])
     });
   }
 }
-for (const C of [Uint16Array, Uint32Array]) {
-  const restart = C === Uint16Array ? 65535 : 4294967295;
+for (const C of [Uint8Array, Uint16Array, Uint32Array]) {
+  const restart = 2 ** (8 * C.BYTES_PER_ELEMENT) - 1;
   for (const [topology, expected] of [['triangles', [2,0,1,6,4,5]], ['lines', [1,0,5,4,7,6]], ['line-strip', [1,0,2,1,5,4,6,5,7,6]]]) {
     test(`${C.name}/${topology}: restart markers do not become vertices or bridge strips`, async t => {
       const f = fixture(t, {C, data: [restart,0,1,2,restart,restart,4,5,6,7,restart,9]}); const r = await f.add(topology);

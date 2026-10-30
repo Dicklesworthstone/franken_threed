@@ -164,6 +164,18 @@ test('native shadow intent promotes default mesh materials without changing fixe
     assert.deepEqual(result.draws.map(draw => draw.object), [ordinary, native]);
   }
 });
+test('ordinary byte-indexed assets select native capture and share native shadow ownership', t => {
+  for (const shadows of [false, true]) {
+    const f = rig(t); f.renderer.shadowMap = {enabled: shadows};
+    const asset = f.mesh(new THREE.MeshBasicMaterial()), companion = f.mesh(new THREE.MeshBasicMaterial());
+    asset.geometry.setIndex(new THREE.BufferAttribute(new Uint8Array([0, 1, 2, 0, 2, 3]), 1));
+    const source = asset.geometry.index.array, captured = f.capture({uniforms: false});
+    assert.ok(captured.objects.has(asset)); assert.equal(captured.objects.has(companion), shadows);
+    assert.equal(captured.bindings.length, shadows ? 2 : 1);
+    assert.equal(captured.bindings[0].material, asset.material); assert.equal(asset.material.colorNode, undefined);
+    assert.equal(asset.geometry.index.array, source); assert.equal(captured.draws.length, 0);
+  }
+});
 test('unsupported mixed shadow materials are re-admitted before updates when they become visible', t => {
   const f = rig(t); f.renderer.shadowMap = {enabled: true};
   const material = f.material(); let updates = 0;

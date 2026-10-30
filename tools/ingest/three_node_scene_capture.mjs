@@ -169,6 +169,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         (renderer.shadowMap.type === three.VSMShadowMap || renderer.shadowMap.transmitted === true || object.shadow?.shadowNode != null)) &&
         object.castShadow === true && object.layers.test(camera.layers) ||
         object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
+        object.geometry?.index?.array instanceof Uint8Array ||
         (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
           nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material) ||
           material instanceof three.NodeMaterial || material?.isShadowMaterial === true)));
@@ -229,7 +230,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const spriteMesh = (object.isMesh === true || object.isSprite === true) && effective.some(material =>
       object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
       material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true);
-    if (!bundle && !instancedGeometry && !batch && !spriteMesh && object.geometry?.indirect == null && !effective.some(nativeMaterial)) continue;
+    // Source WebGPU widens byte indices with 255 as an ordinary vertex. The
+    // native geometry owner also captures their queued per-use upload history;
+    // the fixed/GL owner instead interprets 255 as a primitive restart marker.
+    const byteIndices = object.geometry?.index?.array instanceof Uint8Array;
+    if (!bundle && !instancedGeometry && !batch && !spriteMesh && !byteIndices && object.geometry?.indirect == null && !effective.some(nativeMaterial)) continue;
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;

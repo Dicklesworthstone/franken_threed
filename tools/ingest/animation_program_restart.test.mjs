@@ -36,9 +36,9 @@ function values(c) {
   const C = c.indexFormat === 'uint16' ? Uint16Array : Uint32Array;
   return [...new C(c.indexBuffer.bytes.buffer)].slice(c.first, c.first + c.count);
 }
-for (const C of [Uint16Array, Uint32Array]) for (const topology of ['triangles', 'lines', 'points']) {
+for (const C of [Uint8Array, Uint16Array, Uint32Array]) for (const topology of ['triangles', 'lines', 'points']) {
   test(`${C.name}/${topology}: smooth indexed lists split at fixed restart markers`, async t => {
-    const restart = C === Uint16Array ? 65535 : 4294967295;
+    const restart = 2 ** (8 * C.BYTES_PER_ELEMENT) - 1;
     const f = fixture(t, {C, data: [restart,0,1,2,restart,3,4,5,6,restart]}), r = await f.add(topology);
     const c = f.stage(r);
     assert.deepEqual(values(c), topology === 'triangles' ? [0,1,2,3,4,5] : topology === 'lines' ? [0,1,3,4,5,6] : [0,1,2,3,4,5,6]);
