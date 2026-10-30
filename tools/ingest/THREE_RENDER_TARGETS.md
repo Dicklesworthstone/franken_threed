@@ -168,7 +168,10 @@ depth storage, allocated lazily within the shared budget. Queued draws and clear
 retain their selected level. See
 [THREE_RENDER_TARGET_MIP_SELECTION.md](./THREE_RENDER_TARGET_MIP_SELECTION.md)
 for viewport/scissor behavior, read/copy ordering and the explicit restrictions
-on MSAA, sampled depth and the WebGL facade.
+on MSAA and sampled depth. The WebGL-compatible facade also renders and clears
+complete authored 2D and WebGL cube pyramids under that document's color-only,
+single-sample profile. It preserves physical WebGL viewport/scissor dimensions;
+applications must set a viewport that fits the selected level.
 
 On the WebGL-compatible surface, each target owns independent shader-program
 state. Intermediate passes disable renderer tone mapping and emit linear values;
@@ -438,8 +441,9 @@ They do not execute GPU shaders or establish browser pixel parity or speedups.
 ## Remaining gaps and verification
 
 Public MRT, native cube, array and 3D readback do not close all target rendering
-and sampling contracts. Source `WebGLCubeRenderTarget` remains outside this
-profile. Nonzero mip rendering retains the restrictions above. Shader programs retain their
+and sampling contracts. Source `WebGLCubeRenderTarget` authored mip rendering
+retains the bounded WebGL profile above. Nonzero mip rendering retains the other
+restrictions above. Shader programs retain their
 explicit unsupported-feature errors. Mesh-root, offscreen shader and small-pass
 capture support remove postprocessing blockers but do not establish complete
 EffectComposer compatibility, effect parity or arbitrary scene snapshots.

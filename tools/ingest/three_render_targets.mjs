@@ -221,8 +221,12 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   const generateMipmaps = texture.generateMipmaps;
   const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(width, height, volume ? layers : 1)));
   if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
-  if (webglCube && texture.mipmaps?.length)
-    fail('UNSUPPORTED', 'WebGL cube targets currently require automatic mip generation rather than authored levels');
+  const authoredMipLevelCount = texture.mipmaps?.length ?? 0;
+  // WebGLTextures.setupRenderTarget counts the base image in an authored cube
+  // chain. A partial chain with mip filtering is incomplete in GL, unlike a
+  // WebGPU sampler clamped to the available levels. Admit complete chains only.
+  if (webglCube && authoredMipLevelCount && authoredMipLevelCount !== maximumMipLevels)
+    fail('UNSUPPORTED', 'Authored WebGL cube targets require a complete mip chain including the base level');
   // Source Textures.getMipLevels uses authored descriptors before automatic
   // generation. Uncompressed CubeTexture descriptors omit the base level:
   // Textures.updateTexture adds it separately. Render-target descriptors
@@ -248,12 +252,13 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
     (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
-  return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps, mipLevelCount, float32,
+  return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps,
+    mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
     cube, webglCube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
     depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
-    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}`};
+    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
@@ -271,11 +276,23 @@ export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = nul
 }
 
 /** Validate a destination before any GPU allocation or queued submission. */
-export function inspectThreeRenderTargetMip(shape, mipLevel = 0, face = 0) {
+export function inspectThreeRenderTargetMip(shape, mipLevel = 0, face = 0, {webgl = false, generateMipmaps = shape.generateMipmaps} = {}) {
   if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= shape.mipLevelCount)
     fail('MIP', 'Render mip level is not allocated');
-  if (shape.webglCube && mipLevel !== 0)
-    fail('MIP', 'WebGL cube render destinations currently require the base level');
+  if ((webgl || shape.webglCube) && mipLevel > 0) {
+    // r186 WebGL uses a depthless scratch framebuffer for higher levels. The
+    // current dispatcher retains one attachment profile per target, so admit
+    // ordinary 2D/cube color-only targets until it supports per-level profiles.
+    if (shape.array || shape.volume || shape.cube && !shape.webglCube ||
+        shape.authoredMipLevelCount !== shape.maximumMipLevels ||
+        shape.depthAttachment || shape.depthTexture !== null || shape.sampleCount !== 1)
+      fail('MIP', 'WebGL mip rendering requires a complete authored 2D or cube chain, single-sample color and no depth/stencil attachment');
+    // The facade supplies this flag at capture time. Owner submission must not
+    // reread a later source flag: CubeCamera and subsequent base draws can
+    // change it while an already accepted higher-mip request is queued.
+    if (webgl && generateMipmaps !== false)
+      fail('MIP', 'WebGL mip rendering requires automatic mip generation disabled at capture');
+  }
   const slices = shape.volume ? Math.max(1, Math.floor(shape.layers / 2 ** mipLevel)) : shape.layers ?? (shape.cube ? 6 : 1);
   if (!Number.isSafeInteger(face) || face < 0 || face >= slices)
     fail('FACE', shape.cube ? 'Cube face must be an integer from zero to five' : shape.volume ? 'Volume slice is out of range for this mip'
@@ -508,7 +525,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
       references: 0, sourceShape: null, retirement: null, cubeInitialized: false,
-      cubeMipReady: !shape.webglCube || shape.mipLevelCount === 1 || shape.generateMipmaps,
+      cubeMipReady: !shape.webglCube || shape.mipLevelCount === 1 || shape.generateMipmaps || shape.authoredMipLevelCount === shape.mipLevelCount,
       dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);

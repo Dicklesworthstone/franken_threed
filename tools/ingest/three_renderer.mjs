@@ -804,9 +804,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._targets.ensure(this._targets.capture(target, {initialize: true}));
     }
     setRenderTarget(renderTarget, activeCubeFace = 0, activeMipmapLevel = 0) {
-      if (activeMipmapLevel !== 0 && this._shaderEncodedOutput)
-        fail('UNSUPPORTED', 'Nonzero target mips on the WebGL-authored route are not admitted');
-      if (renderTarget !== null) inspectThreeRenderTargetMip(this._targets.capture(renderTarget).shape, activeMipmapLevel, activeCubeFace);
+      if (renderTarget !== null) inspectThreeRenderTargetMip(this._targets.capture(renderTarget).shape,
+        activeMipmapLevel, activeCubeFace, {webgl: this._shaderEncodedOutput, generateMipmaps: renderTarget.texture.generateMipmaps});
       else if (activeMipmapLevel !== 0 || activeCubeFace !== 0) fail('UNSUPPORTED', 'The canvas has only mip level and face zero');
       this._renderTarget = renderTarget;
       this._activeCubeFace = activeCubeFace;
@@ -835,7 +834,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     // ---- frames ----
     _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel) {
       const targetShape = target ? this._targets.capture(target).shape : null;
-      const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel) : null;
+      const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel, 0,
+        {webgl: this._shaderEncodedOutput, generateMipmaps: target.texture.generateMipmaps}) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       if (!target && this.outputColorSpace !== SRGBColorSpace &&
           (this._shaderEncodedOutput || this.outputColorSpace !== THREE.LinearSRGBColorSpace))
@@ -878,9 +878,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const pr = target ? 1 : this._pixelRatio;
       const [bufferWidth, bufferHeight] = target ? [mipShape.width, mipShape.height] : this._bufferSize();
       const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;
-      // r186 WebGPU scales only width/height at a selected mip; origins remain
-      // physical coordinates. Capture without mutating the source Vector4s.
-      const divisor = target ? 2 ** mipLevel : 1;
+      // r186 WebGPU scales width/height at a selected mip. WebGL keeps the
+      // authored viewport/scissor in physical pixels, including their extents.
+      // Neither route mutates the source Vector4s while capturing a request.
+      const divisor = target && !this._shaderEncodedOutput ? 2 ** mipLevel : 1;
       const vx = px(v.x * pr), vw = Math.floor(px(v.z * pr) / divisor), vh = Math.floor(px(v.w * pr) / divisor);
       // Program gl_FragCoord (framebuffer) and point-sprite sizes (viewport).
       if (this._shaderEncodedOutput && !hdr) frame.targetSize = [bufferWidth, bufferHeight, vw, vh];
@@ -888,6 +889,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._shaderEncodedOutput) frame.viewportSize = [vw, vh];
       // WebGL viewports/scissors use a bottom-left origin; WebGPU's is top-left.
       const vy = this._bottomLeftOrigin ? bufferHeight - px(v.y * pr) - vh : px(v.y * pr);
+      const webglMip = target && this._shaderEncodedOutput && mipLevel > 0;
+      if (webglMip && (![vx, vy, vw, vh].every(Number.isFinite) || vx < 0 || vy < 0 || vw < 0 || vh < 0 ||
+          vx + vw > bufferWidth || vy + vh > bufferHeight))
+        fail('UNSUPPORTED', 'WebGL mip rendering requires a viewport inside the selected mip extent');
       const [minDepth, maxDepth] = target ? [0, 1] : this._viewportDepth;
       if (vx !== 0 || vy !== 0 || vw !== bufferWidth || vh !== bufferHeight || minDepth !== 0 || maxDepth !== 1)
         frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
@@ -902,7 +907,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const clip = this._bottomLeftOrigin;
         const sw = Math.max(0, Math.min(Math.floor(px(sc.z * pr) / divisor) + (clip ? Math.min(0, px(sc.x * pr)) : 0), bufferWidth - sx)),
           sh = Math.max(0, Math.min(rawH + (clip ? Math.min(0, rawY) : 0), bufferHeight - sy));
-        if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight) frame.scissor = [sx, sy, sw, sh];
+        if (sx !== 0 || sy !== 0 || sw !== bufferWidth || sh !== bufferHeight)
+          frame.scissor = [webglMip ? Math.min(sx, bufferWidth) : sx, webglMip ? Math.min(sy, bufferHeight) : sy, sw, sh];
       }
       if (hdr) {
         if (!this._compositedAlpha()) frame.clearColor[3] = 1;

@@ -72,6 +72,62 @@ test('unallocated source cube mip levels cannot expose the reserved native pyram
   assert.equal(owner.bindingsFor().get(target.texture).sampler.lodMaxClamp, 0);
 });
 
+test('complete authored WebGL cube chains include base and sample every allocated face and mip', async t => {
+  const {owner, device} = fixture(t), target = cube(t, 8, {generateMipmaps: false});
+  target.texture.mipmaps = [{}, {}, {}, {}];
+  const entry = owner.capture(target);
+  assert.equal(entry.shape.authoredMipLevelCount, 4); assert.equal(entry.shape.mipLevelCount, 4);
+  assert.equal(entry.shape.colorBytes, 4080); assert.equal(device.textures.length, 0);
+  owner.render(entry, attachments => {
+    assert.equal(attachments.colorView.baseMipLevel, 2); assert.equal(attachments.colorView.baseArrayLayer, 5);
+    assert.equal(attachments.depthView, undefined);
+  }, {face: 5, mipLevel: 2});
+  const binding = owner.bindingsFor().get(target.texture);
+  assert.equal(binding.viewDimension, 'cube'); assert.equal(binding.sampler.lodMaxClamp, 3);
+  assert.deepEqual(device.passes.map(pass => [pass.desc.colorAttachments[0].view.baseMipLevel,
+    pass.desc.colorAttachments[0].view.baseArrayLayer]),
+  [0, 1, 2, 3].flatMap(level => [0, 1, 2, 3, 4, 5].map(face => [level, face])));
+  assert.equal(entry.storage.diagnostics.mipGenerations, 0); assert.equal(device.textureWrites.length, 0);
+  target.texture.generateMipmaps = true;
+  assert.equal(owner.capture(target), entry, 'generation toggles preserve the authored allocation');
+  target.texture.minFilter = T.LinearFilter;
+  assert.equal(owner.bindingsFor().get(target.texture).sampler.lodMaxClamp, 0);
+  await owner.whenIdle();
+});
+
+test('CubeCamera queues authored mip faces with physical viewports and captured generation flags', async t => {
+  const {renderer, device} = await rendererFixture(t), target = cube(t, 8, {generateMipmaps: false}), mesh = producer(t);
+  target.texture.mipmaps = [{}, {}, {}, {}];
+  const createEncoder = device.createCommandEncoder;
+  device.createCommandEncoder = (...args) => {
+    const encoder = createEncoder(...args), begin = encoder.beginRenderPass;
+    encoder.beginRenderPass = descriptor => {
+      const pass = begin(descriptor), record = device.passes.at(-1);
+      return {...pass, setViewport(...viewport) { record.viewport = viewport; pass.setViewport(...viewport); }};
+    };
+    return encoder;
+  };
+  const camera = new T.CubeCamera(.1, 10, target), previous = new T.WebGLRenderTarget(4, 4);
+  t.after(() => previous.dispose()); renderer.setRenderTarget(previous); renderer.xr.enabled = true;
+  target.viewport.set(0, 0, 4, 4); camera.activeMipmapLevel = 1; camera.update(renderer, mesh);
+  const entry = renderer._targets.capture(target);
+  target.viewport.set(0, 0, 2, 2); camera.activeMipmapLevel = 2; camera.update(renderer, mesh);
+  assert.equal(renderer.getRenderTarget(), previous); assert.equal(renderer.getActiveMipmapLevel(), 0);
+  assert.equal(renderer.xr.enabled, true); assert.equal(target.texture.generateMipmaps, false);
+  target.texture.generateMipmaps = true;
+  assert.throws(() => renderer.setRenderTarget(target, 0, 1), {code: 'THREE_TARGET_MIP'});
+  assert.equal(renderer.getRenderTarget(), previous);
+  await renderer.waitForGPU();
+  assert.equal(renderer._targets.capture(target), entry, 'later flags cannot replace queued face storage');
+  assert.deepEqual(device.passes.map(pass => [pass.desc.colorAttachments[0].view.baseMipLevel,
+    pass.desc.colorAttachments[0].view.baseArrayLayer]),
+  [1, 2].flatMap(level => [0, 1, 2, 3, 4, 5].map(face => [level, face])));
+  assert.ok(device.passes.every(pass => pass.desc.depthStencilAttachment === undefined));
+  assert.ok(device.passes.every(pass => pass.viewport === undefined), 'physical viewport already fills each selected mip');
+  assert.equal(entry.storage.diagnostics.mipGenerations, 0); assert.equal(renderer.info.f3d.offscreenRenders, 12);
+  assert.equal(device.textureWrites.length, 0);
+});
+
 test('cold CubeCamera renders all source faces then generates the full WebGL mip chain', async t => {
   const {renderer, device} = await rendererFixture(t), target = cube(t), mesh = producer(t);
   const camera = new T.CubeCamera(.1, 10, target);

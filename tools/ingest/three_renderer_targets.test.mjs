@@ -248,19 +248,107 @@ test('depth-only clear selects the captured mip while ordinary source readback s
   f.r.dispose();
 });
 
-test('unsupported native mip selectors preserve binding without allocation and WebGL refuses nonzero levels', async () => {
+test('queued WebGL mip draws retain physical viewport/scissor and independent readback levels', async () => {
+  const f = await make(true), t = new T.RenderTarget(64, 32, {depthBuffer: false}), gate = deferred();
+  t.texture.mipmaps = [{}, {}, {}, {}, {}, {}, {}];
+  f.r.setPixelRatio(3);
+  const first = scene('gl-mip-one', 11); first.gate = gate.promise;
+  t.viewport.set(2, 1, 20, 10); t.scissor.set(3, 2, 16, 8); t.scissorTest = true;
+  f.r.setRenderTarget(t, 0, 1); f.r.render(first, new Camera());
+  assert.deepEqual(t.viewport.toArray(), [2, 1, 20, 10]);
+  assert.deepEqual(t.scissor.toArray(), [3, 2, 16, 8]);
+  t.viewport.set(1, 2, 12, 4); t.scissor.set(2, 1, 8, 4);
+  f.r.setRenderTarget(t, 0, 2); f.r.render(scene('gl-mip-two', 22), new Camera());
+  t.viewport.set(0, 0, 64, 32); t.scissorTest = false;
+  f.r.setRenderTarget(t); f.r.render(scene('gl-base', 33), new Camera());
+  const one = f.r.readRenderTargetMipPixelsAsync(t, 1), two = f.r.readRenderTargetMipPixelsAsync(t, 2);
+  const output = new Uint8Array(64 * 32 * 4), base = f.r.readRenderTargetPixelsAsync(t, 0, 0, 64, 32, output);
+  const region = f.r.readRenderTargetMipPixelsAsync(t, 2, {x: 1, y: 1, width: 3, height: 2});
+  f.r.setRenderTarget(null); gate.resolve();
+  const values = await Promise.all([one, two, base, region]); await flush(f.r);
+  assert.deepEqual(f.draws.map(d => d.frame.colorView.descriptor.baseMipLevel), [1, 2, 0]);
+  assert.ok(f.draws.every(d => d.frame.depthView === undefined && d.renderOptions.depthFormat === null));
+  assert.deepEqual(f.draws[0].frame.viewport, [2, 5, 20, 10, 0, 1]);
+  assert.deepEqual(f.draws[1].frame.viewport, [1, 2, 12, 4, 0, 1]);
+  assert.deepEqual(f.draws[0].frame.scissor, [3, 6, 16, 8]);
+  assert.deepEqual(f.draws[1].frame.scissor, [2, 3, 8, 4]);
+  assert.deepEqual(f.draws[0].frame.targetSize, [32, 16, 20, 10]);
+  assert.deepEqual(f.draws[1].frame.targetSize, [16, 8, 12, 4]);
+  assert.deepEqual(values.map(a => a.length), [32 * 16 * 4, 16 * 8 * 4, 64 * 32 * 4, 3 * 2 * 4]);
+  for (const [i, data] of values.entries()) assert.ok(data.every(x => x === [11, 22, 33, 22][i]));
+  assert.equal(values[2], output);
+  assert.deepEqual(f.copies.map(c => c.source.mipLevel), [1, 2, 0, 2]);
+  assert.deepEqual(f.copies[3].source.origin, {x: 1, y: 5, z: 0});
+  assert.equal(f.r._targets.capture(t).storage.diagnostics.mipGenerations, 0);
+  assert.equal(f.r.getRenderTarget(), null); assert.equal(f.r.getActiveMipmapLevel(), 0);
+  assert.equal(f.canvas.acquired, 0); f.r.dispose();
+});
+
+test('WebGL mip clears use NPOT attachment extents and clip source scissors', async () => {
+  const f = await make(true), t = new T.RenderTarget(9, 5, {depthBuffer: false});
+  t.texture.mipmaps = [{}, {}, {}, {}];
+  t.viewport.set(0, 0, 4, 2); t.scissor.set(-2, -1, 8, 4); t.scissorTest = true;
+  f.r.setRenderTarget(t, 0, 1); f.r.setClearColor(new T.Color(.25, .5, .75), .8); f.r.clear();
+  t.scissor.set(9, 9, 2, 2); f.r.clear();
+  await flush(f.r);
+  const [first, second] = f.draws.map(d => d.frame);
+  assert.equal(first.colorView.descriptor.baseMipLevel, 1); assert.equal(first.depthView, undefined);
+  assert.equal(first.loadOp, 'clear'); assert.deepEqual(first.clearColor, [.25, .5, .75, .8]);
+  assert.equal(first.viewport, undefined); assert.equal(first.scissor, undefined);
+  assert.deepEqual(first.targetSize, [4, 2, 4, 2]);
+  assert.deepEqual(second.scissor, [4, 0, 0, 0]);
+  assert.equal(f.r._targets.capture(t).storage.diagnostics.mipGenerations, 0);
+  assert.equal(f.canvas.acquired, 0); f.r.dispose();
+});
+
+test('WebGL authored mip sampling refreshes all source-oriented levels without generation', async () => {
+  const f = await make(true), t = new T.RenderTarget(8, 8, {depthBuffer: false}), consumer = scene('gl-mip-consumer');
+  t.texture.mipmaps = [{}, {}, {}, {}]; t.viewport.set(0, 0, 4, 4); consumer.sample = t.texture;
+  f.r.setRenderTarget(t, 0, 1); f.r.render(scene('gl-mip-producer', 17), new Camera());
+  f.r.setRenderTarget(null); f.r.render(consumer, new Camera()); await flush(f.r);
+  const entry = f.r._targets.capture(t), view = f.draws[1].sampled.view;
+  assert.equal(view.texture.mipLevelCount, 4); assert.equal(entry.copies, 1);
+  const copies = f.calls.submissions.flatMap(command => command.passes ?? []);
+  assert.deepEqual(copies.map(pass => pass.descriptor.colorAttachments[0].view.descriptor.baseMipLevel), [0, 1, 2, 3]);
+  const code = f.calls.modules.find(module => module.label === 'Source target UV orientation').code;
+  assert.ok(code.includes('i32(size.y) - 1 - i32(p.y)'));
+  t.viewport.set(0, 0, 2, 2);
+  f.r.setRenderTarget(t, 0, 2); f.r.render(scene('gl-second-mip-producer', 29), new Camera());
+  f.r.setRenderTarget(null); f.r.render(consumer, new Camera()); await flush(f.r);
+  assert.equal(f.draws.at(-1).sampled.view, view); assert.equal(entry.copies, 2);
+  assert.equal(entry.storage.diagnostics.mipGenerations, 0); assert.equal(f.copies.length, 0); f.r.dispose();
+});
+
+test('unsupported WebGL mip profiles and viewports fail before allocation or queue submission', async () => {
+  const f = await make(true), good = new T.RenderTarget(8, 8, {depthBuffer: false});
+  good.texture.mipmaps = [{}, {}, {}, {}]; f.r.setRenderTarget(good, 0, 1);
+  for (const options of [{}, {stencilBuffer: true}, {depthBuffer: false, samples: 4},
+    {depthBuffer: false, generateMipmaps: true}]) {
+    const bad = new T.RenderTarget(8, 8, options); bad.texture.mipmaps = [{}, {}, {}, {}];
+    assert.throws(() => f.r.setRenderTarget(bad, 0, 1), {code: 'THREE_TARGET_MIP'});
+  }
+  const partial = new T.RenderTarget(8, 8, {depthBuffer: false}); partial.texture.mipmaps = [{}, {}, {}];
+  assert.throws(() => f.r.setRenderTarget(partial, 0, 1), {code: 'THREE_TARGET_MIP'});
+  assert.equal(f.r.getRenderTarget(), good); assert.equal(f.r.getActiveMipmapLevel(), 1);
+  assert.throws(() => f.r.render(scene('oversized-gl-mip'), new Camera()), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  good.viewport.set(0, 0, 4, 4); good.texture.generateMipmaps = true;
+  assert.throws(() => f.r.render(scene('changed-gl-generation'), new Camera()), {code: 'THREE_TARGET_MIP'});
+  assert.equal(f.calls.textures.length, 0); assert.equal(f.draws.length, 0); assert.equal(f.r._drain, null); f.r.dispose();
+});
+
+test('unsupported mip selectors preserve binding without allocation, including WebGL depth targets', async () => {
   const f = await make(), t = new T.RenderTarget(8, 8); t.texture.mipmaps = [{}, {}, {}];
   f.r.setRenderTarget(t, 0, 1);
   for (const mip of [-1, .5, 3, '1']) assert.throws(() => f.r.setRenderTarget(t, 0, mip), {code: 'THREE_TARGET_MIP'});
   assert.throws(() => f.r.setRenderTarget(null, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  assert.throws(() => f.r.setRenderTarget(t, 1, 0), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => f.r.setRenderTarget(t, 1, 0), {code: 'THREE_TARGET_FACE'});
   const msaa = new T.RenderTarget(8, 8, {samples: 4}); msaa.texture.mipmaps = [{}, {}, {}];
   assert.throws(() => f.r.setRenderTarget(msaa, 0, 1), {code: 'THREE_TARGET_MIP'});
   assert.throws(() => f.r.setRenderTarget(new T.RenderTarget(8, 8), 0, 1), {code: 'THREE_TARGET_MIP'});
   assert.equal(f.r.getRenderTarget(), t); assert.equal(f.r.getActiveMipmapLevel(), 1);
   assert.equal(f.calls.textures.length, 0); f.r.dispose();
   const gl = await make(true);
-  assert.throws(() => gl.r.setRenderTarget(t, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => gl.r.setRenderTarget(t, 0, 1), {code: 'THREE_TARGET_MIP'});
   assert.equal(gl.r.getRenderTarget(), null); assert.equal(gl.calls.textures.length, 0); gl.r.dispose();
 });
 
