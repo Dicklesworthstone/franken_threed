@@ -260,14 +260,14 @@ test('empty arrays honor clears and the pinned non-culled parent-camera fallback
   object.frustumCulled = false; h.renderer.render(scene, camera); assert.equal(snapshots(h.device).length, 1);
 });
 
-test('native callback admission and WebGL-authored ArrayCamera refusal stay explicit', async t => {
+test('native callback admission stays explicit while empty WebGL ArrayCamera can clear', async t => {
   const h = fixture(), scene = new T.Scene(), camera = cameras(); t.after(() => h.renderer.dispose());
   let callbacks = 0; mesh(scene, 0xff0000, 0).onBeforeRender = () => callbacks++;
   await assert.rejects(h.renderer.compileAsync(scene, camera), {code: 'THREE_SCENE_HOOK'});
   assert.equal(callbacks, 0); assert.equal(h.device.submissions.length, 0);
   const gl = fixture({}, createWebGLRendererClass(T)); t.after(() => gl.renderer.dispose()); await gl.renderer.init();
-  assert.throws(() => gl.renderer.render(new T.Scene(), cameras()), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  assert.equal(gl.acquired(), 0);
+  gl.renderer.render(new T.Scene(), cameras()); await gl.renderer.waitForGPU();
+  assert.equal(snapshots(gl.device).length, 0); assert.equal(gl.acquired(), 1);
 });
 
 test('queued fixed material snapshots preserve ArrayCamera views and fog admission',async t=>{

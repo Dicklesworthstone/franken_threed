@@ -312,3 +312,38 @@ textures bind as unfilterable and linear ones fail explicitly.
 Evidence: scenarios `shaderlib_maps` (340 of 76,800 pixels differ slightly)
 and `shaderlib_physical` (166 differ slightly) vs upstream WebGLRenderer;
 `helpers_lines_points` now draws real point sizes.
+
+## WebGL ArrayCamera views
+
+The WebGL-authored renderer now admits ordinary `ArrayCamera` scenes through
+the native scene and program owners. It builds and sorts the parent-camera
+frustum/layer list once, clears the attachments once, and renders each child's
+whole list in source order. Child viewports use physical bottom-left pixels,
+including on a canvas with a nonunit device pixel ratio. Children without a
+viewport inherit the preceding effective viewport, including the dimensions
+used by program point-sprite expansion.
+
+Object and material callbacks receive the original child camera. Object
+model-view/normal matrices update before the material callback. Layer tests and
+later child identity, projection and viewport reads occur at their source draw
+boundaries, so earlier callbacks can affect later draws. Per-use program bytes
+and fixed-draw world transforms remain immutable until their GPU submission.
+Overlapping double-sided transparent views retain camera-major side order and
+the source material-version changes. Empty arrays clear without a parent draw.
+Explicit `ShaderMaterial.uniformsNeedUpdate` requests are consumed before the
+object's after-render callback, preserving the source update flag lifecycle.
+
+Twelve focused recording-device cases cover these contracts. The browser
+comparison is `tests/e2e/webgpu_renderer/program_array_cameras.mjs` and checks
+pixels, callback order, public matrices and side-version changes against the
+pinned WebGLRenderer. Eight Chrome 151 SwiftShader checkpoints match all 224,256
+RGBA bytes exactly, with identical callback traces, matrices and version deltas,
+56 native draw calls and zero GPU/browser errors. Cases cover split/overlapping
+views, child layers, parent culling, mixed projections, shared scissoring,
+target resize and empty-array clearing. This is correctness evidence with no
+performance claim. Native WebGPU ArrayCamera retains its existing eager
+capture and object-major ordering.
+
+WebGL ArrayCamera transmission and BatchedMesh are explicit boundaries pending
+per-view transmission bindings and indirect-texture histories. XR/multiview and
+the existing viewport/resource capacity restrictions also remain explicit.

@@ -929,13 +929,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       let matricesUpdated = false;
       if (camera?.isArrayCamera === true && captureCameras) {
-        // WebGLRenderer has camera-major drawing, physical bottom-left viewports
-        // and per-child callbacks. This slice implements the WebGPU contract.
-        if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'ArrayCamera on the WebGL-authored route is not admitted');
         if (!Array.isArray(camera.cameras) || camera.cameras.length > 256 || camera.isMultiViewCamera)
           fail('UNSUPPORTED', 'Expected an ordinary ArrayCamera with at most 256 views');
-        // Source WebGPU viewports are logical canvas units, physical target units.
-        frame.arrayCamera = {pixelRatio: target ? 1 : this._pixelRatio, clipSpace: 'webgpu',
+        // WebGL child viewports already use physical bottom-left pixels. Native
+        // WebGPU canvas views instead use logical units and a top-left origin.
+        frame.arrayCamera = {pixelRatio: this._shaderEncodedOutput || target ? 1 : this._pixelRatio,
+          clipSpace: this._shaderEncodedOutput ? 'webgl' : 'webgpu',
           targetSize: target ? [Math.max(1, Math.floor(target.width / 2 ** mipLevel)), Math.max(1, Math.floor(target.height / 2 ** mipLevel))] : this._bufferSize()};
       }
       const native = !this._shaderEncodedOutput && !clearOnly;

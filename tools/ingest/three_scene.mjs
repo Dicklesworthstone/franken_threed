@@ -1434,11 +1434,18 @@ export async function createGpuThreeScene(device,scene,{
     if(!camera.isArrayCamera)return null;
     // WebGL sources draw camera-major and invoke callbacks with each child.
     // Modern WebGPU sources draw object-major and share the parent's list.
-    if(programRoute()||camera.isMultiViewCamera||!Array.isArray(camera.cameras)||camera.cameras.length>256)
-      fail('CAMERA','Only ordinary ArrayCamera views on the native WebGPU source path are admitted');
+    if(camera.isMultiViewCamera||!Array.isArray(camera.cameras)||camera.cameras.length>256)
+      fail('CAMERA','Expected an ordinary ArrayCamera with at most 256 views');
+    if(programRoute()&&programTransmissionMode)
+      fail('CAMERA','WebGL ArrayCamera transmission needs per-view transmission target bindings');
     const pixelRatio=profile.pixelRatio??1;
     finite(pixelRatio,'array camera pixel ratio');if(pixelRatio<=0)fail('CAMERA','Expected positive camera pixel ratio');
-    return camera.cameras.map(child=>{
+    // WebGL reads each child at renderScene entry, after callbacks in earlier
+    // views. Native WebGPU packets keep their existing eager capture contract.
+    return programRoute()?new Array(camera.cameras.length):
+      camera.cameras.map(child=>arrayCameraView(camera,child,profile,frame,pixelRatio));
+  }
+  function arrayCameraView(camera,child,profile,frame,pixelRatio=profile.pixelRatio??1){
       checkCamera(child);if(child.isArrayCamera)fail('CAMERA','Nested ArrayCamera views are not admitted');
       const projected=new three.Matrix4().multiplyMatrices(child.projectionMatrix,child.matrixWorldInverse);
       const childFrustum=new three.Frustum().setFromProjectionMatrix(projected,child.coordinateSystem,child.reversedDepth);
@@ -1456,15 +1463,19 @@ export async function createGpuThreeScene(device,scene,{
         const v=child.viewport;
         viewport=[v.x,v.y,v.z,v.w].map(n=>Math.floor(finite(n,'array camera viewport')*pixelRatio));
         if(viewport.some(n=>n<0))fail('CAMERA','ArrayCamera viewports must be nonnegative');
+        if(programRoute()){
+          const height=profile.targetSize?.[1]??programTargetSize?.[1];
+          if(!Number.isFinite(height))fail('CAMERA','WebGL ArrayCamera needs its physical framebuffer size');
+          viewport[1]=height-viewport[1]-viewport[3];
+        }
         viewport.push(frame.viewport?.[4]??0,frame.viewport?.[5]??1);
       }
       return {camera:child,frustum:childFrustum,viewProjection,viewport,
-        lighting:{...(camera.isOrthographicCamera?{viewDirection:[child.matrixWorld.elements[8],child.matrixWorld.elements[9],child.matrixWorld.elements[10]]}:
+        lighting:{...((programRoute()?child:camera).isOrthographicCamera?{viewDirection:[child.matrixWorld.elements[8],child.matrixWorld.elements[9],child.matrixWorld.elements[10]]}:
           {cameraPosition:position(child)}),viewMatrix:child.matrixWorldInverse.elements.slice()},
         fog:fogEnabled&&!nativeLightMode?fogApi.threeFogDescriptor(sourceFog(),shadingCamera,three):null,
         // Pinned Background inserts a default-layer mesh after parent culling.
         background:backgroundOwner&&(child.layers.mask&1)!==0?backgroundOwner.capture(backgroundScene(),child):null};
-    });
   }
   function render(camera,frame,options={}){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
@@ -1511,7 +1522,10 @@ export async function createGpuThreeScene(device,scene,{
       }
       const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
       const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
-      const cullingFrustum=arrayViews?{
+      const programArray=programRoute()&&arrayViews!==null;
+      if(programArray&&nodes.some(object=>object.isBatchedMesh))
+        fail('CAMERA','WebGL ArrayCamera BatchedMesh needs per-view indirect texture histories');
+      const cullingFrustum=arrayViews&&!programArray?{
         intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object)),
         intersectsSprite:object=>arrayViews.some(view=>view.frustum.intersectsSprite(object)),
       }:frustum;
@@ -1657,7 +1671,7 @@ export async function createGpuThreeScene(device,scene,{
         if(copies?.length)framebufferCopies.push({index:draws.length,copies});
       };
       if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1)*
-          (item.nodeProgram?item.nodeViews?.length??1:arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
+          (item.nodeProgram?item.nodeViews?.length??1:programArray?arrayViews.length:arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
         fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
@@ -1697,7 +1711,39 @@ export async function createGpuThreeScene(device,scene,{
         try{transmission().render(passItems,transmissiveItems,camera,{width,height,background:scene.background,renderer:shadowRenderer(),sourceScene:root})();}
         catch(error){if(error?.code==='THREE_PROGRAM_TRANSMISSION_PREPARE')fail('PREPARE',error.message);throw error;}
       }
-      for(const item of [...casterItems,...items]){
+      // WebGL builds and sorts one parent-frustum list, then renders each
+      // child's entire list. Pack uniforms and run callbacks in that same order;
+      // overlapping views and shared mutable uniforms make it observable.
+      let programSourceDraws=0;
+      function* executions(){
+        for(const item of casterItems)yield {item,view:null};
+        if(!programArray){for(const item of items)yield {item,view:null};return;}
+        // Upstream captures the array and its length once, then reads each
+        // element at that view's entry. Replacing a later element is observable;
+        // replacing camera.cameras or appending a view inside a callback is not.
+        const cameras=camera.cameras,count=cameras.length;
+        if(!Array.isArray(cameras)||count>256)fail('CAMERA','Expected at most 256 ordinary ArrayCamera views');
+        arrayViews.length=count;
+        let activeViewport=frame.viewport??null;
+        for(let index=0;index<count;index++){
+          const view=arrayCameraView(camera,cameras[index],arrayProfile,frame);
+          activeViewport=view.viewport??activeViewport;
+          // The effective viewport is used for both source program uniforms
+          // (including point sprites) and the eventual immutable GPU packet.
+          view.viewport=activeViewport;arrayViews[index]=view;
+          programSupport.setLightsView(view.camera);
+          for(const item of items){
+            // renderObjects checks layers immediately before each renderObject;
+            // previous callbacks may change this object or this child's layers.
+            if(!item.object.layers.test(view.camera.layers))continue;
+            const instances=item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1;
+            if(draws.length+item.bindings.length*instances>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
+            programSourceDraws++;yield {item,view};
+          }
+        }
+      }
+      for(const {item,view} of executions()){
+        const drawCamera=item.shadowPass?shadowOwner.source.shadow.camera:view?.camera??camera;
         if(item.nodeProgram){
           const gpu=item.bindings[0].programGeometry;
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
@@ -1717,14 +1763,16 @@ export async function createGpuThreeScene(device,scene,{
           if(item.bindings.some(e=>e.signature!=='program:'+programSupport.geometrySnapshot(gpu,device).signature))
             fail('PREPARE','Program geometry layout changed; call prepare() before drawing it');
           const object=item.object,start=item.group?integer(item.group.start,0,Number.MAX_SAFE_INTEGER,'group start'):0;
-          const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):Number.MAX_SAFE_INTEGER;
+          // Geometry extents are bounded to uint32. Point expansion validates
+          // the request before clipping it to the live geometry draw range.
+          const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):0xffffffff;
           // renderObject: onBeforeRender, matrices, draw (uniforms packed now), onAfterRender.
           const hooked=object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender;
-          if(hooked)object.onBeforeRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
-          // renderBufferDirect: material.onBeforeRender(renderer, scene, camera, geometry, object, group).
-          if(item.material.onBeforeRender!==three.Material.prototype.onBeforeRender)item.material.onBeforeRender(shadowRenderer(),root,camera,object.geometry,object,item.group);
-          object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse,object.matrixWorld);
+          if(hooked)object.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);
+          object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,object.matrixWorld);
           object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+          // renderBufferDirect: material.onBeforeRender(renderer, scene, camera, geometry, object, group).
+          if(item.material.onBeforeRender!==three.Material.prototype.onBeforeRender)item.material.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,object,item.group);
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
           const g=object.geometry;
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
@@ -1743,19 +1791,25 @@ export async function createGpuThreeScene(device,scene,{
           }):null;
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection;
-            const clip=programSupport.clippingState(programClippingControls(),item.material,camera);
+            if(programArray&&item.bindings.length===2){item.material.side=d.programSide;item.material.needsUpdate=true;}
+            const clip=programSupport.clippingState(programClippingControls(),item.material,drawCamera);
             for(const sub of multi??[null]){
               const bytes=new Uint8Array(reflection.uniformBufferSize);
               const values={...(programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:{}),...(sub?{_gl_DrawID:sub.id}:{})};
-              const current=programSupport.pack(reflection,programSupport.uniformsFor(item.material),programObject(object),camera,bytes,{targetSize:programTargetSize,material:item.material,values});
+              const targetSize=view?.viewport&&programTargetSize?[...programTargetSize.slice(0,2),...view.viewport.slice(2,4)]:programTargetSize;
+              const uniforms=programArray?programSupport.refresh(item.material,d.refreshOptions):programSupport.uniformsFor(item.material);
+              const current=programSupport.pack(reflection,uniforms,programObject(object),drawCamera,bytes,{targetSize,material:item.material,values});
               if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
               for(const t of current)if(t)frameTextures?.add(t);
               // Programs evaluate fog/lighting in their own source; never core receivers.
+              if(programArray)drawObjects.push({object,material:item.material,view});
               draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,
                 ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
             }
+            if(programArray&&item.material.isShaderMaterial&&item.material.uniformsNeedUpdate===true)item.material.uniformsNeedUpdate=false;
           }
-          if(hooked)object.onAfterRender(shadowRenderer(),root,camera,object.geometry,item.material,item.group);
+          if(programArray&&item.bindings.length===2)item.material.side=three.DoubleSide;
+          if(hooked)object.onAfterRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);
           continue;
         }
         const deformation=item.bindings[0].deformation;
@@ -1791,16 +1845,19 @@ export async function createGpuThreeScene(device,scene,{
           first=Math.min(Math.max(start,rangeStart),extent);
           count=Math.max(0,Math.min(start+length,rangeStart+rangeCount,extent)-first);
         }
-        const drawCamera=item.shadowPass?shadowOwner.source.shadow.camera:camera;
         // Array-camera nodes use private arrays of model-view/normal matrices;
         // they do not overwrite the object's public single-camera caches.
-        if(item.shadowPass||!arrayViews?.length){
+        if(item.shadowPass||programArray||!arrayViews?.length){
           item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
           item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
         }
         for(let i=0;i<item.bindings.length;i++){
-          const values=item.desc[i].values,clipped=item.desc[i].clipped,common={worldMatrix:item.object.isSprite?
-            threeSpriteWorldMatrix(three,item.object,materialState(item.material),drawCamera):item.object.matrixWorld.elements,first,count};
+          if(programArray&&item.bindings.length===2&&!item.shadowPass){item.material.side=i===0?three.BackSide:three.FrontSide;item.material.needsUpdate=true;}
+          const values=item.desc[i].values,clipped=item.desc[i].clipped,worldMatrix=item.object.isSprite?
+            threeSpriteWorldMatrix(three,item.object,materialState(item.material),drawCamera):item.object.matrixWorld.elements;
+          // Later view callbacks may rewrite the public transform before these
+          // immutable per-view draw spans reach GPU packing.
+          const common={worldMatrix:programArray?worldMatrix.slice():worldMatrix,first,count};
           if(!item.shadowPass&&item.desc[i].coat)item.bindings[i].mesh.setClearcoat(item.desc[i].coat);
           if(item.shadowPass)shadowDraws.push({mesh:casters.get(item.bindings[i]),...common,baseColor:values.baseColor,
             ...(textureTransforms?{mapTransforms:opacityFields(values.mapTransforms)}:{}),
@@ -1808,12 +1865,13 @@ export async function createGpuThreeScene(device,scene,{
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
           else {for(let instance=0,instances=item.object.isSprite?threeSpriteCount(item.object):1;instance<instances;instance++){
-            drawObjects.push({object:item.object,material:item.material});draws.push({mesh:item.bindings[i].mesh,...common,...values,
+            drawObjects.push({object:item.object,material:item.material,view});draws.push({mesh:item.bindings[i].mesh,...common,...values,
             ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),
             ...(environmentEnabled?{receiveEnvironment:item.desc[i].options.shading==='metallic-roughness'}:{})});}}
         }
+        if(programArray&&item.bindings.length===2&&!item.shadowPass)item.material.side=three.DoubleSide;
       }
       // One fused core batch precedes all consuming material/group draws. No
       // source animation clock or CPU per-vertex deformation runs here.
@@ -1843,7 +1901,27 @@ export async function createGpuThreeScene(device,scene,{
           prepared.shadow=shadowOwner.descriptor(shadowFrame,lightIndex);
         }
       }
-      if(arrayViews?.length||passNodeFrame?.draws.some(draw=>draw.nodeViews!==null&&draw.nodeViews!==undefined)){
+      if(programArray){
+        // Clear once, then submit each camera's span with immutable packed
+        // uniforms. Empty arrays still clear, but never fall back to the parent.
+        renderer.render({...prepared,draws:[]});backgroundSubmitted=true;live();
+        const loaded={...prepared,loadOp:'load',depthLoadOp:'load',...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})};
+        let activeViewport=frame.viewport??null,first=0,passes=renderer.colorPassCount??1,backgrounds=0;
+        logicalDraws=0;drawCalls=0;
+        for(const view of arrayViews){
+          activeViewport=view.viewport??activeViewport;
+          let end=first;while(drawObjects[end]?.view===view)end++;
+          if(!activeViewport||activeViewport[2]!==0&&activeViewport[3]!==0){
+            if(view.background){backgroundOwner.render(view.background,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:'load',
+              viewport:activeViewport,scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});backgrounds++;live();}
+            renderer.render({...loaded,viewport:activeViewport,viewProjection:view.viewProjection,
+              lighting:{...view.lighting,lights:lighting.lights},draws:draws.slice(first,end),...(fogEnabled?{fog:view.fog}:{})});
+            logicalDraws+=renderer.drawCount;drawCalls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+          }
+          first=end;
+        }
+        sourceDraws=programSourceDraws;backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
+      }else if(arrayViews?.length||passNodeFrame?.draws.some(draw=>draw.nodeViews!==null&&draw.nodeViews!==undefined)){
         // One attachment clear precedes every view. A pass per ordered view span
         // keeps camera/lighting uniforms immutable until its immediate submit,
         // including overlapping viewports and transparent double-sided draws.
