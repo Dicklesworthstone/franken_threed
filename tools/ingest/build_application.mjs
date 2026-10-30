@@ -34,7 +34,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
-import { analyzeModuleAst, classifyImportType } from "./ast_analyzer.mjs";
+import { analyzeModuleAst, classifyDynamicImportArgument, classifyImportType } from "./ast_analyzer.mjs";
 import { bundleWithRollup } from "./bundler.mjs";
 import {
   parseHtmlEntries,
@@ -1418,7 +1418,14 @@ const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttri
 // Fields the routed WebGLRenderer serves truthfully (three_renderer.mjs).
 const SERVED_CAPABILITIES = new Set(["getMaxAnisotropy", "logarithmicDepthBuffer", "reversedDepthBuffer", "precision", "getMaxPrecision", "isWebGL2"]);
 /** True when an application (non-pinned-library) module reads GL-context state. */
-function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources) {
+export function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources) {
+  const propertyNames = node => {
+    if (!node.computed) return [node.property.name];
+    // Reuse finite string analysis without evaluating keys or their effects.
+    // Brackets and optional access expose the same source contracts as dots.
+    const key = classifyDynamicImportArgument(node.property);
+    return key.classification === "literal" ? [key.specifier] : key.candidates;
+  };
   const inline = new Map();
   if (/\.html?$/.test(entryAbs)) {
     const entryUrl = pathToFileURL(entryAbs).href;
@@ -1440,11 +1447,12 @@ function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources) {
     let found = false;
     walk.ancestor(ast, {
       MemberExpression(node, _state, ancestors) {
-        if (node.computed || !GL_CONTEXT_STATE.has(node.property.name)) return;
+        const names = propertyNames(node);
+        if (!names?.some(name => GL_CONTEXT_STATE.has(name))) return;
         // renderer.capabilities.<served field> describes this route, not a GL context.
         const parent = ancestors.at(-2);
-        if (node.property.name === "capabilities" && parent?.type === "MemberExpression" && parent.object === node &&
-            !parent.computed && SERVED_CAPABILITIES.has(parent.property.name)) return;
+        if (names.every(name => name === "capabilities") && parent?.type === "MemberExpression" && parent.object === node &&
+            propertyNames(parent)?.every(name => SERVED_CAPABILITIES.has(name))) return;
         found = true;
       },
     });

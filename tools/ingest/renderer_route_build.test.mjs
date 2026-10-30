@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { buildApplication as buildSourceApplication } from "./build_application.mjs";
+import { buildApplication as buildSourceApplication, readsGlContextState } from "./build_application.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 import { geometryDevice } from "./fixtures/gpu_geometry_device.mjs";
 
@@ -269,6 +269,80 @@ export const isF3DRenderer = renderer.isF3DRenderer;
 export const isWebGLRenderer = renderer.isWebGLRenderer;
 export const anisotropy = renderer.capabilities.getMaxAnisotropy();
 `;
+
+function readsSourceGlState(source) {
+  const id = 'file:///application/main.mjs';
+  return readsGlContextState({modules: {[id]: {}}}, '/application/main.mjs', undefined,
+    {read(url) { assert.equal(url, id); return {code: source}; }});
+}
+
+test('computed GL-context properties retain source ownership before renderer construction', () => {
+  for (const expression of [
+    "renderer.capabilities.maxTextures",
+    "renderer['capabilities'].maxTextures",
+    'renderer[`capabilities`].maxTextures',
+    "renderer['cap' + 'abilities'].maxTextures",
+    "renderer[flag ? 'capabilities' : 'extensions'].maxTextures",
+    "renderer[(effect(), 'capabilities')].maxTextures",
+    "renderer?.['capabilities']?.['maxTextures']",
+    "renderer['capabilities'][capability]",
+    "renderer['capabilities'][flag ? 'precision' : 'maxTextures']",
+    "renderer['extensions']",
+    "renderer['getContextAttributes']()",
+    "renderer[`forceContextLoss`]()",
+    "renderer['forceContextRestore']()",
+  ]) assert.equal(readsSourceGlState(`const value = ${expression};`), true, expression);
+  assert.equal(readsSourceGlState("const capabilities = renderer['capabilities']; capabilities.maxTextures;"), true);
+});
+
+test('computed served capabilities stay on the new renderer route', () => {
+  for (const expression of [
+    "renderer.capabilities.precision",
+    "renderer['capabilities']['getMaxAnisotropy']()",
+    'renderer[`capabilities`][`isWebGL2`]',
+    "renderer['cap' + 'abilities']['getMax' + 'Precision']('highp')",
+    "renderer?.['capabilities']?.['logarithmicDepthBuffer']",
+    "renderer['capabilities'][flag ? 'precision' : 'reversedDepthBuffer']",
+    "renderer[(effect(), 'capabilities')][(effect(), 'precision')]",
+    "objects[index].visible",
+  ]) assert.equal(readsSourceGlState(`const value = ${expression};`), false, expression);
+});
+
+test('computed capability analysis never evaluates source key expressions', () => {
+  const key = '__f3d_capability_key_evaluated';
+  const previous = Object.getOwnPropertyDescriptor(globalThis, key);
+  Object.defineProperty(globalThis, key, {configurable: true, get() { assert.fail('source key evaluated during routing'); }});
+  try {
+    assert.equal(readsSourceGlState(`renderer[(globalThis.${key}, 'capabilities')].maxTextures;`), true);
+    assert.equal(readsSourceGlState(`renderer['capabilities'][(globalThis.${key}, 'precision')];`), false);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, key, previous);
+    else delete globalThis[key];
+  }
+});
+
+test('computed GL capability application emits the genuine synchronous source constructor', async t => {
+  const a = app(GL_PROGRAM + "export const units = renderer['capabilities'].maxTextures;");
+  const result = await buildApplication(a.entry, a.out, {routeWebGLRenderer: true});
+  assert.equal(result.rendererRoute.routed, false);
+  assert.equal(result.rendererRoute.reason, 'gl-context-state-read');
+  assert.deepEqual(result.rendererRoute.substitutedModules, []);
+  assert.ok(!result.chunks.some(chunk => chunk.fileName.startsWith('f3d-renderer-runtime-')));
+  const marker = new Error('genuine source WebGL context request'), contexts = [];
+  const canvas = {width: 32, height: 32, style: {}, addEventListener() {}, removeEventListener() {},
+    setAttribute() {}, getContext(type) { contexts.push(type); throw marker; }};
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', {configurable: true, value: {createElementNS: () => canvas}});
+  t.mock.method(console, 'error', () => {});
+  try {
+    await assert.rejects(import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href), error => error === marker);
+    assert.deepEqual(contexts, ['webgl2']);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'document', previous);
+    else delete globalThis.document;
+  }
+});
+
 test("WebGLRenderer apps route only when opted in and free of GL escapes or GL-state reads", async () => {
   const plain = app(GL_PROGRAM);
   const off = await buildApplication(plain.entry, plain.out, { routeWebGPURenderer: true });
