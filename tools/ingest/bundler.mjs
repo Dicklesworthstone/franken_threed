@@ -790,6 +790,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
           _moduleSources: moduleSources,
+          unavailableGlobals: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             packageRootUrl: options.packageRootUrl,

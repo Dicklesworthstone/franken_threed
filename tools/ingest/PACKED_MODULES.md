@@ -13,8 +13,25 @@ global scope, execution attributes and repeated script references. Relative lazy
 module dependencies, stylesheets and their assets are emitted as before. The CLI
 can build and then pack this application without injecting a synthetic module.
 These scripts remain source-owned; an empty module graph claims no renderer
-substitution or numeric specialization. Dedicated workers created by document
-classic scripts still need the existing networked route at this boundary.
+substitution or numeric specialization.
+
+Inline and external classic scripts can launch dedicated classic or module
+workers through the existing worker graph. Finite literal/conditional URL choices
+keep their selector and constructor-option effects. String worker URLs resolve
+from the document base, including when the constructor lives in an external
+script in another directory. Worker imports, repeated `importScripts`, JSON and
+static worker resources use the same native realm closure as module parents.
+The ordinary build retains script order, attributes and global declarations,
+updates supported valid external-script integrity metadata when bytes change,
+and preserves failed-integrity and open worker host routes.
+
+Packing these documents adds one parser-ordered classic factory script before
+the source scripts. Its private lexical declarations create and cache worker
+Blob URLs lazily, without new global-object properties. Repeated external scripts
+share those factories; each source script keeps its directive prologue, globals,
+`async` and `defer` attributes. Direct document host rebinding, dynamic `with`
+scopes and sloppy block-function host bindings retain their source ownership;
+packing refuses unsafe factory substitution before writing output.
 
 ## Project transforms before bundling
 
@@ -205,8 +222,8 @@ operands remains unsupported, as do reflective changes to host constructors.
 
 ## Nested dedicated worker graphs
 
-Dedicated workers may be constructed by document modules, module workers,
-classic workers and ESM helpers inside classic workers. Finite literal,
+Dedicated workers may be constructed by document classic scripts and modules,
+module workers, classic workers and ESM helpers inside classic workers. Finite literal,
 conditional and sequence-result URLs are closed without executing selectors.
 Native URL-object arguments stay URL objects. Omitted, null and empty/plain
 options retain the classic default; type/name and option-expression effects
@@ -241,9 +258,8 @@ Worker module cycles, recursive classic script imports and cyclic worker
 construction still require the ordinary multi-file build. Closure identity,
 nesting and finite-choice limits are enforced before publication. Realm-expanded
 encoded worker resources also consume a cumulative byte budget, independently
-of the final HTML size check. Open URL expressions, opaque host mutation,
-location reflection and document classic-script Worker construction remain
-outside this standalone route.
+of the final HTML size check. Open URL expressions, opaque host mutation and
+location reflection remain outside this standalone route.
 
 ## Retained Draco, KTX2 and Meshopt workers
 

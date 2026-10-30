@@ -3,9 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Worker as Thread } from "node:worker_threads";
 import { buildApplication } from "./build_application.mjs";
+import { parseTagAttributes } from "./html_parser.mjs";
+import { packHtml } from "./pack_html.mjs";
 
 // Test host only: real native worker threads, ESM, classic script evaluation,
 // Wasm compilation and filesystem-backed Response bodies. Production worker
@@ -15,6 +19,8 @@ const bootstrap = new URL("data:text/javascript;base64," + Buffer.from(`
   import fs from 'node:fs'; import vm from 'node:vm';
   import {parentPort,workerData} from 'node:worker_threads';
   const NativeURL=URL,nativeFetch=fetch;
+  const bytes=url=>String(url).startsWith('data:')
+    ?Buffer.from(String(url).slice(String(url).indexOf(',')+1).split('#')[0],'base64'):fs.readFileSync(url);
   globalThis.self=globalThis; globalThis.location=new NativeURL(workerData.url);
   globalThis.postMessage=(value,transfer=[])=>parentPort.postMessage(value,transfer);
   globalThis.fetch=(input,options)=>{
@@ -26,9 +32,9 @@ const bootstrap = new URL("data:text/javascript;base64," + Buffer.from(`
   globalThis.importScripts=(...urls)=>{
     if(workerData.kind!=='classic')throw new TypeError('Module workers cannot importScripts');
     for(const input of urls){const url=new NativeURL(input,workerData.url);
-      vm.runInThisContext(fs.readFileSync(url,'utf8'),{filename:url.href});}
+      vm.runInThisContext(bytes(url).toString(),{filename:url.href});}
   };
-  if(workerData.kind==='classic')vm.runInThisContext(fs.readFileSync(new NativeURL(workerData.url),'utf8'),{filename:workerData.url});
+  if(workerData.kind==='classic')vm.runInThisContext(bytes(new NativeURL(workerData.url)).toString(),{filename:workerData.url});
   else await import(workerData.url);
 `).toString("base64"));
 
@@ -56,22 +62,128 @@ function workerHost(t, documentBase) {
     constructor(input, options = {}) {
       this.url = new URL(String(input), documentBase);
       this.options = options;
-      this.thread = new Thread(bootstrap, { workerData: { url: this.url.href, kind: options?.type ?? "classic" } });
       workers.push(this);
-      this.result = new Promise((resolve, reject) => {
+      this.ready = (async () => {
+        const url = this.url.protocol === "blob:" ? "data:text/javascript;base64," +
+          Buffer.from(await (await fetch(this.url)).text()).toString("base64") : this.url.href;
+        return this.thread = new Thread(bootstrap, {workerData: {url,kind:options?.type ?? "classic"}});
+      })();
+      this.result = this.ready.then(() => new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("Worker did not return a result")), 10000);
         this.thread.once("message", (value) => { clearTimeout(timer); resolve(value); });
         this.thread.once("error", (error) => { clearTimeout(timer); reject(error); });
         this.thread.once("exit", (code) => { clearTimeout(timer); if (code !== 0) reject(new Error(`Worker exit ${code}`)); });
-      });
+      }));
     }
   };
   t.after(async () => {
     if (original === undefined) delete globalThis.Worker;
     else globalThis.Worker = original;
-    await Promise.all(workers.map((worker) => worker.thread.terminate()));
+    await Promise.all(workers.map(async worker => (await worker.ready).terminate()));
   });
 }
+
+function classicDocument(html, documentBase) {
+  const context = vm.createContext({Worker:globalThis.Worker,URL,Blob});
+  for (const tag of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    const attrs = parseTagAttributes(tag[1]);
+    const source = attrs.src?.startsWith("data:")
+      ? Buffer.from(attrs.src.slice(attrs.src.indexOf(",")+1).split("#")[0],"base64").toString()
+      : attrs.src ? fs.readFileSync(new URL(attrs.src,documentBase),"utf8") : tag[2];
+    vm.runInContext(source,context);
+  }
+  return context;
+}
+
+test("classic document worker builds execute complete graphs from the document base with native script globals", async (t) => {
+  const source = `"use strict";{function Worker(){throw new Error('block-local');}}var runs=(globalThis.runs||0)+1;
+    var start=flag=>new Worker((log.push('url'),flag?'./selected.js':'./other.js'),
+      {name:(log.push('options'),'decoder')});
+    var task=()=>new Worker('./task.mjs',{type:'module'});`;
+  const sri = "sha384-" + createHash("sha384").update(source).digest("base64");
+  const root = fixture({
+    "index.html": `<base href="site/base.html"><script>const seed=21;var log=[];
+      function localShadow(Worker){return Worker;}</script>
+      <script src="../scripts/app.js" integrity="${sri}" defer data-original="yes"></script>
+      <script src="../scripts/app.js" async></script>
+      <script>globalThis.run=async()=>[await start(true).result,await task().result,log,runs,seed,this===globalThis];</script>`,
+    "scripts/app.js": source,
+    "site/selected.js": `importScripts('./lib/value.js');fetch('./settings.json').then(r=>r.json()).then(v=>postMessage([value,v.answer]));`,
+    "site/lib/value.js": "self.value=42;",
+    "site/settings.json": '{"answer":7}',
+    "site/other.js": "postMessage(0);",
+    "site/task.mjs": "import data from './settings.json' with {type:'json'};postMessage(data.answer);",
+  });
+  const built = await buildApplication(path.join(root,"index.html"),path.join(root,"dist"));
+  assert.deepEqual(built.entryFiles, []);
+  assert.ok(built.emittedFiles.some(name => name.startsWith("f3d-workers/")));
+  const html = fs.readFileSync(path.join(built.outDir,"index.html"),"utf8");
+  const output = fs.readFileSync(path.join(built.outDir,"scripts/app.js"),"utf8");
+  assert.match(html, /defer data-original="yes"/);
+  assert.match(html, /src="\.\.\/scripts\/app.js" async/);
+  const updated = "sha384-" + createHash("sha384").update(output).digest("base64");
+  assert.notEqual(updated,sri);
+  assert.ok(html.includes(`integrity="${updated}"`));
+  const documentBase = pathToFileURL(path.join(built.outDir,"site/base.html"));
+  workerHost(t,documentBase);
+  fs.renameSync(path.join(root,"site"),path.join(root,"source-site-unavailable"));
+  fs.renameSync(path.join(root,"scripts"),path.join(root,"source-scripts-unavailable"));
+  const context = classicDocument(html,documentBase);
+  assert.deepEqual(JSON.parse(JSON.stringify(await context.run())),[[42,7],7,["url","options"],2,21,true]);
+});
+
+test("inline classic document workers build and pack into executable independent classic and module realms", async (t) => {
+  const root = fixture({
+    "index.html": `<script>"use strict";{function Worker(){throw new Error('block-local');}}const answer=42;var log=[];globalThis.run=async()=>{
+      var a=new Worker((log.push('classic'),'./classic.js'));
+      var b=new Worker('./module.mjs',{type:'module',name:(log.push('module'),'json')});
+      return [await a.result,await b.result,log,answer,this===globalThis];};</script>`,
+    "classic.js": "importScripts('./lib.js','./lib.js');postMessage([count,typeof document]);",
+    "lib.js": "self.count=(self.count||0)+1;",
+    "module.mjs": "import config from './config.json' with {type:'json'};postMessage([config.answer,typeof document]);",
+    "config.json": '{"answer":42}',
+  });
+  const built = await buildApplication(path.join(root,"index.html"),path.join(root,"dist"));
+  const packed = path.join(root,"packed.html"), entry = path.join(built.outDir,"index.html");
+  assert.equal(packHtml(entry,packed).workerCount,2);
+  const base = pathToFileURL(entry);
+  workerHost(t,base);
+  for (const file of ["classic.js","lib.js","module.mjs","config.json"])
+    fs.renameSync(path.join(root,file),path.join(root,"source-unavailable-"+file));
+  const expected = [[2,"undefined"],[42,"undefined"],["classic","module"],42,true];
+  const ordinary = classicDocument(fs.readFileSync(entry,"utf8"),base);
+  assert.deepEqual(JSON.parse(JSON.stringify(await ordinary.run())),expected);
+  fs.renameSync(built.outDir,path.join(root,"build-unavailable"));
+  const standalone = classicDocument(fs.readFileSync(packed,"utf8"),pathToFileURL(packed));
+  assert.deepEqual(JSON.parse(JSON.stringify(await standalone.run())),expected);
+});
+
+test("classic document worker builds retain failed integrity and unclosed host routes", async () => {
+  for (const [attributes, setup, worker, source = "globalThis.start=()=>new Worker('./worker.js');"] of [
+    ['integrity="sha384-not-the-source"', "", "postMessage(42);"],
+    ["", "const Worker=CustomWorker;", "postMessage(42);"],
+    ["", "", "onmessage=e=>fetch(e.data).then(r=>postMessage(r.status));"],
+    ["", "", "postMessage(42);", "with({Worker:class{constructor(url){this.url=url;}}}){new Worker('./worker.js');}"],
+    ["", "", "postMessage(42);", "{function Worker(url){this.url=url;}}new Worker('./worker.js');"],
+  ]) {
+    const html = `<script>${setup}</script><script src="app.js" ${attributes}></script>`;
+    const root = fixture({"index.html":html,"app.js":source,"worker.js":worker});
+    const built = await buildApplication(path.join(root,"index.html"),path.join(root,"dist"));
+    assert.equal(fs.readFileSync(path.join(built.outDir,"app.js"),"utf8"),source,attributes || setup || worker);
+    assert.equal(fs.readFileSync(path.join(built.outDir,"index.html"),"utf8"),html);
+    assert.ok(!built.emittedFiles.some(name => name.startsWith("f3d-workers/")));
+  }
+});
+
+test("classic document host bindings also protect worker calls in bundled module scripts", async () => {
+  const root = fixture({"index.html": `<script>{function Worker(url){this.url=url;}}</script>
+    <script type="module" src="app.mjs"></script>`,
+    "app.mjs": "export const start=()=>new Worker('./worker.js');",
+    "worker.js": "postMessage(42);"});
+  const built = await buildApplication(path.join(root,"index.html"),path.join(root,"dist"));
+  assert.ok(!built.emittedFiles.some(name => name.startsWith("f3d-workers/")));
+  assert.match(fs.readFileSync(path.join(built.outDir,built.entryFiles[0]),"utf8"),/new Worker\('\.\/worker\.js'\)/);
+});
 
 test("document worker strings preserve base, finite branch effects, options and real classic/Wasm dependencies", async (t) => {
   const root = fixture({

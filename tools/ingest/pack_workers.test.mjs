@@ -267,11 +267,6 @@ for (const [label, files, code] of [
     { "worker.mjs": `import './a.mjs';`, "a.mjs": `import './worker.mjs';` },
     "WORKER_MODULE_CYCLE",
   ],
-  [
-    "classic document parent",
-    { "index.html": `<script>new Worker('./worker.mjs',{type:'module'});</script>` },
-    "WORKER_PARENT",
-  ],
   ["location observation", { "worker.mjs": `postMessage(self.location.href);` }, "WORKER_LOCATION"],
   ["dynamic import", { "worker.mjs": `import(name);` }, "DYNAMIC_IMPORT_OPEN"],
   ["unclosed fetch", { "worker.mjs": `fetch('https://example.com/api');` }, "FETCH_URL"],

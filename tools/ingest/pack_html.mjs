@@ -256,6 +256,8 @@ export function packHtml(
     workerModules = new Map(),
     workerClassics = new Map(),
     workerActive = new Set();
+  const documentFactories = new Map(), documentNames = new Set(),
+    documentBindings = new Set(), documentWorkerUses = new Set();
   let inputBytes = 0, workerBytes = 0, documentFetchUsed = false, documentFetchMutated = false;
   function chargeWorker(encoded) {
     const size = Buffer.byteLength(encoded);
@@ -546,6 +548,8 @@ export function packHtml(
     const sourceLoaderRuntime = !worker && sourceType === "module" && isThreeLoaderResourceModule(source, ast);
     const ancestorsByNode = new WeakMap(), scopedBindings = new WeakMap(), hostWrites = new Set(), writes = [];
     const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+    const strictScope = node => ["ClassDeclaration", "ClassExpression", "StaticBlock"].includes(node.type) ||
+      (node.type === "Program" ? node.body : functions.has(node.type) ? node.body.body : [])?.some(statement => statement.directive === "use strict");
     const scopeTypes = new Set(["Program", "BlockStatement", "StaticBlock", "SwitchStatement", "CatchClause",
       "ForStatement", "ForInStatement", "ForOfStatement", "ClassDeclaration", "ClassExpression", ...functions]);
     const scopeFor = (ancestors, variable = false) => {
@@ -631,7 +635,8 @@ export function packHtml(
     // Bundled addons may contain an unrelated local `URL` (GLTFLoader does).
     // Resolve document-module host uses in their lexical scope. Keep classic
     // worker realm checks conservative across scripts and imported modules.
-    const boundAt = (node, name) => worker ? bindings.has(name) : hostWrites.has(name) || locallyBound(node, name);
+    const boundAt = (node, name) => (ancestorsByNode.get(node) ?? []).some(parent => parent.type === "WithStatement") ||
+      (worker ? bindings.has(name) : hostWrites.has(name) || locallyBound(node, name));
     function writtenHost(node) {
       // Module locals are isolated; direct writes to a classic realm's host
       // globals are not. Track writes even in ESM helpers of that realm.
@@ -661,7 +666,10 @@ export function packHtml(
         bind(node.id);
         node.params.forEach(parameter => { bind(parameter); bindIn(node, parameter); });
         if (node.id) bindIn(node, node.id);
-        if (node.type === "FunctionDeclaration") bindIn(scopeFor(parents), node.id);
+        if (node.type === "FunctionDeclaration") {
+          bindIn(scopeFor(parents), node.id);
+          if (sourceType === "script" && !parents.some(strictScope)) bindIn(scopeFor(parents, true), node.id);
+        }
       }
       if (node.type === "ClassDeclaration" || node.type === "ClassExpression") {
         bind(node.id);
@@ -690,6 +698,12 @@ export function packHtml(
         fail("WORKER_LOCATION", "Worker location observation requires the normal build");
     });
     writes.forEach(recordHostWrite);
+    if (!worker) {
+      for (const name of names) documentNames.add(name);
+      for (const name of hostWrites) documentBindings.add(name);
+      if (sourceType === "script")
+        for (const name of scopedBindings.get(ast) ?? []) documentBindings.add(name);
+    }
     if (worker && sourceType === "script") {
       for (const name of names) worker.names.add(name);
       for (const name of bindings) worker.bindings.add(name);
@@ -703,6 +717,7 @@ export function packHtml(
     }
     function uses(...names) {
       if (worker?.kind === "classic") for (const name of names) worker.hostUses.add(name);
+      else if (!worker) for (const name of names) documentWorkerUses.add(name);
     }
     // Rewrite only finite URL result leaves. Conditions, comma-prefix effects,
     // native URL construction and caller options keep their execution ordering.
@@ -735,11 +750,6 @@ export function packHtml(
       // codec sites. Retain native construction of their source-created Blob
       // URLs; never infer this permission from an import/export or class name.
       if (sourceLoaderRuntime) continue;
-      if (!worker && sourceType !== "module")
-        fail(
-          "WORKER_PARENT",
-          "Dedicated workers must be constructed by an emitted document module",
-        );
       if (boundAt(site, "Worker") || boundAt(site, "URL"))
         fail("WORKER_BINDING", "Shadowed Worker/URL bindings require the normal build");
       if (site.arguments.length < 1 || site.arguments.length > 2)
@@ -762,7 +772,7 @@ export function packHtml(
         const childUrl = local(value, origin), record = workerFactory(childUrl, kind);
         if (sourceType === "script") {
           const name = "__f3d_worker_" + digest(kind + ":" + keyFor(childUrl));
-          worker.factories.set(name, record.classic);
+          (worker ? worker.factories : documentFactories).set(name, record.classic);
           return `${name}()`;
         }
         let name = `__f3d_packed_worker_${workerImports.length}`;
@@ -1185,16 +1195,29 @@ export function packHtml(
   }
   if (documentFetchUsed && documentFetchMutated)
     fail("FETCH_URL", "A document script replaces fetch; keep its original networked host route");
+  for (const name of documentWorkerUses)
+    if (documentBindings.has(name))
+      fail("WORKER_BINDING", `Document scripts rebind the host name ${name}`);
+  const declarations = [];
+  for (const [name, expression] of documentFactories) {
+    if (documentNames.has(name)) fail("WORKER_BINDING", "Document worker factory name collision");
+    declarations.push(`const ${name} = ${expression};`);
+  }
   // Emit one map before executable code. All identities are now known; circular
   // modules refer to stable keys, never recursively nested data URLs.
   const map = Object.fromEntries([...modules.values()].flatMap((record) =>
     [[record.key, record.data], ...(record.urlKey ? [[record.urlKey, record.data]] : [])]));
   const insertion = mapRanges.length ? Math.min(firstScript, mapRanges[0].start) : firstScript;
-  if (modules.size)
+  // A single parser-ordered classic prelude shares lazy URL factories across
+  // inline, repeated external, async and deferred classic scripts. It adds no
+  // window properties and leaves every source script's directive/global scope.
+  const prelude = (modules.size ? `<script type="importmap">${JSON.stringify({ imports: map }).replace(/</g, "\\u003c")}</script>\n` : "") +
+    (declarations.length ? `<script src="${dataUrl(declarations.join("\n"), "text/javascript")}"></script>\n` : "");
+  if (prelude)
     replacements.push({
       start: insertion,
       end: insertion,
-      value: `<script type="importmap">${JSON.stringify({ imports: map }).replace(/</g, "\\u003c")}</script>\n`,
+      value: prelude,
     });
   const output = edits(html, replacements);
   if (Buffer.byteLength(output) > maxBytes)

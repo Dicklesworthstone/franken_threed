@@ -107,6 +107,8 @@ function scopedGlobals(ast) {
   const functions = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
   const lexical = new Set(['Program', 'BlockStatement', 'StaticBlock', 'CatchClause',
     'ForStatement', 'ForInStatement', 'ForOfStatement', 'SwitchStatement', ...functions]);
+  const strictScope = node => ['ClassDeclaration', 'ClassExpression', 'StaticBlock'].includes(node.type) ||
+    (node.type === 'Program' ? node.body : functions.has(node.type) ? node.body.body : [])?.some(statement => statement.directive === 'use strict');
   function names(node, result = []) {
     if (!node) return result;
     if (node.type === 'Identifier') result.push(node.name);
@@ -132,7 +134,12 @@ function scopedGlobals(ast) {
       put(node, node.params.flatMap(value => names(value)));
       if (node.id) {
         put(node, [node.id.name]);
-        if (node.type === 'FunctionDeclaration') put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+        if (node.type === 'FunctionDeclaration') {
+          put(containing(parent => lexical.has(parent.type)), [node.id.name]);
+          // Sloppy classic block functions can also create Annex B var bindings.
+          if (ast.sourceType === 'script' && !parents.some(strictScope))
+            put(containing(parent => functions.has(parent.type) || parent.type === 'Program'), [node.id.name]);
+        }
       }
     } else if (node.type === 'CatchClause') put(node, names(node.param));
     else if (['ClassDeclaration', 'ClassExpression'].includes(node.type) && node.id) {
@@ -159,7 +166,11 @@ function scopedGlobals(ast) {
     AssignmentExpression: node => mutation(node.left), UpdateExpression: node => mutation(node.argument),
     ForInStatement: node => mutation(node.left), ForOfStatement: node => mutation(node.left),
   });
-  return node => new Set([...writes, ...(ancestorsByNode.get(node) ?? []).flatMap(parent => [...(scopes.get(parent) ?? [])])]);
+  return node => {
+    const ancestors = ancestorsByNode.get(node) ?? [];
+    return new Set([...writes, ...ancestors.flatMap(parent => [...(scopes.get(parent) ?? [])]),
+      ...(ancestors.some(parent => parent.type === 'WithStatement') ? ['Worker', 'SharedWorker', 'URL'] : [])]);
+  };
 }
 function sitesIn(ast, changed, {classic = false, relative = false, withConstructors = false} = {}) {
   const sites = [];
@@ -197,9 +208,17 @@ export function findModuleWorkerSites(source) {
 }
 
 /** URL-form workers; literal URLs when their document or worker realm is known. */
-export function findWorkerSites(source, {sourceType = 'module', relative = false} = {}) {
+export function findWorkerSites(source, {sourceType = 'module', relative = false, unavailableGlobals = []} = {}) {
   const ast = typeof source === 'string' ? parse(source, null, sourceType) : source;
-  return sitesIn(ast, scopedGlobals(ast), {classic: true, relative});
+  const globals = scopedGlobals(ast);
+  return sitesIn(ast, node => new Set([...globals(node), ...unavailableGlobals]), {classic: true, relative});
+}
+
+/** Direct global bindings/writes shared by document scripts. Module locals do
+ * not become document globals; top-level classic bindings do. */
+export function workerGlobalBindings(source, {sourceType = 'script'} = {}) {
+  const ast = typeof source === 'string' ? parse(source, null, sourceType) : source;
+  return scopedGlobals(ast)(sourceType === 'script' ? ast : null);
 }
 
 const realmKey = (url, workerType) => JSON.stringify([workerType, url]);
@@ -597,7 +616,8 @@ export function moduleWorkerRollupPlugin(options = {}) {
     },
     transform(code, id) {
       if (!code.includes('Worker')) return null;
-      const sites = findWorkerSites(code, {relative: Boolean(options.documentUrl)});
+      const sites = findWorkerSites(code, {sourceType: options.sourceType ?? 'module',
+        relative: Boolean(options.documentUrl), unavailableGlobals: options.unavailableGlobals});
       if (!sites.length) return null;
       const base = id.startsWith('file:') ? id : path.isAbsolute(id) ? pathToFileURL(id).href : null;
       if (!base) fail('ENTRY', 'A module worker URL needs a local source module', id);

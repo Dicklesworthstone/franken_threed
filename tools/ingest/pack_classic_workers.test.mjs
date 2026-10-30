@@ -6,6 +6,7 @@ import test from "node:test";
 import vm from "node:vm";
 import * as acorn from "acorn";
 import { packHtml } from "./pack_html.mjs";
+import { parseTagAttributes } from "./html_parser.mjs";
 
 const decode = (url) =>
   Buffer.from(url.slice(url.indexOf(",") + 1).split("#")[0], "base64").toString();
@@ -43,6 +44,65 @@ async function workerSource(f) {
   );
   return (await fetch(factory.default())).text();
 }
+
+test("document classics share lazy worker factories without changing directives, globals or script attributes", async () => {
+  const f = fixture({
+    "index.html": `<script>const seed=21;globalThis.effects=[];</script>
+      <script src="scripts/start.js" defer data-owner="first"></script>
+      <script src="scripts/start.js" async data-owner="second"></script>`,
+    "scripts/start.js": `"use strict";var runs=(globalThis.runs||0)+1;
+      var strictThis=(function(){return this;})();
+      var decoder=new Worker((effects.push(runs),true?'./worker.js':'./other.js'),
+        {type:'classic',name:(effects.push(seed),'decoder')});`,
+    "worker.js": "self.value=42;",
+    "other.js": "self.value=7;",
+  });
+  const report = f.pack(), html = fs.readFileSync(f.output, "utf8"), calls = [];
+  assert.equal(report.workerCount, 2);
+  assert.match(html, /defer data-owner="first"/);
+  assert.match(html, /async data-owner="second"/);
+  const context = vm.createContext({URL, Blob, Worker: class {
+    constructor(url, options) { calls.push({url, options}); }
+  }});
+  for (const tag of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    const attrs = parseTagAttributes(tag[1]);
+    vm.runInContext(attrs.src ? decode(attrs.src) : tag[2], context);
+  }
+  assert.equal(context.runs, 2);
+  assert.equal(context.strictThis, undefined);
+  assert.deepEqual(Array.from(context.effects), [1,21,2,21]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, calls[1].url, "repeated document scripts reuse one worker URL");
+  assert.equal(calls[0].options.name, "decoder");
+  assert.equal(await (await fetch(calls[0].url)).text(), "self.value=42;");
+  assert.deepEqual(Object.keys(context).filter(name => name.startsWith("__f3d_worker_")), []);
+  URL.revokeObjectURL(calls[0].url);
+});
+
+for (const binding of ["const Worker=CustomWorker;", "globalThis.Worker=CustomWorker;",
+  "var URL=CustomURL;", "globalThis.Blob=CustomBlob;", "{function Worker(url){this.url=url;}}"]) {
+  test("document classic worker factories reject shared host rebinding: " + binding, () => {
+    const f = fixture({"index.html": `<script>${binding}</script>
+      <script>new Worker('./worker.js');</script>`, "worker.js": "self.ready=true;"});
+    assert.throws(() => f.pack(), {code: "WORKER_BINDING"});
+    assert.equal(fs.existsSync(f.output), false);
+  });
+}
+
+test("document classic worker packing still retains native SharedWorker ownership", () => {
+  const f = fixture({"index.html": "<script>new SharedWorker('./worker.js');</script>",
+    "worker.js": "self.ready=true;"});
+  assert.throws(() => f.pack(), {code: "HOST_RESOURCE"});
+  assert.equal(fs.existsSync(f.output), false);
+});
+
+test("document classic dynamic with scopes retain their original Worker lookup", () => {
+  const f = fixture({"index.html": `<script>with({Worker:class{constructor(url){this.url=url;}}}){
+    new Worker('./worker.js');}</script>`, "worker.js": "self.ready=true;"});
+  assert.throws(() => f.pack(), {code: "WORKER_BINDING"});
+  assert.equal(fs.existsSync(f.output), false);
+});
+
 // vm implements only a classic-script test seam; browser tests exercise native importScripts.
 test("keeps importScripts synchronous, ordered and repeatable in its global scope", async () => {
   const f = fixture({

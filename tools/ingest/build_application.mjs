@@ -46,6 +46,7 @@ import {
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
@@ -817,6 +818,7 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
 
       // Handle <script> tags
       if (isScript) {
+        if (options.classicScriptRewrites?.has(match)) return options.classicScriptRewrites.get(match);
         const attrs = parseTagAttributes(scriptAttrs);
         const scriptType = (attrs.type || "text/javascript").toLowerCase();
 
@@ -963,6 +965,71 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const targetFiles = new Map(); // relativePath -> string | Buffer
   const htmlFileName = isHtml ? path.basename(resolvedEntryAbs) : null;
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
+  const classicWorkerSources = new Map(), classicScriptRewrites = new Map();
+  const documentWorkerGlobals = new Set();
+
+  if (isHtml) {
+    const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf8"), documentUrl = pathToFileURL(resolvedEntryAbs).href;
+    const parsed = parseHtmlEntries(rawHtml, documentUrl), scripts = [];
+    // Skip markup-looking text in comments, styles and other raw-text elements.
+    const tags = /<!--[\s\S]*?(?:-->|$)|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/\1\s*>/gi;
+    for (const match of rawHtml.matchAll(tags)) {
+      if (match[1]?.toLowerCase() !== "script") continue;
+      const attrs = parseTagAttributes(match[2]);
+      const sourceType = attrs.type?.trim().toLowerCase() === "module" ? "module" : "script";
+      if ((sourceType === "script" && !isClassicJavaScriptType(attrs.type)) || attrs.src === "") continue;
+      let source = match[3], file = null, original = Buffer.from(source);
+      if (attrs.src !== undefined) {
+        const url = new URL(attrs.src, parsed.baseUrl);
+        if (url.protocol !== "file:" || !isRelativeUrl(attrs.src)) {
+          // An uninspected external script can replace the document globals.
+          documentWorkerGlobals.add("Worker"); documentWorkerGlobals.add("SharedWorker"); continue;
+        }
+        file = fileURLToPath(url);
+        const relative = path.relative(entryDir, file);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) continue; // Existing asset closure reports this.
+        if (!fs.existsSync(file) || !fs.statSync(file).isFile()) continue;
+        original = fs.readFileSync(file);
+        source = moduleSources.read(url.href, {sourceType}).code;
+      }
+      for (const name of workerGlobalBindings(source, {sourceType})) documentWorkerGlobals.add(name);
+      if (sourceType === "script") scripts.push({match, attrs, source, file, original});
+    }
+    const plugin = moduleWorkerRollupPlugin({_moduleSources: moduleSources, sourceType: "script",
+      documentUrl, documentBaseUrl: parsed.baseUrl, unavailableGlobals: documentWorkerGlobals,
+      resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
+        packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources})});
+    const context = {emitFile(asset) {
+      const previous = targetFiles.get(asset.fileName);
+      if (previous !== undefined && !Buffer.from(previous).equals(Buffer.from(asset.source)))
+        throw new Error(`Worker resource bytes disagree for ${JSON.stringify(asset.fileName)}`);
+      targetFiles.set(asset.fileName, asset.source); return asset.fileName;
+    }};
+    plugin.buildStart();
+    for (const {match, attrs, source, file, original} of scripts) {
+      // Preserve an original SRI failure instead of turning it into a working
+      // script while rewriting its URLs. Supported digests use their strongest
+      // algorithm, matching the browser's choice among multiple metadata tokens.
+      const tokens = (file ? attrs.integrity ?? "" : "").trim().split(/\s+/).filter(Boolean);
+      const known = tokens.map(token => /^(sha(?:256|384|512))-([^?]+)(?:\?.*)?$/.exec(token)).filter(Boolean);
+      const strongest = Math.max(0, ...known.map(token => Number(token[1].slice(3))));
+      if (strongest && !known.some(token => Number(token[1].slice(3)) === strongest &&
+          crypto.createHash(token[1]).update(original).digest("base64") === token[2])) continue;
+      const transformed = plugin.transform.call(context, source, file ? pathToFileURL(file).href : documentUrl);
+      if (!transformed) continue;
+      if (file) {
+        classicWorkerSources.set(file, {before: Buffer.from(source), after: Buffer.from(transformed.code)});
+        if (known.length) {
+          const metadata = tokens.map(token => /^(sha(?:256|384|512))-/.test(token)
+            ? computeIntegrityForContent(token, transformed.code) : token).join(" ");
+          const updated = match[2].replace(/(?:^|\s+)([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g,
+            (attribute, name) => name.toLowerCase() === "integrity"
+              ? attribute.replace(/integrity[\s\S]*/i, `integrity="${metadata}"`) : attribute);
+          classicScriptRewrites.set(match[0], `<script${updated}>${match[3]}</script>`);
+        }
+      } else classicScriptRewrites.set(match[0], `<script${match[2]}>${transformed.code}</script>`);
+    }
+  }
 
   // The same closure walk runs before bundling to establish retained module identity,
   // then afterward to validate chunk collisions and collect unbundled preloads.
@@ -1165,8 +1232,10 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
       // Retained scripts must use the same frontend output as bundled imports.
       // URL variants can share a physical output only when their bytes agree.
-      const assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
+      let assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
         {sourceType: item.isModuleSpecifier ? "module" : "script"}).bytes : fs.readFileSync(srcAssetAbs);
+      const workerSource = classicWorkerSources.get(srcAssetAbs);
+      if (workerSource && assetData.equals(workerSource.before)) assetData = workerSource.after;
       const previous = targetFiles.get(relFromEntryDir);
       if (previous !== undefined && !Buffer.from(previous).equals(assetData))
         throw new Error(`Source transforms disagree for retained resource ${JSON.stringify(relFromEntryDir)}`);
@@ -1238,6 +1307,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
     _moduleSources: moduleSources,
     packageRootUrl: options.packageRootUrl,
+    workerHostBindings: documentWorkerGlobals,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
@@ -1273,7 +1343,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         fs.readFileSync(resolvedEntryAbs, "utf-8"),
         bundleResult.entryFiles,
         bundleResult.files,
-        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl },
+        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, classicScriptRewrites },
       ),
     );
   }
