@@ -173,13 +173,27 @@ test('disposing a target cancels its stalled preparation rather than hanging com
   gate.resolve(); f.r.dispose(); assert.ok(f.calls.textures.every(x => x.destroyed === 1));
 });
 
-test('canvas preserveDrawingBuffer restrictions do not reject offscreen layered loads', async () => {
+test('preserveDrawingBuffer admits canvas and offscreen layered loads', async () => {
   const f = await make(true, {preserveDrawingBuffer: true}), target = new T.RenderTarget(), s = scene('layered');
   f.r.setRenderTarget(target); await f.r.compileAsync(s, new Camera()); f.r.render(s, new Camera());
   f.r.autoClear = false; f.r.render(s, new Camera());
   assert.equal(f.draws[0].frame.loadOp, 'clear'); assert.equal(f.draws[1].frame.loadOp, 'load');
   assert.equal(f.draws[1].frame.depthLoadOp, 'load');
-  f.r.setRenderTarget(null); assert.throws(() => f.r.render(s, new Camera()), {code: 'F3D_RENDERER_UNSUPPORTED'}); f.r.dispose();
+  f.r.setRenderTarget(null); f.r.render(s, new Camera()); await flush(f.r);
+  assert.equal(f.draws[2].frame.loadOp, 'load'); assert.equal(f.draws[2].frame.depthLoadOp, 'load'); f.r.dispose();
+});
+
+test('preserved WebGL history refuses incompatible whole-image HDR fallback before replacing its owner', async () => {
+  for (const autoClear of [false, true]) {
+    const f = await make(true, {preserveDrawingBuffer: true}), first = scene('history', 42), unsupported = scene('fallback');
+    await f.r.renderAsync(first, new Camera());
+    const session = f.r._session, closed = f.canvas.closed;
+    f.r.autoClear = autoClear; f.r.setScissor(1, 1, 8, 8); f.r.setScissorTest(true);
+    f.r.toneMapping = T.ACESFilmicToneMapping; unsupported.requiresHdr = true;
+    await assert.rejects(f.r.compileAsync(unsupported, new Camera()), {code: 'THREE_SCENE_TONE_MAPPING'});
+    assert.equal(f.r._session, session); assert.equal(f.canvas.closed, closed);
+    assert.equal(f.canvas.texture.value, 42); assert.notEqual(f.r._hdrFallback, true); f.r.dispose();
+  }
 });
 
 test('immediate canvas program draws keep live renderer mutations made by source callbacks', async () => {

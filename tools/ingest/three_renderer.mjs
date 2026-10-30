@@ -499,6 +499,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...presentation,
+            preserveDrawingBuffer: this._shaderEncodedOutput && this.preserveDrawingBuffer === true,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
       this._canvases.save();
       } finally { release(); }
@@ -1469,7 +1470,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             this._rebuild = false;
             try { await this._session.prepare(); }
             catch (error) {
-              if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true) throw error;
+              // Encoded history cannot move into a linear whole-image output
+              // target: it would be lost or tone-mapped again on later frames.
+              // Even auto-clears can be scissored or retain other attachments.
+              if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true ||
+                  this._shaderEncodedOutput && this.preserveDrawingBuffer === true) throw error;
               this._hdrFallback = true;
               this._session.dispose();
               const fallbackHdr = selectOutput();
@@ -1643,7 +1648,7 @@ const WEBGL_PARAMETERS = new Set(['canvas', 'context', 'depth', 'stencil', 'alph
  *   sRGB-encoded shader outputs: translucent pixels differ (opaque ones do not).
  * - Tone mapping is a whole-image output pass, not per-material in the shader;
  *   toneMapped:false materials and translucent pixels under tone mapping differ.
- * - preserveDrawingBuffer with autoClear:false accumulation is not admitted.
+ * - preserveDrawingBuffer retains owned color/depth/MSAA storage across frames.
  */
 export function createWebGLRendererClass(THREE, classOptions = {}) {
   const {exactBackend = null, ...options} = classOptions;
@@ -1701,8 +1706,6 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     }
     _needsGlobalClipping() { return this.clippingPlanes.length > 0; }
     _beforeRender() {
-      if (!this._renderTarget && this.preserveDrawingBuffer && this.autoClear === false)
-        fail('UNSUPPORTED', 'preserveDrawingBuffer accumulation across frames is not admitted');
       this._clippingControls.planes = this.clippingPlanes;
       this._clippingControls.localClippingEnabled = this.localClippingEnabled;
     }

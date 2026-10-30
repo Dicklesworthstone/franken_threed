@@ -218,6 +218,41 @@ updates follow the pinned native renderer. This does not admit nested arrays,
 multiview/XR cameras, or ArrayCamera on the WebGL-authored route. Custom native
 scene/object/material render hooks retain their existing explicit rejection.
 
+## Preserved WebGL-authored canvases
+
+`createWebGLRendererClass(THREE)` admits `preserveDrawingBuffer: true` with
+`autoClear: false`. Painting, motion trails and layered composition retain their
+encoded color, depth and optional stencil contents across browser presentation
+turns. One-sample and four-sample draws use the same owned history; multisample
+color resolves into its single-sample presentation source after each draw.
+
+The owner initializes fresh attachments to transparent black, depth one and
+stencil zero before the first load. Each submitted frame copies the resulting
+color texels into a newly acquired canvas texture. There is no CPU readback or
+extra tone/color/alpha conversion in this presentation path. Scissored clears,
+independent attachment clears and source alpha blending operate on retained
+storage. Changed dimensions allocate fresh history; old attachments retire only
+after their submitted work completes, and their overlap counts toward the
+existing memory budget. Failed preparation before attachment use presents
+nothing; already issued partial draws remain visible if a later callback fails.
+
+Preserved canvases keep per-material shader tone mapping. A material requiring
+the separate whole-image HDR fallback reports its existing
+`THREE_SCENE_TONE_MAPPING` error before replacing the canvas owner: moving
+encoded history into a linear output target would discard or reprocess earlier
+pixels. This boundary also applies to clearing frames because scissors and
+independent clear masks can retain history. Native WebGPURenderer output is
+unaffected.
+
+`node tests/e2e/webgpu_renderer/program_preserved_canvas.mjs` compares the pinned
+WebGL renderer with actual new-backend canvas pixels after separate animation
+frames. Chromium 151.0.7922.34 / SwiftShader passed 30 exact checkpoints and
+123,904 RGBA bytes across one and four samples: first-load initialization,
+opaque trails, alpha accumulation, retained depth, `clearDepth`, scissored clears,
+empty loads, changed dimensions, same-size `setSize` and same-value pixel ratio.
+There were zero GPU/browser errors. These are rendering-correctness results,
+not physical-device performance measurements.
+
 ## Explicit differences
 
 - Structural edits (new objects/materials, material structure, enabling fog,

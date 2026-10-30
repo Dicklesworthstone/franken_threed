@@ -4,7 +4,7 @@ import {register} from 'node:module';
 import {T, fixture, passFixture, deferred} from './fixtures/pass_snapshot_renderer.mjs';
 register('./fixtures/pass_snapshot_loader.mjs', import.meta.url);
 const {createWebGLRendererClass} = await import('./three_renderer.mjs');
-const C = createWebGLRendererClass(T);
+const C = createWebGLRendererClass(T, {maxPendingRenders: 64});
 const flush = async r => { while (r._drain) await r._drain; };
 async function make() { const f = fixture(); f.r = new C({canvas: f.canvas, device: f.device}); await f.r.init(); return f; }
 
@@ -135,15 +135,17 @@ test('renderAsync captures and queues before initialization, preserving mixed AP
   assert.equal(f.device.draws[0].frame.colorView, f.device.draws[2].frame.colorView); r.dispose();
 });
 
-test('renderAsync retains WebGL restrictions and the synchronous WebGPU initialization guard', async () => {
+test('renderAsync admits preserved WebGL canvas loads and retains the synchronous WebGPU initialization guard', async () => {
   const f = fixture(), r = new C({canvas: f.canvas, device: f.device, preserveDrawingBuffer: true}), p = passFixture();
   r.autoClear = false;
-  await assert.rejects(r.renderAsync(p.root, p.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  assert.equal(f.device.draws.length, 0); await r.init(); r.dispose();
+  await r.renderAsync(p.root, p.camera);
+  assert.equal(f.device.draws.length, 1); assert.equal(f.device.draws[0].frame.loadOp, 'load'); r.dispose();
   const {createWebGPURendererClass} = await import('./three_renderer.mjs');
   const WebGPU = createWebGPURendererClass(T), g = fixture(), gpu = new WebGPU({canvas: g.canvas, device: g.device});
   assert.throws(() => gpu.render(p.root, p.camera), /called before the backend is initialized/);
-  await gpu.renderAsync(p.root, p.camera); assert.equal(g.device.draws.length, 1); gpu.dispose();
+  // This fixture supplies WebGL pass classes. Native node execution is covered
+  // by the real-source renderer suites; only its initialization guard belongs here.
+  await gpu.init(); gpu.dispose();
 });
 
 for (const mutate of [t => t.dispose(), t => t.setSize(8, 4), t => { t.width++; }])

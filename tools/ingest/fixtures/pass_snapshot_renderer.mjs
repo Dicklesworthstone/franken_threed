@@ -1,9 +1,10 @@
 /** Real facade/target/readback code; this factory records pass inputs instead of executing shaders. */
 import {passThree, passFixture} from './pass_snapshot_fixture.mjs';
 import {targetThree, targetDevice} from './target_residency_fixture.mjs';
+import {EventDispatcher} from '../../../upstream/three.js/src/core/EventDispatcher.js';
 class Color { constructor(r = 0, g = 0, b = 0) { Object.assign(this, {r, g, b, isColor: true}); } set(c) { return this.copy(c?.isColor ? c : new Color()); } copy(c) { Object.assign(this, {r: c.r, g: c.g, b: c.b}); return this; } }
 class Scene extends passThree.Object3D { isScene = true; background = null; environment = null; fog = null; overrideMaterial = null; }
-export const T = {...passThree, ...targetThree, Color, Scene, PerspectiveCamera: passThree.Camera, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
+export const T = {...passThree, ...targetThree, EventDispatcher, Color, Scene, PerspectiveCamera: passThree.Camera, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
 export {passFixture};
 export const createThreeProgramSupport = options => options;
 export const createThreeProgramPMREM = () => {};
@@ -58,7 +59,7 @@ export async function createGpuCanvasRenderer(canvas, factory, {device}) {
 export const createGpuHdrCanvasRenderer = createGpuCanvasRenderer;
 export function fixture() {
   const f = targetDevice(); Object.assign(f.device, {draws: [], preparations: []});
-  f.canvas = {width: 64, height: 32, style: {}, texture: {value: 0}, acquired: 0};
+  f.canvas = {width: 64, height: 32, style: {}, texture: {value: 0}, acquired: 0, getContext() { return null; }};
   f.copies = []; f.buffers = [];
   f.device.createBuffer = d => {
     const data = new ArrayBuffer(d.size), b = {destroyed: 0, data, unmap() {}, destroy() { this.destroyed++; },

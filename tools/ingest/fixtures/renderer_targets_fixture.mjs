@@ -1,6 +1,7 @@
 /** Scene/canvas factory doubles: this tests the actual renderer's public API,
  * target owner, GPU descriptors and queue sequencing, not rasterized pixels. */
 import {targetDevice, targetThree} from './target_residency_fixture.mjs';
+import {EventDispatcher} from '../../../upstream/three.js/src/core/EventDispatcher.js';
 class Object3D {
   name = '';
   children = [];
@@ -17,7 +18,7 @@ class Color {
   copy(c) { Object.assign(this, {r: c.r, g: c.g, b: c.b}); return this; }
 }
 class Vector2 { set(x, y) { Object.assign(this, {x, y}); return this; } }
-export const T = {...targetThree, Scene, Object3D, Camera, PerspectiveCamera: Camera, Color, Vector2,
+export const T = {...targetThree, EventDispatcher, Scene, Object3D, Camera, PerspectiveCamera: Camera, Color, Vector2,
   WebGPUCoordinateSystem: 2001, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
 export const createThreeProgramSupport = options => options;
 export const createThreeProgramPMREM = () => {};
