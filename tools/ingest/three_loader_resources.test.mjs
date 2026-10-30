@@ -200,6 +200,94 @@ test("ObjectLoader saved scenes retain external images, cube faces and edited JS
     "re-import retains the data-image URLs written by the source JSON exporter");
 });
 
+test("packed OBJ and MTL retain material textures, creator identity and pending resource paths offline", async () => {
+  const mtl = `newmtl Paint
+Kd 0.5 0.25 0.75
+Ns 24
+d 0.6
+map_Kd -s 2 3 1 -o 0.25 0.5 0 paint%20%23.png?version=2#color
+map_Ks specular.png
+map_Ke glow.png
+norm normal.png
+map_bump -bm 0.4 bump.png
+disp -mm -0.2 1.5 height.png
+map_d alpha.png
+`;
+  const obj = `mtllib nested/library.mtl
+o triangle
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+vn 0 0 1
+usemtl Paint
+f 1/1/1 2/2/1 3/3/1
+`;
+  const imageNames = ['paint #.png', 'specular.png', 'glow.png', 'normal.png', 'bump.png', 'height.png', 'alpha.png'];
+  const images = Object.fromEntries(['models/', 'shared/'].flatMap(base => imageNames.map(name => [base + name, pixel])));
+  const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
+  const f = fixture({'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      import {MTLLoader} from ${JSON.stringify(loaderUrl('MTLLoader'))};
+      import {OBJLoader} from ${JSON.stringify(loaderUrl('OBJLoader'))};
+      const mapNames=['map','specularMap','emissiveMap','normalMap','bumpMap','displacementMap','alphaMap'];
+      async function ready(material){
+        for(let attempt=0;attempt<100;attempt++){
+          if(mapNames.every(name=>material[name]?.image?.complete))return;
+          await new Promise(resolve=>setTimeout(resolve,10));
+        }
+        throw new Error('Unloaded MTL textures: '+mapNames.filter(name=>!material[name]?.image?.complete));
+      }
+      export async function run(){
+        const order=[];
+        const pending=new MTLLoader().setPath('models/').setMaterialOptions({side:THREE.DoubleSide})
+          .loadAsync('nested/library.mtl'); order.push('returned');
+        const materials=await pending; order.push('loaded'); materials.preload();
+        const objects=new OBJLoader(); objects.setMaterials(materials); objects.setPath('models/');
+        const first=await objects.loadAsync('triangle.obj');
+        const second=await objects.loadAsync('triangle.obj');
+        const independent=await new Promise((resolve,reject)=>new MTLLoader().setPath('models/')
+          .load('nested/library.mtl',resolve,undefined,reject));
+        const independentMesh=await new OBJLoader().setMaterials(independent).setPath('models/').loadAsync('triangle.obj');
+        const changing=new MTLLoader(), lateLoad=changing.loadAsync('late/library.mtl');
+        changing.setResourcePath('shared/'); const late=await lateLoad; late.preload();
+        const a=first.children[0], b=second.children[0], c=independentMesh.children[0], material=a.material;
+        await Promise.all([ready(material),ready(c.material),ready(late.create('Paint'))]);
+        a.position.x=7;
+        return {order,name:a.name,type:material.type,vertices:[...a.geometry.attributes.position.array],
+          uv:[...a.geometry.attributes.uv.array],independentObjects:a!==b&&a.geometry!==b.geometry&&b.position.x===0,
+          sharedCreator:material===b.material,independentCreator:material!==c.material&&material.map!==c.material.map,
+          mapNames:mapNames.filter(name=>material[name].image.complete),repeat:material.map.repeat.toArray(),
+          offset:material.map.offset.toArray(),side:material.side,opacity:material.opacity,transparent:material.transparent,
+          shininess:material.shininess,bumpScale:material.bumpScale,displacementBias:material.displacementBias,
+          displacementScale:material.displacementScale,colorSpaces:mapNames.map(name=>material[name].colorSpace),
+          lateBase:late.baseUrl,lateDistinct:late.create('Paint').map.image.src!==material.map.image.src};
+      }`,
+    'models/nested/library.mtl': mtl, 'late/library.mtl': mtl, 'models/triangle.obj': obj, ...images,
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders:true});
+  assert.equal(fs.readFileSync(path.join(f.out,'models/nested/library.mtl'),'utf8'),mtl);
+  assert.equal(fs.readFileSync(path.join(f.out,'models/triangle.obj'),'utf8'),obj);
+  for (const [name, bytes] of Object.entries(images)) assert.deepEqual(fs.readFileSync(path.join(f.out,name)),bytes);
+  packHtml(path.join(f.out,'index.html'),f.packed);
+  const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  assert.deepEqual(result.result,{order:['returned','loaded'],name:'triangle',type:'MeshPhongMaterial',
+    vertices:[0,0,0,1,0,0,0,1,0],uv:[0,0,1,0,0,1],independentObjects:true,sharedCreator:true,independentCreator:true,
+    mapNames:['map','specularMap','emissiveMap','normalMap','bumpMap','displacementMap','alphaMap'],repeat:[2,3],
+    offset:[0.25,0.5],side:2,opacity:0.6,transparent:true,shininess:24,bumpScale:0.4,displacementBias:-0.2,
+    displacementScale:1.5,colorSpaces:['srgb','','srgb','','','',''],lateBase:'shared/',lateDistinct:true});
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='models/paint%20%23.png?version=2#color'));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='shared/normal.png'));
+  assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
+  assert.ok(result.images.every(url=>url.startsWith('data:image/png;')));
+});
+
 test("packed HDR/EXR environments, fonts and geometry execute retained addon parsers without network or source files", async () => {
   const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
   const hdr = Buffer.concat([Buffer.from('#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n'), Buffer.from([255, 128, 64, 128])]);

@@ -15,6 +15,8 @@ const coreUrl = rootUrl + "build/three.core.js";
 const gltfUrl = rootUrl + "examples/jsm/loaders/GLTFLoader.js";
 const dracoUrl = rootUrl + "examples/jsm/loaders/DRACOLoader.js";
 const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
+const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
+const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -109,7 +111,7 @@ test("pinned single-file addons retain finite paths, decoder settings and import
     'exr/sky.exr', 'font.json', 'geometry/mesh.stl', 'mesh.ply', 'mesh.obj', 'namespace.hdr', 'namespace-font.json']);
 });
 
-test("addon asset discovery preserves opaque loaders, shadows and side-resource routes", () => {
+test("addon asset discovery preserves opaque loaders and shadows while OBJ material setters retain its model URL", () => {
   const addon = name => JSON.stringify(rootUrl + `examples/jsm/loaders/${name}.js`);
   const requests = discover(`import { HDRLoader } from ${addon('HDRLoader')};
     import { OBJLoader } from ${addon('OBJLoader')};
@@ -125,7 +127,55 @@ test("addon asset discovery preserves opaque loaders, shadows and side-resource 
     new OBJLoader().setMaterials(materials).load('materials.obj');
     new FBXLoader().load('sidecars.fbx');
     new HDRLoader().load('known.hdr');`);
-  assert.deepEqual(requests.map(({url}) => url), ['known.hdr']);
+  assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'known.hdr']);
+});
+
+test("MTL and configured OBJ loaders retain finite model paths, material settings and namespace identity", () => {
+  const requests = discover(`import { MTLLoader as Materials } from ${JSON.stringify(mtlUrl)};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { OBJLoader } from ${JSON.stringify(objUrl)};
+    const loader = new Materials().setMaterialOptions({side:doubleSide,normalizeRGB:true});
+    loader.setPath('materials/');
+    loader.loadAsync(which ? 'day.mtl' : 'night.mtl');
+    loader.parse(runtimeText, 'runtime/');
+    new Addons.MTLLoader().setResourcePath('textures/').load('other/library.mtl');
+    const object = new OBJLoader(); object.setMaterials(materials); object.setPath('models/');
+    object.loadAsync('mesh.obj');
+    new OBJLoader().setMaterials(materials).load('other.obj');`);
+  assert.deepEqual(requests.map(({url}) => url), ['materials/day.mtl', 'materials/night.mtl',
+    'other/library.mtl', 'models/mesh.obj', 'other.obj']);
+  assert.deepEqual(requests.slice(0, 3).map(({texturePaths}) => texturePaths),
+    [['materials/'], ['materials/'], ['textures/']]);
+});
+
+test("MTL pending resource resets retain each request's captured default path rather than a sticky base", () => {
+  const requests = discover(`import { MTLLoader } from ${JSON.stringify(mtlUrl)};
+    const loader = new MTLLoader();
+    loader.load('first/library.mtl'); loader.loadAsync('second/library.mtl');
+    loader.setResourcePath('shared/');
+    loader.setPath('models/'); loader.load('nested/library.mtl');
+    loader.setResourcePath('');
+    loader.load(runtimeURL);
+    const pending = new MTLLoader().setResourcePath('before/');
+    pending.load('default/library.mtl'); pending.setResourcePath('');
+    const changed = new MTLLoader(); changed.load('known/library.mtl'); changed.setResourcePath(runtimePath);
+    new MTLLoader(manager).load('managed.mtl');
+    const escaped = new MTLLoader(); customize(escaped); escaped.load('escaped.mtl');`);
+  assert.deepEqual(requests.map(({url}) => url), ['first/library.mtl', 'second/library.mtl',
+    'models/nested/library.mtl', 'default/library.mtl', 'known/library.mtl']);
+  assert.deepEqual(requests.map(({texturePaths}) => texturePaths), [['first/', 'shared/'],
+    ['second/', 'shared/'], ['models/', 'shared/'], ['before/', 'default/'], null]);
+});
+
+test("only the exact pinned MTL manager fallback is exempt from application manager escape detection", () => {
+  const source = fs.readFileSync(new URL(mtlUrl), 'utf8');
+  for (const [moduleUrl, code, expected] of [[mtlUrl, source, false],
+    [mtlUrl, source + '\n// customized\n', true], ['file:///other/MTLLoader.js', source, true]]) {
+    let exposed = false;
+    const requests = discover(code, {moduleUrl, source: code, onDefaultManagerExposure: () => { exposed = true; }});
+    assert.equal(exposed, expected);
+    assert.deepEqual(requests, []);
+  }
 });
 
 test("ObjectLoader retains sticky image bases and finite resets visible to pending loads", () => {
@@ -255,6 +305,51 @@ function fixture(files) {
   }
   return root;
 }
+
+test("MTL texture closure matches source map overrides, option parsing, encoded URLs and document bases", () => {
+  const mtl = `# No material owns this first map\nmap_Kd unused.png
+newmtl replaced
+map_Kd discarded.png
+newmtl painted
+map_Kd stale.png
+MAP_KD -o 0.25 0.5 0 -s 2 3 1 paint%20%23.png?version=2#face
+map_Ks specular.png
+map_Ke glow.png
+norm normal.png
+map_bump -bm 0.75 bump.png
+bump ignored-bump.png
+disp -mm -0.5 2 height.png
+map_d alpha.png
+map_Ka ignored-ambient.png
+newmtl replaced
+map_Kd replacement.png
+newmtl remote
+map_Kd https://example.test/live.png
+newmtl unknown-option
+map_Kd -clamp on literal.png
+newmtl slash
+map_Kd /slash.png
+`;
+  const images = ['paint #.png', 'specular.png', 'glow.png', 'normal.png', 'bump.png', 'height.png',
+    'alpha.png', 'replacement.png', '-clamp on literal.png', 'slash.png'];
+  const root = fixture({'index.html': '', 'site/models/nested/library.mtl': mtl,
+    ...Object.fromEntries(images.map(name => [`site/models/${name}`, name])),
+    ...Object.fromEntries(['unused.png','discarded.png','stale.png','ignored-bump.png','ignored-ambient.png']
+      .map(name => [`site/models/${name}`, 'must not be loaded'])),
+    'site/models/nested/paint #.png': 'wrong nested base',
+  });
+  const requests = discover(`import { MTLLoader } from ${JSON.stringify(mtlUrl)};
+    new MTLLoader().setPath('models/').load('nested/library.mtl');`);
+  const resources = [], assets = collectThreeLoaderAssets(requests, {
+    documentUrl: pathToFileURL(path.join(root, 'index.html')).href,
+    documentBaseUrl: pathToFileURL(path.join(root, 'site/')).href,
+    onResource: (name, url) => resources.push({name, url}),
+  });
+  assert.deepEqual([...assets.keys()].sort(), ['site/models/nested/library.mtl',
+    ...images.map(name => `site/models/${name}`)].sort());
+  assert.equal(assets.get('site/models/nested/library.mtl').source.toString(), mtl);
+  assert.ok(resources.some(({url}) => url.endsWith('/models/paint%20%23.png?version=2#face')));
+});
 
 test("ObjectLoader collects encoded image and cube sidecars without changing JSON, data images or host URLs", () => {
   const scene = JSON.stringify({metadata: {type: 'Object'}, images: [

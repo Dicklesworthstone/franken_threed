@@ -406,6 +406,7 @@ export function f3dRollupPlugin(options = {}) {
         }
         if (options.documentUrl && (code.includes("load") || code.includes("LoadingManager"))) {
           const requests = findThreeLoaderRequests(ast, {
+            moduleUrl: id, source: code,
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
               mapBaseUrl, packageRootUrl: options.packageRootUrl,
             }),

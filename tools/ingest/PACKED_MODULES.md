@@ -193,8 +193,42 @@ An executable packed regression decodes HDR and ZIP-compressed EXR pixels,
 generates font outlines and loads STL/PLY/OBJ triangles after source/build files
 are unavailable, with non-data requests rejected. This is retained-loader
 packaging, not new renderer or browser GPU validation. Custom managers, escaping
-loaders, unknown paths and OBJ `setMaterials()` remain on their original host
-route; this does not close material/texture sidecars for other model formats.
+loaders and unknown paths remain on their original host route; this does not
+close material/texture sidecars for every model format.
+
+## OBJ material libraries
+
+Finite `MTLLoader.load()` and `loadAsync()` requests include their material
+libraries and diffuse, specular, emissive, normal, bump, displacement and alpha
+texture sidecars. `OBJLoader.setMaterials()` retains discovery of the OBJ model
+itself, including fluent chains and separate setters. The original MTL and OBJ
+bytes are unchanged; the retained source loaders still create materials, load
+textures, parse geometry and preserve material-creator sharing or independent
+instances.
+
+Texture discovery follows the pinned MTL parser's repeated material/key rules,
+first bump-map selection and `-bm`, `-mm`, `-s`, `-o` option handling. Unsupported
+options remain part of the source URL instead of being interpreted by a new MTL
+parser. A loader's default image base is captured when loading starts; finite
+`setResourcePath()` changes also cover pending loads without applying
+ObjectLoader's different sticky-base behavior. Encoded names and URL suffixes
+retain their logical identities.
+
+The exact pinned MTL module's read-only default-manager fallback does not count
+as application exposure of that manager. This exception requires both its
+canonical source path and full source hash. Modified or foreign modules and
+actual application manager access retain the existing conservative route.
+
+The packed regression runs the retained loaders after source and build files
+are unavailable, with non-data requests rejected. It checks all seven texture
+slots, UVs, texture transforms, material settings, async ordering, material
+identity and a pending resource-path reset. Its image host verifies bytes and
+loading completion; it does not establish browser decoder or renderer parity.
+An independent Chrome 151 run of that packed artifact also passes with the
+browser offline and every external request blocked: all 21 native PNG images
+decode, all material/geometry assertions pass, and there are no browser errors.
+This validates retained-loader packaging and native image decoding, not rendering
+or acceleration.
 
 ## Validation and boundaries
 

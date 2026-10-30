@@ -5,6 +5,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as walk from "acorn-walk";
 import { isInternalLibraryModule } from "./route_bridge.mjs";
@@ -17,7 +18,7 @@ const CORE_LOADERS = new Set([
 ]);
 const SETTINGS = new Set(["setPath", "setResourcePath", "setCrossOrigin", "setWithCredentials", "setRequestHeader"]);
 // These pinned loaders fetch one source file; their parsers do not fetch model
-// sidecars. OBJ materials supplied through setMaterials remain an opaque route.
+// sidecars. OBJ's material creator executes upstream and has its own MTL closure.
 // The setters below change decoding, not the URL, and still execute upstream.
 const SINGLE_FILE_ADDONS = new Map([
   ["HDRLoader", new Set(["setDataType"])],
@@ -26,10 +27,11 @@ const SINGLE_FILE_ADDONS = new Map([
   ["FontLoader", new Set()],
   ["STLLoader", new Set()],
   ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],
-  ["OBJLoader", new Set()],
+  ["OBJLoader", new Set(["setMaterials"])],
 ]);
 const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
+  ["MTLLoader", new Set(["setMaterialOptions"])],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -38,6 +40,7 @@ const ADDON_USES = new Map([
   ["GLTFLoader", new Set(["parse", "parseAsync"])],
   ["DRACOLoader", new Set(["decodeDracoFile", "decodeGeometry"])],
   ["KTX2Loader", new Set(["parse", "init", "detectSupportAsync"])],
+  ["MTLLoader", new Set(["parse"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
 const isSetting = (loader, method) => SETTINGS.has(method) || ADDON_SETTINGS.get(loader)?.has(method);
@@ -81,8 +84,14 @@ function relativeUrl(value) {
 }
 
 /** Returns finite load requests, following lexical const bindings without guessing names. */
-export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure } = {}) {
+export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure, moduleUrl, source } = {}) {
   const root = packageRootUrl ? canonicalUrl(packageRootUrl).replace(/\/?$/, "/") : PINNED_ROOT;
+  // This exact retained module only reads the default manager as the fallback
+  // for MaterialCreator.loadTexture(). It neither changes nor exposes it to app
+  // code. A modified module or an identically named file keeps the escape rule.
+  if (moduleUrl && typeof source === "string" &&
+      canonicalUrl(moduleUrl) === root + "examples/jsm/loaders/MTLLoader.js" &&
+      createHash("sha256").update(source).digest("hex") === "f1f8f0c6fcfa09671cb609954ea436521d835606853c110c5aff2dc8188f5e61") return [];
   const importedBindings = new Map();
   for (const node of ast.body) {
     if (node.type !== "ImportDeclaration") continue;
@@ -363,7 +372,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     return binding?.kind === "const" && !active.has(binding)
       ? instanceOrigin(binding.init, new Set(active).add(binding)) : null;
   };
-  const requests = [], objectLoads = new Map(), unresolvedLoads = new Set();
+  const requests = [], objectLoads = new Map(), materialLoads = new Map(), unresolvedLoads = new Set();
   for (const call of calls) {
     const method = memberName(call.callee);
     if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile"].includes(method)) continue;
@@ -390,11 +399,20 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
           }
         }
       }
+      let materialGroup;
+      if (value.loader === "MTLLoader") {
+        // MTL captures its default path when load() starts, but resourcePath is
+        // read later by parse(). Each pending request keeps its own fallback.
+        if (!materialLoads.has(value.origin)) materialLoads.set(value.origin, { paths: new Set(), requests: [], unknown: false });
+        materialGroup = materialLoads.get(value.origin);
+        for (const prefix of value.resourcePaths) materialGroup.paths.add(prefix);
+      }
       if (urls && urls.length * value.paths.length * value.resourcePaths.length <= LIMIT) {
         for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
           const request = { loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url };
           requests.push(request);
           objectGroup?.requests.push(request);
+          materialGroup?.requests.push(request);
         }
       }
     } else if (!isUse(value.loader, method) && !(value.loader === "DRACOLoader" && method === "preload")) continue;
@@ -406,17 +424,62 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   }
   for (const call of calls) {
     if (memberName(call.callee) !== "setResourcePath") continue;
-    const group = objectLoads.get(instanceOrigin(call.callee.object));
-    if (!group) continue;
+    const origin = instanceOrigin(call.callee.object);
     const paths = finite(call.arguments[0]);
-    if (!paths) group.unknown = true;
-    else for (const prefix of paths) group.paths.add(prefix);
+    for (const group of [objectLoads.get(origin), materialLoads.get(origin)]) {
+      if (!group) continue;
+      if (!paths) group.unknown = true;
+      else for (const prefix of paths) group.paths.add(prefix);
+    }
   }
   for (const [origin, group] of objectLoads) {
     for (const request of group.requests) request.imagePaths = group.unknown || unresolvedLoads.has(origin) || group.paths.size > LIMIT
       ? null : [...group.paths];
   }
+  for (const group of materialLoads.values()) {
+    for (const request of group.requests) request.texturePaths = group.unknown || group.paths.size > LIMIT
+      ? null : [...new Set([...group.paths].map(prefix => prefix || request.path || extractUrlBase(request.originalUrl)))];
+  }
   return requests;
+}
+
+// Discover references, not materials: the original bytes and parser remain in
+// the artifact. Match r186 MTLLoader's duplicate keys/materials, first bump map,
+// literal-space keyword separator and getTextureParams option-removal order.
+function mtlTextureUris(text) {
+  const maps = new Map([
+    ["map_kd", "map"], ["map_ks", "specularMap"], ["map_ke", "emissiveMap"],
+    ["norm", "normalMap"], ["map_bump", "bumpMap"], ["bump", "bumpMap"],
+    ["disp", "displacementMap"], ["map_d", "alphaMap"],
+  ]);
+  const materials = new Map();
+  let material;
+  for (let line of text.split("\n")) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+    const space = line.indexOf(" ");
+    const key = (space < 0 ? line : line.slice(0, space)).toLowerCase();
+    const value = space < 0 ? "" : line.slice(space + 1).trim();
+    if (key === "newmtl") { material = new Map(); materials.set(value, material); }
+    else if (material && maps.has(key)) material.set(key, value);
+  }
+  const uris = new Set();
+  for (const properties of materials.values()) {
+    const usedMaps = new Set();
+    for (const [key, value] of properties) {
+      const type = maps.get(key);
+      if (!value || usedMaps.has(type)) continue;
+      usedMaps.add(type);
+      const items = value.split(/\s+/);
+      for (const [option, count] of [["-bm", 2], ["-mm", 3], ["-s", 4], ["-o", 4]]) {
+        const index = items.indexOf(option);
+        if (index >= 0) items.splice(index, count);
+      }
+      const uri = items.join(" ").trim();
+      if (uri) uris.add(uri);
+    }
+  }
+  return uris;
 }
 
 /** Copies the finite local closure without changing the loader's original URL strings. */
@@ -443,6 +506,14 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
   for (const request of requests) {
     const asset = add(request.url);
     if (!asset) continue;
+    if (request.loader === "MTLLoader") {
+      if (!request.texturePaths) continue;
+      for (const uri of mtlTextureUris(asset.source.toString("utf8"))) {
+        // Pinned MaterialCreator only bypasses its prefix for HTTP(S) URLs.
+        for (const base of request.texturePaths) add(/^https?:\/\//i.test(uri) ? uri : base + uri);
+      }
+      continue;
+    }
     if (request.loader === "ObjectLoader") {
       if (!request.imagePaths) continue; // An unknown earlier load can own the sticky base.
       let json;
