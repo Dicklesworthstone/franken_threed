@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {KTX2Loader} from '../../upstream/three.js/examples/jsm/loaders/KTX2Loader.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -55,6 +56,30 @@ function compressed(t, {kind = '2d', width = 8, height = 8, layers = 3, levels =
     : kind === 'array' ? new T.CompressedArrayTexture(chain(0), width, height, layers, format, type)
       : new T.CompressedTexture(chain(0), width, height, format, type);
   value.colorSpace = colorSpace; value.needsUpdate = true; t.after(() => value.dispose()); return value;
+}
+const rawBytes = data => new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+function blockView(data, Kind) {
+  const offset = Kind === DataView ? 3 : Kind.BYTES_PER_ELEMENT * 3;
+  const buffer = new ArrayBuffer(offset + data.byteLength + 8); new Uint8Array(buffer).fill(239);
+  new Uint8Array(buffer, offset, data.byteLength).set(rawBytes(data));
+  return Kind === DataView ? new DataView(buffer, offset, data.byteLength)
+    : new Kind(buffer, offset, data.byteLength / Kind.BYTES_PER_ELEMENT);
+}
+function hdrLoaderOutput(t, kind) {
+  // Synthetic transcode bytes, but the real retained loader constructs all
+  // public textures. Its UASTC_HDR -> BC6H worker uses Uint16Array/HalfFloatType.
+  const width = 8, height = 8;
+  const faces = Array.from({length: kind === 'cube' ? 6 : 1}, (_, face) => ({width, height,
+    mipmaps: Array.from({length: 3}, (_, level) => {
+      const w = width >> level, h = height >> level;
+      const bytes = new Uint8Array(Math.ceil(w / 4) * Math.ceil(h / 4) * 16).fill(10 + face + level);
+      return {width: w, height: h, data: blockView(bytes, Uint16Array)};
+    })}));
+  const texture = new KTX2Loader()._createTextureFrom({type: 'transcode', data: {
+    faces, width, height, format: T.RGB_BPTC_UNSIGNED_Format, type: T.HalfFloatType, dfdFlags: 0,
+  }}, {faceCount: faces.length, layerCount: 0,
+    dataFormatDescriptor: [{colorPrimaries: 1, transferFunction: 1}]});
+  t.after(() => texture.dispose()); return texture;
 }
 const draws = f => f.device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'main');
 const entries = draw => [...draw.groups.values()].flatMap(({group}) => group.entries);
@@ -163,6 +188,63 @@ test('compressed HDR type changes rebuild source filtering code while retaining 
   assert.match(a.fragment, /textureLoad/); assert.match(b.fragment, /textureSample/);
   assert.ok(draws(f).every(draw => layouts(draw).filter(entry => entry.texture).every(entry => entry.texture.sampleType === 'float')));
   assertSource(f, b);
+});
+
+for (const kind of ['2d', 'cube']) test(`retained KTX2Loader HDR ${kind} output preserves typed block histories and source shading`, async t => {
+  const f = fixture(t), texture = hdrLoaderOutput(t, kind), updates = [];
+  const chains = kind === 'cube' ? texture.image.map(face => face.mipmaps) : [texture.mipmaps];
+  const views = chains.flatMap(chain => chain.map(mip => mip.data));
+  assert.ok(views.every(data => data instanceof Uint16Array && data.byteOffset === 6));
+  assert.equal(texture.type, T.HalfFloatType); assert.equal(texture.colorSpace, T.LinearSRGBColorSpace);
+  texture.onUpdate = value => updates.push(value); sample(f, texture); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  for (const data of views) rawBytes(data).fill(73);
+  texture.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  for (const data of views) rawBytes(data).fill(99);
+  await f.renderer.waitForGPU();
+  const [first, second] = draws(f).map(draw => sampledView(draw).texture);
+  assert.notEqual(first, second); assert.equal(first.format, 'bc6h-rgb-ufloat');
+  assert.equal(first.mipLevelCount, 3); assertSource(f, f.captures[1].draws[0].binding.nodeProgram);
+  assert.match(draws(f)[0].pipeline.fragment.module.code, /textureSample/);
+  const count = chains.length * 3;
+  assert.equal(uploaded(f, first).length, count); assert.equal(uploaded(f, second).length, count);
+  for (const write of uploaded(f, first))
+    assert.ok(write.bytes.every(value => value === 10 + write.destination.origin[2] + write.destination.mipLevel));
+  assert.ok(uploaded(f, second).every(write => write.bytes.every(value => value === 73)));
+  assert.deepEqual(chains.flatMap(chain => chain.map(mip => mip.data)), views);
+  assert.equal(texture.type, T.HalfFloatType); assert.deepEqual(updates, [texture, texture]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('typed HDR array snapshots merge byte ranges across view types without leaking later edits', async t => {
+  const f = fixture(t), texture = compressed(t, {kind: 'array', format: T.RGB_BPTC_UNSIGNED_Format,
+    type: T.HalfFloatType, blockBytes: 16});
+  for (const mip of texture.mipmaps) mip.data = blockView(mip.data, Uint16Array);
+  sample(f, texture); await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  for (const [Kind, layer, value] of [[Uint32Array, 1, 71], [DataView, 2, 91]]) {
+    for (const mip of texture.mipmaps) { mip.data = blockView(mip.data, Kind); rawBytes(mip.data).fill(value); }
+    // Declare this queued request's layer set independently of earlier uploads
+    // whose asynchronous acknowledgments have not cleared the public Set yet.
+    texture.clearLayerUpdates();
+    texture.addLayerUpdate(layer); texture.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  }
+  for (const mip of texture.mipmaps) rawBytes(mip.data).fill(127);
+  await f.renderer.waitForGPU();
+  const natives = draws(f).map(draw => sampledView(draw).texture); assert.equal(new Set(natives).size, 3);
+  for (const [frame, native] of natives.entries()) for (const write of uploaded(f, native)) {
+    const slice = write.bytes.length / 3, old = 10 + write.destination.mipLevel;
+    assert.deepEqual([...write.bytes], [...Array(slice).fill(old),
+      ...Array(slice).fill(frame >= 1 ? 71 : old), ...Array(slice).fill(frame >= 2 ? 91 : old)]);
+  }
+  assert.ok(texture.mipmaps.every(mip => mip.data instanceof DataView && mip.data.byteOffset === 3));
+  assert.equal(texture.layerUpdates.size, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('retained HDR KTX2 output still requires the enabled BC feature before allocation', async t => {
+  const f = fixture(t, []), texture = hdrLoaderOutput(t, '2d'); sample(f, texture);
+  await f.renderer.init(); const allocated = f.textures.length;
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_TEXTURE_FEATURE'});
+  assert.equal(f.textures.length, allocated); assert.equal(f.writes.length, 0);
 });
 
 test('queued compressed array updates replace marked layers in every mip without exposing stale CPU edits', async t => {

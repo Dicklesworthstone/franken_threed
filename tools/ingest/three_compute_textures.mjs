@@ -105,7 +105,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       for (const [level, upload] of shape.uploads.entries()) {
         const image = texture.mipmaps[level], data = image?.data;
         if (upload.image !== image || upload.level !== level || upload.layer !== 0 || upload.depth !== shape.layers ||
-            !positive(upload.sliceBytes) || !(data instanceof Uint8Array) ||
+            !positive(upload.sliceBytes) || !ArrayBuffer.isView(data) ||
             upload.sliceBytes * (shape.layers - 1) >= data.byteLength)
           fail('RANGES', 'Compressed mip metadata does not describe every source layer');
         // sliceBytes comes from the native inspector's block geometry, not
@@ -327,7 +327,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       }
       const copyData = (data, image) => {
         if (data == null) return data;
-        if (!ArrayBuffer.isView(data) || data instanceof DataView) fail('SOURCE', 'Expected typed texture data');
+        if (!ArrayBuffer.isView(data) || !shape.blockUploads && data instanceof DataView)
+          fail('SOURCE', 'Expected typed texture data');
         const partial = updates?.get(image), copyKey = partial ?? data;
         if (copies.has(copyKey)) return copies.get(copyKey);
         if (data.byteLength > maxSnapshotBytes - snapshotBytes - bytes)
@@ -335,15 +336,21 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         let copy;
         if (partial) {
           const previous = partial.level === null ? previousPixels?.source.data?.data : previousPixels?.mipmaps[partial.level]?.data;
-          copy = new data.constructor(data.length);
+          copy = shape.blockUploads ? new Uint8Array(data.byteLength) : new data.constructor(data.length);
           const destination = new Uint8Array(copy.buffer, copy.byteOffset, copy.byteLength);
           if (previous) {
-            if (previous.constructor !== data.constructor) fail('RANGES', 'Partial snapshot component type changed');
+            if (!shape.blockUploads && previous.constructor !== data.constructor) fail('RANGES', 'Partial snapshot component type changed');
             destination.set(new Uint8Array(previous.buffer, previous.byteOffset, Math.min(previous.byteLength, copy.byteLength)));
           }
           const incoming = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
           for (const [offset, size] of partial.spans) destination.set(incoming.subarray(offset, offset + size), offset);
-        } else copy = new data.constructor(data);
+        } else {
+          // Preserve compressed bit patterns and view ranges verbatim, including
+          // HDR half-word views. Their element type is not a texel conversion.
+          copy = shape.blockUploads
+            ? new Uint8Array(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+            : new data.constructor(data);
+        }
         copies.set(copyKey, copy); bytes += copy.byteLength;
         return copy;
       };

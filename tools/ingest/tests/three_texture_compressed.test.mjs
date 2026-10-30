@@ -77,6 +77,12 @@ function make(profile=profiles[0],{layers=1,cube=false,w=profile[2]*2,h=profile[
     layers>1?new T.CompressedArrayTexture(chain(0),w,h,layers,T[profile[0]]):new T.CompressedTexture(chain(0),w,h,T[profile[0]]);
   t.needsUpdate=true;return t;
 }
+const rawBytes=data=>new Uint8Array(data.buffer,data.byteOffset,data.byteLength);
+function blockView(data,Kind){
+  const offset=Kind===DataView?3:Kind.BYTES_PER_ELEMENT*3,buffer=new ArrayBuffer(offset+data.byteLength+8);
+  new Uint8Array(buffer).fill(239);new Uint8Array(buffer,offset,data.byteLength).set(rawBytes(data));
+  return Kind===DataView?new DataView(buffer,offset,data.byteLength):new Kind(buffer,offset,data.byteLength/Kind.BYTES_PER_ELEMENT);
+}
 for(const p of profiles)for(const srgb of p[6]?[false,true]:[false])test(`${p[0]}${srgb?' sRGB':''}: exact blocks and physical mip tails`,async()=>{
   const d=gpu(),owner=pool(d),t=make(p);if(srgb)t.colorSpace=T.SRGBColorSpace;
   const source=t.source,image=t.image,mips=t.mipmaps;owner.prepare([t]);await owner.whenIdle();
@@ -98,6 +104,60 @@ test('compressed arrays update selected layers at every authored mip before ackn
     assert.ok(n.levels[i].subarray(slice*2).every(v=>v===71));
   }
   assert.equal(d.textureWrites.length-at,t.mipmaps.length);assert.ok(d.textureWrites.slice(at).every(w=>w.dest.origin[2]===2&&w.size[2]===1));owner.dispose();
+});
+
+for(const Kind of [Uint16Array,Uint32Array,Float32Array,Float64Array,BigUint64Array,DataView])
+test(`BC6H ${Kind.name} views upload raw bytes and retain their public range/type`,()=>{
+  const d=gpu(),owner=pool(d),t=make(profiles[8]);t.type=T.HalfFloatType;
+  for(const mip of t.mipmaps){
+    mip.data=blockView(mip.data,Kind);
+    // A floating-point view must not interpret or canonicalize block payloads.
+    rawBytes(mip.data).set([1,0,128,127,17,0,192,127]);
+  }
+  const views=t.mipmaps.map(mip=>mip.data),expected=views.map(data=>rawBytes(data).slice());
+  owner.prepare([t]);const native=owner.nativeTexture(t);
+  assert.equal(native.desc.format,'bc6h-rgb-ufloat');assert.equal(t.type,T.HalfFloatType);
+  assert.deepEqual(native.levels,expected);assert.deepEqual(d.textureWrites.map(w=>w.data),expected);
+  for(const [i,mip] of t.mipmaps.entries())assert.equal(mip.data,views[i]);
+  owner.dispose();
+});
+
+test('typed compressed layer updates match pinned source byte offsets at every mip',async()=>{
+  const sourceRoot=process.env.F3D_THREE_ROOT??path.resolve('upstream/three.js');
+  const {default:WebGPUTextureUtils}=await import(pathToFileURL(path.join(sourceRoot,'src/renderers/webgpu/utils/WebGPUTextureUtils.js')));
+  const d=gpu(),owner=pool(d),t=make(profiles[8],{layers:3});t.type=T.HalfFloatType;
+  for(const mip of t.mipmaps)mip.data=blockView(mip.data,Uint16Array);
+  owner.prepare([t]);const native=owner.nativeTexture(t),initial=native.levels.map(data=>data.slice());
+  for(const mip of t.mipmaps){mip.data=blockView(mip.data,Uint32Array);rawBytes(mip.data).fill(71);}
+  t.addLayerUpdate(1);t.needsUpdate=true;
+  const sourceWrites=[],source=new WebGPUTextureUtils({device:{queue:{writeTexture(destination,data,layout,size){
+    sourceWrites.push({level:destination.mipLevel,layer:destination.origin.z,
+      bytes:rawBytes(data).slice(layout.offset,layout.offset+layout.bytesPerRow*layout.rowsPerImage),
+      row:layout.bytesPerRow,rows:layout.rowsPerImage,size:[size.width,size.height,1]});
+  }}}});
+  source._copyCompressedBufferToTexture(t.mipmaps,{},
+    {format:'bc6h-rgb-ufloat',size:{depthOrArrayLayers:3}},t.layerUpdates);
+  const at=d.textureWrites.length;owner.update([t]);
+  assert.deepEqual(d.textureWrites.slice(at).map(w=>({level:w.dest.mipLevel,layer:w.dest.origin[2],bytes:w.data,
+    row:w.layout.bytesPerRow,rows:w.layout.rowsPerImage,size:w.size})),sourceWrites);
+  for(const [level,data] of native.levels.entries()){
+    const slice=data.length/3,expected=initial[level].slice();expected.fill(71,slice,slice*2);assert.deepEqual(data,expected);
+  }
+  assert.equal(t.layerUpdates.size,0);owner.dispose();
+});
+
+test('invalid compressed typed views reject before allocation',()=>{
+  for(const invalid of [
+    new Uint16Array(new SharedArrayBuffer(64)),new Uint16Array(31),new Uint32Array(17),
+    new DataView(new ArrayBuffer(64,{maxByteLength:128})),
+  ]){
+    const d=gpu(),owner=pool(d),t=make(profiles[8]);t.type=T.HalfFloatType;t.mipmaps[0].data=invalid;
+    assert.throws(()=>owner.prepare([t]),{code:'THREE_TEXTURE_STORAGE'});
+    assert.equal(d.textures.length,0);assert.equal(d.textureWrites.length,0);owner.dispose();
+  }
+  const d=gpu(),owner=pool(d),t=make(profiles[8]),data=new Uint16Array(32);
+  structuredClone(data.buffer,{transfer:[data.buffer]});t.mipmaps[0].data=data;
+  assert.throws(()=>owner.prepare([t]),{code:'THREE_TEXTURE_STORAGE'});assert.equal(d.textures.length,0);owner.dispose();
 });
 
 test('compressed cubes keep all six face mip chains, sharing, and reference-counted disposal',()=>{

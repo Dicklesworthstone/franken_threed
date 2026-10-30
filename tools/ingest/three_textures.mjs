@@ -172,8 +172,11 @@ function textureInspector(T,{
       const w=Math.max(1,width>>level),h=Math.max(1,height>>level);
       if(mip?.width!==w||mip.height!==h)fail('MIPS','Compressed mip dimensions differ from their source extent');
       const data=mip.data;
-      if(!(data instanceof Uint8Array)||!(data.buffer instanceof ArrayBuffer)||data.buffer.resizable)
-        fail('STORAGE','Expected fixed unshared compressed Uint8Array blocks');
+      // Compression formats describe bytes, independently of the view's element
+      // type. In particular, the pinned KTX2 HDR worker returns BC6H blocks in a
+      // Uint16Array while retaining HalfFloatType on the public texture.
+      if(!ArrayBuffer.isView(data)||!(data.buffer instanceof ArrayBuffer)||data.buffer.resizable)
+        fail('STORAGE','Expected fixed unshared compressed buffer views');
       try{new Uint8Array(data.buffer,0,0);}catch{fail('STORAGE','Compressed source blocks are detached');}
       const row=Math.ceil(w/blockWidth)*blockBytes,rowsPerImage=Math.ceil(h/blockHeight);
       const bytesPerRow=family?row:Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
@@ -470,13 +473,14 @@ export function createGpuThreeTextures(device,{
       if(d.data){
         if(d.blockUploads){
           for(const u of d.uploads){
+            const data=new Uint8Array(u.image.data.buffer,u.image.data.byteOffset,u.image.data.byteLength);
             const write=(layer,data,depth)=>{
               native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:u.level,origin:[0,0,layer]},data,
                 {bytesPerRow:u.bytesPerRow,rowsPerImage:u.rowsPerImage},[u.copyWidth,u.copyHeight,depth]));stats.writeCalls++;
             };
             if(d.layerUpdates?.length)for(const layer of d.layerUpdates)
-              write(layer,u.image.data.subarray(layer*u.sliceBytes,(layer+1)*u.sliceBytes),1);
-            else write(u.layer,u.image.data,u.depth);
+              write(layer,data.subarray(layer*u.sliceBytes,(layer+1)*u.sliceBytes),1);
+            else write(u.layer,data,u.depth);
           }
           if(d.layerUpdates?.length)t.clearLayerUpdates();
         }else if(d.layered){
