@@ -129,33 +129,42 @@ export function gpuTargetWriteData(plan) {
   return {data, layout: {offset: 0, bytesPerRow: plan.rowBytes, rowsPerImage: plan.size.height}};
 }
 
-/** Copy a selected source mip into destination level zero. Destination mipmaps
- * are subsequently derived from level zero, never overwritten by stale levels.
+/** Copy between independently selected source and destination mip levels.
+ * Nonzero destinations must be authored: automatic reduction would overwrite
+ * those contents on the next sample. Each endpoint has mip-local bounds/rows.
  */
 export function inspectGpuTargetCopy(source, destination, value = {}) {
-  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
+  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'destinationMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
   const {sourceColorIndex = 0, colorIndex = 0} = value;
   const [Type, components] = layout(source, sourceColorIndex); layout(destination, colorIndex);
-  const face = transferFace(destination, value.face, 'face');
   if (gpuTargetColorFormat(source, sourceColorIndex).replace(/-srgb$/, '') !==
       gpuTargetColorFormat(destination, colorIndex).replace(/-srgb$/, ''))
     fail('FORMAT', 'Texture copies require copy-compatible color formats');
   if (destination.sampleCount !== 1) fail('SAMPLES', 'Color copies require a single-sample destination');
-  const {sourceX = 0, sourceY = 0, x = 0, y = 0, sourceMipLevel = 0, flipY = false,
+  const {sourceX = 0, sourceY = 0, x = 0, y = 0, sourceMipLevel = 0, destinationMipLevel = 0, flipY = false,
     maxBytes = 64 * 1024 * 1024} = value;
   integer(sourceMipLevel, 'Source mip level');
+  integer(destinationMipLevel, 'Destination mip level');
   if (!Number.isSafeInteger(source.mipLevelCount) || source.mipLevelCount < 1 || sourceMipLevel >= source.mipLevelCount)
     fail('REGION', 'Source mip level is not allocated');
+  const destinationLevels = destination.mipLevelCount ?? 1;
+  if (!Number.isSafeInteger(destinationLevels) || destinationLevels < 1 || destinationMipLevel >= destinationLevels)
+    fail('REGION', 'Destination mip level is not allocated');
+  if (destinationMipLevel > 0 && destination.generateMipmaps !== false)
+    fail('MIP', 'Nonzero copy destinations require authored, non-generated mip levels');
   const sourceFace = transferFace(source, value.sourceFace, 'sourceFace', sourceMipLevel);
-  const divisor = 2 ** sourceMipLevel;
+  const face = transferFace(destination, value.face, 'face', destinationMipLevel);
+  const divisor = 2 ** sourceMipLevel, destinationDivisor = 2 ** destinationMipLevel;
   const sw = source.width === 0 ? 0 : Math.max(1, Math.floor(source.width / divisor));
   const sh = source.height === 0 ? 0 : Math.max(1, Math.floor(source.height / divisor));
+  const dw = destination.width === 0 ? 0 : Math.max(1, Math.floor(destination.width / destinationDivisor));
+  const dh = destination.height === 0 ? 0 : Math.max(1, Math.floor(destination.height / destinationDivisor));
   const {width = sw - sourceX, height = sh - sourceY} = value;
-  region(sw, sh, sourceX, sourceY, width, height); region(destination.width, destination.height, x, y, width, height);
+  region(sw, sh, sourceX, sourceY, width, height); region(dw, dh, x, y, width, height);
   if (typeof flipY !== 'boolean') fail('OPTIONS', 'flipY must be boolean');
   budget(width * height * components * Type.BYTES_PER_ELEMENT, maxBytes);
-  return {empty: width === 0 || height === 0, sourceMipLevel, sourceColorIndex, colorIndex,
+  return {empty: width === 0 || height === 0, sourceMipLevel, destinationMipLevel, sourceColorIndex, colorIndex,
     sourceOrigin: {x: sourceX, y: flipY ? sh - sourceY - height : sourceY, z: sourceFace},
-    destinationOrigin: {x, y: flipY ? destination.height - y - height : y, z: face},
+    destinationOrigin: {x, y: flipY ? dh - y - height : y, z: face},
     size: {width, height, depthOrArrayLayers: 1}};
 }

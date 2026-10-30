@@ -50,6 +50,84 @@ function payload(format, pixels = 12, seed = 7) {
   return output;
 }
 
+function mipTarget(width, height, gl = true) {
+  const result = new (gl ? T.WebGLRenderTarget : T.RenderTarget)(width, height, textureOptions);
+  result.texture.mipmaps = Array.from({length: 1 + Math.floor(Math.log2(Math.max(width, height)))}, () => ({}));
+  return result;
+}
+
+for (const gl of [false, true]) test(`queued destination mip copies preserve raw regions, selectors and readback (${gl})`, async t => {
+  const f = fixture(t, {gl}), r = f.r, seed = mipTarget(4, 4, gl), source = mipTarget(8, 8, gl), destination = mipTarget(16, 16, gl);
+  const input = payload('rgba8unorm', 16), expected = new Uint8Array([...input.subarray(20, 28), ...input.subarray(36, 44)]);
+  const writing = r.writeRenderTargetPixelsAsync(seed, input);
+  const seeding = r.copyRenderTargetPixelsAsync(seed, source, {destinationMipLevel: 1});
+  const options = {sourceMipLevel: 1, destinationMipLevel: 2, sourceX: 1, sourceY: 1, x: 1, y: 0, width: 2, height: 2};
+  const copying = r.copyRenderTargetPixelsAsync(source, destination, options);
+  const reading = r.readRenderTargetMipPixelsAsync(destination, 2, {x: 1, y: 0, width: 2, height: 2});
+  const base = r.readRenderTargetMipPixelsAsync(destination, 0), other = r.readRenderTargetMipPixelsAsync(destination, 1);
+  options.sourceMipLevel = options.destinationMipLevel = options.x = options.y = 0; input.fill(0);
+  assert.equal(f.calls.textures.length, 0); await f.ready();
+  assert.deepEqual(await reading, expected); assert.ok((await base).every(value => value === 0));
+  assert.ok((await other).every(value => value === 0)); await Promise.all([writing, seeding, copying]);
+  assert.equal(f.copies[1].source.mipLevel, 1); assert.equal(f.copies[1].destination.mipLevel, 2);
+  assert.equal(f.copies[1].destination.origin.y, gl ? 2 : 0);
+  assert.equal(r._targets.capture(destination).storage.diagnostics.mipGenerations, 0);
+  assert.equal(r._targets.capture(destination).sample, null); assert.equal(r.getRenderTarget(), null);
+});
+
+test('WebGL void and async source copies populate independent destination mips with captured physical rectangles', async t => {
+  const f = fixture(t, {gl: true}), r = f.r, source = mipTarget(8, 8), destination = mipTarget(16, 16);
+  const writing = r.writeRenderTargetPixelsAsync(source, payload('rgba8unorm', 64));
+  const region = new T.Box2(new T.Vector2(2, 1), new T.Vector2(5, 3)), position = new T.Vector2(1, 4);
+  assert.equal(r.copyTextureToTexture(source.texture, destination.texture, region, position, 0, 1), undefined);
+  const copying = r.copyTextureToTextureAsync(source.texture, destination.texture,
+    new T.Box2(new T.Vector2(0, 1), new T.Vector2(2, 3)), new T.Vector2(1, 0), 0, 2);
+  region.min.set(99, 99); region.max.set(100, 100); position.set(99, 99);
+  const first = r.readRenderTargetMipPixelsAsync(destination, 1, {x: 1, y: 4, width: 3, height: 2});
+  const second = r.readRenderTargetMipPixelsAsync(destination, 2, {x: 1, y: 0, width: 2, height: 2});
+  const expectedFirst = r.readRenderTargetMipPixelsAsync(source, 0, {x: 2, y: 1, width: 3, height: 2});
+  const expectedSecond = r.readRenderTargetMipPixelsAsync(source, 0, {x: 0, y: 1, width: 2, height: 2});
+  await f.ready(); await Promise.all([writing, copying]);
+  assert.deepEqual(await first, await expectedFirst); assert.deepEqual(await second, await expectedSecond);
+  assert.deepEqual(f.copies.map(copy => copy.destination.mipLevel), [1, 2]);
+  assert.equal(f.copies[0].source.origin.y, 5); assert.equal(f.copies[0].destination.origin.y, 2);
+  assert.equal(r._transfers.pendingRequests, 0); assert.equal(r._targets.capture(destination).storage.diagnostics.mipGenerations, 0);
+});
+
+for (const gl of [false, true]) test(`zero-origin source copies select both authored mip levels (${gl})`, async t => {
+  const f = fixture(t, {gl}), r = f.r, seed = mipTarget(4, 4, gl), source = mipTarget(8, 8, gl), destination = mipTarget(16, 16, gl);
+  await f.ready(); const input = payload('rgba8unorm', 16);
+  await r.writeRenderTargetPixelsAsync(seed, input);
+  await r.copyRenderTargetPixelsAsync(seed, source, {destinationMipLevel: 1});
+  // Native r186 defaults to the base image extent; supply its mip-local box.
+  // WebGL r186 derives the default extent from sourceLevel instead.
+  const region = gl ? null : new T.Box2(new T.Vector2(), new T.Vector2(4, 4));
+  await r.copyTextureToTextureAsync(source.texture, destination.texture, region, null, 1, 2);
+  assert.deepEqual(await r.readRenderTargetMipPixelsAsync(destination, 2), input);
+  const before = f.copies.length, allocations = f.calls.textures.length;
+  if (gl) {
+    assert.throws(() => r.copyTextureToTexture(source.texture, destination.texture,
+      new T.Box2(new T.Vector2(1, 0), new T.Vector2(3, 2)), null, 1, 2), {code: 'F3D_RENDERER_UNSUPPORTED'});
+    assert.throws(() => r.copyTextureToTexture(source.texture, destination.texture,
+      new T.Box2(new T.Vector2(), new T.Vector2(2, 2)), new T.Vector2(1, 0), 1, 2), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  }
+  const generated = mipTarget(16, 16, gl); generated.texture.generateMipmaps = true;
+  await assert.rejects(r.copyRenderTargetPixelsAsync(source, generated, {destinationMipLevel: 1}), {code: 'GPU_TRANSFER_MIP'});
+  assert.equal(f.copies.length, before); assert.equal(f.calls.textures.length, allocations);
+  assert.equal(r._transfers.pendingRequests, 0);
+});
+
+test('WebGL destination mip copies preserve empty default source tails while explicit rectangles copy the allocated texel row', async t => {
+  const f = fixture(t, {gl: true}), r = f.r, source = mipTarget(8, 1), destination = mipTarget(8, 1);
+  await f.ready();
+  await r.copyTextureToTextureAsync(source.texture, destination.texture, null, null, 1, 1);
+  assert.equal(f.copies.length, 0); assert.equal(f.calls.textures.length, 0);
+  await r.copyTextureToTextureAsync(source.texture, destination.texture,
+    new T.Box2(new T.Vector2(), new T.Vector2(4, 1)), null, 1, 1);
+  assert.equal(f.copies.length, 1); assert.equal(f.copies[0].source.mipLevel, 1); assert.equal(f.copies[0].destination.mipLevel, 1);
+  assert.deepEqual(f.copies[0].size, {width: 4, height: 1, depthOrArrayLayers: 1});
+});
+
 test('native public readback reads all six source cube faces and defaults to +X', async t => {
   const f = fixture(t), r = f.r, source = cube(); await f.ready();
   for (let face = 0; face < 6; face++) {

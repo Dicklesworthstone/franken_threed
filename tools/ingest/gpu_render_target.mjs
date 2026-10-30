@@ -42,8 +42,10 @@
  * readDepthPixels() reads sampled depth as native-space Float32 values; MSAA
  * requires an explicit sampleIndex. Depth never travels through RGBA/half floats.
  * copyDestination:true additionally admits writePixels(data, options) and
- * copyFrom(sourceTarget, options). These queue-ordered, level-zero writes dirty
+ * copyFrom(sourceTarget, options). Uploads and level-zero copies dirty
  * the mip chain; copies can read a selected source mip or resolved MSAA color.
+ * destinationMipLevel selects an authored, non-generated destination level;
+ * its bounds and array/volume slice are independent of the source selection.
  * Upload/copy destinations must be single-sample. No implicit color conversion.
  * withColorDestination(callback, {colorIndex, validation}) admits externally
  * owned GPU producers through the same copyDestination capability. The callback
@@ -292,7 +294,8 @@ export function createGpuRenderTarget(device, options = {}) {
       fail('FEATURE', 'Float32 cube mip generation requires float32-filterable on the supplied device');
   }
   if (generateMipmaps && levels(width, height) > 1) requireMipFeatures();
-  const transferShape = () => ({width, height, format, colorFormats, sampleCount, mipLevelCount: levels(width, height), cube, array, volume, depth: volume ? layers : 1, layers});
+  const transferShape = () => ({width, height, format, colorFormats, sampleCount, generateMipmaps,
+    mipLevelCount: levels(width, height), cube, array, volume, depth: volume ? layers : 1, layers});
   const depthShape = () => ({width, height, depthFormat, sampleCount, sampleDepth, cube, array: depthArray, layers: depthLayers, depthLayers});
   if (sharedDepth) {
     const source = sharedDepth.depthShape(), shape = depthShape();
@@ -785,7 +788,7 @@ export function createGpuRenderTarget(device, options = {}) {
         other.borrow(texture => checked(() => {
           const encoder = device.createCommandEncoder({label: label + ' color copy'});
           encoder.copyTextureToTexture({texture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
-            {texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: 0, origin: plan.destinationOrigin}, plan.size);
+            {texture: slots[plan.colorIndex] ? current.historyColors.get(plan.colorIndex) : current.colors[plan.colorIndex], mipLevel: plan.destinationMipLevel, origin: plan.destinationOrigin}, plan.size);
           device.queue.submit([encoder.finish()]);
         }), plan.sourceColorIndex);
         // A source mip-generation/upload error must also fail the dependent

@@ -16,6 +16,9 @@
  * readback layer, sourceFace selects the copy source. Each cube endpoint must
  * supply its face, independently of the active render face. Source-shaped
  * texture copies remain 2D; cube operations use target identities directly.
+ * destinationMipLevel selects an authored destination for explicit raw copies;
+ * source-shaped copies use their dstLevel argument. Higher WebGL source mips
+ * currently require zero origins when also copying to a nonzero destination.
  * colorIndex/sourceColorIndex select MRT attachments in explicit color APIs.
  * Texture-shaped copies derive those indices from the supplied source identities,
  * never from the active draw or the primary attachment's format.
@@ -222,7 +225,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
         assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
         const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
-          sourceMipLevel: plan.sourceMipLevel, sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
+          sourceMipLevel: plan.sourceMipLevel, destinationMipLevel: plan.destinationMipLevel,
+          sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
         return schedule([from, to], signal, 0, () => () => renderer._targets.copyColor(from, to, copyOptions));
       } catch (error) { return Promise.reject(error); }
     },
@@ -253,18 +257,16 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     sourceLevel = 0, destinationLevel = 0) {
     live();
     assertThreeNativeTextureWrite(renderer, destination);
-    if (destinationLevel !== 0)
-      fail('UNSUPPORTED', 'Texture copies write destination mip zero and regenerate its derived mips');
     if (sourceRegion !== null && (!sourceRegion.min || !sourceRegion.max ||
         (sourceRegion.isBox3 && (sourceRegion.min.z !== 0 || sourceRegion.max.z !== 1))))
       fail('UNSUPPORTED', 'Expected a 2D source region or a single depth-zero slice');
     if (destinationPosition !== null && destinationPosition.z !== undefined && destinationPosition.z !== 0)
       fail('UNSUPPORTED', 'Texture copies require destination depth zero');
     const depth = source?.isDepthTexture === true || destination?.isDepthTexture === true;
-    if (depth && sourceLevel !== 0) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
+    if (depth && (sourceLevel !== 0 || destinationLevel !== 0)) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
     const from = textureEntry(source, depth), to = textureEntry(destination, depth);
     if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
-    const value = {...(depth ? {} : {sourceMipLevel: sourceLevel,
+    const value = {...(depth ? {} : {sourceMipLevel: sourceLevel, destinationMipLevel: destinationLevel,
       sourceColorIndex: (from.shape.textures ?? [source.renderTarget.texture]).indexOf(source),
       colorIndex: (to.shape.textures ?? [destination.renderTarget.texture]).indexOf(destination)}), flipY: renderer._bottomLeftOrigin === true,
       sourceX: sourceRegion === null ? 0 : sourceRegion.min.x,
@@ -273,6 +275,21 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       y: destinationPosition === null ? 0 : destinationPosition.y,
       ...(sourceRegion === null ? {} : {width: sourceRegion.max.x - sourceRegion.min.x,
         height: sourceRegion.max.y - sourceRegion.min.y})};
+    if (!depth && destinationLevel !== 0 && sourceLevel > 0 && renderer._bottomLeftOrigin === true) {
+      // r186 WebGLRenderer's higher-source-mip branch passes width/height as
+      // blitFramebuffer endpoints, not origin + extent. Offset rectangles can
+      // therefore scale or reverse the copy; a raw copy cannot emulate them.
+      // Keep the newly admitted destination-mip path at zero origins until an
+      // equivalent blit exists. Explicit target copies retain raw semantics.
+      if (value.sourceX !== 0 || value.sourceY !== 0 || value.x !== 0 || value.y !== 0)
+        fail('UNSUPPORTED', 'WebGL copies between nonzero mips require zero source and destination origins');
+      // Its default source extent floors image dimensions without clamping
+      // one-dimensional tails back to one. Preserve that zero-area no-op.
+      if (sourceRegion === null) {
+        value.width = Math.floor((source.image?.width ?? from.shape.width) / 2 ** sourceLevel);
+        value.height = Math.floor((source.image?.height ?? from.shape.height) / 2 ** sourceLevel);
+      }
+    }
     // Validate before the void source call returns. Copy only scalar options;
     // later edits to a caller's Box2/Vector2 must not retarget a queued copy.
     if (depth) {

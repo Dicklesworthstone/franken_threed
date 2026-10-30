@@ -149,7 +149,7 @@ test('ordinary void copy submits immediately and reports native validation at th
 test('source admission rejects unsupported mip/layer/texture and bad bounds synchronously without submission', () => {
   const f = fixture(), a = f.target(), b = f.target();
   const copy = (...args) => f.renderer.copyTextureToTexture(...args);
-  assert.throws(() => copy(a.texture, b.texture, null, null, 0, 1), /destination mip zero/);
+  assert.throws(() => copy(a.texture, b.texture, null, null, 0, 1), /Destination mip level is not allocated/);
   assert.throws(() => copy(a.texture, b.texture, null, {x: 0, y: 0, z: 1}), /depth zero/);
   assert.throws(() => copy(a.texture, b.texture, {isBox3: true, min: {x: 0, y: 0, z: 1}, max: {x: 1, y: 1, z: 2}}), /2D source/);
   assert.throws(() => copy({}, b.texture), /target-owned/);
@@ -163,7 +163,7 @@ test('source admission rejects unsupported mip/layer/texture and bad bounds sync
 
 test('async source admission rejects a promise and does not poison later valid operations', async () => {
   const f = fixture(), a = f.target(), b = f.target();
-  await assert.rejects(f.renderer.copyTextureToTextureAsync(a.texture, b.texture, null, null, 0, 1), /mip zero/);
+  await assert.rejects(f.renderer.copyTextureToTextureAsync(a.texture, b.texture, null, null, 0, 1), /Destination mip level is not allocated/);
   assert.equal(f.renderer._deferredError, null);
   await f.renderer.copyTextureToTextureAsync(a.texture, b.texture);
 });

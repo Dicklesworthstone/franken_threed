@@ -105,14 +105,42 @@ Ordinary `readRenderTargetPixelsAsync` retains the source API's level-zero
 behavior, regardless of the active selector. The facade extension
 `readRenderTargetMipPixelsAsync(target, level, options)` reads an explicit level;
 options include `x`, `y`, `width`, `height` and a typed-array `output`. Default
-bounds cover that level. `copyTextureToTexture` already accepts `sourceLevel` and
-can copy an authored mip to another target's level zero. Drawing, clearing,
-copying and readback stay in the renderer's common FIFO.
+bounds cover that level. Drawing, clearing, copying and readback stay in the
+renderer's common FIFO.
 
-For source-compatible mip copies, supply a `Box2` region in the selected level's
-coordinates. Pinned r186 defaults a null copy region to the base image dimensions
-even when `sourceLevel` is nonzero; an explicit mip-sized region avoids an
-out-of-bounds reference copy.
+Raw target copies independently select `sourceMipLevel` and
+`destinationMipLevel`. The destination must have that level allocated, use one
+sample and disable automatic mip generation. Bounds and bottom-left coordinate
+conversion use each endpoint's selected mip dimensions; volume slices shrink
+with the mip while array layers and cube faces retain their indices. Copies
+preserve the other authored levels, invalidate any existing sampling replica and
+use the original GPU allocation without CPU readback or temporary color images.
+
+```js
+await renderer.copyRenderTargetPixelsAsync(source, destination, {
+  sourceMipLevel: 1,
+  destinationMipLevel: 2,
+  sourceX: 1, sourceY: 1, x: 2, y: 0, width: 4, height: 2,
+});
+const pixels = await renderer.readRenderTargetMipPixelsAsync(destination, 2);
+```
+
+The WebGL source-shaped `copyTextureToTexture` and its asynchronous extension
+also accept their `dstLevel` argument for authored 2D color targets. A level-zero
+source supports cropped regions and offset destinations. When both source and
+destination levels are nonzero, this path currently requires zero source and
+destination origins: pinned r186 passes extents as `blitFramebuffer` endpoints,
+so offset rectangles can scale or reverse rather than perform a raw copy. Such
+offsets remain an explicit admission gap; the raw target-copy extension above
+does not promise those blit semantics. WebGL's null source region floors the
+base dimensions by the source level, retaining zero-area one-dimensional tails.
+Depth copies still require level zero at both endpoints.
+
+For native source-compatible mip copies, supply a `Box2` region in the selected
+level's coordinates. Pinned native r186 defaults a null copy region to the base
+image dimensions even when `sourceLevel` is nonzero; an explicit mip-sized region
+avoids an out-of-bounds reference copy. Queued operations capture levels and
+rectangle scalars when accepted, so later edits do not redirect their writes.
 
 The native owner also exposes
 `createGpuRenderTarget(device, { ..., mipLevelCount, generateMipmaps: false })`
@@ -135,6 +163,15 @@ capture, source-oriented sampling replicas, all cube faces and generation-flag
 snapshots. These 37 checks use recording GPU boundaries; no WebGL mip pixel or
 performance result is claimed. Unrelated stale fixtures in the full renderer
 target suite were also observed on the unchanged baseline.
+
+The destination-mip copy extension is covered by eight target-owner cases and
+six actual-r186 facade cases in `gpu_target_transfer.test.mjs` and
+`three_renderer_public_readback.test.mjs`. They compare independent byte arrays
+for RGBA8, half-float bit patterns and float32 exceptional values; preserve
+untouched levels; exercise NPOT bounds, both coordinate origins, queued option
+snapshots, zero-area tails and invalid generation/level requests. These recording
+device checks establish transfer and scheduling behavior, not rasterized pixel
+parity or hardware performance.
 
 The focused tests run directly with:
 

@@ -52,7 +52,7 @@ test('void and delegated texture copies share the owner, and incompatible second
   assert.equal(f.copies.length, 2);
   assert.throws(() => r.copyTextureToTexture(source.textures[1], destination.textures[1]), {code: 'GPU_TRANSFER_FORMAT'});
   assert.throws(() => r.copyTextureToTexture(source.textures[1], source.textures[2]), {code: 'F3D_RENDERER_TRANSFER'});
-  assert.throws(() => r.copyTextureToTexture(source.textures[1], destination.textures[2], null, null, 0, 1), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => r.copyTextureToTexture(source.textures[1], destination.textures[2], null, null, 0, 1), {code: 'GPU_TRANSFER_REGION'});
   const impostor = Object.assign(new T.Texture(), {isRenderTargetTexture: true, renderTarget: source});
   assert.throws(() => r.copyTextureToTexture(impostor, destination.textures[2]), {code: 'F3D_RENDERER_UNSUPPORTED'});
   assert.equal(f.controller.pendingRequests, 0); f.close();

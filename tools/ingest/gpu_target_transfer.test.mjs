@@ -89,6 +89,52 @@ test('a selected NPOT source mip is copied into destination level zero', async (
   assert.ok((await b.readPixels()).every(n => n === 42)); a.dispose(); b.dispose();
 });
 
+for (const [format, Type, components] of cases.filter(([format]) => ['rgba8unorm', 'rgba16float', 'rgba32float'].includes(format)))
+  for (const flipY of [false, true]) test(`${format}/flip=${flipY}: authored destination mip copies preserve other levels and raw bits`, async () => {
+    const f = transferDevice(), a = make(f, {format, width: 15, height: 11, mipLevelCount: 4}),
+      b = make(f, {format, width: 31, height: 35, mipLevelCount: 4});
+    a.withTexture(texture => texture.levels[1].bytes.set(raw(payload(Type, 7 * 5 * components))));
+    b.withTexture(texture => texture.levels.forEach(level => level.bytes.fill(191)));
+    b.copyFrom(a, {sourceMipLevel: 1, destinationMipLevel: 2,
+      sourceX: 1, sourceY: 1, x: 2, y: 2, width: 3, height: 2, flipY});
+    const copy = f.calls.colorCopies[0];
+    assert.equal(copy.source.mipLevel, 1); assert.equal(copy.destination.mipLevel, 2);
+    assert.equal(copy.source.origin.y, flipY ? 2 : 1); assert.equal(copy.destination.origin.y, flipY ? 4 : 2);
+    assert.equal(f.calls.buffers.length, 0); assert.equal(f.calls.textures.length, 2);
+    const expected = await a.readPixels({mipLevel: 1, x: 1, y: 1, width: 3, height: 2, flipY});
+    const actual = await b.readPixels({mipLevel: 2, x: 2, y: 2, width: 3, height: 2, flipY});
+    assert.deepEqual(raw(actual), raw(expected));
+    for (const mipLevel of [0, 1, 3]) assert.ok(raw(await b.readPixels({mipLevel})).every(value => value === 191));
+    assert.ok(raw(await b.readPixels({mipLevel: 2, width: 1, height: 1})).every(value => value === 191));
+    assert.equal(b.diagnostics.mipGenerations, 0); a.dispose(); b.dispose();
+  });
+
+test('destination mip validation rejects unallocated/generated levels and uses mip-local bounds', () => {
+  const f = transferDevice(), a = make(f, {width: 2, height: 2}),
+    b = make(f, {width: 8, height: 8, mipLevelCount: 4}), generated = make(f, {width: 8, height: 8, generateMipmaps: true});
+  for (const destinationMipLevel of [-1, .5, '1', 4])
+    assert.throws(() => b.copyFrom(a, {destinationMipLevel}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => b.copyFrom(a, {destinationMipLevel: 3}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => b.copyFrom(a, {destinationMipLevel: 2, x: 1}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => generated.copyFrom(a, {destinationMipLevel: 1}), {code: 'GPU_TRANSFER_MIP'});
+  assert.throws(() => generated.copyFrom(a, {destinationMipLevel: 1, width: 0}), {code: 'GPU_TRANSFER_MIP'});
+  assert.equal(f.calls.submissions.length, 0); assert.equal(f.calls.colorCopies.length, 0);
+  a.dispose(); b.dispose(); generated.dispose();
+});
+
+test('destination mip copies shrink volume slice bounds while retaining array layers and cube faces', () => {
+  const source = {width: 2, height: 2, format: 'rgba8unorm', sampleCount: 1, mipLevelCount: 1};
+  const destination = {width: 8, height: 8, layers: 8, format: 'rgba8unorm', sampleCount: 1,
+    mipLevelCount: 4, generateMipmaps: false};
+  const plan = inspectGpuTargetCopy(source, {...destination, volume: true}, {destinationMipLevel: 2, face: 1});
+  assert.equal(plan.destinationOrigin.z, 1); assert.equal(plan.destinationMipLevel, 2);
+  assert.throws(() => inspectGpuTargetCopy(source, {...destination, volume: true}, {destinationMipLevel: 2, face: 2}),
+    {code: 'GPU_TRANSFER_FACE'});
+  assert.equal(inspectGpuTargetCopy(source, {...destination, array: true}, {destinationMipLevel: 2, face: 7}).destinationOrigin.z, 7);
+  assert.equal(inspectGpuTargetCopy(source, {...destination, cube: true}, {destinationMipLevel: 2, face: 5}).destinationOrigin.z, 5);
+  assert.throws(() => inspectGpuTargetCopy(source, {...destination, cube: true}, {destinationMipLevel: 2}), {code: 'GPU_TRANSFER_FACE'});
+});
+
 test('MSAA sources copy their resolved single-sample image, never the multisample attachment', async () => {
   const f = transferDevice(), a = make(f, {sampleCount: 4}), b = make(f);
   a.withFrame((frame, color) => { assert.notEqual(frame.colorView.texture, color); color.levels[0].bytes.fill(79); });
