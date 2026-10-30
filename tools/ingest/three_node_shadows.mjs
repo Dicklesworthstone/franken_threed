@@ -2,7 +2,7 @@
  * camera fitting and update frequency; the facade captures every resulting pass
  * for its own submission. No upstream renderer or backend is constructed here.
  */
-const renderFunctions = new WeakMap(), captures = new WeakMap(), computePrerequisites = new WeakSet(), objectHooks = new WeakSet();
+const renderFunctions = new WeakMap(), captures = new WeakMap(), computePrerequisites = new WeakMap(), objectHooks = new WeakSet();
 const reject = message => {
   const error = new Error(`THREE_NODE_PROGRAM_SHADOW: ${message}`);
   error.name = 'ThreeNodeProgramError'; error.code = 'THREE_NODE_PROGRAM_SHADOW'; throw error;
@@ -159,11 +159,12 @@ export function withThreeShadowMaterial(three, renderer, material, original, run
  * a child rewrite of a texture already read by an earlier parent draw: keeping
  * callbacks in order alone cannot preserve that earlier draw's GPU contents.
  */
-export function withThreeNativeCapture(renderer, run) {
+export function withThreeNativeCapture(renderer, run, target = null) {
   let stack = captures.get(renderer);
   if (!stack) captures.set(renderer, stack = []);
-  const scope = {textures: new Set(), draws: 0}; stack.push(scope);
-  try { return run(texture => scope.textures.add(texture)); }
+  const scope = {textures: new Set(), buffers: new Set(), draws: 0, unknown: false,
+    attachments: new Set([...(target?.textures ?? []), target?.depthTexture].filter(Boolean))}; stack.push(scope);
+  try { return run(texture => scope.textures.add(texture), buffer => scope.buffers.add(buffer)); }
   finally { stack.pop(); if (!stack.length) captures.delete(renderer); }
 }
 
@@ -172,9 +173,9 @@ export function withThreeNativeCapture(renderer, run) {
  * Mark only the current pass: completed child captures do not become earlier
  * parent draws, but every still-active ancestor must remain free of reads.
  */
-export function markThreeNativeDrawCaptured(renderer) {
+export function markThreeNativeDrawCaptured(renderer, known = false) {
   const scope = captures.get(renderer)?.at(-1);
-  if (scope) scope.draws++;
+  if (scope) { scope.draws++; scope.unknown ||= !known; }
 }
 
 /** Object callbacks execute synchronously around their accepted draw. Nested
@@ -196,11 +197,11 @@ const assertOutsideObjectHook = renderer => {
   }
 };
 
-export function withThreeNativeComputePrerequisites(renderer, run) {
-  const previous = computePrerequisites.has(renderer);
-  computePrerequisites.add(renderer);
+export function withThreeNativeComputePrerequisites(renderer, run, disjoint = false) {
+  const previous = computePrerequisites.get(renderer);
+  computePrerequisites.set(renderer, previous === true || disjoint);
   try { return run(); }
-  finally { if (!previous) computePrerequisites.delete(renderer); }
+  finally { if (previous === undefined) computePrerequisites.delete(renderer); else computePrerequisites.set(renderer, previous); }
 }
 
 export function assertThreeNativeTargetWrite(renderer, target) {
@@ -217,10 +218,17 @@ export function assertThreeNativeTextureWrite(renderer, texture) {
       reject('A nested write cannot overwrite a texture sampled by an earlier draw in its pending parent pass');
 }
 
-export function assertThreeNativeComputeOutsideCapture(renderer) {
+export function assertThreeNativeComputeOutsideCapture(renderer, resources = null) {
   assertOutsideObjectHook(renderer);
   const stack = captures.get(renderer);
-  if (stack && (!computePrerequisites.has(renderer) || stack.some(scope => scope.draws || scope.textures.size))) {
+  const disjoint = computePrerequisites.get(renderer);
+  // The pinned backend submits a separate compute encoder before its pending
+  // render encoder. Geometry prerequisites retain that order. Restrict their
+  // extension beyond the first draw to known, disjoint resources; overlapping
+  // GPU/host upload histories still need their own source-equivalence proof.
+  if (stack && (disjoint === undefined || stack.some(scope => scope.unknown ||
+      !disjoint && (scope.draws || scope.textures.size) ||
+      resources?.some(resource => scope.buffers.has(resource) || scope.textures.has(resource) || scope.attachments.has(resource))))) {
     const error = new Error('THREE_COMPUTE_REENTRY: Compute inside native draw capture requires a separate submission boundary; compute before rendering the scene');
     error.name = 'ThreeComputeError'; error.code = 'THREE_COMPUTE_REENTRY'; throw error;
   }

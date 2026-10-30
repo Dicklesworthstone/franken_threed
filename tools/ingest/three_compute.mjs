@@ -345,17 +345,32 @@ function createThreeCompute(renderer, three) {
     } finally { building.delete(node); }
   }
   function withFrame(node, run) {
-    const previous = {renderer: frame.renderer, compute: frame.compute, renderId: frame.renderId};
-    frame.renderer = renderer; frame.compute = node; frame.renderId = renderer.info.calls;
+    const previous = Object.fromEntries(['renderer', 'compute', 'renderId', 'scene', 'object', 'camera', 'material']
+      .map(key => [key, frame[key]]));
+    Object.assign(frame, {renderer, compute: node, renderId: renderer.info.calls, scene: null, object: null, camera: null, material: null});
     try { return run(); } finally { Object.assign(frame, previous); }
   }
   function update(entry, stage) {
     const names = {before: ['updateBeforeNodes', 'updateBeforeNode'], current: ['updateNodes', 'updateNode'], after: ['updateAfterNodes', 'updateAfterNode']};
     const [nodes, method] = names[stage];
-    for (const node of entry.builder[nodes] ?? []) frame[method](node);
+    // NodeManager resets context for each before/after node. Ordinary compute
+    // updates use getNodeFrame(), whose compute and render objects are null.
+    const context = {renderer, compute: stage === 'current' ? null : entry.builder.compute,
+      scene: null, object: null, camera: null, material: null};
+    if (stage === 'current') Object.assign(frame, context);
+    for (const node of entry.builder[nodes] ?? []) {
+      if (stage !== 'current') Object.assign(frame, context);
+      frame[method](node);
+    }
   }
   function capture(node, entry, override, deferred) {
-    assertThreeNativeComputeOutsideCapture(renderer);
+    // Validate live binding identities before capturing any upload histories.
+    // onInit kernels enter this same boundary independently of their parent.
+    const resources = entry.groups.flatMap(group => group.bindings.map(binding => binding.isStorageBuffer
+      ? binding.attribute : binding.isSampledTexture || binding.isSampler ? textureBinding(binding).texture : null)).filter(Boolean);
+    const dispatch = override ?? node.dispatchSize ?? node.count;
+    if (dispatch?.isIndirectStorageBufferAttribute) resources.push(dispatch);
+    assertThreeNativeComputeOutsideCapture(renderer, resources);
     const held = new Set(), textureUses = [], epoch = listeners.get(node);
     let released = false;
     entry.uses++;

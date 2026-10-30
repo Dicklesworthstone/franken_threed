@@ -32,7 +32,7 @@
  */
 import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
 import {inspectThreeNativeShadowFilter, installThreeNativeShadowTargets,
-  registerThreeNativeShadow, updateThreeNativeShadow} from './three_node_shadows.mjs';
+  registerThreeNativeShadow, updateThreeNativeShadow, withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
   updateThreeNativePass, inspectThreeMRT, inspectThreeNativeCamera} from './three_node_passes.mjs';
 import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_clipping.mjs';
@@ -47,7 +47,7 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode', 'geometryNode']);
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
 const POINT_SLOTS = new Set(['sizeNode']);
 const DASH_SLOTS = new Set(['offsetNode', 'dashScaleNode', 'dashSizeNode', 'gapSizeNode']);
@@ -859,6 +859,19 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
     }));
   }
+  function geometrySignature(material) {
+    const node = material.geometryNode;
+    return node == null ? null : JSON.stringify([sourceId(node), node.getCacheKey()]);
+  }
+  function inspectCompute(node) {
+    const source = three.ComputeNode?.prototype;
+    if (!source || Object.getPrototypeOf(node) !== source ||
+        ['setup', 'generate', 'updateBefore', 'getUpdateBeforeType'].some(key => node[key] !== source[key]) ||
+        ['getUpdateType', 'getUpdateAfterType', 'updateReference'].some(key => node[key] !== three.Node.prototype[key]) ||
+        !['none', 'frame', 'render', 'object'].includes(node.updateBeforeType) ||
+        node.updateType !== 'none' || node.updateAfterType !== 'none')
+      fail('STORAGE', 'Render-triggered compute requires the pinned ComputeNode construction and update lifecycle');
+  }
   function sssSignature(material) {
     if (Object.getPrototypeOf(material) !== three.MeshSSSNodeMaterial?.prototype) return null;
     // The retained SSS model consumes these graphs during construction. Slot
@@ -1001,7 +1014,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (seen.size > maxNodes) fail('LIMIT', 'Native node graph exceeds its node budget');
       checkNode(node, lightsNode, lights, null, null, material, authoredNodes);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
-      if (typeof node.getChildren === 'function') for (const child of node.getChildren()) stack.push(child);
+      // A compute body has its own writable-resource validation at dispatch.
+      // Its generated graphics output is checked after source construction.
+      if (!node.isComputeNode && typeof node.getChildren === 'function') for (const child of node.getChildren()) stack.push(child);
     }
     return material;
   }
@@ -1026,6 +1041,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
+    if (node.isComputeNode) { inspectCompute(node); return; }
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isPassTextureNode === true) {
       if (node.passNode?.isPassNode === true) inspectThreeNativePass(three, renderer, node.passNode);
@@ -1109,7 +1125,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       wideLineCoverage(material),
       material.depthWrite, material.depthTest, material.lights, clippingKey,
-      spriteSignature(material, object), wideLineSignature(material), volumeSignature(material), sssSignature(material),
+      spriteSignature(material, object), wideLineSignature(material), volumeSignature(material), sssSignature(material), geometrySignature(material),
       primitiveLayout(object, material),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
@@ -1120,7 +1136,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
         environment.isPMREMTexture === true, materialEnvironment(material, environment)] : null,
-      Object.entries(object.geometry.attributes).map(([name, a]) => [name, a.itemSize, a.normalized, a.gpuType, a.array?.constructor.name,
+      Object.entries(object.geometry.attributes).map(([name, a]) => [name,
+        (a.isStorageBufferAttribute || a.isStorageInstancedBufferAttribute) && a.itemSize === 3 ? 4 : a.itemSize,
+        a.normalized, a.gpuType, a.array?.constructor.name,
         a.isInterleavedBufferAttribute, a.data?.array?.constructor.name, a.data?.stride, a.offset,
         a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
@@ -1155,10 +1173,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
-    const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial);
+    const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
-    const key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey), byMaterial = cache.get(object);
+    let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
+    const byMaterial = cache.get(object);
     // Source render objects distinguish the transparent back-side pass from
     // the ordinary front-side pass. Both may own generated attribute streams;
     // compiling one must not retire the other's accepted descriptor.
@@ -1194,11 +1213,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     if (environmentNode) builder.environmentNode = environmentNode;
     builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
+    // ComputeNode.setup constructs its body in this graphics builder, but its
+    // generate() emits only outputComputeNode. Keep source update lists intact
+    // while separating setup-only compute writes from actual graphics nodes.
+    const computeChildren = new Set(), graphicsNodes = new Set(), generatedNodes = new Set(), addChain = builder.addChain;
+    builder.addChain = function (node) {
+      (this.chaining.some(parent => parent.isComputeNode) ? computeChildren : graphicsNodes).add(node);
+      if (this.buildStage === 'generate') generatedNodes.add(node);
+      return addChain.call(this, node);
+    };
     try { builder.build(); }
     catch (cause) {
       if (cause instanceof ThreeNodeProgramError) throw cause;
       throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
-    }
+    } finally { builder.addChain = addChain; }
+    const graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
     assertInstances(object, instanceSignature);
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
@@ -1213,6 +1242,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native volume graphs changed during source construction');
     if (sssSignature(prepareMaterial(material)) !== sssKey)
       fail('CHANGED', 'Native subsurface scattering graphs changed during source construction');
+    if (geometrySignature(prepareMaterial(material)) !== geometryKey)
+      fail('CHANGED', 'Native geometry graph changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
@@ -1239,6 +1270,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     }
     for (const node of builder.nodes) {
+      if (!graphicsNode(node)) continue;
       checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
     }
@@ -1327,7 +1359,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
-      if (node) generated.push({name: attribute.name, attribute: source});
+      if (node || storage) generated.push({name: attribute.name, attribute: source});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
     const vertex = builder.vertexShader, fragment = builder.fragmentShader;
@@ -1365,10 +1397,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Node.build() deduplicates unsized storage by attribute before addNode().
     // Walk the original child edges too, including graphs created inside Fn,
     // so changing one alias cannot silently keep the old shared binding.
-    const graphNodes = new Set(builder.nodes);
+    const graphNodes = new Set([...builder.nodes].filter(graphicsNode));
     for (const node of graphNodes) {
       if (graphNodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
-      if (typeof node.getChildren === 'function') for (const child of node.getChildren()) graphNodes.add(child);
+      if (!node.isComputeNode && typeof node.getChildren === 'function')
+        for (const child of node.getChildren()) if (graphicsNode(child)) graphNodes.add(child);
     }
     // Include TextureNodes omitted by source UUID binding deduplication. Source
     // MaterialNode caches its references across materials, so read their live
@@ -1404,7 +1437,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       spriteSignature: spriteSignature(preparedMaterial, object),
       wideLineSignature: wideLineSignature(preparedMaterial),
       volumeSignature: volumeKey,
-      sssSignature: sssKey,
+      sssSignature: sssKey, geometrySignature: geometryKey,
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
@@ -1414,6 +1447,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
+    // Source geometry constructors may add named storage attributes. Adopt
+    // their accepted layout now, including the canonical vec3 padding above,
+    // instead of rebuilding that constructor and repeating onInit next frame.
+    if (geometryKey !== null) key = keyOf(preparedMaterial, object, context, lights, environment,
+      instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
     const entry = {key, passId, descriptor, builder, material, object, geometry: object.geometry, shaders, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
@@ -1722,6 +1760,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (volumeSignature(prepareMaterial(state.material)) !== state.volumeSignature)
       fail('CHANGED', 'Native volume scattering, emission, offset or depth graphs changed; compile the volume graph again');
   }
+  function checkGeometry(state) {
+    if (geometrySignature(prepareMaterial(state.material)) !== state.geometrySignature)
+      fail('CHANGED', 'Native geometry graph changed; compile the source geometry constructor again');
+  }
   function checkSSS(state) {
     if (sssSignature(prepareMaterial(state.material)) !== state.sssSignature)
       fail('CHANGED', 'Native subsurface thickness graphs changed; compile the SSS graph again');
@@ -1761,6 +1803,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native wide-line expansion, dashes, colors or transparency changed; compile the line graph again');
     checkVolume(state);
     checkSSS(state);
+    checkGeometry(state);
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
@@ -1794,7 +1837,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         registerThreeNativeShadow(three, renderer, node);
         updateThreeNativeShadow(three, renderer, node, frame);
       } else if (node.isPassNode === true) updateThreeNativePass(three, renderer, node, frame);
-      else if (effects.owns(node)) effects.update(node, frame);
+      else if (node.isComputeNode) {
+        inspectCompute(node);
+        withThreeNativeComputePrerequisites(renderer, () => frame.updateBeforeNode(node), true);
+      } else if (effects.owns(node)) effects.update(node, frame);
       else frame.updateBeforeNode(node);
       // PMREM refresh keeps its separate ordered-prefix contract. Shadow
       // recursion runs outside draw-resource capture at its source boundary.
@@ -1847,6 +1893,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkTransmission(state);
       checkVolume(state);
       checkSSS(state);
+      checkGeometry(state);
       checkAttributes(state);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -1876,6 +1923,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkTransmission(state);
       checkVolume(state);
       checkSSS(state);
+      checkGeometry(state);
       checkClipping(state, context);
       checkWireframe(state);
       const textures = readTextures(state);
@@ -1910,6 +1958,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return withFrame(state, context, () => { for (const node of state.builder.updateAfterNodes) frame.updateAfterNode(node); });
   }
   const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
+    hasGeometryCompute(descriptor) { return stateOf(descriptor).builder.updateBeforeNodes.some(node => node.isComputeNode); },
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
       : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
     attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)

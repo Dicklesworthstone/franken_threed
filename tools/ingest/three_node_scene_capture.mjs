@@ -181,6 +181,12 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeWideLineScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.layers.test(camera.layers) && (Array.isArray(object.material) ? object.material : [object.material])
       .some(material => material?.visible !== false && material && Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype));
+  // Source geometry constructors can schedule compute before their draw. Keep
+  // ordinary companions in the same capture so their prior resource uses are
+  // known when admitting those prerequisites, including native backgrounds.
+  const nativeGeometryScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
+    object.layers.test(camera.layers) && (Array.isArray(object.material) ? object.material : [object.material])
+      .some(material => material?.visible !== false && material?.geometryNode != null));
   // Occlusion results are read during source callbacks. Capture the complete
   // ordered scene so tested and ordinary companions share that boundary.
   let nativeOcclusionScene = false;
@@ -191,7 +197,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
-  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeOcclusionScene
+  const nativeMaterial = material => nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene
     ? material != null : nativeFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -520,6 +526,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const frameContext = {...context, ...frameStamp};
   const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
   const captureVertexAttribute = (attribute, view) => {
+    recordBuffer(attribute);
     const lease = storageOwner.capture(attribute);
     // Retain first so any subsequent proof/capture failure releases the upload.
     storageUses.push(lease); vertexStorageUses.push(lease);
@@ -543,7 +550,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     return record;
   };
-  let recordTexture = () => {};
+  let recordTexture = () => {}, recordBuffer = () => {};
   const captureDraw = draw => {
     // RenderObject receives the geometry's current range before this physical
     // pass's node lifecycle. A preceding pass may replace the range object.
@@ -581,9 +588,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const beforeDone = typeof programs.before === 'function';
       if (beforeDone) programs.before(draw.binding.nodeProgram, updateContext);
       const capture = () => {
-      markThreeNativeDrawCaptured(renderer);
+      markThreeNativeDrawCaptured(renderer, true);
       const vertexStart = vertexStorageUses.length;
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
+      for (const attribute of [...Object.values(draw.geometry.attributes), draw.geometry.index, draw.geometry.indirect])
+        if (attribute) recordBuffer(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+      for (const binding of captured.storage) recordBuffer(binding.attribute);
+      for (const binding of captured.textures) recordTexture(binding.texture);
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
       if (captured.bundleGeometry) {
@@ -650,7 +661,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       draw.nodeTextures = Object.freeze(captured.textures.map(binding => {
         const lease = textureOwner.captureBinding(binding);
         textureUses.push(lease);
-        recordTexture(binding.texture);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
       draw.nodeStorage = Object.freeze(captured.storage.map(binding => {
@@ -832,8 +842,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     else run();
   };
   const capturePhase = (selected, phase, bundled = false) => {
-    // Source compileAsync runs the object callback, but no NodeFrame updates.
-    // Render capture runs it in draw order below, before a DoubleSide split.
+    // Source compileAsync selects object callbacks first; geometry-node updates
+    // run later at its pipeline preparation boundary. Render capture runs them
+    // in draw order below, before a DoubleSide split.
     if (!uniforms && !nativeLifecycle) for (const draw of selected) if (draw.object.isBatchedMesh)
       draw.object.onBeforeRender(renderer, root, camera, draw.geometry, draw.sourceMaterial, draw.sourceGroup);
     preparePhase(selected, phase, bundled);
@@ -992,8 +1003,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const installOverride = nativeLifecycle && previousOverride !== overrideMaterial;
   if (installOverride) root.overrideMaterial = overrideMaterial;
   try {
-    withThreeNativeCapture(renderer, record => {
-      recordTexture = record;
+    withThreeNativeCapture(renderer, (record, buffer) => {
+      recordTexture = record; recordBuffer = buffer;
       // Fixed companions may sort before these native draws. Their reads are
       // not captured here, so this mixed pass cannot prove a compute prefix.
       if (fixedDrawCandidates) markThreeNativeDrawCaptured(renderer);
@@ -1004,7 +1015,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         if (textureOwner) textureOwner.captureDispatch(captureStorage);
         else captureStorage();
       }
-    });
+    }, destination);
     storageOwner?.validate(storageUses);
     for (const {selection, draws: packets, version} of capturedBundles)
       bundles.commit(selection, packets, version);
@@ -1019,38 +1030,61 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   draws.splice(0, draws.length, ...capturedDraws);
   let preparedAttributes = null, preparedBindings = null;
   const acceptedBindings = Object.freeze([...compiledBindings]);
+  const precompile = run => {
+    const previous = renderer._isPreCompiling; renderer._isPreCompiling = true;
+    try { return run(); } finally { renderer._isPreCompiling = previous; }
+  };
+  const publishAttributes = () => {
+    for (const attributes of preparedAttributes ?? []) attributes.install();
+    // Publish at preparation's FIFO boundary. Unchanged upload versions retain
+    // GPU-authored bytes, including the buffers shared by geometry compute.
+    if (vertexStorageUses.length) storageOwner.withReads(vertexStorageUses, () => {});
+    if (preparedIndirectUses.length) storageOwner.withReads(preparedIndirectUses, () => {});
+  };
+  function* preparationSteps(updates) {
+    let dirty = true;
+    if (!uniforms && preparedAttributes === null) {
+      preparedAttributes = []; const ready = [];
+      for (const binding of preparationBindings) {
+        const compute = updates && programs.hasGeometryCompute?.(binding.nodeProgram);
+        const updateContext = {...frameContext, ...(compute ? {renderId: frame.renderId, frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime} : {}),
+          object: binding.object, material: binding.material, clippingContext: binding.clippingContext, captureVertexAttribute,
+          captureIndirect: () => captureIndirectUpload(binding.object, binding.geometry),
+          ...(bundles ? {captureGeometry: (view, attributes) => bundles.captureGeometry(view, attributes, renderId)} : {})};
+        withBinding(binding, () => {
+          // Public source compilation executes before -> geometry -> current;
+          // raw graph/pipeline preparation remains inert. Keep the immutable
+          // geometry upload before current callbacks can mutate its CPU arrays.
+          const captured = compute ? precompile(() => programs.captureDraw(binding.nodeProgram, updateContext)) : null;
+          const attributes = compute ? captured.attributes : programs.captureAttributes?.(binding.nodeProgram, updateContext);
+          if (attributes) { preparedAttributes.push(attributes); attributes.install(); }
+          const indirect = compute ? captured.indirect : captureIndirectUpload(binding.object, binding.geometry);
+          if (indirect) preparedIndirectUses.push(indirect.lease);
+          if (bundles) {
+            const lease = captured?.bundleGeometry ?? bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
+            bundleGeometries.push(lease);
+            ready.push(Object.freeze({...binding, programGeometry: lease.geometry}));
+          } else ready.push(binding);
+        });
+        preparedBindings = Object.freeze(ready.slice()); dirty = true;
+        if (compute) {
+          publishAttributes(); yield; dirty = false;
+          // Pinned compileAsync completes this object's pipeline and after
+          // callbacks before advancing to the next render object. No await may
+          // leave the renderer's precompilation flag installed.
+          withBinding(binding, () => precompile(() => programs.after(binding.nodeProgram, updateContext)));
+        }
+      }
+    }
+    if (dirty) { publishAttributes(); yield; }
+  }
+  const geometryCompilation = !uniforms && [...preparationBindings].some(binding => programs.hasGeometryCompute?.(binding.nodeProgram));
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
     sortObjects, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
     get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,
-    prepareAttributes() {
-      if (!uniforms) {
-        // compileAsync uploads visible geometry without node updates. Preserve
-        // immutable CPU histories and the storage owner's captured GPU views.
-        if (preparedAttributes === null) {
-          preparedAttributes = []; const ready = [];
-          for (const binding of preparationBindings) withBinding(binding, () => {
-            const attributes = programs.captureAttributes?.(binding.nodeProgram,
-              {...frameContext, object: binding.object, material: binding.material, captureVertexAttribute});
-            if (attributes) { preparedAttributes.push(attributes); attributes.install(); }
-            const indirect = captureIndirectUpload(binding.object, binding.geometry);
-            if (indirect) preparedIndirectUses.push(indirect.lease);
-            if (bundles) {
-              const lease = bundles.captureGeometry(attributes?.geometry ?? binding.programGeometry, null, renderId);
-              bundleGeometries.push(lease);
-              ready.push(Object.freeze({...binding, programGeometry: lease.geometry}));
-            } else ready.push(binding);
-          });
-          preparedBindings = Object.freeze(ready);
-        }
-        for (const attributes of preparedAttributes) attributes.install();
-      }
-      // Pipeline preparation needs actual vertex buffers. Publish these captured
-      // versions at the FIFO preparation boundary; unchanged versions preserve
-      // compute-authored bytes. Submission retains the same storage leases.
-      if (vertexStorageUses.length) storageOwner.withReads(vertexStorageUses, () => {});
-      if (preparedIndirectUses.length) storageOwner.withReads(preparedIndirectUses, () => {});
-    },
+    prepareAttributes() { for (const step of preparationSteps(false)) { /* publish without node updates */ } },
+    ...(geometryCompilation ? {async compileAttributes(prepare) { for (const step of preparationSteps(true)) await prepare(); }} : {}),
     installAttributes() { for (const draw of draws) draw.nodeAttributes?.install(); },
     textureOwner, textureUses: Object.freeze(textureUses), storageOwner,
     get storageUses() { return Object.freeze(storageUses.slice()); }});

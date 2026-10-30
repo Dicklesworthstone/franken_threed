@@ -628,7 +628,10 @@ test('pre-init computeAsync advances source frame one before its first frame-upd
   const attribute = new T.StorageBufferAttribute(1, 1), output = N.storage(attribute, 'float', 1);
   let kernel;
   const value = N.uniform(0).onFrameUpdate(frame => {
-    assert.equal(frame.renderer, f.renderer); assert.equal(frame.compute, kernel);
+    assert.equal(frame.renderer, f.renderer);
+    // Pinned NodeManager.updateForCompute uses getNodeFrame() defaults for
+    // ordinary updates; only before/after updates receive the compute node.
+    for (const key of ['compute', 'scene', 'object', 'camera', 'material']) assert.equal(frame[key], null);
     updates.push(frame.frameId); return frame.frameId + .125;
   });
   kernel = N.Fn(() => { output.element(0).assign(value); })().compute(1);

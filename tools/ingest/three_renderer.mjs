@@ -1338,7 +1338,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!(compiled instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
       // Capture before initialization or another compile can yield. Preparation
       // and later draws address the same stable execution root.
-      const requests = this._makeOutputRequests(compiled, camera, null, false);
+      const requests = this._makeOutputRequests(compiled, camera, null, false), compilation = {frameAdvanced: false};
+      for (const request of requests) request.compilation = compilation;
       try {
         await this.init();
         if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
@@ -1347,7 +1348,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           request.destination._wanted.set(request.scene, request.key);
           await this._prepare(request.destination, request);
         }
-      } finally { for (const request of requests) this._releaseRequest(request); }
+      } finally {
+        // Geometry-node compilation can enqueue initialization/update kernels.
+        // Drain only after _prepare has released its own queue barrier, even
+        // when a later node callback rejected the parent compilation.
+        try { while (this._drain) await this._drain; }
+        finally { for (const request of requests) this._releaseRequest(request); }
+      }
     }
     /** All scene preparations share one queue; targets never rebuild the canvas. */
     _prepare(destination = this, request = null) {
@@ -1394,6 +1401,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           }
         }
         const captured = request?.nodeFrame;
+        // Deferred pre-init captures discover geometry kernels only here. The
+        // source advances one frame for the entire public compilation, keeping
+        // its previous renderId across all output requests.
+        if (captured?.compileAttributes && request.compilation && !request.compilation.frameAdvanced) {
+          this._nodes.nodeFrame.update(); request.compilation.frameAdvanced = true;
+        }
         const textureReady = captured?.textureOwner?.preparation(captured.textureUses);
         if (textureReady) await textureReady;
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
@@ -1405,7 +1418,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           backgroundState: request.backgroundState, materialFrame: request.materialFrame} : undefined;
         try {
           request?.snapshot?.install();
-          captured?.prepareAttributes?.();
+          const prepare = async () => {
           captured?.installAttributes?.();
           if (destination !== this) {
             this._targets.ensure(destination);
@@ -1452,6 +1465,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             }
           }
           this.info.f3d.preparations++;
+          };
+          if (captured?.compileAttributes) await captured.compileAttributes(prepare);
+          else { captured?.prepareAttributes?.(); await prepare(); }
         } finally { this._programFrame = previous; destination._preparationRoot = previousRoot; destination._preparationOptions = previousOptions; }
       });
       this._preparing = run;

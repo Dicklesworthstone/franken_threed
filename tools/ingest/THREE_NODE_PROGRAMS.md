@@ -12,6 +12,88 @@ acceleration or a Rust implementation of node evaluation.
 
 ## Implemented graph surface
 
+### Render-triggered geometry compute
+
+`NodeMaterial.geometryNode` now admits the pinned `ComputeNode` lifecycle,
+including a lazy `TSL.Fn(({ renderer, geometry }) => ...)()` constructor that
+creates named storage attributes and returns a compute kernel. The official
+`webgpu_compute_geometry.html` jelly pattern can initialize storage in
+`kernel.onInit()`, update it through `geometryNode`, and read the same allocation
+through `positionNode = TSL.attribute('storagePosition')`. Background nodes and
+ordinary companion meshes share the native scene route without an application
+rewrite. Hidden or layer-excluded constructors remain inactive.
+
+The retained source builder constructs the graphics output and compute body.
+Compute-only setup nodes are checked by the compute owner, so legal kernel
+assignments do not become rejected graphics writes. Nodes generated into the
+vertex or fragment shader still receive full graphics validation; returning or
+sharing a write into an actual graphics flow does not bypass that boundary.
+Custom ComputeNode subclasses or replaced construction/update methods remain
+outside this profile.
+
+The original `NodeFrame` drives before/current/after callbacks. A shared kernel
+with the default `FRAME` frequency runs once across multiple objects and repeated
+renders in that frame. `onInit()` dispatches precede the first update kernel;
+subsequent draws use that same GPU buffer. Named storage attributes, ordinary
+attributes promoted by `TSL.storage()`, source vec3 padding and generated program
+cache keys retain one source constructor/kernel identity. Queued renders keep
+their accepted compute uniforms and source upload versions, and unmarked CPU
+arrays do not overwrite GPU-authored results. Compute before/after callbacks see
+the kernel and null scene/object/camera/material; current compute callbacks also
+see a null `compute`, as in `NodeManager.updateForCompute`. Nested work restores
+the enclosing graphics callback context.
+
+Public `compileAsync()` follows the geometry program's source lifecycle: advance
+the shared frame, preserve its previous render ID, run before updates, capture
+geometry before current updates, prepare that object's pipeline, then run its
+after updates before advancing to the next geometry object. The precompilation
+flag is restored before each await, so source shadow nodes keep their skip
+behavior. Accepted initialization/update kernels drain before public compilation
+resolves, including when a later source callback rejects the parent. Internal
+shader construction and ordinary pipeline preparation do not independently
+execute geometry kernels.
+
+There is a remaining public-compilation construction boundary: accepted source
+Fn graphs are built eagerly before the per-object update/pipeline sequence. A
+later object's constructor that depends on side effects from an earlier object's
+compile callbacks is not yet source-compatible. This profile supports the
+ordinary lazy constructor and shared-kernel patterns; it does not establish
+complete general `compileAsync()` parity or change the existing compilation
+lifecycle of unrelated material graphs.
+
+Geometry kernels use the existing render prerequisite FIFO. Disjoint earlier
+native draws are admitted; a background or companion mesh does not itself block
+the update. Live compute storage, indirect and texture bindings are checked
+before upload capture against earlier parent readers and pending attachments.
+Overlapping resources, untracked fixed draws and arbitrary object-hook compute
+remain explicit refusals. This overlap check is conservative: pinned WebGPU
+submits compute through an independent encoder before the unfinished parent
+render encoder. This change does not introduce interleaved draw/compute passes
+or claim support for every source-valid aliasing combination. Accepted child
+kernels survive a later parent capture failure, with no parent draw submitted.
+
+Sixteen `three_renderer_geometry_compute.test.mjs` cases cover exact pinned
+vertex/fragment and compute WGSL, constructor/cache stability, shared-frame
+updates, queued uniforms and GPU-buffer identity, compilation callback ordering
+and IDs, pre-init compilation through a tone-mapped output target, compute
+context restoration, late failures and buffer/texture overlap refusals. The
+record device verifies commands and bytes; it does not execute WGSL. Adjacent
+storage-attribute and storage-texture suites pass all 32 tests after reconciliation
+with concurrent matrix-storage and HDR-output changes (48 focused cases total). The native-shadow
+suite passes 25 of 29; its four target-generation-count and malformed hidden-skin
+fixture failures also reproduce with unchanged main product modules. They remain
+pre-existing failures, rather than a claim that every adjacent suite is green.
+
+Both `native_geometry_compute.mjs` source/candidate browser cases pass exactly:
+the official-style Fn constructor and a shared kernel used by two meshes match
+688,128 RGBA bytes at fourteen checkpoints in Chrome 151.0.7922.34 / SwiftShader,
+with zero GPU or browser errors and the owned general-WebGPU route. GPU position
+and per-vertex counter readbacks verify source vec3 padding, initialization once,
+stable storage identity, one kernel update per logical frame, untouched CPU arrays
+and visible live changes. These additions retain the source JavaScript builder
+and callback runtime; hardware performance and Rust node evaluation remain
+unmeasured.
+
 ### Native occlusion queries
 
 Objects with `occlusionTest = true` now issue GPU occlusion queries through the
@@ -717,13 +799,17 @@ versions in FIFO order, including calls targeting different render targets.
 `compute(kernel); render(scene, camera)` consumes that dispatch's allocation and
 GPU contents without re-uploading an unchanged host version. Unmarked CPU edits
 cannot overwrite resident GPU results. Vertex and fragment aliases borrow one
-allocation, and `compileAsync()` performs no storage upload or node update.
+allocation. Ordinary graphics-only `compileAsync()` does not update storage
+bindings or run their node callbacks; the geometry-compute lifecycle described
+above explicitly runs its source prerequisites.
 
 Storage capture has its own transaction, nested with texture capture when both
 are used. Registered source texture producers may run compute prerequisites
 before the first draw or texture read in every active parent capture. Completed
-child passes already precede their parent in the FIFO. Ordinary callbacks and
-compute after an earlier parent draw still require a separate submission boundary.
+child passes already precede their parent in the FIFO. Render-triggered geometry
+compute may also follow earlier native draws when its live resources are disjoint
+from their captured readers and the pending attachments. Unproven overlap and
+ordinary callback compute still require separate public submissions.
 Leases release their captured bytes on success and failure; the compute
 owner retains GPU lifetime. Conflicting host versions of one storage attribute
 within a single logical render are rejected before any storage writes. They
@@ -749,8 +835,10 @@ updates preserve unrequested bytes and consume the ranges. Each logical render
 retains immutable data even if later calls mutate or poison the public arrays.
 Source histories survive program replacement and retire on geometry/renderer
 disposal. `compileAsync()` establishes the initial upload history for visible
-generated streams at preparation without running node update callbacks; hidden
-objects do not acquire that history until their first visible use. Replacing a
+generated streams at preparation. Geometry-compute programs execute their source
+node lifecycle at that boundary as described above; other programs keep their
+existing callback-free preparation. Hidden objects do not acquire that history
+until their first visible use. Replacing a
 program waits for submitted work before retiring its old GPU geometry owner.
 
 Instance culling still uses the source mesh's CPU `boundingSphere` before node
@@ -1345,7 +1433,8 @@ texture identity and compiled mip. Separate stage bindings may share the same
 native view. Compute and graphics requests keep FIFO order; disposed or
 reconfigured queued textures fail before drawing. Compilation prepares shader
 and binding layouts without dispatching a producer or allocating storage
-pixels. Per-stage storage texture limits are enforced before native pipeline
+pixels, except for explicit geometry-compute prerequisites described above.
+Per-stage storage texture limits are enforced before native pipeline
 allocation. Graphics texture stores, comparison, bias, gradient and gather
 variants remain outside this read-only profile.
 
@@ -1365,8 +1454,10 @@ for those scenes; they do not measure hardware acceleration.
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
 graphics writes, atomics outside the scalar integer fragment profile above,
 matrix storage outside the padded Float32 profile, nested/boolean/atomic
-struct members, PBO storage, managed uniform arrays, compute nodes inside
-graphics graphs and multiple-render-target graphics graphs are refused.
+struct members, PBO storage and managed uniform arrays remain refused.
+Render-triggered compute beyond the source geometry profile and resource ordering
+boundaries described above is unsupported; generated graphics writes still
+require an explicitly admitted graphics access profile.
 Light-probe grids, other custom light models, custom shadow replacement nodes
 and custom lighting-manager subclasses remain missing.
 Media, compressed, depth/comparison, array, volume, storage,
