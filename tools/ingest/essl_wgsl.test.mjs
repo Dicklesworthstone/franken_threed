@@ -150,3 +150,110 @@ test('gl_DepthRange is the GL default range (near 0, far 1, diff 1) in both stag
   }
   assert.match(r.fragment, /f3d_DepthRange\.diff/);
 });
+
+
+// Test seam for scalar control flow only: execute the emitted integer helper
+// body with JS arithmetic. WGSL case blocks break implicitly; the adapter adds
+// those breaks and removes scalar type syntax. This is not WGSL/GPU validation.
+function scalarSwitch(body, {unsigned = false} = {}) {
+  const wgsl = compileEsslStage('fragment', F('color = vec4(float(probe(' + (unsigned ? '0u' : '0') + ', 0)));',
+    'int probe(' + (unsigned ? 'uint' : 'int') + ' key, int gate) {' + body + '}'));
+  const signature = /fn probe\(([^)]*)\) -> i32 \{/.exec(wgsl);
+  assert.ok(signature);
+  const start = signature.index + signature[0].length;
+  let end = start, depth = 1;
+  for (; depth; end++) { if (wgsl[end] === '{') depth++; else if (wgsl[end] === '}') depth--; }
+  const source = wgsl.slice(start, end - 1), braces = [];
+  let code = '';
+  for (const c of source) {
+    if (c === '{') braces.push(/\b(?:case [^{}:]+|default):\s*$/.test(code));
+    if (c === '}' && braces.pop()) code += '\nbreak;\n';
+    code += c;
+  }
+  code = code.replace(/\bcase ([^:]+):\s*\{/g, (_, labels) => labels.split(',').map(label =>
+    label.trim() === 'default' ? 'default:' : 'case ' + label.trim() + ':').join('\n') + '{')
+    .replace(/\bvar (\w+): (?:i32|u32)\s*;/g, 'let $1 = 0;')
+    .replace(/\bvar (\w+): bool\s*;/g, 'let $1 = false;')
+    .replace(/\b(?:var|let) (\w+): (?:i32|u32|bool)\s*=/g, 'let $1 =')
+    .replace(/\b(\d+)u\b/g, '$1');
+  const params = signature[1].split(',').map(parameter => parameter.trim().split(':')[0]);
+  return {wgsl, run: Function('i32', 'u32', ...params, code).bind(null, value => value | 0, value => value >>> 0)};
+}
+
+test('switch fallthrough preserves default placement, empty labels and a single selector evaluation', () => {
+  const {run, wgsl} = scalarSwitch('int n=key; int value=0; switch(n++) {' +
+    'case 0:value+=1; case 1:case 2:value+=10; default:value+=100; case 3:value+=1000;break;' +
+    'case 4:value=7;} return value*10+n;');
+  const reference = key => {
+    let n=key, value=0;
+    switch(n++) {case 0:value+=1; case 1:case 2:value+=10; default:value+=100; case 3:value+=1000;break;case 4:value=7;}
+    return value*10+n;
+  };
+  for (const key of [-1,0,1,2,3,4,5]) assert.equal(run(key,0),reference(key));
+  assert.equal((wgsl.match(/switch \(/g) ?? []).length,1);
+});
+
+test('switch fallthrough keeps conditional breaks inside nested if and block scopes', () => {
+  const {run} = scalarSwitch('int value=0; switch(key) {' +
+    'case 0:value+=1;if(gate>0){{if(gate>1)break;value+=10;}}' +
+    'case 1:value+=100;if(gate<0)break;default:value+=1000;} return value;');
+  const reference = (key,gate) => {
+    let value=0;
+    switch(key) {case 0:value+=1;if(gate>0){{if(gate>1)break;value+=10;}}
+      case 1:value+=100;if(gate<0)break;default:value+=1000;}
+    return value;
+  };
+  for (const key of [0,1,2]) for (const gate of [-1,0,1,2]) assert.equal(run(key,gate),reference(key,gate));
+});
+
+test('switch labels share declarations while mutable initializers and shadowed names stay source-correct', () => {
+  const {run,wgsl} = scalarSwitch('int hits=0;int value=80;int result=0;switch(key){' +
+    'case 0:int value=value+(++hits);case 1:if(key==1)value=20;result=value;break;' +
+    'default:{int value=7;result=value;}}return result*100+hits*10+value;');
+  assert.deepEqual([run(0,0),run(1,0),run(2,0)],[8190,2080,780]);
+  assert.match(wgsl,/var f3d_t\d+_value: i32;/);
+  assert.equal((wgsl.match(/hits = \(hits \+ 1\);/g) ?? []).length,1);
+  const constants = scalarSwitch('int value=0;switch(key){case 0:const int label=2;' +
+    'case label:value=label;break;default:value=7;}return value;');
+  assert.deepEqual([constants.run(0,0),constants.run(2,0),constants.run(5,0)],[2,2,7]);
+});
+
+test('switch suffixes stop at both-branch returns and correctly consume nested switch breaks', () => {
+  const allReturn = scalarSwitch('switch(key){case 0:if(gate>0){return 1;}else{return 2;}gate=999;' +
+    'case 1:return 3;default:return 4;}');
+  assert.deepEqual([allReturn.run(0,1),allReturn.run(0,0),allReturn.run(1,0),allReturn.run(2,0)],[1,2,3,4]);
+  assert.doesNotMatch(allReturn.wgsl,/gate = 999;/,'unreachable suffix statements are not emitted');
+  const nested = scalarSwitch('int value=0;switch(key){case 0:switch(gate){case 0:value=1;break;default:value=2;}' +
+    'case 1:value+=10;break;default:value=50;}return value;');
+  assert.deepEqual([nested.run(0,0),nested.run(0,1),nested.run(1,0),nested.run(2,0)],[11,12,10,50]);
+  const nestedReturn = scalarSwitch('switch(key){case 0:switch(gate){case 0:return 1;default:return 2;}' +
+    'case 1:return 3;default:return 4;}');
+  assert.deepEqual([nestedReturn.run(0,0),nestedReturn.run(0,1),nestedReturn.run(1,0)],[1,2,3]);
+  assert.equal((nestedReturn.wgsl.match(/return 3;/g) ?? []).length,1);
+});
+
+test('switch fallthrough retains outer continue and inner-loop break targets without a dispatch loop', () => {
+  const wgsl = compileEsslStage('fragment', F('int value=0;for(int i=0;i<3;i++){' +
+    'switch(i){case 0:if(value==0)continue;value+=1;case 1:while(value<2){value++;break;}' +
+    'value+=10;default:value+=100;}}color=vec4(float(value));'));
+  assert.equal((wgsl.match(/\bloop \{/g) ?? []).length,3,'one outer loop and the inner loop in two case suffixes');
+  assert.equal((wgsl.match(/\bcontinue;/g) ?? []).length,1);
+  assert.equal((wgsl.match(/\bcontinuing \{/g) ?? []).length,1,'the original for step is the only continuing block');
+  assert.match(wgsl,/value = \(value \+ 10\);[\s\S]*value = \(value \+ 100\);/);
+});
+
+test('switch unsigned selectors, discard, scope diagnostics and compact non-fallthrough cases', () => {
+  const {run} = scalarSwitch('int value=0;switch(key){case 0u:value+=1;case 1u:value+=2;break;}return value;', {unsigned:true});
+  assert.deepEqual([run(0,0),run(1,0),run(2,0)],[3,2,0]);
+  const discarded = compileEsslStage('fragment', F('switch(0){case 0:discard;case 1:color=vec4(1.0);break;}'));
+  assert.equal((discarded.match(/\bdiscard;/g) ?? []).length,1);
+  const compact = scalarSwitch('int value=0;switch(key){case 0:value+=11;break;case 1:value+=22;break;' +
+    'default:value+=33;}return value;').wgsl;
+  for (const n of [11,22,33]) assert.equal(compact.split('value = (value + ' + n + ');').length-1,1);
+  for (const body of ['switch(0){case 0:int value=1;case 1:int value=2;}', 'switch(0){case 0:break;case 0:break;}',
+    'switch(0){default:break;default:break;}', 'switch(0){case 1u:break;}'])
+    assert.throws(() => compileEsslStage('fragment', F(body)), EsslError);
+  assert.throws(() => compileEsslStage('fragment', F('switch(0){case 0:int value=1;break;}color=vec4(float(value));')),/Undeclared identifier/);
+  const cases = Array.from({length:400},(_,i) => 'case ' + i + ':value+=1;').join('');
+  assert.throws(() => compileEsslStage('fragment', F('int value=0;switch(0){' + cases + '}')),/fallthrough expansion exceeds/);
+});

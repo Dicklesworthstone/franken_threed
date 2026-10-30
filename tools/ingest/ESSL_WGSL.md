@@ -44,6 +44,16 @@ per element/column; integer varyings are flat.
 - `out`/`inout` arguments copy through temporaries in source evaluation order;
   side-effecting `?:`, `&&`, `||`, `++`/`--` and assignments inside expressions
   are lowered to statements; multi-component swizzle stores are split.
+- Nonempty switch fallthrough uses reachable source-case suffixes in native WGSL
+  cases. The selector runs once; conditional breaks, defaults between labels,
+  return/discard and continue targets retain source control flow. A nested loop
+  or switch consumes its own breaks. Empty labels merge; terminating cases are
+  emitted once. Additional duplicated source is bounded at 1 MiB per switch.
+- Switch labels share their source declaration scope. Mutable storage is hoisted
+  with unique names, while initializer effects stay inside the original case.
+  Named compile-time constants remain available from later labels. Explicit
+  blocks keep their own scope, and later declarations do not become visible
+  before their source location.
 - Implicit-derivative sampling in non-uniform control flow keeps GL's undefined-
   in-divergent-quads behavior by disabling WGSL's `derivative_uniformity`
   diagnostic. That is the same contract ESSL gives, not an approximation.
@@ -51,13 +61,15 @@ per element/column; integer varyings are flat.
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
-filtered sampling of integer textures, true `switch` fallthrough, struct stage
-I/O, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
+filtered sampling of integer textures, struct stage I/O, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
 
 ## Evidence
 
-- `essl_wgsl.test.mjs`: lowering and layout regressions.
+- `essl_wgsl.test.mjs`: lowering and layout regressions. Switch tests execute
+  emitted scalar helper control flow through a small test-only JS syntax adapter
+  and check loop targets and scope diagnostics. These checks do not validate
+  WGSL or establish rendered parity; Naga/browser validation remains separate.
 - Corpus: every program r186 `WebGLRenderer` compiled across the 299 upstream
   `webgl_*` examples (578 unique stages, built-in materials included):
   570 translate and validate with Naga and compile in Chrome; the 8 others are

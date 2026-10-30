@@ -32,8 +32,10 @@
  * Points (option points:true): each vertex is drawn as an instanced quad of
  * gl_PointSize pixels (clamped to [1, maxPointSize]), a clipped center drops the
  * whole point as GL does, and gl_PointCoord uses GL's upper-left origin.
- * Unsupported constructs (gl_ClipDistance, integer-texture filtering, true switch
- * fallthrough, struct varyings, ...) throw EsslError; nothing is dropped.
+ * Switch fallthrough expands reachable case suffixes without replacing native
+ * break/continue targets; switch-local storage is shared across source labels.
+ * Unsupported constructs (gl_ClipDistance, integer-texture filtering,
+ * struct varyings, ...) throw EsslError; nothing is dropped.
  * No performance claim.
  */
 import {preprocess, EsslError, essError} from './essl_preprocess.mjs';
@@ -94,6 +96,40 @@ function glslName(t) {
   }
 }
 const typeKey = glslName;
+
+// Possible exits of a source case, used only to stop suffix duplication.
+// Break/continue inside a nested loop stay there; a nested switch consumes
+// its own breaks. Conditional exits retain the reachable fallthrough path.
+function switchCaseFlow(list) {
+  const union = (a, b) => new Set([...a, ...b]);
+  const sequence = (before, after) => {
+    const exits = new Set(before);
+    if (exits.delete('next')) for (const exit of after) exits.add(exit);
+    return exits;
+  };
+  const statement = node => {
+    if (['break', 'continue', 'return', 'discard'].includes(node.k)) return new Set([node.k]);
+    if (node.k === 'block') return switchCaseFlow(node.list);
+    if (node.k === 'if') return union(statement(node.a), node.b ? statement(node.b) : new Set(['next']));
+    if (['while', 'do', 'for'].includes(node.k))
+      return new Set(['next', ...[...statement(node.body)].filter(exit => ['return', 'discard'].includes(exit))]);
+    if (node.k === 'switch') {
+      let next = new Set(['next']), exits = new Set();
+      for (const c of [...node.cases].reverse()) {
+        next = sequence(switchCaseFlow(c.body), next);
+        exits = union(exits, next);
+      }
+      const breaks = exits.delete('break');
+      if (!node.cases.some(c => c.value === null) || breaks) exits.add('next');
+      return exits;
+    }
+    return new Set(['next']);
+  };
+  let exits = new Set(['next']);
+  for (const node of list) exits = sequence(exits, statement(node));
+  return exits;
+}
+
 
 // Every WGSL keyword, reserved word, predeclared type and builtin function this
 // compiler may emit. User identifiers matching one gain a trailing underscore.
@@ -771,34 +807,69 @@ class Unit {
   switchStatement(s, ctx, scope) {
     const {pre, result} = this.hoisted(ctx, () => this.expr(s.e, ctx));
     if (!(result.t.k === 's' && (result.t.s === 'int' || result.t.s === 'uint'))) essError('switch needs an integer selector', s.line);
-    // Merge empty labels; require each non-empty group to end in a jump.
-    const groups = [];
-    let labels = [];
-    s.cases.forEach((c, i) => {
-      labels.push(c.value);
-      if (!c.body.length && i < s.cases.length - 1) return;
-      groups.push({labels, body: c.body}); labels = [];
-    });
-    const lines = [...pre, `switch (${result.c}) {`];
-    let hasDefault = false;
-    groups.forEach((g, i) => {
-      let body = g.body;
-      const last = body.at(-1);
-      if (i < groups.length - 1 && !(last && ['break', 'return', 'discard', 'continue'].includes(last.k)))
-        essError('switch fallthrough between non-empty cases is not supported', s.line);
-      if (last?.k === 'break') body = body.slice(0, -1);
-      const values = g.labels.filter(v => v !== null).map(v => this.expr(v, ctx).c);
-      const isDefault = g.labels.includes(null); hasDefault ||= isDefault;
-      const label = isDefault ? (values.length ? `case ${values.join(', ')}, default` : 'default') : `case ${values.join(', ')}`;
-      const inner = this.statements(body, ctx, {vars: new Map(), parent: scope});
-      lines.push(`  ${label}: {`, ...inner.map(x => '    ' + x), '  }');
-    });
+    // Source labels share one lexical scope. Mutable storage moves out of the
+    // cases, but its initializers stay at their original execution point.
+    // Named compile-time constants remain available when entered at a later label.
+    const inner = {vars: new Map(), parent: scope, switchDeclarations: []};
+    const groups = [], seen = new Set();
+    let labels = [], hasDefault = false;
+    for (const [i, c] of s.cases.entries()) {
+      if (c.value === null) {
+        if (hasDefault) essError('Duplicate switch default', s.line);
+        hasDefault = true; labels.push(null);
+      } else {
+        ctx.scope = inner;
+        const label = this.hoisted(ctx, () => this.expr(c.value, ctx));
+        if (label.pre.length || !same(label.result.t, result.t))
+          essError('case needs a constant integer matching the switch selector', c.value.line);
+        const value = this.constValue(c.value, inner);
+        let code = label.result.c;
+        if (Number.isInteger(value)) {
+          const integer = result.t.s === 'uint' ? value >>> 0 : value | 0;
+          if (seen.has(integer)) essError('Duplicate switch case', c.value.line);
+          seen.add(integer);
+          code = String(integer) + (result.t.s === 'uint' ? 'u' : '');
+        }
+        labels.push(code);
+      }
+      if (!c.body.length && i < s.cases.length - 1) continue;
+      const code = [];
+      let falls = true;
+      for (const node of c.body) {
+        const emitted = this.statement(node, ctx, inner); // Still check unreachable declarations/types.
+        if (falls) code.push(...emitted);
+        falls &&= switchCaseFlow([node]).has('next');
+      }
+      groups.push({labels, code, falls});
+      labels = [];
+    }
+    const lines = ['switch (' + result.c + ') {'];
+    let duplicatedBytes = 0;
+    for (const [i, g] of groups.entries()) {
+      const body = [];
+      for (let j = i; j < groups.length; j++) {
+        body.push(...groups[j].code);
+        if (j > i) {
+          duplicatedBytes += groups[j].code.reduce((n, line) => n + line.length + 1, 0);
+          if (duplicatedBytes > 1024 * 1024)
+            essError('switch fallthrough expansion exceeds 1 MiB', s.line);
+        }
+        if (!groups[j].falls) break;
+      }
+      if (body.at(-1) === 'break;') body.pop(); // WGSL cases already break.
+      const values = g.labels.filter(value => value !== null);
+      const label = g.labels.includes(null) ? (values.length ? 'case ' + values.join(', ') + ', default' : 'default')
+        : 'case ' + values.join(', ');
+      lines.push('  ' + label + ': {', ...body.map(line => '    ' + line), '  }');
+    }
     if (!hasDefault) lines.push('  default: {}');
     lines.push('}');
-    return lines;
+    if (!inner.switchDeclarations.length) return [...pre, ...lines];
+    return ['{', ...[...pre, ...inner.switchDeclarations, ...lines].map(line => '  ' + line), '}'];
   }
   local(name, type, scope) {
-    let w = safe(name);
+    if (scope.switchDeclarations && scope.vars.has(name)) essError('Duplicate switch-local declaration ' + name);
+    let w = scope.switchDeclarations ? this.tmp() + '_' + safe(name) : safe(name);
     // Avoid WGSL redeclaration in the same scope after GLSL shadowing a parameter.
     scope.vars.set(name, {kind: 'local', type, w});
     return w;
@@ -815,16 +886,24 @@ class Unit {
       let init = null;
       if (v.init) {
         const {pre, result} = this.hoisted(ctx, () => this.coerce(this.expr(v.init, ctx), type, v.line));
-        out.push(...pre); init = result.c;
+        (scope.switchDeclarations && s.q.storage === 'const' ? scope.switchDeclarations : out).push(...pre);
+        init = result.c;
       }
+      const constant = s.q.storage === 'const' ? this.constValue(v.init, scope) : undefined;
       const w = this.local(v.name, type, scope);
       const sym = scope.vars.get(v.name);
       if (s.q.storage === 'const') {
-        const value = this.constValue(v.init, scope);
-        if (typeof value === 'number') sym.constValue = value;
-        out.push(`let ${w}: ${this.wgsl(type)} = ${init};`);
+        if (typeof constant === 'number') sym.constValue = constant;
         sym.readonly = true;
-      } else out.push(`var ${w}: ${this.wgsl(type)}${init !== null ? ` = ${init}` : ''};`);
+      }
+      if (scope.switchDeclarations) {
+        if (s.q.storage === 'const') scope.switchDeclarations.push(`let ${w}: ${this.wgsl(type)} = ${init};`);
+        else {
+          scope.switchDeclarations.push(`var ${w}: ${this.wgsl(type)};`);
+          if (init !== null) out.push(`${w} = ${init};`);
+        }
+      } else if (s.q.storage === 'const') out.push(`let ${w}: ${this.wgsl(type)} = ${init};`);
+      else out.push(`var ${w}: ${this.wgsl(type)}${init !== null ? ` = ${init}` : ''};`);
     }
     return out;
   }
