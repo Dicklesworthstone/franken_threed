@@ -110,6 +110,11 @@ export async function createGpuThreeScene(device,scene,{
   const bundledNodeObject=o=>passNodeFrame?.bundleObjects?.has(o)===true;
   const capturedNodeLight=o=>passNodeFrame?.nativeLights?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
+  // Ordinary facade draws can retain raw attribute history before entering the
+  // queue. Public geometry identities stay intact; only GPU inputs use the
+  // captured view. A null selection was culled or excluded at source capture.
+  const fixedGeometry=o=>passNodeFrame?.fixedGeometries?.get(o);
+  const sourceGeometry=o=>fixedGeometry(o)?.source??o.geometry;
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
   for(const key of Object.keys(textureOptions))if(!['maxTextureBytes','maxTextures','maxPixels','label'].includes(key))fail('OPTIONS',`Unsupported texture option: ${key}`);
@@ -272,13 +277,15 @@ export async function createGpuThreeScene(device,scene,{
   // influences (USE_INSTANCING_MORPH); only the program route draws them.
   const instancedMorph=object=>object.isInstancedMesh===true&&object.morphTexture!=null&&programRoute();
   function geometryAdmission(g,object){
+    const fixed=fixedGeometry(object),view=fixed?.geometry??g,groups=fixed?.groups??g?.groups;
     const list=colorMaterials(object);
     const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
-    if(!(g instanceof three.BufferGeometry)||(g.isInstancedBufferGeometry&&!programs&&!capturedNodeObject(object)))fail('GEOMETRY','Expected source BufferGeometry');
+    if(!(g instanceof three.BufferGeometry)||(view.isInstancedBufferGeometry&&!programs&&!capturedNodeObject(object)))fail('GEOMETRY','Expected source BufferGeometry');
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
-    if(g.isInstancedBufferGeometry)programGeometries_.add(g);
-    // Program-drawn skinned meshes (in-shader tone mapping) skin in their own program.
-    if(hasThreeDeformation(object)&&!programToneMapping()&&!programLogDepth()&&!capturedNodeObject(object)){
+    if(view.isInstancedBufferGeometry)programGeometries_.add(g);
+    // Captured fixed views already proved rigid. A later geometry replacement
+    // cannot redirect an accepted draw into the live deformation owner.
+    if(!fixed&&hasThreeDeformation(object)&&!programToneMapping()&&!programLogDepth()&&!capturedNodeObject(object)){
       try{inspectThreeDeformation(object,{...deformationOptions,three});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
@@ -288,9 +295,9 @@ export async function createGpuThreeScene(device,scene,{
         programDeformed.add(object);
       }
     }
-    const owners=new Set(Object.values(g.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
-    if(g.index)owners.add(g.index);
-    if(!Array.isArray(g.groups)||g.groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
+    const owners=new Set(Object.values(view.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
+    if(view.index)owners.add(view.index);
+    if(!Array.isArray(groups)||groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
     // Upload callbacks (e.g. onUpload(disposeArray)) run after each owner's upload,
     // as WebGLAttributes does, at this bridge's preparation/update boundary.
     for(const owner of owners)if(typeof owner.onUploadCallback!=='function')fail('HOOK','Expected an attribute upload callback function');
@@ -318,11 +325,11 @@ export async function createGpuThreeScene(device,scene,{
       // Source projection skips hidden objects before touching render hooks,
       // materials or geometry. Keep hierarchy/capacity validation, while the
       // accepted native capture retains inherited visibility through any await.
-      if(excludedNodeObject(object)||bundledNodeObject(object))continue;
+      if(excludedNodeObject(object)||bundledNodeObject(object)||fixedGeometry(object)===null)continue;
       // Suppressed color lists retain hierarchy traversal and shadow casters,
       // but acquire no color material, geometry or upload work for this pass.
       if(sourceMaterial(object)&&!sourceMaterials(object).some(colorPhaseEnabled)&&!(shadowEnabled&&object.castShadow))continue;
-      if(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender){
+      if(!fixedGeometry(object)&&(object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender)){
         // WebGL surface: program draws run the callbacks around each draw, in
         // draw order, as renderObject does; the core path never could.
         const list=colorMaterials(object);
@@ -346,7 +353,7 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowEnabled){
           if(typeof object.castShadow!=='boolean'||typeof object.receiveShadow!=='boolean')fail('SHADOW','Expected boolean source shadow flags');
         }
-        geometryAdmission(object.geometry,object);
+        geometryAdmission(sourceGeometry(object),object);
         if(instancedMorph(object))programDeformed.add(object);
         // Native draws already captured their instance storage and active count.
         // Async preparation must not reread a later live instance configuration.
@@ -363,7 +370,7 @@ export async function createGpuThreeScene(device,scene,{
           // Line casters draw through the program shadow port (WebGL surface).
           if(!capturedNodeObject(object)&&(object.isPoints?(object.castShadow||object.receiveShadow):((object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled))))
             fail('SHADOW','Line and point shadows are not admitted');
-          geometryAdmission(object.geometry,object);
+          geometryAdmission(sourceGeometry(object),object);
         }
       } else if(object.isSprite){
         const list=colorMaterials(object);
@@ -380,11 +387,11 @@ export async function createGpuThreeScene(device,scene,{
               fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
             threeSpriteCount(object);
           }
-          geometryAdmission(object.geometry,object);
+          geometryAdmission(sourceGeometry(object),object);
         }
       }
     }
-    const activeNodes=nodes.filter(object=>!excludedNodeObject(object)&&!bundledNodeObject(object));
+    const activeNodes=nodes.filter(object=>!excludedNodeObject(object)&&!bundledNodeObject(object)&&fixedGeometry(object)!==null);
     // Captured native programs own their light selection and uniform bytes.
     // Fixed or mixed scenes still use the ordinary fixed-light admission below.
     nativeLightMode=!!passNodeFrame&&activeNodes.every(object=>!drawable(object)||capturedNodeObject(object));
@@ -1156,10 +1163,10 @@ export async function createGpuThreeScene(device,scene,{
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
-      if(capturedNodeObject(object))continue;
-      const topology=topologyOf(object);
-      const g=object.geometry,instanceSource=object.isInstancedMesh?object:null;
-      const deformationSource=hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
+      if(capturedNodeObject(object)||fixedGeometry(object)===null)continue;
+      const topology=topologyOf(object),fixed=fixedGeometry(object);
+      const g=fixed?.geometry??object.geometry,instanceSource=!fixed&&object.isInstancedMesh?object:null;
+      const deformationSource=!fixed&&hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
       const instanceSignature=instanceSource&&!instancedMorph(instanceSource)?instanceAdmission(instanceSource).signature:null;
       const source=sourceMaterials(object);
       for(const original of source){
@@ -1646,8 +1653,9 @@ export async function createGpuThreeScene(device,scene,{
         if(!byTopology.has(key))byTopology.set(key,materialDescription(m,clippingFrame,topology,object));return byTopology.get(key);
       };
       function append(object,groupOrder,z,shadowPass=false){
-        if(capturedNodeObject(object))return;
-        const source=object.geometry,topology=topologyOf(object);
+        const fixed=fixedGeometry(object);
+        if(capturedNodeObject(object)||fixed===null)return;
+        const source=fixed?.source??object.geometry,topology=topologyOf(object);
         if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
         function push(original,sourceGroup){
               const originalState=materialState(original);
@@ -1661,7 +1669,7 @@ export async function createGpuThreeScene(device,scene,{
               // list, with draw ranges and groups scaled by two.
               const wire=object.isMesh&&materialState(material).wireframe===true;
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
-              const g=wire?wireframeGeometry(source):source;
+              const selected=fixed?.geometry??source,g=wire?wireframeGeometry(selected):selected;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
               if(programCapable(material)&&get(material,wire?'lines':topology,object).some(d=>d.program)){
                 if(shadowPass)return;
@@ -1675,9 +1683,9 @@ export async function createGpuThreeScene(device,scene,{
                   sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
                 return;
               }
-              const instanceSource=object.isInstancedMesh?object:null;
+              const instanceSource=!fixed&&object.isInstancedMesh?object:null;
               const instanceSignature=instanceSource?instanceAdmission(instanceSource).signature:null;
-              const deformationSource=hasThreeDeformation(object)?object:null;
+              const deformationSource=!fixed&&hasThreeDeformation(object)?object:null;
               const desc=get(material,wire?'lines':topology),records=lookup.get(deformationSource??instanceSource??g)?.get(material);
               if(textureTransforms)for(const d of desc)uvApi.checkThreeMapChannels(g,d.options.mapChannels);
               const bindings=desc.map(d=>records?.find(e=>!e.mesh.disposed&&e.geometry===g&&
@@ -1690,7 +1698,7 @@ export async function createGpuThreeScene(device,scene,{
                 sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
             }
         const selectedMaterial=sourceMaterial(object);
-        if(Array.isArray(selectedMaterial))for(const group of source.groups)push(selectedMaterial[group.materialIndex],group);
+        if(Array.isArray(selectedMaterial))for(const group of fixed?.groups??source.groups)push(selectedMaterial[group.materialIndex],group);
         else push(selectedMaterial,null);
       }
       let visited=0;
@@ -1699,7 +1707,7 @@ export async function createGpuThreeScene(device,scene,{
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
         projectionOrder.set(object,visited);
         if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
-        if(object.layers.test(camera.layers)){
+        if(fixedGeometry(object)!==null&&object.layers.test(camera.layers)){
           if(object.isGroup)groupOrder=object.renderOrder;
           else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
           else if(object.isLight&&!capturedNodeLight(object)){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
@@ -1711,10 +1719,10 @@ export async function createGpuThreeScene(device,scene,{
             // A caster outside the viewing frustum can still shadow a receiver.
             // Preserve source visibility/layers/LOD, but use the light frustum.
             if(shadowOwner&&object.isMesh&&object.castShadow)casterObjects.push(object);
-            if(!object.frustumCulled||object.intersectsFrustum(cullingFrustum)){
-            const g=object.geometry;
-            let z=0;
-            if(sorting){
+            if(fixedGeometry(object)||!object.frustumCulled||object.intersectsFrustum(cullingFrustum)){
+            const g=sourceGeometry(object),fixed=fixedGeometry(object);
+            let z=fixed?.z??0;
+            if(sorting&&!fixed){
               if(object.isSprite){
                 // Source sprite sorting uses its origin, never mutable geometry bounds.
                 const e=object.matrixWorld.elements,p=vp.elements;

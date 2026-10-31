@@ -365,22 +365,120 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       bindings.push(draw.binding); compiledBindings.add(draw.binding);
       objects.add(draw.object); bundleObjects.add(draw.object);
     }
-  const rememberFixedAttributes = (selectedPhases = null) => {
-    const selected = material => material?.visible && (selectedPhases
+  const assertFixedHistory = owners => {
+    if (owners.some(owner => bundles?.hasGeometryHistory?.(owner)))
+      fail('CHANGED', 'Captured attribute history cannot return to a separate fixed upload owner');
+  };
+  const rememberFixedAttributes = (selectedPhases = null, captured = null, inspect = false) => {
+    const selected = (material, object) => material && ((selectedPhases
       ? selectedPhases[transparent(material) ? 'transparent' : 'opaque']
-      : listEnabled(transparent(material) ? 'transparent' : 'opaque'));
+      : listEnabled(transparent(material) ? 'transparent' : 'opaque')) ||
+      renderer?.shadowMap?.enabled === true && object.castShadow);
     if (!renderer || nativeHookScene) return;
-    const fixed = [...hierarchy.keys()].filter(object => visibility.get(object) && !objects.has(object) &&
+    // Legacy preparation uploads off-layer and invisible materials too; source
+    // visibility and disabled phases still exclude their complete subtrees/work.
+    const fixed = [...hierarchy.keys()].filter(object => visibility.get(object) && !excludedObjects.has(object) && !objects.has(object) && !captured?.has(object) &&
         object.isLineLoop !== true && (object.isMesh || object.isSprite || object.isPoints || object.isLine) &&
-        object.layers.test(camera.layers) && (Array.isArray(object.material)
-          ? Array.isArray(object.geometry?.groups) && object.geometry.groups.some(group => selected(object.material[group.materialIndex]))
-          : selected(object.material)));
+        (Array.isArray(object.material) ? object.material : [object.material]).some(material => selected(material, object)));
+    if (inspect) { for (const object of fixed) assertFixedHistory(attributeOwners(object)); return; }
     if (!fixed.length) return;
-    // A later hook-driven promotion cannot recover unversioned CPU edits from
-    // the fixed owner's private upload history. Refuse before any hook effect.
     let attributes = fixedAttributeHistory.get(renderer);
     if (!attributes) fixedAttributeHistory.set(renderer, attributes = new WeakSet());
     for (const object of fixed) for (const owner of attributeOwners(object)) attributes.add(owner);
+  };
+  const captureFixedGeometry = () => {
+    const fixedGeometries = new Map(), bundleGeometries = [], captured = new Map();
+    let bytes = 0;
+    // Fixed shadows project a separate caster list, including geometry outside
+    // this camera. Keep that complete pass on its existing guarded owner.
+    if (!bundles || !renderer || renderer.shadowMap?.enabled === true) {
+      rememberFixedAttributes(phases, null, true);
+      return {fixedGeometries, bundleGeometries, bytes};
+    }
+    const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const frustum = camera.isArrayCamera ? new three.FrustumArray().setFromArrayCamera(camera) :
+      new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
+    const selected = material => material?.visible && phases[transparent(material) ? 'transparent' : 'opaque'];
+    const center = new three.Vector4();
+    let unsupported = fixedAttributeHistory.get(renderer);
+    if (!unsupported) fixedAttributeHistory.set(renderer, unsupported = new WeakSet());
+    const pending = new Set(), blockedOwner = owner => unsupported.has(owner) || pending.has(owner);
+    const candidates = [];
+    for (const object of hierarchy.keys()) {
+      if (objects.has(object) || excludedObjects.has(object) || object.isLineLoop ||
+          !(object.isMesh || object.isSprite || object.isPoints || object.isLine)) continue;
+      // Preserve source list selection without reading inactive geometry. A
+      // null entry also prevents later preparation from uploading a culled mesh.
+      if (!visibility.get(object) || !object.layers.test(camera.layers) ||
+          !(Array.isArray(object.material)
+            ? object.geometry?.groups?.some(group => selected(object.material[group.materialIndex]))
+            : selected(object.material)) || object.frustumCulled && !object.intersectsFrustum(frustum)) {
+        fixedGeometries.set(object, null); continue;
+      }
+      const source = object.geometry, owners = attributeOwners(object);
+      const eligible = source instanceof three.BufferGeometry && Array.isArray(source.groups) && source.groups.length <= maxDraws &&
+        !object.isInstancedMesh && !object.isSkinnedMesh && !source.isInstancedBufferGeometry &&
+        !Object.values(source.morphAttributes ?? {}).some(attributes => attributes.length) &&
+        owners.every(owner => owner.onUploadCallback === (owner.isInterleavedBuffer
+          ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype).onUploadCallback);
+      // Keep projection depth with this accepted geometry; later bounds edits
+      // must not reorder a fixed draw while its pipeline is being prepared.
+      let z = 0;
+      if (eligible && sortObjects) {
+        if (object.isSprite) z = center.setFromMatrixPosition(object.matrixWorld).applyMatrix4(projection).z;
+        else {
+          const bounds = object.boundingSphere !== undefined ? object : source;
+          if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
+          z = center.copy(bounds.boundingSphere.center).applyMatrix4(object.matrixWorld).applyMatrix4(projection).z;
+        }
+      }
+      candidates.push({object, source, owners, eligible, z: camera.reversedDepth === true ? -z : z});
+      if (!eligible) for (const owner of owners) pending.add(owner);
+    }
+    // An unsupported fixed geometry can share owners with an otherwise rigid
+    // draw. Close that set before taking any snapshots, including transitive
+    // sharing, so no source history is seeded from already-stale live CPU bytes.
+    const aliases = new Map(), blocked = [];
+    for (const candidate of candidates) if (candidate.eligible) {
+      if (candidate.owners.some(blockedOwner)) blocked.push(candidate);
+      for (const owner of candidate.owners) {
+        let users = aliases.get(owner);
+        if (!users) aliases.set(owner, users = []);
+        users.push(candidate);
+      }
+    }
+    while (blocked.length) {
+      const candidate = blocked.pop();
+      if (!candidate.eligible) continue;
+      candidate.eligible = false;
+      for (const owner of candidate.owners) if (!blockedOwner(owner)) {
+        pending.add(owner); blocked.push(...(aliases.get(owner) ?? []));
+      }
+    }
+    for (const candidate of candidates) if (!candidate.eligible) assertFixedHistory(candidate.owners);
+    for (const owner of pending) unsupported.add(owner);
+    try {
+      for (const {object, source, eligible, z} of candidates) {
+        if (!eligible) continue;
+        let view = captured.get(source);
+        if (!view) {
+          // Start in the existing renderer-wide raw attribute owner. Native
+          // callbacks added later therefore see the same uploaded generations,
+          // including when this fixed draw is still waiting for its pipeline.
+          const lease = bundles.captureGeometry(source, null, renderId);
+          bundleGeometries.push(lease); bytes += lease.bytes;
+          if (bytes > maxUniformBytes) fail('LIMIT', 'Fixed geometry exceeds the pending capture byte budget');
+          view = Object.freeze({source, geometry: lease.geometry,
+            groups: Object.freeze(source.groups.map(group => Object.freeze({...group})))});
+          captured.set(source, view);
+        }
+        fixedGeometries.set(object, Object.freeze({...view, z}));
+      }
+    } catch (error) {
+      for (const lease of bundleGeometries) lease.release();
+      throw error;
+    }
+    return {fixedGeometries, bundleGeometries: Object.freeze(bundleGeometries), bytes};
   };
   const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
@@ -401,11 +499,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
-    rememberFixedAttributes(phases);
+    const fixed = captureFixedGeometry();
+    rememberFixedAttributes(phases, fixed.fixedGeometries);
     return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
-      bytes: 0, background: false, prepareAttributes() {}, installAttributes() {},
+      ...fixed, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
+  rememberFixedAttributes(null, null, true);
   inspectThreeNativeCamera(three, camera);
   if (typeof getPrograms !== 'function' || typeof raster !== 'function' || !renderer?._nodes?.nodeFrame)
     fail('SOURCE', 'Native scene capture needs its source compiler, renderer NodeFrame and raster adapter');
@@ -1150,6 +1250,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       }
     }, destination);
     storageOwner?.validate(storageUses);
+    rememberFixedAttributes(phases, null, true);
     for (const {selection, draws: packets, version} of capturedBundles)
       bundles.commit(selection, packets, version);
     captureCompleted = true;

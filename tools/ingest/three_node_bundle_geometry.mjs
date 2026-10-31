@@ -186,7 +186,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     if (state.latest) dropView(state.latest); state.latest = view;
     return lease(view);
   }
-  return Object.freeze({capture,
+  return Object.freeze({capture, hasHistory: owner => !!owners.get(owner)?.generation,
     dispose() {
       if (disposed) return; disposed = true;
       for (const state of [...geometries.values()]) state.onDispose();

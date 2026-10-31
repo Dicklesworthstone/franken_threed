@@ -1039,17 +1039,37 @@ material values and requested geometry uploads before preparation can await.
 Removing the hooks retains the native owner and its upload history, including
 when another scene shares the geometry or individual attributes.
 
-This path requires a source Scene. Install ordinary object hooks before their
-geometry attributes enter a fixed-path render or `compileAsync()`: adding them
-after a fixed owner has accepted those attributes, even through another scene,
-still fails before invoking any hook. Transferring the fixed owner's existing
-upload history, including queued work and unversioned CPU edits, remains
-unimplemented. Hooks added to an already native scene retain
-its existing upload history. Custom BatchedMesh hooks, effectful attribute upload
-hooks and recursive GPU writes also require additional capture boundaries and
-fail explicitly. Callback exceptions
-retain earlier source mutations and do not replay updates or run later
-after-callbacks. These are remaining compatibility gaps, not source-invalid uses.
+Ordinary fixed scenes with shadow mapping disabled now establish their raw
+attribute history in the same renderer-wide immutable geometry owner from the
+first accepted render or
+`compileAsync()`. Object hooks and custom dispatch can therefore be added later
+to rigid meshes, lines, points and sprites, including while the initial fixed
+draw still awaits pipeline preparation. The fixed draw retains its accepted
+rigid geometry, groups, range and projected depth even if later calls change
+geometry bounds or select morph geometry; subsequent native draws reuse the
+same source upload generations. Unrequested CPU edits remain invisible,
+requested partial updates
+preserve untouched components, and `DynamicDrawUsage` observes source render
+frequency. Interleaved and normalized streams retain raw source values before
+GPU conversion. Shared attributes follow this history into another scene;
+source disposal resets future uploads while accepted draws retain their bytes.
+Culled and phase-inactive objects acquire no upload history.
+
+This path requires a source Scene. Fixed scenes with shadow mapping enabled,
+and scenes containing native companions, CPU instancing, skinning or morph
+deformation still use separate upload owners. The fixed shadow owner retains
+its separate light-frustum caster selection, including off-camera geometry.
+Their attributes, including transitive sharing with ordinary geometry, retain
+the explicit guard against adding hooks after that fixed history exists.
+Switching attributes with retained immutable history back into one of these
+separate fixed owners is also refused before new uploads. The existing geometry
+owner supplies this check, so source disposal clears the retained boundary and
+rejected transitions leave the earlier route usable.
+Custom BatchedMesh hooks, effectful attribute upload hooks and recursive GPU
+writes also require additional capture boundaries and fail explicitly.
+Callback exceptions retain earlier source mutations and do not replay updates
+or run later after-callbacks. These are remaining compatibility gaps, not
+source-invalid uses.
 
 Object hooks and custom dispatch can replace `object.geometry` with another
 admitted geometry. Hooks keep the projected geometry and group arguments, while
@@ -1059,19 +1079,23 @@ side's node after-updates can therefore select a different geometry for the
 second side. Queued draws retain their accepted bytes; hook removal and sharing
 replacement attributes with another scene preserve the same upload history.
 `compileAsync()` selects geometry after the object hooks, including
-`onAfterRender`, have completed. A replacement whose attributes already belong
-to a fixed owner remains refused, retaining the callback's completed source
-effects without silently recapturing unversioned CPU changes.
+`onAfterRender`, have completed. Replacements can reuse the ordinary fixed
+history described above. Attributes from the remaining separate fixed owners
+are refused, retaining the callback's completed source effects without silently
+recapturing unversioned CPU changes.
 
 Focused cases in `three_node_scene_capture.test.mjs` and
 `three_renderer_nodes.test.mjs` verify the ordinary/mixed lifecycle, source group
 and material identities, compile-only effects, exceptions, queued draw bytes,
 hook removal, cross-scene attribute history and the existing-owner boundary.
-Five replacement cases additionally cover queued geometry, forwarded dispatch,
-alpha-side changes, compilation timing and history-preserving failure/recovery.
-All ninety selected facade, scene-capture and geometry-compute tests pass after
-the replacement change. The recording device verifies commands and uploaded
-bytes; this change has no new browser-pixel or performance measurement.
+Replacement cases additionally cover queued geometry, forwarded dispatch,
+alpha-side changes and compilation timing. Late-hook regressions cover initial
+fixed renders and compilation, normalized interleaved sharing and disposal,
+partial uploads, dynamic updates, culling, queued geometry/group replacement,
+later morph selection, captured depth, and the retained generated-instance
+boundary. The recording device verifies
+commands and uploaded bytes; these changes have no new browser-pixel or
+performance measurement.
 
 ## Custom object dispatch
 
@@ -1100,8 +1124,9 @@ The pinned Basic lighting model still constructs selected analytic light nodes.
 A selected RectAreaLight therefore retains the source LTC initialization
 prerequisite even in an unlit pass; unused LTC tables are not uploaded.
 
-Install the dispatcher before the selected attributes acquire a fixed-path
-owner; the existing explicit history-transfer boundary above still applies.
+Dispatchers can be installed after ordinary fixed rendering or compilation
+through the shared geometry history above. Separate fixed instancing,
+deformation and mixed-list histories retain their explicit boundary.
 Forwarded calls must retain the selected object, scene, camera and group, along
 with the supplied light-node and clipping-context identities. The projected
 geometry argument stays available to hooks while `object.geometry` can change

@@ -416,19 +416,20 @@ test('compileAsync selects replacement geometry after object after-hooks without
   assert.equal(events.length,2);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
-test('callback replacement cannot discard a fixed owner history and leaves the source mutation visible on failure',async t=>{
+test('callback replacement reuses a prior fixed geometry history across scenes',async t=>{
   const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const position=f.mesh.geometry.attributes.position;position.array.fill(.125);
   await f.renderer.compileAsync(f.scene,f.camera);
   const otherScene=new T.Scene(),fresh=new T.PlaneGeometry(),other=new T.Mesh(fresh,new T.MeshBasicMaterial());
   other.frustumCulled=false;otherScene.add(other);t.after(()=>fresh.dispose());let before=0,after=0;
+  position.array.fill(99);
   other.onBeforeRender=()=>{before++;other.geometry=f.mesh.geometry;};other.onAfterRender=()=>{after++;};
-  assert.throws(()=>f.renderer.render(otherScene,f.camera),error=>
-    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
-  assert.equal(before,1);assert.equal(after,0);assert.equal(other.geometry,f.mesh.geometry);
-  assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
-  other.geometry=fresh;other.onBeforeRender=T.Object3D.prototype.onBeforeRender;
   f.renderer.render(otherScene,f.camera);await drain(f.renderer);
-  assert.equal(nativeDraws(f.device).length,1);assert.equal(after,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,1);
+  const bytes=draws[0].contents.get(draws[0].streams.get(0));
+  assert.deepEqual([...new Float32Array(bytes.buffer,bytes.byteOffset,position.array.length)],Array(position.array.length).fill(.125));
+  assert.equal(before,1);assert.equal(after,1);assert.equal(other.geometry,f.mesh.geometry);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 for(const firstUse of ['render','compileAsync'])test(`native selected inputs defer inactive color uploads after ${firstUse}`,async t=>{
@@ -507,28 +508,169 @@ test('ordinary object hooks capture queued draws and retain upload history after
   assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(f.renderer.info.f3d.presentedRenders,3);
 });
 
-test('adding ordinary hooks after fixed preparation refuses before effects instead of losing upload history',async t=>{
+for(const firstUse of ['render','compileAsync'])test(`late ordinary hooks preserve fixed upload generations after ${firstUse}`,async t=>{
   const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
-  await f.renderer.compileAsync(f.scene,f.camera);
-  f.mesh.geometry.attributes.position.array.fill(7);let callbacks=0;
-  f.mesh.onBeforeRender=()=>{callbacks++;};
-  assert.throws(()=>f.renderer.render(f.scene,f.camera),error=>
-    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
-  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);
-  assert.equal(f.acquired(),0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  const position=f.mesh.geometry.attributes.position,events=[];position.array.fill(.125);
+  await f.renderer.init();
+  if(firstUse==='compileAsync')await f.renderer.compileAsync(f.scene,f.camera);
+  else f.renderer.render(f.scene,f.camera);
+  position.array.fill(99);let phase=0;
+  f.mesh.onBeforeRender=()=>{
+    events.push(['before',phase]);
+    if(phase===1){position.array[0]=.25;position.addUpdateRange(0,1);position.needsUpdate=true;}
+  };
+  f.mesh.onAfterRender=()=>{events.push(['after',phase]);position.array.fill(-99);};
+  f.renderer.render(f.scene,f.camera);phase=1;f.renderer.render(f.scene,f.camera);
+  position.array.fill(99);
+  assert.deepEqual(events,[['before',0],['after',0],['before',1],['after',1]]);
+  assert.equal(f.acquired(),0,'accepted callback effects precede pending pipeline preparation');
+  await drain(f.renderer);
+  f.mesh.onBeforeRender=T.Object3D.prototype.onBeforeRender;f.mesh.onAfterRender=T.Object3D.prototype.onAfterRender;
+  f.renderer.render(f.scene,f.camera);position.array.fill(-99);await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0);
+  assert.equal(draws.length,firstUse==='render'?4:3);
+  const uploaded=draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return [...new Float32Array(bytes.buffer,bytes.byteOffset,position.array.length)];});
+  assert.deepEqual(uploaded.map(words=>words[0]),firstUse==='render'?[.125,.125,.25,.25]:[.125,.25,.25]);
+  for(const words of uploaded)assert.deepEqual(words.slice(1),Array(position.array.length-1).fill(.125));
+  assert.deepEqual(position.updateRanges,[]);assert.equal(events.length,4);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
-test('ordinary hooks reject prior fixed attribute history shared by another scene before effects',async t=>{
-  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+test('late hooks preserve shared normalized interleaved history and source disposal across scenes',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial({vertexColors:true});f.mesh.frustumCulled=false;
+  const geometry=f.mesh.geometry,position=geometry.attributes.position;
+  const colorOwner=new T.InterleavedBuffer(new Uint8Array(position.count*4).fill(64),4);
+  geometry.setAttribute('color',new T.InterleavedBufferAttribute(colorOwner,3,0,true));position.array.fill(.125);
   await f.renderer.compileAsync(f.scene,f.camera);
-  const otherScene=new T.Scene(),other=new T.Mesh(f.mesh.geometry.clone(),new T.MeshBasicMaterial());
-  other.geometry.setAttribute('position',f.mesh.geometry.attributes.position);
-  otherScene.add(other);other.frustumCulled=false;let callbacks=0;
-  other.geometry.attributes.position.array.fill(7);other.onBeforeRender=()=>{callbacks++;};
+  const otherGeometry=geometry.clone(),otherScene=new T.Scene(),other=new T.Mesh(otherGeometry,f.mesh.material);
+  otherGeometry.setAttribute('position',position);otherGeometry.setAttribute('color',geometry.attributes.color);
+  otherScene.add(other);other.frustumCulled=false;t.after(()=>otherGeometry.dispose());
+  position.array.fill(99);colorOwner.array.fill(255);
+  other.onBeforeRender=()=>{colorOwner.array[1]=128;colorOwner.addUpdateRange(1,1);colorOwner.needsUpdate=true;};
+  f.renderer.render(otherScene,f.camera);
+  other.onBeforeRender=T.Object3D.prototype.onBeforeRender;geometry.dispose();
+  position.array.fill(.5);colorOwner.array.fill(192);f.renderer.render(otherScene,f.camera);
+  position.array.fill(-99);colorOwner.array.fill(0);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  const words=(draw,name)=>{
+    const match=new RegExp('@location\\(\\s*(\\d+)\\s*\\)\\s+'+name+'\\s*:').exec(draw.pipeline.vertex.module.code);
+    assert.ok(match,`source input ${name}`);
+    const slot=draw.pipeline.vertex.buffers.findIndex(layout=>layout.attributes.some(a=>a.shaderLocation===Number(match[1])));
+    const bytes=draw.contents.get(draw.streams.get(slot));return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4);
+  };
+  assert.equal(words(draws[0],'position')[0],.125);assert.equal(words(draws[1],'position')[0],.5);
+  assert.deepEqual([...words(draws[0],'color').slice(0,4)],[64,128,64,64].map(value=>Math.fround(value/255)));
+  assert.deepEqual([...words(draws[1],'color').slice(0,4)],Array(4).fill(Math.fround(192/255)));
+  assert.deepEqual(colorOwner.updateRanges,[]);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('late custom dispatch preserves an earlier queued fixed geometry and group selection',async t=>{
+  const f=fixture(t);f.mesh.material=[new T.MeshBasicMaterial()];f.mesh.frustumCulled=false;
+  const original=f.mesh.geometry,replacement=new T.PlaneGeometry().toNonIndexed();
+  original.clearGroups();original.addGroup(0,3,0);original.attributes.position.array.fill(.125);
+  replacement.clearGroups();replacement.addGroup(0,6,0);replacement.attributes.position.array.fill(.5);
+  t.after(()=>replacement.dispose());await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  f.mesh.geometry=replacement;let dispatches=0;
+  f.renderer.setRenderObjectFunction(function(...args){dispatches++;this.renderObject(...args);});
+  f.renderer.render(f.scene,f.camera);
+  original.attributes.position.array.fill(99);replacement.attributes.position.array.fill(-99);
+  original.clearGroups();replacement.clearGroups();await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>[draw.indexed,draw.args[0]]),[[true,3],[false,6]]);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];}),[.125,.5]);
+  assert.equal(dispatches,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('queued fixed geometry remains rigid after a later callback selects morph geometry',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const original=f.mesh.geometry,replacement=new T.PlaneGeometry().toNonIndexed();
+  original.attributes.position.array.fill(.125);replacement.attributes.position.array.fill(.5);
+  replacement.morphAttributes.position=[replacement.attributes.position.clone()];replacement.morphTargetsRelative=true;
+  t.after(()=>replacement.dispose());await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  let callbacks=0;
+  f.mesh.onBeforeRender=()=>{callbacks++;f.mesh.geometry=replacement;f.mesh.updateMorphTargets();};
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>[draw.indexed,draw.args[0]]),[[true,6],[false,6]]);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];}),[.125,.5]);
+  assert.equal(callbacks,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('queued fixed geometry keeps projected depth when later calls change its source bounds',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const otherGeometry=new T.PlaneGeometry(),other=new T.Mesh(otherGeometry,f.mesh.material);
+  other.frustumCulled=false;f.scene.add(other);t.after(()=>otherGeometry.dispose());
+  f.mesh.geometry.translate(0,0,1);otherGeometry.translate(0,0,-1);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  const position=f.mesh.geometry.attributes.position;
+  for(let i=2;i<position.array.length;i+=3)position.array[i]=-3;
+  f.mesh.geometry.computeBoundingSphere();f.mesh.onBeforeRender=()=>{};
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0);assert.equal(draws.length,4);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[2];}),[1,-1,-1,1]);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('fixed projected shadows retain off-camera casters and their guarded upload owner',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshPhongMaterial();f.mesh.receiveShadow=true;
+  f.renderer.shadowMap.enabled=true;f.renderer.shadowMap.type=T.PCFShadowMap;
+  const caster=new T.Mesh(new T.PlaneGeometry(),new T.MeshBasicMaterial());caster.position.x=3;caster.castShadow=true;
+  const light=new T.DirectionalLight();light.position.z=5;light.castShadow=true;light.shadow.mapSize.set(16,16);
+  Object.assign(light.shadow.camera,{left:-6,right:6,top:6,bottom:-6,near:.1,far:20});light.shadow.camera.updateProjectionMatrix();
+  f.scene.add(caster,light,light.target);t.after(()=>caster.geometry.dispose());
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const projected=new T.Matrix4().multiplyMatrices(f.camera.projectionMatrix,f.camera.matrixWorldInverse);
+  assert.equal(caster.intersectsFrustum(new T.Frustum().setFromProjectionMatrix(projected,f.camera.coordinateSystem)),false);
+  assert.equal(caster.intersectsFrustum(light.shadow.getFrustum()),true);
+  const depth=f.device.passes.filter(pass=>!pass.desc.colorAttachments?.length);
+  assert.equal(depth.length,1);assert.equal(depth[0].draws.length,1);
+  assert.equal(f.device.passes.filter(pass=>pass.desc.colorAttachments?.length).flatMap(pass=>pass.draws).filter(draw=>draw.streams.size).length,1);
+  let callbacks=0;caster.onBeforeRender=()=>{callbacks++;};
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),error=>error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
+  assert.equal(callbacks,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('culled fixed geometry remains fresh when a later hook first selects it',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.position.x=10000;
+  const position=f.mesh.geometry.attributes.position;await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(f.device.writes.length,0,'a culled fixed geometry never reaches the upload owner');
+  f.mesh.position.x=0;f.mesh.frustumCulled=false;position.array.fill(.375);let callbacks=0;
+  f.mesh.onBeforeRender=()=>{callbacks++;};f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draw=nativeDraws(f.device)[0],bytes=draw.contents.get(draw.streams.get(0));
+  assert.equal(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0],.375);
+  assert.equal(callbacks,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('fixed dynamic attributes keep source render frequency when late hooks are installed',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const position=f.mesh.geometry.attributes.position;position.setUsage(T.DynamicDrawUsage);position.array.fill(.125);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  position.array.fill(.25);f.renderer.render(f.scene,f.camera);
+  position.array.fill(.5);f.mesh.onBeforeRender=()=>{};f.renderer.render(f.scene,f.camera);
+  position.array.fill(99);await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0);
+  assert.deepEqual(draws.map(draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];}),[.125,.25,.5]);
+  assert.equal(position.version,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('late hooks still reject fixed generated instance history before source effects',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const instanceGeometry=f.mesh.geometry.clone(),linkedGeometry=f.mesh.geometry.clone();
+  instanceGeometry.setAttribute('position',f.mesh.geometry.attributes.position);
+  linkedGeometry.setAttribute('normal',f.mesh.geometry.attributes.normal);
+  const instances=new T.InstancedMesh(instanceGeometry,new T.MeshBasicMaterial(),1),linked=new T.Mesh(linkedGeometry,f.mesh.material);
+  instances.frustumCulled=false;linked.frustumCulled=false;f.scene.add(linked,instances);
+  t.after(()=>{instanceGeometry.dispose();linkedGeometry.dispose();});await f.renderer.compileAsync(f.scene,f.camera);
+  const otherScene=new T.Scene(),otherGeometry=new T.PlaneGeometry(),other=new T.Mesh(otherGeometry,f.mesh.material);
+  otherGeometry.setAttribute('position',linkedGeometry.attributes.position);other.frustumCulled=false;otherScene.add(other);
+  t.after(()=>otherGeometry.dispose());let callbacks=0;other.onBeforeRender=()=>{callbacks++;};
   assert.throws(()=>f.renderer.render(otherScene,f.camera),error=>
     error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
-  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);
-  assert.equal(f.acquired(),0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 test('ordinary hook attribute history follows shared geometry into another scene after hook removal',async t=>{
@@ -1540,4 +1682,30 @@ test('fixed material capture budgets are released on disposal and preparation fa
     assert.equal(f.renderer._materialCaptureValues,0);assert.equal(f.renderer._pending.length,0);
     assert.equal(f.renderer._nodeCaptureBytes,0);
   }
+});
+
+
+for(const route of ['shadows','instances'])test('fixed raw history rejects legacy '+route+' adoption without poisoning later draws',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const geometry=f.mesh.geometry,position=geometry.attributes.position;position.array.fill(.125);
+  await f.renderer.compileAsync(f.scene,f.camera);position.array.fill(99);
+  const aliasGeometry=geometry.clone();aliasGeometry.setAttribute('position',position);
+  const alias=new T.InstancedMesh(aliasGeometry,new T.MeshBasicMaterial(),1);alias.frustumCulled=false;
+  t.after(()=>{aliasGeometry.dispose();alias.material.dispose();});
+  const activate=()=>{if(route==='shadows')f.renderer.shadowMap.enabled=true;else f.scene.add(alias);};
+  const deactivate=()=>{f.renderer.shadowMap.enabled=false;f.scene.remove(alias);};
+  const writes=f.device.writes.length,submissions=f.device.submissions.length;
+  activate();
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.renderer._nodeCaptureBytes,0,'refused route retains no queued leases');
+  deactivate();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=()=>f.device.snapshots.flat().filter(draw=>draw.streams.size>0);
+  const firstWord=draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];};
+  assert.equal(draws().length,1);assert.equal(firstWord(draws()[0]),.125,'refusal preserves the accepted history');
+  geometry.dispose();activate();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const fresh=draws().slice(1);assert.equal(fresh.length,route==='shadows'?1:2);
+  assert.ok(fresh.every(draw=>firstWord(draw)===99),'source disposal permits a fresh fixed upload');
+  assert.equal(f.renderer._nodeCaptureBytes,0);
 });

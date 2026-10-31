@@ -69,6 +69,7 @@ export function createThreeNodeBundles(three, {maxEntries = 16384, maxBytes = 64
       if (!passes.has(passId)) passes.set(passId, {});
       return passes.get(passId);
     },
+    hasGeometryHistory: owner => geometry.hasHistory(owner),
     captureGeometry(view, attributes, renderId, inputs = null) {
       // Generated streams install into private views only. Freeze all streams
       // at the same upload boundary, before ordinary NodeFrame updates.
