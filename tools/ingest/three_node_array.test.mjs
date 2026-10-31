@@ -8,10 +8,12 @@ import {inspectThreeTexture} from './three_textures.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
-function arrayTexture(type = T.UnsignedByteType, value = 1, layers = 3) {
-  const Scalar = type === T.FloatType ? Float32Array : type === T.HalfFloatType ? Uint16Array : Uint8Array;
-  const texture = new T.DataArrayTexture(new Scalar(2 * 2 * layers * 4).fill(value), 2, 2, layers);
-  texture.type = type; texture.needsUpdate = true; return texture;
+function arrayTexture(type = T.UnsignedByteType, value = 1, layers = 3, format = T.RGBAFormat) {
+  const Scalar = type === T.IntType ? Int32Array : type === T.UnsignedIntType ? Uint32Array
+    : type === T.FloatType ? Float32Array : type === T.HalfFloatType ? Uint16Array : Uint8Array;
+  const channels = format === T.RedIntegerFormat ? 1 : format === T.RGIntegerFormat ? 2 : 4;
+  const texture = new T.DataArrayTexture(new Scalar(2 * 2 * layers * channels).fill(value), 2, 2, layers);
+  Object.assign(texture, {type, format}); texture.needsUpdate = true; return texture;
 }
 function compiler(t, filterable = false) {
   const renderer = {library: new T.StandardNodeLibrary(), contextNode: N.context(),
@@ -61,6 +63,45 @@ test('native vertex array loads do not require float32 filtering or sampler bind
   assert.match(descriptor.vertex, /texture_2d_array<f32>/); assert.match(descriptor.vertex, /textureLoad/);
   assert.equal(textureLayouts(descriptor)[0].texture.sampleType, 'unfilterable-float');
   assert.equal(f.owner.captureDraw(descriptor, f.context).textures.some(binding => binding.isSampler && !binding.isSampledTexture), false);
+});
+
+for (const signed of [false, true]) for (const format of [T.RedIntegerFormat, T.RGIntegerFormat, T.RGBAIntegerFormat])
+test(`integer array ${signed ? 'signed' : 'unsigned'} format ${format}: exact source loads in both graphics stages`, t => {
+  const f = compiler(t), source = arrayTexture(signed ? T.IntType : T.UnsignedIntType, 1, 3, format);
+  const loaded = N.textureLoad(source, N.ivec2(1, 0)).depth(N.int(2));
+  const selected = loaded.x.equal(signed ? N.int(-16777217) : N.uint(0xffffffff)).select(1, 0);
+  f.material.positionNode = N.positionLocal.add(N.vec3(selected).mul(.125));
+  f.material.colorNode = N.vec3(selected);
+  const descriptor = f.compile(), builder = new T.WGSLNodeBuilder(f.object, f.renderer);
+  builder.scene = f.scene; builder.camera = f.camera; builder.build();
+  assert.equal(descriptor.vertex, builder.vertexShader); assert.equal(descriptor.fragment, builder.fragmentShader);
+  for (const shader of [descriptor.vertex, descriptor.fragment]) {
+    assert.match(shader, signed ? /texture_2d_array<i32>/ : /texture_2d_array<u32>/);
+    assert.match(shader, /textureLoad\(/); assert.doesNotMatch(shader, /textureSample/);
+  }
+  const entries = textureLayouts(descriptor);
+  assert.ok(entries.length > 0); assert.equal(entries.reduce((visibility, entry) => visibility | entry.visibility, 0), 3);
+  assert.ok(entries.every(entry => entry.texture.sampleType === (signed ? 'sint' : 'uint') &&
+    entry.texture.viewDimension === '2d-array' && entry.texture.multisampled === false));
+  assert.equal(descriptor.groups.flatMap(group => group.entries).some(entry => entry.sampler), false);
+  const bindings = f.owner.captureDraw(descriptor, f.context).textures;
+  assert.ok(bindings.length > 0); assert.ok(bindings.every(binding => binding.texture === source && binding.isSampledTexture));
+});
+
+for (const [name, mutate, sampled = false] of [
+  ['filtered node', () => {}, true],
+  ['signed byte shader typing', texture => { texture.type = T.ByteType; texture.image.data = new Int8Array(48); }],
+  ['unsigned byte shader typing', texture => { texture.type = T.UnsignedByteType; texture.image.data = new Uint8Array(48); }],
+  ['signed short shader typing', texture => { texture.type = T.ShortType; texture.image.data = new Int16Array(48); }],
+  ['unsigned short shader typing', texture => { texture.type = T.UnsignedShortType; texture.image.data = new Uint16Array(48); }],
+  ['normalization', texture => { texture.normalized = true; }],
+  ['color conversion', texture => { texture.colorSpace = T.SRGBColorSpace; }],
+]) test(`integer arrays retain admission refusal for ${name}`, t => {
+  const f = compiler(t), source = arrayTexture(T.UnsignedIntType, 1, 3, T.RGBAIntegerFormat);
+  mutate(source);
+  const loaded = (sampled ? N.texture(source, N.vec2(.5)) : N.textureLoad(source, N.ivec2(0))).depth(N.int(1));
+  f.material.colorNode = N.vec3(loaded.x);
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_TEXTURE'});
 });
 
 test('array replacement reuses compatible programs but a changed view invalidates captured layout', t => {
@@ -129,6 +170,48 @@ test('queued native array draws preserve partial layer histories instead of unma
   assert.deepEqual([...a], Array(48).fill(1));
   assert.deepEqual([...b], [...Array(16).fill(1), ...Array(16).fill(9), ...Array(16).fill(1)]);
   assert.equal(source.layerUpdates.size, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const signed of [false, true])
+test(`queued ${signed ? 'signed' : 'unsigned'} integer arrays share exact upload histories between graphics stages`, async t => {
+  const f = recording(t); await f.renderer.init();
+  const Scalar = signed ? Int32Array : Uint32Array, channels = signed ? 2 : 4;
+  const source = arrayTexture(signed ? T.IntType : T.UnsignedIntType, 0, 3,
+    signed ? T.RGIntegerFormat : T.RGBAIntegerFormat);
+  const extremes = signed ? [-2147483648, 2147483647, -16777217, -1] : [0xffffffff, 0x80000000, 0x01000001, 0x7fffffff];
+  source.image.data = new Scalar(source.image.data.length + 4).subarray(2, -2);
+  source.image.data.set(Array.from(source.image.data, (_, i) => extremes[i % extremes.length]));
+  const initial = [...source.image.data], loaded = N.textureLoad(source, N.ivec2(1, 0)).depth(N.int(1));
+  const selected = loaded.x.equal(signed ? N.int(-1) : N.uint(0xffffffff)).select(1, 0);
+  f.material.positionNode = N.positionLocal.add(N.vec3(selected).mul(.125));
+  f.material.colorNode = N.vec3(selected).mul(N.uniform(1).setName('nativeIntegerArrayHistory'));
+  f.renderer.render(f.scene, f.camera);
+  const marked = signed ? -16777219 : 0xfffffffd;
+  source.image.data.fill(marked); source.addLayerUpdate(1); source.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  source.image.data.fill(99); f.renderer.render(f.scene, f.camera);
+  while (f.renderer._drain) await f.renderer._drain;
+  const draws = f.device.snapshots.flat().filter(draw => draw.pipeline.fragment.module.code.includes('nativeIntegerArrayHistory'));
+  assert.equal(draws.length, 3);
+  const native = draws.map(draw => {
+    const stageViews = views(draw).filter(view => view.dimension === '2d-array');
+    assert.ok(stageViews.length > 0); assert.ok(stageViews.every(view => view.texture === stageViews[0].texture));
+    const layouts = [...draw.groups.values()].flatMap(({group}) => group.layout.entries);
+    assert.equal(layouts.some(entry => entry.sampler), false);
+    assert.equal(layouts.filter(entry => entry.texture).reduce((visibility, entry) => visibility | entry.visibility, 0), 3);
+    return stageViews[0].texture;
+  });
+  assert.notEqual(native[0], native[1]); assert.equal(native[1], native[2]);
+  const words = texture => {
+    const [write] = f.device.textureWrites.filter(value => value.texture === texture);
+    assert.ok(write); return [...new Scalar(write.bytes.buffer, write.bytes.byteOffset, write.bytes.byteLength / 4)];
+  };
+  const updated = [...initial]; updated.fill(marked, 4 * channels, 8 * channels);
+  assert.deepEqual(words(native[0]), initial); assert.deepEqual(words(native[1]), updated);
+  assert.equal(f.device.textureWrites.filter(write => native.includes(write.texture)).length, 2);
+  assert.ok(native.every(texture => texture.format === `${signed ? 'rg' : 'rgba'}32${signed ? 'sint' : 'uint'}`));
+  assert.equal(source.layerUpdates.size, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.ok(source.image.data.every(value => value === 99), 'capture preserves caller-owned CPU data');
 });
 
 test('actual native graphics bind nearest float32 arrays without the optional filtering feature', async t => {

@@ -1594,6 +1594,24 @@ alias isolation, bitmap readiness, default storage, origin failures and upload m
 recording host/GPU checks do not establish browser decoder or color-pixel
 parity.
 
+## Native integer array texture inputs
+
+Source `DataArrayTexture` inputs support sampler-free `TSL.textureLoad()` calls
+with `.depth()` layer selection in both vertex and fragment graphs. Signed and
+unsigned 32-bit R, RG and RGBA integer formats retain the pinned builder's
+`texture_2d_array<i32>` / `texture_2d_array<u32>` declarations and integer texels.
+The existing sampled-texture owner supplies the matching layout, GPU allocation
+and upload history; stages reading the same accepted version share that storage.
+
+Queued draws retain their accepted `needsUpdate` versions. Partial
+`addLayerUpdate()` uploads preserve untouched layers, and later unmarked CPU
+writes cannot alter an earlier draw's captured bytes. The focused
+`three_node_array.test.mjs` cases compare exact source WGSL and record signed and
+unsigned layouts, stage aliases and queued upload bytes. These checks do not
+execute shaders or establish browser pixel parity. Source 8/16-bit integer
+shader typing, filtered integer sampling, normalization and color conversion
+remain outside this profile.
+
 ## Native 3D texture inputs
 
 Ordinary source `Data3DTexture` inputs now enter native graphics through

@@ -783,11 +783,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
               typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
       fail('TEXTURE', 'Native cube sampling requires six source data/image/compressed faces or a registered native cube target with reflection or refraction mapping');
     const integerType = integerTextureType(texture);
-    const integerData = integerType && (dataVolume || typeof three.DataTexture === 'function' &&
+    const integerData = integerType && (dataVolume || texture.isDataArrayTexture === true || typeof three.DataTexture === 'function' &&
       texture instanceof three.DataTexture && texture.isDataTexture === true && !volume) &&
-      !array && !texture.isCubeTexture && !target;
+      !texture.isCubeTexture && !target;
     if (integerType && ((!storage && !integerData) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
-      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, DataTexture or Data3DTexture inputs with NoColorSpace');
+      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, DataTexture, DataArrayTexture or Data3DTexture inputs with NoColorSpace');
     const packedTarget = target && three.UnsignedInt101111Type !== undefined &&
       texture.type === three.UnsignedInt101111Type && texture.format === three.RGBFormat;
     if (!depth && !integerType && (!packedTarget && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
