@@ -39,6 +39,121 @@ test('vector equality reduces with all/any; mod uses floor; integer shifts take 
   assert.match(r.fragment, /vec2<u32>\(u32\(1\)\)/);
 });
 
+// Execute generated equality helper control flow and member/index access only.
+// Vector all(a == b) uses component equality; no shader arithmetic is emulated.
+function aggregateEquality(wgsl, expression, values, before = '') {
+  const helpers = [...wgsl.matchAll(/^fn (f3d_equal_\w+)\([^\n]+\) -> bool \{\n([\s\S]*?)^\}/gm)]
+    .map(([, name, body]) => `function ${name}(a, b) {${body}}`).join('\n')
+    .replace(/all\(([^()\n]+) == ([^()\n]+)\)/g, 'vectorEqual($1, $2)').replace(/\bvar i =/g, 'let i =');
+  assert.ok(helpers.length);
+  const prefix = before.replace(/\bvar (\w+): bool/g, 'let $1');
+  return Function('vectorEqual', ...Object.keys(values), helpers + '\n' + prefix + '\nreturn ' + expression + ';')(
+    (a, b) => a.length === b.length && a.every((value, i) => value === b[i]), ...Object.values(values));
+}
+function aggregateProgram(type, {array = '', declarations = ''} = {}) {
+  return compileEsslStage('fragment', F('color = vec4(1.0);', declarations +
+    `bool probe(${type} a${array}, ${type} b${array}) { return a == b; }\n` +
+    `bool different(${type} a${array}, ${type} b${array}) { return a != b; }`));
+}
+const comparisonExpression = (wgsl, name = 'probe') => new RegExp(`fn ${name}\\([^\\n]+\\) -> bool \\{[\\s\\S]*?return ([^;]+);`).exec(wgsl)[1];
+
+test('aggregate equality compares every array element and preserves scalar equality rules', () => {
+  for (const [type, a] of [['float', [-0, Infinity, -Infinity]], ['int', [1, -2, 3]],
+    ['bool', [true, false, true]], ['uvec2', [[1, 2], [3, 4], [5, 6]]],
+    ['bvec3', [[true, false, true], [false, true, false], [true, true, false]]]]) {
+    const wgsl = aggregateProgram(type, {array: '[3]'}), equal = comparisonExpression(wgsl), different = comparisonExpression(wgsl, 'different');
+    const b = structuredClone(a);
+    assert.equal(aggregateEquality(wgsl, equal, {a, b}), true);
+    for (let i = 0; i < a.length; i++) {
+      const changed = structuredClone(b);
+      if (Array.isArray(changed[i])) changed[i][1] = typeof changed[i][1] === 'boolean' ? !changed[i][1] : changed[i][1] + 1;
+      else changed[i] = type === 'bool' ? !changed[i] : 9;
+      assert.equal(aggregateEquality(wgsl, equal, {a, b: changed}), false);
+      assert.equal(aggregateEquality(wgsl, different, {a, b: changed}), true);
+    }
+  }
+  const wgsl = aggregateProgram('float', {array: '[3]'}), equal = comparisonExpression(wgsl);
+  assert.equal(aggregateEquality(wgsl, equal, {a: [-0, 1, 2], b: [0, 1, 2]}), true);
+  assert.equal(aggregateEquality(wgsl, equal, {a: [NaN, 1, 2], b: [NaN, 1, 2]}), false);
+  assert.equal(aggregateEquality(wgsl, comparisonExpression(wgsl, 'different'), {a: [NaN, 1, 2], b: [NaN, 1, 2]}), true);
+});
+
+test('aggregate equality recursively compares nested structs, arrays, booleans and matrices', () => {
+  const declarations = 'struct Inner { bvec2 flags; vec2 uv; };\nstruct Record { Inner inner; mat2x3 frame; float weights[2]; int alias; };';
+  const wgsl = aggregateProgram('Record', {array: '[2]', declarations}), equal = comparisonExpression(wgsl), different = comparisonExpression(wgsl, 'different');
+  const value = {inner: {flags: [true, false], uv: [2, 3]}, frame: [[5, 7, 11], [13, 17, 19]], weights: [-0, 23], alias_: 29};
+  const a = [structuredClone(value), structuredClone(value)], b = structuredClone(a);
+  assert.equal(aggregateEquality(wgsl, equal, {a, b}), true);
+  for (const mutate of [v => { v.inner.flags[1] = true; }, v => { v.inner.uv[0]++; }, v => { v.frame[1][2]++; },
+    v => { v.weights[1]++; }, v => { v.alias_++; }]) {
+    const changed = structuredClone(b); mutate(changed[1]);
+    assert.equal(aggregateEquality(wgsl, equal, {a, b: changed}), false);
+    assert.equal(aggregateEquality(wgsl, different, {a, b: changed}), true);
+  }
+  assert.match(wgsl, /a\.alias_ == b\.alias_/);
+  const helpers = [...wgsl.matchAll(/^fn (f3d_equal_\w+)/gm)].map(m => m[1]);
+  assert.equal(new Set(helpers).size, helpers.length, 'equal and not-equal share one typed helper per aggregate');
+});
+
+test('matrix equality evaluates producing expressions once and retains logical short-circuiting', () => {
+  const declarations = 'int count = 0; mat3 nextValue() { count++; return mat3(float(count)); }';
+  for (const [source, expected, calls] of [['nextValue() == nextValue()', false, 2], ['nextValue() != nextValue()', true, 2],
+    ['false && (nextValue() == nextValue())', false, 0], ['true || (nextValue() != nextValue())', true, 0]]) {
+    const wgsl = compileEsslStage('fragment', F('bool result = ' + source + '; color = vec4(result ? 1.0 : 0.0);', declarations));
+    const [, before, expression] = /fn main_\(\) \{\n([\s\S]*?)var result: bool = ([^;]+);/.exec(wgsl);
+    let produced = 0;
+    const nextValue = () => { const n = ++produced; return [[n, 0, 0], [0, n, 0], [0, 0, n]]; };
+    assert.equal(aggregateEquality(wgsl, expression, {nextValue}, before), expected);
+    assert.equal(produced, calls);
+  }
+});
+
+test('aggregate equality helpers have bounded array code and distinct type identities', () => {
+  const small = aggregateProgram('float', {array: '[2]'}), large = aggregateProgram('float', {array: '[100000]'});
+  assert.ok(large.length - small.length < 100, 'array length changes the loop bound, not generated comparisons');
+  assert.match(large, /for \(var i = 0; i < 100000; i\+\+\)/);
+  const wgsl = compileEsslStage('fragment', F('color = vec4(1.0);',
+    'struct float_13_2 { float value; }; bool arrayProbe(float a[3], float b[3]) { return a == b; }\n' +
+    'bool structProbe(float_13_2 a, float_13_2 b) { return a == b; }'));
+  const names = [...wgsl.matchAll(/^fn (f3d_equal_\w+)/gm)].map(m => m[1]);
+  assert.equal(names.length, 2); assert.notEqual(names[0], names[1]);
+});
+
+test('aggregate comparisons in global constants use legal entry initialization', () => {
+  const wgsl = compileEsslStage('fragment', F('color = vec4(equalValue && dependent ? 1.0 : 0.0);',
+    'struct Pair { float value; vec2 uv; };\nconst bool equalValue = Pair(1.0, vec2(2.0)) == Pair(1.0, vec2(2.0));\n' +
+    'const bool dependent = equalValue;'));
+  assert.doesNotMatch(wgsl, /const equalValue:/);
+  assert.match(wgsl, /var<private> equalValue: bool;/);
+  assert.match(wgsl, /equalValue = f3d_equal_Pair\(/);
+  assert.ok(wgsl.indexOf('  equalValue =') < wgsl.indexOf('  dependent ='));
+  assert.ok(wgsl.indexOf('  dependent =') < wgsl.indexOf('  main_();'));
+});
+
+test('uniform boolean-vector arrays retain every component through aggregate and indexed reads', () => {
+  for (const width of [2, 3, 4]) {
+    const type = `bvec${width}`, swizzle = 'xyzw'.slice(0, width);
+    const wgsl = compileEsslStage('fragment', F(`bool same = a == b; ${type} item = a[1]; color = vec4(same && item.x ? 1.0 : 0.0);`,
+      `uniform ${type} a[2]; uniform ${type} b[2];`));
+    assert.ok(wgsl.includes(`r[i] = (v[i].${swizzle} != vec${width}<u32>(0u));`));
+    assert.ok(wgsl.includes(`(f3d_u.a[1].${swizzle} != vec${width}<u32>(0u))`));
+    assert.match(wgsl, new RegExp(`fn f3d_equal_bvec${width}_12_2\\(a: array<vec${width}<bool>, 2>`));
+  }
+});
+
+test('aggregate equality enforces matching types and the ESSL 1.00 array boundary', () => {
+  assert.throws(() => compileEsslStage('fragment', F('color = vec4(1.0);',
+    'bool probe(float a[2], float b[3]) { return a == b; }')), /Cannot compare float\[2\] with float\[3\]/);
+  assert.throws(() => compileEsslStage('fragment', F('color = vec4(1.0);',
+    'struct A { float x; }; struct B { float x; }; bool probe(A a, B b) { return a == b; }')), /Cannot compare A with B/);
+  const legacy = 'precision highp float; struct Item { bool active; mat2 frame; };\n' +
+    'bool probe(Item a, Item b) { return a == b; } void main() { gl_FragColor = vec4(1.0); }';
+  assert.match(compileEsslStage('fragment', legacy), /fn f3d_equal_Item\(/);
+  for (const declarations of ['bool probe(float a[2], float b[2]) { return a == b; }',
+    'struct Item { float weights[2]; }; bool probe(Item a, Item b) { return a == b; }'])
+    assert.throws(() => compileEsslStage('fragment', 'precision highp float; ' + declarations + 'void main() { gl_FragColor = vec4(1.0); }'), /Array equality requires ESSL 3.00/);
+});
+
 test('out/inout parameters copy through temporaries in source order; swizzle stores split', () => {
   const r = program(minimalVS, F(`vec4 v = vec4(0.0); float s = 1.0;
   float r = bump(s) + s;

@@ -56,6 +56,18 @@ admitted. The source rules are in the
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
   shift counts become `u32`; `inverse`, `matrixCompMult`, `outerProduct` are
   generated helpers.
+- ESSL 3.00 whole-array and struct equality compare all corresponding elements
+  and fields, including nested structs, arrays, matrices and booleans. Cached
+  typed helpers take each operand by value once; matrix-producing expressions
+  no longer repeat for every column. Arrays use loops rather than expanded
+  comparisons. `!=` negates the same comparison, and surrounding `&&`/`||`
+  retain their short-circuit behavior. Generated helper calls in global constant
+  initializers use the existing entry initialization path, before `main`.
+- ESSL 1.00 struct equality is supported when the structure has no array or
+  opaque members. Array equality requires ESSL 3.00. These version rules follow
+  section 5.7 of the respective Khronos specifications. Existing uniform layout
+  conversion feeds comparisons; wrapped boolean-vector arrays now preserve all
+  components for both whole-array and indexed reads.
 - Global stage I/O becomes private variables copied by the entry points.
 - `out`/`inout` arguments copy through temporaries in source evaluation order;
   side-effecting `?:`, `&&`, `||`, `++`/`--` and assignments inside expressions
@@ -91,6 +103,14 @@ conversions).
   smooth/flat/centroid interpolation, identifier collisions, independent stage
   compilation and source/link errors. These tests do not execute a GPU or prove
   interpolation pixel parity.
+- Aggregate-comparison regressions execute generated helper control flow and
+  member/index accesses with a small test-local vector equality adapter. They
+  check nested values, short-circuiting, operand call counts, exceptional scalar
+  comparisons, constant initialization, uniform vector widths and bounded array
+  code size. The focused `aggregate equality: live ShaderMaterial` test in
+  `three_program.test.mjs` also compiles a real pinned ShaderMaterial, packs live
+  struct/array/bool uniform edits and compiles an unseen runtime inequality
+  variant. It does not execute the generated WGSL or establish GPU parity.
 - Corpus: every program r186 `WebGLRenderer` compiled across the 299 upstream
   `webgl_*` examples (578 unique stages, built-in materials included):
   570 translate and validate with Naga and compile in Chrome; the 8 others are

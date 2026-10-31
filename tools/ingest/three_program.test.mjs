@@ -96,6 +96,40 @@ test('program support caches compiled programs by exact source text', () => {
     'HAS_NORMAL differs, so the program differs');
 });
 
+test('aggregate equality: live ShaderMaterial uniforms and unseen runtime variants use the compiler path', t => {
+  const value = () => ({uv: new T.Vector2(2, 3), gains: [5, 7], active: true, flags: [[true, false, true], [false, true, false]]});
+  const material = shader({uniforms: {left: {value: value()}, right: {value: value()}},
+    fragmentShader: 'struct Payload { vec2 uv; float gains[2]; bool active; bvec3 flags[2]; };\n' +
+      'uniform Payload left; uniform Payload right;\nvoid main() { gl_FragColor = vec4(left == right ? 1.0 : 0.0); }'});
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  t.after(() => { material.dispose(); mesh.geometry.dispose(); });
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  const first = support.compile(material, mesh), {program} = first, {reflection} = program;
+  assert.match(program.fragment, /fn f3d_equal_Payload\(/);
+  assert.match(program.fragment, /f3d_equal_Payload\(f3d_from_u_Payload\(f3d_u.left\), f3d_from_u_Payload\(f3d_u.right\)\)/);
+  assert.match(program.fragment, /v\[i\]\.xyz != vec3<u32>\(0u\)/);
+  const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
+  const pack = () => support.pack(reflection, support.refresh(material), mesh, camera, bytes, {});
+  const uniform = name => reflection.uniforms.find(u => u.name === name);
+  const right = uniform('right'), gains = right.node.fields.find(f => f.name === 'gains').node;
+  const active = right.node.fields.find(f => f.name === 'active').node;
+  const flags = right.node.fields.find(f => f.name === 'flags').node;
+  pack();
+  assert.equal(view.getFloat32(gains.offset + gains.stride, true), 7);
+  assert.equal(view.getUint32(active.offset, true), 1);
+  assert.deepEqual([0, 4, 8, flags.stride, flags.stride + 4, flags.stride + 8].map(offset => view.getUint32(flags.offset + offset, true)), [1, 0, 1, 0, 1, 0]);
+  material.uniforms.right.value.gains[1] = 11; material.uniforms.right.value.active = false; material.uniforms.right.value.flags[1][2] = true;
+  pack();
+  assert.equal(view.getFloat32(gains.offset + gains.stride, true), 11);
+  assert.equal(view.getUint32(active.offset, true), 0);
+  assert.equal(view.getUint32(flags.offset + flags.stride + 8, true), 1);
+  assert.equal(support.compile(material, mesh), first, 'uniform edits preserve the compiled program');
+  material.fragmentShader = material.fragmentShader.replace('left == right', 'left != right'); material.needsUpdate = true;
+  const second = support.compile(material, mesh);
+  assert.notEqual(second, first, 'an unvisited runtime shader variant is compiled');
+  assert.match(second.program.fragment, /!f3d_equal_Payload\(/);
+});
+
 test('PMREM: r186 PMREMGenerator passes record against the host and compile with GL rows', async () => {
   const {createThreeProgramPMREM, pmremSourceComplete, pmremSourceKind} = await import('./three_program_pmrem.mjs');
   const cube = new T.CubeTexture([0, 1, 2, 3, 4].map(() => ({width: 32, height: 32})));

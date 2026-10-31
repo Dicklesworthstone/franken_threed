@@ -560,7 +560,7 @@ class Unit {
       const {decl, type, w} = sym.pendingInit;
       const ctx = this.context(null, null);
       const value = this.coerce(this.expr(decl.init, ctx), type, decl.line);
-      if (!ctx.pre.length && this.constEvaluable(decl.init)) { sym.wgslConst = true; this.consts.push(`const ${w}: ${this.wgsl(type)} = ${value.c};`); }
+      if (!ctx.pre.length && !ctx.runtime && this.constEvaluable(decl.init)) { sym.wgslConst = true; this.consts.push(`const ${w}: ${this.wgsl(type)} = ${value.c};`); }
       else { this.privates.push(`var<private> ${w}: ${this.wgsl(type)};`); deferredConsts.push({decl, type, w}); }
     }
     this.deferredInit = [...deferredConsts, ...this.deferredInit];
@@ -1045,7 +1045,7 @@ class Unit {
         if (!r.wrapped && !(t.of.k === 'st' && needsStructConversion(t.of.name, this.shared))) return code;
         const name = `f3d_from_u_${typeKey(t).replace(/\W/g, '_')}`;
         if (!this.helpers.has(name)) this.helpers.set(name, [`fn ${name}(v: ${this.wgslUniform(r)}) -> ${this.wgsl(t)} {`, `  var r: ${this.wgsl(t)};`,
-          `  for (var i = 0; i < ${t.n}; i++) { r[i] = ${r.wrapped ? this.fromUniform(`v[i]${t.of.k === 's' ? '.x' : '.xy'}`, t.of) : this.fromUniform('v[i]', t.of)}; }`, '  return r;', '}'].join('\n'));
+          `  for (var i = 0; i < ${t.n}; i++) { r[i] = ${r.wrapped ? this.fromUniform(`v[i].${'xyzw'.slice(0, comps(t.of))}`, t.of) : this.fromUniform('v[i]', t.of)}; }`, '  return r;', '}'].join('\n'));
         return `${name}(${code})`;
       }
     }
@@ -1169,7 +1169,7 @@ class Unit {
     if (a.u) {
       const repr = uniformRepr(a.t, this.shared);
       if (repr.wrapped) {
-        const code = `${parts[0].c}[${index.c}]${t.k === 's' ? '.x' : '.xy'}`;
+        const code = `${parts[0].c}[${index.c}].${'xyzw'.slice(0, comps(t))}`;
         return {c: this.fromUniform(code, t), t};
       }
       return {c: `${parts[0].c}[${index.c}]`, t, u: true};
@@ -1236,7 +1236,11 @@ class Unit {
       return {c: tmp, t: BOOL};
     }
     const [a, b] = this.sequence(ctx, [() => this.expr(e.a, ctx), () => this.expr(e.b, ctx)]);
-    return this.binaryCode(e.op, a, b, e.line);
+    const result = this.binaryCode(e.op, a, b, e.line);
+    // User-defined WGSL helper calls are not module constant expressions.
+    // Existing entry initialization also handles constants depending on them.
+    ctx.runtime ||= result.runtime;
+    return result;
   }
   binaryCode(op, a, b, line) {
     const ta = a.t, tb = b.t;
@@ -1246,11 +1250,8 @@ class Unit {
         if (!same(ta, tb)) essError(`Cannot compare ${glslName(ta)} with ${glslName(tb)}`, line);
         if (ta.k === 's') return {c: `(${a.c} ${op} ${b.c})`, t: BOOL};
         if (ta.k === 'v') return {c: `${op === '==' ? 'all' : 'any'}(${a.c} ${op} ${b.c})`, t: BOOL};
-        if (ta.k === 'm') {
-          const cols = Array.from({length: ta.c}, (_, i) => `all(${a.c}[${i}] == ${b.c}[${i}])`).join(' && ');
-          return {c: op === '==' ? `(${cols})` : `(!(${cols}))`, t: BOOL};
-        }
-        essError(`Equality on ${glslName(ta)} is not supported`, line);
+        const equal = this.equalityCode(ta, a.c, b.c, line);
+        return {c: op === '==' ? equal : `(!${equal})`, t: BOOL, runtime: true};
       }
       case '<': case '>': case '<=': case '>=':
         if (!same(ta, tb) || ta.k !== 's') essError('Relational operators need matching scalars', line);
@@ -1287,6 +1288,35 @@ class Unit {
       }
     }
     essError(`Unsupported operator ${op}`, line);
+  }
+  /** Compare aggregate values through typed parameters: evaluate each operand
+   * once, then inspect its copied value. Array size does not expand the shader. */
+  equalityCode(type, left, right, line) {
+    if (type.k === 's') return `(${left} == ${right})`;
+    if (type.k === 'v') return `all(${left} == ${right})`;
+    if (!['m', 'a', 'st'].includes(type.k)) essError(`Equality is not defined for ${glslName(type)}`, line);
+    if (type.k === 'a' && this.version === 100) essError('Array equality requires ESSL 3.00', line);
+    // Escape type-name punctuation injectively; a user struct named like an
+    // encoded array must not share that array's helper signature.
+    const name = 'f3d_equal_' + typeKey(type).replace(/[_\[\]]/g, c => ({_: '_0', '[': '_1', ']': '_2'}[c]));
+    if (!this.helpers.has(name)) {
+      const body = [];
+      if (type.k === 'a') {
+        const equal = this.equalityCode(type.of, 'a[i]', 'b[i]', line);
+        body.push(`  for (var i = 0; i < ${type.n}; i++) {`, `    if (!${equal}) { return false; }`, '  }');
+      } else {
+        const members = type.k === 'm'
+          ? Array.from({length: type.c}, (_, i) => ({access: `[${i}]`, type: V('float', type.r)}))
+          : this.shared.structs.get(type.name).fields.map(f => ({access: '.' + safe(f.name), type: f.type}));
+        for (const member of members) {
+          const equal = this.equalityCode(member.type, 'a' + member.access, 'b' + member.access, line);
+          body.push(`  if (!${equal}) { return false; }`);
+        }
+      }
+      this.helpers.set(name, [`fn ${name}(a: ${this.wgsl(type)}, b: ${this.wgsl(type)}) -> bool {`,
+        ...body, '  return true;', '}'].join('\n'));
+    }
+    return `${name}(${left}, ${right})`;
   }
   matScalar(op, m, s, scalarFirst) {
     const cols = Array.from({length: m.t.c}, (_, i) => scalarFirst ? `(${s.c} ${op} ${m.c}[${i}])` : `(${m.c}[${i}] ${op} ${s.c})`);
