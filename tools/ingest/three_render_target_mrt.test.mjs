@@ -5,6 +5,9 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTarget} from './three_render_targets.mjs';
 import {gpuPostprocessFixture, deferred} from './fixtures/animation/gpu_postprocess_fixture.mjs';
+import {gpuTargetMipmapFixture} from './fixtures/animation/gpu_target_mipmap_fixture.mjs';
+import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {captureTargetColorCopy} from './three_target_texture_copy.mjs';
 
 function fixture(options = {}) {
   const f = gpuPostprocessFixture(), create = f.device.createTexture;
@@ -49,7 +52,7 @@ for (const sampleCount of [1, 4]) test(`MRT shares depth and resolves each of ${
   await raw.whenIdle(); raw.dispose(); destroyed(f.calls.textures); f.owner.dispose();
 });
 
-test('MRT count, render byte cost, storage budget and unsupported mips reject before allocation', () => {
+test('MRT count, render byte cost, storage budget and multisampled pyramids reject before allocation', () => {
   const f = fixture();
   const base = {width: 16, height: 8, colorFormats: ['rgba8unorm', 'rgba8unorm']};
   f.device.limits.maxColorAttachments = 1;
@@ -57,10 +60,172 @@ test('MRT count, render byte cost, storage budget and unsupported mips reject be
   f.device.limits.maxColorAttachments = 8;
   assert.throws(() => createGpuRenderTarget(f.device, {...base, colorFormats: Array(5).fill('rgba8unorm')}), {code: 'GPU_TARGET_LIMIT'});
   assert.throws(() => createGpuRenderTarget(f.device, {...base, maxBytes: 16 * 8 * 12 - 1}), {code: 'GPU_TARGET_BUDGET'});
-  assert.throws(() => createGpuRenderTarget(f.device, {...base, generateMipmaps: true}), {code: 'GPU_TARGET_UNSUPPORTED'});
+  assert.throws(() => createGpuRenderTarget(f.device, {...base, sampleCount: 4, generateMipmaps: true}), {code: 'GPU_TARGET_UNSUPPORTED'});
   const source = target(); source.textures.push(source.texture);
   assert.throws(() => f.owner.capture(source), {code: 'THREE_TARGET_SOURCE'});
   assert.equal(f.calls.textures.length, 0); f.owner.dispose();
+});
+
+function mipFixture(options = {}) {
+  const f = gpuTargetMipmapFixture();
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  f.device.createBindGroupLayout = descriptor => descriptor;
+  f.device.createPipelineLayout = descriptor => descriptor;
+  const owner = createThreeRenderTargets(T, {getDevice: () => f.device, flipY: false, ...options});
+  return {...f, owner};
+}
+const mipPasses = f => f.submissions.flatMap(commands => commands.flatMap(command => command.passes));
+
+test('MRT attachments allocate independent pyramid counts and generate the selected color format', async () => {
+  const f = mipFixture(), counts = [1, 4], flags = [false, true];
+  const raw = createGpuRenderTarget(f.device, {width: 8, height: 4, depthFormat: null,
+    colorFormats: ['rgba8unorm', 'rgba16float'], colorMipLevelCounts: counts, colorGenerateMipmaps: flags});
+  counts[1] = 1; flags[1] = false;
+  assert.deepEqual(f.textures.map(texture => texture.mipLevelCount), [1, 4]);
+  assert.equal(raw.allocatedBytes, 32 * 4 + (32 + 8 + 2 + 1) * 8);
+  raw.withTexture(() => {}, {colorIndex: 0}); assert.equal(f.submissions.length, 0);
+  raw.withTexture(texture => assert.equal(texture, f.textures[1]), {colorIndex: 1});
+  assert.deepEqual(mipPasses(f).map(pass => pass.descriptor.colorAttachments[0].view.descriptor.baseMipLevel), [1, 2, 3]);
+  for (const pass of mipPasses(f)) {
+    assert.equal(pass.pipeline.descriptor.fragment.targets[0].format, 'rgba16float');
+    assert.equal(pass.descriptor.colorAttachments[0].view.texture, f.textures[1]);
+    assert.equal(pass.group.entries[0].resource.texture, f.textures[1]);
+  }
+  const before = f.textures.length;
+  assert.throws(() => raw.withFrame(() => assert.fail('missing primary level'), {mipLevel: 1}), {code: 'GPU_TARGET_MIP'});
+  assert.equal(f.textures.length, before);
+  await raw.whenIdle(); raw.dispose(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('authored MRT render mips expose every color and reuse one matching private depth level', async () => {
+  const f = mipFixture(), raw = createGpuRenderTarget(f.device, {width: 8, height: 4,
+    colorFormats: ['rgba8unorm-srgb', 'rgba16float'], mipLevelCount: 4});
+  let first;
+  raw.withFrame(frame => {
+    first = frame;
+    assert.equal(frame.colorView, frame.colorViews[0]);
+    assert.deepEqual(frame.colorViews.map(view => view.descriptor.baseMipLevel), [1, 1]);
+    assert.deepEqual(frame.colorViews.map(view => view.texture.format), ['rgba8unorm-srgb', 'rgba16float']);
+    assert.deepEqual([frame.depthView.texture.width, frame.depthView.texture.height], [4, 2]);
+  }, {mipLevel: 1});
+  const allocation = raw.allocatedBytes;
+  raw.withFrame(frame => assert.equal(frame, first), {mipLevel: 1});
+  assert.equal(raw.allocatedBytes, allocation);
+  raw.withFrame(frame => {
+    assert.notEqual(frame.depthView.texture, first.depthView.texture);
+    assert.deepEqual(frame.colorViews.map(view => view.descriptor.baseMipLevel), [2, 2]);
+  }, {mipLevel: 2});
+  assert.equal(raw.allocatedBytes, allocation + 2 * 1 * 4);
+  raw.withAttachments(() => {}); assert.equal(f.submissions.length, 0, 'authored history is not filtered');
+  await raw.whenIdle(); raw.dispose(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('MRT automatic and explicit generation keep independent dirty state and authored contents', async () => {
+  const f = mipFixture(), raw = createGpuRenderTarget(f.device, {width: 8, height: 4, depthFormat: null,
+    colorFormats: ['rgba8unorm-srgb', 'r32float'], mipLevelCount: 3, colorGenerateMipmaps: [true, false]});
+  raw.withFrame(() => {});
+  raw.withAttachments(() => {});
+  assert.equal(mipPasses(f).length, 2);
+  assert.ok(mipPasses(f).every(pass => pass.descriptor.colorAttachments[0].view.texture === f.textures[0]));
+  assert.equal(raw.generateMipmaps([1]), true);
+  assert.equal(mipPasses(f).length, 4);
+  assert.ok(mipPasses(f).slice(2).every(pass => pass.descriptor.colorAttachments[0].view.texture === f.textures[1]));
+  assert.equal(raw.generateMipmaps([0, 1]), false);
+  assert.equal(raw.generateMipmaps([]), false);
+  raw.withFrame(() => {});
+  raw.generateMipmaps([1]);
+  raw.withTexture(() => {}, {colorIndex: 0});
+  assert.equal(f.submissions.length, 4);
+  assert.deepEqual(f.pipelines.map(pipeline => pipeline.descriptor.fragment.targets[0].format), ['rgba8unorm-srgb', 'r32float']);
+  assert.match(f.pipelines[1].descriptor.fragment.module.code, /textureLoad\(/);
+  await raw.whenIdle(); raw.dispose(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('native MRT generation follows captured render selections and preserves allocation across flag edits', async () => {
+  const f = mipFixture(), source = new T.RenderTarget(8, 4, {count: 2, depthBuffer: false, generateMipmaps: true});
+  source.textures[1].type = T.HalfFloatType;
+  const entry = f.owner.capture(source, {initialize: true});
+  source.texture.generateMipmaps = false;
+  f.owner.render(entry, () => assert.equal(f.submissions.length, 0), {generateColorMipmaps: [0]});
+  assert.equal(mipPasses(f).length, 3);
+  const images = f.textures.slice(), before = f.submissions.length;
+  source.textures[1].generateMipmaps = false;
+  source.texture.mipmaps = [{}];
+  assert.equal(f.owner.capture(source), entry, 'initialized descriptors and flag edits do not reallocate');
+  f.owner.render(entry, () => {}, {generateColorMipmaps: []});
+  f.owner.render(entry, () => {});
+  f.owner.withNativeTextures(source.textures.map(texture => f.owner.captureNativeTexture(texture)), () => {});
+  assert.equal(f.submissions.length, before, 'sampling and manual clears do not regenerate');
+  f.owner.render(entry, () => {}, {generateColorMipmaps: [1]});
+  assert.equal(mipPasses(f).length, 6);
+  assert.ok(mipPasses(f).slice(3).every(pass => pass.descriptor.colorAttachments[0].view.texture === images[1]));
+  assert.deepEqual(f.textures, images);
+  source.texture.needsUpdate = true;
+  assert.throws(() => f.owner.assertCurrent(entry), {code: 'THREE_TARGET_STALE'});
+  const replacement = f.owner.capture(source);
+  assert.deepEqual(replacement.shape.colorMipLevelCounts, [1, 1]);
+  f.owner.dispose(); destroyed(images);
+});
+
+test('native authored MRT mips retain all queued resized images and independent sampler counts', async () => {
+  const f = mipFixture(), source = new T.RenderTarget(8, 4, {count: 2, depthBuffer: false});
+  source.texture.mipmaps = [{}, {}, {}]; source.textures[1].mipmaps = [{}, {}, {}, {}];
+  source.texture.minFilter = source.textures[1].minFilter = T.LinearFilter;
+  const inputs = source.textures.map(texture => f.owner.captureNativeTexture(texture)), entry = inputs[0].entry;
+  const release = f.owner.retainGeneration(entry);
+  assert.deepEqual(inputs.map(input => input.sampler.lodMaxClamp), [2, 3]);
+  f.owner.render(entry, frame => assert.deepEqual(frame.colorViews.map(view => view.descriptor.baseMipLevel), [2, 2]), {mipLevel: 2});
+  assert.throws(() => f.owner.render(entry, () => assert.fail('unallocated color mip'), {mipLevel: 3}), {code: 'THREE_TARGET_MIP'});
+  const before = f.textures.slice();
+  f.owner.withNativePassResize(source, 16, 8, () => source.setSize(16, 8));
+  f.owner.withNativeTextures(inputs, textures => {
+    assert.deepEqual([...textures.values()].map(texture => texture.width), [8, 8]);
+  });
+  const next = f.owner.capture(source); assert.notEqual(next, entry);
+  f.owner.render(next, frame => assert.deepEqual(frame.colorViews.map(view => view.texture.width), [16, 16]), {mipLevel: 1});
+  before.forEach(texture => assert.equal(texture.destroyed, 0));
+  release(); await f.owner.whenIdle(); destroyed(before);
+  f.owner.dispose(); destroyed(f.textures);
+});
+
+test('MRT transfers select their own allocated levels and generation policy', () => {
+  const shape = {width: 8, height: 4, format: 'rgba8unorm', colorFormats: ['rgba8unorm', 'rgba16float'], sampleCount: 1,
+    mipLevelCount: 1, colorMipLevelCounts: [1, 4], generateMipmaps: true, colorGenerateMipmaps: [true, false]};
+  const write = inspectGpuTargetWrite(shape, new Uint16Array(8), {colorIndex: 1, destinationMipLevel: 2});
+  assert.deepEqual(write.size, {width: 2, height: 1, depthOrArrayLayers: 1});
+  assert.throws(() => inspectGpuTargetWrite(shape, new Uint8Array(8), {destinationMipLevel: 2}), {code: 'GPU_TRANSFER_REGION'});
+  const copy = inspectGpuTargetCopy(shape, shape, {sourceColorIndex: 1, colorIndex: 1, sourceMipLevel: 3, destinationMipLevel: 2});
+  assert.deepEqual(copy.size, {width: 1, height: 1, depthOrArrayLayers: 1});
+  assert.throws(() => inspectGpuTargetCopy(shape, shape, {sourceColorIndex: 1, colorIndex: 1, sourceMipLevel: 4}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => inspectGpuTargetWrite({...shape, colorGenerateMipmaps: [false, true]}, new Uint16Array(8),
+    {colorIndex: 1, destinationMipLevel: 2}), {code: 'GPU_TRANSFER_MIP'});
+});
+
+test('native target copies regenerate only the captured MRT destination after submitting its copy', async () => {
+  const f = mipFixture(), copies = [], createEncoder = f.device.createCommandEncoder;
+  f.device.createCommandEncoder = (...args) => {
+    const encoder = createEncoder(...args);
+    encoder.copyTextureToTexture = (source, destination, size) => copies.push({source, destination, size});
+    return encoder;
+  };
+  const source = new T.RenderTarget(8, 4, {depthBuffer: false});
+  const destination = new T.RenderTarget(8, 4, {count: 2, depthBuffer: false, generateMipmaps: true});
+  const renderer = {_device: f.device, _targets: f.owner};
+  const generated = captureTargetColorCopy(renderer, source.texture, destination.textures[1]);
+  destination.textures[1].generateMipmaps = false;
+  destination.texture.generateMipmaps = false;
+  const retained = captureTargetColorCopy(renderer, source.texture, destination.texture);
+  destination.texture.generateMipmaps = true;
+  generated.issue(); retained.issue();
+  assert.equal(copies.length, 2);
+  assert.deepEqual(f.submissions.map(commands => commands[0].passes.length), [0, 3, 0]);
+  assert.ok(mipPasses(f).every(pass => pass.descriptor.colorAttachments[0].view.texture === copies[0].destination.texture));
+  assert.notEqual(copies[0].destination.texture, copies[1].destination.texture);
+  const entry = f.owner.capture(destination);
+  assert.equal(entry.references, 0);
+  f.owner.withNativeTextures(destination.textures.map(texture => f.owner.captureNativeTexture(texture)), () => {});
+  assert.equal(f.submissions.length, 3, 'later sampling cannot reinterpret either copied generation flag');
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
 });
 
 test('MRT retirement and partial allocation failure release every color and shared depth exactly once', async () => {

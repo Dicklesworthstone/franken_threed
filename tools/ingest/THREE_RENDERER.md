@@ -469,6 +469,29 @@ events, 14 framebuffer copies and 35 direct draws match, with zero GPU/browser
 errors and the owned `general-webgpu` route. Hardware performance remains
 unmeasured.
 
+## Native multiple-render-target mip chains
+
+Native single-sample 2D targets can render and sample mip chains on multiple
+color attachments. Each attachment retains its own format, allocated mip count,
+sampler and generation policy. Rendering an authored level binds that level on
+every color and requires it to exist on every attachment; sampling, copies and
+readback select the requested attachment's own levels.
+
+Source `generateMipmaps` flags are captured per accepted render or texture copy.
+Only the selected colors regenerate after that operation. Clear-only calls keep
+lower levels intact, and changing a generation flag does not replace initialized
+storage or erase other attachments. Copies into a generated level-zero color
+complete its pyramid before subsequent consumers. Per-level depth attachments,
+queued generation ownership and allocation overlap remain within the existing
+resource budgets.
+
+`native_mrt_mips.mjs` compares mixed sRGB-byte, linear-byte and half-float targets
+with pinned r186, including authored overwrites, independent queued generation,
+clear history, explicit LOD sampling and unequal color mip counts. Chromium
+151.0.7922.34 / SwiftShader matches the stored and sampled texels exactly with
+zero GPU/browser errors. This profile does not yet add MRT mip pyramids to
+multisampled, layered, volume or WebGL-authored targets.
+
 ## Registered native output color spaces
 
 The native `WebGPURenderer` route accepts output spaces registered through the

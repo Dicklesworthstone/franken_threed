@@ -1133,6 +1133,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
             : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
+          generateColorMipmaps: !this._shaderEncodedOutput && !clearOnly && target?.textures.length > 1
+            ? target.textures.flatMap((texture, index) => texture.generateMipmaps ? [index] : []) : null,
           linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
           hdr: !target && this._wantsHdr(this._toneMapping()),
           srgbView: target ? false : this._canvasSrgbView(outputProfile?.space ?? this.outputColorSpace,
@@ -1369,7 +1371,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1412,7 +1414,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               (!this._shaderEncodedOutput && destination.shape.sharedDepth ||
                 outputPass && sourceTarget !== null && !copiedDepth);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps});
+            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth && (!destination.shape.sharedDepth || !clearOnly))

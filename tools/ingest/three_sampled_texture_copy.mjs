@@ -31,7 +31,8 @@ function captureDestination(renderer, texture, level) {
   const color = entry.shape.colors[colorIndex];
   // CubeCamera can toggle generation without changing the native allocation.
   // Capture this call's policy; authored faces share its six array layers.
-  const generateMipmaps = entry.shape.cube ? texture.generateMipmaps : color.generateMipmaps;
+  const generateMipmaps = entry.shape.cube || !renderer._shaderEncodedOutput && entry.shape.textures.length > 1
+    ? texture.generateMipmaps : color.generateMipmaps;
   if (entry.shape.cube && generateMipmaps !== false)
     fail('LEVEL', 'Cube destinations require an authored, non-generated mip chain');
   // Authored chains already belong to the target's native allocation. The
@@ -69,7 +70,8 @@ function captureDestination(renderer, texture, level) {
           fail('LIMIT', 'Destination target exceeds the device texture array layer limit');
       }
     },
-    withTexture: (run, validation) => targets.withNativeColorDestination(source, run, {validation}),
+    withTexture: (run, validation) => targets.withNativeColorDestination(source, run, {validation,
+      generateMipmaps: entry.shape.textures.length > 1 && level === 0 && generateMipmaps === true}),
     release: targets.retainGeneration(entry)};
 }
 

@@ -91,7 +91,7 @@ function depthComparison(texture, three) {
   return compare;
 }
 
-function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null) {
+function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null, mipProfile = null) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const webglCube = target.isWebGLCubeRenderTarget === true;
   const webglArray = target.isWebGLArrayRenderTarget === true && texture?.isDataArrayTexture === true;
@@ -220,10 +220,10 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       fail('SAMPLER', 'Depth textures require nearest/linear filtering and anisotropy one');
     samplerDescriptor(depthTexture, three, 1);
   }
-  const generateMipmaps = texture.generateMipmaps;
+  const generateMipmaps = mipProfile?.generateMipmaps ?? texture.generateMipmaps;
   const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(width, height, volume ? layers : 1)));
   if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
-  const authoredMipLevelCount = texture.mipmaps?.length ?? 0;
+  const authoredMipLevelCount = mipProfile?.authoredMipLevelCount ?? texture.mipmaps?.length ?? 0;
   // WebGLTextures.setupRenderTarget counts the base image in an authored cube
   // chain. A partial chain with mip filtering is incomplete in GL, unlike a
   // WebGPU sampler clamped to the available levels. Admit complete chains only.
@@ -236,10 +236,10 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   // GL can allocate the pyramid later with generateMipmap. Reserve it now in
   // immutable WebGPU storage, but filter only at the captured source render
   // boundary (CubeCamera restores generation immediately before face 5).
-  const mipLevelCount = webglCube ? maximumMipLevels
+  const mipLevelCount = mipProfile?.mipLevelCount ?? (webglCube ? maximumMipLevels
     : cube && cubeMipLevelCount !== null ? cubeMipLevelCount
     : texture.mipmaps?.length ? texture.mipmaps.length + (cube ? 1 : 0)
-      : generateMipmaps ? maximumMipLevels : 1;
+      : generateMipmaps ? maximumMipLevels : 1);
   if (!positive(mipLevelCount) || mipLevelCount > maximumMipLevels)
     fail('SIZE', 'Invalid target mip count for its extent');
   const texelBytes = format === 'r8unorm' ? 1 : format === 'r16float' ? 2 : format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
@@ -260,28 +260,32 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy})} : {}),
     cube, webglCube, webglArray, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
-    ...(cube ? {sourceVersion: texture.version} : {}),
+    sourceVersion: texture.version,
     depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
     key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
 }
 
-export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
+export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null, colorMipProfiles = null} = {}) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   if (!Array.isArray(target.textures) || !target.textures.length || target.textures.length > 8 ||
       new Set(target.textures).size !== target.textures.length || target.texture !== target.textures[0])
     fail('SOURCE', 'Expected one to eight distinct target-owned color attachments');
-  const colors = target.textures.map(texture => inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount)), primary = colors[0];
-  if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1)))
-    fail('UNSUPPORTED', 'Multiple color attachments currently require 2D mip-zero targets');
+  const colors = target.textures.map((texture, index) => inspectThreeRenderTargetColor(target, three, texture,
+    cubeMipLevelCount, colorMipProfiles?.[index])), primary = colors[0];
+  if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1) &&
+      (primary.array || primary.volume || primary.sampleCount !== 1)))
+    fail('UNSUPPORTED', 'Multiple color mip pyramids require single-sample 2D targets');
   const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes * (color.sampleCount === 4 ? 5 : 1), 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {...primary, colors, textures: colors.map(color => color.texture), colorFormats: colors.map(color => color.format), bytes,
+    colorMipLevelCounts: colors.map(color => color.mipLevelCount), colorGenerateMipmaps: colors.map(color => color.generateMipmaps),
     key: colors.map(color => color.key).join('|')};
 }
 
 /** Validate a destination before any GPU allocation or queued submission. */
 export function inspectThreeRenderTargetMip(shape, mipLevel = 0, face = 0, {webgl = false, generateMipmaps = shape.generateMipmaps} = {}) {
-  if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= shape.mipLevelCount)
+  if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 ||
+      (shape.colorMipLevelCounts ?? [shape.mipLevelCount]).some(count => mipLevel >= count))
     fail('MIP', 'Render mip level is not allocated');
   if ((webgl || shape.webglCube) && mipLevel > 0) {
     // r186 WebGL uses a depthless scratch framebuffer for higher levels. The
@@ -440,7 +444,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       : entry.target.width === resize.width && entry.target.height === resize.height);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
         matchesSize && entry.target.depth === resize.depth) {
-      const shape = resize.shape ??= inspectThreeRenderTarget(entry.target, three);
+      const shape = resize.shape ??= sourceShape(entry.target, entry);
       if ((entry.historyGroup ? shape.textures.every((texture, index) => entry.historyGroup.pairs[index]?.includes(texture)) : sameColors(shape, entry.shape)) && shape.depthTexture === entry.shape.depthTexture &&
           shape.depthFormat === entry.shape.depthFormat &&
           shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
@@ -472,6 +476,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
     if (entry.shape.cube) entry.cubeInitialized = true;
+    if (!flipY && entry.shape.textures.length > 1) entry.mrtInitialized = true;
     let held = true;
     return () => {
       if (!held) return;
@@ -484,11 +489,25 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // update. Selection/layout queries alone have not initialized that image.
     const frozen = entry?.alive && entry.shape.cube && !entry.shape.webglCube && (entry.cubeInitialized || entry.storage) &&
       entry.shape.texture === target.texture && entry.shape.sourceVersion === target.texture.version;
-    return inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null});
+    const nativeMrt = !flipY && target.textures?.length > 1 && !nativePasses.has(target);
+    const frozenMrt = nativeMrt && entry?.alive && (entry.mrtInitialized || entry.storage) &&
+      entry.shape.width === (target.width || 1) && entry.shape.height === (target.height || 1) &&
+      entry.shape.sampleCount === (target.samples === 4 ? 4 : 1) && entry.shape.textures.length === target.textures.length &&
+      entry.shape.colors.every((color, index) => color.texture === target.textures[index] && color.sourceVersion === color.texture.version);
+    const shape = inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null,
+      colorMipProfiles: frozenMrt ? entry.shape.colors : null});
+    // The source keeps each initialized image's mip allocation until its texture
+    // version changes. Per-render generation flags are separately captured by
+    // the facade; editing a flag must not replace previous rendered contents.
+    if (nativeMrt && shape.colors.some(color => color.mipLevelCount > 1))
+      shape.key += `/mipVersions/${shape.colors.map(color => color.sourceVersion).join(',')}`;
+    return shape;
   }
   function capture(target, {initialize = false} = {}) {
     live();
     const shape = sourceShape(target);
+    if (flipY && shape.textures.length > 1 && shape.colors.some(color => color.mipLevelCount > 1 || color.generateMipmaps))
+      fail('UNSUPPORTED', 'MRT mip pyramids currently require the native WebGPU renderer surface');
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
       const owner = ownedColorTargets.get(texture);
       if (owner && owner !== target && owner.textures.includes(texture))
@@ -521,10 +540,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry && (!sameShape(entry.shape, shape) || entry.depthEntry && !entry.depthEntry.alive)) { retire(entry); entry = null; }
     if (entry) {
       if (initialize && shape.cube) entry.cubeInitialized = true;
+      if (initialize && !flipY && shape.textures.length > 1) entry.mrtInitialized = true;
       return entry;
     }
     entry = createEntry(target, shape);
     entry.cubeInitialized = initialize && shape.cube;
+    entry.mrtInitialized = initialize && !flipY && shape.textures.length > 1;
     entries.set(target, entry);
     return entry;
   }
@@ -664,7 +685,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     prepareDepthTexture(entry);
-    const {width, height, format, colorFormats, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
+    const {width, height, format, colorFormats, colorMipLevelCounts, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
+    const nativeMrt = !flipY && colorFormats.length > 1;
+    const mipOptions = nativeMrt ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
     const depthOptions = depthEntry ? entry.shape.depthAttachment
       ? {depthSource: depthEntry.storage} : {depthFormat: null, sampleDepth: false} : {};
     if (group) {
@@ -675,7 +698,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       allocatedBytes += needed - group.charged; group.charged = needed;
       entry.storage = group.storage.selectColorSlots(entry.colorSlots);
     } else {
-      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube ? false : generateMipmaps, mipLevelCount,
+      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube || nativeMrt ? false : generateMipmaps, mipLevelCount, ...mipOptions,
         sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
       entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     }
@@ -683,7 +706,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // original attachment, not the UV-oriented sampling replica.
     entry.session = {device, get width() { return width; }, get height() { return height; },
       get disposed() { return !entry.alive; }, get failed() { return !!entry.error || !!entry.storage?.failed; },
-      get diagnostics() { return {target: {format, colorFormats, mipLevelCount, cube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers}}; },
+      get diagnostics() { return {target: {format, colorFormats, mipLevelCount, colorMipLevelCounts, cube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers}}; },
       get validation() { assertCurrent(entry); return Promise.all([entry.validation, entry.storage.validation]); },
       withTexture(callback, options) {
         assertCurrent(entry);
@@ -712,7 +735,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(samplerState, three, shape.mipLevelCount);
-    if (shape.cube && !shape.webglCube || shape.volume) {
+    if (shape.cube && !shape.webglCube || shape.volume || !flipY && entry.shape.textures.length > 1) {
       // Native source samplers retain explicit LOD access even for ordinary
       // LinearFilter/NearestFilter; only their mip interpolation is nearest.
       // WebGL cube replicas retain the source's base-only minification clamp.
@@ -1143,8 +1166,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Cube colors are the same six-layer native allocation: the caller's checked
     // copy origin/range selects faces, never the renderer's active face or a view.
     // As with face-aware copyColor, cube mip generation stays source-ordered.
-    withNativeColorDestination(source, callback, {validation} = {}) {
+    withNativeColorDestination(source, callback, {validation, generateMipmaps = false} = {}) {
       if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
+      if (typeof generateMipmaps !== 'boolean') fail('MIP', 'Native copy generation must be a captured boolean');
       this.validateNativeTextures([source]);
       const {entry, colorIndex} = source;
       if (source.depth || entry.shape.sampleCount !== 1)
@@ -1153,9 +1177,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       entry.busy = true;
       if (colorIndex === 0) entry.dirty = true;
       try {
-        return entry.storage.withColorDestination(native => {
+        const result = entry.storage.withColorDestination(native => {
           const result = callback(native); assertCurrent(entry); return result;
         }, {colorIndex, validation});
+        // Pinned copyTextureToTexture filters a generated level-zero destination
+        // after the raw copy. Only that selected color becomes a new pyramid.
+        if (generateMipmaps) entry.storage.generateMipmaps([colorIndex]);
+        return result;
       } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
     },
     writePixels(entry, data, options = {}) {
@@ -1172,8 +1200,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
-    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false} = {}) {
+    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
+      if (generateColorMipmaps !== null && (!Array.isArray(generateColorMipmaps) ||
+          generateColorMipmaps.some(index => !Number.isSafeInteger(index) || index < 0 || index >= entry.shape.textures.length) ||
+          new Set(generateColorMipmaps).size !== generateColorMipmaps.length))
+        fail('MIP', 'MRT generation requires distinct captured color attachment indices');
       ensure(entry);
       const group = entry.historyGroup;
       const borrowed = group?.readBorrow;
@@ -1211,6 +1243,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (entry.shape.cube && generateMipmaps) {
           entry.storage.generateMipmaps(); entry.cubeMipReady = true;
         }
+        if (generateColorMipmaps !== null) entry.storage.generateMipmaps(generateColorMipmaps);
         return result;
       }
       finally {

@@ -157,7 +157,8 @@ export function createThreeComputeTargets({targets, device, signal = null,
       if (!texture) fail('BORROW', 'The native source has not been borrowed');
       let view = views.get(texture);
       if (!view) {
-        view = native(() => texture.createView({dimension: source.viewDimension, baseMipLevel: 0, mipLevelCount: source.depth ? 1 : source.entry.shape.mipLevelCount,
+        view = native(() => texture.createView({dimension: source.viewDimension, baseMipLevel: 0,
+          mipLevelCount: source.depth ? 1 : source.entry.shape.colors[source.colorIndex].mipLevelCount,
           ...(['cube', '2d-array'].includes(source.viewDimension) ? {baseArrayLayer: 0,
             arrayLayerCount: source.depth ? source.entry.shape.depthLayers ?? source.entry.shape.layers : source.entry.shape.layers} : {}),
           ...(source.depth ? {aspect: 'depth-only'} : {})}));

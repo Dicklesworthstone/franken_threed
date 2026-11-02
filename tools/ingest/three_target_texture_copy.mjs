@@ -19,9 +19,10 @@ function targetColor(renderer, texture, retain) {
   // a cube sampler, source-face permutation, CPU upload or UV-flipped replica.
   const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1,
     viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension,
-    // CubeCamera can toggle this flag without replacing the allocation. Capture
-    // this use's policy, not an earlier entry's temporary generation setting.
-    ...(entry.shape.cube ? {generateMipmaps: texture.generateMipmaps} : {})};
+    // CubeCamera and native MRT colors can change this flag while retaining
+    // their allocation. Capture this call's policy independently of its mips.
+    ...(entry.shape.cube || !renderer._shaderEncodedOutput && entry.shape.textures.length > 1
+      ? {generateMipmaps: texture.generateMipmaps} : {})};
   const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
   return {entry, shape, source,
     check() {
@@ -120,7 +121,8 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
           const commands = encoder.finish();
           destination.check(); storage.assertCurrent(source); checkRenderer(renderer, device);
           device.queue.submit([commands]);
-        }, {validation}));
+        }, {validation, generateMipmaps: destination.entry.shape.textures.length > 1 &&
+          destinationLevel === 0 && destination.shape.generateMipmaps === true}));
         resolve(storage.validation);
         return true;
       } catch (error) { reject(error); throw error; }
@@ -190,7 +192,8 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
               const commands = encoder.finish();
               checkRenderer(renderer, device); source.check(); destination.check();
               device.queue.submit([commands]);
-            }, {validation}));
+            }, {validation, generateMipmaps: destination.entry.shape.textures.length > 1 &&
+              destinationLevel === 0 && destination.shape.generateMipmaps === true}));
           // Snapshot after the source borrow (including generated source mips),
           // before a subsequent reverse copy can depend on this destination.
           resolve(Promise.all([source.entry.validation, source.entry.storage.validation]));

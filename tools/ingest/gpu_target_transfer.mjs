@@ -87,10 +87,10 @@ export function inspectGpuTargetWrite(shape, data, value = {}) {
   const {colorIndex = 0, destinationMipLevel = 0} = value;
   const [Type, components, bgra] = layout(shape, colorIndex), pixelBytes = Type.BYTES_PER_ELEMENT * components;
   integer(destinationMipLevel, 'Destination mip level');
-  const mipLevelCount = shape.mipLevelCount ?? 1;
+  const mipLevelCount = shape.colorMipLevelCounts?.[colorIndex] ?? shape.mipLevelCount ?? 1;
   if (!Number.isSafeInteger(mipLevelCount) || mipLevelCount < 1 || destinationMipLevel >= mipLevelCount)
     fail('REGION', 'Destination mip level is not allocated');
-  if (destinationMipLevel > 0 && shape.generateMipmaps !== false)
+  if (destinationMipLevel > 0 && (shape.colorGenerateMipmaps?.[colorIndex] ?? shape.generateMipmaps) !== false)
     fail('MIP', 'Nonzero upload destinations require authored, non-generated mip levels');
   const divisor = 2 ** destinationMipLevel;
   const mipWidth = shape.width === 0 ? 0 : Math.max(1, Math.floor(shape.width / divisor));
@@ -154,12 +154,13 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
     maxBytes = 64 * 1024 * 1024} = value;
   integer(sourceMipLevel, 'Source mip level');
   integer(destinationMipLevel, 'Destination mip level');
-  if (!Number.isSafeInteger(source.mipLevelCount) || source.mipLevelCount < 1 || sourceMipLevel >= source.mipLevelCount)
+  const sourceLevels = source.colorMipLevelCounts?.[sourceColorIndex] ?? source.mipLevelCount;
+  if (!Number.isSafeInteger(sourceLevels) || sourceLevels < 1 || sourceMipLevel >= sourceLevels)
     fail('REGION', 'Source mip level is not allocated');
-  const destinationLevels = destination.mipLevelCount ?? 1;
+  const destinationLevels = destination.colorMipLevelCounts?.[colorIndex] ?? destination.mipLevelCount ?? 1;
   if (!Number.isSafeInteger(destinationLevels) || destinationLevels < 1 || destinationMipLevel >= destinationLevels)
     fail('REGION', 'Destination mip level is not allocated');
-  if (destinationMipLevel > 0 && destination.generateMipmaps !== false)
+  if (destinationMipLevel > 0 && (destination.colorGenerateMipmaps?.[colorIndex] ?? destination.generateMipmaps) !== false)
     fail('MIP', 'Nonzero copy destinations require authored, non-generated mip levels');
   const sourceFace = transferFace(source, value.sourceFace, 'sourceFace', sourceMipLevel);
   const face = transferFace(destination, value.face, 'face', destinationMipLevel);

@@ -72,6 +72,26 @@ test('NPOT mip uses its allocated dimensions and submits before the first await'
   assert.ok(f.buffers.every(buffer => buffer.destroyed && buffer.unmapped));
 });
 
+test('native MRT reads select the attachment mip count and retain it through resize', async () => {
+  const f = fixture({pending: true});
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  const create = f.device.createTexture;
+  f.device.createTexture = descriptor => Object.assign(create(descriptor), {format: descriptor.format});
+  const target = createGpuRenderTarget(f.device, {width: 9, height: 7, depthFormat: null,
+    colorFormats: ['rgba8unorm', 'rgba8unorm'], colorMipLevelCounts: [1, 4]});
+  await assert.rejects(target.readPixels({mipLevel: 3, colorIndex: 0}), {code: 'GPU_READBACK_REGION'});
+  assert.equal(f.copies.length, 0);
+  const result = target.readPixels({mipLevel: 3, colorIndex: 1});
+  assert.equal(f.copies.length, 1);
+  assert.equal(f.copies[0].source.texture, f.textures[1]);
+  assert.equal(f.copies[0].source.mipLevel, 3);
+  assert.deepEqual(f.copies[0].size, {width: 1, height: 1, depthOrArrayLayers: 1});
+  target.resize(18, 14); f.complete();
+  assert.deepEqual([...await result], [120, 121, 122, 123]);
+  await target.whenIdle(); target.dispose();
+  assert.ok(f.textures.every(texture => texture.destroyed));
+});
+
 test('flipY transforms mip-local source coordinates and output rows', async () => {
   const f = fixture({width: 17, height: 15, mipLevelCount: 5});
   const output = new Uint8Array(32).fill(255), view = output.subarray(4, 24);

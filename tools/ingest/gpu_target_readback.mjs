@@ -92,7 +92,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
   const diagnostics = session.diagnostics;
   const shape = diagnostics?.target ?? diagnostics;
   const format = gpuTargetColorFormat(shape, colorIndex, fail);
-  let mipLevelCount = diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
+  let mipLevelCount = shape?.colorMipLevelCounts?.[colorIndex] ?? diagnostics?.target?.mipLevelCount ?? diagnostics?.mipLevelCount ?? session.mipLevelCount ?? 1;
   // Suspended owners have no allocation, but still admit an empty base-level read.
   if (mipLevelCount === 0 && (session.width === 0 || session.height === 0)) mipLevelCount = 1;
   const maxMipLevels = session.width && session.height
