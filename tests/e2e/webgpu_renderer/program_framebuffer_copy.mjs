@@ -183,6 +183,11 @@ async function capture(mode) {
           sampleArray(layered.texture, 2, 2);await read('array-sampled-other-mip');
           sampleArray(layered.texture, 2, 0);await read('array-sampled-base');
           sampleArray(layered.texture, 2, 5);await read('array-sampled-last-mip');
+          // Render-target samplers are installed by setupRenderTarget. Source
+          // setTexture2DArray skips their later needsUpdate uploads entirely.
+          layered.texture.minFilter = T.NearestFilter;layered.texture.needsUpdate = true;
+          sampleArray(layered.texture, 2, 2);await read('array-sampled-sampler-edit-ignored');
+          layered.texture.minFilter = T.NearestMipmapNearestFilter;
           sampleArray(array.texture, 2, 3);await read('array-sampled-nonmip-filter');
           writeLayer(1, 1, 1);sampleArray(layered.texture, 1, 1);await read('array-sampled-rewritten-layer');
           const generated = new T.WebGLArrayRenderTarget(width, height, 3, {depthBuffer: false,
@@ -286,7 +291,8 @@ try {
     ['array-authored-mip-initial', false], ['array-authored-mip-updated', true],
     ['array-authored-mip-sibling', false], ['array-authored-other-mip', false], ['array-authored-base-preserved', true],
     ['array-sampled-mip-updated', true], ['array-sampled-mip-sibling', false], ['array-sampled-other-mip', false],
-    ['array-sampled-base', true], ['array-sampled-nonmip-filter', false], ['array-sampled-rewritten-layer', true],
+    ['array-sampled-base', true], ['array-sampled-sampler-edit-ignored', false],
+    ['array-sampled-nonmip-filter', false], ['array-sampled-rewritten-layer', true],
     ['array-sampled-generated-mip', false], ['array-sampled-resized', false], ['array-sampled-recreated', true],
     ['half-float-destination', false], ['initialization-retarget', true], ['draw-before-copy', false], ['draw-after-copy', true],
   ]) for (let index = 0; index < corners.length; index++) {

@@ -93,10 +93,15 @@ for (const authored of [false, true]) test(`WebGL array sampling orients every l
   assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 1);
   f.owner.render(entry, () => {}, {face: 1, mipLevel: authored ? 1 : 0});
   assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 2);
-  source.texture.minFilter = THREE.LinearFilter;
-  assert.equal(bindings.get(source.texture).sampler.lodMaxClamp, 0, 'source nonmip filters clamp explicit LOD');
-  assert.equal(entry.copies, 2, 'sampler edits retain the oriented image');
+  source.texture.minFilter = THREE.LinearFilter; source.texture.wrapS = THREE.RepeatWrapping;
+  source.texture.needsUpdate = true;
+  assert.equal(bindings.get(source.texture).sampler, binding.sampler, 'source render-target sampling ignores edits until recreation');
+  assert.equal(entry.copies, 2, 'GPU-invisible sampler edits retain the oriented image');
   assert.throws(() => f.owner.bindingsFor(source).get(source.texture), {code: 'THREE_TARGET_FEEDBACK'});
+  source.dispose(); f.owner.capture(source);
+  const recreated = bindings.get(source.texture);
+  assert.equal(recreated.sampler.lodMaxClamp, 0); assert.equal(recreated.sampler.addressModeU, 'repeat');
+  assert.notEqual(recreated.view, binding.view);
   assert.equal(source.texture.renderTarget, null); await f.owner.whenIdle();
 });
 

@@ -256,6 +256,8 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
+    ...(webglArray ? {webglSampler: Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
+      wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy})} : {}),
     cube, webglCube, webglArray, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
@@ -704,24 +706,24 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (error) { terminal ??= error; entry.error = error; retire(entry); throw error; }
     return result;
   }
-  function colorSampler(entry, texture) {
+  function colorSampler(entry, texture, samplerState = texture) {
     const device = getDevice();
     const shape = entry.shape.colors[entry.shape.textures.indexOf(texture)];
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
-    const descriptor = samplerDescriptor(texture, three, shape.mipLevelCount);
+    const descriptor = samplerDescriptor(samplerState, three, shape.mipLevelCount);
     if (shape.cube && !shape.webglCube || shape.volume) {
       // Native source samplers retain explicit LOD access even for ordinary
       // LinearFilter/NearestFilter; only their mip interpolation is nearest.
       // WebGL cube replicas retain the source's base-only minification clamp.
       descriptor.lodMaxClamp = shape.mipLevelCount - 1;
-      if ([three.NearestFilter, three.LinearFilter].includes(texture.minFilter)) {
+      if ([three.NearestFilter, three.LinearFilter].includes(samplerState.minFilter)) {
         descriptor.mipmapFilter = 'nearest'; descriptor.maxAnisotropy = 1;
       }
     }
     if (!filterable) {
-      if (texture.magFilter !== three.NearestFilter ||
-          (texture.minFilter !== three.NearestFilter && texture.minFilter !== three.NearestMipmapNearestFilter))
+      if (samplerState.magFilter !== three.NearestFilter ||
+          (samplerState.minFilter !== three.NearestFilter && samplerState.minFilter !== three.NearestMipmapNearestFilter))
         fail('SAMPLER', 'Linear float32 color sampling requires the device float32-filterable feature');
       // A non-filtering sampler must use nearest for all three filters, even
       // when the mip filter is inactive because lodMaxClamp is zero.
@@ -736,9 +738,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
-    const {descriptor, sampleType} = colorSampler(entry, texture);
+    // Source setTexture2DArray skips uploads for render-target textures, even
+    // after needsUpdate. Their setup sampler survives until target recreation.
+    const samplerState = entry.shape.webglSampler ?? texture;
+    const {descriptor, sampleType} = colorSampler(entry, texture, samplerState);
     if (entry.shape.webglArray && entry.shape.mipLevelCount !== entry.shape.maximumMipLevels &&
-        ![three.NearestFilter, three.LinearFilter].includes(texture.minFilter))
+        ![three.NearestFilter, three.LinearFilter].includes(samplerState.minFilter))
       fail('UNSUPPORTED', 'Mip-filtered WebGL arrays require a complete source mip chain');
     if (entry.shape.webglCube && descriptor.lodMaxClamp > 0 && !entry.cubeMipReady)
       fail('UNSUPPORTED', 'Mip-filtered WebGL cubes require a completed source mip generation');
