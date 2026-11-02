@@ -144,8 +144,10 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
   if (!targets || !device) fail('DEVICE', 'Initialize the renderer and its target owner before copying');
   return captureTextureCopy(renderer, retain => {
     const source = captureTargetColor(renderer, texture, retain), destination = captureTargetColor(renderer, destinationTexture, retain);
-    if (source.entry === destination.entry || source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup)
-      fail('FEEDBACK', 'In-place target color copies are not admitted');
+    const sameOwner = source.entry === destination.entry ||
+      !!source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup;
+    if (sameOwner && (texture === destinationTexture || source.shape.viewDimension !== '2d' || destination.shape.viewDimension !== '2d'))
+      fail('FEEDBACK', 'Copies within one target require distinct ordinary 2D color images');
     if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
       fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Target color copies require a single-sample destination');
@@ -179,6 +181,13 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       // Admit the combined allocation, not two individually affordable owners.
       // No layer may be written before all destination extents/budgets pass.
       targets.validateNativeTextures([source.source, destination.source]);
+      if (sameOwner) {
+        // A single owner submits both selected images under one native lock.
+        // Joining a deferred destination dependency back to this same source
+        // would create a validation cycle; copyColor already owns both checks.
+        return targets.copyColor(source.entry, destination.entry, {...step(0), destinationMipLevel: destinationLevel},
+          {generateMipmaps: destination.shape.generateMipmaps === true});
+      }
       if (!destination.entry.shape.cube || destinationLevel !== 0) {
         // One native copy covers every contiguous layer/slice. The destination
         // borrow marks the same level-zero mip chain and sampling replica dirty

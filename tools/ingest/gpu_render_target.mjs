@@ -814,7 +814,7 @@ export function createGpuRenderTarget(device, options = {}) {
         readPixels: {value: (options = {}) => api.readPixels(options, selected)},
         copyFrom: {value: (source, options = {}) => api.copyFrom(source, options, selected)},
       });
-      transferTargets.set(view, {...transferTargets.get(api),
+      transferTargets.set(view, {...transferTargets.get(api), colorSlots: selected,
         borrow: (callback, colorIndex = 0) => borrow(callback, 'color', 0, 0, colorIndex, selected)});
       return view;
     },
@@ -851,20 +851,34 @@ export function createGpuRenderTarget(device, options = {}) {
       const other = transferTargets.get(source);
       if (!other) fail('SOURCE', 'Expected a native render target handle');
       if (other.device !== device) fail('DEVICE', 'Target copies require the same GPUDevice');
-      if (other.owner === api) fail('FEEDBACK', 'In-place target copies are not admitted');
       other.exclusive();
       const plan = inspectGpuTargetCopy(other.shape(), transferShape(), options);
+      const sameOwner = other.owner === api;
+      if (sameOwner && plan.sourceColorIndex === plan.colorIndex &&
+          (other.colorSlots?.[plan.sourceColorIndex] ?? 0) === slots[plan.colorIndex])
+        fail('FEEDBACK', 'Copies cannot read and write the same color image');
       if (plan.empty) return false;
       busy = true;
       try {
         const texture = colorTexture(current, plan.colorIndex, slots);
-        current.used = true; current.mipsDirty.add(texture);
-        other.borrow(sourceTexture => checked(() => {
-          const encoder = device.createCommandEncoder({label: label + ' color copy'});
-          encoder.copyTextureToTexture({texture: sourceTexture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
-            {texture, mipLevel: plan.destinationMipLevel, origin: plan.destinationOrigin}, plan.size);
-          device.queue.submit([encoder.finish()]);
-        }), plan.sourceColorIndex);
+        current.used = true;
+        const copy = sourceTexture => {
+          if (sourceTexture === texture) fail('FEEDBACK', 'Copies cannot read and write the same color image');
+          current.mipsDirty.add(texture);
+          checked(() => {
+            const encoder = device.createCommandEncoder({label: label + ' color copy'});
+            encoder.copyTextureToTexture({texture: sourceTexture, mipLevel: plan.sourceMipLevel, origin: plan.sourceOrigin},
+              {texture, mipLevel: plan.destinationMipLevel, origin: plan.destinationOrigin}, plan.size);
+            device.queue.submit([encoder.finish()]);
+          });
+        };
+        if (sameOwner) {
+          // Shared allocation views retain independent physical history slots.
+          // Refresh the selected source under this one lock, before dirtying
+          // the destination; borrowing the same owner again would reenter it.
+          refreshMips(current, null, false, [plan.sourceColorIndex], other.colorSlots);
+          copy(colorTexture(current, plan.sourceColorIndex, other.colorSlots));
+        } else other.borrow(copy, plan.sourceColorIndex);
         // A source mip-generation/upload error must also fail the dependent
         // copy, even if its own copy error scope happened to validate first.
         validation = Promise.all([validation, other.validation()]).then(() => {});

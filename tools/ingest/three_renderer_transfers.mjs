@@ -222,13 +222,14 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         live();
         const {value, signal} = options(supplied);
         const from = transferEntry(source), to = transferEntry(destination);
-        if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
         const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
+        if (from === to && plan.sourceColorIndex === plan.colorIndex)
+          fail('TRANSFER', 'Copies cannot read and write the same color image');
         assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
         const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
           sourceMipLevel: plan.sourceMipLevel, destinationMipLevel: plan.destinationMipLevel,
           sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
-        return schedule([from, to], signal, 0, () => () => renderer._targets.copyColor(from, to, copyOptions));
+        return schedule(from === to ? [from] : [from, to], signal, 0, () => () => renderer._targets.copyColor(from, to, copyOptions));
       } catch (error) { return Promise.reject(error); }
     },
   });
@@ -266,7 +267,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     const depth = source?.isDepthTexture === true || destination?.isDepthTexture === true;
     if (depth && (sourceLevel !== 0 || destinationLevel !== 0)) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
     const from = textureEntry(source, depth), to = textureEntry(destination, depth);
-    if (from === to) fail('TRANSFER', 'In-place render target copies are not admitted');
+    if (from === to && (depth || source === destination))
+      fail('TRANSFER', 'Copies cannot read and write the same target image');
     const value = {...(depth ? {} : {sourceMipLevel: sourceLevel, destinationMipLevel: destinationLevel,
       sourceColorIndex: (from.shape.textures ?? [source.renderTarget.texture]).indexOf(source),
       colorIndex: (to.shape.textures ?? [destination.renderTarget.texture]).indexOf(destination)}), flipY: renderer._bottomLeftOrigin === true,

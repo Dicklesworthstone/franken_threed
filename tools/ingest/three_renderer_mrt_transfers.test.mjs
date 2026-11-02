@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readGpuTargetPixels} from './gpu_target_readback.mjs';
+import {captureTargetColorCopy} from './three_target_texture_copy.mjs';
+import {submitTextureCopy} from './three_texture_copy_lifetime.mjs';
+import {targetDevice} from './fixtures/target_residency_fixture.mjs';
 import {withThreeNativeCapture} from './three_node_shadows.mjs';
 import {fixture, target, payload, formats, T, deferred, flush, bytes} from './fixtures/mrt_renderer_transfer_fixture.mjs';
 
@@ -51,7 +54,7 @@ test('void and delegated texture copies share the owner, and incompatible second
   await f.controller.copyTexture(source.textures[1], destination.textures[2]);
   assert.equal(f.copies.length, 2);
   assert.throws(() => r.copyTextureToTexture(source.textures[1], destination.textures[1]), {code: 'GPU_TRANSFER_FORMAT'});
-  assert.throws(() => r.copyTextureToTexture(source.textures[1], source.textures[2]), {code: 'F3D_RENDERER_TRANSFER'});
+  assert.throws(() => r.copyTextureToTexture(source.textures[1], source.textures[2]), {code: 'GPU_TRANSFER_FORMAT'});
   assert.throws(() => r.copyTextureToTexture(source.textures[1], destination.textures[2], null, null, 0, 1), {code: 'GPU_TRANSFER_REGION'});
   const impostor = Object.assign(new T.Texture(), {isRenderTargetTexture: true, renderTarget: source});
   assert.throws(() => r.copyTextureToTexture(impostor, destination.textures[2]), {code: 'F3D_RENDERER_UNSUPPORTED'});
@@ -373,4 +376,187 @@ test('legacy single-color mip metadata and depth admission remain independent of
   assert.equal(f.reads[0].source.mipLevel, 2);
   assert.deepEqual([f.reads[0].size.width, f.reads[0].size.height], [2, 1]);
   assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0); f.close();
+});
+
+for (const format of formats) for (const gl of [false, true])
+  test(`same MRT ${format}/${gl}: selected copies preserve FIFO bytes and fit one allocation`, async () => {
+    const pixelBytes = payload(format, 1).byteLength;
+    const f = fixture({gl, ownerBytes: 12 * (pixelBytes * 3 + 4)}), r = f.renderer;
+    const source = target([format, format, format]), input = payload(format), later = payload(format, 12, 53);
+    for (const texture of source.textures) texture.mipmaps = [];
+    const initial = bytes(input).slice(), final = bytes(later).slice(), expected = new Uint8Array(input.byteLength);
+    for (let y = 0; y < 2; y++) expected.set(initial.subarray((y * 4 + 1) * pixelBytes,
+      (y * 4 + 3) * pixelBytes), (y + 1) * 4 * pixelBytes);
+    const options = {sourceColorIndex: 1, colorIndex: 2, sourceX: 1, sourceY: 0, x: 0, y: 1, width: 2, height: 2};
+    const write = r.writeRenderTargetPixelsAsync(source, input, {colorIndex: 1});
+    const copy = r.copyRenderTargetPixelsAsync(source, source, options);
+    const read = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 2});
+    const overwrite = r.writeRenderTargetPixelsAsync(source, later, {colorIndex: 2});
+    options.sourceColorIndex = options.colorIndex = 0; options.width = 99; input.fill(0); later.fill(0);
+    const entry = f.owner.capture(source);
+    assert.equal(entry.references, 4); assert.equal(f.controller.pendingRequests, 4);
+    assert.equal(f.calls.textures.length, 0);
+    f.ready(); await Promise.all([write, copy, overwrite]);
+    assert.deepEqual(bytes(await read), expected);
+    assert.deepEqual(bytes(await r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1})), initial);
+    assert.deepEqual(bytes(await r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 2})), final);
+    assert.ok((await r.readRenderTargetMipPixelsAsync(source)).every(value => value === 0));
+    assert.notEqual(f.copies[0].source.texture, f.copies[0].destination.texture);
+    assert.equal(f.copies[0].source.origin.y, gl ? 1 : 0);
+    assert.equal(f.copies[0].destination.origin.y, gl ? 0 : 1);
+    assert.deepEqual(f.events.slice(0, 4), ['upload', 'copy', 'read', 'upload']);
+    assert.equal(f.owner.allocatedBytes, entry.shape.bytes); assert.equal(entry.references, 0);
+    assert.equal(f.controller.allocatedBytes, 0); f.close();
+  });
+
+test('same-target texture-shaped copies preserve copy-compatible sRGB bytes', async () => {
+  const f = fixture({initialized: true}), r = f.renderer, source = target(['rgba8unorm', 'rgba8unorm-srgb']);
+  const input = payload('rgba8unorm'); await r.writeRenderTargetPixelsAsync(source, input);
+  await r.copyTextureToTextureAsync(source.texture, source.textures[1]);
+  assert.deepEqual(bytes(await r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1})), bytes(input));
+  assert.equal(f.copies[0].source.texture.format, 'rgba8unorm');
+  assert.equal(f.copies[0].destination.texture.format, 'rgba8unorm-srgb'); f.close();
+});
+
+test('source-shaped same-owner copies capture independent authored mip rectangles', async () => {
+  const f = fixture({initialized: true}), r = f.renderer; r._device = f.device;
+  const source = target(['rgba8unorm', 'rgba16float', 'rgba16float'], {width: 13, height: 9});
+  source.textures[1].mipmaps = Array.from({length: 3}, () => ({}));
+  source.textures[2].mipmaps = Array.from({length: 4}, () => ({}));
+  const input = payload('rgba16float', 24), before = payload('rgba16float', 6, 31), expected = bytes(before).slice();
+  await r.writeRenderTargetPixelsAsync(source, input, {colorIndex: 1, destinationMipLevel: 1});
+  await r.writeRenderTargetPixelsAsync(source, before, {colorIndex: 2, destinationMipLevel: 2});
+  expected.set(bytes(input).subarray(7 * 8, 9 * 8), 4 * 8);
+  const region = {isBox2: true, min: {x: 1, y: 1}, max: {x: 3, y: 2}}, position = {isVector2: true, x: 1, y: 1};
+  r._preparing = true;
+  const request = captureTargetColorCopy(r, source.textures[1], source.textures[2], region, position, 1, 2);
+  submitTextureCopy(r, request, error => { r._deferredError = error; });
+  const read = r.readRenderTargetMipPixelsAsync(source, 2, {colorIndex: 2});
+  region.min.x = position.x = 99; region.max.y = 99;
+  r._preparing = null; f.drain();
+  assert.deepEqual(bytes(await read), expected); await f.owner.whenIdle();
+  assert.deepEqual([f.copies[0].source.mipLevel, f.copies[0].destination.mipLevel], [1, 2]);
+  assert.deepEqual(f.copies[0].size, {width: 2, height: 1, depthOrArrayLayers: 1});
+  assert.deepEqual(bytes(await r.readRenderTargetMipPixelsAsync(source, 1, {colorIndex: 1})), bytes(input));
+  assert.ok((await r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 2})).every(value => value === 0));
+  assert.equal(r._deferredError, null); f.close();
+});
+
+test('same-owner source copies retain current and previous physical color slots without validation cycles', async () => {
+  const f = fixture({initialized: true}), r = f.renderer; r._device = f.device;
+  const source = target(['rgba16float', 'rgba16float']), current = source.textures.slice();
+  const previous = current.map(texture => Object.assign(new T.Texture(), {
+    isRenderTargetTexture: true, renderTarget: source, type: texture.type, format: texture.format,
+    colorSpace: texture.colorSpace, minFilter: texture.minFilter, magFilter: texture.magFilter,
+  }));
+  const pass = {renderTarget: source, _textures: {a: current[0], b: current[1]},
+    _previousTextures: {a: previous[0], b: previous[1]}};
+  f.owner.registerNativePass(pass);
+  const first = payload('rgba16float', 12, 17), second = payload('rgba16float', 12, 43);
+  await r.writeRenderTargetPixelsAsync(source, first);
+  const entry = f.owner.capture(source); r._preparing = true;
+  submitTextureCopy(r, captureTargetColorCopy(r, current[0], current[1]), error => { r._deferredError = error; });
+  const oldRead = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  source.textures = previous.slice(); pass._textures = {a: previous[0], b: previous[1]};
+  pass._previousTextures = {a: current[0], b: current[1]}; f.owner.registerNativePass(pass);
+  const write = r.writeRenderTargetPixelsAsync(source, second);
+  submitTextureCopy(r, captureTargetColorCopy(r, previous[0], previous[1]), error => { r._deferredError = error; });
+  const newRead = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  submitTextureCopy(r, captureTargetColorCopy(r, current[0], previous[1]), error => { r._deferredError = error; });
+  const previousRead = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  r._preparing = null; f.drain(); await write;
+  assert.deepEqual(bytes(await oldRead), bytes(first)); assert.deepEqual(bytes(await newRead), bytes(second));
+  assert.deepEqual(bytes(await previousRead), bytes(first)); await f.owner.whenIdle();
+  assert.equal(f.copies[0].source.texture, f.copies[2].source.texture);
+  assert.equal(f.copies[1].destination.texture, f.copies[2].destination.texture);
+  assert.notEqual(f.copies[0].source.texture, f.copies[1].source.texture);
+  assert.notEqual(f.copies[0].destination.texture, f.copies[1].destination.texture);
+  const storage = entry.historyGroup.storage, a = storage.selectColorSlots([0, 0]), b = storage.selectColorSlots([0, 1]);
+  assert.throws(() => b.copyFrom(a), {code: 'GPU_TARGET_FEEDBACK'});
+  assert.equal(f.copies.length, 3); assert.equal(entry.references, 0);
+  assert.ok([...entry.historyGroup.entries].every(member => member.references === 0 && !member.busy));
+  assert.equal(entry.historyGroup.busy, false); assert.equal(r._deferredError, null); f.close();
+});
+
+test('same-owner source copies keep a queued generation alive across automatic resize', async () => {
+  const f = fixture({initialized: true}), r = f.renderer; r._device = f.device;
+  const source = target(['r32float', 'r32float']), input = payload('r32float');
+  await r.writeRenderTargetPixelsAsync(source, input); const entry = f.owner.capture(source);
+  r._preparing = true;
+  submitTextureCopy(r, captureTargetColorCopy(r, source.texture, source.textures[1]), error => { r._deferredError = error; });
+  const read = r.readRenderTargetMipPixelsAsync(source, 0, {colorIndex: 1});
+  assert.equal(entry.references, 2);
+  f.owner.withNativePassResize(source, 8, 6, () => source.setSize(8, 6));
+  const replacement = f.owner.capture(source); f.owner.ensure(replacement);
+  assert.notEqual(entry, replacement); assert.equal(entry.alive, true);
+  r._preparing = null; f.drain();
+  assert.deepEqual(bytes(await read), bytes(input)); await f.owner.whenIdle();
+  assert.equal(f.copies[0].source.texture.width, 4); assert.equal(f.copies[0].destination.texture.width, 4);
+  assert.equal(replacement.storage.width, 8); assert.equal(entry.alive, false);
+  assert.equal(entry.references, 0); assert.equal(r._deferredError, null); f.close();
+});
+
+test('same-image feedback and invalid selected copies reject before retaining or allocating', async () => {
+  const f = fixture({initialized: true}), r = f.renderer; r._device = f.device;
+  const source = target(['rgba16float', 'rgba16float']), entry = f.owner.capture(source);
+  await assert.rejects(r.copyRenderTargetPixelsAsync(source, source), {code: 'F3D_RENDERER_TRANSFER'});
+  await assert.rejects(r.copyTextureToTextureAsync(source.texture, source.texture), {code: 'F3D_RENDERER_TRANSFER'});
+  assert.throws(() => captureTargetColorCopy(r, source.texture, source.texture), {code: 'THREE_STORAGE_COPY_FEEDBACK'});
+  await assert.rejects(r.copyRenderTargetPixelsAsync(source, source, {colorIndex: 2}), {code: 'GPU_TRANSFER_ATTACHMENT'});
+  await assert.rejects(r.copyRenderTargetPixelsAsync(source, source, {colorIndex: 1, destinationMipLevel: 1}), {code: 'GPU_TRANSFER_REGION'});
+  assert.throws(() => f.owner.copyColor(entry, entry), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.throws(() => f.owner.copyColor(entry, entry, {colorIndex: 1}, {generateMipmaps: 1}), {code: 'THREE_TARGET_MIP'});
+  assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0);
+  assert.equal(f.calls.textures.length, 0); assert.equal(f.copies.length, 0); f.close();
+});
+
+test('cancelling a queued same-owner copy releases its single generation lease', async () => {
+  const f = fixture(), r = f.renderer, source = target(['rgba16float', 'rgba16float']);
+  const copy = r.copyRenderTargetPixelsAsync(source, source, {colorIndex: 1});
+  const refused = assert.rejects(copy, {code: 'THREE_TARGET_STALE'}), entry = f.owner.capture(source);
+  assert.equal(entry.references, 1); source.textures[1].dispose(); await refused;
+  assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0);
+  f.ready(); assert.equal(f.calls.textures.length, 0); assert.equal(f.copies.length, 0); f.close();
+});
+
+test('same-owner copies propagate native validation failures after synchronous submission', async () => {
+  const f = fixture({initialized: true}), r = f.renderer, source = target(['rgba16float', 'rgba16float']);
+  await r.initRenderTargetAsync(source);
+  f.controls.scopeError = {message: 'same-owner copy invalid'};
+  const copying = r.copyRenderTargetPixelsAsync(source, source, {colorIndex: 1});
+  assert.equal(f.copies.length, 1);
+  await assert.rejects(copying, /same-owner copy invalid/);
+  assert.equal(f.controller.pendingRequests, 0); assert.equal(f.controller.allocatedBytes, 0); f.close();
+});
+
+test('same-owner source copies capture destination mip generation independently of allocated history', async () => {
+  const f = fixture({initialized: true}), r = f.renderer; r._device = f.device;
+  const mip = targetDevice(), encode = f.device.createCommandEncoder;
+  f.device.createSampler = mip.device.createSampler; f.device.createRenderPipeline = mip.device.createRenderPipeline;
+  f.device.createCommandEncoder = () => {
+    const encoder = encode(), recording = mip.device.createCommandEncoder(), finish = encoder.finish;
+    encoder.beginRenderPass = recording.beginRenderPass;
+    encoder.finish = () => ({...finish(), passes: recording.finish().passes});
+    return encoder;
+  };
+  const source = target(['rgba8unorm', 'rgba8unorm'], {width: 4, height: 4});
+  source.textures.forEach(texture => { texture.generateMipmaps = true; });
+  await r.initRenderTargetAsync(source); const entry = f.owner.capture(source);
+  r._preparing = true;
+  submitTextureCopy(r, captureTargetColorCopy(r, source.texture, source.textures[1]), error => { r._deferredError = error; });
+  source.textures[1].generateMipmaps = false;
+  r._preparing = null; f.drain(); await f.owner.whenIdle();
+  const passes = () => f.calls.submissions.flatMap(batch => batch.flatMap(command => command.passes ?? []));
+  assert.equal(entry.storage.diagnostics.mipGenerations, 1); assert.equal(passes().length, 2);
+  assert.ok(passes().every(pass => pass.descriptor.colorAttachments[0].view.texture === f.copies[0].destination.texture));
+  assert.ok(passes().every(pass => pass.descriptor.colorAttachments[0].view.texture !== f.copies[0].source.texture));
+  r._preparing = true;
+  const region = {isBox2: true, min: {x: 0, y: 0}, max: {x: 2, y: 2}};
+  submitTextureCopy(r, captureTargetColorCopy(r, source.texture, source.textures[1], region, null, 0, 1),
+    error => { r._deferredError = error; });
+  source.textures[1].generateMipmaps = true;
+  r._preparing = null; f.drain(); await f.owner.whenIdle();
+  assert.equal(f.copies.length, 2); assert.equal(f.copies[1].destination.mipLevel, 1);
+  assert.equal(entry.storage.diagnostics.mipGenerations, 1); assert.equal(passes().length, 2);
+  assert.equal(entry.references, 0); assert.equal(r._deferredError, null); f.close();
 });

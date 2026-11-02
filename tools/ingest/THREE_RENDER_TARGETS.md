@@ -100,6 +100,41 @@ attachment flags; storage budgets include the history depth. Sampling that same
 target's depth while rendering its color still encounters the existing feedback
 restriction; TRAA uses separate resolve and history targets.
 
+### Copies between colors of one MRT target
+
+An ordinary 2D MRT target can copy between distinct, compatible color images
+through the existing public source or explicit transfer APIs:
+
+```js
+renderer.copyTextureToTexture(target.textures[0], target.textures[1]);
+// The explicit extension also selects cropped regions and authored mip levels.
+await renderer.copyRenderTargetPixelsAsync(target, target, {
+  sourceColorIndex: 0,
+  colorIndex: 1,
+});
+```
+
+The copy runs on the GPU under one native target lock. Its selected images,
+regions and mip levels are captured before queueing; later writes, history
+swaps and recognized automatic resizing retain the accepted generation. Current
+and previous PassNode images can participate independently, including different
+physical images at the same color index. Allocation preflight counts shared
+history storage once, and source-shaped copies preserve the destination's
+captured mip-generation policy.
+
+Feedback checks still reject reading and writing the same physical image,
+including aliases through selected history slots. Formats must be copy-compatible
+and the destination must be single-sample; compatible linear/sRGB copies preserve
+stored bits without color conversion. Same-image subresource copies remain
+outside this profile. The source-shaped same-owner route currently requires
+ordinary 2D colors; existing explicit face APIs retain their own admission rules.
+
+The MRT transfer tests compare exact copied bytes across six formats and both
+coordinate origins. They also exercise independent mip rectangles, queued
+history swaps, resize leases, cancellation, selected mip-generation commands
+and native error propagation. These are production-owner/recording-fixture
+checks; they do not execute mip shaders or establish browser pixel parity.
+
 ### Shared depth between 2D passes
 
 Distinct 2D color targets can attach the same source `DepthTexture`, including

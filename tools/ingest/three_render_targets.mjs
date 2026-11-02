@@ -1022,28 +1022,43 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (colorIndex === 0) entry.dirty = true;
     else { const sample = entry.colorSamples.get(colorIndex); if (sample) sample.dirty = true; }
   }
-  function copyTarget(source, destination, options, depth = false) {
+  function copyTarget(source, destination, options, depth = false, generateMipmaps = null) {
     assertCurrent(source); assertCurrent(destination);
+    if (generateMipmaps !== null && typeof generateMipmaps !== 'boolean')
+      fail('MIP', 'Color copy generation must be a captured boolean');
     if (depth) { source = source.depthEntry ?? source; destination = destination.depthEntry ?? destination; }
-    if (source === destination || source.historyGroup && source.historyGroup === destination.historyGroup)
-      fail('FEEDBACK', 'In-place target copies are not admitted');
-    if (source.busy || destination.busy) fail('REENTRANT', 'Cannot copy during a target submission');
+    const group = source.historyGroup && source.historyGroup === destination.historyGroup ? source.historyGroup : null;
+    const sameOwner = source === destination || group !== null;
+    if (depth && sameOwner) fail('FEEDBACK', 'In-place depth copies are not admitted');
+    if (source.busy || destination.busy || group?.busy || group?.frame)
+      fail('REENTRANT', 'Cannot copy during a target submission');
+    // Source-shaped copies capture the live generation flag independently of
+    // the initialized allocation. Raw transfer calls keep its authored policy.
+    const destinationShape = generateMipmaps === null ? destination.shape : {...destination.shape,
+      colorGenerateMipmaps: destination.shape.colorGenerateMipmaps.map((value, index) =>
+        index === (options.colorIndex ?? 0) ? generateMipmaps : value)};
     const plan = depth
-      ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destination.shape, options)
-      : inspectGpuTargetCopy(source.shape, destination.shape, options);
+      ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destinationShape, options)
+      : inspectGpuTargetCopy(source.shape, destinationShape, options);
+    if (!depth && sameOwner && source.shape.textures[plan.sourceColorIndex] === destination.shape.textures[plan.colorIndex])
+      fail('FEEDBACK', 'Copies cannot read and write the same color image');
     if (plan.empty) return false;
-    budget(allocationBytes(source) + allocationBytes(destination));
+    budget(allocationBytes(source) + (sameOwner ? 0 : allocationBytes(destination)));
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
+    if (group) group.busy = true;
     if (depth) { destination.depthDirty = true; if (destination.depthEntry) destination.depthEntry.depthDirty = true; }
     else dirtyColor(destination, plan.colorIndex);
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
+      if (!depth && generateMipmaps && plan.destinationMipLevel === 0) destination.storage.generateMipmaps([plan.colorIndex]);
       assertCurrent(source); assertCurrent(destination); return result;
     } finally {
       source.busy = destination.busy = false;
-      try { if (!source.alive) release(source); }
-      finally { if (!destination.alive) release(destination); }
+      if (group) group.busy = false;
+      for (const entry of group?.entries ?? new Set([source, destination])) {
+        if (!entry.alive) release(entry); else collect(entry);
+      }
     }
   }
   function withNativeResize(target, width, height, run) {
@@ -1316,7 +1331,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       try { const result = entry.storage.writePixels(data, options); assertCurrent(entry); return result; }
       finally { entry.busy = false; if (!entry.alive) release(entry); }
     },
-    copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
+    copyColor(source, destination, options = {}, {generateMipmaps = null} = {}) {
+      return copyTarget(source, destination, options, false, generateMipmaps);
+    },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
     render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null, resolveColor = true} = {}) {
