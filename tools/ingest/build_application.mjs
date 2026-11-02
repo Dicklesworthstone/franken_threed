@@ -1311,7 +1311,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
-    ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites } } : {}),
+    ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites,
+      postprocessingTransforms: rendererRoute.postprocessingTransforms } } : {}),
   });
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {
     throw new Error("A renderer route was decided but no pinned three build import was substituted");
@@ -1482,7 +1483,10 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSou
       if (siteIndex < 0) throw new Error("Source-selected renderer construction lost its original site");
       return {moduleId: decision.moduleId, sourceSpan: decision.sourceSpan, siteIndex, sourceHash: module.content_hash};
     }) : [];
-  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets, exactSites };
+  const postprocessingTransforms = targets.some(target => target.exportName === 'WebGLRenderer')
+    ? Object.entries(graph.modules).filter(([, mod]) => mod.postprocessing_transform)
+      .map(([id, mod]) => ({id, ...mod.postprocessing_transform})) : [];
+  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets, exactSites, postprocessingTransforms };
 }
 
 const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttributes", "forceContextLoss", "forceContextRestore"]);

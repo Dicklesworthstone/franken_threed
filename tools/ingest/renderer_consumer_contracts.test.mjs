@@ -9,6 +9,7 @@ import {buildModuleGraph} from './module_graph.mjs';
 import {verifiedRendererConsumerContracts} from './renderer_consumer_contracts.mjs';
 import {evaluateGraphRoutes, extractGraphRoutingFacts} from './route_bridge.mjs';
 import {decideRendererRoute} from '../compat/route_decider.mjs';
+import {transformThreePostProcessing} from './postprocessing_contracts.mjs';
 
 const upstream = new URL('../../upstream/three.js/', import.meta.url);
 const three = new URL('build/three.webgpu.js', upstream).href;
@@ -189,4 +190,100 @@ test('unresolved code prevents the retained-consumer proof', async () => {
     assert.equal(evaluateGraphRoutes(changed, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
     assert.ok(extractGraphRoutingFacts(changed).escapes.some(escape => escape.reason === 'opaque-call-argument'));
   }
+});
+
+const passImports = `import * as THREE from 'three';
+import {EffectComposer as Composer} from 'composer';
+import {MaskPass as Mask, ClearMaskPass as Unmask} from 'mask';
+import {ShaderPass} from 'shader'; import {CopyShader} from 'copy';\n`;
+const passSetup = `const renderer = new THREE.WebGLRenderer();
+const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera();
+const composer = new Composer(renderer), mask = new Mask(scene, camera);
+const effect = new ShaderPass(CopyShader);\n`;
+function passFixture(body = '', map = {}) {
+  const dir = fs.mkdtempSync(path.join(tmpdir(), 'f3d-pass-proof-'));
+  const entry = path.join(dir, 'index.html');
+  const imports = {three: new URL('build/three.module.js', upstream).href,
+    composer: new URL('examples/jsm/postprocessing/EffectComposer.js', upstream).href,
+    mask: new URL('examples/jsm/postprocessing/MaskPass.js', upstream).href,
+    shader: new URL('examples/jsm/postprocessing/ShaderPass.js', upstream).href,
+    copy: new URL('examples/jsm/shaders/CopyShader.js', upstream).href, ...map};
+  fs.writeFileSync(entry, '<script type="importmap">' + JSON.stringify({imports}) + '</script>' +
+    '<script type="module">' + passImports + passSetup + body + '</script>');
+  return {dir, entry};
+}
+const passBaseline = passFixture('composer.addPass(mask); composer.addPass(effect); composer.addPass(new Unmask()); composer.render();');
+const passGraph = await buildModuleGraph(passBaseline.entry);
+const passContract = verifiedRendererConsumerContracts(new Map(Object.entries(passGraph.modules))).get(passGraph.root_entries[0]);
+assert.ok(passContract);
+const inspectPass = body => analyzeModuleAst(passImports + passSetup + body, 'file:///application.js', {}, passContract).routing_facts;
+
+test('the original H6 graph routes its closed standard-pass chain with three source-verified transforms', async () => {
+  const h6 = await buildModuleGraph(fileURLToPath(new URL('examples/webgl_postprocessing_advanced.html', upstream)));
+  assert.deepEqual(extractGraphRoutingFacts(h6).escapes, []);
+  assert.equal(evaluateGraphRoutes(h6, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  assert.deepEqual(Object.values(h6.modules).filter(mod => mod.postprocessing_transform)
+    .map(mod => mod.postprocessing_transform.name).sort(), ['BloomPass.js', 'EffectComposer.js', 'MaskPass.js']);
+});
+
+test('closed composer/pass aliases, settings and direct rendering preserve source ownership', () => {
+  assert.equal(evaluateGraphRoutes(passGraph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  for (const body of [
+    'composer.addPass(mask); composer.insertPass(effect, 0); composer.removePass(effect); composer.render();',
+    'const local = composer; local.renderToScreen = false; local.setSize(64, 32); local.setPixelRatio(2); local.reset(); local.dispose();',
+    'mask.inverse = true; mask.enabled = false; effect.uniforms.opacity.value = .5; effect.material.depthTest = false;',
+    'const Local = Mask; const local = new Local(scene, camera); composer.addPass(local); const same = local instanceof Mask;',
+    'const Local = Composer; const local = new Local(renderer); local.addPass(new Unmask()); const same = local instanceof Composer;',
+    'const local = composer.renderer; mask.render(local, composer.writeBuffer, composer.readBuffer);',
+    'composer.readBuffer.texture.name = "retained target"; composer.swapBuffers(); mask.setSize(32, 32); mask.dispose();',
+  ]) assert.equal(inspectPass(body).has_opaque_gl_escapes, false, body);
+  assert.equal(analyzeModuleAst(passImports + passSetup, 'file:///application.js').routing_facts.has_opaque_gl_escapes, true,
+    'no source proof means the renderer argument remains opaque');
+});
+
+test('custom passes, carrier escapes and source mutations retain exact renderer ownership', () => {
+  for (const body of [
+    'composer.addPass(plugin);', 'composer.insertPass(new CustomPass(), 0);',
+    'composer.passes.push(mask);', 'composer.copyPass.render = plugin;',
+    'mask.render = plugin; composer.addPass(mask);', 'mask.setSize = plugin;',
+    'composer.render = plugin;', 'composer.renderer = plugin;',
+    'plugin(composer);', 'plugin(mask);', 'plugin(composer.renderer);',
+    'export {composer};', 'export {mask};', 'globalThis.mask = mask;',
+    'const items = [mask];', 'const render = mask.render;',
+    'class Custom extends Mask {}', 'Mask.prototype.render = plugin;',
+    'const local = composer.renderer; local.getContext();',
+    'let local = mask; local = plugin; composer.addPass(local);',
+    'let Local = Mask; Local = plugin; composer.addPass(new Local(scene, camera));',
+    'new Composer(new THREE.WebGPURenderer());',
+    'new Mask(...args);', 'composer.addPass(...args);',
+  ]) {
+    const facts = inspectPass(body);
+    assert.equal(decideRendererRoute({constructorName: 'WebGLRenderer', analysis: facts, ...environment}).route,
+      'exact-backend', body);
+    assert.ok(facts.escapes.every(escape => escape.source_span?.start));
+  }
+});
+
+test('pass source and resolved dependency fingerprints are checked before lowering', async () => {
+  for (const suffix of ['/postprocessing/MaskPass.js', '/postprocessing/Pass.js', '/build/three.core.js']) {
+    const changed = await buildModuleGraph(passBaseline.entry, {
+      transformModule: (source, {url}) => url.endsWith(suffix) ? source + '\n// changed implementation\n' : null,
+    });
+    assert.equal(evaluateGraphRoutes(changed, decideRendererRoute, environment)[0].decision.route, 'exact-backend', suffix);
+    assert.equal(Object.values(changed.modules).some(mod => mod.postprocessing_transform?.name === 'MaskPass.js'), false);
+  }
+  const open = await buildModuleGraph(passFixture('import(location.hash.slice(1));').entry);
+  assert.equal(evaluateGraphRoutes(open, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  assert.equal(Object.values(open.modules).some(mod => mod.postprocessing_transform), false);
+
+  const dir = fs.mkdtempSync(path.join(tmpdir(), 'f3d-pass-renamed-'));
+  fs.writeFileSync(path.join(dir, 'renamed.js'), fs.readFileSync(new URL('examples/jsm/postprocessing/MaskPass.js', upstream)));
+  fs.writeFileSync(path.join(dir, 'Pass.js'), fs.readFileSync(new URL('examples/jsm/postprocessing/Pass.js', upstream)));
+  const renamed = await buildModuleGraph(passFixture('composer.addPass(mask);', {mask: pathToFileURL(path.join(dir, 'renamed.js')).href}).entry);
+  assert.equal(evaluateGraphRoutes(renamed, decideRendererRoute, environment)[0].decision.route, 'general-webgpu',
+    'identical source and resolved imports keep their original distinct module identity');
+  const record = renamed.modules[pathToFileURL(path.join(dir, 'renamed.js')).href].postprocessing_transform;
+  const original = fs.readFileSync(path.join(dir, 'renamed.js'), 'utf8');
+  assert.throws(() => transformThreePostProcessing(original + '\n// changed after analysis', record),
+    /source changed before stencil lowering/);
 });

@@ -539,6 +539,42 @@ events, 14 framebuffer copies and 35 direct draws match, with zero GPU/browser
 errors and the owned `general-webgpu` route. Hardware performance remains
 unmeasured.
 
+## Standard composer stencil masks
+
+The pinned r186 EffectComposer, MaskPass/ClearMaskPass and BloomPass use a
+compiler-private stencil adapter on the owned WebGPU renderer. Dependency and
+source fingerprints authorize only their finite state expressions; original
+classes, exports and `instanceof MaskPass` identities remain intact. The H6
+`webgl_postprocessing_advanced` graph now selects `general-webgpu`. Changed
+sources, custom or mutated passes, open import graphs and arbitrary native
+context/state consumers retain exact routing. Ordinary `getContext()` still
+refuses on the owned renderer; no GL context is fabricated.
+
+Per-renderer state captures explicit pass changes around accepted renders and
+resolves material changes in actual draw order. Color/depth locks preserve
+contents during mask clears. Stencil locks suppress test/write-mask setters,
+while comparison/reference/operation setters remain live, including those from
+stencil-writing materials. Composer's NOTEQUAL copy preserves the outside of
+each pingpong image, and ClearMaskPass restores ordinary full-frame effects.
+Pre-activation stencil draws, queued frames, failed requests and cancellation
+retain ordered state without replaying source callbacks.
+
+Mask raster variants reuse prepared shaders, geometry and texture bindings.
+The existing program-mesh owner caches immutable bindings, charges them against
+its capacity, and keeps earlier queued draws alive. Ordinary renderers do not
+allocate pass capture tokens until a verified pass activates the adapter.
+
+`program_composer_masks.mjs` compares both stored composer buffers with pinned
+source across 12 checkpoints and 299,008 RGBA bytes: normal/inverse masks, two
+masked swaps, depth-failing mask geometry, color/depth preservation, material
+stencil inheritance, ClearMaskPass, resize and queued controls. Nineteen of 24
+images match byte-for-byte; the other five differ by at most one channel unit,
+with zero outliers under the existing WebGL tolerance and zero GPU/browser
+errors on Chromium 151.0.7922.34 / SwiftShader. Full H6 application and hardware
+performance closure are separate gates. Locked partial stencil clears and
+locked masks combined with shadow/transmission prepasses are explicit runtime
+boundaries.
+
 ## Native multiple-render-target mip chains
 
 Native 2D targets can render and sample mip chains on multiple

@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { analyzeModuleAst } from "./ast_analyzer.mjs";
 import { verifiedRendererConsumerContracts } from "./renderer_consumer_contracts.mjs";
+import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
@@ -523,12 +524,20 @@ export async function buildModuleGraph(entryPath, options = {}) {
   // Only a verified dependency closure can close an imported canvas consumer.
   // Reanalyze its callers with the retained-instance contract; all other escape
   // facts and source spans are recomputed, never suppressed graph-wide.
-  for (const [id, contract] of verifiedRendererConsumerContracts(modules, {externalModules})) {
+  const consumerContracts = verifiedRendererConsumerContracts(modules, {externalModules});
+  for (const [id, contract] of consumerContracts) {
     const input = sourceInputs.get(id);
     if (!input) continue;
     const analysis = analyzeModuleAst(input.code, input.sourceUrl, input.offsets, contract);
     const node = modules.get(id);
     node.routing_facts = node.routingFacts = analysis.routing_facts;
+  }
+  for (const [id, record] of consumerContracts.postprocessingSources ?? []) {
+    if (!record.transform) continue;
+    const input = sourceInputs.get(id), node = modules.get(id);
+    const code = transformThreePostProcessing(input.code, record);
+    node.routing_facts = node.routingFacts = analyzeModuleAst(code, input.sourceUrl).routing_facts;
+    node.postprocessing_transform = record;
   }
 
   // Build adjacency map for cycle detection

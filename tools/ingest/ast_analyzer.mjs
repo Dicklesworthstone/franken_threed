@@ -599,10 +599,11 @@ const OPAQUE_GL_METHODS = new Set([
 function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const RENDERER = 1, CANVAS = 2, WEBGL = 4, WEBGPU = 8, NAMESPACE = 16, DOM = 32;
   const ORBIT_CTOR = 64, CONTROLS = 128, BASE_CTOR = 256, ORBIT_NAMESPACE = 512, BASE_NAMESPACE = 1024;
-  const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | ORBIT_CTOR | BASE_CTOR;
-  const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS;
+  const COMPOSER_CTOR = 2048, PASS_CTOR = 4096, COMPOSER = 8192, PASS = 16384;
+  const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | ORBIT_CTOR | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR;
+  const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS;
   const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
-    role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : 0;
+    role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : role === "composer" ? COMPOSER_CTOR : role === "pass" ? PASS_CTOR : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
     "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
@@ -688,6 +689,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & ORBIT_NAMESPACE && names.includes("OrbitControls")) result |= ORBIT_CTOR;
     if (object & BASE_NAMESPACE && names.some(name => name === "Controls" || name === "EventDispatcher")) result |= BASE_CTOR;
     if (object & (RENDERER | CONTROLS) && names.some(name => name === "domElement")) result |= CANVAS;
+    if (object & COMPOSER && names.includes("renderer")) result |= RENDERER;
     if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
     return result;
   };
@@ -706,7 +708,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       }
       case "NewExpression": {
         const constructor = child(node.callee);
-        value = (constructor & CONSTRUCTOR ? RENDERER : 0) | (constructor & ORBIT_CTOR ? CONTROLS : 0);
+        value = (constructor & CONSTRUCTOR ? RENDERER : 0) | (constructor & ORBIT_CTOR ? CONTROLS : 0) |
+          (constructor & COMPOSER_CTOR ? COMPOSER : 0) | (constructor & PASS_CTOR ? PASS : 0);
         break;
       }
       case "MemberExpression": value = propertyKind(child(node.object), staticPropertyNames(node)); break;
@@ -962,12 +965,15 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
       return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
     if (node.type === "NewExpression") return expected === CONTROLS ? visit(node.callee, ORBIT_CTOR) :
-      expected === RENDERER && visit(node.callee, CONSTRUCTOR);
+      expected === COMPOSER ? visit(node.callee, COMPOSER_CTOR) : expected === PASS ? visit(node.callee, PASS_CTOR) :
+      expected === WEBGL ? visit(node.callee, WEBGL) : expected === RENDERER && visit(node.callee, CONSTRUCTOR);
     if (node.type === "MemberExpression") {
       const names = staticPropertyNames(node);
       if (!names) return false;
       if (expected === ORBIT_CTOR) return names.every(name => name === "OrbitControls") && visit(node.object, ORBIT_NAMESPACE);
       if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
+      if (expected === WEBGL) return names.every(name => name === "WebGLRenderer") && visit(node.object, BASE_NAMESPACE) ||
+        names.every(name => name === "renderer") && visit(node.object, COMPOSER);
     }
     return false;
   };
@@ -1022,6 +1028,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "minTargetRadius", "maxTargetRadius", "enableZoom", "zoomSpeed", "zoomToCursor", "enableRotate", "rotateSpeed",
     "enablePan", "panSpeed", "keyPanSpeed", "keyRotateSpeed", "screenSpacePanning"]);
   const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches"]);
+  const composerMethods = new Set(["render", "addPass", "insertPass", "removePass", "swapBuffers", "reset", "setSize", "setPixelRatio", "dispose", "isLastEnabledPass"]);
+  const composerViews = new Set(["renderer", "renderToScreen", "renderTarget1", "renderTarget2", "readBuffer", "writeBuffer"]);
+  const passMethods = new Set(["render", "setSize", "dispose"]);
+  const passSettings = new Set(["enabled", "needsSwap", "clear", "renderToScreen", "inverse", "scene", "camera", "overrideMaterial",
+    "clearColor", "clearAlpha", "clearDepth", "material", "uniforms", "textureID", "map", "opacity"]);
   const reflection = new Set(["prototype", "__proto__", "constructor", "getPrototypeOf", "setPrototypeOf",
     "defineProperty", "defineProperties", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
     "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "eval", "Function", "Reflect"]);
@@ -1032,6 +1043,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     (call.type === "NewExpression" && closedConsumerValue(call.callee, ORBIT_CTOR) && index === 1 ||
       call.type === "CallExpression" && call.callee.type === "MemberExpression" && closedConsumerValue(call.callee.object, CONTROLS) &&
       staticPropertyNames(call.callee)?.every(name => name === "connect") && index === 0);
+  const isPassInput = (call, argument, index) => index === 0 && !call.arguments.some(value => value.type === "SpreadElement") &&
+    (call.type === "NewExpression" && closedConsumerValue(call.callee, COMPOSER_CTOR) && kind(argument) & RENDERER && closedConsumerValue(argument, WEBGL) ||
+      call.type === "CallExpression" && call.callee.type === "MemberExpression" &&
+      (closedConsumerValue(call.callee.object, COMPOSER) && staticPropertyNames(call.callee)?.every(name => ["addPass", "insertPass", "removePass"].includes(name)) && closedConsumerValue(argument, PASS) ||
+        closedConsumerValue(call.callee.object, PASS) && staticPropertyNames(call.callee)?.every(name => name === "render") && kind(argument) & RENDERER && closedConsumerValue(argument, WEBGL)));
   const publicMethods = new Set([
     "init", "render", "renderAsync", "compile", "compileAsync", "compute", "computeAsync", "dispose",
     "setAnimationLoop", "setSize", "setPixelRatio", "setDrawingBufferSize", "getSize", "getPixelRatio",
@@ -1104,6 +1120,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
           report(node, "opaque-controls-canvas-input");
       }
+      if (node.type === "NewExpression" && kind(node.callee) & (COMPOSER_CTOR | PASS_CTOR) &&
+          (!closedConsumerValue(node.callee, kind(node.callee) & COMPOSER_CTOR ? COMPOSER_CTOR : PASS_CTOR) ||
+            node.arguments.some(value => value.type === "SpreadElement") ||
+            kind(node.callee) & COMPOSER_CTOR && (!(kind(node.arguments[0]) & RENDERER) || !closedConsumerValue(node.arguments[0], WEBGL))))
+        report(node, "unclosed-postprocessing-constructor");
       if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
           kind(node.callee.object) & RENDERER &&
           !staticPropertyNames(node.callee)?.every(name => publicMethods.has(name)))
@@ -1112,6 +1133,13 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (kind(node.callee.object) & CONTROLS && (!closedConsumerValue(node.callee.object, CONTROLS) ||
             !staticPropertyNames(node.callee)?.every(name => controlsMethods.has(name))))
           report(node, "opaque-controls-method");
+        if (kind(node.callee.object) & (COMPOSER | PASS)) {
+          const composer = !!(kind(node.callee.object) & COMPOSER), names = staticPropertyNames(node.callee);
+          if (!closedConsumerValue(node.callee.object, composer ? COMPOSER : PASS) ||
+              !names?.every(name => (composer ? composerMethods : passMethods).has(name)) ||
+              composer && names.some(name => ["addPass", "insertPass", "removePass"].includes(name)) && !closedConsumerValue(node.arguments[0], PASS))
+            report(node, "opaque-postprocessing-method");
+        }
         if (kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
           const canvas = node.arguments[0];
           if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
@@ -1126,7 +1154,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       for (const [index, argument] of node.arguments.entries()) {
         const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
         const helper = localHelper(node);
-        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) &&
+        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) && !isPassInput(node, argument, index) &&
             !(helper && index < helper.params.length))
           report(node, "opaque-call-argument");
       }
@@ -1140,9 +1168,12 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         report(node, "renderer-constructor-mutation");
       if (node.left.type === "MemberExpression" && kind(node.left.object) & CONTROLS &&
           !staticPropertyNames(node.left)?.every(name => controlsSettings.has(name))) report(node, "controls-member-write");
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & (COMPOSER | PASS) &&
+          !staticPropertyNames(node.left)?.every(name => kind(node.left.object) & COMPOSER ? name === "renderToScreen" : passSettings.has(name)))
+        report(node, "postprocessing-member-write");
     } else if ((node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete") &&
-        node.argument.type === "MemberExpression" && kind(node.argument.object) & CONTROLS) {
-      report(node, "controls-member-write");
+        node.argument.type === "MemberExpression" && kind(node.argument.object) & (CONTROLS | COMPOSER | PASS)) {
+      report(node, kind(node.argument.object) & CONTROLS ? "controls-member-write" : "postprocessing-member-write");
     } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" || node.type === "ThrowStatement" ||
         node.type === "ArrowFunctionExpression" && node.body.type !== "BlockStatement") {
       const helper = node.type === "ArrowFunctionExpression" ? node : functionOf(node);
@@ -1157,7 +1188,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     } else if (node.type === "TaggedTemplateExpression" && node.quasi.expressions.some(value => kind(value) & RESOURCE)) {
       report(node, "opaque-call-argument");
     } else if (consumerContract && node.type === "BinaryExpression" && node.operator === "instanceof" && kind(node.left) & RESOURCE &&
-        !closedConsumerValue(node.right, kind(node.left) & CONTROLS ? ORBIT_CTOR : CONSTRUCTOR)) {
+        !closedConsumerValue(node.right, kind(node.left) & CONTROLS ? ORBIT_CTOR : kind(node.left) & COMPOSER ? COMPOSER_CTOR : kind(node.left) & PASS ? PASS_CTOR : CONSTRUCTOR)) {
       report(node, "opaque-instance-check");
     } else if (node.type === "ExportNamedDeclaration") {
       if (node.source && node.specifiers.some(spec =>
@@ -1182,6 +1213,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       else if (kind(node.object) & CONTROLS && !names.every(name => controlsSettings.has(name) || controlsViews.has(name) ||
           controlsMethods.has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
         report(node, "opaque-controls-member");
+      else if (kind(node.object) & (COMPOSER | PASS) && !names.every(name =>
+          (kind(node.object) & COMPOSER ? composerViews : passSettings).has(name) ||
+          (kind(node.object) & COMPOSER ? composerMethods : passMethods).has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
+        report(node, "opaque-postprocessing-member");
     } else if (node.type === "VariableDeclarator" && node.id.type !== "Identifier" && kind(node.init) & RESOURCE) {
       if (!(node.id.type === "ObjectPattern" && node.id.properties.every(property =>
           property.type === "Property" && property.value.type === "Identifier" &&

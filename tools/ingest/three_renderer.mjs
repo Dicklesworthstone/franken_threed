@@ -41,6 +41,7 @@ import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
+import {registerThreePassState, captureThreePassState, finishThreePassState} from './three_pass_state.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
@@ -1152,10 +1153,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             this._wantsHdr(this._toneMapping()), outputProfile), outputProfile, key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
-            logarithmicDepthBuffer: this.logarithmicDepthBuffer === true}});
+            logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
+            ...(this._shaderEncodedOutput ? {
+              passClear: clearOnly ? {...clearOnly} : {color: this.autoClear && this.autoClearColor,
+                depth: this.autoClear && this.autoClearDepth, stencil: this.autoClear && this.autoClearStencil},
+              passBackgroundClear: clearOnly ? null : {color: this.autoClearColor, depth: this.autoClearDepth, stencil: this.autoClearStencil},
+            } : {})}});
         request.programTextures = this._captureFramebufferBindings();
         request.releaseDestination = destination === this ? null : this._targets.retainGeneration(destination);
         request.releaseCanvas = this._canvases.retain(canvasTarget, canvas);
+        // Compilation does not execute GL state. Publish a render's token only
+        // after all captures succeed, preserving explicit pass calls around
+        // deferred draws without imposing state work on ordinary renderers.
+        request.programFrame.passState = this._shaderEncodedOutput && captureCameras ? captureThreePassState(this) : null;
         return request;
       } catch (error) { this._releaseRequest(request); throw error; }
     }
@@ -1364,6 +1374,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return captured;
     }
     _releaseRequest(request) {
+      finishThreePassState(request.programFrame?.passState, {render: false});
       request.releaseFramebuffer?.(); request.releaseFramebuffer = null;
       if (request.programTextures) {
         for (const lease of request.programTextures.bindings.values()) request.programTextures.owner.release(lease);
@@ -1435,7 +1446,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (occlusion) frame = {...frame, occlusion};
       // Immediate source callbacks must still be able to change live program
       // state. Only deferred calls need the queued renderer-state snapshot.
-      this._programFrame = deferred ? programFrame : undefined;
+      this._programFrame = deferred ? programFrame : this._shaderEncodedOutput ? {
+        passState: programFrame.passState, passClear: programFrame.passClear, passBackgroundClear: programFrame.passBackgroundClear,
+      } : undefined;
       try {
         const issue = () => {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState},
@@ -1475,6 +1488,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           textures.withDispatch(nodeFrame.textureUses, readStorage);
         } else readStorage();
         occlusion?.commit();
+        finishThreePassState(programFrame.passState, {render: !clearOnly});
       } catch (error) { occlusion?.cancel(); if (!isPrepareBoundary(error)) frame.timestamp?.cancel(); throw error; }
       finally {
         this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth;
@@ -1937,6 +1951,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       this._shaderEncodedOutput = true;
       this._contextAlpha = true;
       this._pixelRound = Math.round;
+      registerThreePassState(this, THREE);
       // Source construction is synchronous: start device negotiation now.
       this.init().catch(error => { this._deferredError ??= error; });
     }
@@ -1956,6 +1971,10 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     init() { return super.init(); }
     setAnimationLoop(callback) { this._setLoop(callback); }
     getContext() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
+    setClearStencil(value) {
+      super.setClearStencil(value);
+      registerThreePassState(this, THREE).buffers.stencil.setClear(value);
+    }
     getContextAttributes() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextLoss() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
     forceContextRestore() { fail('UNSUPPORTED', 'This WebGLRenderer route has no GL context'); }
@@ -1996,20 +2015,27 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
   // WebGLState: only facts true of THIS renderer are served. Depth is never
   // reversed (capabilities.reversedDepthBuffer is false). setMask(true) is what
-  // CubeCamera/Reflector/Water call so the next clear writes depth: this route's
-  // clears always write depth, so it is that behavior, not a dropped call. Any
+  // CubeCamera/Reflector/Water call before clearing depth. Preserve that request
+  // in the private state too, where a retained MaskPass may hold its lock. Any
   // other GL state access (masks off, stencil, raw viewport) throws explicitly.
   const glState = (path, known) => new Proxy(known, {get(target, key) {
     if (typeof key === 'symbol' || Object.hasOwn(target, key)) return target[key];
     fail('UNSUPPORTED', `WebGLRenderer.state.${path}${String(key)} describes a GL context; this route has none`);
   }});
-  const depthState = glState('buffers.depth.', {
-    getReversed: () => false,
-    setMask(mask) { if (mask !== true) fail('UNSUPPORTED', 'WebGLRenderer.state.buffers.depth.setMask(false) needs GL depth-mask state; this route has none'); },
-  });
-  const stateBuffers = glState('buffers.', {depth: depthState});
-  const webglState = glState('', {buffers: stateBuffers});
-  Object.defineProperty(WebGLRenderer.prototype, 'state', {configurable: true, get() { return webglState; }});
+  const webglStates = new WeakMap();
+  Object.defineProperty(WebGLRenderer.prototype, 'state', {configurable: true, get() {
+    if (!webglStates.has(this)) {
+      const depthState = glState('buffers.depth.', {
+        getReversed: () => false,
+        setMask: mask => {
+          if (mask !== true) fail('UNSUPPORTED', 'WebGLRenderer.state.buffers.depth.setMask(false) needs GL depth-mask state; this route has none');
+          registerThreePassState(this, THREE).buffers.depth.setMask(true);
+        },
+      });
+      webglStates.set(this, glState('', {buffers: glState('buffers.', {depth: depthState})}));
+    }
+    return webglStates.get(this);
+  }});
   // Only capabilities that describe THIS renderer's behavior are served: the
   // sampler anisotropy ceiling it applies (WebGPU clamps maxAnisotropy to 16, as
   // r186's WebGPU backend reports) and the depth/precision modes it admits.

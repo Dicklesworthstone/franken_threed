@@ -420,6 +420,41 @@ test("H2 routes through the new backend after its verified controls ownership ed
   assert.ok(result.chunks.some(chunk => chunk.fileName.startsWith("f3d-renderer-runtime-")));
 });
 
+test('a bundled standard-pass composer retains class identities and target sizing with the new renderer', async () => {
+  const addon = name => pathToFileURL(path.resolve(upstreamBuild, '../examples/jsm/postprocessing/', name + '.js')).href;
+  const a = app(`import * as THREE from 'three/legacy';
+import {EffectComposer} from ${JSON.stringify(addon('EffectComposer'))};
+import {MaskPass, ClearMaskPass} from ${JSON.stringify(addon('MaskPass'))};
+import {RenderPass} from ${JSON.stringify(addon('RenderPass'))};
+const renderer = new THREE.WebGLRenderer();
+const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera();
+const composer = new EffectComposer(renderer);
+const mask = new MaskPass(scene, camera), unmask = new ClearMaskPass();
+composer.addPass(new RenderPass(scene, camera)); composer.addPass(mask); composer.addPass(unmask);
+composer.renderToScreen = false; composer.setSize(32, 24);
+export const isF3DRenderer = renderer.isF3DRenderer;
+export const sourceClasses = [composer instanceof EffectComposer, mask instanceof MaskPass, unmask instanceof ClearMaskPass];
+export const sizes = [composer.readBuffer.width, composer.readBuffer.height, composer.writeBuffer.width, composer.writeBuffer.height];
+export const dispose = () => { composer.dispose(); renderer.dispose(); };
+`);
+  // Legacy passes import UniformsUtils from the same WebGL build as H6.
+  fs.writeFileSync(a.entry, fs.readFileSync(a.entry, 'utf8').replace('/three.webgpu.js"', '/three.module.js"'));
+  const result = await buildApplication(a.entry, a.out, {routeWebGLRenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.decisions[0].route, 'general-webgpu');
+  assert.ok(result.chunks.some(chunk => chunk.modules.some(id => id.endsWith('/three_pass_state.mjs'))),
+    'the source-verified stencil helpers are actually included in the emitted bundle');
+  const previous = globalThis.document;
+  globalThis.document = {createElementNS: () => ({width: 32, height: 24, style: {}})};
+  let emitted;
+  try {
+    emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.equal(emitted.isF3DRenderer, true);
+    assert.deepEqual(emitted.sourceClasses, [true, true, true]);
+    assert.deepEqual(emitted.sizes, [32, 24, 32, 24]);
+  } finally { emitted?.dispose(); globalThis.document = previous; }
+});
+
 test("a bundled closed-controls application executes retained camera controls with the new renderer", async () => {
   const controlsUrl = pathToFileURL(path.resolve(upstreamBuild, "../examples/jsm/controls/OrbitControls.js")).href;
   const a = app(`import * as THREE from 'three/webgpu';

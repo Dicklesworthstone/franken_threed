@@ -34,6 +34,8 @@ import {hasThreeDeformation, inspectThreeDeformation, createGpuThreeDeformation,
 import {createThreeSceneRaster} from './three_scene_raster.mjs';
 import {threeSpriteCount,threeSpriteWorldMatrix} from './three_sprites.mjs';
 import {hasThreeNodeProgram} from './three_node_program.mjs';
+import {beginThreePassState, applyThreePassMaterial, applyThreePassClear,
+  recordThreePassMaterial, recordThreePassClear} from './three_pass_state.mjs';
 export class ThreeSceneError extends Error {
   constructor(code,message){super(`THREE_SCENE_${code}: ${message}`);this.name='ThreeSceneError';this.code='THREE_SCENE_'+code;}
 }
@@ -43,6 +45,13 @@ const integer=(n,min,max,label)=>{
 };
 const finite=(n,label)=>{if(typeof n!=='number'||!Number.isFinite(n))fail('VALUE',`Invalid ${label}`);return n;};
 const same=(a,b)=>a.length===b.length&&a.every((v,i)=>v===b[i]);
+// A private pass changes only these raster fields. Geometry, shaders, texture
+// bindings and the remaining material raster stay on the prepared registration.
+const samePassRaster=(a,b)=>a===b||!!a&&!!b&&a.writeMask===b.writeMask&&
+  a.depthWriteEnabled===b.depthWriteEnabled&&a.stencilReference===b.stencilReference&&
+  (a.stencil===b.stencil||!!a.stencil&&!!b.stencil&&a.stencil.readMask===b.stencil.readMask&&
+    a.stencil.writeMask===b.stencil.writeMask&&['front','back'].every(face=>
+      ['compare','failOp','depthFailOp','passOp'].every(key=>a.stencil[face][key]===b.stencil[face][key])));
 const rgba=(color,alpha=1)=>[color.r,color.g,color.b,alpha];
 const rgb=color=>[color.r,color.g,color.b];
 const position=object=>{const e=object.matrixWorld.elements;return [e[12],e[13],e[14]];};
@@ -903,7 +912,7 @@ export async function createGpuThreeScene(device,scene,{
       if(m.isPointsMaterial||m.isLineDashedMaterial||m.isMeshMatcapMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
       // Keep GL stencil conversion on its existing ShaderLib route. The core
       // material mapper below follows WebGPU's unsigned reference contract.
-      if(m.stencilWrite&&stencilAttachment)return programDescription(m,topology,object);
+      if((m.stencilWrite&&stencilAttachment)||programSupport.state?.().passState)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
       if(programLogDepth())return programDescription(m,topology,object);
       if(programTransmissionMode)return programDescription(m,topology,object);
@@ -1555,6 +1564,7 @@ export async function createGpuThreeScene(device,scene,{
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
     let backgroundSubmitted=false;
     const publicRenderer=programRoute()?shadowRenderer():null;
+    const passProgram=programSupport?.state?.(),passState=passProgram?.passState??null;
     const previousDrawContext=publicRenderer?._programDrawContext;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
@@ -1846,6 +1856,11 @@ export async function createGpuThreeScene(device,scene,{
         }
       }
       let submitShadows=null;
+      if(passState&&(programShadowMode||transmissionPasses.length)){
+        const state=beginThreePassState(passState);
+        if(state.colorLocked||state.depthLocked||state.stencilLocked||state.stencilTest)
+          fail('UNSUPPORTED','Locked postprocessing masks with shadow or transmission prepasses are not admitted');
+      }
       if(programShadowMode){
         try{submitShadows=programShadows().render(castingLights(camera),root,camera,shadowControls(),shadowRenderer());}catch(error){shadowBoundary(error);}
         programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
@@ -1877,18 +1892,51 @@ export async function createGpuThreeScene(device,scene,{
       let programSourceDraws=0;
       const preparedDeformations=new Set();
       let shadowSubmitted=false;
+      // GL clears before material selection. Resolve its masks once now, while
+      // leaving attachment getters lazy until a draw/callback prefix submits.
+      let clearPolicy={loadOp:frame.loadOp,depthLoadOp:frame.depthLoadOp,clearColor:frame.clearColor,
+        ...(frame.stencilLoadOp===undefined?{}:{stencilLoadOp:frame.stencilLoadOp,clearStencil:frame.clearStencil})};
+      let clearRequested=passProgram?.passClear;
+      if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
+        clearPolicy.clearColor=rgba(backgroundScene().background);clearPolicy.loadOp='clear';
+        if(renderOptions.outputTransfer==='srgb')clearPolicy.clearColor=[...srgbEncode(clearPolicy.clearColor.slice(0,3)),1];
+        if(passState&&passProgram.passBackgroundClear){
+          clearRequested=passProgram.passBackgroundClear;
+          clearPolicy.loadOp=clearRequested.color?'clear':'load';
+          clearPolicy.depthLoadOp=clearRequested.depth?'clear':'load';
+          if(clearPolicy.stencilLoadOp!==undefined)clearPolicy.stencilLoadOp=clearRequested.stencil?'clear':'load';
+        }
+      }
+      if(passState)clearPolicy=applyThreePassClear(passState,clearPolicy,clearRequested);
+      else if(publicRenderer)recordThreePassClear(publicRenderer,clearPolicy,clearRequested);
+      const selectPassRaster=(material,raster)=>{
+        if(passState)return applyThreePassMaterial(passState,material,raster);
+        recordThreePassMaterial(publicRenderer,material);
+        return raster;
+      };
+      const passMesh=(binding,description,material)=>{
+        const raster=selectPassRaster(material,description.options.raster);
+        if(raster===description.options.raster)return binding.mesh;
+        const variants=binding.passVariants??=[];
+        const found=variants.find(entry=>!entry.mesh.disposed&&samePassRaster(entry.passRaster,raster));
+        if(found)return found.mesh;
+        // The existing owner charges each immutable binding and its uniforms.
+        // Never evict a registration referenced by an earlier pending draw.
+        entries=entries.filter(entry=>!entry.mesh.disposed);
+        if(entries.length>=maxBindings)fail('LIMIT','Postprocessing raster binding capacity exceeded');
+        const mesh=renderer.addProgramMeshImmediate(binding.programGeometry,{...description.options,raster});
+        const entry={...binding,mesh,passRaster:raster,passVariants:undefined,passVariant:true};
+        binding.passVariants=variants.filter(entry=>!entry.mesh.disposed);binding.passVariants.push(entry);entries.push(entry);
+        return mesh;
+      };
       const preparedFrame=()=>{
         const added=[...activeDeformations].filter(owner=>!preparedDeformations.has(owner));
         if(added.length){live();updateGpuThreeDeformations(added);live();for(const owner of added)preparedDeformations.add(owner);}
-        const prepared={...frame,viewProjection:clip.elements,lighting,draws,
+        const prepared={...frame,...clearPolicy,viewProjection:clip.elements,lighting,draws,
           ...(clippingFrame?{clippingPlanes:clippingFrame.planes}:{})};
         if(occlusion)prepared.occlusion={session:occlusion,objects:drawObjects};
         if(fogEnabled)prepared.fog=fogFrame;
         if(environmentEnabled)prepared.environment=environmentFrame;
-        if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
-          prepared.clearColor=rgba(backgroundScene().background);prepared.loadOp='clear';
-          if(renderOptions.outputTransfer==='srgb')prepared.clearColor=[...srgbEncode(prepared.clearColor.slice(0,3)),1];
-        }
         if(shadowEnabled){
           prepared.shadow=null;
           if(shadowFrame){
@@ -1953,6 +2001,7 @@ export async function createGpuThreeScene(device,scene,{
           // renderBufferDirect does not call object/material draw hooks or update
           // model-view matrices. It consumes the caches supplied by its caller.
           const desc=programDescription(material,topology,sourceObject,{scene:drawScene,camera:drawCamera,previous:boundary.last})[0];
+          const raster=selectPassRaster(material,desc.options.raster);
           const reflection=desc.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
           const clipState=programSupport.clippingState(programClippingControls(),material,drawCamera);
           const current=programSupport.pack(reflection,desc.retained?null:programSupport.uniformsFor(material),sourceObject,drawCamera,bytes,
@@ -1975,7 +2024,7 @@ export async function createGpuThreeScene(device,scene,{
           }else gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
           const signature=programSignature(programSupport.geometrySnapshot(gpu,device),false,topology);
           let entry=entries.find(record=>record.direct&&!record.mesh.disposed&&record.material===material&&record.programGeometry===gpu&&
-            record.signature===signature&&same(record.structural,desc.structural));
+            record.signature===signature&&same(record.structural,desc.structural)&&samePassRaster(record.passRaster,raster));
           if(!entry){
             entries=entries.filter(record=>!record.mesh.disposed);
             if(entries.length>=maxBindings){
@@ -1983,9 +2032,9 @@ export async function createGpuThreeScene(device,scene,{
               if(!oldest)fail('LIMIT','Direct program binding capacity exceeded');
               oldest.mesh.dispose();entries.splice(entries.indexOf(oldest),1);
             }
-            const mesh=renderer.addProgramMeshImmediate(gpu,desc.options);
+            const mesh=renderer.addProgramMeshImmediate(gpu,{...desc.options,raster});
             entry={key:programKeyOf(sourceObject),geometry,material,programGeometry:gpu,programSource:source,topology,signature,
-              structural:desc.structural,mesh,direct:true};entries.push(entry);
+              structural:desc.structural,mesh,direct:true,passRaster:raster};entries.push(entry);
           }
           const factor=wire?2:1,first=group===null?0:integer(group.start,0,Number.MAX_SAFE_INTEGER,'direct group start')*factor;
           const count=group===null?0xffffffff:integer(group.count,0,Number.MAX_SAFE_INTEGER,'direct group count')*factor;
@@ -2071,6 +2120,7 @@ export async function createGpuThreeScene(device,scene,{
           for(let i=0;i<item.bindings.length;i++){
             const d=item.desc[i],reflection=d.program.program.reflection;
             if(programArray&&item.bindings.length===2){item.material.side=d.programSide;item.material.needsUpdate=true;}
+            const mesh=passMesh(item.bindings[i],d,item.material);
             const clip=programSupport.clippingState(programClippingControls(),item.material,drawCamera);
             for(const sub of multi??[null]){
               const bytes=new Uint8Array(reflection.uniformBufferSize);
@@ -2082,7 +2132,7 @@ export async function createGpuThreeScene(device,scene,{
               for(const t of current)if(t)frameTextures?.add(t);
               // Programs evaluate fog/lighting in their own source; never core receivers.
               if(programArray)drawObjects.push({object,material:item.material,view});
-              draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,source:item,
+              draws.push({mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,source:item,
                 ...(sub?{programRangeCaptured:true}:{}),
                 ...(sub&&item.group?{programRangeGroup:{start:item.group.start*(item.material.wireframe?2:1),count:item.group.count*(item.material.wireframe?2:1)}}:{}),
                 ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
@@ -2094,6 +2144,7 @@ export async function createGpuThreeScene(device,scene,{
           if(hooked)object.onAfterRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);
           continue;
         }
+        if(publicRenderer)recordThreePassMaterial(publicRenderer,item.material);
         const deformation=item.bindings[0].deformation;
         let shape;
         if(deformation){
