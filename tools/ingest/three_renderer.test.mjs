@@ -64,6 +64,12 @@ async function create(parameters = {}) {
 }
 const flush = async renderer => { while (renderer._drain) await renderer._drain; };
 const passes = d => d.passes;
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+};
+const hostTurn = () => new Promise(resolve => setImmediate(resolve));
 
 test('source construction surface: render before init throws the source error', async () => {
   const {renderer, canvas} = await create();
@@ -113,6 +119,121 @@ test('ordinary first frame: render defers to preparation without presenting an e
   assert.ok(pass.colorAttachments[0].resolveTarget, 'antialias resolves into the presentation view');
   await renderer.waitForGPU(); renderer.dispose();
   assert.ok(calls.some(c => c[0] === 'unconfigure'));
+});
+
+test('initialization disposal rejects a pending adapter without requesting a late device or canvas', async () => {
+  const adapter = deferred(), c = canvasFixture(), device = recordingDevice();
+  let requests = 0, destroyed = 0, rejected;
+  device.destroy = () => { destroyed++; };
+  const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: () => adapter.promise}});
+  const renderer = new Renderer({canvas: c.canvas});
+  const init = renderer.init();
+  init.catch(error => { rejected = error; });
+  assert.equal(renderer.init(), init, 'concurrent callers share initialization');
+  renderer.dispose();
+  await hostTurn();
+  const stopped = rejected;
+  adapter.resolve({requestDevice() { requests++; return Promise.resolve(device); }});
+  await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
+  await hostTurn();
+  assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal settles init before the host adapter');
+  assert.equal(requests, 0);
+  assert.equal(destroyed, 0, 'no device was requested or owned');
+  assert.deepEqual(c.calls, []);
+  assert.equal(renderer.initialized, false);
+  assert.equal(renderer.info.frame, 0);
+  assert.equal(renderer.init(), init, 'a disposed initialization cannot restart');
+});
+
+test('initialization disposal retires a late owned device once without publishing it', async () => {
+  const acquisition = deferred(), requested = deferred(), c = canvasFixture(), device = recordingDevice();
+  let destroyed = 0, rejected;
+  device.destroy = () => { destroyed++; };
+  const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: async () => ({
+    requestDevice() { requested.resolve(); return acquisition.promise; },
+  })}});
+  const renderer = new Renderer({canvas: c.canvas}), init = renderer.init();
+  init.catch(error => { rejected = error; });
+  await requested.promise;
+  renderer.dispose();
+  await hostTurn();
+  const stopped = rejected;
+  acquisition.resolve(device);
+  await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
+  await hostTurn();
+  assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal does not await requestDevice');
+  assert.equal(destroyed, 1);
+  assert.equal(renderer._device, null, 'late ownership is retired before publication');
+  assert.equal(renderer._ownsDevice, false);
+  assert.deepEqual(c.calls, []);
+  assert.equal(renderer.initialized, false);
+  renderer.dispose();
+  assert.equal(destroyed, 1);
+});
+
+test('initialization failure releases its canvas and owned device while preserving a borrowed device', async t => {
+  for (const borrowed of [false, true]) {
+    const c = canvasFixture(), device = recordingDevice(), failure = new Error('output pipeline rejected');
+    let destroyed = 0, requests = 0;
+    device.destroy = () => { destroyed++; };
+    device.createRenderPipelineAsync = async () => { throw failure; };
+    const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: async () => ({
+      requestDevice: async () => { requests++; return device; },
+    })}});
+    const renderer = new Renderer({canvas: c.canvas, ...(borrowed ? {device} : {})});
+    t.after(() => renderer.dispose());
+    const init = renderer.init();
+    await assert.rejects(init, error => error === failure);
+    assert.equal(renderer.initialized, false);
+    assert.equal(renderer.info.frame, 0);
+    assert.equal(requests, borrowed ? 0 : 1);
+    assert.equal(destroyed, borrowed ? 0 : 1, 'failed initialization releases owned GPU state without manual dispose');
+    assert.equal(c.calls.filter(call => call[0] === 'configure').length, 1);
+    assert.equal(c.calls.filter(call => call[0] === 'unconfigure').length, 1);
+    assert.ok(device.textures.every(texture => texture.destroyed));
+    assert.ok(device.buffers.every(buffer => buffer.destroyed));
+    assert.equal(renderer.init(), init, 'failure retains its original result and does not renegotiate');
+    renderer.dispose();
+    assert.equal(destroyed, borrowed ? 0 : 1);
+  }
+});
+
+test('initialization disposal aborts pending output preparation and cannot unconfigure a replacement', async t => {
+  for (const borrowed of [false, true]) {
+    const c = canvasFixture(), device = recordingDevice(), pipeline = deferred(), started = deferred();
+    let destroyed = 0, rejected;
+    device.destroy = () => { destroyed++; };
+    device.createRenderPipelineAsync = descriptor => { started.resolve(descriptor); return pipeline.promise; };
+    const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: async () => ({requestDevice: async () => device})}});
+    const renderer = new Renderer({canvas: c.canvas, ...(borrowed ? {device} : {})});
+    t.after(() => renderer.dispose());
+    const init = renderer.init();
+    init.catch(error => { rejected = error; });
+    const descriptor = await started.promise;
+    renderer.dispose();
+    await hostTurn();
+    const stopped = rejected, unconfigured = c.calls.filter(call => call[0] === 'unconfigure').length;
+    const replacement = new WebGPURenderer({canvas: c.canvas, device: recordingDevice()});
+    t.after(() => replacement.dispose());
+    let replacementError;
+    try { await replacement.init(); }
+    catch (error) { replacementError = error; }
+    finally { pipeline.resolve(descriptor); }
+    await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
+    await hostTurn();
+    assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal settles init before native compilation');
+    assert.equal(unconfigured, 1, 'the pending session relinquishes its canvas promptly');
+    assert.equal(destroyed, borrowed ? 0 : 1);
+    assert.equal(renderer._session, null);
+    assert.equal(renderer.initialized, false);
+    assert.equal(renderer.info.frame, 0);
+    assert.ok(device.textures.every(texture => texture.destroyed));
+    assert.ok(device.buffers.every(buffer => buffer.destroyed));
+    assert.equal(replacementError, undefined, 'the new owner initializes before the old pipeline resolves');
+    assert.equal(c.calls.filter(call => call[0] === 'unconfigure').length, unconfigured);
+    assert.equal(replacement.initialized, true);
+    replacement.dispose();
+  }
 });
 
 test('clear color state, scene background and autoClear map to source clear semantics', async () => {

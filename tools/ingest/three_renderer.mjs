@@ -458,42 +458,67 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         fail('UNSUPPORTED', 'Native canvas output requires unsigned-byte or half-float storage');
       if (this.isWebGPURenderer && ![THREE.UnsignedByteType, THREE.HalfFloatType, THREE.FloatType].includes(this._outputBufferType))
         fail('UNSUPPORTED', 'Output buffers require unsigned-byte, half-float or float texture storage');
+      const signal = this._targetLifetime.signal;
+      let rejectStopped;
+      const stopped = new Promise((_, reject) => { rejectStopped = reject; });
+      stopped.catch(() => {});
+      const live = () => { if (signal.aborted) throw signal.reason; };
+      const abort = () => rejectStopped(signal.reason);
+      const wait = promise => Promise.race([promise, stopped]);
+      signal.addEventListener('abort', abort, {once: true});
+      try {
+      live();
       // The renderer owns one device for its lifetime so the output path can be
       // rebuilt (tone mapping on/off) without losing it. A supplied device is borrowed.
       if (p.device) this._device = p.device;
       else {
         const gpu = defaultGpu ?? globalThis.navigator?.gpu;
         if (!gpu || typeof gpu.requestAdapter !== 'function') fail('UNAVAILABLE', 'WebGPU is unavailable in this host');
-        const adapter = await gpu.requestAdapter(p.powerPreference ? {powerPreference: p.powerPreference} : {});
+        const adapter = await wait(gpu.requestAdapter(p.powerPreference ? {powerPreference: p.powerPreference} : {}));
+        live();
         if (!adapter) fail('UNAVAILABLE', 'No WebGPU adapter is available');
         // As r186 WebGPUBackend: request every GPUFeatureName the adapter supports.
         const requiredFeatures = [...new Set([...R186_GPU_FEATURES.filter(f => adapter.features?.has?.(f)), ...(p.requiredFeatures ?? [])])];
-        this._device = await adapter.requestDevice({requiredFeatures, requiredLimits: p.requiredLimits ?? {}});
-        this._ownsDevice = true;
+        // Browser requests cannot be cancelled. Transfer ownership in this
+        // continuation, or retire a late device without publishing it.
+        const acquisition = Promise.resolve(adapter.requestDevice({requiredFeatures, requiredLimits: p.requiredLimits ?? {}})).then(device => {
+          if (signal.aborted) { device.destroy(); throw signal.reason; }
+          this._device = device; this._ownsDevice = true;
+        });
+        await wait(acquisition);
+        live();
       }
       this._preferredFormat = p.outputType === THREE.HalfFloatType ? 'rgba16float' :
         p.outputType === THREE.UnsignedByteType ? 'bgra8unorm' :
         (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
-      await this._createSession(this._wantsHdr(this._toneMapping()));
-      if (this._disposed) { this._release(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
+      await wait(this._createSession(this._wantsHdr(this._toneMapping())));
+      live();
       this._initialized = true;
       // Source Animation.start() advances once during initialization and keeps
       // the node clock running even without a user animation callback.
       if (this.isWebGPURenderer) this._setLoop(null);
       return this;
+      } catch (error) {
+        // A failed session never transfers device ownership to a usable
+        // renderer. Canvas children borrow that device and cannot retire it.
+        try { this._canvases.dispose(); }
+        finally { if (this._ownsDevice) { this._ownsDevice = false; this._device.destroy(); } }
+        throw signal.aborted ? signal.reason : error;
+      } finally { signal.removeEventListener('abort', abort); }
     }
     /** Native tone mapping and output color conversion use the source's linear
      * framebuffer target. Preserve working-linear scene color from the first
      * render, including when no tone mapping is selected. */
     async _createSession(hdr, srgbView = this._canvasSrgbView(this.outputColorSpace, hdr),
       canvasTarget = this.getCanvasTarget(), canvasSize = this._bufferSize(), canvas = canvasTarget.domElement) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       const release = this._canvases.retain(canvasTarget, canvas);
       this._canvases.activate(canvasTarget, canvas);
       try {
       const sampleCount = this.antialias || this.samples > 0 ? 4 : 1;
       const depthFormat = this.depth ? (this.stencil ? 'depth24plus-stencil8' : 'depth24plus') : null;
       const [width, height] = canvasSize;
-      const common = {device: this._device};
+      const common = {device: this._device, signal: this._targetLifetime.signal};
       const format = this._preferredFormat ? {format: this._preferredFormat} : {};
       const extended = this._preferredFormat === 'rgba16float';
       // Half-float presentation has no sRGB attachment view. Its output pass
@@ -503,7 +528,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._hdr = hdr;
       this._srgbView = srgbView;
       this._dispatcher = null;
-      this._session = hdr
+      const session = hdr
         ? await createGpuHdrCanvasRenderer(canvas, createDispatcher(this), {...common,
           target: {width, height, ...presentation, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
           renderTarget: {depthFormat, sampleCount, format: this._outputBufferFormat()},
@@ -513,6 +538,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           target: {width, height, depthFormat, sampleCount, ...presentation,
             preserveDrawingBuffer: this._shaderEncodedOutput && this.preserveDrawingBuffer === true,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
+      if (this._disposed) { session.dispose(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
+      this._session = session;
       this._canvases.save();
       } finally { release(); }
     }
