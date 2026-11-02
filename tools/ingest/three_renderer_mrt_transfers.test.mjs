@@ -304,3 +304,73 @@ test('source validation errors propagate through the selected copy and fire-and-
   await rejected; await flush(); assert.match(r._deferredError.message, /MRT source upload invalid/);
   await assert.rejects(r.readRenderTargetMipPixelsAsync(destination, 0, {colorIndex: 1}), /MRT source upload invalid/); f.close();
 });
+
+test('queued MRT mip reads retain independent attachment levels, precision and mip-local extents', async () => {
+  const f = fixture(), r = f.renderer;
+  const source = target(['rgba8unorm', 'r32float', 'rgba16float'], {width: 13, height: 9});
+  source.textures[1].mipmaps = Array.from({length: 3}, () => ({}));
+  source.textures[2].mipmaps = Array.from({length: 4}, () => ({}));
+  const a = payload('r32float', 6), b = payload('rgba16float', 1);
+  const expectedA = bytes(a).slice(), expectedB = bytes(b).slice();
+  const writeA = r.writeRenderTargetPixelsAsync(source, a, {colorIndex: 1, destinationMipLevel: 2});
+  const writeB = r.writeRenderTargetPixelsAsync(source, b, {colorIndex: 2, destinationMipLevel: 3});
+  const optionsA = {colorIndex: 1}, optionsB = {colorIndex: 2};
+  let levelA = 2, levelB = 3;
+  const readA = r.readRenderTargetMipPixelsAsync(source, levelA, optionsA);
+  const readB = r.readRenderTargetMipPixelsAsync(source, levelB, optionsB);
+  optionsA.colorIndex = optionsB.colorIndex = 0; levelA = levelB = 0;
+  a.fill(0); b.fill(0);
+  const entry = f.owner.capture(source);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [1, 3, 4]);
+  assert.equal(entry.references, 4); assert.equal(f.controller.pendingRequests, 4);
+  assert.equal(f.controller.allocatedBytes, 64); assert.equal(f.calls.textures.length, 0);
+  f.ready();
+  const [actualA, actualB] = await Promise.all([readA, readB]);
+  await Promise.all([writeA, writeB]);
+  assert.ok(actualA instanceof Float32Array); assert.ok(actualB instanceof Uint16Array);
+  assert.deepEqual(bytes(actualA), expectedA); assert.deepEqual(bytes(actualB), expectedB);
+  assert.deepEqual(f.reads.map(read => [read.source.texture.format, read.source.mipLevel,
+    read.size.width, read.size.height, read.source.origin.x, read.source.origin.y]),
+  [['r32float', 2, 3, 2, 0, 0], ['rgba16float', 3, 1, 1, 0, 0]]);
+  assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0);
+  assert.equal(f.controller.allocatedBytes, 0); f.close();
+});
+
+test('shorter MRT mip chains reject before retention and native allocation, including empty reads', async () => {
+  const f = fixture({initialized: true}), r = f.renderer;
+  const source = target(['rgba8unorm', 'r32float'], {width: 8, height: 4});
+  source.texture.mipmaps = Array.from({length: 4}, () => ({}));
+  const entry = f.owner.capture(source);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [4, 1]);
+  for (const level of [1, 3]) {
+    await assert.rejects(r.readRenderTargetMipPixelsAsync(source, level, {colorIndex: 1}),
+      {code: 'F3D_RENDERER_REGION'});
+    await assert.rejects(r.readRenderTargetMipPixelsAsync(source, level, {colorIndex: 1, width: 0, height: 0}),
+      {code: 'F3D_RENDERER_REGION'});
+  }
+  assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0);
+  assert.equal(f.controller.allocatedBytes, 0); assert.equal(r._pending.length, 0);
+  assert.equal(f.calls.textures.length, 0); assert.equal(f.calls.buffers.length, 0);
+  assert.equal(f.reads.length, 0); f.close();
+});
+
+test('legacy single-color mip metadata and depth admission remain independent of color pyramids', async () => {
+  const f = fixture({initialized: true}), r = f.renderer;
+  const source = target(['rgba16float'], {width: 8, height: 4});
+  source.texture.mipmaps = Array.from({length: 4}, () => ({}));
+  const entry = f.owner.capture(source);
+  // Legacy controller owners expose the primary count without an MRT vector.
+  delete entry.shape.colorMipLevelCounts;
+  await assert.rejects(r.readRenderTargetDepthPixelsAsync(source, {mipLevel: 1}),
+    {code: 'F3D_RENDERER_OPTIONS'});
+  await assert.rejects(r.readRenderTargetDepthPixelsAsync(source),
+    {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(entry.references, 0); assert.equal(f.calls.textures.length, 0);
+  const input = payload('rgba16float', 2), expected = bytes(input).slice();
+  await r.writeRenderTargetPixelsAsync(source, input, {destinationMipLevel: 2});
+  const actual = await r.readRenderTargetMipPixelsAsync(source, 2);
+  assert.deepEqual(bytes(actual), expected);
+  assert.equal(f.reads[0].source.mipLevel, 2);
+  assert.deepEqual([f.reads[0].size.width, f.reads[0].size.height], [2, 1]);
+  assert.equal(entry.references, 0); assert.equal(f.controller.pendingRequests, 0); f.close();
+});

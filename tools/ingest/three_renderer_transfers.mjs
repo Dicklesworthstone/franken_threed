@@ -322,7 +322,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
           : layers > 1 ? 'Array readback requires an in-range layer' : '2D readback requires face zero');
     if (depth && !entry.shape.depthTexture)
       fail('UNSUPPORTED', 'Attach a source DepthTexture before requesting depth readback');
-    const levels = depth ? 1 : entry.shape.mipLevelCount;
+    const levels = depth ? 1 : entry.shape.colorMipLevelCounts?.[colorIndex] ?? entry.shape.mipLevelCount;
     if (!Number.isSafeInteger(mipLevel) || mipLevel < 0 || mipLevel >= levels)
       fail('REGION', 'Readback mip level is not allocated');
     const w = Math.max(1, Math.floor(entry.shape.width / 2 ** mipLevel));

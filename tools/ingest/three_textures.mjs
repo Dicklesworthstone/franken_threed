@@ -393,17 +393,31 @@ function textureInspector(T,{
 
 export function createGpuThreeTextures(device,{
   three:T,maxTextureBytes=128*1024*1024,maxTextures=256,maxPixels=16*1024*1024,label='f3d-three-textures',
-  imageSnapshots=null,mediaSnapshots=null,nativeCube=false,nativeMedia=false,
+  imageSnapshots=null,mediaSnapshots=null,nativeCube=false,nativeMedia=false,webglVersioning=false,
 }={}) {
   if(T?.REVISION!=='186'||typeof T.Texture!=='function')fail('SOURCE','Supply the pinned r186 module');
   integer(maxTextureBytes,1,Number.MAX_SAFE_INTEGER,'texture budget');integer(maxTextures,1,65536,'texture capacity');
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
+  if(typeof webglVersioning!=='boolean')fail('OPTIONS','Expected a boolean WebGL upload profile');
   const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,mediaSnapshots,nativeCube,nativeMedia,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map(),samplers=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
   const stopped=new Promise((_,reject)=>{rejectStop=reject;});stopped.catch(()=>{});
   const stats={allocations:0,uploads:0,writeCalls:0,externalCopies:0,mipPasses:0};
+  function inspect(t,options){
+    const r=records.get(t);
+    // WebGL checks Texture.version before reading upload/sampler parameters.
+    // Unrequested edits cannot reallocate storage or expose newer CPU pixels.
+    return webglVersioning&&r?.description&&r.version===t.version?r.description:describe(t,options);
+  }
+  function remember(r,d){
+    if(!webglVersioning||d.video||r.description===d)return;
+    // Warm inspection needs metadata only. Do not keep replaced image/mipmap
+    // payloads alive; Source and GPU residency already have their existing owner.
+    const {images,uploads,layerUpdates,...description}=d;
+    r.description=Object.freeze({...description,sampler:Object.freeze({...d.sampler})});
+  }
   function live(){if(disposed)fail('DISPOSED','Texture owner is disposed');if(terminal)throw terminal;}
   function drop(t){const r=records.get(t);if(!r)return;t.removeEventListener('dispose',r.listener);records.delete(t);
     if(--r.resource.refs===0){const a=r.resource;a.texture.destroy();textureBytes-=a.bytes;sources.get(a.source)?.delete(a.key);
@@ -434,7 +448,7 @@ export function createGpuThreeTextures(device,{
   }
   function plans(input,{initialize=false}={}){
     live();const list=[];for(const t of input){if(list.length>=maxTextures)fail('LIMIT','Requested texture count exceeds capacity');list.push(t);}
-    return [...new Set(list)].map(t=>({t,d:describe(t,{initialize:initialize||records.has(t)})}));
+    return [...new Set(list)].map(t=>({t,d:inspect(t,{initialize:initialize||records.has(t)})}));
   }
   function validatePlans(list){
     let addedBytes=0,addedCount=0;const newKeys=new Map();
@@ -612,20 +626,21 @@ export function createGpuThreeTextures(device,{
           native(()=>device.queue.submit([encoder.finish()]));
           if(copyOnly){r.resource.sourceVersion=t.source.version;r.version=t.version;}
         }
+        remember(r,d);
         if(!copyOnly)upload(t,r,d);
       }});
       return api;
     }finally{busy=false;}
   }
-  function check(t){live();const d=describe(t,{initialize:records.has(t)}),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
+  function check(t){live();const d=inspect(t,{initialize:records.has(t)}),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
   function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,samplerDescriptor:Object.freeze({...d.sampler}),version:r.version,sourceVersion:r.resource.sourceVersion,
     ...(d.layered?{viewDimension:d.viewDimension}:{}),sampleType:d?.sampleType??'float',filtering:(d?.sampleType??'float')==='float'});}
   function update(input){
     const list=plans(input);if(busy)fail('REENTRANT','Cannot update during a texture operation');
     for(const {t,d} of list)if(!match(t,d))fail('PREPARE','Texture structure changed; call prepare');
-    busy=true;try{if(list.length)checked(()=>{for(const {t,d} of list)upload(t,match(t,d),d);});return api;}finally{busy=false;}
+    busy=true;try{if(list.length)checked(()=>{for(const {t,d} of list){const r=match(t,d);remember(r,d);upload(t,r,d);}});return api;}finally{busy=false;}
   }
-  const api=Object.freeze({prepare,update,binding,inspect:describe,
+  const api=Object.freeze({prepare,update,binding,inspect,
     sampler(descriptor){live();return samplers.get(JSON.stringify(descriptor))??checked(()=>samplerFor(descriptor));},
     validatePreparation(input){validatePlans(plans(input));},
     // Borrowed native storage, for consumers such as the background renderer.

@@ -220,7 +220,7 @@ export async function createGpuThreeScene(device,scene,{
   let batchHistoryBytes=0,batchHistoryValidation=Promise.resolve(),passBatchHistory=null;
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false,nativeLightMode=false;
   let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null,transmissionView=null;
-  const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
+  const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three,webglVersioning:!!programSupport});
   const textureBindings=createThreeTextureBindings(device,{
     three,textures,autoTextures,ownedTextures,fail,
     get textureScan(){return textureScan;},

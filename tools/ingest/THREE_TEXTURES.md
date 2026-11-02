@@ -80,8 +80,19 @@ acknowledgment, not a fictitious rollback or repeated callback on retry. Reentra
 updates/disposal are refused. The stricter automatic scene integration rejects
 custom upload callbacks before using this explicit owner.
 
-Sampling/storage/source identity changes require prepare(). New allocations are
-charged before old ones retire, so the peak budget is bounded. Defaults are
+Automatic WebGL-authored scenes enable `webglVersioning: true` on this owner.
+For nonvideo textures, that profile retains each Texture's accepted source,
+storage and sampler description until its Texture.version changes. Versionless
+wrap/filter, image, Source, dimensions or mip edits remain GPU-stale across
+inspection, preparation and draws. A requested `needsUpdate` revalidates the
+current description, and disposal followed by preparation admits current source
+state again. Source aliases retain shared pixels and independent sampler
+histories. Cached descriptions contain metadata without retaining obsolete
+image or mip upload arrays. Video keeps its existing frame-update path.
+
+Without that profile, sampling/storage/source identity changes require
+prepare(). New allocations are charged before old ones retire, so the peak
+budget is bounded. Defaults are
 128 MiB total texel/mip storage, 256 texture identities and 16 million pixels per
 image. Temporary flipped row copies are at most one admitted base/mip image.
 Driver/native object overhead is not reported as exact bytes. Source dispose
@@ -126,8 +137,10 @@ source comparisons covering data, images, aliases, bundles and prior uploads.
 `F3D_THREE_ROOT=/path/to/pinned/three node --test tools/ingest/three_textures.test.mjs`
 executes the actual source Texture classes and complete retained WebGLTextures
 uploader from commit `148ef33ecb6d2502ff796d4554abd1549c95d519`. Eighty deterministic
-update frames compare byte histories, source range mutations and callback traces.
-Other tests cover pooling, sampling, mips, external-copy descriptors, exact
+update frames compare byte histories, source range mutations, callback traces
+and requested/unrequested wrapping and magnification changes. Automatic binding
+regressions also cover shared Source uploads, source/mip replacement, disposal
+and callback acknowledgment. Other tests cover pooling, sampling, mips, external-copy descriptors, exact
 budgets, native errors, disposal and pending completion. The device boundary is
 a byte/command recorder: mip shaders and external-image conversions are not
 executed in those tests. No native pixel parity or measured speedup is claimed.

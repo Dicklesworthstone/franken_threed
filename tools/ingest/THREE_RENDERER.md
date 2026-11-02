@@ -821,6 +821,13 @@ complete its pyramid before subsequent consumers. Per-level depth attachments,
 queued generation ownership and allocation overlap remain within the existing
 resource budgets.
 
+Public `readRenderTargetMipPixelsAsync` admission uses the selected color's
+captured mip count and mip-local extent, including a secondary chain longer or
+shorter than the primary attachment's chain. Invalid levels reject before
+retaining a target or allocating native textures/staging buffers, even for an
+empty rectangle. Legacy owners with only a primary mip count remain supported;
+depth readback retains its separate single-level contract.
+
 `native_mrt_mips.mjs` compares mixed sRGB-byte, linear-byte and half-float targets
 with pinned r186, including authored overwrites, independent queued generation,
 clear history, explicit LOD sampling and unequal color mip counts. Chromium

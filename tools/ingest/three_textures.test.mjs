@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {createGpuThreeTextures} from './three_textures.mjs';
+import {createGpuThreeTextures,createThreeTextureBindings} from './three_textures.mjs';
 import {textureDevice} from './fixtures/gpu_texture_device.mjs';
 const root=process.env.F3D_THREE_ROOT??path.resolve('upstream/three.js');
 const T=await import(pathToFileURL(path.join(root,'build/three.core.js')));
@@ -198,7 +198,8 @@ test('differential upload histories match the retained r186 WebGLTextures implem
   const {WebGLTextures}=await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLTextures.js')));
   const {WebGLProperties}=await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLProperties.js')));
   let bound,next=1;const parameters=new Map(),buffers=[];
-  const gl=new Proxy({TEXTURE0:0,createTexture(){const t={};buffers.push(t);return t;},deleteTexture(t){t.destroyed=true;},texParameteri(){},generateMipmap(){}},
+  const gl=new Proxy({TEXTURE0:0,createTexture(){const t={parameters:new Map()};buffers.push(t);return t;},deleteTexture(t){t.destroyed=true;},
+    texParameteri(_target,key,value){bound.parameters.set(key,value);},generateMipmap(){}},
     {get(o,k){if(!(k in o))o[k]=next++;return o[k];}});
   const properties=WebGLProperties();
   const state={activeTexture(){},bindTexture(_target,t){bound=t;},pixelStorei(k,v){parameters.set(k,v);},getParameter:k=>parameters.get(k)??0,
@@ -209,13 +210,17 @@ test('differential upload histories match the retained r186 WebGLTextures implem
     }};
   const uploader=new WebGLTextures(gl,{has:()=>false},state,properties,{maxTextures:16,maxTextureSize:8192},
     {convert:value=>value===T.RGBAFormat?gl.RGBA:value===T.UnsignedByteType?gl.UNSIGNED_BYTE:value},{memory:{textures:0}});
-  const a=make(8,4),b=make(8,4),d=textureDevice(),p=pool(d),calls=[[],[]];
+  const a=make(8,4),b=make(8,4),d=textureDevice(),p=pool(d,{webglVersioning:true}),calls=[[],[]];
   a.onUpdate=t=>calls[0].push([t.version,t.source.version,t.updateRanges.length]);
   b.onUpdate=t=>calls[1].push([t.version,t.source.version,t.updateRanges.length]);
   p.prepare([a]);uploader.setTexture2D(b,0);
   let seed=0x5ced;const random=n=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed%n;};
   for(let frame=0;frame<80;frame++){
     for(let i=0;i<a.image.data.length;i++)a.image.data[i]=b.image.data[i]=random(256);
+    // Sampler edits are sometimes unrequested; both pixels and parameters
+    // must stay at their accepted versions until a later source upload.
+    if(frame%7===0)a.wrapS=b.wrapS=frame%14===0?T.RepeatWrapping:T.ClampToEdgeWrapping;
+    if(frame%11===0)a.magFilter=b.magFilter=frame%22===0?T.LinearFilter:T.NearestFilter;
     if(frame%3!==0){
       for(let n=0;n<3;n++){
         const y=random(4),x=random(6),count=random(3)*4,start=(y*8+x)*4;
@@ -223,8 +228,11 @@ test('differential upload histories match the retained r186 WebGLTextures implem
       }
       a.needsUpdate=true;b.needsUpdate=true;
     }
-    p.update([a]);uploader.setTexture2D(b,0);
-    assert.deepEqual(p.binding(a).view.texture.levels[0],properties.get(b).__webglTexture.data,`frame ${frame}`);
+    p.prepare([a]);uploader.setTexture2D(b,0);
+    const expected=properties.get(b).__webglTexture;
+    assert.deepEqual(p.binding(a).view.texture.levels[0],expected.data,`frame ${frame}`);
+    assert.equal(p.binding(a).samplerDescriptor.addressModeU,expected.parameters.get(gl.TEXTURE_WRAP_S)===gl.REPEAT?'repeat':'clamp-to-edge');
+    assert.equal(p.binding(a).samplerDescriptor.magFilter,expected.parameters.get(gl.TEXTURE_MAG_FILTER)===gl.LINEAR?'linear':'nearest');
     assert.deepEqual(a.updateRanges,b.updateRanges);assert.deepEqual(calls[0],calls[1]);
   }
   b.dispose();assert.ok(buffers[0].destroyed);p.dispose();
@@ -244,4 +252,70 @@ test('half-float and float DataTextures upload exact bytes; float32 linear filte
   const srgb=new T.DataTexture(new Uint16Array(4),1,1,T.RGBAFormat,T.HalfFloatType);srgb.colorSpace=T.SRGBColorSpace;srgb.needsUpdate=true;
   assert.throws(()=>p.prepare([srgb]),{code:'THREE_TEXTURE_COLOR'});
   p.dispose();
+});
+
+test('automatic WebGL textures keep accepted sampling and shared GPU pixels until needsUpdate',()=>{
+  const d=textureDevice(),p=pool(d,{webglVersioning:true}),a=make(),b=a.clone();
+  let scan=null;
+  const frames=new Set(),bindings=createThreeTextureBindings(d,{three:T,textures:new Map(),autoTextures:true,ownedTextures:()=>p,
+    get textureScan(){return scan;},pendingTextures:new WeakSet(),frameTextures:frames,
+    fail(code,message){throw Object.assign(new Error(message),{code:'THREE_SCENE_'+code});}});
+  p.prepare([a,b]);const first=bindings.binding(a),pixels=first.view.texture.levels[0].slice();
+  a.image.data.fill(77);a.wrapS=T.RepeatWrapping;a.magFilter=T.LinearFilter;a.minFilter=T.LinearFilter;
+  assert.equal(bindings.binding(a).view,first.view);assert.equal(bindings.binding(a).sampler,first.sampler);
+  scan=new Set();const inspected=bindings.binding(a);
+  assert.equal(inspected.samplerDescriptor.addressModeU,'clamp-to-edge');
+  assert.equal(inspected.samplerDescriptor.magFilter,'nearest');
+  p.prepare(scan);scan=null;p.update([a,b]);
+  assert.deepEqual(first.view.texture.levels[0],pixels);assert.equal(d.textureWrites.length,1);assert.equal(d.textures.length,1);
+  b.needsUpdate=true;p.update([b]);
+  assert.ok(first.view.texture.levels[0].every(value=>value===77),'a requested alias upload updates their shared GPU image');
+  assert.equal(bindings.binding(a).sampler,first.sampler,'another alias upload does not publish this Texture sampler edit');
+  a.needsUpdate=true;
+  assert.throws(()=>bindings.binding(a),{code:'THREE_SCENE_PREPARE'});
+  p.prepare([a]);const current=bindings.binding(a);
+  assert.notEqual(current.view,first.view);assert.equal(current.samplerDescriptor.addressModeU,'repeat');
+  assert.equal(current.samplerDescriptor.magFilter,'linear');assert.equal(current.samplerDescriptor.minFilter,'linear');
+  assert.equal(bindings.binding(b).view,first.view);assert.equal(first.view.texture.destroyed,false);
+  assert.ok(frames.has(a));bindings.dispose();p.dispose();
+});
+
+test('WebGL upload versions retain prior source dimensions and mips across unrequested replacements',()=>{
+  const d=textureDevice(),p=pool(d,{webglVersioning:true}),texture=make(4,4);
+  p.prepare([texture]);const first=p.binding(texture),pixels=first.view.texture.levels[0].slice();
+  texture.source=new T.TextureSource({width:2,height:2,data:new Uint8Array(16).fill(91)});
+  texture.mipmaps=[texture.image,{width:1,height:1,data:new Uint8Array(4).fill(37)}];
+  texture.minFilter=T.NearestMipmapNearestFilter;
+  p.update([texture]);p.prepare([texture]);
+  assert.equal(p.binding(texture).view,first.view);assert.deepEqual(first.view.texture.levels[0],pixels);
+  assert.equal(p.inspect(texture).width,4);assert.equal(p.inspect(texture).levels,1);
+  assert.equal(d.textureWrites.length,1);assert.equal(d.textures.length,1);
+  texture.needsUpdate=true;p.prepare([texture]);const second=p.binding(texture);
+  assert.notEqual(second.view,first.view);assert.equal(second.view.texture.size[0],2);
+  assert.deepEqual(second.view.texture.levels.map(level=>[...level]),[Array(16).fill(91),Array(4).fill(37)]);
+  texture.mipmaps[0].data.fill(63);texture.wrapT=T.MirroredRepeatWrapping;texture.dispose();
+  p.prepare([texture]);const recreated=p.binding(texture);
+  assert.notEqual(recreated.view,second.view);assert.equal(recreated.samplerDescriptor.addressModeV,'mirror-repeat');
+  assert.ok(recreated.view.texture.levels[0].every(value=>value===63));p.dispose();
+});
+
+test('WebGL accepted descriptor history preserves callback acknowledgment and failed-upload recovery',()=>{
+  const d=textureDevice(),p=pool(d,{webglVersioning:true}),texture=make();let calls=0;
+  texture.onUpdate=source=>{
+    calls++;assert.equal(source,texture);assert.equal(p.binding(source).sourceVersion,source.source.version);
+    source.wrapS=T.RepeatWrapping;source.source=new T.TextureSource({width:2,height:2,data:new Uint8Array(16).fill(69)});source.needsUpdate=true;
+  };
+  p.prepare([texture]);const first=p.binding(texture);
+  assert.equal(first.samplerDescriptor.addressModeU,'clamp-to-edge');assert.equal(first.version,texture.version);
+  p.update([texture]);p.prepare([texture]);
+  assert.equal(calls,1);assert.equal(d.textureWrites.length,1);assert.equal(p.binding(texture).view,first.view);
+  texture.onUpdate=null;texture.needsUpdate=true;p.prepare([texture]);
+  assert.equal(p.binding(texture).samplerDescriptor.addressModeU,'repeat');
+  assert.ok(p.binding(texture).view.texture.levels[0].every(value=>value===69));
+  const failed=make(),sentinel={};let failures=0;failed.onUpdate=()=>{failures++;throw sentinel;};
+  assert.throws(()=>p.prepare([failed]),error=>error===sentinel);assert.equal(p.failed,false);
+  const writes=d.textureWrites.length;p.update([failed]);
+  assert.equal(failures,1);assert.equal(d.textureWrites.length,writes);
+  failed.wrapS=T.MirroredRepeatWrapping;
+  assert.equal(p.binding(failed).samplerDescriptor.addressModeU,'clamp-to-edge');p.dispose();
 });
