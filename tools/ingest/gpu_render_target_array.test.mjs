@@ -95,7 +95,7 @@ test('array allocation rejects invalid dimensions, layers and unsupported sample
   }
   const f = fixture(), target = make(f);
   for (const face of [-1, 3, .5]) assert.throws(() => target.withFrame(() => assert.fail('invalid layer'), {face}), {code: 'GPU_TARGET_FACE'});
-  assert.throws(() => target.reserveColorHistory([0]), {code: 'GPU_TARGET_UNSUPPORTED'});
+  assert.throws(() => target.reserveColorHistory([1]), {code: 'GPU_TARGET_ATTACHMENT'});
   assert.equal(target.failed, false); target.dispose();
 });
 

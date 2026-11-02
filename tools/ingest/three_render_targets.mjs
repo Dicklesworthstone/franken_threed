@@ -646,8 +646,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const shape = {...inspected, key: inspected.colors.map(color => color.key).join('|')};
     const names = Object.keys(node._previousTextures ?? {});
     if (!names.length) return;
-    if (shape.cube || shape.array || shape.volume)
-      fail('UNSUPPORTED', 'Native pass histories require 2D color attachments');
+    if (shape.cube || shape.volume)
+      fail('UNSUPPORTED', 'Native pass histories require ordinary 2D or 2D-array color attachments');
     nativePasses.set(target, node);
     let group = historyGroups.get(target);
     if (group && (!historyShape(group, shape) || group.node !== node)) {
@@ -1061,7 +1061,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // change with stable attachments, formats and samples at the dispose event.
     const scopes = [...new Set(targets)].map(target => {
       const shape = inspectThreeRenderTarget(target, three);
-      if (shape.cube || shape.array || shape.volume) fail('UNSUPPORTED', 'Native effect resize scopes require 2D targets');
+      if (shape.cube || shape.volume) fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D or 2D-array targets');
       if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
       const scope = {width: target.width, height: target.height, depth: target.depth,
         dynamic: true, event: null, shape: null};

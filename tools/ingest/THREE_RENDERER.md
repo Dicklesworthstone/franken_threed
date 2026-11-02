@@ -663,8 +663,34 @@ r186, including current/previous explicit-LOD sampling, queued complementary
 generation flags, late attachment activation, authored lower levels and resize
 while readbacks remain pending. All 14 checkpoints, 254 images, 33,784 components
 and 54,600 stored bytes match exactly on Chromium 151.0.7922.34 / SwiftShader,
-with zero GPU/browser errors. Layered and volume mipmapped histories remain
-outside this profile; hardware performance is unmeasured.
+with zero GPU/browser errors. Hardware performance is unmeasured.
+
+Native 2D-array histories retain all layers of each physical current/previous
+image. Public PassNode subclasses can render several layers, sample their own
+previous-frame layers during rendering, and expose them through the source
+`getTextureNode().depth(layer)` and `getPreviousTextureNode().depth(layer)` API.
+The subclass must preserve its layer count in `setSize()` and select each layer
+when rendering; ordinary source PassNode sizing resets the target depth to one.
+Independent MRT histories preserve their formats and late activation. Four-sample
+histories retain a separate multisample image per layer and physical color;
+ordinary or per-layer depth stays shared between the two temporal colors.
+
+Single-color arrays also retain complete generated or authored mip chains for
+both histories. A selected render view includes its physical image, layer and
+mip level, while filtering updates every layer of only the selected image.
+Recognized automatic subclass resizes preserve accepted older generations with
+the same layer count until queued consumers and GPU work complete. Layer-count
+changes and explicit disposal invalidate those generations. All array layers,
+MSAA images, mip chains and private mip depth remain charged to the existing
+target budget.
+
+`native_history_layers.mjs` compares actual temporal accumulation in three layers
+against pinned r186, with mixed half-float/byte MRT, four samples, generated mips,
+late auxiliary-history activation and queued renders/readbacks across resize.
+All 15 checkpoints, 261 images, 67,320 components and 114,672 stored bytes match
+exactly on Chromium 151.0.7922.34 / SwiftShader, with zero GPU/browser errors.
+Layered MRT mip pyramids, sampled multisampled array depth, cube histories and
+volume histories remain outside this profile.
 
 ## Registered native output color spaces
 

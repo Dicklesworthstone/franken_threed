@@ -86,8 +86,9 @@
  * depthArray opts into independent depth layers; the default shares one 2D
  * depth attachment across color layers, matching source RenderTarget behavior.
  * Four-sample array rendering keeps separate persistent 2D MSAA images per
- * layer. Sampled array depth currently requires one sample. History colors
- * remain ordinary 2D. volumeDepth instead allocates single-sample 3D color;
+ * layer, including each alternate history image. History selection preserves
+ * every layer and shares ordinary or per-layer depth across both color images.
+ * Sampled array depth currently requires one sample. volumeDepth allocates 3D color;
  * frame.depthSlice selects a mip-local voxel slice through a 3D attachment view.
  * Authored mips halve all three color dimensions. Depth remains independently
  * owned 2D/array storage, including private depth at nonzero color mips.
@@ -423,7 +424,7 @@ export function createGpuRenderTarget(device, options = {}) {
         }
         pair.color = pair.colors[0]; pair.view = pair.views[0];
         pair.multisample = pair.multisamples[0]; pair.multisampleView = pair.multisampleViews[0];
-        for (const index of historyIndices) allocateHistory(pair, index, w, h);
+        for (const index of historyIndices) allocateHistory(pair, index, w, h, layers);
         if (depthFormat !== null) {
           if (sharedDepth) {
             const shared = sharedDepth.shareDepth({width: w, height: h, depthFormat, sampleCount, depthLayers, cube, array: depthArray});
@@ -459,28 +460,31 @@ export function createGpuRenderTarget(device, options = {}) {
       return pair;
     } catch (error) { destroy(pair); throw error; }
   }
-  function allocateHistory(pair, index, w, h) {
-    const size = {width: w, height: h, depthOrArrayLayers: 1}, attachmentFormat = colorFormats[index];
+  function allocateHistory(pair, index, w, h, layerCount = layers) {
+    const size = {width: w, height: h, depthOrArrayLayers: layerCount}, attachmentFormat = colorFormats[index];
     const color = device.createTexture({label: `${label} history color ${index}`, size, format: attachmentFormat,
       ...(attachmentFormat.endsWith('-srgb') ? {viewFormats: [attachmentFormat.replace(/-srgb$/, '')]} : {}),
       dimension: '2d', sampleCount: 1, mipLevelCount: pair.colorMipLevelCounts[index], usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
     pair.historyColors.set(index, color); pair.mipsDirty.add(color);
-    pair.historyViews.set(index, color.createView({baseMipLevel: 0, mipLevelCount: 1}));
-    if (sampleCount === 4) {
-      const multisample = device.createTexture({label: `${label} history MSAA ${index}`, size, format: attachmentFormat,
+    pair.historyViews.set(index, Array.from({length: layerCount}, (_, layer) => color.createView({baseMipLevel: 0, mipLevelCount: 1,
+      ...(array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})})));
+    if (sampleCount === 4) for (let layer = 0; layer < layerCount; layer++) {
+      const key = index * layerCount + layer;
+      const multisample = device.createTexture({label: `${label} history MSAA ${index}/${layer}`,
+        size: {width: w, height: h, depthOrArrayLayers: 1}, format: attachmentFormat,
         dimension: '2d', sampleCount, mipLevelCount: 1, usage: 16});
-      pair.historyMultisamples.set(index, multisample); pair.historyMultisampleViews.set(index, multisample.createView());
+      pair.historyMultisamples.set(key, multisample); pair.historyMultisampleViews.set(key, multisample.createView());
     }
   }
   function reserveColorHistory(indices) {
     exclusive();
     if (!Array.isArray(indices) || indices.some(index => !Number.isSafeInteger(index) || index < 0 || index >= colorFormats.length))
       fail('ATTACHMENT', 'History requires allocated color attachment indices');
-    if (cube || array || volume)
-      fail('UNSUPPORTED', 'History colors currently require 2D targets');
+    if (cube || volume)
+      fail('UNSUPPORTED', 'History colors require ordinary 2D or 2D-array targets');
     const additions = [...new Set(indices)].filter(index => !historyIndices.has(index));
     if (!additions.length) return api;
-    const bytes = additions.reduce((sum, index) => sum + colorCost(width, height, 1, index), 0);
+    const bytes = additions.reduce((sum, index) => sum + colorCost(width, height, layers, index), 0);
     if (bytes > maxBytes - allocated()) fail('BUDGET', 'History colors exceed maxBytes');
     busy = true;
     try {
@@ -624,15 +628,17 @@ export function createGpuRenderTarget(device, options = {}) {
       fail('ATTACHMENT', 'Mip generation requires distinct allocated color indices');
     return colorIndices.slice();
   }
-  function selectedFrame(frame, slots, mipLevel = 0) {
+  function selectedFrame(frame, slots, mipLevel = 0, face = 0) {
     if (!slots.some(Boolean)) return frame;
-    const key = `history/${mipLevel}/${slots.join(',')}`;
+    const key = `history/${mipLevel}/${face}/${slots.join(',')}`;
     if (!current.frames.has(key)) {
       current.frames.set(key, checked(() => {
-        const base = mipLevel === 0 ? current.views : frame.colorViews ?? [frame.colorView];
-        const resolved = base.map((view, index) => !slots[index] ? view : mipLevel === 0 ? current.historyViews.get(index)
-          : current.historyColors.get(index).createView({baseMipLevel: mipLevel, mipLevelCount: 1}));
-        const views = sampleCount === 4 ? current.multisampleViews.map((view, index) => slots[index] ? current.historyMultisampleViews.get(index) : view) : resolved;
+        const base = frame.resolveTargets ?? (frame.resolveTarget ? [frame.resolveTarget] : frame.colorViews ?? [frame.colorView]);
+        const resolved = base.map((view, index) => !slots[index] ? view : mipLevel === 0 ? current.historyViews.get(index)[face]
+          : current.historyColors.get(index).createView({baseMipLevel: mipLevel, mipLevelCount: 1,
+            ...(array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})}));
+        const views = sampleCount === 4 ? (frame.colorViews ?? [frame.colorView]).map((view, index) =>
+          slots[index] ? current.historyMultisampleViews.get(index * layers + face) : view) : resolved;
         return Object.freeze({...frame, colorView: views[0],
           ...(multiple ? {colorViews: Object.freeze(views), ...(sampleCount === 4 ? {resolveTargets: Object.freeze(resolved)} : {})} : {}),
           ...(sampleCount === 4 ? {resolveTarget: resolved[0]} : {})});
@@ -658,7 +664,7 @@ export function createGpuRenderTarget(device, options = {}) {
     if (extraBytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     busy = true; let active = true;
     try {
-      const frame = kind === 'frame' ? selectedFrame(frameAt(mipLevel, extraBytes, face), slots, mipLevel) : null;
+      const frame = kind === 'frame' ? selectedFrame(frameAt(mipLevel, extraBytes, face), slots, mipLevel, face) : null;
       const colors = current.colors.map((_, index) => colorTexture(current, index, slots));
       const handles = Object.freeze({colors: Object.freeze(current.colors.slice()),
         historyColors: Object.freeze(colorFormats.map((_, index) => current.historyColors.get(index) ?? null)), depth: current.depth});
@@ -667,12 +673,12 @@ export function createGpuRenderTarget(device, options = {}) {
       // source owner verifies disjoint read/write selections before using it.
       const nestedFrame = (run, {colorSlots: selected = null, mipLevel = 0, face = 0, generateColorMipmaps = null} = {}) => {
         if (!active) fail('BORROW', 'The attachment borrow has ended');
-        if (!historyIndices.size || cube || array || volume || typeof run !== 'function') fail('CALLBACK', 'Expected a synchronous history frame callback');
+        if (!historyIndices.size || cube || volume || typeof run !== 'function') fail('CALLBACK', 'Expected a synchronous history frame callback');
         const choice = selectedSlots(selected);
         const generate = generateColorMipmaps === null ? null : selectedMipColors(generateColorMipmaps);
         const bytes = mipFrameBytes(mipLevel, face);
         if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
-        const frame = selectedFrame(frameAt(mipLevel, bytes, face), choice, mipLevel);
+        const frame = selectedFrame(frameAt(mipLevel, bytes, face), choice, mipLevel, face);
         for (const index of colorFormats.keys()) current.mipsDirty.add(colorTexture(current, index, choice));
         const result = run(frame, colorTexture(current, 0, choice), handles);
         if (result?.then) { Promise.resolve(result).catch(() => {}); fail('ASYNC_USE', 'A history frame cannot cross an await'); }

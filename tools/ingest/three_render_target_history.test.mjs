@@ -13,11 +13,12 @@ import {fixture as colorCopyFixture} from './fixtures/target_storage_copy_fixtur
 
 function fixture(options = {}) {
   const f = gpuPostprocessFixture(), create = f.device.createTexture;
-  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32, maxTextureArrayLayers: 256});
   f.device.features = new Set();
   f.device.createTexture = descriptor => {
     const texture = create(descriptor);
     texture.sampleCount = descriptor.sampleCount; texture.mipLevelCount = descriptor.mipLevelCount;
+    texture.depthOrArrayLayers = descriptor.size.depthOrArrayLayers ?? 1;
     return texture;
   };
   const owner = createThreeRenderTargets(T, {getDevice: () => f.device, ...options});
@@ -50,6 +51,87 @@ for (const samples of [1, 4]) test(`raw history preserves each ${samples}-sample
   raw.reserveColorHistory([0]); assert.equal(raw.allocatedBytes, bytes);
   assert.throws(() => raw.withFrame(() => {}, {colorSlots: [0, 1]}), {code: 'GPU_TARGET_ATTACHMENT'});
   await raw.whenIdle(); raw.dispose(); destroyed(f.calls.textures); f.owner.dispose();
+});
+
+for (const sampleCount of [1, 4]) for (const depthArray of [false, true])
+test(`array histories preserve each layer's ${sampleCount}-sample color and ${depthArray ? 'independent' : 'shared'} depth`, async () => {
+  const f = fixture(), raw = createGpuRenderTarget(f.device, {width: 8, height: 4, arrayLayers: 3, depthArray,
+    colorFormats: ['rgba16float', 'rgba8unorm'], sampleCount});
+  const first = [], second = [], baseBytes = 8 * 4 * (3 * 12 * (sampleCount === 4 ? 5 : 1) + (depthArray ? 3 : 1) * 4 * sampleCount);
+  for (const face of [0, 1, 2]) raw.withFrame(frame => { first.push(frame); }, {face});
+  raw.reserveColorHistory([0]);
+  for (const face of [0, 1, 2]) raw.withFrame(frame => {
+    second.push(frame);
+    assert.notEqual(resolved(frame), resolved(first[face]));
+    assert.equal(resolved(frame).depthOrArrayLayers, 3);
+    assert.equal((frame.resolveTarget ?? frame.colorView).descriptor.baseArrayLayer, face);
+    assert.equal(frame.colorViews[1], first[face].colorViews[1]);
+    assert.equal(frame.depthView, first[face].depthView);
+  }, {face, colorSlots: [1, 0]});
+  if (sampleCount === 4) {
+    assert.equal(new Set(second.map(frame => frame.colorView.texture)).size, 3, 'each layer retains its own multisample image');
+    for (const frame of second) assert.equal(frame.colorView.texture.depthOrArrayLayers, 1);
+  }
+  assert.equal(new Set(second.map(frame => frame.depthView.texture)).size, depthArray && sampleCount === 4 ? 3 : 1);
+  assert.equal(raw.allocatedBytes, baseBytes + 8 * 4 * 3 * 8 * (sampleCount === 4 ? 5 : 1));
+  raw.withAttachments((colors, depth, history, withFrame) => {
+    assert.equal(colors[0], resolved(first[0])); assert.equal(history[0], resolved(second[0]));
+    for (const face of [2, 0, 1]) withFrame(frame => assert.equal(frame, second[face]), {face, colorSlots: [1, 0]});
+  });
+  raw.reserveColorHistory([1]);
+  raw.withFrame(frame => {
+    assert.equal(frame.colorView, second[2].colorView);
+    assert.notEqual(frame.colorViews[1], second[2].colorViews[1]);
+    assert.equal((frame.resolveTargets?.[1] ?? frame.colorViews[1]).descriptor.baseArrayLayer, 2);
+  }, {face: 2, colorSlots: [1, 1]});
+  assert.equal(raw.allocatedBytes, baseBytes + 8 * 4 * 3 * 12 * (sampleCount === 4 ? 5 : 1));
+  await raw.whenIdle(); raw.dispose(); f.owner.dispose(); destroyed(f.calls.textures);
+});
+
+test('array history budgets include every layer before allocation and retain the extent after raw resize', async () => {
+  const f = fixture(), bytes = 8 * 4 * 3 * 4;
+  const limited = createGpuRenderTarget(f.device, {width: 8, height: 4, arrayLayers: 3, format: 'rgba8unorm', depthFormat: null, maxBytes: bytes * 2 - 1});
+  const count = f.calls.textures.length;
+  assert.throws(() => limited.reserveColorHistory([0]), {code: 'GPU_TARGET_BUDGET'});
+  assert.equal(f.calls.textures.length, count); assert.equal(limited.allocatedBytes, bytes); limited.dispose();
+  const raw = createGpuRenderTarget(f.device, {width: 8, height: 4, arrayLayers: 3, format: 'rgba8unorm', depthFormat: null});
+  raw.reserveColorHistory([0]); raw.resize(4, 2);
+  raw.withFrame(frame => {
+    assert.equal(frame.colorView.texture.depthOrArrayLayers, 3);
+    assert.equal(frame.colorView.descriptor.baseArrayLayer, 2);
+  }, {face: 2, colorSlots: [1]});
+  assert.equal(raw.allocatedBytes, 4 * 2 * 3 * 4 * 2);
+  await raw.whenIdle(); raw.dispose(); f.owner.dispose(); destroyed(f.calls.textures);
+});
+
+test('array PassNode swaps retain full images, detached feedback and queued resize generations', async () => {
+  const f = fixture({flipY: false}), pass = T.TSL.pass(new T.Scene(), new T.PerspectiveCamera(), {samples: 0, depth: 3, useArrayDepthTexture: true});
+  pass.getTextureNode('aux').value.type = T.UnsignedByteType; pass.getPreviousTextureNode();
+  pass.renderTarget.setSize(8, 4, 3); f.owner.registerNativePass(pass);
+  const old = f.owner.captureNativeTexture(pass.renderTarget.texture), release = f.owner.retainGeneration(old.entry);
+  const original = [];
+  for (const face of [0, 1, 2]) f.owner.render(old.entry, frame => { original.push(frame); }, {face});
+  pass.toggleTexture('output'); f.owner.registerNativePass(pass);
+  const entry = f.owner.capture(pass.renderTarget), previous = f.owner.captureNativeTexture(pass.getPreviousTexture('output'));
+  f.owner.withNativeTexture(previous, texture => {
+    assert.equal(texture, resolved(original[0])); assert.equal(texture.depthOrArrayLayers, 3);
+    for (const face of [2, 0, 1]) f.owner.render(entry, frame => {
+      assert.notEqual(resolved(frame), texture);
+      assert.equal(frame.colorView.descriptor.baseArrayLayer, face);
+      assert.equal(frame.depthView, original[face].depthView);
+    }, {face});
+  });
+  f.owner.withNativeTexture(f.owner.captureNativeTexture(pass.renderTarget.texture), () => {
+    assert.throws(() => f.owner.render(entry, () => {}, {face: 2}), {code: 'THREE_TARGET_FEEDBACK'});
+  });
+  const originalTextures = f.calls.textures.slice(), fence = deferred(); f.controls.completion = fence;
+  f.owner.withNativeEffectTargets([pass.renderTarget], () => pass.renderTarget.setSize(16, 4, 3));
+  pass.toggleTexture('output'); f.owner.registerNativePass(pass);
+  f.owner.render(f.owner.capture(pass.renderTarget), frame => assert.equal(resolved(frame).width, 16), {face: 2});
+  f.owner.withNativeTexture(old, texture => { assert.equal(texture.width, 8); assert.equal(texture.depthOrArrayLayers, 3); });
+  release(); originalTextures.forEach(texture => assert.equal(texture.destroyed, 0));
+  fence.resolve(); await f.owner.whenIdle(); destroyed(originalTextures);
+  f.owner.dispose(); destroyed(f.calls.textures);
 });
 
 for (const samples of [0, 4]) test(`PassNode alternates persistent colors with ${samples || 1} samples and permits only detached feedback`, async () => {
@@ -208,10 +290,39 @@ test('source setup refreshes cold history metadata but shape edits invalidate re
 
 function mipFixture() {
   const f = gpuTargetMipmapFixture();
-  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32, maxTextureArrayLayers: 256});
   return f;
 }
 const mipPasses = f => f.submissions.flatMap(commands => commands.flatMap(command => command.passes));
+
+test('array history mip views select both layer and physical image and share private mip depth', async () => {
+  const f = mipFixture(), raw = createGpuRenderTarget(f.device, {width: 8, height: 4, arrayLayers: 3, depthArray: true,
+    format: 'rgba8unorm', mipLevelCount: 4});
+  raw.reserveColorHistory([0]);
+  const a = raw.selectColorSlots([0]), b = raw.selectColorSlots([1]);
+  a.generateMipmaps(); b.generateMipmaps();
+  const first = [];
+  for (const face of [0, 1, 2]) a.withFrame(frame => { first.push(frame); }, {face, mipLevel: 1});
+  a.generateMipmaps();
+  const bytes = 43 * 3 * 4 * 2 + (8 * 4 + 4 * 2) * 3 * 4;
+  assert.equal(raw.allocatedBytes, bytes);
+  a.withAttachments((colors, depth, history, withFrame) => {
+    for (const face of [2, 0, 1]) withFrame(frame => {
+      assert.equal(frame.colorView.texture, history[0]);
+      assert.equal(frame.colorView.descriptor.baseMipLevel, 1);
+      assert.equal(frame.colorView.descriptor.baseArrayLayer, face);
+      assert.equal(frame.depthView, first[face].depthView);
+    }, {face, mipLevel: 1, colorSlots: [1], generateColorMipmaps: []});
+  });
+  assert.equal(raw.allocatedBytes, bytes, 'both physical colors share the same mip depth allocation');
+  const before = mipPasses(f).length;
+  assert.equal(b.generateMipmaps(), true); assert.equal(a.generateMipmaps(), false);
+  const passes = mipPasses(f).slice(before);
+  assert.equal(passes.length, 9, 'each of three layers gets three mip reductions');
+  assert.deepEqual(passes.map(pass => pass.descriptor.colorAttachments[0].view.descriptor.baseArrayLayer), [0, 1, 2, 0, 1, 2, 0, 1, 2]);
+  b.withTexture(texture => assert.ok(passes.every(pass => pass.descriptor.colorAttachments[0].view.texture === texture)));
+  await raw.whenIdle(); raw.dispose(); destroyed(f.textures);
+});
 
 for (const sampleCount of [1, 4]) test(`history mip chains retain independent physical images, caches and ${sampleCount}-sample budgets`, async () => {
   const f = mipFixture(), raw = createGpuRenderTarget(f.device, {width: 8, height: 4, sampleCount,
