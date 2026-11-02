@@ -37,6 +37,7 @@ import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
 import {createThreeTimestampQueries} from './three_timestamp_queries.mjs';
+import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
@@ -417,12 +418,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._renderUid = 0;
       const timestamps = this._timestamps = createThreeTimestampQueries({getDevice: () => this._device,
         enabled: () => this._backend?.trackTimestamp === true, signal: this._targetLifetime.signal, warn: THREE.warnOnce});
-      this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: parameters.trackTimestamp === true,
+      this._backend = Object.defineProperties(createThreeBackendOperations(this), Object.getOwnPropertyDescriptors({isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: parameters.trackTimestamp === true,
         get hasTimestamp() { return timestamps.supported; },
         capabilities: {getUniformBufferLimit: () => this._device.limits.maxUniformBufferBindingSize},
         hasTimestampQuery: timestamps.hasTimestampQuery, getTimestampUID: timestamps.getTimestampUID,
         getTimestamp: timestamps.getTimestamp, getTimestampFrames: timestamps.getTimestampFrames,
-        resolveTimestampsAsync: type => this.resolveTimestampsAsync(type), delete: target => this._canvases.forget(target)};
+        resolveTimestampsAsync: type => this.resolveTimestampsAsync(type), delete: target => this._canvases.forget(target)}));
       // The source frame clock (Animation advances it once per loop tick).
       this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};
       this._inspector = typeof THREE.InspectorBase === 'function' ? new THREE.InspectorBase() : inspectorStub();
@@ -1060,12 +1061,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.info.render.calls++;
       this.info.render.frameCalls++;
       // Source timestamp UID shape `<call id>:f<frame>` (Inspector groups by call id).
-      const uid = `render:${++this._renderUid}:f${this.info.frame}`, previousTimestamp = this._timestampScope;
+      const uid = `render:${++this._renderUid}:f${this.info.frame}`, previousTimestamp = this._timestampScope,
+        previousOperations = this._operationScope;
       const timestamp = this._timestamps.begin('render', uid);
       this._inspector.beginRender(uid, scene, camera, this._renderTarget);
       this._timestampScope = timestamp;
+      this._operationScope = this._backend._capture({camera, renderTarget: this._renderTarget});
       try { return this._renderFrame(scene, camera); }
-      finally { this._timestampScope = previousTimestamp; this._inspector.finishRender(); }
+      finally { this._timestampScope = previousTimestamp; this._operationScope = previousOperations; this._inspector.finishRender(); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
@@ -1081,6 +1084,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const outputProfile = target ? null : this._captureOutputProfile();
       const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile), key = sceneKey(this, scene, backgroundState);
       if (!clearOnly && this._timestampScope) frame.timestamp = this._timestampScope;
+      if (!clearOnly && this._operationScope) frame.operations = this._operationScope;
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
@@ -1399,7 +1403,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         throw error;
       }
     }
-    _submit({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submit(request) {
+      return request.frame.operations ? request.frame.operations.run(() => this._submitFrame(request)) : this._submitFrame(request);
+    }
+    _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);

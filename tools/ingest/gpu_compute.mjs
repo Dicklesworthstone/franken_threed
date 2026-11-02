@@ -295,7 +295,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return pipeline;
   }
-  function dispatch(pipeline, groups, workgroups, timestamp = null) {
+  function dispatch(pipeline, groups, workgroups, timestamp = null, operation = null) {
     live();
     if (!ready.has(pipeline)) fail('PIPELINE', 'Prepare the compute pipeline before dispatch');
     let direct = null;
@@ -313,16 +313,26 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     }
     const snapshots = captureGroups(groups);
     const validations = timestamp ? [] : null;
-    try { checked(() => {
+    const issue = () => checked(() => {
       const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
       const encoder = device.createCommandEncoder({label: 'f3d-compute'});
-      const pass = encoder.beginComputePass({label: 'f3d-compute', timestampWrites: timestamp?.writes()});
-      pass.setPipeline(pipeline);
-      for (const {index, group} of bindings) pass.setBindGroup(index, group);
-      if (direct) pass.dispatchWorkgroups(...direct);
-      else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
-      pass.end(); device.queue.submit([encoder.finish()]);
-    }, validations); }
+      const descriptor = {label: 'f3d-compute', timestampWrites: timestamp?.writes()};
+      if (operation) {
+        const {backend, context} = operation.scope;
+        const pass = backend.beginCompute(context, encoder, descriptor);
+        backend.compute(context, operation.node, bindings, pipeline, operation.dispatchSize, pass, direct ?? workgroups);
+        backend.finishCompute(context, pass);
+      } else {
+        const pass = encoder.beginComputePass(descriptor);
+        pass.setPipeline(pipeline);
+        for (const {index, group} of bindings) pass.setBindGroup(index, group);
+        if (direct) pass.dispatchWorkgroups(...direct);
+        else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
+        pass.end();
+      }
+      device.queue.submit([encoder.finish()]);
+    }, validations);
+    try { if (operation) operation.scope.run(issue); else issue(); }
     catch (error) { timestamp?.cancel(); throw error; }
     if (timestamp) timestamp.validate(Promise.all(validations));
   }

@@ -2580,6 +2580,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           "clippingPlanes",
           "occlusion",
           "timestamp",
+          "operations",
         ],
         "frame",
       );
@@ -2714,8 +2715,9 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
       for (let i = 0; i < draws.length; i++) {
         const input = owned.has(draws[i]) ? { mesh: draws[i] } : draws[i];
         const programRecord = owned.get(input?.mesh);
+        (commands[i] ?? (commands[i] = {})).source = input?.source;
         if (programRecord?.nodeProgram) {
-          keys(input, ["mesh", "first", "count", "instanceCount", "firstInstance", "nodeUniforms", "nodeResources", "nodeIndirect", "frontFaceCW", "nodeRangeCaptured"], "node program draw");
+          keys(input, ["mesh", "first", "count", "instanceCount", "firstInstance", "nodeUniforms", "nodeResources", "nodeIndirect", "frontFaceCW", "nodeRangeCaptured", "source"], "node program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
           if (input.nodeRangeCaptured !== undefined && typeof input.nodeRangeCaptured !== "boolean")
             fail("ANIMATION_RENDER_OPTIONS", "nodeRangeCaptured must be boolean");
@@ -2727,7 +2729,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           continue;
         }
         if (programRecord?.program) {
-          keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount", "programRangeCaptured", "programRangeGroup"], "program draw");
+          keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount", "programRangeCaptured", "programRangeGroup", "source"], "program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
           programs.stage(programRecord, input, commands[i] ?? (commands[i] = {}));
           dependencies.add(programRecord.gpu);
@@ -2737,6 +2739,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           input,
           [
             "mesh",
+            "source",
             "worldMatrix",
             "baseColor",
             "first",
@@ -2993,18 +2996,21 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           ((format !== null && loadOp === "clear") || (depthFormat && depthLoadOp === "clear") || (stencilAttachment && stencilLoadOp === "clear"));
         if (scissoredClear) {
           // Its own pass, ahead of the frame's, so no pass state leaks into draws.
-          const clearPass = encoder.beginRenderPass({label: `${label}/scissor-clear`,
+          const clearDescriptor = {label: `${label}/scissor-clear`,
             timestampWrites: frame.timestamp?.writes(),
             colorAttachments: colorViews.map(view => ({view, ...(depthSlice === undefined ? {} : {depthSlice}), loadOp: "load", storeOp: "store"})),
             ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp: "load", depthStoreOp: "store",
-              ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})});
+              ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})};
+          const clearPass = frame.operations ? frame.operations.backend.beginRender(frame.operations.context, encoder, clearDescriptor)
+            : encoder.beginRenderPass(clearDescriptor);
           clearPass.setScissorRect(...scissor);
           scissorClear(clearPass, scissor, {colors: format !== null && loadOp === "clear" ? clearColors : null,
             depth: depthFormat && depthLoadOp === "clear" ? clearDepth : null, stencil: stencilAttachment && stencilLoadOp === "clear" ? clearStencil : null});
-          clearPass.end();
+          if (frame.operations) frame.operations.backend.finishRender(frame.operations.context, clearPass);
+          else clearPass.end();
         }
         const queryPlan = frame.occlusion?.session.plan(frame.occlusion.objects, commands, draws.length);
-        const pass = encoder.beginRenderPass({
+        const descriptor = {
           label,
           timestampWrites: frame.timestamp?.writes(),
           ...(queryPlan ? {occlusionQuerySet: queryPlan.querySet} : {}),
@@ -3025,15 +3031,18 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
                 },
               }
             : {}),
-        });
+        };
+        const pass = frame.operations ? frame.operations.backend.beginRender(frame.operations.context, encoder, descriptor)
+          : encoder.beginRenderPass(descriptor);
         if (viewport) pass.setViewport(...viewport);
         if (scissor) pass.setScissorRect(...scissor);
         // Bundle keys record structural inputs only. All live uniform/geometry
         // updates and immediate queue submission below remain unchanged.
         submittedDrawCalls = encodeAnimationRenderSpans(pass, commands, draws.length, {
-          bindGroup, lightGroup: frameLightGroup, stride, instancing, queryIndices: queryPlan?.indices,
+          bindGroup, lightGroup: frameLightGroup, stride, instancing, queryIndices: queryPlan?.indices, operations: frame.operations,
         }, useBundles ? bundleCache : null);
-        pass.end();
+        if (frame.operations) frame.operations.backend.finishRender(frame.operations.context, pass);
+        else pass.end();
         queryPlan?.resolve(encoder);
         const command = encoder.finish();
         if (draws.length)
@@ -3102,6 +3111,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         command.instanceBindGroup = null;
         command.program = null;
         command.nodeProgram = null;
+        command.source = null;
       }
       busy = false;
     }

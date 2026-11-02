@@ -1960,7 +1960,7 @@ export async function createGpuThreeScene(device,scene,{
           if(current.some((texture,index)=>(texture??null)!==desc.programTextures[index]))
             fail('MATERIAL','A direct program changed sampler identities while packing its uniforms');
           if(material.uniformsNeedUpdate===true)material.uniformsNeedUpdate=false;
-          boundary.last={material,camera:drawCamera,version:material.version,desc,bytes,receiveShadow:object.receiveShadow};
+          boundary.last={object,geometry,material,camera:drawCamera,version:material.version,desc,bytes,receiveShadow:object.receiveShadow};
           const source=programSource(sourceObject,wire);
           let byKey=programGeometries.get(source);
           if(!byKey){
@@ -1991,7 +1991,7 @@ export async function createGpuThreeScene(device,scene,{
           const count=group===null?0xffffffff:integer(group.count,0,Number.MAX_SAFE_INTEGER,'direct group count')*factor;
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'direct instance count'):
             geometry.isInstancedBufferGeometry?Math.min(geometry.instanceCount,0xffffffff):1;
-          draws.push({mesh:entry.mesh,first,count,programUniforms:bytes,frontFaceCW,instanceCount,
+          draws.push({mesh:entry.mesh,first,count,programUniforms:bytes,frontFaceCW,instanceCount,source:boundary.last,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           boundary.direct++;flush();
         }};
@@ -2033,7 +2033,7 @@ export async function createGpuThreeScene(device,scene,{
           copiesAtDraw(item.nodeFramebufferCopies);
           drawObjects.push({object:item.object,material:item.material,native:true,views:item.nodeViews,
             tested:item.occlusionTest===true,bundle:!!item.nodeBundle});
-          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,nodeIndirect:item.nodeIndirect,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,
+          draws.push({mesh:item.bindings[0].mesh,first:item.first,count:item.count,instanceCount:item.instanceCount,firstInstance:item.firstInstance??0,nodeUniforms:item.nodeUniforms,nodeResources:item.nodeResources,nodeIndirect:item.nodeIndirect,frontFaceCW:item.frontFaceCW,nodeRangeCaptured:true,source:item,
             ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
           copiesAtDraw(item.nodeFramebufferAfterCopies);
           continue;
@@ -2082,7 +2082,7 @@ export async function createGpuThreeScene(device,scene,{
               for(const t of current)if(t)frameTextures?.add(t);
               // Programs evaluate fog/lighting in their own source; never core receivers.
               if(programArray)drawObjects.push({object,material:item.material,view});
-              draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,
+              draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,source:item,
                 ...(sub?{programRangeCaptured:true}:{}),
                 ...(sub&&item.group?{programRangeGroup:{start:item.group.start*(item.material.wireframe?2:1),count:item.group.count*(item.material.wireframe?2:1)}}:{}),
                 ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
@@ -2147,7 +2147,7 @@ export async function createGpuThreeScene(device,scene,{
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
           else {for(let instance=0,instances=item.object.isSprite?threeSpriteCount(item.object):1;instance<instances;instance++){
-            drawObjects.push({object:item.object,material:item.material,view});draws.push({mesh:item.bindings[i].mesh,...common,...values,
+            drawObjects.push({object:item.object,material:item.material,view});draws.push({mesh:item.bindings[i].mesh,...common,...values,source:item,
             ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
             ...(shadowEnabled?{receiveShadow:item.object.receiveShadow}:{}),

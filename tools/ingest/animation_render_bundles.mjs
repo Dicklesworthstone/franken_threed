@@ -11,6 +11,23 @@
 import {hasAnimationStencil} from './animation_raster.mjs';
 const blended = record => record.alphaMode === 'BLEND' || record.blended === true;
 const nodeOffsets = binding => binding.offsets ?? (binding.offset === null ? [] : [binding.offset]);
+function encodeAnimationNodeDraw(encoder, command) {
+  encoder.setPipeline(command.pipeline);
+  for (let group = 0; group < command.nodeProgram.groups.length; group++) {
+    const binding = command.nodeProgram.groups[group];
+    encoder.setBindGroup(group, binding.group, nodeOffsets(binding));
+  }
+  for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
+  const indirect = command.nodeIndirect;
+  if (command.indexBuffer) {
+    encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
+    if (indirect) for (const offset of indirect.offsets) encoder.drawIndexedIndirect(indirect.buffer, offset);
+    else encoder.drawIndexed(command.count, command.instanceCount, command.first, 0, command.firstInstance ?? 0);
+  } else if (indirect) {
+    for (const offset of indirect.offsets) encoder.drawIndirect(indirect.buffer, offset);
+  } else encoder.draw(command.count, command.instanceCount, command.first, command.firstInstance ?? 0);
+  return indirect ? indirect.offsets.length : 1;
+}
 function compatible(a, b) {
   return !a.program && !b.program && !a.nodeProgram && !b.nodeProgram &&
     a.instanceCount == null && b.instanceCount == null &&
@@ -23,81 +40,59 @@ function compatible(a, b) {
     a.record.textureGroup === b.record.textureGroup;
 }
 
-/** Fully bind every draw/run, also after executeBundles([]), which clears pass
- * pipeline/binding state. No warm-state assumption crosses an encoder boundary.
- * Instancing never sorts or combines BLEND draws. The instance start/dynamic
- * offset remains the original logical draw's position in the current arena.
- */
-export function encodeAnimationDraws(encoder, commands, length, {
-  bindGroup, lightGroup, stride, instancing, start = 0,
-}) {
+/** Execute one already-selected physical command/run. Used by the backend's
+ * observable draw operation and the direct path, with identical GPU bindings. */
+export function encodeAnimationDrawCommand(encoder, command, {bindGroup, lightGroup, stride, instancing}, index, instances = 1) {
+  if (command.nodeProgram) return encodeAnimationNodeDraw(encoder, command);
+  const {record, first, count, pipeline} = command;
+  if (command.program) {
+    encoder.setPipeline(pipeline);
+    encoder.setBindGroup(0, command.program.group, [command.program.offset]);
+    if (record.textureGroup) encoder.setBindGroup(1, record.textureGroup);
+    for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
+    const pointRuns = command.program.pointRuns;
+    if (pointRuns != null) {
+      for (let run = 0; run < pointRuns.length; run += 2) encoder.draw(6, pointRuns[run + 1], 0, pointRuns[run]);
+      return pointRuns.length / 2;
+    }
+    if (command.indexBuffer) {
+      encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
+      encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
+    } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
+    return 1;
+  }
+  const native = command.instanceCount != null;
+  encoder.setPipeline(pipeline);
+  encoder.setBindGroup(0, native ? command.instanceBindGroup : bindGroup,
+    instancing && !native ? [] : [index * stride]);
+  for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
+  if (record.surfaceBuffer) encoder.setVertexBuffer(1, record.surfaceBuffer);
+  if (record.textureGroup) encoder.setBindGroup(1, record.textureGroup);
+  if (record.lit) encoder.setBindGroup(record.textureGroup ? 2 : 1, lightGroup);
+  if (command.indexBuffer) {
+    encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
+    encoder.drawIndexed(count, native ? command.instanceCount : instances, first, 0, instancing && !native ? index : 0);
+  } else encoder.draw(count, native ? command.instanceCount : instances, first, instancing && !native ? index : 0);
+  return 1;
+}
+
+/** Fully bind every draw/run, including after bundles clear pass state. Physical
+ * instancing decisions and original arena indices are independent of inspection. */
+export function encodeAnimationDraws(encoder, commands, length, parameters) {
+  const {instancing, start = 0, operations = null} = parameters;
   let calls = 0;
   const end = start + length;
   for (let i = start; i < end;) {
-    const command = commands[i], {record, first, count, pipeline} = command;
-    if (command.nodeProgram) {
-      // Source node updates still run for an empty draw, but the backend emits
-      // no GPU call. Preserve that distinction in direct and bundled encoding.
-      const indirect = command.nodeIndirect;
-      if ((!indirect && count === 0) || command.instanceCount === 0 || indirect?.skip) { i++; continue; }
-      // Native node WGSL owns all groups in their source builder order. Its
-      // dynamic offsets select this logical draw, independent of arena index i.
-      encoder.setPipeline(pipeline);
-      for (let group = 0; group < command.nodeProgram.groups.length; group++) {
-        const binding = command.nodeProgram.groups[group];
-        encoder.setBindGroup(group, binding.group, nodeOffsets(binding));
-      }
-      for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
-      if (command.indexBuffer) {
-        encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-        if (indirect) for (const offset of indirect.offsets) encoder.drawIndexedIndirect(indirect.buffer, offset);
-        else encoder.drawIndexed(count, command.instanceCount, first, 0, command.firstInstance ?? 0);
-      } else if (indirect) {
-        for (const offset of indirect.offsets) encoder.drawIndirect(indirect.buffer, offset);
-      } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
-      calls += indirect ? indirect.offsets.length : 1; i++;
-      continue;
-    }
-    if (command.program) {
-      // Compiled source program: its own uniform slice (dynamic offset) and textures.
-      encoder.setPipeline(pipeline);
-      encoder.setBindGroup(0, command.program.group, [command.program.offset]);
-      if (record.textureGroup) encoder.setBindGroup(1, record.textureGroup);
-      for (let slot = 0; slot < command.vertexBuffers.length; slot++) encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
-      const pointRuns = command.program.pointRuns;
-      if (pointRuns != null) {
-        for (let run = 0; run < pointRuns.length; run += 2) {
-          encoder.draw(6, pointRuns[run + 1], 0, pointRuns[run]);
-          calls++;
-        }
-        i++;
-        continue;
-      }
-      if (command.indexBuffer) {
-        encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-        encoder.drawIndexed(count, command.instanceCount, first, 0, 0);
-      } else encoder.draw(count, command.instanceCount, first, command.firstInstance ?? 0);
-      calls++; i++;
-      continue;
-    }
-    const native = command.instanceCount != null;
+    const command = commands[i];
+    // Empty native draws still run source updates but issue no GPU command.
+    if (command.nodeProgram && ((!command.nodeIndirect && command.count === 0) ||
+        command.instanceCount === 0 || command.nodeIndirect?.skip)) { i++; continue; }
     let instances = 1;
-    if (instancing && !native && !blended(record)) {
+    if (!command.nodeProgram && !command.program && instancing && command.instanceCount == null && !blended(command.record))
       while (i + instances < end && compatible(command, commands[i + instances])) instances++;
-    }
-    encoder.setPipeline(pipeline);
-    encoder.setBindGroup(0, native ? command.instanceBindGroup : bindGroup,
-      instancing && !native ? [] : [i * stride]);
-    for (let slot = 0; slot < command.vertexBuffers.length; slot++)
-      encoder.setVertexBuffer(slot, command.vertexBuffers[slot]);
-    if (record.surfaceBuffer) encoder.setVertexBuffer(1, record.surfaceBuffer);
-    if (record.textureGroup) encoder.setBindGroup(1, record.textureGroup);
-    if (record.lit) encoder.setBindGroup(record.textureGroup ? 2 : 1, lightGroup);
-    if (command.indexBuffer) {
-      encoder.setIndexBuffer(command.indexBuffer, command.indexFormat);
-      encoder.drawIndexed(count, native ? command.instanceCount : instances, first, 0, instancing && !native ? i : 0);
-    } else encoder.draw(count, native ? command.instanceCount : instances, first, instancing && !native ? i : 0);
-    calls++;
+    calls += operations && command.source
+      ? operations.backend.draw(operations.backend._drawObject(commands, i, instances, parameters), encoder, command, parameters, i, instances)
+      : encodeAnimationDrawCommand(encoder, command, parameters, i, instances);
     i += instances;
   }
   return calls;
@@ -174,7 +169,7 @@ export function createAnimationRenderBundleCache(device, {
   let builds = 0, reuses = 0, executions = 0, evictions = 0, encodedDrawCalls = 0;
   const parameters = {bindGroup, stride, instancing, lightGroup: null};
   return Object.freeze({
-    execute(pass, commands, length, lightGroup, start = 0) {
+    execute(pass, commands, length, lightGroup, start = 0, operations = null) {
       if (disposed) throw new Error('Render bundle cache is disposed');
       if (!Number.isSafeInteger(length) || length < 0 || length > maxDraws ||
           !Number.isSafeInteger(start) || start < 0 || start + length > maxDraws || start + length > commands.length)
@@ -188,22 +183,25 @@ export function createAnimationRenderBundleCache(device, {
       }
       if (index >= 0) {
         const entry = entries[index];
-        pass.executeBundles([entry.bundle]);
+        if (operations) operations.backend.addBundle(operations.context, entry.bundle, pass);
+        else pass.executeBundles([entry.bundle]);
         entries.splice(index, 1); entries.push(entry);
         reuses++; executions++;
         return entry.drawCalls;
       }
-      parameters.lightGroup = lightGroup; parameters.start = start;
+      parameters.lightGroup = lightGroup; parameters.start = start; parameters.operations = operations;
       let bundle, drawCalls;
       try {
-        const encoder = device.createRenderBundleEncoder(descriptor);
+        const encoder = operations ? operations.backend.beginBundle(operations.context, device, descriptor)
+          : device.createRenderBundleEncoder(descriptor);
         drawCalls = encodeAnimationDraws(encoder, commands, length, parameters);
-        bundle = encoder.finish({label});
-      } finally { parameters.lightGroup = null; }
+        bundle = operations ? operations.backend.finishBundle(operations.context, encoder, {label}) : encoder.finish({label});
+      } finally { parameters.lightGroup = null; parameters.operations = null; }
       // Capture independent data, not the renderer's reused command objects.
       const recorded = [];
       for (let i = start; i < start + length; i++) recorded.push(snapshot(commands[i], lightGroup));
-      pass.executeBundles([bundle]);
+      if (operations) operations.backend.addBundle(operations.context, bundle, pass);
+      else pass.executeBundles([bundle]);
       if (entries.length === maxBundles) { entries.shift(); evictions++; }
       entries.push({commands: recorded, bundle, drawCalls, start});
       builds++; executions++; encodedDrawCalls += drawCalls;
@@ -244,7 +242,7 @@ export function encodeAnimationRenderSpans(pass, commands, length, parameters, c
     while (end < length && samePassState(command, commands[end]) && (queryIndices?.[end] ?? null) === query) end++;
     if (command.blendConstant != null) pass.setBlendConstant(command.blendConstant);
     if (command.stencilReference != null) pass.setStencilReference(command.stencilReference);
-    calls += cache ? cache.execute(pass, commands, end - start, parameters.lightGroup, start)
+    calls += cache ? cache.execute(pass, commands, end - start, parameters.lightGroup, start, parameters.operations)
       : encodeAnimationDraws(pass, commands, end - start, {...parameters, start});
     start = end;
   }

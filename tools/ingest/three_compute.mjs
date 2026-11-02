@@ -364,7 +364,7 @@ function createThreeCompute(renderer, three) {
       frame[method](node);
     }
   }
-  function capture(node, entry, override, deferred, timestamp = null) {
+  function capture(node, entry, override, deferred, timestamp = null, operations = null) {
     // Validate live binding identities before capturing any upload histories.
     // onInit kernels enter this same boundary independently of their parent.
     const resources = entry.groups.flatMap(group => group.bindings.map(binding => binding.isStorageBuffer
@@ -420,6 +420,7 @@ function createThreeCompute(renderer, three) {
       }
       if (direct && direct.some(n => !Number.isSafeInteger(n) || n < 0 || n > (device.limits?.maxComputeWorkgroupsPerDimension ?? 65535)))
         fail('DISPATCH', 'Workgroup counts must fit the device limits');
+      const operation = operations ? {scope: operations, node, dispatchSize: Array.isArray(size) ? size.slice() : size} : null;
       const preparation = textureOwner.preparation(textureUses);
       // Decide from the captured payloads: an unchanged alias can retain a
       // pending HTML snapshot after its live source becomes a canvas. Every
@@ -437,7 +438,7 @@ function createThreeCompute(renderer, three) {
           const dimensions = indirect ? {buffer: upload(indirect), offset: 0} : direct;
           textureOwner.validateDispatch(textureUses);
           if (dispatch) {
-            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions, timestamp);
+            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions, timestamp, operation);
             textureOwner.written(textureUses);
           }
         }); } finally { issuing = false; }
@@ -458,6 +459,7 @@ function createThreeCompute(renderer, three) {
     const uid = `compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`;
     const timestamp = renderer._timestamps?.begin('compute', uid, list.length === 1 ? list[0] : list);
     renderer.inspector?.beginCompute?.(uid, list);
+    const operations = renderer.backend?._capture?.(list);
     const pending = [];
     try {
       for (const node of list) {
@@ -465,7 +467,7 @@ function createThreeCompute(renderer, three) {
         withFrame(node, () => {
           update(entry, 'before'); update(entry, 'current');
           textureOwner.captureDispatch(() => {
-            const request = capture(node, entry, override, deferred(), timestamp);
+            const request = capture(node, entry, override, deferred(), timestamp, operations);
             let result;
             try { result = schedule(() => request.issue(), request.asynchronous); }
             catch (error) { request.release(); throw error; }
