@@ -983,10 +983,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     ? texture.renderTarget ?? ownedColorTargets.get(texture) ?? null : null;
   const targetTexture = texture => textureTarget(texture) !== null;
   // The existing scene bridge accepts a Map of externally owned bindings. Its
-  // has/get calls always resolve the current target generation, so stale views
-  // trigger the bridge's normal re-preparation boundary before submission.
-  function bindingsFor(destination = null, retained = new Map()) {
+  // Ordinary has/get calls resolve current generations. Captured fullscreen
+  // passes may instead select their retained generation across a trusted resize;
+  // changed physical views use the bridge's existing preparation boundary.
+  function bindingsFor(destination = null, retained = new Map(), capturedEntry = null) {
     if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
+    if (capturedEntry !== null && typeof capturedEntry !== 'function') fail('OPTIONS', 'Expected a captured target selector');
     return new class extends Map {
       has(texture) { return targetTexture(texture) || retained.has(texture); }
       get(texture) {
@@ -995,7 +997,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (destination && (destination.textures.includes(texture) ||
             (destination.depthBuffer || destination.stencilBuffer) && destination.depthTexture === texture))
           fail('FEEDBACK', 'A render pass cannot sample an attached color or depth image');
-        const entry = capture(target);
+        const entry = capturedEntry?.(texture) ?? capture(target);
+        if (entry.target !== target) fail('SOURCE', 'Captured texture generation belongs to another target');
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
         const binding = sampling(entry, texture);

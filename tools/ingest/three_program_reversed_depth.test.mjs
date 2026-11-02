@@ -110,6 +110,26 @@ test('fullscreen snapshots publish reversal to the source camera on both cold an
   }
 });
 
+for (const Camera of [T.PerspectiveCamera, T.OrthographicCamera]) test(`ordinary ${Camera.name} capture publishes reversed projection on cold and warm draws`, async t => {
+  const {device, canvas} = deviceAndCanvas(), renderer = new (createWebGLRendererClass(T))({canvas, device, reversedDepthBuffer: true});
+  t.after(() => renderer.dispose()); await renderer.init();
+  const scene = new T.Scene(), geometry = new T.BoxGeometry(), material = new T.MeshBasicMaterial();
+  scene.add(new T.Mesh(geometry, material));
+  t.after(() => { geometry.dispose(); material.dispose(); });
+  for (let draw = 0; draw < 2; draw++) {
+    const camera = new Camera(); camera.position.z = 3; camera.near = .1; camera.far = 100; camera.zoom = 1.3;
+    if (camera.isPerspectiveCamera) { camera.filmGauge = 42; camera.filmOffset = 5; }
+    camera.setViewOffset(64, 64, 4, 3, 56, 58);
+    const expected = camera.clone(); expected._reversedDepth = true; expected.updateProjectionMatrix();
+    await renderer.renderAsync(scene, camera);
+    assert.equal(camera.reversedDepth, true, `public camera transitions on ${draw ? 'warm' : 'cold'} draw`);
+    assert.equal(camera.coordinateSystem, T.WebGLCoordinateSystem);
+    assert.deepEqual(camera.projectionMatrix.elements, expected.projectionMatrix.elements);
+    assert.deepEqual(camera.projectionMatrixInverse.elements, expected.projectionMatrixInverse.elements);
+  }
+  assert.equal(device.snapshots.flat().length, 2);
+});
+
 test('queued camera projections retain lens, frustum and view-offset inputs without cloning source cameras', () => {
   for (const source of [new T.PerspectiveCamera(67, 1.3, .2, 80), new T.OrthographicCamera(-3, 4, 2, -1, .2, 80)]) {
     source.setViewOffset(400, 300, 50, 20, 250, 180);

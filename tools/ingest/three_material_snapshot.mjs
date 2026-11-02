@@ -84,18 +84,20 @@ function captureSelections(three, root, {camera, overrideMaterial, maxNodes, max
     }
     return true;
   };
+  const ordinaryMaterial = material => material instanceof three.Material && dataOnly(material) &&
+    data(material, 'onBeforeRender') === three.Material.prototype.onBeforeRender &&
+    data(material, 'onBeforeCompile') === three.Material.prototype.onBeforeCompile &&
+    data(material, 'customProgramCacheKey') === three.Material.prototype.customProgramCacheKey;
   const captureMaterial = material => {
     if (material == null || materials.has(material)) return true;
-    if (!(material instanceof three.Material) || !dataOnly(material) ||
-        data(material, 'onBeforeRender') !== three.Material.prototype.onBeforeRender ||
-        data(material, 'onBeforeCompile') !== three.Material.prototype.onBeforeCompile ||
-        data(material, 'customProgramCacheKey') !== three.Material.prototype.customProgramCacheKey) return false;
+    if (!ordinaryMaterial(material)) return false;
     if (materials.size >= maxMaterials) fail('LIMIT', 'Material snapshot identity capacity exceeded');
     claim(1); materials.set(material, material);
     return true;
   };
   // ArrayCamera callbacks and custom camera children retain their established
-  // per-view projection order; ordinary application cameras need no private copy.
+  // per-view projection order. Callback-free ordinary cameras may be captured
+  // independently of these live material objects.
   if (camera && (!ordinaryObject(camera) || data(camera, 'isArrayCamera') ||
       data(camera, 'children')?.length !== 0)) return null;
   if (!captureMaterial(overrideMaterial)) return null;
@@ -118,7 +120,22 @@ function captureSelections(three, root, {camera, overrideMaterial, maxNodes, max
     objects.set(object, selected);
     for (const source of Array.isArray(selected) ? selected : [selected]) if (!captureMaterial(source)) return null;
   }
-  return objects.size ? {materials, objects, values} : null;
+  const cameraSafe = () => {
+    const perspective = data(camera, 'isPerspectiveCamera') === true;
+    if (!camera || !ordinaryObject(camera) || data(camera, 'isArrayCamera') || data(camera, 'isMultiViewCamera') ||
+        !perspective && data(camera, 'isOrthographicCamera') !== true || data(camera, 'children')?.length !== 0) return false;
+    const prototype = perspective ? three.PerspectiveCamera.prototype : three.OrthographicCamera.prototype;
+    if (data(camera, 'updateProjectionMatrix') !== prototype.updateProjectionMatrix ||
+        perspective && data(camera, 'getFilmWidth') !== prototype.getFilmWidth) return false;
+    for (const object of seen) {
+      if (!ordinaryObject(object) || !ordinaryGeometry(data(object, 'geometry'))) return false;
+      const children = selectorArray(data(object, 'children'), maxNodes);
+      if (!children || children.some(child => !seen.has(child))) return false;
+    }
+    for (const material of materials.keys()) if (!ordinaryMaterial(material)) return false;
+    return true;
+  };
+  return objects.size ? {materials, objects, values, cameraSafe} : null;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,

@@ -21,7 +21,7 @@ export function registerThreePassState(renderer, three) {
     stencilTest: false, stencilLocked: false, stencilWriteMask: 0xffffffff,
     stencilFunc: three.AlwaysStencilFunc, stencilRef: 0, stencilFuncMask: 0xffffffff,
     stencilFail: three.KeepStencilOp, stencilZFail: three.KeepStencilOp, stencilZPass: three.KeepStencilOp, stencilClear: 0};
-  const record = {three, initial, active: false, latest: null, pending: {}, locks: {color: false, depth: false, stencil: false}};
+  const record = {three, targets: renderer._targets, initial, active: false, latest: null, pending: {}, locks: {color: false, depth: false, stencil: false}};
   const write = (key, value) => { record.pending[key] = value; };
   const setLocked = name => value => {
     record.locks[name] = !!value; write(`${name}Locked`, !!value);
@@ -63,6 +63,62 @@ export function getThreeStencilConstants(renderer) {
   const record = renderers.get(renderer);
   if (!record) return renderer.getContext();
   record.active = true; return record.constants;
+}
+
+/** Source-verified supersampling passes temporarily change their camera's
+ * projection for each render call. The owned renderer must capture that call
+ * before the pass restores the public camera. Exact renderers execute normally;
+ * no public state flag or camera replacement is installed on either renderer.
+ */
+export function renderThreePassScene(renderer, scene, camera) {
+  const record = renderers.get(renderer);
+  if (!record) return renderer.render(scene, camera);
+  const previous = record.captureCamera;
+  record.captureCamera = true;
+  try { return renderer.render(scene, camera); }
+  finally { record.captureCamera = previous; }
+}
+
+export function requiresThreePassCamera(renderer) {
+  return renderers.get(renderer)?.captureCamera === true;
+}
+
+/** The verified composer calls its original setSize body inside this scope.
+ * Its own targets and the standard passes' direct target fields are finite;
+ * inspect data descriptors only, never application getters or nested metadata.
+ * Actual disposal and unscoped resize retain their normal invalidation rules.
+ */
+export function withThreeComposerResize(composer, run) {
+  const renderer = Object.getOwnPropertyDescriptor(composer, 'renderer')?.value;
+  const record = renderers.get(renderer);
+  if (!record) return run();
+  const targets = new Set();
+  const add = value => {
+    if (!(value instanceof record.three.RenderTarget)) return;
+    targets.add(value);
+    if (targets.size > 64) fail('LIMIT', 'Composer resize exceeds the retained target capacity');
+  };
+  const fields = value => {
+    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
+      if (!Object.hasOwn(descriptor, 'value')) continue;
+      const entry = descriptor.value;
+      if (!Array.isArray(entry)) { add(entry); continue; }
+      const elements = Object.getOwnPropertyDescriptors(entry);
+      if (elements.length.value > 64) fail('LIMIT', 'Composer resize target arrays exceed capacity');
+      for (const [key, element] of Object.entries(elements))
+        if (/^(0|[1-9][0-9]*)$/.test(key) && Object.hasOwn(element, 'value')) add(element.value);
+    }
+  };
+  add(Object.getOwnPropertyDescriptor(composer, 'renderTarget1')?.value);
+  add(Object.getOwnPropertyDescriptor(composer, 'renderTarget2')?.value);
+  const passes = Object.getOwnPropertyDescriptor(composer, 'passes')?.value;
+  if (!Array.isArray(passes) || passes.length > 64) fail('LIMIT', 'Expected a finite source composer pass array');
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(passes))) {
+    if (!/^(0|[1-9][0-9]*)$/.test(key)) continue;
+    if (!Object.hasOwn(descriptor, 'value') || !descriptor.value) fail('SOURCE', 'Expected source composer pass identities');
+    fields(descriptor.value);
+  }
+  return targets.size ? record.targets.withNativeEffectTargets([...targets], run) : run();
 }
 
 // Requests accepted before a retained pass activates this adapter have no

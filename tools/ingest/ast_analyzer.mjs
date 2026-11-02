@@ -1055,7 +1055,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const composerViews = new Set(["renderer", "renderToScreen", "renderTarget1", "renderTarget2", "readBuffer", "writeBuffer"]);
   const passMethods = new Set(["render", "setSize", "dispose"]);
   const passSettings = new Set(["enabled", "needsSwap", "clear", "renderToScreen", "inverse", "scene", "camera", "overrideMaterial",
-    "clearColor", "clearAlpha", "clearDepth", "material", "uniforms", "textureID", "map", "opacity"]);
+    "clearColor", "clearAlpha", "clearDepth", "material", "uniforms", "textureID", "map", "opacity",
+    "strength", "radius", "threshold", "resolution", "damp", "sampleLevel", "unbiased", "accumulate", "accumulateIndex",
+    "materialBokeh", "compFsMaterial", "copyFsMaterial"]);
   const computationMethods = new Set(["setDataType", "addVariable", "setVariableDependencies", "init", "compute",
     "getCurrentRenderTarget", "getAlternateRenderTarget", "dispose", "addResolutionDefine", "createShaderMaterial",
     "createRenderTarget", "createTexture", "renderTexture", "doRenderTarget"]);

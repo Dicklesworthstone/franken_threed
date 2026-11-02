@@ -661,6 +661,46 @@ performance closure are separate gates. Locked partial stencil clears and
 locked masks combined with shadow/transmission prepasses are explicit runtime
 boundaries.
 
+## Bloom, depth of field, temporal accumulation and supersampling
+
+The pinned `UnrealBloomPass`, `BokehPass`, `AfterimagePass`, `SSAARenderPass` and
+`TAARenderPass` now execute through the owned WebGPU renderer. Their original
+classes, shaders, blur chains, accumulation weights and pingpong targets remain
+source JavaScript. Complete dependency fingerprints authorize these consumers;
+changed shaders, custom subclasses, replaced methods and escaped instances
+retain exact routing.
+
+SSAA and TAA temporarily jitter a camera and restore it before returning. Their
+verified scene-render expressions now enter a private capture scope so every
+accepted draw keeps its own projection. Ordinary callback-free perspective and
+orthographic cameras also retain their accepted matrices. Public reversed-depth
+transitions still update the original camera, including its projection inverse.
+Custom projection methods and callback-bearing scenes keep their established
+ordinary rendering path; required supersampling capture explicitly refuses
+them. Shadows, custom sorting, instancing, skinning and batching remain outside
+this supersampling capture profile.
+
+The verified `EffectComposer.setSize()` body runs inside the existing target
+owner's resize scope. Queued fullscreen draws retain their sampled target
+generations, including bloom's basic-material screen copy, while preparation
+and submission bind the same accepted images. Two queued resizes therefore do
+not replace earlier color or temporal-history inputs. Retired generations stay
+charged to the existing resource budget until their leases are released. This
+does not copy GPU images to the CPU or introduce a second target owner.
+Explicit disposal still invalidates accepted work; direct `pass.setSize()`
+outside the verified composer scope requires draining pending work first.
+
+`program_advanced_passes.mjs` compares the unchanged source passes with pinned
+WebGL across 39 checkpoints and 476,672 RGBA bytes. It covers cold shaders,
+queued controls, normal/inverse bloom masks, TAA reset and complete 32-sample
+accumulation, plus two queued resizes for every family. Chromium 151.0.7922.34 /
+SwiftShader differs by at most one channel value, with zero pixels outside the
+existing WebGL tolerance and zero GPU/browser errors. Recording-facade tests
+also inspect distinct SSAA/TAA projections, accumulation weights, blur direction,
+depth-material selection, history identity, sampled dimensions and explicit
+disposal. These checks establish these source-pass paths; full application
+coverage and physical-device performance remain separate gates.
+
 ## GPUComputationRenderer texture simulations
 
 The pinned `GPUComputationRenderer` addon now runs its floating-point texture

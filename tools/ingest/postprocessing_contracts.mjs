@@ -15,11 +15,19 @@ const pins = new Map([
   ['TexturePass.js', ['402cfcdda8e69db5f0faa778c51b97fc2ec740846a088d169f555fc3403b7d7d', {TexturePass: 'pass'}]],
   ['ClearPass.js', ['69c525e8e3be28999453177a9d0bd1771d27a4d04378307242802fec84301bcb', {ClearPass: 'pass'}]],
   ['OutputPass.js', ['02e4a261af34de71338185e9e87f0cbe5cba9115608d984363e1269dec1d2272', {OutputPass: 'pass'}]],
+  ['UnrealBloomPass.js', ['ba8f2fcadfa6588384c9473498f974d81d120f02f0e63a0e59c265202a006b5a', {UnrealBloomPass: 'pass'}]],
+  ['BokehPass.js', ['5b9b0bc5cee6e24b2417da95f40eb2d178943c2ffbacbc4c2993a89d0597bfb3', {BokehPass: 'pass'}]],
+  ['AfterimagePass.js', ['8cc0c8724a674a649d438c932e0b5f287e7d02f9fc35f627b669180bf4d2cc01', {AfterimagePass: 'pass'}]],
+  ['SSAARenderPass.js', ['cd2b8e83b32e806091117dfbeff1f8f4e78df0175a4a3acd865b9989df1c420b', {SSAARenderPass: 'pass'}]],
+  ['TAARenderPass.js', ['463dbda5d1f0f401b3575f60eddd2a84234ff5be44d29a3dc41129c34aba0f47', {TAARenderPass: 'pass'}]],
   ['CopyShader.js', ['a33057d5ac91c43304c186ac0e8816e62bb2ed471d3a00ff3018dfd5c0389718', {}]],
   ['ConvolutionShader.js', ['bad71ed02351acb701e62e21a9d11f044c2c689d924d714061edb756fbea8ace', {}]],
   ['FilmShader.js', ['744c619c70f949af5d3f0f9edb27573743ab9ad12869e7c306ffb3d0caff7bb5', {}]],
   ['DotScreenShader.js', ['959a2e0ea3d4a89d67754e417c56bd67abd632427d51fab19361003cd0ca7cef', {}]],
   ['OutputShader.js', ['353479f77a8d7e2629d49ccac9fc2f5dbfdda5442e0adf867b00377a2fcb0cb2', {}]],
+  ['LuminosityHighPassShader.js', ['5044f780b6e6cf863947f64c36fe1587132f7fbe395ada863cd1e5f0388dcf1e', {}]],
+  ['BokehShader.js', ['bd8525158e3574a803f2e2ce5d5e263349a80ee41bf789e71446b9caa256aa9a', {}]],
+  ['AfterimageShader.js', ['fb842ae657379a6ee3b431bd864b4e4956d36df14daf502bf6ffecdbf14de8bb', {}]],
   // H6's retained model loader reads typed-array constructors. These exact
   // cold helpers do not receive the renderer or mutate pass prototypes; keep
   // their original native-access facts without the caller reflection guard.
@@ -28,7 +36,8 @@ const pins = new Map([
   ['SkeletonUtils.js', ['b1632a703206c3d830de9fcbe515696770d04b71a15ee6b50afa6d2c3298c86f', {}]],
 ]);
 const byHash = new Map([...pins].map(([name, [hash, exports]]) => ['sha256:' + hash, {name, exports}]));
-const transformed = new Set(['MaskPass.js', 'EffectComposer.js', 'BloomPass.js']);
+const transformed = new Set(['MaskPass.js', 'EffectComposer.js', 'BloomPass.js', 'UnrealBloomPass.js',
+  'SSAARenderPass.js', 'TAARenderPass.js']);
 
 export function verifiedPostProcessingSources(modules, bases) {
   const result = new Map(), visiting = new Set();
@@ -56,11 +65,26 @@ export function transformThreePostProcessing(code, record,
   if ('sha256:' + createHash('sha256').update(code).digest('hex') !== record.sourceHash ||
       byHash.get(record.sourceHash)?.name !== record.name)
     throw new Error('Pinned postprocessing source changed before stencil lowering');
-  const state = '__f3dPassState', constants = '__f3dStencilConstants';
+  const state = '__f3dPassState', constants = '__f3dStencilConstants', renderScene = '__f3dRenderPassScene',
+    resizeComposer = '__f3dComposerResize';
   // Exact fingerprints make these finite spellings unambiguous. No source
   // expression or getter is duplicated; the exact-renderer helpers preserve
   // its original state/context accesses.
   code = code.replace(/\b(this\.renderer|renderer)\.getContext\(\)/g, (_, receiver) => `${constants}(${receiver})`)
     .replace(/\b(this\.renderer|renderer)\.state\b/g, (_, receiver) => `${state}(${receiver})`);
-  return `import {getThreePassState as ${state}, getThreeStencilConstants as ${constants}} from ${JSON.stringify(runtime)};\n` + code;
+  // These source passes restore camera jitter before asynchronous preparation
+  // completes. Mark only their exact scene-draw operation for accepted camera
+  // capture; other pass work and source renderer calls retain their identities.
+  if (['SSAARenderPass.js', 'TAARenderPass.js'].includes(record.name))
+    code = code.replaceAll('renderer.render( this.scene, this.camera );', `${renderScene}(renderer, this.scene, this.camera);`);
+  if (record.name === 'EffectComposer.js') {
+    // Retain the exact size calculation and pass iteration. The private scope
+    // preserves accepted target generations across the source's resize-dispose
+    // events, and does not turn explicit disposal into deferred resize.
+    code = code.replace('\tsetSize( width, height ) {\n',
+      `\tsetSize( width, height ) {\n\t\treturn ${resizeComposer}(this, () => {\n`)
+      .replace('\t\t\tthis.passes[ i ].setSize( effectiveWidth, effectiveHeight );\n\n\t\t}\n\n\t}',
+        '\t\t\tthis.passes[ i ].setSize( effectiveWidth, effectiveHeight );\n\n\t\t}\n\t\t});\n\t}');
+  }
+  return `import {getThreePassState as ${state}, getThreeStencilConstants as ${constants}, renderThreePassScene as ${renderScene}, withThreeComposerResize as ${resizeComposer}} from ${JSON.stringify(runtime)};\n` + code;
 }

@@ -1,4 +1,4 @@
-/** Per-call state for small, callback-free ShaderMaterial Mesh passes.
+/** Per-call state for small, callback-free shader and basic-material Mesh passes.
  *
  * FullScreenQuad deliberately reuses one mesh and mutable uniforms. Preparation
  * may await pipeline creation, so borrowing that mesh would draw later values.
@@ -109,7 +109,7 @@ export function captureThreeArrayCamera(T, camera, maxViews = 256) {
   return result;
 }
 
-export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCaptureBytes = 2 * 1024 * 1024,
+export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 1024 * 1024, maxCaptureBytes = 2 * 1024 * 1024,
   maxRoots = 64, maxVertices = 6, maxValues = 65536} = {}) {
   if (![maxBytes, maxCaptureBytes, maxRoots, maxVertices, maxValues].every(positive)) fail('OPTIONS', 'Expected positive snapshot limits');
   const states = new WeakMap(), retained = new Set(), records = new Set();
@@ -122,7 +122,7 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
     // explicit live-source path. No user clone()/copy()/serialization hook runs.
     if (!T.Mesh || Object.getPrototypeOf(root ?? {}) !== T.Mesh.prototype || !T.Camera || !(camera instanceof T.Camera)) return false;
     const m = own(root, 'material'), g = own(root, 'geometry');
-    if (!m || ![T.ShaderMaterial?.prototype, T.RawShaderMaterial?.prototype].includes(Object.getPrototypeOf(m)) ||
+    if (!m || ![T.ShaderMaterial?.prototype, T.RawShaderMaterial?.prototype, T.MeshBasicMaterial?.prototype].includes(Object.getPrototypeOf(m)) ||
         !T.BufferGeometry || !(g instanceof T.BufferGeometry) || root.children?.length || root.isInstancedMesh || root.isSkinnedMesh || g.isInstancedBufferGeometry) return false;
     if (camera.children?.length || camera.isArrayCamera || (!camera.isPerspectiveCamera && !camera.isOrthographicCamera)) return false;
     if (root.onBeforeRender !== T.Object3D.prototype.onBeforeRender || root.onAfterRender !== T.Object3D.prototype.onAfterRender ||
@@ -146,6 +146,8 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
     allocatedBytes -= record.bytes;
     for (const [texture, listener] of record.listeners) texture.removeEventListener('dispose', listener);
     record.listeners.length = 0;
+    for (const release of record.targetReleases) release();
+    record.targetReleases.length = 0;
     record.data = record.camera = null;
   }
   function capture(root, camera) {
@@ -159,12 +161,14 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
       if (!Number.isSafeInteger(bytes) || bytes > maxCaptureBytes || bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Pass snapshots exceed their byte budget');
       if (++values > maxValues) fail('BUDGET', 'Pass snapshot contains too many values');
     };
-    const memo = new Map(), textures = new Map();
+    const memo = new Map(), textures = new Map(), targetEntries = new Map();
     function textureState(t) {
       const result = TEXTURE_STATE.map(k => own(t, k));
       const target = own(t, 'renderTarget');
       result.push(t.source, t.source?.version, target);
-      if (target) result.push(target.width, target.height, target.depth, target.samples, target.texture,
+      // The retained owner validates an exact generation across a verified
+      // composer resize. Other texture/sampler edits still invalidate capture.
+      if (target && !targetEntries.has(t)) result.push(target.width, target.height, target.depth, target.samples, target.texture,
         target.depthBuffer, target.stencilBuffer, target.depthTexture, target.resolveColorBuffer);
       for (const k of ['offset', 'repeat', 'center']) { const v = own(t, k); result.push(v?.x, v?.y); }
       // Auto-updated matrices are derived from the transform fields above; a
@@ -244,6 +248,22 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
       matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false});
     const cameraData = fields(camera, {parent: null, children: [], animations: [],
       matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false});
+    const targetReleases = [], heldTargets = new Set();
+    try {
+      for (const texture of textures.keys()) {
+        const target = targets?.getTextureTarget(texture);
+        if (!target) continue;
+        const entry = targets.capture(target);
+        if (!heldTargets.has(entry)) {
+          targetReleases.push(targets.retainGeneration(entry)); heldTargets.add(entry);
+        }
+        targetEntries.set(texture, entry);
+        textures.set(texture, textureState(texture));
+      }
+    } catch (error) {
+      for (const release of targetReleases) release();
+      throw error;
+    }
     if (!state) {
       state = {root: view(root), record: null, material: null, geometry: null, attributeViews: new Map()};
       // Type flags suffice until the first serialized install; it is not an
@@ -251,18 +271,27 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
       put(state.root, 'isMesh', true); put(state.root, 'isObject3D', true);
       states.set(root, state); retained.add(state);
     }
-    const record = {state, data: rootData, camera: cameraData, bytes, pending: true, installed: false, listeners: [], stale: false};
+    const record = {state, data: rootData, camera: cameraData, bytes, pending: true, installed: false, listeners: [], stale: false,
+      targetReleases};
     allocatedBytes += bytes; records.add(record);
     const resources = new Set(textures.keys());
     for (const t of textures.keys()) if (t.renderTarget) resources.add(t.renderTarget);
+    const retainedTargets = new Set([...heldTargets].map(entry => entry.target));
+    for (const target of retainedTargets) resources.add(target);
     for (const resource of resources) {
-      const listener = () => { record.stale = true; };
+      // Target disposal is classified by its existing owner: a trusted resize
+      // preserves this generation, while explicit disposal still retires it.
+      const listener = () => { if (!retainedTargets.has(resource)) record.stale = true; };
       record.listeners.push([resource, listener]); resource.addEventListener('dispose', listener);
     }
     function check() {
       live();
       if (!record.pending) fail('RELEASED', 'Pass capture was already released');
       if (record.stale) fail('STALE', 'A captured pass texture was disposed before submission');
+      for (const entry of heldTargets) {
+        try { targets.assertCurrent(entry); }
+        catch { fail('STALE', 'A captured pass target changed or was disposed before submission'); }
+      }
       for (const [t, expected] of textures) {
         const current = textureState(t);
         if (current.length !== expected.length || current.some((v, i) => !Object.is(v, expected[i])))
@@ -300,7 +329,7 @@ export function createThreePassSnapshots(T, {maxBytes = 32 * 1024 * 1024, maxCap
       overwrite(state.root, rootData); state.root.material = state.material; state.root.geometry = state.geometry;
       record.installed = true; state.record = record;
     }
-    return Object.freeze({root: state.root, camera: cameraData, bytes, check, install,
+    return Object.freeze({root: state.root, camera: cameraData, bytes, targetEntries, check, install,
       release() { if (!record.pending) return; record.pending = false; collect(record); }});
   }
   return Object.freeze({capture,

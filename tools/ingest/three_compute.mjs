@@ -625,7 +625,8 @@ export function withThreeCompute(Base, THREE) {
       const targets = this._targets;
       if (targets?.bindingsFor) {
         const bindingsFor = targets.bindingsFor.bind(targets);
-        targets.bindingsFor = (destination, retained) => bindingsFor(destination, this._storageTextures.bindingsFor(retained));
+        targets.bindingsFor = (destination, retained, capturedEntry) => bindingsFor(destination,
+          this._storageTextures.bindingsFor(retained), capturedEntry);
       }
       // The pinned WGSL builder asks its backend for texture sample metadata.
       // Report the captured target's MSAA state and its resolved primary view.

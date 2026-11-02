@@ -41,7 +41,7 @@ import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
-import {registerThreePassState, captureThreePassState, finishThreePassState} from './three_pass_state.mjs';
+import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera} from './three_pass_state.mjs';
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -222,7 +222,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               backgroundState: passOptions?.backgroundState, materialFrame: passOptions?.materialFrame,
               sourceAttributeCallbacks: owner._shaderEncodedOutput === true,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target,
-                owner._shaderEncodedOutput ? owner._framebufferBindings(sceneLimits.textures) : sceneLimits.textures),
+                owner._shaderEncodedOutput ? owner._framebufferBindings(sceneLimits.textures) : sceneLimits.textures,
+                owner._shaderEncodedOutput ? texture => owner._programFrame?.passTextureEntries?.get(texture) : null),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,
                 ...(destination !== owner || owner._hdr || !owner._shaderEncodedOutput ? {} : {outputTransfer: 'srgb'})},
               textureTransforms: true, alphaMaps: true,
@@ -375,7 +376,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._activeMipmapLevel = 0;
       this._targetLifetime = new AbortController();
       this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
-      this._passSnapshots = createThreePassSnapshots(THREE);
+      this._passSnapshots = createThreePassSnapshots(THREE, {targets: this._targets});
       this._nodeProgramSupport = null;
       this._nodeBackgrounds = null;
       this._nodeBundles = null;
@@ -1074,6 +1075,22 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
+      const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
+      const passCameraRequired = this._shaderEncodedOutput && !clearOnly && captureCameras && requiresThreePassCamera(this);
+      // Source-verified SSAA/TAA must not collapse temporary jitter into the
+      // restored camera. Check before capturing a destination or retaining GPU
+      // generations. Hook-bearing scenes keep their existing public identities;
+      // they need a broader synchronous command capture before admission here.
+      let requiredMaterialFrame = null;
+      if (passCameraRequired) {
+        if (this.shadowMap.enabled || this.sortObjects && (this._opaqueSort || this._transparentSort))
+          fail('UNSUPPORTED', 'Supersampling camera capture requires a callback-free scene without shadows or custom sorting');
+        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true,
+          maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
+          maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
+        if (!requiredMaterialFrame?.cameraSafe())
+          fail('UNSUPPORTED', 'Supersampling camera capture requires ordinary callback-free scene and camera state');
+      }
       // Each accepted call keeps its source sort selection while pipelines are
       // prepared. Changing a sorter for the next call cannot reorder this one.
       const sortState = Object.freeze({sortObjects: this.sortObjects === true,
@@ -1089,7 +1106,6 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!clearOnly && this._operationScope) frame.operations = this._operationScope;
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
-      const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
       const c = this._clearColor, a = this._clearAlpha;
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
@@ -1137,13 +1153,27 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // UI material changes may arrive while an accepted draw prepares its
         // pipeline. Keep that draw's selector, without freezing live uniforms or
         // changing hooked projection/shadow work's established source ordering.
-        materialFrame = this._captureMaterialFrame({scene, camera, overrideMaterial, selectionOnly: true});
+        materialFrame = requiredMaterialFrame ?? this._captureMaterialFrame({scene, camera, overrideMaterial, selectionOnly: true});
+        if (requiredMaterialFrame) this._materialCaptureValues += materialFrame.values;
       }
       // Captures already own source resource leases. Publish each additional
       // lease immediately so a later acquisition failure can release all of it.
       const request = {snapshot, nodeFrame, materialFrame};
       try {
+        let webglSourceCamera = null;
+        if (this._shaderEncodedOutput && captureCameras && !snapshot && materialFrame?.cameraSafe?.() &&
+            !(this.sortObjects && (this._opaqueSort || this._transparentSort))) {
+          // Keep one camera value per accepted draw, including SSAA's distinct
+          // projections. Default scene transforms still update at submission;
+          // the private camera itself cannot be updated to a later source pose.
+          if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
+          if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+          webglSourceCamera = camera;
+          cameraSource ??= camera;
+          camera = captureThreeCamera(THREE, camera);
+        }
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
+          webglSourceCamera, passCameraRequired,
           nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState,
           canvasFrameToken: this._shaderEncodedOutput ? this._webglFrameToken ?? null : null,
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
@@ -1157,6 +1187,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           srgbView: target ? false : this._canvasSrgbView(outputProfile?.space ?? this.outputColorSpace,
             this._wantsHdr(this._toneMapping()), outputProfile), outputProfile, key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+            passTextureEntries: snapshot?.targetEntries,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
             reversedDepthBuffer: this.reversedDepthBuffer === true,
@@ -1426,7 +1457,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return request.frame.operations ? request.frame.operations.run(() => this._submitFrame(request)) : this._submitFrame(request);
     }
     _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
+      webglSourceCamera = null, passCameraRequired = false,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
+      if (webglSourceCamera && !materialFrame?.cameraSafe()) {
+        if (passCameraRequired) fail('UNSUPPORTED', 'Supersampling scene or camera gained callbacks before its captured draw submitted');
+        // An application may install hooks while preparation is pending. Keep
+        // those callbacks on their original camera and live mutation path.
+        camera = webglSourceCamera;
+      }
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
         if (this._targetDepthInitialized.has(initializeOutputDepth)) return;
@@ -1457,6 +1495,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : this._shaderEncodedOutput ? {
         passState: programFrame.passState, passClear: programFrame.passClear, passBackgroundClear: programFrame.passBackgroundClear,
+        passTextureEntries: programFrame.passTextureEntries,
         cameraSource: programFrame.cameraSource, cameraSnapshot: programFrame.cameraSnapshot,
       } : undefined;
       try {

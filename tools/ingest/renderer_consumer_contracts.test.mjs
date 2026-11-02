@@ -310,6 +310,49 @@ test('closed composer/pass aliases, settings and direct rendering preserve sourc
     'no source proof means the renderer argument remains opaque');
 });
 
+test('advanced source passes retain their parameters and closed composer ownership', async () => {
+  for (const [name, args, settings] of [
+    ['UnrealBloomPass', 'new THREE.Vector2(64, 32), 1.5, .4, .85',
+      'pass.strength = 1.2; pass.radius = .7; pass.threshold = .6;'],
+    ['BokehPass', 'scene, camera, {focus: 3, aperture: .02, maxblur: .1}',
+      'pass.uniforms.focus.value = 2; pass.materialBokeh.depthTest = false;'],
+    ['AfterimagePass', '.8', 'pass.damp = .7; pass.uniforms.damp.value = .6;'],
+    ['SSAARenderPass', 'scene, camera', 'pass.sampleLevel = 2; pass.unbiased = false;'],
+    ['TAARenderPass', 'scene, camera', 'pass.sampleLevel = 2; pass.accumulate = true; pass.accumulateIndex = -1;'],
+  ]) {
+    const entry = passFixture(`import {${name}} from 'advanced';
+      const pass = new ${name}(${args}); ${settings}
+      composer.addPass(pass); composer.render(.016); pass.setSize(48, 32); pass.dispose();`,
+    {advanced: new URL(`examples/jsm/postprocessing/${name}.js`, upstream).href}).entry;
+    const graph = await buildModuleGraph(entry);
+    assert.deepEqual(extractGraphRoutingFacts(graph).escapes, [], name);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu', name);
+    if (name === 'UnrealBloomPass') {
+      const mod = Object.values(graph.modules).find(mod => mod.postprocessing_transform?.name === name + '.js');
+      assert.ok(mod, 'Unreal Bloom receives the same private stencil state as EffectComposer');
+    }
+    const changed = await buildModuleGraph(entry, {
+      transformModule: (source, {url}) => url.endsWith(`/${name}.js`) ? source + '\n// changed implementation\n' : null,
+    });
+    assert.equal(evaluateGraphRoutes(changed, decideRendererRoute, environment)[0].decision.route, 'exact-backend', name);
+  }
+});
+
+test('advanced pass shader dependencies and unknown pass consumers retain the exact renderer', async () => {
+  const source = `import {UnrealBloomPass} from 'advanced';
+    const pass = new UnrealBloomPass(); composer.addPass(pass); composer.render();`;
+  const map = {advanced: new URL('examples/jsm/postprocessing/UnrealBloomPass.js', upstream).href};
+  const changed = await buildModuleGraph(passFixture(source, map).entry, {
+    transformModule: (text, {url}) => url.endsWith('/LuminosityHighPassShader.js') ? text + '\n// changed shader\n' : null,
+  });
+  assert.equal(evaluateGraphRoutes(changed, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  for (const extra of ['plugin(pass);', 'pass.render = plugin;', 'pass.strength = renderer;',
+    'class CustomBloom extends UnrealBloomPass {}', 'UnrealBloomPass.prototype.dispose = plugin;']) {
+    const graph = await buildModuleGraph(passFixture(source + extra, map).entry);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', extra);
+  }
+});
+
 test('custom passes, carrier escapes and source mutations retain exact renderer ownership', () => {
   for (const body of [
     'composer.addPass(plugin);', 'composer.insertPass(new CustomPass(), 0);',

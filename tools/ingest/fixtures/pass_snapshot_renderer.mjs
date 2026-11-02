@@ -20,30 +20,41 @@ async function gate(device, signal) {
   } finally { signal.removeEventListener('abort', abort); }
 }
 export async function createGpuThreeScene(device, root, options) {
-  let material, signature, texture, binding, disposed = false;
+  let material, signature, texture, binding, disposed = false, samples = new Map();
+  const textureInputs = () => new Map([
+    ...Object.entries(root.material?.uniforms ?? {}).filter(([, uniform]) => uniform.value?.isTexture)
+      .map(([name, uniform]) => [name, uniform.value]),
+    ...(root.material?.map?.isTexture ? [['map', root.material.map]] : []),
+  ]);
   const key = () => root.material?.vertexShader + '/' + root.material?.fragmentShader;
   const prepare = async () => {
-    device.preparations.push({root, factor: root.material?.uniforms.factor?.value});
+    device.preparations.push({root, factor: root.material?.uniforms?.factor?.value});
     await gate(device, options.signal);
     if (root.material?.fragmentShader === 'reject') throw new Error('rejected program');
-    material = root.material; signature = key(); texture = material?.uniforms.input?.value;
+    material = root.material; signature = key(); texture = material?.uniforms?.input?.value;
     binding = texture ? options.textures.get(texture) : null;
+    samples = new Map([...textureInputs()].map(([name, value]) => [name, options.textures.get(value)]));
   };
   await prepare();
   return {get disposed() { return disposed; }, failed: false, prepare,
     diagnostics: {sourceDraws: 1, drawCalls: 1, geometryCount: 1, geometryBytes: 60, instanceBytes: 0, deformationBytes: 0, rendererBytes: 128},
-    render(camera, frame) {
+    render(camera, frame, renderOptions = {}) {
       if (disposed) throw Error('disposed scene');
       if (device.retry) { device.retry--; throw boundary(); }
-      const input = root.material?.uniforms.input?.value;
+      const input = root.material?.uniforms?.input?.value;
       if (root.material !== material || key() !== signature || input !== texture) throw boundary();
       const sampled = input ? options.textures.get(input) : null;
       if (sampled && sampled.view !== binding.view) throw boundary();
-      const factor = root.material?.uniforms.factor?.value ?? 0, direction = root.material?.uniforms.direction?.value;
+      const currentSamples = new Map([...textureInputs()].map(([name, value]) => [name, options.textures.get(value)]));
+      if (currentSamples.size !== samples.size || [...currentSamples].some(([name, value]) => value?.view !== samples.get(name)?.view)) throw boundary();
+      const factor = root.material?.uniforms?.factor?.value ?? 0, direction = root.material?.uniforms?.direction?.value;
       const output = frame.resolveTarget ?? frame.colorView; output.texture.value = factor;
       const draw = {factor, direction: direction ? [direction.x, direction.y] : null, shader: root.material?.fragmentShader,
         root, material: root.material, geometry: root.geometry, position: root.geometry?.attributes.position.array[0],
         worldX: root.matrixWorld?.elements[12], cameraX: camera.matrixWorld?.elements[12], input, sampled, frame,
+        camera, projection: camera.projectionMatrix?.elements.slice(), overrideMaterial: renderOptions.overrideMaterial,
+        uniforms: Object.fromEntries(Object.entries(root.material?.uniforms ?? {}).map(([name, uniform]) => [name, uniform.value])),
+        samples: currentSamples,
         program: options.program?.state()};
       device.draws.push(draw); device.queue.submit([{draw}]);
     },
