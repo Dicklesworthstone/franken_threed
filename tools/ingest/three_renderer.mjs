@@ -1123,6 +1123,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (native && !nodeCaptureDeferred) {
         try { materialFrame = this._captureMaterialFrame({scene, nodeFrame, overrideMaterial}); }
         catch (error) { this._releaseRequest({nodeFrame}); throw error; }
+      } else if (this._shaderEncodedOutput && !clearOnly && !snapshot && !this.shadowMap.enabled) {
+        // UI material changes may arrive while an accepted draw prepares its
+        // pipeline. Keep that draw's selector, without freezing live uniforms or
+        // changing hooked projection/shadow work's established source ordering.
+        materialFrame = this._captureMaterialFrame({scene, camera, overrideMaterial, selectionOnly: true});
       }
       // Captures already own source resource leases. Publish each additional
       // lease immediately so a later acquisition failure can release all of it.
@@ -1323,8 +1328,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (captured) this._nodeCaptureBytes += captured.bytes;
       return captured;
     }
-    _captureMaterialFrame({scene, nodeFrame, overrideMaterial}) {
-      const captured = captureThreeMaterialState(THREE, scene, {nodeFrame, overrideMaterial,
+    _captureMaterialFrame({scene, camera, nodeFrame, overrideMaterial, selectionOnly = false}) {
+      const captured = captureThreeMaterialState(THREE, scene, {nodeFrame, overrideMaterial, camera, selectionOnly,
         maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
         maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
       if (captured) this._materialCaptureValues += captured.values;

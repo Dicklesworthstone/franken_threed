@@ -112,3 +112,95 @@ test('exotic material selectors preserve their live receiver without invoking cu
   }
   assert.equal(calls, 0);
 });
+
+test('WebGL selections retain material identities and live shader uniform aliases', () => {
+  const light = new THREE.DirectionalLight(), camera = new THREE.PerspectiveCamera();
+  const a = new THREE.ShaderMaterial({uniforms: {lightPosition: {value: light.position}}});
+  const b = new THREE.MeshPhongMaterial(), original = [a, b], scene = sceneWith(original);
+  const mesh = scene.children[0], geometry = mesh.geometry;
+  const first = captureThreeMaterialState(THREE, scene, {selectionOnly: true, camera});
+  original[0] = b; mesh.material = b;
+  light.position.set(2, 3, 4); a.opacity = .25;
+  assert.deepEqual(first.objects.get(mesh), [a, b]);
+  assert.equal(first.materials.get(a), a);
+  assert.equal(first.materials.get(b), b);
+  assert.equal(first.materials.get(a).uniforms.lightPosition.value, light.position);
+  assert.deepEqual(first.materials.get(a).uniforms.lightPosition.value.toArray(), [2, 3, 4]);
+  assert.equal(first.materials.get(a).opacity, .25);
+  assert.equal(mesh.material, b); assert.equal(mesh.geometry, geometry);
+  const next = captureThreeMaterialState(THREE, scene, {selectionOnly: true, camera});
+  assert.equal(next.objects.get(mesh), b);
+  assert.equal(next.materials.has(a), false);
+});
+
+test('WebGL material selection leaves projection and upload hooks on their source path', () => {
+  let calls = 0;
+  const hook = () => { calls++; };
+  const mutations = [
+    ({scene}) => { scene.onBeforeRender = hook; },
+    ({mesh}) => { mesh.onAfterRender = hook; },
+    ({scene}) => { scene.updateMatrixWorld = hook; },
+    ({mesh}) => { mesh.updateMatrix = hook; },
+    ({camera}) => { camera.updateMatrixWorld = hook; },
+    ({camera}) => { camera.updateMatrix = hook; },
+    ({material}) => { material.onBeforeRender = hook; },
+    ({material}) => { material.onBeforeCompile = hook; },
+    ({material}) => { material.customProgramCacheKey = hook; },
+    ({mesh}) => { mesh.intersectsFrustum = hook; },
+    ({mesh}) => { mesh.layers.test = hook; },
+    ({mesh}) => { mesh.boundingSphere = null; mesh.computeBoundingSphere = hook; },
+    ({geometry}) => { geometry.computeBoundingSphere = hook; },
+    ({geometry}) => { geometry.attributes.position.onUpload(hook); },
+    ({geometry}) => { geometry.setIndex([0, 1, 2]); geometry.index.onUpload(hook); },
+    ({geometry}) => {
+      const data = new THREE.InterleavedBuffer(new Float32Array(9), 3);
+      data.onUpload(hook); geometry.setAttribute('position', new THREE.InterleavedBufferAttribute(data, 3, 0));
+    },
+    ({geometry}) => { geometry.morphAttributes.position = [new THREE.Float32BufferAttribute(9, 3).onUpload(hook)]; },
+    ({scene}) => { const lod = new THREE.LOD(); lod.update = hook; scene.add(lod); },
+  ];
+  for (const mutate of mutations) {
+    const material = new THREE.MeshBasicMaterial(), scene = sceneWith(material), mesh = scene.children[0];
+    const camera = new THREE.PerspectiveCamera(), geometry = mesh.geometry;
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(9, 3));
+    mutate({scene, mesh, material, camera, geometry});
+    assert.equal(captureThreeMaterialState(THREE, scene, {selectionOnly: true, camera}), null);
+  }
+  assert.equal(calls, 0, 'capture never invokes the hooks it detects');
+});
+
+test('WebGL selector eligibility never invokes accessor-backed or exotic source state', () => {
+  let calls = 0;
+  const getter = () => { calls++; throw new Error('capture must not invoke source accessor'); };
+  const mutations = [
+    ({mesh}) => { Object.defineProperty(mesh, 'material', {get: getter}); },
+    ({mesh}) => { Object.defineProperty(mesh, 'onBeforeRender', {get: getter}); },
+    ({scene}) => { Object.defineProperty(scene, 'children', {get: getter}); },
+    ({camera}) => { Object.defineProperty(camera, 'updateMatrixWorld', {get: getter}); },
+    ({material}) => { Object.defineProperty(material, 'onBeforeCompile', {get: getter}); },
+    ({mesh, material}) => { const array = [material]; Object.defineProperty(array, '0', {get: getter}); mesh.material = array; },
+    ({mesh, material}) => { const array = [material]; array[Symbol.iterator] = getter; mesh.material = array; },
+    ({geometry}) => { Object.defineProperty(geometry.attributes.position, 'onUploadCallback', {get: getter}); },
+    ({mesh}) => { Object.defineProperty(mesh.layers, 'mask', {get: getter}); },
+    ({geometry}) => { geometry.addGroup(0, 3, 0); Object.defineProperty(geometry.groups[0], 'materialIndex', {get: getter}); },
+    ({geometry}) => { geometry.groups.push(Object.assign(Object.create({get materialIndex() { return getter(); }}), {start: 0, count: 3})); },
+  ];
+  for (const mutate of mutations) {
+    const material = new THREE.MeshBasicMaterial(), scene = sceneWith(material), mesh = scene.children[0];
+    const camera = new THREE.PerspectiveCamera(), geometry = mesh.geometry;
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(9, 3));
+    mutate({scene, mesh, material, camera, geometry});
+    assert.equal(captureThreeMaterialState(THREE, scene, {selectionOnly: true, camera}), null);
+  }
+  assert.equal(calls, 0);
+});
+
+test('WebGL selector capture enforces pending-value, identity and graph budgets', () => {
+  const scene = sceneWith(new THREE.MeshBasicMaterial(), new THREE.MeshPhongMaterial());
+  for (const limits of [{maxValues: 2}, {maxMaterials: 1}, {maxNodes: 1}])
+    assert.throws(() => captureThreeMaterialState(THREE, scene, {selectionOnly: true, ...limits}),
+      {code: 'THREE_MATERIAL_SNAPSHOT_LIMIT'});
+  scene.children.push(scene);
+  assert.throws(() => captureThreeMaterialState(THREE, scene, {selectionOnly: true}),
+    {code: 'THREE_MATERIAL_SNAPSHOT_GRAPH'});
+});

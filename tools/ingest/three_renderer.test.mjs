@@ -531,6 +531,112 @@ test('WebGL material and procedural geometry changes do not acquire unused canva
   }
 });
 
+const submittedSurfaceDraws = device => device.snapshots.flat().filter(draw => draw.streams.has(0));
+function submittedMaterialColor(draw) {
+  const {group, offsets} = draw.groups.get(0), resource = group.entries[0].resource;
+  const layout = group.layout.entries[0].buffer, bytes = draw.contents.get(resource.buffer);
+  const offset = (resource.offset ?? 0) + (offsets[0] ??
+    (layout.type === 'read-only-storage' ? draw.args.at(-1) * layout.minBindingSize : 0));
+  return Array.from(new Float32Array(bytes.buffer, bytes.byteOffset + offset).slice(16, 19));
+}
+
+test('WebGL accepted material selection survives a GUI replacement during pipeline preparation while values stay live', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+  const renderer = new Renderer({canvas: c.canvas, device}), gate = deferred(), started = deferred();
+  const first = new TC.MeshBasicMaterial({color: 0xff0000, side: TC.FrontSide});
+  const next = new TC.MeshBasicMaterial({color: 0x0000ff, side: TC.BackSide});
+  const scene = new TC.Scene(), mesh = new TC.Mesh(new TC.PlaneGeometry(2, 2), first);
+  const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+  t.after(() => { gate.resolve(); renderer.dispose(); mesh.geometry.dispose(); first.dispose(); next.dispose(); });
+  await renderer.compileAsync(scene, camera); scene.add(mesh);
+  const createPipeline = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = async descriptor => { started.resolve(); await gate.promise; return createPipeline(descriptor); };
+  renderer.render(scene, camera); await started.promise;
+  assert.equal(c.acquired(), 0); assert.equal(device.submissions.length, 0);
+  mesh.material = next;
+  first.color.setRGB(.25, .5, .75);
+  gate.resolve(); await flush(renderer);
+  const accepted = submittedSurfaceDraws(device);
+  assert.equal(accepted.length, 1, 'the accepted frame completes once after its pipeline is ready');
+  assert.equal(accepted[0].pipeline.primitive.cullMode, 'back', 'the accepted source material still selects the raster state');
+  assert.deepEqual(submittedMaterialColor(accepted[0]), [.25, .5, .75], 'selection capture does not clone material values');
+  assert.equal(mesh.material, next, 'rendering never restores a stale selector onto the application object');
+  assert.equal(c.acquired(), 1); assert.equal(renderer._deferredError, null);
+  renderer.render(scene, camera); await flush(renderer);
+  const draws = submittedSurfaceDraws(device);
+  assert.equal(draws.length, 2); assert.equal(c.acquired(), 2);
+  assert.equal(draws[1].pipeline.primitive.cullMode, 'front');
+  assert.deepEqual(submittedMaterialColor(draws[1]), [0, 0, 1], 'the next accepted request sees the GUI selection');
+  assert.equal(renderer._deferredError, null); assert.equal(renderer._materialCaptureValues, 0);
+});
+
+test('WebGL accepted material-array slots survive in-place GUI edits during preparation', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+  const renderer = new Renderer({canvas: c.canvas, device}), gate = deferred(), started = deferred();
+  const materials = [0xff0000, 0x0000ff, 0x00ff00].map(color => new TC.MeshBasicMaterial({color}));
+  const selected = materials.slice(0, 2), geometry = new TC.PlaneGeometry(2, 2);
+  geometry.clearGroups(); geometry.addGroup(0, 3, 0); geometry.addGroup(3, 3, 1);
+  const scene = new TC.Scene(), mesh = new TC.Mesh(geometry, selected);
+  const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+  t.after(() => { gate.resolve(); renderer.dispose(); geometry.dispose(); for (const material of materials) material.dispose(); });
+  await renderer.compileAsync(scene, camera); scene.add(mesh);
+  const createPipeline = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = async descriptor => { started.resolve(); await gate.promise; return createPipeline(descriptor); };
+  renderer.render(scene, camera); await started.promise;
+  selected[0] = materials[2]; selected[1] = materials[0];
+  gate.resolve(); await flush(renderer);
+  const byGroup = draws => [...draws].sort((a, b) => a.args[2] - b.args[2]).map(submittedMaterialColor);
+  assert.deepEqual(byGroup(submittedSurfaceDraws(device)), [[1, 0, 0], [0, 0, 1]]);
+  assert.equal(mesh.material, selected); assert.deepEqual(selected, [materials[2], materials[0]]);
+  assert.equal(c.acquired(), 1); assert.equal(renderer._deferredError, null);
+  renderer.render(scene, camera); await flush(renderer);
+  const draws = submittedSurfaceDraws(device);
+  assert.equal(draws.length, 4); assert.equal(c.acquired(), 2);
+  assert.deepEqual(byGroup(draws.slice(2)), [[0, 1, 0], [1, 0, 0]]);
+  assert.equal(renderer._deferredError, null); assert.equal(renderer._materialCaptureValues, 0);
+});
+
+test('WebGL hooked draws retain original source identities and live shader uniforms across preparation', async t => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+  const renderer = new Renderer({canvas: c.canvas, device}), gate = deferred(), started = deferred();
+  const tint = new TC.Vector3(.125, .25, .5), material = new TC.ShaderMaterial({uniforms: {tint: {value: tint}},
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform vec3 tint; void main() { gl_FragColor = vec4(tint, 1.0); }'});
+  const scene = new TC.Scene(), mesh = new TC.Mesh(new TC.PlaneGeometry(2, 2), material);
+  const camera = new TC.PerspectiveCamera(50, 2, .1, 10); camera.position.z = 3;
+  const callbacks = [];
+  mesh.onBeforeRender = function (actualRenderer, actualScene, actualCamera, geometry, selected) {
+    assert.equal(this, mesh); assert.equal(actualRenderer, renderer); assert.equal(actualScene, scene);
+    assert.equal(actualCamera, camera); assert.equal(geometry, mesh.geometry); assert.equal(selected, material);
+    callbacks.push('before'); tint.x = .875;
+  };
+  mesh.onAfterRender = function () { callbacks.push('after'); };
+  t.after(() => { gate.resolve(); renderer.dispose(); mesh.geometry.dispose(); material.dispose(); });
+  await renderer.compileAsync(scene, camera); scene.add(mesh);
+  const createPipeline = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = async descriptor => { started.resolve(); await gate.promise; return createPipeline(descriptor); };
+  renderer.render(scene, camera); await started.promise;
+  assert.deepEqual(callbacks, [], 'preparation never replays draw callbacks');
+  tint.set(.25, .625, .375);
+  gate.resolve(); await flush(renderer);
+  assert.deepEqual(callbacks, ['before', 'after']); assert.equal(c.acquired(), 1);
+  const [draw] = submittedSurfaceDraws(device);
+  const words = [...draw.groups.values()].flatMap(({group, offsets}) => group.layout.entries
+    .filter(entry => entry.buffer?.type === 'uniform').sort((a, b) => a.binding - b.binding)
+    .flatMap((entry, index) => {
+      const resource = group.entries.find(binding => binding.binding === entry.binding).resource;
+      const bytes = draw.contents.get(resource.buffer), offset = (resource.offset ?? 0) + (offsets[index] ?? 0);
+      return Array.from(new Float32Array(bytes.buffer, bytes.byteOffset + offset, resource.size / 4));
+    }));
+  assert.ok(words.some((value, index) => value === .875 && words[index + 1] === .625 && words[index + 2] === .375),
+    'the actual shader upload observes the same live uniform object after the draw callback');
+  assert.equal(material.uniforms.tint.value, tint); assert.equal(renderer._materialCaptureValues, 0);
+  assert.equal(renderer._deferredError, null);
+});
+
 test('WebGL animation preserves procedural updates across cold preparation and resumes before GPU completion', async t => {
   const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
   const device = recordingDevice(), c = canvasFixture(), host = animationHost(c.canvas);
