@@ -257,7 +257,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
     (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
-  return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps,
+  return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, baseColorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
     ...(webglArray || webglVolume ? {webglSampler: Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
       wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy,
@@ -277,9 +277,10 @@ export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = nul
   const colors = target.textures.map((texture, index) => inspectThreeRenderTargetColor(target, three, texture,
     cubeMipLevelCount, colorMipProfiles?.[index])), primary = colors[0];
   if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1) &&
-      (primary.array || primary.volume || primary.sampleCount !== 1)))
-    fail('UNSUPPORTED', 'Multiple color mip pyramids require single-sample 2D targets');
-  const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes * (color.sampleCount === 4 ? 5 : 1), 0);
+      (primary.array || primary.volume)))
+    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D targets');
+  const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes +
+    (color.sampleCount === 4 ? color.baseColorBytes * 4 : 0), 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {...primary, colors, textures: colors.map(color => color.texture), colorFormats: colors.map(color => color.format), bytes,
     colorMipLevelCounts: colors.map(color => color.mipLevelCount), colorGenerateMipmaps: colors.map(color => color.generateMipmaps),
@@ -452,7 +453,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   const sameShape = (a, b) => a.key === b.key && sameColors(a, b) && a.depthTexture === b.depthTexture && a.depthOwner === b.depthOwner;
   function historyShape(group, shape, base = group.shape) {
     return shape.key === base.key && shape.depthTexture === base.depthTexture && shape.depthOwner === base.depthOwner &&
-      shape.textures.length === group.pairs.length && shape.textures.every((texture, index) => group.pairs[index].includes(texture));
+      shape.textures.length === group.pairs.length && shape.textures.every((texture, index) => group.pairs[index].includes(texture)) &&
+      (!group.mipInitialized || [...group.mipProfiles].every(([texture, profile]) => texture.version === profile.sourceVersion));
+  }
+  function initializeHistory(group) {
+    if (group.mipInitialized) return;
+    for (const [texture, profile] of group.mipProfiles)
+      group.mipProfiles.set(texture, {...profile, sourceVersion: texture.version});
+    group.mipInitialized = true;
   }
   function retireHistory(group) { for (const entry of [...group.entries]) retire(entry); }
   function sourceDisposed(entry, event) {
@@ -466,7 +474,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const shape = resize.shape ??= sourceShape(entry.target, entry);
       if ((entry.historyGroup ? shape.textures.every((texture, index) => entry.historyGroup.pairs[index]?.includes(texture)) : sameColors(shape, entry.shape)) && shape.depthTexture === entry.shape.depthTexture &&
           shape.depthFormat === entry.shape.depthFormat &&
-          shape.sampleCount === entry.shape.sampleCount && shape.generateMipmaps === entry.shape.generateMipmaps) {
+          shape.sampleCount === entry.shape.sampleCount && (entry.historyGroup || shape.generateMipmaps === entry.shape.generateMipmaps)) {
         resize.event = event;
         // Capture leases can end before submitted GPU validation/fence
         // observers. Keep their generation alive until collect() has awaited
@@ -495,7 +503,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
     if (entry.shape.cube) entry.cubeInitialized = true;
-    if (!flipY && entry.shape.textures.length > 1) entry.mrtInitialized = true;
+    if (!flipY) entry.mrtInitialized = true;
+    if (entry.historyGroup) initializeHistory(entry.historyGroup);
     let held = true;
     return () => {
       if (!held) return;
@@ -508,13 +517,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // update. Selection/layout queries alone have not initialized that image.
     const frozen = entry?.alive && entry.shape.cube && !entry.shape.webglCube && (entry.cubeInitialized || entry.storage) &&
       entry.shape.texture === target.texture && entry.shape.sourceVersion === target.texture.version;
-    const nativeMrt = !flipY && target.textures?.length > 1 && !nativePasses.has(target);
+    const group = entry?.historyGroup ?? historyGroups.get(target);
+    const nativeMrt = !flipY && !nativePasses.has(target) && (target.textures?.length > 1 ||
+      !target.isCubeRenderTarget && !target.isWebGLCubeRenderTarget && !target.isRenderTarget3D &&
+      !target.isWebGL3DRenderTarget && target.depth === 1 && !target.texture?.isDataArrayTexture && !target.texture?.isArrayTexture);
     const frozenMrt = nativeMrt && entry?.alive && (entry.mrtInitialized || entry.storage) &&
       entry.shape.width === (target.width || 1) && entry.shape.height === (target.height || 1) &&
       entry.shape.sampleCount === (target.samples === 4 ? 4 : 1) && entry.shape.textures.length === target.textures.length &&
       entry.shape.colors.every((color, index) => color.texture === target.textures[index] && color.sourceVersion === color.texture.version);
+    const base = group?.sourceShape ?? group?.shape;
+    const frozenHistory = group?.mipInitialized && base.width === (target.width || 1) && base.height === (target.height || 1) &&
+      base.sampleCount === (target.samples === 4 ? 4 : 1) && base.textures.length === target.textures.length &&
+      target.textures.every(texture => group.mipProfiles.get(texture)?.sourceVersion === texture.version);
     const shape = inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null,
-      colorMipProfiles: frozenMrt ? entry.shape.colors : null});
+      colorMipProfiles: frozenHistory ? base.colors : frozenMrt ? entry.shape.colors : null});
     // The source keeps each initialized image's mip allocation until its texture
     // version changes. Per-render generation flags are separately captured by
     // the facade; editing a flag must not replace previous rendered contents.
@@ -553,18 +569,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       registerNativePass(node); group = historyGroups.get(target);
     }
     if (group) {
-      const entry = historyEntry(group, shape); entries.set(target, entry); return entry;
+      const entry = historyEntry(group, shape); entries.set(target, entry);
+      if (initialize) initializeHistory(group);
+      return entry;
     }
     let entry = entries.get(target);
     if (entry && (!sameShape(entry.shape, shape) || entry.depthEntry && !entry.depthEntry.alive)) { retire(entry); entry = null; }
     if (entry) {
       if (initialize && shape.cube) entry.cubeInitialized = true;
-      if (initialize && !flipY && shape.textures.length > 1) entry.mrtInitialized = true;
+      if (initialize && !flipY) entry.mrtInitialized = true;
       return entry;
     }
     entry = createEntry(target, shape);
     entry.cubeInitialized = initialize && shape.cube;
-    entry.mrtInitialized = initialize && !flipY && shape.textures.length > 1;
+    entry.mrtInitialized = initialize && !flipY;
     entries.set(target, entry);
     return entry;
   }
@@ -612,21 +630,28 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function registerNativePass(node) {
     live();
-    const target = node.renderTarget, shape = inspectThreeRenderTarget(target, three);
+    const target = node.renderTarget, existing = entries.get(target);
+    // An already rendered image keeps its initialized mip allocation when a
+    // previous-frame image is added later. History versions are tracked by
+    // physical source texture, independently of the current attachment order.
+    const inspected = sourceShape(target, existing);
+    const shape = {...inspected, key: inspected.colors.map(color => color.key).join('|')};
     const names = Object.keys(node._previousTextures ?? {});
     if (!names.length) return;
-    if (shape.cube || shape.array || shape.volume || shape.colors.some(color => color.mipLevelCount !== 1 || color.generateMipmaps))
-      fail('UNSUPPORTED', 'Native pass histories currently require 2D mip-zero color attachments');
+    if (shape.cube || shape.array || shape.volume)
+      fail('UNSUPPORTED', 'Native pass histories require 2D color attachments');
     nativePasses.set(target, node);
     let group = historyGroups.get(target);
     if (group && (!historyShape(group, shape) || group.node !== node)) {
       retireHistory(group); group = null;
     }
     if (!group) {
-      const existing = entries.get(target);
-      if (existing && !sameShape(existing.shape, shape)) retire(existing);
+      if (existing && !(sameColors(existing.shape, shape) && existing.shape.depthTexture === shape.depthTexture &&
+          existing.shape.depthOwner === shape.depthOwner && existing.shape.colors.every((color, index) => color.key === shape.colors[index].key))) retire(existing);
       group = {node, target, shape, pairs: shape.textures.map(texture => [texture]), variants: new Map(),
-        entries: new Set(), watched: new Set(), storage: null, charged: 0, sourceShape: null, busy: false, frame: null};
+        entries: new Set(), watched: new Set(), storage: null, charged: 0, mipDepthBytes: 0, sourceShape: null, busy: false, frame: null,
+        mipProfiles: new Map(shape.colors.map(color => [color.texture, color])),
+        mipInitialized: existing?.alive === true && !!(existing.storage || existing.mrtInitialized)};
       group.onDispose = () => retireHistory(group);
       historyGroups.set(target, group);
       if (existing?.alive) {
@@ -634,19 +659,23 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         existing.historyGroup = group; existing.colorSlots = Object.freeze(shape.textures.map(() => 0));
         group.entries.add(existing); historyEntries.add(existing); group.variants.set(existing.colorSlots.join(','), existing);
         group.storage = existing.storage; group.charged = existing.charged; existing.charged = 0; existing.storage = null;
+        group.mipDepthBytes = Math.max(0, (group.storage?.allocatedBytes ?? 0) - existing.shape.bytes);
       }
     }
     for (const name of names) {
       const current = node._textures[name], previous = node._previousTextures[name], index = shape.textures.indexOf(current);
       if (index < 0 || previous === current || previous?.isDepthTexture)
         fail('SOURCE', 'Pass histories require distinct current and previous color textures');
-      const color = inspectThreeRenderTargetColor(target, three, previous);
+      const profile = group.mipInitialized && group.mipProfiles.get(previous)?.sourceVersion === previous.version
+        ? shape.colors[index] : null;
+      const color = inspectThreeRenderTargetColor(target, three, previous, null, profile);
       if (color.key !== shape.colors[index].key)
         fail('SOURCE', 'Current and previous pass color formats must match');
       const pair = group.pairs[index];
       if (pair.length === 1) pair.push(previous);
       else if (!pair.includes(previous) || !pair.includes(current))
         fail('STALE', 'Pass history texture identity changed outside its source swap');
+      if (!group.mipInitialized || !group.mipProfiles.has(previous)) group.mipProfiles.set(previous, color);
       for (const texture of pair) if (!group.watched.has(texture)) {
         group.watched.add(texture); texture.addEventListener('dispose', group.onDispose);
       }
@@ -672,7 +701,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function allocationBytes(entry) {
     const group = entry.historyGroup;
     return group ? entry.shape.bytes + group.pairs.reduce((sum, pair, index) => sum +
-      (pair.length > 1 ? entry.shape.colors[index].colorBytes * (entry.shape.sampleCount === 4 ? 5 : 1) : 0), 0) - group.charged
+      (pair.length > 1 ? entry.shape.colors[index].colorBytes +
+        (entry.shape.sampleCount === 4 ? entry.shape.colors[index].baseColorBytes * 4 : 0) : 0), 0) + group.mipDepthBytes - group.charged
       : entry.storage ? 0 : entry.shape.bytes;
   }
   function prepareDepthTexture(entry) {
@@ -705,17 +735,18 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     prepareDepthTexture(entry);
     const {width, height, format, colorFormats, colorMipLevelCounts, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
-    const nativeMrt = !flipY && colorFormats.length > 1;
+    const nativeMrt = !flipY && (colorFormats.length > 1 || !cube && !array && !volume) || !!group;
     const mipOptions = nativeMrt ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
     const depthOptions = depthEntry ? entry.shape.depthAttachment
       ? {depthSource: depthEntry.storage} : {depthFormat: null, sampleDepth: false} : {};
     if (group) {
-      group.storage ??= gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps, mipLevelCount,
+      group.storage ??= gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: false, mipLevelCount, ...mipOptions,
         sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
       if (group.charged !== needed)
         group.storage.reserveColorHistory(group.pairs.flatMap((pair, index) => pair.length > 1 ? [index] : []));
       allocatedBytes += needed - group.charged; group.charged = needed;
       entry.storage = group.storage.selectColorSlots(entry.colorSlots);
+      initializeHistory(group);
     } else {
       entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube || nativeMrt ? false : generateMipmaps, mipLevelCount, ...mipOptions,
         sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
@@ -760,7 +791,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!native && (shape.webglArray || shape.webglVolume) &&
         ![three.NearestMipmapLinearFilter, three.LinearMipmapLinearFilter].includes(samplerState.minFilter))
       descriptor.maxAnisotropy = 1;
-    if (shape.cube && !shape.webglCube || native && shape.volume || !flipY && entry.shape.textures.length > 1) {
+    if (shape.cube && !shape.webglCube || native && (shape.volume || entry.historyGroup) ||
+        !flipY && (entry.shape.textures.length > 1 || !shape.cube && !shape.array && !shape.volume)) {
       // Native source samplers retain explicit LOD access even for ordinary
       // LinearFilter/NearestFilter; only their mip interpolation is nearest.
       // WebGL cube replicas retain the source's base-only minification clamp.
@@ -1051,7 +1083,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.
-    captureNativeTexture(texture, {comparison = false} = {}) {
+    captureNativeTexture(texture, {comparison = false, sampled = true} = {}) {
       live();
       if (!targetTexture(texture)) {
         if (texture?.isCubeTexture === true && texture.isRenderTargetTexture === true)
@@ -1064,7 +1096,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const index = group.pairs.findIndex(pair => pair.includes(texture));
         if (index < 0) fail('STALE', 'Texture is not a registered previous pass color');
         const colors = entry.shape.colors.slice(), textures = entry.shape.textures.slice();
-        colors[index] = inspectThreeRenderTargetColor(entry.target, three, texture); textures[index] = texture;
+        colors[index] = inspectThreeRenderTargetColor(entry.target, three, texture, null,
+          group.mipInitialized ? entry.shape.colors[index] : null); textures[index] = texture;
         entry = historyEntry(group, {...entry.shape, ...colors[0], colors, textures,
           colorFormats: colors.map(color => color.format), bytes: entry.shape.bytes, key: entry.shape.key});
       }
@@ -1080,13 +1113,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       // replica. r186 forces ordinary depth samplers to nearest even when the
       // texture requests linear filtering. Comparison uses the source filters
       // and compare function; one depth view may have both kinds of consumers.
-      const {descriptor, sampleType} = depth
+      // Raw copies use the same history-slot resolution without imposing a
+      // sampler or optional float32-filterable requirement on copied pixels.
+      const {descriptor, sampleType} = !sampled ? {descriptor: null, sampleType: null} : depth
         ? {descriptor: {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1,
           ...(comparison ? {compare: depthComparison(texture, three)} : {magFilter: 'nearest', minFilter: 'nearest'})}, sampleType: 'depth'}
         : colorSampler(entry, texture);
       const samples = entry.shape.sampleCount;
       if (depth) prepareDepthTexture(entry);
-      return Object.freeze({entry, texture, device, depth, colorIndex, sampler: Object.freeze(descriptor), sampleType, viewDimension: depth ? entry.shape.depthViewDimension : entry.shape.viewDimension,
+      return Object.freeze({entry, texture, device, depth, colorIndex, sampler: descriptor === null ? null : Object.freeze(descriptor), sampleType, viewDimension: depth ? entry.shape.depthViewDimension : entry.shape.viewDimension,
         // r186 resolves color into its primary image. Depth retains every
         // sample and the source builder selects its own textureLoad index.
         sampleData: Object.freeze({samples, primarySamples: depth ? samples : 1, isMSAA: !depth && samples > 1})});
@@ -1248,7 +1283,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const depthReads = entry.depthEntry?.nativeReads ?? entry.depthEntry?.historyGroup?.readBorrow?.reads;
       if (entry.shape.depthAttachment && depthReads?.has(entry.shape.depthTexture))
         fail('FEEDBACK', 'A pass cannot write shared depth held by its sampled inputs');
-      if (!borrowed) budget(entry.storage.frameAllocationBytes(mipLevel, face));
+      budget(entry.storage.frameAllocationBytes(mipLevel, face));
       const allocatedBefore = entry.storage.allocatedBytes;
       entry.busy = true; entry.dirty = true;
       // Higher private depth levels never modify the source's level-zero depth.
@@ -1256,7 +1291,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         entry.depthDirty = true;
         if (entry.depthEntry) entry.depthEntry.depthDirty = true;
       }
-      const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots}) : entry.storage.withFrame;
+      const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots,
+        generateColorMipmaps}) : entry.storage.withFrame;
       try {
         const result = withFrame((frame, texture, handles) => {
           if (group) group.frame = {handles, writes: new Set(entry.shape.textures), depthAttachment: entry.shape.depthAttachment};
@@ -1276,12 +1312,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (entry.shape.cube && generateMipmaps) {
           entry.storage.generateMipmaps(); entry.cubeMipReady = true;
         }
-        if (generateColorMipmaps !== null) entry.storage.generateMipmaps(generateColorMipmaps);
+        if (!borrowed && generateColorMipmaps !== null) entry.storage.generateMipmaps(generateColorMipmaps);
         return result;
       }
       finally {
         const delta = entry.storage.allocatedBytes - allocatedBefore;
-        entry.charged += delta; allocatedBytes += delta;
+        if (group) { group.charged += delta; group.mipDepthBytes += delta; } else entry.charged += delta;
+        allocatedBytes += delta;
         entry.busy = false; if (!entry.alive) release(entry); else collect(entry);
         if (group) for (const member of group.entries) { if (!member.alive) release(member); else collect(member); }
       }

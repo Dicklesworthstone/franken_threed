@@ -52,7 +52,7 @@ for (const sampleCount of [1, 4]) test(`MRT shares depth and resolves each of ${
   await raw.whenIdle(); raw.dispose(); destroyed(f.calls.textures); f.owner.dispose();
 });
 
-test('MRT count, render byte cost, storage budget and multisampled pyramids reject before allocation', () => {
+test('MRT count, render byte cost and storage budget reject before allocation', () => {
   const f = fixture();
   const base = {width: 16, height: 8, colorFormats: ['rgba8unorm', 'rgba8unorm']};
   f.device.limits.maxColorAttachments = 1;
@@ -60,7 +60,6 @@ test('MRT count, render byte cost, storage budget and multisampled pyramids reje
   f.device.limits.maxColorAttachments = 8;
   assert.throws(() => createGpuRenderTarget(f.device, {...base, colorFormats: Array(5).fill('rgba8unorm')}), {code: 'GPU_TARGET_LIMIT'});
   assert.throws(() => createGpuRenderTarget(f.device, {...base, maxBytes: 16 * 8 * 12 - 1}), {code: 'GPU_TARGET_BUDGET'});
-  assert.throws(() => createGpuRenderTarget(f.device, {...base, sampleCount: 4, generateMipmaps: true}), {code: 'GPU_TARGET_UNSUPPORTED'});
   const source = target(); source.textures.push(source.texture);
   assert.throws(() => f.owner.capture(source), {code: 'THREE_TARGET_SOURCE'});
   assert.equal(f.calls.textures.length, 0); f.owner.dispose();

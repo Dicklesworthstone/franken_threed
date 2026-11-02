@@ -525,11 +525,13 @@ unmeasured.
 
 ## Native multiple-render-target mip chains
 
-Native single-sample 2D targets can render and sample mip chains on multiple
+Native 2D targets can render and sample mip chains on multiple
 color attachments. Each attachment retains its own format, allocated mip count,
 sampler and generation policy. Rendering an authored level binds that level on
 every color and requires it to exist on every attachment; sampling, copies and
-readback select the requested attachment's own levels.
+readback select the requested attachment's own levels. Four-sample targets render
+at level zero and resolve before generating each selected color's lower levels;
+authored nonzero-level rendering requires one sample.
 
 Source `generateMipmaps` flags are captured per accepted render or texture copy.
 Only the selected colors regenerate after that operation. Clear-only calls keep
@@ -543,8 +545,34 @@ resource budgets.
 with pinned r186, including authored overwrites, independent queued generation,
 clear history, explicit LOD sampling and unequal color mip counts. Chromium
 151.0.7922.34 / SwiftShader matches the stored and sampled texels exactly with
-zero GPU/browser errors. This profile does not yet add MRT mip pyramids to
-multisampled, layered, volume or WebGL-authored targets.
+zero GPU/browser errors. Layered, volume and WebGL-authored MRT mip pyramids
+remain outside this profile.
+
+## Native mipmapped pass histories
+
+Native ordinary 2D PassNode histories keep a complete mip chain for each
+physical current/previous color image, including independently selected MRT
+attachments. History swaps change the selected image without moving texels or
+discarding either pyramid. Dirty levels and cached filtering steps belong to
+the physical texture; each accepted render captures its generation choices.
+One- and four-sample histories resolve before filtering, and clear-only calls
+preserve lower levels. Late history activation preserves the existing current
+image. Public texture copies can consume either history role at an allocated
+mip level without requiring that image to be filterable.
+
+The existing target owner charges both complete resolved chains, base-level
+MSAA storage and per-level depth attachments. Queued generations retain their
+storage and byte charges across resize; changing generation flags does not
+replace initialized images. The history borrow covers drawing, resolve and
+selected filtering as one synchronous operation.
+
+`native_history_mips.mjs` compares mixed half-float/byte histories with pinned
+r186, including current/previous explicit-LOD sampling, queued complementary
+generation flags, late attachment activation, authored lower levels and resize
+while readbacks remain pending. All 14 checkpoints, 254 images, 33,784 components
+and 54,600 stored bytes match exactly on Chromium 151.0.7922.34 / SwiftShader,
+with zero GPU/browser errors. Layered and volume mipmapped histories remain
+outside this profile; hardware performance is unmeasured.
 
 ## Registered native output color spaces
 

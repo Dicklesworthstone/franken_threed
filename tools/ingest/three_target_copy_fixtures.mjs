@@ -99,6 +99,9 @@ export function targetCopyFixture() {
         viewDimension: dimension, sampleCount: samples, colors, textures, colorFormats: colors.map(c => c.format)},
       native: textures.map((_, colorIndex) => ({target, colorIndex})),
       validation: Promise.resolve(), storage: {validation: Promise.resolve()}};
+    for (const [index, texture] of textures.entries()) Object.defineProperty(texture, 'generateMipmaps', {
+      get: () => colors[index].generateMipmaps, set: value => { colors[index].generateMipmaps = value; },
+    });
     for (const texture of textures) entries.set(texture, entry);
     return {entry, texture: textures[0], textures, dispose() { entry.alive = false; entry.lifetime.abort(failure('TARGET_DISPOSED')); }};
   }

@@ -72,10 +72,11 @@ test('authored source mip copies to an allocated storage mip without overwriting
   assert.equal(f.calls.passes.length, 0); await f.storage.whenIdle(); f.dispose();
 });
 
-test('source and destination automatic mip passes surround the copy, not the opposite way round', async () => {
+test('captured native render generation precedes the copy and storage destination generation follows it', async () => {
   const f = fixture(), source = target({generateMipmaps: true}), destination = storageTexture();
   destination.generateMipmaps = true; destination.mipmapsAutoUpdate = true;
-  seed(f, source, payload('rgba8unorm'));
+  const entry = seed(f, source, payload('rgba8unorm'));
+  f.targets.render(entry, () => {}, {generateColorMipmaps: [0]});
   capture(f, source.texture, destination).issue();
   const labels = f.calls.submissions.map(batch => batch[0].label);
   assert.match(labels[0], /mip chain/); assert.equal(labels[1], 'f3d-target-to-storage-copy');

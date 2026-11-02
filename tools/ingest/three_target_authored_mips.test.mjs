@@ -92,11 +92,11 @@ test('capture freezes bounds and attachments while GPU contents are read at subm
   assert.deepEqual(f.commands[0].size, [2, 2, 2]); assert.equal(f.references, 0); assert.deepEqual(f.errors, []);
 });
 
-test('generated and unknown chains, cube mips and multisample destinations reject before scheduling', () => {
+test('generated and unknown chains, unproven cube mips and multisample destinations reject before scheduling', () => {
   for (const change of [
     ({destination}) => { destination.entry.shape.colors[0].generateMipmaps = true; },
     ({destination}) => { delete destination.entry.shape.colors[0].generateMipmaps; },
-    ({destination}) => { destination.entry.shape.cube = true; },
+    ({destination}) => { destination.entry.shape.cube = true; delete destination.entry.shape.colors[0].generateMipmaps; },
     ({destination}) => { destination.entry.shape.sampleCount = 4; },
   ]) {
     const value = setup(); change(value); value.f.renderer._preparing = true;

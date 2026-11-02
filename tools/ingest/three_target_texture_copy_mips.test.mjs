@@ -51,7 +51,7 @@ function fixture({source: sourceOptions, destination: destinationOptions, colorI
   const source = {isStorageTexture: true, alive: true};
   Object.defineProperty(source, 'image', {get() { throw error('CPU_READ'); }});
   const target = {alive: true, generation: 1, textures: []};
-  target.textures = Array.from({length: colorIndex + 1}, () => ({isRenderTargetTexture: true, renderTarget: target}));
+  target.textures = Array.from({length: colorIndex + 1}, () => ({isRenderTargetTexture: true, renderTarget: target, generateMipmaps}));
   const destination = target.textures[colorIndex];
   const entry = {generation: 1, shape: {...destinationShape, layers: destinationShape.depth,
     sampleCount: 1, cube: false, textures: target.textures.slice(),

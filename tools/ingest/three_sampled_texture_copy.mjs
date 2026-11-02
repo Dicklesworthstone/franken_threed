@@ -24,14 +24,17 @@ function captureDestination(renderer, texture, level) {
   const targets = renderer._targets, target = targets?.getTextureTarget(texture);
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target)
     fail('SOURCE', 'Expected a storage texture or target-owned color destination');
-  const entry = targets.capture(target);
+  let entry = targets.capture(target), colorIndex = entry.shape.textures.indexOf(texture);
+  if (colorIndex < 0 && entry.historyGroup)
+    ({entry, colorIndex} = targets.captureNativeTexture(texture, {sampled: false}));
   if (entry.shape.sampleCount !== 1) fail('SAMPLES', 'Sampled copies require a single-sample target destination');
-  const colorIndex = entry.shape.textures.indexOf(texture);
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   const color = entry.shape.colors[colorIndex];
+  const explicitMipmaps = !renderer._shaderEncodedOutput && (entry.historyGroup || entry.shape.textures.length > 1 ||
+    !entry.shape.cube && !entry.shape.array && !entry.shape.volume);
   // CubeCamera can toggle generation without changing the native allocation.
   // Capture this call's policy; authored faces share its six array layers.
-  const generateMipmaps = entry.shape.cube || !renderer._shaderEncodedOutput && entry.shape.textures.length > 1
+  const generateMipmaps = entry.shape.cube || explicitMipmaps
     ? texture.generateMipmaps : color.generateMipmaps;
   if (entry.shape.cube && generateMipmaps !== false)
     fail('LEVEL', 'Cube destinations require an authored, non-generated mip chain');
@@ -71,7 +74,7 @@ function captureDestination(renderer, texture, level) {
       }
     },
     withTexture: (run, validation) => targets.withNativeColorDestination(source, run, {validation,
-      generateMipmaps: entry.shape.textures.length > 1 && level === 0 && generateMipmaps === true}),
+      generateMipmaps: explicitMipmaps && level === 0 && generateMipmaps === true}),
     release: targets.retainGeneration(entry)};
 }
 

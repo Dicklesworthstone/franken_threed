@@ -12,19 +12,23 @@ function targetColor(renderer, texture, retain) {
   const target = targets.getTextureTarget(texture);
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target)
     fail('SOURCE', 'Expected target-owned color');
-  const entry = targets.capture(target), colorIndex = entry.shape.textures.indexOf(texture);
+  let entry = targets.capture(target), colorIndex = entry.shape.textures.indexOf(texture);
+  if (colorIndex < 0 && entry.historyGroup)
+    ({entry, colorIndex} = targets.captureNativeTexture(texture, {sampled: false}));
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   retain(entry);
+  const explicitMipmaps = !renderer._shaderEncodedOutput && (entry.historyGroup || entry.shape.textures.length > 1 ||
+    !entry.shape.cube && !entry.shape.array && !entry.shape.volume);
   // A raw copy addresses cube faces as native array layers. Never introduce
   // a cube sampler, source-face permutation, CPU upload or UV-flipped replica.
   const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1,
     viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension,
-    // CubeCamera and native MRT colors can change this flag while retaining
+    // CubeCamera and native 2D colors can change this flag while retaining
     // their allocation. Capture this call's policy independently of its mips.
-    ...(entry.shape.cube || !renderer._shaderEncodedOutput && entry.shape.textures.length > 1
+    ...(entry.shape.cube || explicitMipmaps
       ? {generateMipmaps: texture.generateMipmaps} : {})};
   const source = Object.freeze({entry, texture, device, depth: false, colorIndex});
-  return {entry, shape, source,
+  return {entry, shape, source, explicitMipmaps,
     check() {
       targets.assertCurrent(entry);
       if (entry.shape.textures[colorIndex] !== texture) fail('STALE', 'Captured color texture was replaced');
@@ -121,7 +125,7 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
           const commands = encoder.finish();
           destination.check(); storage.assertCurrent(source); checkRenderer(renderer, device);
           device.queue.submit([commands]);
-        }, {validation, generateMipmaps: destination.entry.shape.textures.length > 1 &&
+        }, {validation, generateMipmaps: destination.explicitMipmaps &&
           destinationLevel === 0 && destination.shape.generateMipmaps === true}));
         resolve(storage.validation);
         return true;
@@ -192,7 +196,7 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
               const commands = encoder.finish();
               checkRenderer(renderer, device); source.check(); destination.check();
               device.queue.submit([commands]);
-            }, {validation, generateMipmaps: destination.entry.shape.textures.length > 1 &&
+            }, {validation, generateMipmaps: destination.explicitMipmaps &&
               destinationLevel === 0 && destination.shape.generateMipmaps === true}));
           // Snapshot after the source borrow (including generated source mips),
           // before a subsequent reverse copy can depend on this destination.
