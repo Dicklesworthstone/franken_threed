@@ -1,4 +1,4 @@
-/** Source sampled pixels -> shared storage or native target color.
+/** Source sampled pixels -> sampled, shared storage or native target color.
  * Capture with the existing sampled owner; borrow its native residency only at the renderer's FIFO slot.
  * This layer neither uploads pixels nor changes the source texture/CPU array.
  */
@@ -8,7 +8,7 @@ const EMPTY = Symbol('empty sampled copy');
 
 /** Raw destination capture deliberately does not use sampled target bindings:
  * copying float32 color must not require a filtering feature or a UV replica. */
-function captureDestination(renderer, texture, level) {
+function captureDestination(renderer, texture, level, inputs) {
   const device = renderer._device;
   if (texture?.isStorageTexture === true) {
     const storage = renderer._storageTextures;
@@ -20,6 +20,17 @@ function captureDestination(renderer, texture, level) {
       check: () => storage.assertCurrent(entry),
       preflight: () => storage.validateAllocations([entry]),
       withTexture: (run, validation) => storage.withTexture(entry, run, write, {validation})};
+  }
+  if (texture?.isTexture === true && !texture.isRenderTargetTexture && !texture.isDepthTexture && !texture.isFramebufferTexture) {
+    if (renderer.isWebGPURenderer !== true || renderer._shaderEncodedOutput === true)
+      fail('ROUTE', 'Ordinary sampled copy destinations require the native WebGPU renderer surface');
+    const lease = inputs.captureCopyDestination(texture, level);
+    try {
+      return {lease, shape: inputs.copyShape(lease),
+        check: () => inputs.validateDispatch([lease]),
+        preflight: source => inputs.validateCopyAllocations([source, lease]),
+        release: () => inputs.release(lease)};
+    } catch (error) { inputs.release(lease); throw error; }
   }
   const targets = renderer._targets, target = targets?.getTextureTarget(texture);
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target)
@@ -113,20 +124,36 @@ export function copySampledTexture(renderer, sourceTexture, destinationTexture,
     // descriptor must not become the baseline for later partial source uploads.
     inputs.captureDispatch(() => {
       check();
-      destination = captureDestination(renderer, destinationTexture, destinationLevel);
+      destination = captureDestination(renderer, destinationTexture, destinationLevel, inputs);
       lease = inputs.captureBinding({texture: sourceTexture, isSampledTexture: true});
-      const plan = inspectStorageTextureCopy(inputs.copyShape(lease), destination.shape,
-        region, position, sourceLevel, destinationLevel);
+      const sourceShape = inputs.copyShape(lease);
+      if (destination.lease && (sourceShape.viewDimension !== '2d' || sourceLevel !== 0))
+        fail('SOURCE', 'Ordinary sampled destinations require a base-level 2D source');
+      const plan = inspectStorageTextureCopy(sourceShape, destination.shape,
+        region, position, sourceLevel, destinationLevel,
+        destination.lease ? inputs.sameTexture(lease, destination.lease) : false);
       // Roll back a no-op too: its never-uploaded pixels are not a new history.
       if (plan.empty) throw EMPTY;
-      const ready = inputs.preparation([lease]);
+      const ready = inputs.preparation(destination.lease ? [lease, destination.lease] : [lease]);
       signal?.addEventListener('abort', abort, {once: true});
       check();
       const submit = () => {
         try {
           check(); destination.check(); inputs.validateDispatch([lease]);
           // Check destination budgets before a source upload can issue effects.
-          destination.preflight();
+          destination.preflight(lease);
+          const encode = (nativeSource, nativeDestination) => {
+            const encoder = device.createCommandEncoder({label: 'f3d-sampled-texture-copy'});
+            encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
+              {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
+            const commands = encoder.finish();
+            check(); destination.check(); inputs.validateDispatch([lease]);
+            device.queue.submit([commands]);
+          };
+          if (destination.lease) {
+            inputs.copyTextures(lease, destination.lease, encode);
+            return;
+          }
           inputs.withTexture(lease, nativeSource => {
             check(); destination.check();
             // Snapshot earlier validation BEFORE entering the destination scope.
@@ -134,12 +161,7 @@ export function copySampledTexture(renderer, sourceTexture, destinationTexture,
             // and make the destination's validation depend on itself.
             const validation = inputs.whenIdle(); validation.catch(() => {});
             destination.withTexture(nativeDestination => {
-              const encoder = device.createCommandEncoder({label: 'f3d-sampled-texture-copy'});
-              encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
-                {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
-              const commands = encoder.finish();
-              check(); destination.check(); inputs.validateDispatch([lease]);
-              device.queue.submit([commands]);
+              encode(nativeSource, nativeDestination);
             }, validation);
           });
         } finally { release(); }

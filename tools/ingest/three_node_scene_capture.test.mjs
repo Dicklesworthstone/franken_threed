@@ -860,6 +860,25 @@ test('ordinary AO-only materials keep their existing fixed rendering profile', t
   }
 });
 
+test('ready ordinary 2D maps select the native sampled owner on their first compile and retain companion history', t => {
+  const f = rig(t), map = new THREE.DataTexture(new Uint8Array(16).fill(128), 2, 2);
+  map.needsUpdate = true; f.renderer.isWebGPURenderer = true;
+  f.renderer.backend.utils = {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})};
+  const material = new THREE.MeshBasicMaterial({map}), painted = f.mesh(material), companion = f.mesh(new THREE.MeshBasicMaterial());
+  const first = f.capture({uniforms: false, getTextures: () => ({captureDispatch: run => run()})});
+  assert.deepEqual(new Set(first.bindings.map(binding => binding.object)), new Set([painted, companion]));
+  assert.equal(material.map, map); assert.equal(material.isNodeMaterial, undefined);
+  material.map = null;
+  const second = f.capture({uniforms: false});
+  assert.deepEqual(new Set(second.bindings.map(binding => binding.object)), new Set([painted, companion]));
+  const gl = rig(t); gl.renderer.isWebGPURenderer = true; gl.renderer._shaderEncodedOutput = true;
+  gl.mesh(new THREE.MeshBasicMaterial({map}));
+  assert.equal(gl.capture({uniforms: false, getPrograms() { assert.fail('WebGL maps retain their existing owner'); }}), null);
+  const untextured = rig(t); untextured.renderer.isWebGPURenderer = true;
+  untextured.mesh(new THREE.MeshBasicMaterial());
+  assert.equal(untextured.capture({uniforms: false, getPrograms() { assert.fail('Untextured fixed path stays lazy'); }}), null);
+});
+
 for (const Material of [THREE.MeshBasicMaterial, THREE.MeshPhysicalMaterial])
 test(`ordinary ${Material.name} lightMap selects native capture and shares shadow ownership`, t => {
   for (const shadows of [false, true]) {

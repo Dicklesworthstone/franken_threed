@@ -28,6 +28,7 @@ function fixture(options = {}) {
   const shape = {width: 8, height: 8, layers: 1, mipLevelCount: 4,
     format: 'rgba8unorm', viewDimension: '2d', generateMipmaps: false,
     sampleCount: 1, cube: false, depthFormat: null, depthLayers: 1, depthArray: false, ...options};
+  destination.generateMipmaps = shape.generateMipmaps;
   const nativeDestination = {target};
   const device = {
     limits: {maxTextureDimension2D: 8192, maxTextureDimension3D: 2048, maxTextureArrayLayers: 256},
@@ -180,6 +181,7 @@ test('cube face bounds and full allocation layer limits reject before source upl
 
 test('cube policy follows the current public flag and remains captured through the FIFO', async () => {
   const f = fixture({cube: true, viewDimension: 'cube', layers: 6, generateMipmaps: true});
+  f.destination.generateMipmaps = false;
   f.renderer._preparing = true;
   f.copy(null, point(0, 0, 5)); // Public false overrides the earlier descriptor's true.
   f.destination.generateMipmaps = true;

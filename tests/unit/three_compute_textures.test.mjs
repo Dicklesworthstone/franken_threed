@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {withThreeCompute} from '../../tools/ingest/three_compute.mjs';
 import {createGpuCompute} from '../../tools/ingest/gpu_compute.mjs';
+import {copyFixtures} from '../../tools/ingest/three_sampled_copy_fixtures.mjs';
 import {THREE, gpu, deferred} from './storage_texture_fixture.mjs';
 
 const write = texture => ({texture, isSampler: true, isSampledTexture: true, store: true, access: 'writeOnly', mipLevel: 0});
@@ -63,7 +64,7 @@ function setup(options = {}) {
       this._pending = [];
     }
   }
-  const Renderer = withThreeCompute(Base, {...THREE, WGSLNodeBuilder: Builder, TSL: {context: () => ({isContextNode: true})}});
+  const Renderer = withThreeCompute(Base, {...THREE, ...options.three, WGSLNodeBuilder: Builder, TSL: {context: () => ({isContextNode: true})}});
   return {renderer: new Renderer(), device, builders};
 }
 function block(renderer) {
@@ -168,6 +169,34 @@ test('texture samplers and dispatch sizes are captured while earlier rendering p
   assert.equal(bound[1].entries[0].resource.descriptor.magFilter, 'nearest');
   assert.deepEqual(device.calls.filter(c => c[0] === 'dispatch'), [['dispatch',1,2,1],['dispatch',2,1,1]]);
   renderer.dispose();
+});
+
+test('compute retains a copied texture sampler binding while a new kernel observes live parameters', async t => {
+  const {T} = copyFixtures(), {renderer, device} = setup({three: T});
+  t.after(() => renderer.dispose());
+  device.queue.writeTexture = (...args) => device.calls.push(['textureUpload', ...args]);
+  const encoder = device.createCommandEncoder.bind(device);
+  device.createCommandEncoder = () => Object.assign(encoder(), {
+    copyTextureToTexture: (...args) => device.calls.push(['textureCopy', ...args]),
+  });
+  const destination = new T.DataTexture(new Uint8Array(16).fill(10), 2, 2);
+  const source = new T.DataTexture(new Uint8Array(4).fill(20), 1, 1);
+  const binding = {isSampler: true, texture: destination}, kernel = node([binding, sample(destination)]);
+  renderer.compute(kernel);
+  const first = groups(device)[0].entries[0].resource;
+  assert.equal(first.descriptor.minFilter, 'nearest');
+  destination.minFilter = T.LinearFilter;
+  renderer.copyTextureToTexture(source, destination);
+  renderer.compute(kernel);
+  assert.equal(groups(device)[1].entries[0].resource, first,
+    'the same compute sampler binding retains its accepted parameters across the first copy');
+  renderer.compute(node([{isSampler: true, texture: destination}, sample(destination)]));
+  assert.equal(groups(device)[2].entries[0].resource.descriptor.minFilter, 'linear',
+    'a new kernel sampler binding observes the unrequested live sampler edit');
+  destination.needsUpdate = true;
+  renderer.compute(kernel);
+  assert.equal(groups(device)[3].entries[0].resource.descriptor.minFilter, 'linear');
+  await renderer.waitForGPU();
 });
 
 test('write-to-sample dependency in separate kernels uses the same native allocation', () => {

@@ -306,6 +306,7 @@ function createThreeCompute(renderer, three) {
     const texture = binding.textureNode ? binding.textureNode.value : binding.texture;
     return {texture,
       isSampler: binding.isSampler, isSampledTexture: binding.isSampledTexture,
+      samplerIdentity: binding.isSampler && !binding.isSampledTexture ? binding : null,
       comparison: texture?.isDepthTexture === true && texture.compareFunction !== null &&
         binding.textureNode?.isSampleCompare?.() === true && renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE),
       store: binding.store, access: binding.access, mipLevel: binding.mipLevel};

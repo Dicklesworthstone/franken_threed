@@ -280,12 +280,15 @@ function textureInspector(T,{
     const filterable=!integral&&(bpc!==4||float32Filterable);
     if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
-    const capturedImages=new WeakSet();
+    const capturedImages=new WeakSet(),pendingImages=new WeakSet();let imagesPending=false;
     const unwrap=image=>{
       const capturedMedia=nativeMedia?mediaSnapshots?.get(image):null;
       if(capturedMedia?.image){image=capturedMedia.image;capturedImages.add(image);}
       const captured=imageSnapshots?.get(image);
-      if(captured){image=captured;capturedImages.add(image);}
+      if(captured){
+        if(captured===image){pendingImages.add(image);imagesPending=true;}
+        image=captured;capturedImages.add(image);
+      }
       if(!cube)return image;
       if(data){
         if(typeof T.DataTexture!=='function'||!(image instanceof T.DataTexture)||image.isDataTexture!==true)
@@ -330,7 +333,7 @@ function textureInspector(T,{
     for(const {image,level} of uploads){
       if(!data){
         const bitmap=instance(image,'ImageBitmap');
-        if(!(video||bitmap||instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
+        if(!(video||bitmap||pendingImages.has(image)||instance(image,'HTMLImageElement')||instance(image,'HTMLCanvasElement')||instance(image,'OffscreenCanvas')||instance(image,'ImageData')))
           fail('SOURCE','Use decoded images, ImageBitmaps, canvases or ImageData');
         // r186 WebGLTextures skips UNPACK_FLIP_Y/PREMULTIPLY for ImageBitmaps (their
         // decode options already decided both) while WebGPUTextureUtils applies them.
@@ -355,7 +358,7 @@ function textureInspector(T,{
     }
     const images=uploads.map(entry=>entry.image);
     if(!Array.isArray(t.updateRanges))fail('RANGE','Expected source update ranges');
-    if(t.updateRanges.length){
+    if(t.updateRanges.length&&!(nativeMedia&&data&&!layered&&!cube)){
       if(integral||cube||layered||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
       for(const r of t.updateRanges){
         integer(r.start,0,width*height*4,'range start');integer(r.count,0,width*height*4-r.start,'range count');
@@ -380,7 +383,8 @@ function textureInspector(T,{
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
-    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
+    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,
+      native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
@@ -396,7 +400,7 @@ export function createGpuThreeTextures(device,{
   integer(maxPixels,1,Number.MAX_SAFE_INTEGER,'pixel capacity');if(typeof label!=='string')fail('VALUE','Expected a label');
   const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,mediaSnapshots,nativeCube,nativeMedia,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
-  const records=new Map(),sources=new Map(),pipelines=new Map();
+  const records=new Map(),sources=new Map(),pipelines=new Map(),samplers=new Map();
   let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
   const stopped=new Promise((_,reject)=>{rejectStop=reject;});stopped.catch(()=>{});
   const stats={allocations:0,uploads:0,writeCalls:0,externalCopies:0,mipPasses:0};
@@ -406,7 +410,7 @@ export function createGpuThreeTextures(device,{
       if(sources.get(a.source)?.size===0)sources.delete(a.source);}}
   function release(){for(const t of [...records.keys()])drop(t);
     for(const variants of sources.values())for(const r of variants.values())r.texture.destroy();
-    sources.clear();textureBytes=0;pipelines.clear();mipSampler=null;}
+    sources.clear();textureBytes=0;pipelines.clear();samplers.clear();mipSampler=null;}
   function stop(error){if(!terminal){terminal=error;release();rejectStop(error);}return terminal;}
   function native(fn){try{return fn();}catch(error){throw stop(error);}}
   function checked(fn){
@@ -417,9 +421,35 @@ export function createGpuThreeTextures(device,{
       pending=Promise.all([pending,checked]).then(()=>{});pending.catch(()=>{});
     }
   }
+  function samplerFor(descriptor){
+    const key=JSON.stringify(descriptor);let sampler=samplers.get(key);
+    if(!sampler){
+      sampler=native(()=>device.createSampler(descriptor));
+      // Existing bindings keep their sampler alive; the lookup cache itself
+      // stays bounded when an application repeatedly edits sampler controls.
+      if(samplers.size>=maxTextures)samplers.delete(samplers.keys().next().value);
+      samplers.set(key,sampler);
+    }
+    return sampler;
+  }
   function plans(input,{initialize=false}={}){
     live();const list=[];for(const t of input){if(list.length>=maxTextures)fail('LIMIT','Requested texture count exceeds capacity');list.push(t);}
     return [...new Set(list)].map(t=>({t,d:describe(t,{initialize:initialize||records.has(t)})}));
+  }
+  function validatePlans(list){
+    let addedBytes=0,addedCount=0;const newKeys=new Map();
+    for(const {t,d} of list){
+      if(d.imagesPending)fail('NOT_READY','Captured source image is still preparing');
+      if(d.video&&!d.nativeMedia&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
+      if(!d.data&&typeof device.queue.copyExternalImageToTexture!=='function')
+        fail('DEVICE','External source uploads require GPUQueue.copyExternalImageToTexture');
+      if(!records.has(t))addedCount++;
+      if(!sources.get(d.source)?.has(d.key)){
+        let keys=newKeys.get(d.source);if(!keys)newKeys.set(d.source,keys=new Set());
+        if(!keys.has(d.key)){keys.add(d.key);addedBytes+=d.bytes;}
+      }
+    }
+    if(records.size+addedCount>maxTextures||textureBytes+addedBytes>maxTextureBytes)fail('LIMIT','Aggregate texture residency budget exceeded');
   }
   function match(t,d){const r=records.get(t);return r&&r.resource.source===d.source&&r.resource.key===d.key?r:null;}
   function ranges(t,width){
@@ -496,7 +526,7 @@ export function createGpuThreeTextures(device,{
           }else{
             native(()=>device.queue.writeTexture({texture:a.texture},src,{bytesPerRow:pitch,rowsPerImage:d.height},[d.width,d.height,d.layers]));stats.writeCalls++;
           }
-        }else if(t.updateRanges.length){
+        }else if(t.updateRanges.length&&!d.native2DData){
           const rowBytes=d.width*4,pitch=Math.ceil(rowBytes/d.alignment)*d.alignment;
           for(const range of ranges(t,d.width)){
             const pixel=Math.floor(range.start/4),x=pixel%d.width,y=Math.floor(pixel/d.width),width=Math.ceil(range.count/4);
@@ -533,24 +563,27 @@ export function createGpuThreeTextures(device,{
   // initialize:true reserves ready storage for a version-zero source without
   // uploading its CPU bytes or mutating source versions. Built-in BatchedMesh
   // requests its first indirect upload inside onBeforeRender, after preparation.
-  function prepare(input,{initialize=false}={}){
+  function prepare(input,{initialize=false,copyFrom=null,copyOnly=false}={}){
     if(typeof initialize!=='boolean')fail('OPTIONS','initialize must be boolean');
     const list=plans(input,{initialize});if(busy)fail('REENTRANT','Cannot prepare during a texture operation');busy=true;
     try{
-      let addedBytes=0,addedCount=0;const newKeys=new Map();
-      for(const {t,d} of list){
-        if(d.video&&!d.nativeMedia&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
-        if(!d.data&&typeof device.queue.copyExternalImageToTexture!=='function')
-          fail('DEVICE','External source uploads require GPUQueue.copyExternalImageToTexture');
-        if(!records.has(t))addedCount++;
-        if(!sources.get(d.source)?.has(d.key)){
-          let keys=newKeys.get(d.source);if(!keys)newKeys.set(d.source,keys=new Set());
-          if(!keys.has(d.key)){keys.add(d.key);addedBytes+=d.bytes;}
-        }
-      }
-      if(records.size+addedCount>maxTextures||textureBytes+addedBytes>maxTextureBytes)fail('LIMIT','Aggregate texture residency budget exceeded');
+      // Immutable sampled versions normally start from their captured CPU
+      // pixels. A copied destination instead preserves its preceding GPU
+      // content when detaching a shared allocation or applying a partial host
+      // update. This seed is issued once, before the existing uploader runs.
+      let seed=null;
+      if(copyFrom!==null){
+        if(list.length!==1)fail('OPTIONS','A GPU seed requires exactly one sampled destination');
+        seed=check(copyFrom);
+        const d=list[0].d,s=seed.d;
+        if(d.viewDimension!=='2d'||s.viewDimension!=='2d'||d.levels!==1||s.levels!==1||
+          d.width!==s.width||d.height!==s.height||d.format!==s.format)
+          fail('COPY','Sampled GPU seeds require matching base-level 2D storage');
+        if(d.source===s.source&&d.key===s.key)fail('COPY','A sampled GPU seed requires independent storage');
+      }else if(copyOnly)fail('OPTIONS','A copy-only initialization requires a GPU seed');
+      validatePlans(list);
       if(list.length)checked(()=>{for(const {t,d} of list){
-        let r=match(t,d);
+        let r=match(t,d),created=false;
         if(!r){
           let resource=sources.get(d.source)?.get(d.key);
           if(!resource){
@@ -562,15 +595,23 @@ export function createGpuThreeTextures(device,{
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;
-            try{resource.view=native(()=>texture.createView({format:d.viewFormat,...(d.cube||d.layered?{dimension:d.viewDimension}:{})}));resource.sampler=native(()=>device.createSampler(d.sampler));}
+            try{resource.view=native(()=>texture.createView({format:d.viewFormat,...(d.cube||d.layered?{dimension:d.viewDimension}:{})}));resource.sampler=samplerFor(d.sampler);}
             catch(e){texture.destroy();keys.delete(d.key);textureBytes=Math.max(0,textureBytes-d.bytes);throw e;}
             stats.allocations++;
+            created=true;
           }
           resource.refs++;drop(t);
           r={resource,version:-1,listener:()=>{if(busy)fail('REENTRANT','Cannot dispose source during upload');drop(t);}};
           records.set(t,r);t.addEventListener('dispose',r.listener);
         }
-        upload(t,r,d);
+        if(seed&&created){
+          const encoder=native(()=>device.createCommandEncoder({label:label+'/preserve-copy'}));
+          native(()=>encoder.copyTextureToTexture({texture:seed.r.resource.texture,origin:[0,0,0]},
+            {texture:r.resource.texture,origin:[0,0,0]},[d.width,d.height,1]));
+          native(()=>device.queue.submit([encoder.finish()]));
+          if(copyOnly){r.resource.sourceVersion=t.source.version;r.version=t.version;}
+        }
+        if(!copyOnly)upload(t,r,d);
       }});
       return api;
     }finally{busy=false;}
@@ -584,9 +625,28 @@ export function createGpuThreeTextures(device,{
     busy=true;try{if(list.length)checked(()=>{for(const {t,d} of list)upload(t,match(t,d),d);});return api;}finally{busy=false;}
   }
   const api=Object.freeze({prepare,update,binding,inspect:describe,
+    sampler(descriptor){live();return samplers.get(JSON.stringify(descriptor))??checked(()=>samplerFor(descriptor));},
+    validatePreparation(input){validatePlans(plans(input));},
     // Borrowed native storage, for consumers such as the background renderer.
     // The pool remains its sole owner; callers must not destroy this texture.
     nativeTexture(t){return check(t).r.resource.texture;},
+    // The caller has already prepared both copy endpoints. Keep the submitted
+    // write in this owner's native validation and completion history.
+    writeTexture(t,run,{validation=null}={}){
+      live();if(busy)fail('REENTRANT','Cannot write during a texture operation');
+      if(typeof run!=='function')fail('OPTIONS','Expected a synchronous native texture write');
+      const {r,d}=check(t);if(d.viewDimension!=='2d'||d.levels!==1)
+        fail('COPY','Sampled writes require base-level 2D storage');
+      busy=true;
+      try{return checked(()=>{
+        const value=run(r.resource.texture);
+        if(value?.then){Promise.resolve(value).catch(()=>{});fail('OPTIONS','Native sampled writes cannot cross an await');}
+        live();return value;
+      });}finally{
+        busy=false;
+        if(validation){pending=Promise.all([pending,validation]).then(()=>{}).catch(error=>{throw stop(error);});pending.catch(()=>{});}
+      }
+    },
     retain(input){live();if(busy)fail('REENTRANT','Cannot evict during upload');const keep=new Set(input);for(const t of [...records.keys()])if(!keep.has(t))drop(t);},
     get disposed(){return disposed;},get failed(){return terminal!==null;},
     get diagnostics(){return Object.freeze({...stats,textureBytes,textures:records.size,resources:[...sources.values()].reduce((n,m)=>n+m.size,0)});},

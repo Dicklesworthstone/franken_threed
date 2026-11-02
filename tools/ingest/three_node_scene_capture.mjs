@@ -3,7 +3,7 @@
  * Pipeline preparation consumes these packets later and never repeats updates.
  * Geometry bytes still follow the bridge's existing upload/version contract.
  */
-import {hasThreeNodeProgram, hasThreeNativeMedia, ThreeNodeProgramError} from './three_node_program.mjs';
+import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
 import {inspectThreeLightingContext, inspectThreeNativeCamera} from './three_node_passes.mjs';
@@ -16,6 +16,8 @@ const integer = value => Number.isSafeInteger(value) && value >= 0;
 const transmissive = material => material.transmission > 0 || material.transmissionNode?.isNode === true;
 const transparent = material => material.transparent === true || transmissive(material) || material.backdropNode?.isNode === true;
 const environmentMaterialHistory = new WeakMap();
+const sampledTextureMaterialHistory = new WeakMap();
+const sampledTextureSceneHistory = new WeakMap();
 const hookSceneHistory = new WeakMap();
 const hookAttributeHistory = new WeakMap();
 const fixedAttributeHistory = new WeakMap();
@@ -59,9 +61,30 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Capture ordinary companions through the same owner instead of sorting a
   // partial native list and replaying callbacks when fixed draws are merged.
   const customSort = sortObjects && !!(opaqueSort || transparentSort);
+  const sampledMaterialFeatures = material => {
+    if (sampledTextureMaterialHistory.get(renderer)?.has(material)) return true;
+    if (renderer?.isWebGPURenderer !== true || renderer._shaderEncodedOutput === true) return false;
+    const copied = renderer?._sampledTextureInputs?.isCopyDestination;
+    const sampled2D = texture => copied?.(texture) || texture?.isTexture === true &&
+      !texture.isRenderTargetTexture && !texture.isStorageTexture && !texture.isDepthTexture &&
+      !texture.isFramebufferTexture && !texture.isExternalTexture && !texture.isVideoTexture &&
+      !texture.isCubeTexture && !texture.isDataArrayTexture && !texture.isData3DTexture && !texture.isCompressedTexture &&
+      texture.version > 0 && texture.source?.dataReady === true && texture.image?.complete !== false &&
+      (texture.image?.naturalWidth ?? texture.image?.width) > 0 &&
+      (texture.image?.naturalHeight ?? texture.image?.height) > 0;
+    if (!hasThreeNativeTexture(material, sampled2D)) return false;
+    // Keep ordinary 2D maps on the native sampled owner from their first draw.
+    // A later copy must preserve already uploaded pixels even if CPU image or
+    // Source identities changed without needsUpdate; a second fixed upload
+    // owner could not recover that history. Removing a map retains this path.
+    let retained = sampledTextureMaterialHistory.get(renderer);
+    if (!retained) sampledTextureMaterialHistory.set(renderer, retained = new WeakSet());
+    retained.add(material); return true;
+  };
   // Removing an admitted environment must keep the same source lighting and
   // deformation path. The fixed shader has different rounding/normal behavior.
-  const nativeMaterialFeatures = material => nativeFeatures(material) || environmentMaterialHistory.get(renderer)?.has(material);
+  const nativeMaterialFeatures = material => nativeFeatures(material) ||
+    environmentMaterialHistory.get(renderer)?.has(material) || sampledMaterialFeatures(material);
   // The facade supplies its source controls. Standalone capture callers retain
   // the complete-list default; each control is observed at its source phase.
   const listEnabled = key => renderLists === null || renderLists[key] === true;
@@ -207,6 +230,17 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeGeometryScene = [...hierarchy.keys()].some(object => visibility.get(object) &&
     object.layers.test(camera.layers) && (Array.isArray(object.material) ? object.material : [object.material])
       .some(material => material?.visible !== false && material?.geometryNode != null));
+  // Keep ordinary companions on the same captured attribute owner when 2D
+  // maps select native sampling, including aliases that retain their pixels.
+  const nativeSampledTextureScene = sampledTextureSceneHistory.get(renderer)?.has(root) === true ||
+    [...hierarchy.keys()].some(object => visibility.get(object) && object.layers.test(camera.layers) &&
+      (Array.isArray(object.material) ? object.material : [object.material]).some(material =>
+        material?.visible !== false && sampledMaterialFeatures(material)));
+  if (nativeSampledTextureScene && renderer) {
+    let scenes = sampledTextureSceneHistory.get(renderer);
+    if (!scenes) sampledTextureSceneHistory.set(renderer, scenes = new WeakSet());
+    scenes.add(root);
+  }
   // Occlusion results are read during source callbacks. Capture the complete
   // ordered scene so tested and ordinary companions share that boundary.
   let nativeOcclusionScene = false;
@@ -265,7 +299,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
-  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeOcclusionScene || nativeHookScene
+  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeSampledTextureScene || nativeOcclusionScene || nativeHookScene
     ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -871,7 +905,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         for (const binding of draw.nodeTextures) textureUses.push(resources.textureOwner.retain(binding.lease));
       } else if (reuseResources) {
         textureOwner ??= draw.bundleTextureOwner; storageOwner ??= draw.bundleStorageOwner;
-        for (const binding of draw.nodeTextures) textureUses.push(textureOwner.retain(binding.lease));
+        // Source GPU copies change the already-bound texture contents even
+        // when a static bundle skips ordinary resource updates. Immutable
+        // copied versions retain that accepted residency without rereading CPU
+        // requests, replacement nodes or the bundle's frozen sampler state.
+        draw.nodeTextures = Object.freeze(draw.nodeTextures.map(binding => {
+          const lease = textureOwner.captureShared?.(binding.lease, {copiesOnly: true}) ??
+            textureOwner.retain(binding.lease);
+          textureUses.push(lease);
+          return lease === binding.lease ? binding : Object.freeze({...binding, lease});
+        }));
       } else {
       draw.nodeVertexStorage = Object.freeze(vertexStorageUses.slice(vertexStart));
       draw.nodeTextures = Object.freeze(captured.textures.map(binding => {

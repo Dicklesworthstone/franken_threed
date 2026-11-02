@@ -57,7 +57,7 @@ export function withStorageTextureCopies(Base) {
         const copy = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
         request = {issue: () => { owner.copy(copy); }};
       } else if (source?.isTexture && !source.isStorageTexture && !source.isRenderTargetTexture &&
-          (destination?.isStorageTexture || destination?.isRenderTargetTexture)) {
+          (destination?.isStorageTexture || destination?.isRenderTargetTexture || destination?.isTexture)) {
         copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
         this.inspector?.copyTextureToTexture?.(source, destination);
         return;

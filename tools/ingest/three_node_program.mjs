@@ -97,9 +97,15 @@ export function hasThreeNodeProgram(material) {
 
 /** Built-in media maps need the same immutable queued frames as authored nodes. */
 export function hasThreeNativeMedia(material) {
+  return hasThreeNativeTexture(material, texture => texture?.isVideoTexture === true || texture?.isVideoFrameTexture === true);
+}
+
+/** Test only the source material's admitted map slots, without traversing
+ * arbitrary user properties or requiring an authored NodeMaterial slot. */
+export function hasThreeNativeTexture(material, matches) {
   if (material?.isMaterial !== true) return false;
   for (const slot of MATERIAL_MAPS)
-    if (material[slot]?.isVideoTexture === true || material[slot]?.isVideoFrameTexture === true) return true;
+    if (matches(material[slot])) return true;
   return false;
 }
 
@@ -838,7 +844,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const property of reference.properties) value = value?.[property];
     return value;
   }
-  function textureSignature(nodes, references = null) {
+  function textureSignature(nodes, references = null, filtering = null) {
     const aliases = new Map(), checked = new Map();
     return JSON.stringify(nodes.map(node => {
       const texture = references ? textureValue(node, references) : node.value;
@@ -878,14 +884,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         texture.isDepthTexture === true, texture.isDepthTexture === true ? texture.compareFunction : null,
         node.isSampleCompare?.() === true, texture.isDepthTexture === true && texture.compareFunction !== null
           ? renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE) : null,
-        texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter,
+        filtering?.has(texture) ? filtering.get(texture) :
+          texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter,
         node.sampler, node.updateMatrix, node.groupNode?.name];
     }));
   }
-  function materialMapSignature(material) {
+  function materialMapSignature(material, filtering = null) {
     const maps = [...MATERIAL_MAPS].filter(key => material[key]?.isTexture);
     return JSON.stringify([maps, material.normalMapType,
-      textureSignature(maps.map(key => ({value: material[key]})))]);
+      textureSignature(maps.map(key => ({value: material[key]})), null, filtering)]);
   }
   // Sprite shader construction branches on attenuation and the presence of
   // an anchor reference. Values of center/rotation/scale stay live uniforms.
@@ -1175,7 +1182,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -1191,7 +1198,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
       camera?.isPerspectiveCamera === true, object.receiveShadow === true,
       camera?.isArrayCamera === true ? [camera.id, camera.cameras.length] : null,
-      instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material),
+      instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material, filtering),
       inspectThreePipelineContext(three, renderer, material, object, effects),
       inspectThreeLightingContext(three, renderer.contextNode),
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
@@ -1259,8 +1266,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (sameGraph && preparedMaterial.envNode?.isTextureNode && preparedMaterial.envMap !== environment && mapping !== environment?.mapping)
         fail('ENVIRONMENT_CACHE', 'Pinned texture envNode mapping changes require replacing the environment node or disposing the material');
     }
-    if (previous?.key === key && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
-        textureSignature(previous.textureNodes, previous.textureReferences) === previous.textureSignature &&
+    // r186 RenderObjects only rechecks a texture's sampler-dependent shader
+    // key when the material/program is invalidated. Texture uploads, disposal
+    // and BundleGroup invalidation alone retain the constructed textureLoad or
+    // textureSample path. Normalize that one construction choice while all
+    // physical layouts, aliases, graph fields and source material versions
+    // continue through their existing admission and cache checks.
+    const filtering = previousState?.materialVersion === material.version ? previousState.textureFiltering : null;
+    const reuseKey = filtering && previous.key !== key ? keyOf(preparedMaterial, object, context, lights, environment,
+      instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering) : key;
+    if (previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
+        textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
         attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) {
@@ -1494,6 +1510,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureReferences.set(node.node.getBase(), {material: node.material ?? material, properties: node.properties.slice()});
     const textureNodes = [...graphNodes].filter(node => node.isTextureNode && boundTextures.has(node.value));
     const signature = textureSignature(textureNodes, textureReferences);
+    const textureFiltering = new WeakMap();
+    for (const texture of [...textureNodes.map(node => textureValue(node, textureReferences)),
+      ...[...MATERIAL_MAPS].map(key => material[key])]) if (texture?.isTexture === true)
+      textureFiltering.set(texture, texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter);
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
     const uniformNodes = [...graphNodes].filter(nativeUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
@@ -1525,7 +1545,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       storageTextures: textureNodes.some(node => node.isStorageTextureNode),
-      textureNodes, textureReferences, textureSignature: signature, materialMapSignature: materialMapSignature(material),
+      textureNodes, textureReferences, textureFiltering, materialVersion: material.version,
+      textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
     // Source geometry constructors may add named storage attributes. Adopt
@@ -1742,7 +1763,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const [node, light] of state.shadowGraphs.roots) inspectThreeNativeShadowGraph(three, node, light);
   }
   function checkMaterialMaps(state) {
-    if (materialMapSignature(state.material) !== state.materialMapSignature)
+    const filtering = state.materialVersion === state.material.version ? state.textureFiltering : null;
+    if (materialMapSignature(state.material, filtering) !== state.materialMapSignature)
       fail('CHANGED', 'Native material map slots, layout, normal mode or aliases changed; compile the graph again');
   }
   function readTextures(state, liveReferences = false) {
@@ -1751,7 +1773,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // capture uses the values produced by the actual NodeFrame update order;
     // a later application callback may already have edited the public map.
     const references = liveReferences ? state.textureReferences : null;
-    if (textureSignature(state.textureNodes, references) !== state.textureSignature)
+    const filtering = state.materialVersion === state.material.version ? state.textureFiltering : null;
+    if (textureSignature(state.textureNodes, references, filtering) !== state.textureSignature)
       fail('CHANGED', 'Native node texture layout, UV channel or binding aliases changed; compile the graph again');
     const textures = [];
     for (const [group, source] of state.bindings.entries()) for (const [binding, value] of source.bindings.entries())
@@ -1760,6 +1783,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (value.store) storageTextureLayout(value.textureNode, texture, value.mipLevel);
         textures.push(Object.freeze({group, binding, texture,
         isSampler: value.isSampler === true, isSampledTexture: value.isSampledTexture === true,
+        samplerIdentity: value.isSampler && !value.isSampledTexture ? value : null,
         comparison: comparison(value.textureNode, texture),
         store: value.store === true, access: value.store === true ? value.access : null,
         mipLevel: value.store === true ? value.mipLevel : 0}));

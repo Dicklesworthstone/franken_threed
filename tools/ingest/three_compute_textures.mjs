@@ -34,6 +34,10 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   if (!storage || typeof poolFactory !== 'function' || !positive(maxTextures) || !positive(maxSnapshotBytes))
     fail('OPTIONS', 'Expected storage, source texture pool and positive texture budgets');
   const current = new Map(), records = new Set(), watches = new Map(), sources = new Map(), histories = new Map();
+  // GPU writes belong to a Texture, even when another Texture shares its CPU
+  // Source. Immutable read-only payloads can still share their existing owner.
+  const copyDestinations = new WeakSet();
+  const samplerHistories = new WeakMap();
   const leases = new WeakSet(), imageSnapshots = new WeakMap(), mediaSnapshots = new WeakMap();
   let captureState = null;
   let targetInputs = null;
@@ -59,7 +63,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
   const sourcePool = () => { live(); return pool ??= poolFactory({imageSnapshots, mediaSnapshots}); };
   const isStorage = binding => binding?.texture?.isStorageTexture === true;
-  function describe(binding, {initialize = false} = {}) {
+  function describe(binding, {initialize = false, copyDestination = false} = {}) {
     live();
     const t = binding?.texture;
     if (!t || !(t.isTexture || t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
@@ -68,6 +72,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       fail('SOURCE', 'Compute sampled inputs require ready source data, decoded images or canvases');
     if (binding.store) fail('ACCESS', 'Source textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
+    const destination = (copyDestination || copyDestinations.has(t)) && current.get(t);
+    if (destination?.alive && destination.version === t.version) {
+      // Native Textures.updateTexture returns early for an unchanged Texture
+      // version. In particular a sampler edit cannot restore the CPU image
+      // over patches that were copied into its existing GPU storage.
+      return sourcePool().inspect(destination.texture, {initialize});
+    }
     let input = t;
     const previous = t.isVideoTexture === true ? current.get(t) : null;
     if (previous?.alive && previous.source === t.source && (previous.version === t.version ||
@@ -92,6 +103,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   // private image. Keeping the deltas on the CPU is necessary for queued older
   // versions; applying them to one mutable native texture would lose FIFO state.
   function updatePlan(texture, shape) {
+    // Pinned WebGPUTextureUtils uploads an entire DataTexture image on every
+    // requested version. Its row ranges are a WebGL upload contract only.
+    if (shape.native2DData) return null;
     const ranges = (texture.updateRanges ?? []).map(range => ({...range}));
     const layers = [...texture.layerUpdates ?? []];
     if (!ranges.length && !layers.length) return null;
@@ -207,10 +221,16 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   function pruneHistories() {
     for (const [source, group] of histories) {
-      for (const [key, pixels] of group) if (![...records].some(record => record.source === source && record.key === key)) {
+      for (const [key, pixels] of group) if (![...records].some(record => !record.privateDestination && record.source === source && record.key === key)) {
         group.delete(key); releasePixels(source, pixels);
       }
       if (!group.size) histories.delete(source);
+    }
+  }
+  function releaseCopyBase(record) {
+    const base = record.copyBase; record.copyBase = null;
+    if (base && --base.refs === 0 && current.get(base.original) !== base && !captureState?.records.has(base)) {
+      retire(base); syncPool();
     }
   }
   function retire(record) {
@@ -227,12 +247,14 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (listener) record.original.removeEventListener('dispose', listener);
       watches.delete(record.original);
     }
+    releaseCopyBase(record);
   }
   function watch(original) {
     if (watches.has(original)) return;
     const listener = () => {
       // A texture's dispose event invalidates queued uses, not just future ones.
       for (const record of records) if (record.original === original) retire(record);
+      copyDestinations.delete(original);
       original.removeEventListener('dispose', listener); watches.delete(original);
       syncPool();
     };
@@ -371,6 +393,9 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
           // representation and color metadata: forcing an unpremultiplied bitmap
           // or rasterizing into a different gamut adds an observable conversion.
           const captured = {width, height};
+          // The private self-map admits immutable dimensions during metadata
+          // capture. The pool refuses allocation until the bitmap replaces it.
+          imageSnapshots.set(captured, captured);
           const pending = Promise.resolve(globalThis.createImageBitmap(image,
             {premultiplyAlpha: htmlImage ? 'none' : 'default', colorSpaceConversion: 'default'})).then(bitmap => {
             if (!instance(bitmap, 'ImageBitmap') || bitmap.width !== width || bitmap.height !== height) {
@@ -443,7 +468,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     texture.onUpdate = () => {
       // A source history can outlive the alias that first uploaded it. Recreate
       // native residency as needed without replaying that version's callback.
-      if (pixels.uploaded) return;
+      if (record.privateDestination ? record.uploaded : pixels.uploaded) return;
+      record.uploaded = true;
       pixels.uploaded = true;
       captureState?.uploaded.add(record);
       // Acknowledging an older queued upload must not erase a newer request,
@@ -462,23 +488,46 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       original.onUpdate?.call(original, original);
     };
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
+      partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
       pixels, refs: 0, alive: true, binding: null};
   }
-  function captureBinding(binding) {
+  function captureBinding(binding, {copyDestination = false} = {}) {
     live();
     if (isStorage(binding)) return storage.captureBinding(binding);
     if (resolving) fail('REENTRY', 'Cannot capture compute texture inputs from an upload callback');
     if (isTarget(binding)) return targets().captureBinding(binding);
     if (isFramebuffer(binding)) return framebuffers().captureBinding(binding);
     if (isDetachedDepth(binding)) return depths().captureBinding(binding);
-    const shape = describe(binding), original = binding.texture;
+    if (binding.isSampler && !binding.isSampledTexture && copyDestinations.has(binding.texture)) {
+      const lease = captureBinding({texture: binding.texture, isSampledTexture: true});
+      try {
+        const texture = binding.texture, identity = binding.samplerIdentity, lifetime = watches.get(texture);
+        let history = identity && samplerHistories.get(identity);
+        if (!history || history.texture !== texture || history.version !== texture.version || history.lifetime !== lifetime) {
+          // Native sampler bindings select the live parameters when created or
+          // when their texture version changes. They do not own pixel storage.
+          const descriptor = privateDescriptor(lease.record.texture);
+          descriptor.source = lease.record.texture.source; descriptor.mipmaps = lease.record.texture.mipmaps;
+          for (const key of ['wrapS', 'wrapT', 'wrapR', 'minFilter', 'magFilter', 'anisotropy', 'compareFunction'])
+            descriptor[key] = texture[key];
+          const shape = sourcePool().inspect(descriptor, {initialize: true});
+          history = {texture, version: texture.version, lifetime,
+            descriptor: Object.freeze({...shape.sampler}), layout: inputLayout(binding, shape)};
+          if (identity) samplerHistories.set(identity, history);
+        }
+        lease.sampler = true; lease.samplerDescriptor = history.descriptor; lease.layout = history.layout;
+        return lease;
+      } catch (error) { releaseLease(lease); throw error; }
+    }
+    const shape = describe(binding, {copyDestination}), original = binding.texture;
     let record = current.get(original);
-    const unchanged = record && record.key === shape.key && record.source === original.source &&
+    const privateDestination = copyDestination || copyDestinations.has(original);
+    const unchanged = record && record.key === shape.key && (privateDestination || record.source === original.source) &&
       record.version === original.version;
     // An unused alias can increment Source.version without requesting an upload
     // through this texture. Only an already captured alias payload changes the
     // shared residency; a later uncaptured version must not hide that payload.
-    const sharedPixels = unchanged && !shape.nativeMedia ? histories.get(original.source)?.get(shape.key) : null;
+    const sharedPixels = unchanged && !shape.nativeMedia && !privateDestination ? histories.get(original.source)?.get(shape.key) : null;
     if (!unchanged || sharedPixels && sharedPixels !== record.pixels) {
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       // A sampler change must not reread an advancing video or wait for an
@@ -489,21 +538,70 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       try { watch(original); }
       catch (error) { if (pixels.refs === 0) pixels.disposeImages?.(); throw error; }
       retainPixels(replacement.source, pixels);
+      if (privateDestination) {
+        replacement.privateDestination = true;
+        replacement.texture.source = {...replacement.texture.source};
+        if (replacement.partialRanges && record?.privateDestination && record.key === replacement.key && record.source === replacement.source) {
+          // Preserve GPU patches outside the captured host ranges. The old
+          // residency remains pinned until this version has been initialized.
+          replacement.copyBase = record; record.refs++;
+          replacement.texture.updateRanges = replacement.partialRanges.map(range => ({...range}));
+        }
+      }
       records.add(replacement);
-      if (!replacement.nativeMedia) setHistory(replacement.source, replacement.key, pixels);
+      if (!replacement.nativeMedia && !privateDestination) setHistory(replacement.source, replacement.key, pixels);
       current.set(original, replacement);
       if (record && record.refs === 0 && !captureState?.records.has(record)) { retire(record); syncPool(); }
       record = replacement;
     }
     record.refs++;
     const lease = {record, layout: inputLayout(binding, shape), sampler: binding.isSampler && !binding.isSampledTexture, released: false};
+    if (lease.sampler && binding.samplerIdentity) {
+      // A sampler can predate the first write into this texture. Remember its
+      // accepted identity now so that detaching GPU storage cannot retune an
+      // existing binding from unrequested live sampler edits.
+      const identity = binding.samplerIdentity, lifetime = watches.get(original), history = samplerHistories.get(identity);
+      if (!history || history.texture !== original || history.version !== original.version || history.lifetime !== lifetime)
+        samplerHistories.set(identity, {texture: original, version: original.version, lifetime,
+          descriptor: Object.freeze({...shape.sampler}), layout: lease.layout});
+    }
     leases.add(lease); return lease;
+  }
+  function captureCopyDestination(texture, level = 0) {
+    const shape = describe({texture, isSampledTexture: true}, {copyDestination: true});
+    if (level !== 0 || shape.viewDimension !== '2d' || shape.levels !== 1 || shape.manual || shape.blockUploads || shape.nativeMedia)
+      fail('COPY', 'Ordinary sampled copy destinations require uncompressed base-level 2D storage');
+    const lease = captureBinding({texture, isSampledTexture: true}, {copyDestination: true}), previous = lease.record;
+    const markDestination = () => {
+      if (!copyDestinations.has(texture)) { copyDestinations.add(texture); captureState?.copyDestinations.add(texture); }
+    };
+    if (previous.privateDestination) { markDestination(); return lease; }
+    try {
+      if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
+      const descriptor = privateDescriptor(previous.texture);
+      descriptor.source = {...previous.texture.source}; descriptor.mipmaps = previous.texture.mipmaps;
+      descriptor.onUpdate = previous.texture.onUpdate;
+      const record = {...previous, texture: descriptor, refs: 1, binding: null,
+        privateDestination: true, copyBase: previous, copyOnly: true};
+      // Transfer this lease's reference into the GPU seed dependency; no CPU
+      // pixel copy and no extra source callback accompany the private detach.
+      retainPixels(record.source, record.pixels); records.add(record);
+      current.set(texture, record); lease.record = record;
+      markDestination();
+      return lease;
+    } catch (error) { releaseLease(lease); throw error; }
+  }
+  function releaseLease(snapshot) {
+    if (snapshot.released) return;
+    snapshot.released = true;
+    const record = snapshot.record;
+    if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
   }
   function validate(snapshot) {
     if (snapshot.released || !snapshot.record.alive)
       fail('STALE', 'Sampled texture was disposed or its captured use was released');
   }
-  function captureShared(snapshot) {
+  function captureShared(snapshot, {copiesOnly = false} = {}) {
     live();
     // A source SHARED refresh keeps its existing sampler/view binding. Another
     // FULL draw can nevertheless upload new pixels into that same residency
@@ -511,7 +609,22 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // unobserved CPU edits and replacement TextureNodes must remain inert.
     if (!leases.has(snapshot) || snapshot.sampler) return null;
     validate(snapshot);
+    if (copiesOnly && !copyDestinations.has(snapshot.record.original)) return null;
     const previous = snapshot.record, accepted = previous.nativeMedia ? current.get(previous.original) : null;
+    if (copyDestinations.has(previous.original)) {
+      const resident = current.get(previous.original);
+      if (!resident || resident === previous) return null;
+      // Source updates write into this Texture's existing GPU image even when
+      // its CPU Source, sampler or upload orientation changes. A static bundle
+      // retains its sampler, while its compatible texture view sees those
+      // accepted pixels. Keep extent, format and view-layout changes separate.
+      const before = sourcePool().inspect(previous.texture), after = sourcePool().inspect(resident.texture);
+      if (['width', 'height', 'layers', 'levels', 'format', 'viewFormat', 'viewDimension', 'sampleType']
+        .some(key => before[key] !== after[key])) return null;
+      resident.refs++;
+      const lease = {record: resident, layout: snapshot.layout, sampler: false, released: false};
+      leases.add(lease); return lease;
+    }
     // Native media can refresh only from this texture's accepted upload. A
     // cloned alias shares Source but not modern WebGPU texture residency.
     const pixels = previous.nativeMedia
@@ -536,7 +649,43 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     leases.add(lease); return lease;
   }
   return {
-    layoutOf, captureBinding, captureShared,
+    layoutOf, captureBinding, captureShared, captureCopyDestination,
+    isCopyDestination: texture => copyDestinations.has(texture),
+    sameTexture(first, second) {
+      validate(first); validate(second);
+      return first.record.texture.source === second.record.texture.source && first.record.key === second.record.key;
+    },
+    validateCopyAllocations(snapshots) {
+      live();
+      const textures = new Set();
+      for (const snapshot of snapshots) {
+        validate(snapshot);
+        for (let record = snapshot.record; record; record = record.copyBase) {
+          if (!record.alive) fail('STALE', 'Sampled copy seed was disposed');
+          textures.add(record.texture);
+        }
+      }
+      sourcePool().validatePreparation([...textures]);
+    },
+    copyTextures(source, destination, run) {
+      live(); validate(source); validate(destination);
+      if (!destination.record.privateDestination || typeof run !== 'function')
+        fail('COPY', 'Expected an owned ordinary sampled destination');
+      // Resolve both uploads before borrowing: onUpdate callbacks must not run
+      // inside the GPU write's validation scopes or another texture borrow.
+      this.resolve(source); this.resolve(destination);
+      // Both endpoints belong to this pool. Snapshot their issued validation;
+      // a warm patch must not introduce a submitted-work fence of its own.
+      const validation = sourcePool().validation; validation.catch(() => {});
+      resolving = true;
+      try {
+        return sourcePool().writeTexture(destination.record.texture, nativeDestination => {
+          validate(source); validate(destination);
+          const result = run(sourcePool().nativeTexture(source.record.texture), nativeDestination);
+          live(); validate(source); validate(destination); return result;
+        }, {validation});
+      } finally { resolving = false; if (poolDirty) syncPool(); }
+    },
     /** Metadata and a synchronous native borrow for source-shaped copies.
      * These use the SAME immutable upload history as material/compute reads.
      * Never expose the caller's mutable CPU image as the queued copy source. */
@@ -603,7 +752,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       live();
       if (captureState || resolving) fail('REENTRY', 'Cannot nest a compute texture capture transaction');
       if (typeof run !== 'function') fail('OPTIONS', 'Expected a synchronous capture callback');
-      const before = {current: new Map(current), records: new Set(records), uploaded: new Set(),
+      const before = {current: new Map(current), records: new Set(records), uploaded: new Set(), copyDestinations: new Set(),
         histories: new Map([...histories].map(([source, group]) => [source, new Map(group)]))};
       // Pin history-only payloads too: disposing an uploading alias must not
       // make rollback resurrect an uncharged or already-retired baseline.
@@ -625,11 +774,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         for (const [original, record] of before.current) if (record.alive) current.set(original, record);
         for (const record of uploaded) current.set(record.original, record);
         for (const record of records) if (!before.records.has(record) && !before.uploaded.has(record)) retire(record);
+        for (const texture of before.copyDestinations)
+          if (current.get(texture)?.privateDestination !== true) copyDestinations.delete(texture);
         for (const [source, group] of histories) for (const pixels of group.values()) releasePixels(source, pixels);
         histories.clear();
         for (const [source, group] of before.histories) for (const [key, pixels] of group)
-          if ([...records].some(record => record.source === source && record.key === key)) setHistory(source, key, pixels);
-        for (const record of uploaded) if (!record.nativeMedia) setHistory(record.source, record.key, record.pixels);
+          if ([...records].some(record => !record.privateDestination && record.source === source && record.key === key)) setHistory(source, key, pixels);
+        for (const record of uploaded) if (!record.nativeMedia && !record.privateDestination) setHistory(record.source, record.key, record.pixels);
         throw error;
       } finally {
         captureState = null;
@@ -679,14 +830,26 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (resolving) fail('REENTRY', 'Cannot resolve compute textures from an upload callback');
       const record = snapshot.record;
       if (!record.binding) {
+        if (record.copyBase) {
+          const base = record.copyBase;
+          // The seed is an accepted earlier version, not another observation
+          // of the mutable source image. Resolve recursively in FIFO order.
+          if (!base.alive) fail('STALE', 'Sampled copy seed was disposed');
+          const seed = {record: base, layout: snapshot.layout, sampler: false, released: false};
+          leases.add(seed);
+          try { this.resolve(seed); } finally { leases.delete(seed); }
+        }
         resolving = true;
         try {
-          sourcePool().prepare([record.texture]);
+          sourcePool().prepare([record.texture], record.copyBase
+            ? {copyFrom: record.copyBase.texture, copyOnly: record.copyOnly === true} : undefined);
           validate(snapshot);
           record.binding = sourcePool().binding(record.texture);
+          releaseCopyBase(record);
         } finally { resolving = false; if (poolDirty) syncPool(); }
       }
-      return snapshot.sampler ? record.binding.sampler : record.binding.view;
+      return snapshot.sampler ? snapshot.samplerDescriptor ? sourcePool().sampler(snapshot.samplerDescriptor)
+        : record.binding.sampler : record.binding.view;
     },
     written(snapshots) { live(); storage.written(snapshots.filter(snapshot => !leases.has(snapshot) && !targetInputs?.owns(snapshot) && !framebufferInputs?.owns(snapshot) && !depthInputs?.owns(snapshot))); },
     release(snapshot) {
@@ -694,9 +857,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (framebufferInputs?.owns(snapshot)) { framebufferInputs.release(snapshot); return; }
       if (depthInputs?.owns(snapshot)) { depthInputs.release(snapshot); return; }
       if (!leases.has(snapshot) || snapshot.released) return;
-      snapshot.released = true;
-      const record = snapshot.record;
-      if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
+      releaseLease(snapshot);
     },
     async validationSnapshot(snapshots) {
       live();

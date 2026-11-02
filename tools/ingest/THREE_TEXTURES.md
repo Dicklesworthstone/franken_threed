@@ -70,6 +70,10 @@ are rejected before writes. Only requested source pixels are published; an
 initial partial upload leaves the other native pixels zero-initialized. Mips
 are regenerated from GPU state after a partial update, not stale CPU neighbors.
 
+The native WebGPU profile follows a different pinned DataTexture rule: a
+requested version uploads the complete 2D image and leaves WebGL `updateRanges`
+untouched. Its ordinary texture copies use that same accepted upload history.
+
 Source generation is acknowledged before onUpdate(texture); texture version is
 acknowledged after it. Callback exceptions retain successful writes and source
 acknowledgment, not a fictitious rollback or repeated callback on retry. Reentrant
@@ -89,6 +93,33 @@ failure and device loss terminate residency and release owned native resources.
 Invalid inputs/budgets are recoverable. whenIdle observes cumulative native
 validation and completion. Disposal ends a pending owner wait without claiming
 to cancel work already submitted to the device.
+
+## Native sampled texture copies
+
+Native `renderer.copyTextureToTexture()` accepts ordinary sampled textures as
+destinations for matching, uncompressed base-level 2D copies. DataTexture and
+ready decoded-image destinations retain GPU patches without changing their CPU
+pixels or public versions. The first write detaches shared Source storage once;
+other Texture aliases keep their accepted pixels. Later patches reuse the
+residency and encode only the requested rectangle, with no CPU readback or
+per-copy submitted-work fence. Public `waitForGPU()` retains validation and
+completion responsibility.
+
+Ready ordinary 2D material maps select the existing native sampled owner from
+their first draw, so a future copy preserves uploaded pixels even after
+unrequested CPU edits or Source replacement. Scene companions share that
+capture path; scenes without these maps keep their existing selection. Static
+bundles observe accepted GPU writes while preserving their sampler bindings.
+New sampler bindings observe current parameters; existing bindings update when
+their Texture version requests it. Filter edits preserve a program's constructed
+texture-load or sampling choice until material invalidation; incompatible graph
+and layout changes still trigger the existing checks. Decoded-image capture
+waits for immutable bitmap pixels before allocating or uploading storage.
+
+Ordinary destinations with mip chains, compressed/layered/cube storage, media
+lifetimes, or the WebGL-authored renderer surface remain outside this copy
+profile. Run `node tests/e2e/webgpu_renderer/native_sampled_copy.mjs` for pinned
+source comparisons covering data, images, aliases, bundles and prior uploads.
 
 ## Evidence
 

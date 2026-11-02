@@ -1134,7 +1134,7 @@ test('unfilterable Float32 replacements still require a distinct native program 
   assert.ok(next.groups.some(group => group.entries.some(entry => entry.texture?.sampleType === 'unfilterable-float')));
   assert.match(next.fragment, /textureLoad/);
 });
-test('texture aliases, sampling mode and UV channels invalidate structural programs', t => {
+test('texture aliases and UV channels invalidate programs while filter classification follows material invalidation', t => {
   const f = rig(t), a = dataTexture(), b = dataTexture(), left = N.texture(a), right = N.texture(a);
   f.material.colorNode = left.add(right);
   const initial = f.compile(); assert.equal(f.owner.textures(initial).length, 2);
@@ -1142,6 +1142,12 @@ test('texture aliases, sampling mode and UV channels invalidate structural progr
   assert.throws(() => f.owner.captureDraw(initial, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   const split = f.compile(); assert.notEqual(split, initial); assert.equal(f.owner.textures(split).length, 4);
   b.minFilter = b.magFilter = THREE.NearestFilter;
+  b.needsUpdate = true;
+  assert.equal(f.compile(), split, 'a texture upload retains the constructed source sampling path');
+  b.dispose();
+  assert.equal(f.compile(), split, 'texture disposal alone does not invalidate the source material program');
+  assert.equal(f.owner.captureDraw(split, f.context).textures.length, 4);
+  f.material.needsUpdate = true;
   const nearest = f.compile(); assert.notEqual(nearest, split); assert.equal(f.owner.textures(nearest).length, 3);
   f.object.geometry.setAttribute('uv1', f.object.geometry.attributes.uv); b.channel = 1;
   const channel = f.compile(); assert.notEqual(channel, nearest); assert.ok(channel.attributes.some(attribute => attribute.name === 'uv1'));
