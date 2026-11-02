@@ -698,6 +698,21 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       const record = snapshot.record;
       if (--record.refs === 0 && current.get(record.original) !== record && !captureState?.records.has(record)) { retire(record); syncPool(); }
     },
+    async validationSnapshot(snapshots) {
+      live();
+      const targets = [], framebuffers = [];
+      for (const snapshot of snapshots) {
+        if (targetInputs?.owns(snapshot)) targets.push(snapshot);
+        else if (framebufferInputs?.owns(snapshot)) framebuffers.push(snapshot);
+      }
+      // Capture only validation already issued. Retirement and submitted-work
+      // fences belong to whenIdle(), not asynchronous shader compilation.
+      await Promise.all([storage.validation, pool?.validation,
+        targets.length ? targetInputs.validationSnapshot(targets) : null,
+        framebuffers.length ? framebufferInputs.validationSnapshot(framebuffers) : null,
+        depthInputs?.validationSnapshot()]);
+      live();
+    },
     async whenIdle() { live(); await Promise.all([storage.whenIdle(), pool?.whenIdle(), targetInputs?.whenIdle(), framebufferInputs?.whenIdle(), depthInputs?.whenIdle()]); live(); },
     get diagnostics() { return {textures: current.size, versions: records.size, snapshotBytes,
       ...(framebufferInputs ? {framebuffers: framebufferInputs.diagnostics} : {}),

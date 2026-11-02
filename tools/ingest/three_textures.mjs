@@ -590,6 +590,7 @@ export function createGpuThreeTextures(device,{
     retain(input){live();if(busy)fail('REENTRANT','Cannot evict during upload');const keep=new Set(input);for(const t of [...records.keys()])if(!keep.has(t))drop(t);},
     get disposed(){return disposed;},get failed(){return terminal!==null;},
     get diagnostics(){return Object.freeze({...stats,textureBytes,textures:records.size,resources:[...sources.values()].reduce((n,m)=>n+m.size,0)});},
+    get validation(){live();return Promise.race([pending,stopped]).then(()=>{live();});},
     async whenIdle(){live();try{await Promise.race([Promise.all([pending,device.queue.onSubmittedWorkDone()]),stopped]);live();return api;}catch(e){if(!disposed)stop(e);throw e;}},
     dispose(){if(busy)fail('REENTRANT','Cannot dispose during upload');if(!disposed){disposed=true;release();rejectStop(new ThreeTextureError('DISPOSED','Texture owner is disposed'));}},
   });

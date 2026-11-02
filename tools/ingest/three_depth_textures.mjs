@@ -20,7 +20,7 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
       ![maxTextures, maxBytes, maxBindings, maxSamplers, maxPending].every(positive))
     fail('OPTIONS', 'Expected pinned depth textures, a GPUDevice and positive resource limits');
   const current = new Map(), entries = new Set(), watches = new Map(), leases = new Map(), tokens = new WeakSet();
-  const samplers = new Map(), pending = new Set();
+  const samplers = new Map(), pending = new Set(), validations = new Set();
   let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const live = () => { if (disposed) fail('DISPOSED', 'Depth texture owner is disposed'); if (terminal) throw terminal; };
@@ -45,8 +45,10 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
   const abort = () => stop(signal.reason ?? new ThreeDepthTextureError('ABORTED', 'Renderer lifetime ended'));
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, {once: true});
   device.lost?.then(info => stop(new ThreeDepthTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
-  function track(task) {
-    pending.add(task); task.catch(stop); task.finally(() => pending.delete(task)).catch(() => {}); return task;
+  function track(task, validation = false) {
+    pending.add(task); if (validation) validations.add(task);
+    task.catch(stop);
+    task.finally(() => { pending.delete(task); validations.delete(task); }).catch(() => {}); return task;
   }
   function checked(run) {
     device.pushErrorScope('out-of-memory'); device.pushErrorScope('validation');
@@ -57,7 +59,7 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
       if (error) throw error;
       const invalid = errors.find(Boolean);
       if (invalid) throw new ThreeDepthTextureError('GPU', invalid.message ?? 'Depth texture allocation or binding failed');
-    }));
+    }), true);
     if (error) { stop(error); throw error; }
     return result;
   }
@@ -233,6 +235,9 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
       const record = leases.get(token); if (!record) return;
       leases.delete(token); const entry = record.entry;
       if (--entry.refs === 0 && current.get(entry.texture) !== entry) discard(entry);
+    },
+    async validationSnapshot() {
+      live(); await Promise.race([Promise.all([...validations]), stopped]); live();
     },
     async whenIdle() {
       live(); if (active) fail('REENTRY', 'Cannot await depth completion inside a submitted use');

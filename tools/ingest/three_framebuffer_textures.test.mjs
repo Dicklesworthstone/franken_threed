@@ -35,6 +35,20 @@ function framebuffer(width = 4, height = 4, mips = true) {
   return texture;
 }
 
+test('framebuffer compilation validation waits for allocation scopes without waiting for retirement fences', async t => {
+  const f = fixture(t), validation = deferred(), completion = deferred(), texture = framebuffer(4, 4, false);
+  const pop = f.device.popErrorScope; let held = false;
+  f.device.popErrorScope = () => { const result = pop(); if (!held) { held = true; return validation.promise; } return result; };
+  f.controls.completion = completion;
+  t.after(() => { validation.resolve(null); completion.resolve(); });
+  const read = f.owner.captureBinding(sampled(texture));
+  f.owner.withDispatch([read], () => f.owner.resolve(read));
+  let ready = false; const proof = f.owner.validationSnapshot([read]).then(() => { ready = true; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(ready, false);
+  validation.resolve(null); await proof;
+  assert.equal(ready, true); f.owner.release(read);
+});
+
 test('framebuffer layout is allocation-free and reports resolved single-sample inputs', t => {
   const f = fixture(t), texture = framebuffer();
   assert.deepEqual(f.owner.layoutOf(sampled(texture)), {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}});

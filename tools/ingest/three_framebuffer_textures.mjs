@@ -24,7 +24,8 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
     fail('OPTIONS', 'Expected pinned texture constructors, a GPUDevice, framebuffer format and positive budgets');
   const current = new Map(), entries = new Set(), leases = new Map(), tokens = new WeakSet(), watches = new Map(), samplers = new Map(), pending = new Set();
   const copyPipelines = new Map();
-  let bytes = 0, active = null, terminal = null, disposed = false;
+  let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped;
+  const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const live = () => { if (disposed) fail('DISPOSED', 'Framebuffer textures are disposed'); if (terminal) throw terminal; };
   function track(task) {
     pending.add(task); task.finally(() => pending.delete(task)).catch(() => {});
@@ -52,6 +53,7 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
   }
   function stop(error) {
     terminal ??= error;
+    rejectStopped(terminal);
     for (const entry of entries) discard(entry);
     for (const [texture, listener] of watches) texture.removeEventListener('dispose', listener);
     watches.clear(); samplers.clear(); copyPipelines.clear(); signal?.removeEventListener('abort', abort);
@@ -337,6 +339,11 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
       state.parameters?.destroy();
       leases.delete(token); const entry = state.entry;
       if (--entry.refs === 0 && current.get(entry.texture) !== entry) discard(entry);
+    },
+    async validationSnapshot(tokens) {
+      live();
+      const sources = new Set(tokens.map(token => validate(token).entry));
+      await Promise.race([Promise.all([...sources].map(entry => entry.storage?.validation)), stopped]); live();
     },
     async whenIdle() {
       live(); if (active) fail('REENTRY', 'Cannot await framebuffer completion inside a submitted use');

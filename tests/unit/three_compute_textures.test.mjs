@@ -73,6 +73,66 @@ function block(renderer) {
 }
 const groups = device => device.calls.filter(c => c[0] === 'group').map(c => c[2]);
 
+function holdTextureValidation(device) {
+  const gate = deferred(), issued = deferred();
+  const create = device.createTexture.bind(device), pop = device.popErrorScope.bind(device);
+  let allocation = false, held = false;
+  device.createTexture = descriptor => { allocation = true; return create(descriptor); };
+  device.popErrorScope = () => {
+    const result = pop();
+    if (allocation && !held) {
+      allocation = false; held = true; issued.resolve(); return gate.promise;
+    }
+    return result;
+  };
+  return {...gate, issued: issued.promise};
+}
+
+test('asynchronous compute compilation waits for texture validation before success callbacks without a queue fence', async t => {
+  const completion = deferred(), {renderer, device} = setup({completion});
+  const validation = holdTextureValidation(device), texture = new THREE.Texture(), updates = [];
+  texture.generateMipmaps = false;
+  t.after(() => { validation.resolve(null); completion.resolve(); renderer.dispose(); });
+  const kernel = node([write(texture)], {before: [() => updates.push('before')],
+    updates: [() => updates.push('current')], after: [() => updates.push('after')]});
+  let settled = false;
+  const task = renderer.compileComputeAsync(kernel, () => updates.push('progress')).then(() => { settled = true; });
+  await validation.issued; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.deepEqual(updates, ['before', 'current']);
+  validation.resolve(null);
+  await task;
+  assert.deepEqual(updates, ['before', 'current', 'after', 'progress']);
+  assert.equal(device.calls.some(call => call[0] === 'dispatch'), false);
+});
+
+test('delayed texture validation rejects compilation before after-update or progress callbacks', async t => {
+  const {renderer, device} = setup(), validation = holdTextureValidation(device), texture = new THREE.Texture();
+  texture.generateMipmaps = false;
+  t.after(() => { validation.resolve(null); renderer.dispose(); });
+  let successful = false, after = 0, progress = 0;
+  const task = renderer.compileComputeAsync(node([write(texture)], {after: [() => after++]}), () => progress++)
+    .then(() => { successful = true; });
+  task.catch(() => {});
+  await validation.issued; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(successful, false);
+  validation.resolve({message: 'delayed invalid texture'});
+  await assert.rejects(task, /delayed invalid texture/);
+  assert.equal(after, 0); assert.equal(progress, 0);
+  assert.equal(renderer._storageTextures.allocatedBytes, 0);
+});
+
+test('disposal interrupts compilation while a texture validation result is still pending', async t => {
+  const {renderer, device} = setup(), validation = holdTextureValidation(device), texture = new THREE.Texture();
+  texture.generateMipmaps = false;
+  t.after(() => { validation.resolve(null); renderer.dispose(); });
+  const task = renderer.compileComputeAsync(node([write(texture)])); task.catch(() => {});
+  await validation.issued; await new Promise(resolve => setImmediate(resolve));
+  renderer.dispose();
+  await assert.rejects(task, {code: 'THREE_COMPUTE_DISPOSED'});
+  assert.equal(renderer._storageTextures.allocatedBytes, 0);
+});
+
 test('public compute writes a StorageTexture sampled by ordinary renderer bindings without copying', async () => {
   const {renderer,device} = setup(); const texture = new THREE.Texture();
   renderer.compute(node([write(texture)]));

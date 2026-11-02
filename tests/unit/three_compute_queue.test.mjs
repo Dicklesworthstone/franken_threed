@@ -137,6 +137,26 @@ function node(bindings = [], options = {}) {
 const storage = attribute => ({isStorageBuffer: true, attribute});
 const read = async (renderer, data) => [...new Float32Array(await renderer.getArrayBufferAsync(data))];
 
+test('asynchronous compilation joins storage upload validation before progress', async t => {
+  const {renderer, device} = setup(), validation = deferred(), data = attribute(new Float32Array([1]));
+  const write = device.queue.writeBuffer, pop = device.popErrorScope;
+  let upload = false, held = false, successful = false, progress = 0;
+  device.queue.writeBuffer = (...args) => { upload = true; return write(...args); };
+  device.popErrorScope = () => {
+    const result = pop();
+    if (upload && !held) { held = true; return validation.promise; }
+    return result;
+  };
+  t.after(() => { validation.resolve(null); renderer.dispose(); });
+  const task = renderer.compileComputeAsync(node([storage(data)]), () => progress++).then(() => { successful = true; });
+  task.catch(() => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(held, true); assert.equal(successful, false);
+  validation.resolve({message: 'invalid captured storage upload'});
+  await assert.rejects(task, /invalid captured storage upload/);
+  assert.equal(progress, 0);
+});
+
 // The first three regressions fail against b6a5d7b's call-at-drain adapter.
 test('queued kernels preserve distinct call-time uniforms, even when prewarmed', async () => {
   const {renderer, block} = setup(), data = attribute(new Float32Array([0]));

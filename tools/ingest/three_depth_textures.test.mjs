@@ -20,6 +20,20 @@ function fixture(t, options = {}) {
   return {...f, owner, use};
 }
 
+test('depth compilation validation excludes in-flight GPU fences and reports delayed native errors', async t => {
+  const f = fixture(t), validation = deferred(), completion = deferred(), texture = new T.DepthTexture(2, 2);
+  const pop = f.device.popErrorScope; let held = false;
+  f.device.popErrorScope = () => { const result = pop(); if (!held) { held = true; return validation.promise; } return result; };
+  f.controls.completion = completion;
+  t.after(() => { validation.resolve(null); completion.resolve(); });
+  const read = f.owner.captureBinding(sampled(texture)); f.use([read]);
+  const proof = f.owner.validationSnapshot(); let settled = false;
+  proof.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, false);
+  validation.resolve({message: 'invalid detached depth allocation'});
+  await assert.rejects(proof, /invalid detached depth allocation/); f.owner.release(read);
+});
+
 test('detached depth version zero has allocation-free depth metadata without source mutation', t => {
   const f = fixture(t), texture = new T.DepthTexture(1, 1), source = texture.source, image = texture.image;
   const nextId = new T.Texture().id;

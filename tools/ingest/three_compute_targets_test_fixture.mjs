@@ -126,7 +126,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
     captureUpload(key, data, version) { return {key, data, version}; }, releaseUpload() {},
     getBuffer(key) { return buffers.get(key) ?? {}; }, release(key) { buffers.delete(key); },
     async read() { events.push(['read']); return new ArrayBuffer(4); },
-    async whenIdle() {}, dispose() { events.push(['gpuDispose']); },
+    async validationSnapshot() {}, async whenIdle() {}, dispose() { events.push(['gpuDispose']); },
   };
   const storage = {
     captureBinding(binding) { return {storage: true, binding}; },
@@ -155,7 +155,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
     ['./three_framebuffer_textures.mjs', synthetic({createThreeFramebufferTextures() { throw new Error('No framebuffer textures in this fixture'); }})],
     ['./three_depth_textures.mjs', synthetic({createThreeDepthTextures() { throw new Error('No detached depth textures in this fixture'); }})],
   ]);
-  for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute', 'three_node_shadows'])
+  for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute', 'three_node_shadows', 'gpu_compute_attributes'])
     modules.set(`./${name}.mjs`, new vm.SourceTextModule(await readFile(new URL(`./${name}.mjs`, import.meta.url), 'utf8'), {context, identifier: name}));
   const link = specifier => { assert.ok(modules.has(specifier), specifier); return modules.get(specifier); };
   for (const module of modules.values()) if (module.status === 'unlinked') await module.link(link);

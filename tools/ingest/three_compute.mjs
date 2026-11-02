@@ -443,6 +443,9 @@ function createThreeCompute(renderer, three) {
       };
       return {release, shader, asynchronous: preparation !== null,
         validate: () => textureOwner.validateDispatch(textureUses),
+        async validation() {
+          await Promise.all([gpu.validationSnapshot(), textureOwner.validationSnapshot(textureUses)]);
+        },
         issue(dispatch = true) { return preparation ? preparation.then(() => issue(dispatch)) : issue(dispatch); }};
     } catch (error) { release(); throw error; }
   }
@@ -487,13 +490,20 @@ function createThreeCompute(renderer, three) {
       });
       try {
         await request.issue(false);
-        await gpu.prepare(request.shader);
+        // Native resource creation returns before its validation scopes settle.
+        // Join this issuance snapshot as well as pipeline preparation, without
+        // fencing the GPU queue or waiting for scopes issued by later work.
+        await Promise.all([gpu.prepare(request.shader), request.validation()]);
         live(); request.validate();
         if (programs.get(node) !== entry) fail('STALE', 'Compute node changed during asynchronous compilation');
         withFrame(node, () => update(entry, 'after'));
         if (onProgress) onProgress(typeof ProgressEvent === 'function'
           ? new ProgressEvent('progress', {lengthComputable: true, loaded: i + 1, total: list.length})
           : {type: 'progress', lengthComputable: true, loaded: i + 1, total: list.length});
+      } catch (error) {
+        // Disposal is a public compute failure even when another resource
+        // owner's cancellation happens to settle before the pipeline promise.
+        live(); throw error;
       } finally { request.release(); }
     }
   }

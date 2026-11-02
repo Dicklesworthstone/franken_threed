@@ -12,6 +12,22 @@ const make=(w=2,h=2,format=T.RGBAFormat)=>{
 };
 const pool=(d,opts={})=>createGpuThreeTextures(d,{three:T,...opts});
 
+test('sampled texture validation captures issued uploads without future scopes or queue completion', async t => {
+  const d = textureDevice(), p = pool(d), texture = make();
+  const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
+  const first = deferred(), later = deferred(), completion = deferred();
+  const pop = d.popErrorScope, scopes = [first.promise, Promise.resolve(null), later.promise];
+  d.popErrorScope = () => { const result = pop(); return scopes.shift() ?? result; };
+  d.queue.onSubmittedWorkDone = () => completion.promise;
+  t.after(() => { first.resolve(null); later.resolve(null); completion.resolve(); p.dispose(); });
+  p.prepare([texture]); const validation = p.validation; let ready = false;
+  validation.then(() => { ready = true; });
+  texture.needsUpdate = true; p.update([texture]);
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(ready, false);
+  first.resolve(null); await validation;
+  assert.equal(ready, true);
+});
+
 test('requested byte uploads retain image identity and GPU-stale CPU changes',async()=>{
   const d=textureDevice(),p=pool(d),t=make(),image=t.image,data=image.data;
   p.prepare([t]);const b=p.binding(t),before=b.view.texture.levels[0].slice();

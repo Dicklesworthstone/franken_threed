@@ -19,6 +19,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
       !device?.queue || ![maxBindings, maxSamplers, maxPending].every(positive))
     fail('OPTIONS', 'Expected the renderer target owner, GPUDevice and positive resource limits');
   const records = new Map(), leases = new WeakSet(), samplers = new Map(), views = new WeakMap(), pending = new Set();
+  const validations = new Set();
   let terminal = null, disposed = false, active = null, rejectStop;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function stop(error) {
@@ -38,10 +39,11 @@ export function createThreeComputeTargets({targets, device, signal = null,
     if (terminal) throw terminal;
     if (signal?.aborted) throw signal.reason ?? new ThreeComputeTargetError('ABORTED', 'Renderer lifetime ended');
   };
-  function watch(promise) {
+  function watch(promise, validation = false) {
     const task = Promise.resolve(promise).catch(error => { stop(error); throw error; });
     pending.add(task);
-    task.finally(() => pending.delete(task)).catch(() => {});
+    if (validation) validations.add(task);
+    task.finally(() => { pending.delete(task); validations.delete(task); }).catch(() => {});
   }
   function describe(binding) {
     live();
@@ -76,7 +78,7 @@ export function createThreeComputeTargets({targets, device, signal = null,
       watch(Promise.all(scopes).then(errors => {
         const error = errors.find(Boolean);
         if (error) throw new ThreeComputeTargetError('GPU', error.message ?? 'Native compute target binding failed');
-      }));
+      }), true);
     }
   }
   return {
@@ -165,6 +167,13 @@ export function createThreeComputeTargets({targets, device, signal = null,
     },
     release(snapshot) {
       const record = records.get(snapshot); records.delete(snapshot); record?.releaseGeneration?.();
+    },
+    async validationSnapshot(snapshots) {
+      live();
+      const dependencies = [...validations], sources = new Set();
+      for (const snapshot of snapshots) sources.add(validate(snapshot).source.entry);
+      for (const entry of sources) dependencies.push(entry.validation, entry.storage?.validation);
+      await Promise.race([Promise.all(dependencies), stopped]); live();
     },
     async whenIdle() { live(); await Promise.race([Promise.all([...pending]), stopped]); live(); },
     get diagnostics() { return {bindings: records.size, samplers: samplers.size, pending: pending.size}; },

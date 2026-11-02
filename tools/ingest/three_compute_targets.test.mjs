@@ -2,6 +2,35 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {rig, RenderTarget, THREE, sampled, sampler, kernel, dispatches, plain, deferred} from './three_compute_targets_test_fixture.mjs';
 
+test('target-input compilation joins binding validation without awaiting the producer completion fence', async t => {
+  const r = await rig(), target = new RenderTarget(), validation = deferred(), completion = deferred();
+  r.renderer.produce(target, 17); r.storages[0].wait(completion.promise);
+  r.scopePromises.push(validation.promise);
+  t.after(() => { validation.resolve(null); completion.resolve(); r.renderer.dispose(); });
+  let settled = false;
+  const task = r.renderer.compileComputeAsync(kernel([sampled(target.texture)]));
+  task.then(() => { settled = true; });
+  const draining = r.renderer.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  validation.resolve(null); await task; await draining;
+  assert.equal(settled, true); assert.equal(dispatches(r).length, 0);
+});
+
+test('target-input compilation rejects delayed binding errors before source after updates', async t => {
+  const r = await rig(), target = new RenderTarget(), validation = deferred();
+  r.renderer.produce(target, 17); r.scopePromises.push(validation.promise);
+  t.after(() => { validation.resolve(null); r.renderer.dispose(); });
+  const compute = kernel([sampled(target.texture)]); let after = 0;
+  compute.after = [() => after++];
+  const task = r.renderer.compileComputeAsync(compute); task.catch(() => {});
+  const draining = r.renderer.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  validation.resolve({message: 'invalid native target view'});
+  await assert.rejects(task, /invalid native target view/); await draining;
+  assert.equal(after, 0); assert.equal(dispatches(r).length, 0);
+});
+
 test('public compute samples the native color produced by rendering, without a replica or CPU upload', async () => {
   const r = await rig(), target = new RenderTarget(); r.renderer.produce(target, 17);
   r.renderer.compute(kernel([sampled(target.texture), sampler(target.texture), {...sampled({isStorageTexture: true}), store: true}]));
@@ -92,7 +121,8 @@ test('live texture-node replacement captures old and new targets without stale b
 });
 test('native target compilation prepares bindings but never dispatches a kernel', async () => {
   const r = await rig(), target = new RenderTarget(), node = kernel([sampled(target.texture)]), progress = [];
-  await r.renderer.compileComputeAsync(node, event => progress.push(event.loaded));
+  const preparing = r.renderer.compileComputeAsync(node, event => progress.push(event.loaded));
+  await r.renderer.flush(); await preparing;
   assert.deepEqual(progress, [1]); assert.equal(dispatches(r).length, 0); assert.equal(r.storages.length, 1);
   r.renderer.compute(node); assert.equal(dispatches(r).length, 1); r.renderer.dispose();
 });
