@@ -284,3 +284,78 @@ test("closed render calls, lexical aliases and ordinary DOM attachment remain el
     assert.equal(decision(result).route, "general-webgpu", source);
   }
 });
+
+test("closed local factories retain renderer ownership through calls, returns and canvas parameters", () => {
+  for (const source of [
+    "function make() { return new WebGPURenderer(); } const renderer = make(); renderer.render(scene,camera);",
+    "const make = () => new WebGPURenderer(); make().render(scene,camera);",
+    "const make = function factory() { const value = new WebGPURenderer(); return value; }; const renderer=make(); renderer.render(scene,camera);",
+    "const renderer=(() => new WebGPURenderer())(); renderer.render(scene,camera);",
+    "function make() { const first=new WebGPURenderer(), second=new WebGPURenderer(); return flag?first:second; } make().render(scene,camera);",
+    "const original=new WebGPURenderer(); function identity(value) { return value; } const renderer=identity(original); renderer.render(scene,camera);",
+    "function create(canvas) { return new WebGPURenderer({canvas}); } const canvas=document.createElement('canvas'); const renderer=create(canvas); document.body.appendChild(renderer.domElement);",
+    "const canvas=document.createElement('canvas'); function inner(canvas) { return new WebGPURenderer({canvas}); } function outer(canvas) { return inner(canvas); } outer(canvas).render(scene,camera);",
+    "function canvas() { return document.createElement('canvas'); } function make(element) { return new WebGPURenderer({canvas:element}); } make(canvas()).render(scene,camera);",
+    "function make() { const canvas=document.createElement('canvas'); return new WebGPURenderer({canvas}); } export const draw=()=>make().render(scene,camera);",
+  ]) {
+    const result = analyzeModuleAst(source, moduleUrl);
+    assert.equal(result.routingFacts.hasOpaqueGLEscapes, false, JSON.stringify(result.routingFacts.escapes) + '\n' + source);
+    assert.equal(decision(result).route, "general-webgpu", source);
+  }
+});
+
+test("factory results remain resources at exports, opaque calls, containers, throws and native reads", () => {
+  for (const use of [
+    "plugin(make());", "const renderer=make(); plugin(renderer);", "export const renderer=make();",
+    "export default make();", "const renderer=make(); renderer.getContext();", "const renderer=make(); plugin(renderer.domElement);",
+    "const renderer=make(); renderer.backend.device;", "throw make();", "const box={renderer:make()};",
+    "const list=[make()];", "const renderer=make(); renderer.render=plugin;",
+    "function leak() { return make(); } export {leak};", "register(() => make());",
+  ]) {
+    const source = "function make() { return new WebGPURenderer(); } " + use;
+    const result = analyzeModuleAst(source, moduleUrl);
+    assert.equal(decision(result).route, "exact-backend", source);
+  }
+});
+
+test("escaped, reassigned, recursive, async and dynamically selected factories stay conservative", () => {
+  for (const source of [
+    "export function make() { return new WebGPURenderer(); } make().render(scene,camera);",
+    "export const make=()=>new WebGPURenderer(); make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } export {make}; make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } export {make as default}; make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } export default make; make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } plugin(make); make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } const alias=make; alias().render(scene,camera);",
+    "let make=()=>new WebGPURenderer(); make=plugin; make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } make.call(null).render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } new make().render(scene,camera);",
+    "function make() { if(flag) return make(); return new WebGPURenderer(); } make().render(scene,camera);",
+    "function first() { return second(); } function second() { if(flag) return first(); return new WebGPURenderer(); } first().render(scene,camera);",
+    "async function make() { return new WebGPURenderer(); } (await make()).render(scene,camera);",
+    "function* make() { yield new WebGPURenderer(); } make().next();",
+    "const make=()=>flag?new WebGPURenderer():unknown(); make().render(scene,camera);",
+    "function make() { if(flag) return unknown(); return new WebGPURenderer(); } make().render(scene,camera);",
+    "function make() { let value=new WebGPURenderer(); if(flag) value=unknown(); return value; } make().render(scene,camera);",
+    "function make() { let value=new WebGPURenderer(); if(flag) value=unknown(); return value.domElement; } document.body.appendChild(make());",
+    "function make(...args) { return new WebGPURenderer(); } make().render(scene,camera);",
+    "function make() { return new WebGPURenderer(); } make(...args).render(scene,camera);",
+  ]) assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+});
+
+test("factory canvas provenance includes every call and preserves earlier aliases and opaque observations", () => {
+  for (const setup of [
+    "const canvas=host.canvas; make(canvas);",
+    "const canvas=document.createElement('canvas'); plugin(canvas); make(canvas);",
+    "const canvas=document.createElement('canvas'); const alias=canvas; plugin(canvas); make(alias);",
+    "const canvas=document.createElement('canvas'); make(canvas); make(host.canvas);",
+    "const canvas=document.createElement('canvas'); function getCanvas(){return canvas;} plugin(canvas); make(getCanvas());",
+    "const canvas=document.createElement('canvas'); make(canvas); export {canvas};",
+    "const canvas=document.createElement('canvas'); function nested(canvas){return make(canvas);} plugin(canvas); nested(canvas);",
+  ]) {
+    const source = "function make(canvas) { return new WebGPURenderer({canvas}); } " + setup;
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+  }
+  const source = "const canvas=document.createElement('canvas'); const alias=canvas; plugin(canvas); new WebGPURenderer({canvas:alias});";
+  assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend");
+});

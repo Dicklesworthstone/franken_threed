@@ -61,6 +61,24 @@ test('closed controls aliases, configuration, vector views and DOM attachment pr
     'standalone analysis without the verified graph remains conservative');
 });
 
+test('closed renderer and controls factories preserve the verified canvas connection', () => {
+  const source = imports + `
+    function makeRenderer(canvas) { return new THREE.WebGPURenderer({canvas}); }
+    function makeControls(camera, canvas) { return new Navigation(camera, canvas); }
+    const canvas = document.createElement('canvas');
+    const renderer = makeRenderer(canvas), camera = new THREE.PerspectiveCamera();
+    const controls = makeControls(camera, renderer.domElement);
+    controls.rotateLeft(.25); controls.update(); document.body.appendChild(controls.domElement);
+  `;
+  const facts = analyzeModuleAst(source, 'file:///application.js', {}, contract).routing_facts;
+  assert.deepEqual(facts.escapes, []);
+  assert.equal(decideRendererRoute({constructorName: 'WebGPURenderer', analysis: facts, ...environment}).route, 'general-webgpu');
+  for (const extra of ['plugin(canvas);', 'plugin(controls);', 'export {makeControls};', 'controls.connect(host.canvas);']) {
+    const unsafe = analyzeModuleAst(source + extra, 'file:///application.js', {}, contract).routing_facts;
+    assert.equal(decideRendererRoute({constructorName: 'WebGPURenderer', analysis: unsafe, ...environment}).route, 'exact-backend', extra);
+  }
+});
+
 for (const [name, body] of [
   ['opaque consumer', 'plugin(controls);'],
   ['opaque alias consumer', 'const other = controls; plugin(other);'],

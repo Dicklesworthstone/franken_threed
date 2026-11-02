@@ -589,8 +589,8 @@ const OPAQUE_GL_METHODS = new Set([
 /**
  * A renderer's route must be chosen before an opaque consumer can observe it.
  * Track lexical aliases monotonically: reassignment cannot prove that an earlier
- * consumer lost its reference. Containers, returns and unknown calls are escape
- * boundaries, not invitations to guess what another component will do.
+ * consumer lost its reference. Containers, unclosed returns and unknown calls
+ * are escape boundaries, not invitations to guess what another component will do.
  *
  * Imported consumers remain opaque unless the graph verified their source and
  * dependency contract. Even then their returned resource carriers remain in
@@ -717,6 +717,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       case "AssignmentExpression": value = child(node.right); break;
       case "CallExpression": {
         const callee = node.callee;
+        const helper = localHelper(node);
+        if (closedHelpers.has(helper)) value |= helperReturns.get(helper).reduce((bits, result) => bits | child(result), 0);
         if (callee.type === "MemberExpression" && child(callee.object) & DOM &&
             staticPropertyNames(callee)?.every(name => ["createElement", "createElementNS", "getElementById", "querySelector"].includes(name))) value = DOM;
         if (callee.type === "MemberExpression" && child(callee.object) & RENDERER &&
@@ -745,8 +747,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   // A direct call to an immutable local function is another part of this
   // ownership graph, not an opaque consumer. Flow its actual resources into
   // the lexical parameter cells; the ordinary sinks below then examine the
-  // body, nested calls and closures with the same conservative rules. Returning
-  // a resource still escapes: this does not invent a call-result alias model.
+  // body, nested calls and closures with the same conservative rules. A return
+  // can stay local only when every reference to its function is a proved call.
   const helperTargets = new Map(), helperWrites = new Set(), helperSafety = new WeakMap();
   const patternIdentifiers = pattern => {
     if (!pattern) return [];
@@ -808,14 +810,85 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     }
     return helperSafety.get(fn) ? fn : null;
   };
+  const helperReturns = new Map(), helperCalls = new Map(), helperEdges = new Map();
+  const functionOf = node => {
+    for (let parent = parents.get(node); parent; parent = parents.get(parent))
+      if (functions.has(parent.type)) return parent;
+    return null;
+  };
+  for (const node of nodes) {
+    if (functions.has(node.type)) helperReturns.set(node, node.body.type === "BlockStatement" ? [] : [node.body]);
+  }
+  for (const node of nodes) {
+    if (node.type === "ReturnStatement") helperReturns.get(functionOf(node))?.push(node.argument);
+    const helper = localHelper(node);
+    if (helper) {
+      if (!helperCalls.has(helper)) helperCalls.set(helper, []);
+      helperCalls.get(helper).push(node);
+      const owner = functionOf(node);
+      if (owner) {
+        if (!helperEdges.has(owner)) helperEdges.set(owner, new Set());
+        helperEdges.get(owner).add(helper);
+      }
+    }
+  }
+  const closedHelpers = new Set(helperCalls.keys());
+  for (const helper of closedHelpers) {
+    const parent = parents.get(helper), declaration = parent?.type === "VariableDeclarator" ? parents.get(parent) : helper;
+    const owner = parents.get(declaration);
+    if (owner?.type === "ExportNamedDeclaration" || owner?.type === "ExportDefaultDeclaration" ||
+        !(helper.type === "FunctionDeclaration" || parent?.type === "VariableDeclarator" && parent.id.type === "Identifier" ||
+          parent?.type === "CallExpression" && parent.callee === helper)) closedHelpers.delete(helper);
+  }
+  for (const node of nodes) {
+    // Acorn's reference walk omits export specifier identifiers. They still
+    // publish a callable factory to consumers outside this lexical proof.
+    if (node.type === "ExportNamedDeclaration" && !node.source)
+      for (const specifier of node.specifiers) closedHelpers.delete(helperTargets.get(binding(specifier.local)));
+    if (node.type !== "Identifier") continue;
+    const helper = helperTargets.get(binding(node));
+    if (!closedHelpers.has(helper)) continue;
+    const parent = parents.get(node);
+    const declaration = node === helper.id || parent?.type === "VariableDeclarator" && parent.id === node && parent.init === helper;
+    if (!declaration && !(parent?.type === "CallExpression" && parent.callee === node && localHelper(parent) === helper))
+      closedHelpers.delete(helper);
+  }
+  // Recursive call graphs do not establish a finite return/provenance proof.
+  const acyclic = new Map(), activeHelpers = new Set();
+  const closes = (helper, depth = 0) => {
+    if (depth > 64 || activeHelpers.has(helper)) return false;
+    if (acyclic.has(helper)) return acyclic.get(helper);
+    activeHelpers.add(helper);
+    const result = [...(helperEdges.get(helper) ?? [])].every(child => closes(child, depth + 1));
+    activeHelpers.delete(helper); acyclic.set(helper, result); return result;
+  };
+  for (const helper of closedHelpers) if (!closes(helper)) closedHelpers.delete(helper);
+  const markCanvas = (node, depth = 0) => {
+    if (!node) return;
+    if (depth > 64) { report(node, "canvas-alias-limit"); return; }
+    const visit = value => markCanvas(value, depth + 1);
+    if (node.type === "Identifier") mark(node, CANVAS);
+    else if (node.type === "SequenceExpression") visit(node.expressions.at(-1));
+    else if (node.type === "ConditionalExpression") { visit(node.consequent); visit(node.alternate); }
+    else if (node.type === "LogicalExpression") { visit(node.left); visit(node.right); }
+    else if (node.type === "AssignmentExpression") { visit(node.left); visit(node.right); }
+    else if (node.type === "ChainExpression") visit(node.expression);
+    else if (node.type === "CallExpression" && closedHelpers.has(localHelper(node)))
+      helperReturns.get(localHelper(node)).forEach(visit);
+  };
   // A bounded fixpoint covers aliases assigned before their source declaration,
   // closures and later reassignments without simulating application control flow.
   for (let iteration = 0; iteration < 64; iteration++) {
     changed = false;
     values = new WeakMap();
     for (const node of nodes) {
-      if (node.type === "VariableDeclarator") assign(node.id, kind(node.init));
-      else if (node.type === "AssignmentExpression") assign(node.left, kind(node.right));
+      if (node.type === "VariableDeclarator") {
+        assign(node.id, kind(node.init));
+        if (kind(node.id) & CANVAS) markCanvas(node.init);
+      } else if (node.type === "AssignmentExpression") {
+        assign(node.left, kind(node.right));
+        if (kind(node.left) & CANVAS) markCanvas(node.right);
+      }
       else if (node.type === "NewExpression" && kind(node.callee) & CONSTRUCTOR) {
         const canvas = sourceOptionValue(node.arguments[0], "canvas");
         if (canvas?.type === "Identifier") mark(canvas, CANVAS);
@@ -828,8 +901,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         mark(node.arguments[0], CANVAS);
       }
       const helper = localHelper(node);
-      if (helper) for (let index = 0; index < helper.params.length; index++)
+      if (helper) for (let index = 0; index < helper.params.length; index++) {
         mark(helper.params[index], kind(node.arguments[index]));
+        if (closedHelpers.has(helper) && kind(helper.params[index]) & CANVAS) markCanvas(node.arguments[index]);
+      }
     }
     if (!changed) break;
     if (iteration === 63) report(ast, "alias-analysis-limit");
@@ -857,10 +932,22 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (!origins.has(cell)) origins.set(cell, []);
     origins.get(cell).push(source);
   }
+  for (const helper of closedHelpers) for (const call of helperCalls.get(helper)) {
+    for (let index = 0; index < helper.params.length; index++) {
+      const cell = binding(helper.params[index]);
+      cell.consumerVariable = true;
+      if (!origins.has(cell)) origins.set(cell, []);
+      origins.get(cell).push(call.arguments[index]);
+    }
+  }
   const hostMethods = new Set(["createElement", "createElementNS", "getElementById", "querySelector"]);
   const closedConsumerValue = (node, expected, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = (value, role = expected) => closedConsumerValue(value, role, visiting, depth + 1);
+    if (node.type === "CallExpression" && closedHelpers.has(localHelper(node))) {
+      const results = helperReturns.get(localHelper(node));
+      return results.length > 0 && results.every(value => visit(value));
+    }
     if (node.type === "Identifier") {
       const cell = binding(node);
       if (!origins.has(cell)) return Boolean(cell.consumerSource & expected);
@@ -887,6 +974,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const closedDomValue = (node, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = value => closedDomValue(value, visiting, depth + 1);
+    if (node.type === "CallExpression" && closedHelpers.has(localHelper(node))) {
+      const results = helperReturns.get(localHelper(node));
+      return results.length > 0 && results.every(visit);
+    }
     if (node.type === "Identifier") {
       const cell = binding(node);
       if (!cell.local) return node.name === "document";
@@ -956,6 +1047,31 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "waitForGPU", "getAnimationLoop", "getCurrentViewport",
   ]);
   const hasRenderer = nodes.some(node => node.type === "NewExpression" && kind(node) & RENDERER);
+  const closedReturn = (node, visiting = new Set(), depth = 0) => {
+    if (!node || depth > 64) return false;
+    const visit = value => closedReturn(value, visiting, depth + 1);
+    if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
+    if (node.type === "ChainExpression") return visit(node.expression);
+    if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
+      return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
+    if (node.type === "Identifier") {
+      const cell = binding(node);
+      if (!origins.has(cell) || visiting.has(cell)) return false;
+      visiting.add(cell);
+      const result = origins.get(cell).every(visit);
+      visiting.delete(cell); return result;
+    }
+    if (node.type === "CallExpression" && closedHelpers.has(localHelper(node))) {
+      const results = helperReturns.get(localHelper(node));
+      return results.length > 0 && results.every(visit);
+    }
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
+        staticPropertyNames(node.callee)?.every(name => name === "setMRT")) return visit(node.callee.object);
+    if (node.type === "NewExpression" && kind(node) & (RENDERER | CONTROLS)) return true;
+    if (node.type === "MemberExpression" && staticPropertyNames(node)?.every(name => name === "domElement"))
+      return visit(node.object);
+    return closedDomValue(node);
+  };
   for (const node of nodes) {
     // A retained component contract also depends on its inherited methods and
     // host methods. Keep reflective mutation/code generation outside this slice,
@@ -996,6 +1112,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (kind(node.callee.object) & CONTROLS && (!closedConsumerValue(node.callee.object, CONTROLS) ||
             !staticPropertyNames(node.callee)?.every(name => controlsMethods.has(name))))
           report(node, "opaque-controls-method");
+        if (kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
+          const canvas = node.arguments[0];
+          if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
+            report(node, "opaque-controls-canvas-input");
+        }
         // DOM event callbacks receive the canvas as this/event.target. They are
         // not closed merely because the canvas came from a verified controls.
         if (consumerContract && kind(node.callee.object) & CANVAS) report(node, "opaque-canvas-method");
@@ -1024,7 +1145,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       report(node, "controls-member-write");
     } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" || node.type === "ThrowStatement" ||
         node.type === "ArrowFunctionExpression" && node.body.type !== "BlockStatement") {
-      if (kind(node.argument ?? node.body) & RESOURCE) report(node, node.type === "ThrowStatement" ? "thrown-resource" : "returned-resource");
+      const helper = node.type === "ArrowFunctionExpression" ? node : functionOf(node);
+      const localReturn = (node.type === "ReturnStatement" || node.type === "ArrowFunctionExpression") &&
+        closedHelpers.has(helper) && helperReturns.get(helper).every(value => closedReturn(value));
+      if (kind(node.argument ?? node.body) & RESOURCE && !localReturn)
+        report(node, node.type === "ThrowStatement" ? "thrown-resource" : "returned-resource");
     } else if (node.type === "AssignmentPattern" && kind(node.right) & RESOURCE) {
       report(node, "resource-default-value");
     } else if (node.type === "PropertyDefinition" && kind(node.value) & RESOURCE) {

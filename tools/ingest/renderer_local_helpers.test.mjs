@@ -35,6 +35,8 @@ test('local declarations, lexical functions and immediate callbacks retain the n
     '(function(r) { r.setRenderTarget(target); r.clear(); })(renderer);',
     '((r) => { r.compute(computeNode); r.render(scene, camera); })(renderer);',
     'function ratio(r) { return r.getPixelRatio(); } const value = ratio(renderer);',
+    'function identity(r) { return r; } const local=identity(renderer); local.render(scene,camera);',
+    'const identity = r => r; identity(renderer).render(scene,camera);',
   ]) native(body);
 });
 
@@ -64,8 +66,8 @@ test('ordinary helper bodies still expose native state, canvas and callback esca
     'function draw(r) { plugin(r); } draw(renderer);',
     'function draw(r) { const local = r; plugin(local); } draw(renderer);',
     'function draw(r) { plugin(r.domElement); } draw(renderer);',
-    'function draw(r) { return r; } const exposed = draw(renderer);',
-    'const draw = r => r; draw(renderer);',
+    'function draw(r) { return r; } const exposed = draw(renderer); plugin(exposed);',
+    'const draw = r => r; plugin(draw(renderer));',
     'function draw(r) { return {renderer: r}; } draw(renderer);',
     'function draw(r) { globalThis.activeRenderer = r; } draw(renderer);',
     'function draw(r) { r.getContext(); } draw(renderer);',

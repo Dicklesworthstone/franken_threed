@@ -79,6 +79,40 @@ test("an ordinary WebGPURenderer application is routed and keeps upstream class 
   assert.equal(emitted.REVISION, "186");
 });
 
+test('local renderer factories route through the production builder and preserve construction effects', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+const events=[];
+function create(canvas) {
+  events.push('create');
+  const renderer = new THREE.WebGPURenderer({canvas, get antialias(){events.push('antialias');return false;}});
+  renderer.setSize(40,24,false); return renderer;
+}
+function outer(canvas) { events.push('outer'); return create(canvas); }
+const canvas=document.createElement('canvas');
+const renderer=outer(canvas);
+export const observed=events;
+export const flags=[renderer.isF3DRenderer,renderer.isWebGPURenderer,renderer instanceof THREE.WebGPURenderer,renderer.domElement===canvas];
+export const size=renderer.getSize(new THREE.Vector2()).toArray();
+export const dispose=()=>renderer.dispose();
+`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer:true});
+  const referenceOut = path.join(a.dir, 'reference');
+  const reference = await buildApplication(a.entry, referenceOut);
+  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.decisions[0].route, 'general-webgpu');
+  const previous = globalThis.document;
+  globalThis.document = {createElement: () => ({width: 300, height: 150, style: {}})};
+  let emitted, original;
+  try {
+    original = await import(pathToFileURL(path.join(referenceOut, reference.entryFiles[0])).href);
+    emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.deepEqual(emitted.flags, [true,true,true,true]);
+    assert.deepEqual(emitted.observed, original.observed);
+    assert.deepEqual(emitted.observed.slice(0,2), ['outer','create']);
+    assert.deepEqual(emitted.size, [40,24]);
+  } finally { emitted?.dispose(); globalThis.document=previous; }
+});
+
 for (const inline of [false, true]) test(`mixed source-selected WebGL and native construction preserve option effects with inline=${inline}`, async () => {
   const body = `import * as THREE from 'three/webgpu';
 import {WebGPURenderer as Renderer} from 'three/webgpu';
