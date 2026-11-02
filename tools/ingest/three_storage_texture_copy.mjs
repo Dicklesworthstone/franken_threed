@@ -56,6 +56,11 @@ export function withStorageTextureCopies(Base) {
         const owner = this._storageTextures;
         const copy = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
         request = {issue: () => { owner.copy(copy); }};
+      } else if ((source?.isStorageTexture || targetColor(source)) && destination?.isTexture &&
+          !destination.isStorageTexture && !destination.isRenderTargetTexture && !destination.isDepthTexture && !destination.isFramebufferTexture) {
+        copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
+        this.inspector?.copyTextureToTexture?.(source, destination);
+        return;
       } else if (source?.isTexture && !source.isStorageTexture && !source.isRenderTargetTexture &&
           (destination?.isStorageTexture || destination?.isRenderTargetTexture || destination?.isTexture)) {
         copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);

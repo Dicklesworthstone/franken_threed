@@ -1,8 +1,9 @@
-/** Source sampled pixels -> sampled, shared storage or native target color.
+/** Sampled pixels -> sampled/storage/target, and GPU producers -> sampled.
  * Capture with the existing sampled owner; borrow its native residency only at the renderer's FIFO slot.
  * This layer neither uploads pixels nor changes the source texture/CPU array.
  */
 import {ThreeStorageCopyError, inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
+import {captureTargetColor} from './three_target_texture_copy.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 const EMPTY = Symbol('empty sampled copy');
 
@@ -28,7 +29,7 @@ function captureDestination(renderer, texture, level, inputs) {
     try {
       return {lease, shape: inputs.copyShape(lease),
         check: () => inputs.validateDispatch([lease]),
-        preflight: source => inputs.validateCopyAllocations([source, lease]),
+        preflight: source => inputs.validateCopyAllocations(source ? [source, lease] : [lease]),
         release: () => inputs.release(lease)};
     } catch (error) { inputs.release(lease); throw error; }
   }
@@ -89,23 +90,61 @@ function captureDestination(renderer, texture, level, inputs) {
     release: targets.retainGeneration(entry)};
 }
 
+/** Reuse raw producer ownership: copying a float target or a selected array
+ * slice must not allocate a sampled view, UV replica or another upload pool. */
+function captureProducedSource(renderer, texture) {
+  if (texture?.isStorageTexture) {
+    const storage = renderer._storageTextures;
+    if (!storage) fail('DEVICE', 'Initialize the storage texture owner before copying');
+    const entry = storage.capture(texture);
+    return {shape: entry.shape, check: () => storage.assertCurrent(entry),
+      preflight: () => storage.validateAllocations([entry]),
+      withTexture: run => storage.withTexture(entry, run),
+      validation: () => storage.validation,
+      watch(cancel) {
+        const disposed = () => { try { storage.assertCurrent(entry); } catch (error) { cancel(error); } };
+        texture.addEventListener('dispose', disposed);
+        return () => texture.removeEventListener('dispose', disposed);
+      }};
+  }
+  if (!texture?.isRenderTargetTexture) return null;
+  if (!renderer._targets) fail('DEVICE', 'Initialize the target owner before copying');
+  let release;
+  try {
+    const source = captureTargetColor(renderer, texture, entry => { release = renderer._targets.retainGeneration(entry); });
+    const signal = source.entry.lifetime?.signal;
+    return {...source, release,
+      withTexture: run => renderer._targets.withNativeTexture(source.source, run),
+      validation: () => Promise.all([source.entry.validation, source.entry.storage.validation]),
+      watch(cancel) {
+        const disposed = () => cancel(signal.reason ?? new ThreeStorageCopyError('STALE', 'Source target was disposed'));
+        if (signal?.aborted) disposed(); else signal?.addEventListener('abort', disposed, {once: true});
+        return () => signal?.removeEventListener('abort', disposed);
+      }};
+  } catch (error) { release?.(); throw error; }
+}
+
 export function copySampledTexture(renderer, sourceTexture, destinationTexture,
   region = null, position = null, sourceLevel = 0, destinationLevel = 0, onError = () => {}) {
   const device = renderer._device;
   if (!device || typeof renderer._getSampledTextureInputs !== 'function')
     fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
   const inputs = renderer._getSampledTextureInputs(), signal = renderer._targetLifetime?.signal;
-  let lease, destination, released = false, cancelWait = null;
+  let lease, destination, producer, unwatchProducer, released = false, cancelWait = null;
   const cancelled = () => signal?.reason instanceof Error ? signal.reason
     : new ThreeStorageCopyError('DISPOSED', 'Renderer is disposed');
   const release = () => {
     if (released) return;
     released = true;
     signal?.removeEventListener('abort', abort);
+    unwatchProducer?.(); unwatchProducer = null;
     try { if (lease) inputs.release(lease); }
     finally {
-      try { destination?.release?.(); }
-      finally { cancelWait?.(cancelled()); cancelWait = null; }
+      try { producer?.release?.(); }
+      finally {
+        try { destination?.release?.(); }
+        finally { cancelWait?.(cancelled()); cancelWait = null; }
+      }
     }
   };
   const abort = () => release();
@@ -125,31 +164,57 @@ export function copySampledTexture(renderer, sourceTexture, destinationTexture,
     inputs.captureDispatch(() => {
       check();
       destination = captureDestination(renderer, destinationTexture, destinationLevel, inputs);
-      lease = inputs.captureBinding({texture: sourceTexture, isSampledTexture: true});
-      const sourceShape = inputs.copyShape(lease);
-      if (destination.lease && (sourceShape.viewDimension !== '2d' || sourceLevel !== 0))
+      producer = captureProducedSource(renderer, sourceTexture);
+      if (producer && !destination.lease) fail('SOURCE', 'Raw producers on this path require an ordinary sampled destination');
+      if (!producer) lease = inputs.captureBinding({texture: sourceTexture, isSampledTexture: true});
+      const sourceShape = producer?.shape ?? inputs.copyShape(lease);
+      if (destination.lease && !producer && (sourceShape.viewDimension !== '2d' || sourceLevel !== 0))
         fail('SOURCE', 'Ordinary sampled destinations require a base-level 2D source');
-      const plan = inspectStorageTextureCopy(sourceShape, destination.shape,
-        region, position, sourceLevel, destinationLevel,
-        destination.lease ? inputs.sameTexture(lease, destination.lease) : false);
+      // The pinned native API defaults to base image width/height and ONE
+      // layer, including for a layered or nonzero-mip source. Explicit boxes
+      // address mip-local texels. Never silently substitute a smaller extent.
+      const sourceRegion = producer && region === null ? {isBox2: true,
+        min: {x: 0, y: 0}, max: {x: sourceShape.width, y: sourceShape.height}} : region;
+      const compatible = shape => producer ? {...shape, format: shape.format.replace(/-srgb$/, '')} : shape;
+      const plan = inspectStorageTextureCopy(compatible(sourceShape), compatible(destination.shape),
+        sourceRegion, position, sourceLevel, destinationLevel,
+        destination.lease && lease ? inputs.sameTexture(lease, destination.lease) : false);
       // Roll back a no-op too: its never-uploaded pixels are not a new history.
       if (plan.empty) throw EMPTY;
-      const ready = inputs.preparation(destination.lease ? [lease, destination.lease] : [lease]);
+      const sampled = [lease, destination.lease].filter(Boolean);
+      const ready = inputs.preparation(sampled);
+      unwatchProducer = producer?.watch(rejected);
       signal?.addEventListener('abort', abort, {once: true});
       check();
       const submit = () => {
         try {
-          check(); destination.check(); inputs.validateDispatch([lease]);
+          check(); destination.check(); producer?.check(); if (lease) inputs.validateDispatch([lease]);
           // Check destination budgets before a source upload can issue effects.
           destination.preflight(lease);
+          producer?.preflight();
           const encode = (nativeSource, nativeDestination) => {
             const encoder = device.createCommandEncoder({label: 'f3d-sampled-texture-copy'});
             encoder.copyTextureToTexture({texture: nativeSource, mipLevel: plan.sourceLevel, origin: plan.sourceOrigin},
               {texture: nativeDestination, mipLevel: plan.destinationLevel, origin: plan.destinationOrigin}, plan.size);
             const commands = encoder.finish();
-            check(); destination.check(); inputs.validateDispatch([lease]);
+            check(); destination.check(); producer?.check(); if (lease) inputs.validateDispatch([lease]);
             device.queue.submit([commands]);
           };
+          if (producer) {
+            // User upload callbacks run before either raw GPU borrow. A source
+            // owner closes its validation scopes after the synchronous borrow;
+            // link those already-issued results without waiting for the queue.
+            inputs.resolve(destination.lease);
+            let resolve, reject;
+            const validation = new Promise((yes, no) => { resolve = yes; reject = no; });
+            validation.catch(() => {});
+            try {
+              producer.withTexture(nativeSource => inputs.writeCopyDestination(destination.lease,
+                nativeDestination => encode(nativeSource, nativeDestination), {validation}));
+              resolve(producer.validation());
+            } catch (error) { reject(error); throw error; }
+            return;
+          }
           if (destination.lease) {
             inputs.copyTextures(lease, destination.lease, encode);
             return;

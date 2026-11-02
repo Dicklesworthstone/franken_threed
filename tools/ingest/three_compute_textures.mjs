@@ -673,16 +673,32 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         fail('COPY', 'Expected an owned ordinary sampled destination');
       // Resolve both uploads before borrowing: onUpdate callbacks must not run
       // inside the GPU write's validation scopes or another texture borrow.
-      this.resolve(source); this.resolve(destination);
-      // Both endpoints belong to this pool. Snapshot their issued validation;
-      // a warm patch must not introduce a submitted-work fence of its own.
-      const validation = sourcePool().validation; validation.catch(() => {});
+      this.resolve(source);
+      return this.writeCopyDestination(destination, nativeDestination => {
+        validate(source);
+        const result = run(sourcePool().nativeTexture(source.record.texture), nativeDestination);
+        validate(source); return result;
+      });
+    },
+    /** A raw producer can write the SAME residency used by material, compute
+     * and bundle reads. Its owner keeps the native source and validation; this
+     * pool owns destination initialization, detachment and all later pixels. */
+    writeCopyDestination(destination, run, {validation: sourceValidation} = {}) {
+      live(); validate(destination);
+      if (!destination.record.privateDestination || typeof run !== 'function')
+        fail('COPY', 'Expected an owned ordinary sampled destination');
+      if (resolving) fail('REENTRY', 'Cannot write during another native texture operation');
+      this.resolve(destination);
+      // Snapshot issued upload validation before entering the write scope. No
+      // per-copy completion fence, and no dependency on this write's own scope.
+      const validation = sourceValidation ? Promise.all([sourcePool().validation, sourceValidation]) : sourcePool().validation;
+      validation.catch(() => {});
       resolving = true;
       try {
         return sourcePool().writeTexture(destination.record.texture, nativeDestination => {
-          validate(source); validate(destination);
-          const result = run(sourcePool().nativeTexture(source.record.texture), nativeDestination);
-          live(); validate(source); validate(destination); return result;
+          validate(destination);
+          const result = run(nativeDestination);
+          live(); validate(destination); return result;
         }, {validation});
       } finally { resolving = false; if (poolDirty) syncPool(); }
     },

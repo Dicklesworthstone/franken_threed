@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createGpuThreeTextures} from './three_textures.mjs';
 import {createThreeComputeTextures} from './three_compute_textures.mjs';
+import {createThreeStorageTextures} from './three_storage_textures.mjs';
 import {copyFixtures} from './three_sampled_copy_fixtures.mjs';
 import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
-import {cubeCopyFixture, box, point, checkRegion} from './three_cube_target_copy_fixtures.mjs';
+import {cubeCopyFixture, box, point, checkRegion, pattern, failure, deferred} from './three_cube_target_copy_fixtures.mjs';
 
 function setup(t) {
   const fixture = copyFixtures();
@@ -17,8 +18,9 @@ function setup(t) {
 
 /** Production public facade, sampled upload owner and target owner. Only the
  * device records byte copies; no GPU shader or browser-pixel claim is made. */
-function cubeSetup(t, {native = true} = {}) {
-  const f = cubeCopyFixture(), {T, storage} = copyFixtures(), {device} = f;
+function cubeSetup(t, {native = true, producers = false, storageOptions = {}, poolOptions = {}} = {}) {
+  const f = cubeCopyFixture(), {T, storage: stub} = copyFixtures(), {device} = f;
+  const storage = producers ? createThreeStorageTextures(T, {getDevice: () => device, ...storageOptions}) : stub;
   device.lost = new Promise(() => {});
   device.createSampler = descriptor => ({descriptor});
   const allocate = device.createTexture;
@@ -36,20 +38,22 @@ function cubeSetup(t, {native = true} = {}) {
     }
     f.events.push('upload');
   };
+  let pool;
   const inputs = createThreeComputeTextures({storage,
-    poolFactory: options => createGpuThreeTextures(device, {three: T, nativeCube: native, nativeMedia: native, ...options})});
+    poolFactory: options => pool = createGpuThreeTextures(device, {three: T, nativeCube: native, nativeMedia: native, ...options, ...poolOptions})});
   class Base {
     constructor() {
       Object.assign(this, f.renderer); this.isWebGPURenderer = this._initialized = true;
+      if (producers) this._storageTextures = storage;
       this.inspections = []; this.inspector = {copyTextureToTexture: (...args) => this.inspections.push(args)};
     }
     _getSampledTextureInputs() { return inputs; }
     async waitForGPU() { await inputs.whenIdle(); await f.targets.whenIdle(); }
-    dispose() { inputs.dispose(); f.targets.dispose(); }
+    dispose() { inputs.dispose(); f.targets.dispose(); if (producers) storage.dispose(); }
   }
   const renderer = new (withStorageTextureCopies(Base))();
   t.after(() => renderer.dispose());
-  return {...f, T, inputs, renderer};
+  return {...f, T, inputs, renderer, storage, get pool() { return pool; }};
 }
 
 for (const [type, depth, first, count] of [['DataTexture', 1, 0, 1], ['DataArrayTexture', 6, 0, 6], ['Data3DTexture', 4, 1, 2]])
@@ -436,4 +440,163 @@ test('queued ordinary destination disposal invalidates copies and permits fresh 
   const lease = f.inputs.captureBinding({texture: destination, isSampledTexture: true});
   assert.deepEqual(f.inputs.resolve(lease).texture.levels[0].data, rgba([1, 2, 3, 4]));
   f.inputs.release(lease);
+});
+
+function gpuSource(f, {dimension = '2d', width = 4, height = width, depth = 4, mips = false} = {}) {
+  const texture = new f.T.Texture(undefined, width, height, dimension === '2d' ? undefined : depth);
+  texture.isStorageTexture = true; texture.isArrayTexture = dimension === '2d-array'; texture.is3DTexture = dimension === '3d';
+  texture.generateMipmaps = mips; texture.mipmapsAutoUpdate = false;
+  return texture;
+}
+function storageNative(f, texture) { return f.storage.withTexture(f.storage.capture(texture), value => value); }
+function targetNative(f, source, index = 0) {
+  const captured = f.targets.captureNativeTexture(source.target.textures[index], {sampled: false});
+  let native; f.targets.withNativeTexture(captured, value => { native = value; }); return native;
+}
+
+test('storage producers patch the same ordinary residency used by sampled consumers and Source aliases', async t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {width: 2}), nativeSource = storageNative(f, source);
+  const destination = new f.T.DataTexture(rgba(Array(16).fill(7)), 4, 4);
+  const alias = new f.T.DataTexture(null); alias.source = destination.source;
+  const original = sampledNative(f, destination); sampledNative(f, alias);
+  const cpu = destination.image.data.slice(); let fences = 0;
+  f.device.queue.onSubmittedWorkDone = async () => { fences++; };
+  nativeSource.levels[0].data.set(rgba([11, 12, 13, 14]));
+  assert.equal(f.renderer.copyTextureToTexture(source, destination, null, point(1, 1, 0)), undefined);
+  const copied = sampledNative(f, destination), allocated = f.textures.length, commands = f.commands.length;
+  assert.notEqual(copied, original);
+  assert.deepEqual(copied.levels[0].data, rgba([7, 7, 7, 7, 7, 11, 12, 7, 7, 13, 14, 7, 7, 7, 7, 7]));
+  nativeSource.levels[0].data.set(rgba([21, 22, 23, 24]));
+  f.renderer.copyTextureToTexture(source, destination, null, point(0, 0, 0));
+  assert.equal(sampledNative(f, destination), copied); assert.equal(f.textures.length, allocated);
+  assert.equal(f.commands.length, commands + 1, 'a warm producer patch encodes only the requested raw copy');
+  assert.deepEqual(copied.levels[0].data, rgba([21, 22, 7, 7, 23, 24, 12, 7, 7, 13, 14, 7, 7, 7, 7, 7]));
+  assert.equal(sampledNative(f, alias), original); assert.deepEqual(original.levels[0].data, cpu);
+  assert.deepEqual(destination.image.data, cpu); assert.equal(destination.version, 1); assert.equal(fences, 0);
+  await f.renderer.waitForGPU();
+});
+
+for (const dimension of ['2d', '2d-array', '3d']) test(`storage ${dimension} source copies one explicit mip-local plane into ordinary 2D`, async t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {dimension, mips: true});
+  const nativeSource = storageNative(f, source); pattern(nativeSource);
+  const destination = new f.T.DataTexture(new Uint8Array(4 * 4 * 4).fill(213), 4, 4);
+  const z = dimension === '2d' ? 0 : 1;
+  f.renderer.copyTextureToTexture(source, destination, box(0, 0, z, 2, 2, 1), point(1, 1, 0), 1);
+  const copied = sampledNative(f, destination);
+  checkRegion(nativeSource, copied, {sourceLevel: 1, sourceOrigin: [0, 0, z], destinationOrigin: [1, 1, 0], size: [2, 2, 1]});
+  assert.equal(f.commands.at(-1).from.texture, nativeSource);
+  assert.equal(f.textures.length, 2, 'raw source is shared with compute, not copied into an upload replica');
+  await f.renderer.waitForGPU();
+});
+
+for (const options of [
+  {dimension: '2d', mips: 1},
+  {dimension: '2d', mips: 1, count: 2},
+  {dimension: 'cube', mips: 3},
+  {dimension: '2d-array', depth: 3, mips: 3},
+  {dimension: '3d', depth: 4, mips: 3},
+]) test(`target ${options.dimension}/${options.count ?? 1} color feeds an ordinary destination from native storage`, async t => {
+  const f = cubeSetup(t, {producers: true}), source = f.target(options), index = (options.count ?? 1) - 1;
+  const nativeSource = targetNative(f, source, index); pattern(nativeSource, 41);
+  const destination = new f.T.DataTexture(new Uint8Array(4 * 4 * 4).fill(213), 4, 4);
+  const level = options.mips > 1 ? 1 : 0, z = options.dimension === '2d' ? 0 : 1;
+  f.renderer.copyTextureToTexture(source.target.textures[index], destination, box(0, 0, z, 2, 2, 1), point(1, 1, 0), level);
+  checkRegion(nativeSource, sampledNative(f, destination), {sourceLevel: level, sourceOrigin: [0, 0, z],
+    destinationOrigin: [1, 1, 0], size: [2, 2, 1]});
+  assert.equal(f.commands.at(-1).from.texture, nativeSource); assert.equal(source.entry.references, 0);
+  assert.equal(source.entry.colorSamples.size, 0, 'a raw copy never requests target sampling replicas');
+  assert.equal(f.textures.length, (options.count ?? 1) + 1);
+  await f.renderer.waitForGPU();
+});
+
+test('view-compatible sRGB target bytes reach an ordinary linear allocation without conversion', async t => {
+  const f = cubeSetup(t, {producers: true}), source = f.target({dimension: '2d', mips: 1, format: 'rgba8unorm-srgb'});
+  const nativeSource = targetNative(f, source); pattern(nativeSource);
+  const destination = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  f.renderer.copyTextureToTexture(source.texture, destination);
+  assert.deepEqual(sampledNative(f, destination).levels[0].data, nativeSource.levels[0].data);
+  assert.equal(f.commands.at(-1).from.texture.descriptor.format, 'rgba8unorm-srgb');
+  assert.equal(f.commands.at(-1).to.texture.descriptor.format, 'rgba8unorm');
+  await f.renderer.waitForGPU();
+});
+
+test('native omitted regions copy only the first layer and retain the source base-image extent', t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {dimension: '2d-array', mips: true});
+  const nativeSource = storageNative(f, source); pattern(nativeSource);
+  const destination = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  f.renderer.copyTextureToTexture(source, destination);
+  checkRegion(nativeSource, sampledNative(f, destination), {size: [4, 4, 1]});
+  assert.deepEqual(f.commands.at(-1).size, [4, 4, 1]);
+  const before = f.commands.length;
+  assert.throws(() => f.renderer.copyTextureToTexture(source, destination, null, null, 1), {code: 'THREE_STORAGE_COPY_BOUNDS'});
+  assert.equal(f.commands.length, before, 'nonzero source mip cannot silently shrink an omitted source region');
+});
+
+test('queued producer copies observe GPU bytes at their FIFO position and freeze boxes and destination initialization', async t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {width: 2}), nativeSource = storageNative(f, source);
+  const destination = new f.T.DataTexture(rgba([1, 2, 3, 4]), 2, 2), region = box(0, 0, 0, 1, 1, 1), position = point(0, 0, 0);
+  const enqueue = value => f.renderer._enqueue({issue() { nativeSource.levels[0].data.set(rgba([value, value + 1, value + 2, value + 3])); }, resolve() {}, reject: assert.fail});
+  f.renderer._preparing = true;
+  enqueue(31); f.renderer.copyTextureToTexture(source, destination, region, position);
+  enqueue(61); position.x = 1; f.renderer.copyTextureToTexture(source, destination, region, position);
+  position.x = 99; region.min.x = 99; destination.image.data.fill(199);
+  assert.equal(f.commands.length, 0); f.flush();
+  assert.deepEqual(sampledNative(f, destination).levels[0].data, rgba([31, 61, 3, 4]));
+  assert.equal(f.commands.length, 2); await f.renderer.waitForGPU();
+});
+
+test('producer profile and both owner budgets reject before either side allocates', t => {
+  for (const kind of ['route', 'bounds', 'format', 'source-budget', 'destination-budget', 'source-mip', 'destination-mip']) {
+    const f = cubeSetup(t, {producers: true, storageOptions: kind === 'source-budget' ? {maxBytes: 4} : {},
+      poolOptions: kind === 'destination-budget' ? {maxTextureBytes: 4} : {}});
+    const source = gpuSource(f, {width: 2}), destination = new f.T.DataTexture(new Uint8Array(16), 2, 2);
+    if (kind === 'route') f.renderer._shaderEncodedOutput = true;
+    if (kind === 'format') { destination.type = f.T.HalfFloatType; destination.image.data = new Uint16Array(16); }
+    assert.throws(() => f.renderer.copyTextureToTexture(source, destination, null,
+      kind === 'bounds' ? point(1, 0, 0) : null, kind === 'source-mip' ? 1 : 0, kind === 'destination-mip' ? 1 : 0), undefined, kind);
+    assert.equal(f.textures.length, 0, kind); assert.equal(f.commands.length, 0, kind);
+    assert.equal(f.inputs.diagnostics.versions, 0, kind);
+  }
+});
+
+for (const kind of ['storage', 'target']) test(`${kind} producer disposal cancels queued sampled copies without submitting`, async t => {
+  const f = cubeSetup(t, {producers: true}), source = kind === 'storage' ? gpuSource(f) : f.target({dimension: '2d', mips: 1});
+  const texture = kind === 'storage' ? source : source.texture;
+  const destination = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  f.renderer._preparing = true; f.renderer.copyTextureToTexture(texture, destination);
+  source.dispose();
+  if (kind === 'target') assert.equal(source.entry.references, 0);
+  f.flush(); assert.equal(f.commands.length, 0); assert.equal(f.textures.length, 0);
+  await assert.rejects(f.renderer.waitForGPU());
+});
+
+test('a rejected queued target copy rolls back sampled history and releases the source generation', t => {
+  const f = cubeSetup(t, {producers: true}), source = f.target({dimension: '2d', mips: 1});
+  const destination = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  f.renderer._preparing = true; f.renderer.queueError = failure('FULL'); f.renderer._enqueue = () => { throw f.renderer.queueError; };
+  assert.throws(() => f.renderer.copyTextureToTexture(source.texture, destination), {code: 'FULL'});
+  assert.equal(source.entry.references, 0); assert.equal(f.textures.length, 0); assert.equal(f.commands.length, 0);
+  assert.equal(f.inputs.diagnostics.versions, 0); assert.equal(f.inputs.isCopyDestination(destination), false);
+});
+
+test('producer validation reaches sampled completion without a queue fence', async t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {width: 2});
+  const destination = new f.T.DataTexture(new Uint8Array(16), 2, 2), prior = deferred();
+  const validation = Object.getOwnPropertyDescriptor(f.storage, 'validation').get;
+  Object.defineProperty(f.storage, 'validation', {get() { return Promise.all([validation.call(this), prior.promise]); }});
+  f.device.queue.onSubmittedWorkDone = () => { throw new Error('Copy inserted a queue completion fence'); };
+  f.renderer.copyTextureToTexture(source, destination);
+  const copied = f.pool.validation;
+  prior.reject(failure('PRODUCER_GPU'));
+  await assert.rejects(copied, {code: 'PRODUCER_GPU'});
+  f.device.queue.onSubmittedWorkDone = async () => {};
+});
+
+test('source resize before a queued copy rejects without allocating the sampled destination', async t => {
+  const f = cubeSetup(t, {producers: true}), source = gpuSource(f);
+  const destination = new f.T.DataTexture(new Uint8Array(64), 4, 4);
+  f.renderer._preparing = true; f.renderer.copyTextureToTexture(source, destination);
+  source.image.width = 8; f.flush();
+  assert.equal(f.textures.length, 0); assert.equal(f.commands.length, 0);
+  await assert.rejects(f.renderer.waitForGPU(), {code: 'THREE_STORAGE_TEXTURE_STALE'});
 });

@@ -7,7 +7,7 @@ import {inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
 import {captureTextureCopy} from './three_texture_copy_lifetime.mjs';
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 
-function targetColor(renderer, texture, retain) {
+export function captureTargetColor(renderer, texture, retain) {
   const targets = renderer._targets, device = renderer._device;
   const target = targets.getTextureTarget(texture);
   if (!texture?.isRenderTargetTexture || texture.isDepthTexture || !target)
@@ -67,7 +67,7 @@ export function captureTargetToStorageCopy(renderer, texture, destinationTexture
   if (!targets || !storage || !device) fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
   return captureTextureCopy(renderer, retain => {
     if (!destinationTexture?.isStorageTexture) fail('SOURCE', 'Expected a storage texture destination');
-    const source = targetColor(renderer, texture, retain), destination = storage.capture(destinationTexture);
+    const source = captureTargetColor(renderer, texture, retain), destination = storage.capture(destinationTexture);
     const plan = inspectStorageTextureCopy(source.shape, destination.shape, region, position, sourceLevel, destinationLevel);
     const write = plan.empty ? null : storage.captureBinding({texture: destinationTexture,
       isSampledTexture: true, store: true, access: 'writeOnly', mipLevel: destinationLevel});
@@ -100,7 +100,7 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
   if (!targets || !storage || !device) fail('DEVICE', 'Initialize the renderer and its texture owners before copying');
   return captureTextureCopy(renderer, retain => {
     if (!texture?.isStorageTexture) fail('SOURCE', 'Expected a storage texture source');
-    const destination = targetColor(renderer, destinationTexture, retain);
+    const destination = captureTargetColor(renderer, destinationTexture, retain);
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Storage copies require a single-sample target destination');
     // Explicitly authored levels already share this native allocation. Never
     // write a derived level: the next automatic mip refresh would overwrite it.
@@ -143,7 +143,7 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
   const targets = renderer._targets, device = renderer._device;
   if (!targets || !device) fail('DEVICE', 'Initialize the renderer and its target owner before copying');
   return captureTextureCopy(renderer, retain => {
-    const source = targetColor(renderer, texture, retain), destination = targetColor(renderer, destinationTexture, retain);
+    const source = captureTargetColor(renderer, texture, retain), destination = captureTargetColor(renderer, destinationTexture, retain);
     if (source.entry === destination.entry || source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup)
       fail('FEEDBACK', 'In-place target color copies are not admitted');
     if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
