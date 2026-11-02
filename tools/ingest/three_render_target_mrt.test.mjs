@@ -27,6 +27,135 @@ function target(samples = 0) {
 }
 const destroyed = textures => textures.forEach(texture => assert.equal(texture.destroyed, 1));
 
+function sampledFixture(options = {}) {
+  const f = fixture({flipY: true, ...options});
+  f.device.createRenderPipeline = descriptor => {
+    f.calls.pipelines.push(descriptor);
+    return {...descriptor, getBindGroupLayout() {return {};}};
+  };
+  f.device.createSampler = descriptor => descriptor;
+  f.device.queue.writeTexture = () => {};
+  return f;
+}
+function sampledTarget(samples = 0) {
+  const target = new T.WebGLRenderTarget(16, 8, {count: 2, depthBuffer: false, samples});
+  target.textures[1].type = T.HalfFloatType;
+  return target;
+}
+
+for (const samples of [0, 4]) test(`WebGL MRT sampling borrows each resolved attachment with its own precision (${samples})`, async () => {
+  const f = sampledFixture(), target = sampledTarget(samples), entry = f.owner.capture(target);
+  const textures = target.textures.slice(), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, () => {});
+  const primary = bindings.get(textures[0]), secondary = bindings.get(textures[1]);
+  assert.notEqual(primary.view.texture, secondary.view.texture);
+  assert.deepEqual([primary.view.texture.format, secondary.view.texture.format], ['rgba8unorm', 'rgba16float']);
+  const replicas = [entry, entry.colorSamples.get(1)];
+  entry.storage.withTexture(source => assert.equal(replicas[1].group.entries[0].resource.texture, source), {colorIndex: 1});
+  entry.storage.withTexture(source => assert.equal(replicas[0].group.entries[0].resource.texture, source));
+  assert.deepEqual(replicas.map(sample => sample.copies), [1, 1]);
+  assert.equal(f.owner.allocatedBytes, entry.shape.bytes + 16 * 8 * 12);
+  const before = f.calls.textures.length;
+  assert.equal(bindings.get(textures[1]).view, secondary.view);
+  assert.equal(f.calls.textures.length, before); assert.equal(replicas[1].copies, 1);
+  assert.deepEqual(target.textures, textures);
+  await entry.validation; f.owner.dispose(); await entry.storage?.whenIdle();
+  assert.equal(primary.view.texture.destroyed, 1); assert.equal(secondary.view.texture.destroyed, 1);
+});
+
+test('selected MRT uploads refresh only the changed sampling replica', async () => {
+  const f = sampledFixture(), target = sampledTarget(), entry = f.owner.capture(target), bindings = f.owner.bindingsFor();
+  bindings.get(target.texture); bindings.get(target.textures[1]);
+  f.owner.writePixels(entry, new Uint16Array(16 * 8 * 4), {colorIndex: 1});
+  assert.equal(entry.dirty, false); assert.equal(entry.colorSamples.get(1).dirty, true);
+  bindings.get(target.texture); bindings.get(target.textures[1]);
+  assert.deepEqual([entry.copies, entry.colorSamples.get(1).copies], [1, 2]);
+  f.owner.render(entry, () => {});
+  assert.equal(entry.dirty, true); assert.equal(entry.colorSamples.get(1).dirty, true);
+  await entry.validation; f.owner.dispose();
+});
+
+test('secondary sampling retains target lifetime, rejects feedback, and releases its replica after a resize', async () => {
+  const f = sampledFixture(), target = sampledTarget(), entry = f.owner.capture(target);
+  assert.throws(() => f.owner.bindingsFor(target).get(target.textures[1]), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.equal(f.calls.textures.length, 0);
+  const binding = f.owner.bindingsFor().get(target.textures[1]), release = binding.retain();
+  target.setSize(8, 4);
+  assert.throws(binding.validate, {code: 'THREE_TARGET_STALE'});
+  assert.equal(binding.view.texture.destroyed, 0);
+  const next = f.owner.bindingsFor().get(target.textures[1]);
+  assert.equal(next.view.texture.width, 8); assert.notEqual(next.view, binding.view);
+  release(); assert.equal(binding.view.texture.destroyed, 1);
+  await entry.validation; f.owner.dispose(); assert.equal(next.view.texture.destroyed, 1);
+});
+
+test('MRT replicas charge selected format bytes and enforce the shared target budget', () => {
+  const target = sampledTarget(), bytes = 16 * 8;
+  const f = sampledFixture({maxBytes: bytes * (12 + 4 + 8) - 1}), bindings = f.owner.bindingsFor();
+  const primary = bindings.get(target.texture), allocated = f.owner.allocatedBytes;
+  assert.throws(() => bindings.get(target.textures[1]), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.owner.allocatedBytes, allocated);
+  assert.equal(bindings.get(target.texture).view, primary.view);
+  f.owner.dispose(); assert.equal(f.owner.allocatedBytes, 0);
+});
+
+test('secondary float32 orientation uses an unfilterable binding without reducing precision', async () => {
+  const f = sampledFixture(), target = sampledTarget();
+  Object.assign(target.textures[1], {type: T.FloatType, minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+  const binding = f.owner.bindingsFor().get(target.textures[1]), entry = f.owner.capture(target);
+  assert.equal(binding.sampleType, 'unfilterable-float'); assert.equal(binding.view.texture.format, 'rgba32float');
+  const layout = f.calls.pipelines[0].layout.bindGroupLayouts[0].entries[0];
+  assert.equal(layout.texture.sampleType, 'unfilterable-float');
+  assert.equal(f.owner.allocatedBytes, entry.shape.bytes + 16 * 8 * 16);
+  await entry.validation; f.owner.dispose();
+});
+
+for (const layered of [false, true]) test(`each WebGL MRT attachment retains its own setup sampler until recreation (layered=${layered})`, async () => {
+  const f = sampledFixture(); f.device.limits.maxTextureArrayLayers = 256;
+  const target = layered ? new T.WebGLArrayRenderTarget(8, 4, 2, {count: 2, depthBuffer: false}) : sampledTarget();
+  if (layered) {
+    target.textures[1] = target.texture.clone(); target.textures[1].isRenderTargetTexture = true;
+    target.textures[1].renderTarget = target;
+  }
+  Object.assign(target.texture, {minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+  Object.assign(target.textures[1], {minFilter: T.LinearFilter, magFilter: T.LinearFilter, wrapS: T.RepeatWrapping, anisotropy: 8});
+  f.owner.capture(target);
+  const bindings = f.owner.bindingsFor(), primary = bindings.get(target.texture), secondary = bindings.get(target.textures[1]);
+  assert.equal(primary.sampler.magFilter, 'nearest'); assert.equal(primary.sampler.addressModeU, 'clamp-to-edge');
+  assert.equal(secondary.sampler.magFilter, 'linear'); assert.equal(secondary.sampler.addressModeU, 'repeat');
+  assert.equal(secondary.sampler.maxAnisotropy, 1);
+  Object.assign(target.textures[1], {minFilter: T.NearestFilter, magFilter: T.NearestFilter, wrapS: T.ClampToEdgeWrapping});
+  target.textures[1].needsUpdate = true;
+  assert.equal(bindings.get(target.textures[1]).sampler, secondary.sampler);
+  target.setSize(4, 4, layered ? 2 : 1);
+  const recreated = bindings.get(target.textures[1]);
+  assert.equal(recreated.sampler.magFilter, 'nearest'); assert.equal(recreated.sampler.addressModeU, 'clamp-to-edge');
+  await f.owner.whenIdle(); f.owner.dispose();
+});
+
+test('WebGL MRT refuses authored framebuffer arrays before native allocation', () => {
+  const f = sampledFixture(), target = sampledTarget();
+  target.texture.mipmaps = [{width: 16, height: 8}];
+  assert.throws(() => f.owner.capture(target), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(f.calls.textures.length, 0); f.owner.dispose();
+});
+
+test('unresolved WebGL MSAA clears preserve sampled attachments until the next render', async () => {
+  const f = sampledFixture(), target = sampledTarget(4), entry = f.owner.capture(target), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, frame => assert.equal(frame.resolveTargets.length, 2));
+  bindings.get(target.texture); bindings.get(target.textures[1]);
+  f.owner.render(entry, frame => {
+    assert.equal(frame.colorViews.length, 2); assert.equal(frame.colorViews[0].texture.sampleCount, 4);
+    assert.equal(frame.resolveTarget, undefined); assert.equal(frame.resolveTargets, undefined);
+  }, {resolveColor: false});
+  bindings.get(target.texture); bindings.get(target.textures[1]);
+  assert.deepEqual([entry.copies, entry.colorSamples.get(1).copies], [1, 1]);
+  f.owner.render(entry, frame => assert.equal(frame.resolveTargets.length, 2));
+  bindings.get(target.texture); bindings.get(target.textures[1]);
+  assert.deepEqual([entry.copies, entry.colorSamples.get(1).copies], [2, 2]);
+  await f.owner.whenIdle(); f.owner.dispose();
+});
+
 for (const sampleCount of [1, 4]) test(`MRT shares depth and resolves each of ${sampleCount} color samples independently`, async () => {
   const f = fixture(), formats = ['rgba16float', 'rgba8unorm'];
   const raw = createGpuRenderTarget(f.device, {width: 16, height: 8, colorFormats: formats, sampleCount, sampleDepth: true});

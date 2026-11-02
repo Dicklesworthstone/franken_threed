@@ -1463,7 +1463,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               (!this._shaderEncodedOutput && destination.shape.sharedDepth ||
                 outputPass && sourceTarget !== null && !copiedDepth);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer), {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps});
+            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer),
+              {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps,
+                resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape.sampleCount > 1)});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth && (!destination.shape.sharedDepth || !clearOnly))

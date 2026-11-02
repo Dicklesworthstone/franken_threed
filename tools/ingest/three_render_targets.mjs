@@ -93,6 +93,12 @@ function depthComparison(texture, three) {
   return compare;
 }
 
+function captureWebGLTargetSampler(texture, volume = false) {
+  return Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
+    wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy,
+    ...(volume ? {isData3DTexture: true, wrapR: texture.wrapR} : {})});
+}
+
 function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null, mipProfile = null) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const webglCube = target.isWebGLCubeRenderTarget === true;
@@ -259,9 +265,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, baseColorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
-    ...(webglArray || webglVolume ? {webglSampler: Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
-      wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy,
-      ...(webglVolume ? {isData3DTexture: true, wrapR: texture.wrapR} : {})})} : {}),
+    ...(webglArray || webglVolume ? {webglSampler: captureWebGLTargetSampler(texture, webglVolume)} : {}),
     cube, webglCube, webglArray, webglVolume, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     sourceVersion: texture.version,
@@ -413,6 +417,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         }
       } else entry.storage?.dispose();
       entry.sample?.destroy(); entry.depthSample?.destroy();
+      for (const sample of entry.colorSamples.values()) sample.sample?.destroy();
+      entry.colorSamples.clear();
       allocatedBytes -= entry.charged; entry.charged = 0;
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
       entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = null;
@@ -531,6 +537,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       target.textures.every(texture => group.mipProfiles.get(texture)?.sourceVersion === texture.version);
     const shape = inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null,
       colorMipProfiles: frozenHistory ? base.colors : frozenMrt ? entry.shape.colors : null});
+    if (flipY && shape.textures.length > 1) for (const color of shape.colors)
+      color.webglSampler ??= captureWebGLTargetSampler(color.texture, color.webglVolume);
     // The source keeps each initialized image's mip allocation until its texture
     // version changes. Per-render generation flags are separately captured by
     // the facade; editing a flag must not replace previous rendered contents.
@@ -541,7 +549,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function capture(target, {initialize = false} = {}) {
     live();
     const shape = sourceShape(target);
-    if (flipY && shape.textures.length > 1 && shape.colors.some(color => color.mipLevelCount > 1 || color.generateMipmaps))
+    if (flipY && shape.textures.length > 1 && shape.colors.some(color => color.mipLevelCount > 1 || color.generateMipmaps || color.texture.mipmaps.length > 0))
       fail('UNSUPPORTED', 'MRT mip pyramids currently require the native WebGPU renderer surface');
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
       const owner = ownedColorTargets.get(texture);
@@ -592,7 +600,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
       references: 0, sourceShape: null, retirement: null, cubeInitialized: false,
       cubeMipReady: !shape.webglCube || shape.mipLevelCount === 1 || shape.generateMipmaps || shape.authoredMipLevelCount === shape.mipLevelCount,
-      dirty: true, copies: 0, depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
+      dirty: true, copies: 0, colorSamples: new Map(), depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
     for (const texture of shape.textures) texture.addEventListener('dispose', entry.onDispose);
@@ -655,7 +663,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       group.onDispose = () => retireHistory(group);
       historyGroups.set(target, group);
       if (existing?.alive) {
-        if (existing.sample || existing.depthSample) fail('UNSUPPORTED', 'Pass histories require native attachment sampling');
+        if (existing.sample || existing.colorSamples.size || existing.depthSample) fail('UNSUPPORTED', 'Pass histories require native attachment sampling');
         existing.historyGroup = group; existing.colorSlots = Object.freeze(shape.textures.map(() => 0));
         group.entries.add(existing); historyEntries.add(existing); group.variants.set(existing.colorSlots.join(','), existing);
         group.storage = existing.storage; group.charged = existing.charged; existing.charged = 0; existing.storage = null;
@@ -788,7 +796,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // Pinned WebGL setup only applies anisotropy with mip-linear minification.
     // Layered targets retain that initialized sampler until recreation, even
     // when their source texture later changes its filtering or needsUpdate.
-    if (!native && (shape.webglArray || shape.webglVolume) &&
+    if (!native && shape.webglSampler &&
         ![three.NearestMipmapLinearFilter, three.LinearMipmapLinearFilter].includes(samplerState.minFilter))
       descriptor.maxAnisotropy = 1;
     if (shape.cube && !shape.webglCube || native && (shape.volume || entry.historyGroup) ||
@@ -813,35 +821,41 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function sampling(entry, texture) {
     assertCurrent(entry);
-    if (entry.shape.cube && !entry.shape.webglCube || entry.shape.array && !entry.shape.webglArray || entry.shape.volume && !entry.shape.webglVolume)
+    const colorIndex = entry.shape.textures.indexOf(texture), shape = entry.shape.colors[colorIndex];
+    if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
+    if (shape.cube && !shape.webglCube || shape.array && !shape.webglArray || shape.volume && !shape.webglVolume)
       fail('UNSUPPORTED', 'Native layered target color sampling requires native texture bindings');
-    if (entry.shape.webglVolume && entry.shape.mipLevelCount !== 1)
+    if (shape.webglVolume && shape.mipLevelCount !== 1)
       fail('UNSUPPORTED', 'WebGL volume sampling requires a single allocated base level');
     if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
-    // Source setTexture2DArray/3D skip uploads for render-target textures, even
+    // Source setTexture2D/2DArray/3D skip uploads for render-target textures, even
     // after needsUpdate. Their setup sampler survives until target recreation.
-    const samplerState = entry.shape.webglSampler ?? texture;
+    const samplerState = shape.webglSampler ?? texture;
     const {descriptor, sampleType} = colorSampler(entry, texture, samplerState, {native: false});
-    if ((entry.shape.webglArray || entry.shape.webglVolume) && entry.shape.mipLevelCount !== entry.shape.maximumMipLevels &&
+    if ((shape.webglArray || shape.webglVolume || flipY && entry.shape.textures.length > 1) && shape.mipLevelCount !== shape.maximumMipLevels &&
         ![three.NearestFilter, three.LinearFilter].includes(samplerState.minFilter))
-      fail('UNSUPPORTED', 'Mip-filtered WebGL layered targets require a complete source mip chain');
-    if (entry.shape.webglCube && descriptor.lodMaxClamp > 0 && !entry.cubeMipReady)
+      fail('UNSUPPORTED', 'Mip-filtered WebGL layered or MRT targets require a complete source mip chain');
+    if (shape.webglCube && descriptor.lodMaxClamp > 0 && !entry.cubeMipReady)
       fail('UNSUPPORTED', 'Mip-filtered WebGL cubes require a completed source mip generation');
     const samplerKey = JSON.stringify(descriptor);
     ensure(entry);
+    // Each attachment owns its orientation replica and dirty bit. A selected
+    // transfer refreshes only that image; untouched G-buffer channels stay warm.
+    let sample = colorIndex === 0 ? entry : entry.colorSamples.get(colorIndex);
+    if (!sample) { sample = {sample: null, dirty: true, copies: 0}; entry.colorSamples.set(colorIndex, sample); }
     entry.busy = true;
     try {
-      if (!entry.sample) {
-        budget(entry.shape.colorBytes);
+      if (!sample.sample) {
+        budget(shape.colorBytes);
         checked(entry, device => {
-          const {width, height, format, mipLevelCount, layers, cube, array, volume} = entry.shape;
+          const {width, height, format, mipLevelCount, layers, cube, array, volume} = shape;
           const dimension = volume ? '3d' : '2d';
-          entry.sample = device.createTexture({label: 'Source target UV sampling image',
+          sample.sample = device.createTexture({label: 'Source target UV sampling image',
             size: {width, height, depthOrArrayLayers: layers}, format, dimension, sampleCount: 1, mipLevelCount, usage: 4 | 16});
-          entry.charged += entry.shape.colorBytes; allocatedBytes += entry.shape.colorBytes;
-          entry.view = entry.sample.createView(cube ? {dimension: 'cube'} : array ? {dimension: '2d-array'} : volume ? {dimension} : {});
+          entry.charged += shape.colorBytes; allocatedBytes += shape.colorBytes;
+          sample.view = sample.sample.createView(cube ? {dimension: 'cube'} : array ? {dimension: '2d-array'} : volume ? {dimension} : {});
           const pipelineKey = `${format}/${dimension}`;
           let pipeline = pipelines.get(pipelineKey);
           if (!pipeline) {
@@ -849,7 +863,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
               code: (volume ? VOLUME_FLIP_WGSL : FLIP_WGSL)(flipY)});
             // textureLoad does not need filtering, but an automatic layout would
             // still infer sampleType:float and reject a feature-free float32 view.
-            const layout = entry.shape.float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
+            const layout = shape.float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
               {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: dimension, multisampled: false}},
             ]})]}) : 'auto';
             pipeline = device.createRenderPipeline({label: 'Source target UV orientation', layout,
@@ -857,43 +871,43 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
               primitive: {topology: 'triangle-list'}});
             pipelines.set(pipelineKey, pipeline);
           }
-          entry.pipeline = pipeline;
+          sample.pipeline = pipeline;
           entry.storage.withTexture(source => {
-            entry.flipSteps = [];
+            sample.flipSteps = [];
             for (let level = 0; level < mipLevelCount; level++) for (let face = 0; face < layers; face++) {
               const settings = {baseMipLevel: level, mipLevelCount: 1,
                 ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : volume ? {dimension} : {})};
-              const view = entry.sample.createView(settings);
+              const view = sample.sample.createView(settings);
               const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
                 entries: [{binding: 0, resource: source.createView(settings)}]});
-              entry.flipSteps.push({view, group, ...(volume ? {depthSlice: face} : {})});
+              sample.flipSteps.push({view, group, ...(volume ? {depthSlice: face} : {})});
             }
-            entry.group = entry.flipSteps[0].group;
-          });
+            sample.group = sample.flipSteps[0].group;
+          }, {colorIndex});
         });
       }
-      if (entry.samplerKey !== samplerKey) {
-        entry.sampler = checked(entry, device => device.createSampler(descriptor));
-        entry.samplerKey = samplerKey;
+      if (sample.samplerKey !== samplerKey) {
+        sample.sampler = checked(entry, device => device.createSampler(descriptor));
+        sample.samplerKey = samplerKey;
       }
-      if (entry.dirty) {
+      if (sample.dirty) {
         checked(entry, device => entry.storage.withTexture(() => {
           assertCurrent(entry);
           const encoder = device.createCommandEncoder({label: 'Source target UV orientation'});
-          for (const {view, group, depthSlice} of entry.flipSteps) {
+          for (const {view, group, depthSlice} of sample.flipSteps) {
             const pass = encoder.beginRenderPass({colorAttachments: [{view, ...(depthSlice !== undefined ? {depthSlice} : {}),
               loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
-            pass.setPipeline(entry.pipeline); pass.setBindGroup(0, group);
+            pass.setPipeline(sample.pipeline); pass.setBindGroup(0, group);
             if (depthSlice === undefined) pass.draw(3); else pass.draw(3, 1, 0, depthSlice);
             pass.end();
           }
           assertCurrent(entry);
           device.queue.submit([encoder.finish()]);
-        }));
-        entry.dirty = false; entry.copies++;
+        }, {colorIndex}));
+        sample.dirty = false; sample.copies++;
       }
       assertCurrent(entry);
-      return {view: entry.view, sampler: entry.sampler, sampleType, viewDimension: entry.shape.viewDimension,
+      return {view: sample.view, sampler: sample.sampler, sampleType, viewDimension: shape.viewDimension,
         version: texture.version, sourceVersion: texture.source.version};
     } finally { entry.busy = false; if (!entry.alive) release(entry); }
   }
@@ -984,7 +998,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const entry = capture(target);
         if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
         if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
-        if (entry.shape.texture !== texture) fail('UNSUPPORTED', 'Additional MRT attachments require native texture bindings');
         const binding = sampling(entry, texture);
         // Asynchronous source program preparation (PMREM) may hold this view
         // across pipeline compilation. The ordinary draw path stays synchronous;
@@ -1002,6 +1015,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
     }();
   }
+  function dirtyColor(entry, colorIndex) {
+    if (colorIndex === 0) entry.dirty = true;
+    else { const sample = entry.colorSamples.get(colorIndex); if (sample) sample.dirty = true; }
+  }
   function copyTarget(source, destination, options, depth = false) {
     assertCurrent(source); assertCurrent(destination);
     if (depth) { source = source.depthEntry ?? source; destination = destination.depthEntry ?? destination; }
@@ -1016,7 +1033,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
     if (depth) { destination.depthDirty = true; if (destination.depthEntry) destination.depthEntry.depthDirty = true; }
-    else if (plan.colorIndex === 0) destination.dirty = true;
+    else dirtyColor(destination, plan.colorIndex);
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
       assertCurrent(source); assertCurrent(destination); return result;
@@ -1243,7 +1260,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         fail('UNSUPPORTED', 'Native color destinations require single-sample color attachments');
       ensure(entry);
       entry.busy = true;
-      if (colorIndex === 0) entry.dirty = true;
+      dirtyColor(entry, colorIndex);
       try {
         const result = entry.storage.withColorDestination(native => {
           const result = callback(native); assertCurrent(entry); return result;
@@ -1261,15 +1278,16 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (plan.empty) return false;
       ensure(entry);
       entry.busy = true;
-      if (plan.colorIndex === 0) entry.dirty = true;
+      dirtyColor(entry, plan.colorIndex);
       try { const result = entry.storage.writePixels(data, options); assertCurrent(entry); return result; }
       finally { entry.busy = false; if (!entry.alive) release(entry); }
     },
     copyColor(source, destination, options = {}) { return copyTarget(source, destination, options); },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
-    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null} = {}) {
+    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null, resolveColor = true} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
+      if (typeof resolveColor !== 'boolean') fail('OPTIONS', 'Color resolution requires a captured boolean');
       if (generateColorMipmaps !== null && (!Array.isArray(generateColorMipmaps) ||
           generateColorMipmaps.some(index => !Number.isSafeInteger(index) || index < 0 || index >= entry.shape.textures.length) ||
           new Set(generateColorMipmaps).size !== generateColorMipmaps.length))
@@ -1285,7 +1303,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         fail('FEEDBACK', 'A pass cannot write shared depth held by its sampled inputs');
       budget(entry.storage.frameAllocationBytes(mipLevel, face));
       const allocatedBefore = entry.storage.allocatedBytes;
-      entry.busy = true; entry.dirty = true;
+      entry.busy = true;
+      if (resolveColor || entry.shape.sampleCount === 1) {
+        entry.dirty = true;
+        for (const sample of entry.colorSamples.values()) sample.dirty = true;
+      }
       // Higher private depth levels never modify the source's level-zero depth.
       if (mipLevel === 0 && entry.shape.depthAttachment) {
         entry.depthDirty = true;
@@ -1297,6 +1319,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const result = withFrame((frame, texture, handles) => {
           if (group) group.frame = {handles, writes: new Set(entry.shape.textures), depthAttachment: entry.shape.depthAttachment};
           try {
+            // WebGL clear() changes its multisample renderbuffers, but only a
+            // render() resolves them. Leave the last sampled colors intact.
+            if (!resolveColor) {
+              const {resolveTarget, resolveTargets, ...unresolved} = frame;
+              frame = unresolved;
+            }
             // Source targets can own a depth texture solely for history copies.
             // Allocate and sample it normally, but a color render must neither
             // attach nor clear/write it when depthBuffer is disabled.

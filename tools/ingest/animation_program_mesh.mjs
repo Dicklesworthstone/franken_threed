@@ -35,9 +35,13 @@ import {createProgramUniformArena} from './animation_program_uniforms.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 
-export function createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024, maxPointDraws = 65536, maxUniformBytes = 64 * 1024 * 1024}) {
-  const colorTarget = createAnimationColorTargetProfile(device, {format, sampleCount},
-    message => fail('ANIMATION_RENDER_OPTIONS', message));
+export function createProgramMeshes({device, format, colorFormats = format === null ? [] : [format], depthFormat, sampleCount, maxDraws, label, fail, scoped, lost, maxIndexBytes = 64 * 1024 * 1024, maxPointDraws = 65536, maxUniformBytes = 64 * 1024 * 1024}) {
+  if (!Array.isArray(colorFormats) || (format === null ? colorFormats.length !== 0 : colorFormats[0] !== format))
+    fail('ANIMATION_RENDER_OPTIONS', 'Program color attachments must match the renderer target');
+  colorFormats = Object.freeze(colorFormats.slice());
+  const colorTargets = (colorFormats.length ? colorFormats : [null]).map(format =>
+    createAnimationColorTargetProfile(device, {format, sampleCount},
+      message => fail('ANIMATION_RENDER_OPTIONS', message)));
   if (!Number.isSafeInteger(maxPointDraws) || maxPointDraws < 1 || maxPointDraws > 0xffffffff)
     fail('ANIMATION_RENDER_LIMIT', 'Invalid native point draw budget');
   let pointDraws = 0;
@@ -57,9 +61,15 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       blendConstant: raster?.blendConstant == null ? null : (Array.isArray(raster.blendConstant) || ArrayBuffer.isView(raster.blendConstant) ? Array.from(raster.blendConstant) : {...raster.blendConstant})};
     if (textures.length !== reflection.textures.length) fail('ANIMATION_RENDER_TEXTURE', 'One texture binding per program sampler is required');
     uniforms.checkSize(reflection.uniformBufferSize);
-    if (reflection.outputs.length > 1 || (reflection.outputs[0] && reflection.outputs[0].location !== 0))
-      fail('ANIMATION_RENDER_OPTIONS', 'Multiple program outputs need multiple render targets');
-    colorTarget.assertBlend(raster?.blend);
+    const outputLocations = new Set();
+    for (const output of reflection.outputs) {
+      if (!Number.isSafeInteger(output.location) || output.location < 0 ||
+          output.location >= Math.max(1, colorFormats.length) || outputLocations.has(output.location))
+        fail('ANIMATION_RENDER_OPTIONS', 'Program output locations must select distinct allocated color attachments');
+      outputLocations.add(output.location);
+    }
+    for (const location of outputLocations) colorTargets[location].assertBlend(raster?.blend);
+    if (format === null) colorTargets[0].assertBlend(raster?.blend);
     // GL stencil testing has no effect without a stencil attachment. Otherwise
     // capture both faces, masks and reference before geometry work or awaiting
     // pipelines; caller mutations cannot change this registration's state.
@@ -102,8 +112,9 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
       const pipeline = frontFace => device[immediate ? 'createRenderPipeline' : 'createRenderPipelineAsync']({label, layout,
         vertex: {module: vertexModule, entryPoint: 'f3d_vertex', buffers: layouts},
-        fragment: {module: fragmentModule, entryPoint: 'f3d_fragment', targets: format === null ? [] : [{format,
-          ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}]},
+        fragment: {module: fragmentModule, entryPoint: 'f3d_fragment', targets: colorFormats.map((format, location) =>
+          outputLocations.has(location) ? {format, ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}
+            : {format, writeMask: 0})},
         primitive: {topology: primitiveTopology, cullMode: raster.cullMode, frontFace,
           ...(primitiveTopology === 'line-strip' && stripIndexFormat ? {stripIndexFormat} : {})},
         ...(depthFormat ? {depthStencil: {format: depthFormat, depthWriteEnabled: raster.depthWriteEnabled, depthCompare: raster.depthCompare,

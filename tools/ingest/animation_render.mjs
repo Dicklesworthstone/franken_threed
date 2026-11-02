@@ -1430,7 +1430,7 @@ export async function createGpuAnimationRenderer(
   });
   lost.catch(() => {});
   // Compiled source programs (ShaderMaterial) share this renderer's passes/order.
-  const programs = createProgramMeshes({device, format, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
+  const programs = createProgramMeshes({device, format, colorFormats, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
   // Native Three node builders provide WGSL and bind-group layouts directly.
   // Keep their group order/uniform arenas separate from ESSL-reflected programs.
   let nodePrograms = null;
@@ -1480,8 +1480,6 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
   function checkProgramMesh(options) {
     live();
     keys(options, ["program", "textures", "raster", "topology", "stripIndexFormat"], "program mesh");
-    if (colorFormats.length > 1)
-      fail("ANIMATION_RENDER_OPTIONS", "Multiple color attachments require native node programs; ESSL programs currently write one attachment");
     if (records.size + pendingMeshes >= maxMeshes) fail("ANIMATION_RENDER_LIMIT", "Mesh capacity exceeded");
   }
   function publishProgramMesh(record) {
