@@ -160,3 +160,28 @@ preparation, frozen maps, disposal, relocation, artifact hashes and byte bounds.
 They do not execute native WGSL, compiled deformation or retained Three math;
 full browser GPU images, retained-renderer parity and speed remain unverified by
 these tests. The feature does not establish automatic H1/H2 application closure.
+
+## WebGL-authored program shadow route
+
+The public WebGL facade separately uses `three_program_shadows.mjs` to execute
+the pinned depth/distance programs through owned WebGPU submission. Point
+clouds and wireframe meshes now select this route, including ordinary and
+instanced wireframes, custom shadow materials/hooks, and live wireframe changes.
+Wireframe groups and draw ranges use the source edge-index scaling; point
+programs receive the shadow framebuffer/viewport dimensions and retain their
+source `gl_PointSize`, `gl_PointCoord`, and indexed `gl_VertexID` behavior.
+
+Indexed point color and shadow passes share the existing bounded point-run
+lowering over original vertex storage. The older CPU-gathered color geometry is
+removed: requested position updates reach both passes, unrequested edits remain
+stale, and morph textures use the same original vertex IDs. This removes a
+duplicate CPU geometry path without establishing a measured speedup.
+
+`three_renderer_program_shadow_primitives.test.mjs` covers source identities,
+callback order, groups/ranges, instancing, point draw order and upload versions.
+`tests/e2e/webgpu_renderer/program_shadow_primitives.mjs` compares 24 checkpoints
+and 589,824 RGBA bytes against pinned r186 in Chromium 151.0.7922.34/SwiftShader.
+All checks pass the existing WebGL budget (channel difference 12, at most 2% of
+pixels over it); the eight ordinary point-cloud checkpoints match exactly.
+Morph/line edge differences remain within that budget, with zero GPU/browser
+errors. These results cover software-GPU correctness, not hardware performance.

@@ -367,8 +367,8 @@ export async function createGpuThreeScene(device,scene,{
           if(Array.isArray(sourceMaterial(object))&&sourceMaterial(object).length>maxBindings)fail('LIMIT','Source material array exceeds capacity');
           if(object.intersectsFrustum!==(object.isPoints?three.Points:three.Line).prototype.intersectsFrustum)
             fail('OBJECT','Custom frustum tests are not admitted');
-          // Line casters draw through the program shadow port (WebGL surface).
-          if(!capturedNodeObject(object)&&(object.isPoints?(object.castShadow||object.receiveShadow):((object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled))))
+          // Line and point casters draw through the source program shadow port.
+          if(!capturedNodeObject(object)&&(object.castShadow||object.receiveShadow)&&!(programRoute()&&shadowEnabled))
             fail('SHADOW','Line and point shadows are not admitted');
           geometryAdmission(sourceGeometry(object),object);
         }
@@ -434,7 +434,10 @@ export async function createGpuThreeScene(device,scene,{
     if(!lights.length)return false;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
-    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>(o.isLine||o.isBatchedMesh)&&o.castShadow))return true;
+    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>o.castShadow&&
+      (o.isLine||o.isPoints||o.isBatchedMesh||sourceMaterials(o).some(m=>materialState(m)?.wireframe===true)||
+        o.customDepthMaterial!=null||o.customDistanceMaterial!=null||
+        o.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||o.onAfterShadow!==three.Object3D.prototype.onAfterShadow)))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
@@ -609,7 +612,8 @@ export async function createGpuThreeScene(device,scene,{
       return view;
     }
     if(object.isLineLoop)return loopGeometry(object.geometry);
-    if(object.isPoints&&object.geometry.index)return pointsGeometry(object.geometry);
+    // Indexed point programs retain source vertex IDs through the shared
+    // point-run lowering; gathering a second CPU geometry loses upload history.
     if(!object.isInstancedMesh)return object.geometry;
     let view=programSources.get(object);
     const g=object.geometry;
@@ -642,53 +646,6 @@ export async function createGpuThreeScene(device,scene,{
       view={key,geometry:derived};loopViews.set(g,view);
     }
     return view.geometry;
-  }
-  /** Indexed GL points draw one point per index: a de-indexed view gathering
-   * every attribute through the index over the draw range, re-gathered in place
-   * when the index or an attribute changes version (point sprites expand per
-   * vertex, so they cannot share vertices through an index). */
-  const pointViews=new WeakMap();
-  function pointsGeometry(g){
-    const index=g.index,range=g.drawRange,total=index.count;
-    const start=Math.min(range.start,total),end=Math.min(total,range.count===Infinity?total:range.start+range.count),n=Math.max(0,end-start);
-    const morphs=Object.entries(g.morphAttributes).filter(([,list])=>list?.length);
-    const shape=[idOfLoop(index),n,...Object.entries(g.attributes).map(([k,a])=>k+idOfLoop(a)+':'+a.itemSize),
-      ...morphs.map(([k,list])=>k+list.map(a=>idOfLoop(a)).join('/'))].join(',');
-    const versions=[index.version,start,...Object.values(g.attributes).map(a=>(a.isInterleavedBufferAttribute?a.data.version:a.version))].join(',');
-    let view=pointViews.get(g);
-    if(!view||view.shape!==shape){
-      const derived=new three.BufferGeometry();
-      for(const [name,a] of Object.entries(g.attributes)){
-        const Kind=(a.isInterleavedBufferAttribute?a.data.array:a.array).constructor;
-        derived.setAttribute(name,new three.BufferAttribute(new Kind(n*a.itemSize),a.itemSize,a.normalized));
-      }
-      // Morph targets follow the same numbering (gathered once: WebGLMorphtargets
-      // also builds its texture once per geometry and target count).
-      const gather=a=>{const out=new three.BufferAttribute(new Float32Array(n*a.itemSize),a.itemSize);
-        for(let i=0;i<n;i++){const v=index.getX(start+i);for(let c=0;c<a.itemSize;c++)out.array[i*a.itemSize+c]=a.getComponent(v,c);}return out;};
-      for(const [name,list] of morphs)derived.morphAttributes[name]=list.map(gather);
-      derived.morphTargetsRelative=g.morphTargetsRelative;
-      view={shape,versions:null,geometry:derived};pointViews.set(g,view);
-    }
-    if(view.versions!==versions){
-      for(const [name,a] of Object.entries(g.attributes)){
-        const out=view.geometry.attributes[name],size=a.itemSize;
-        for(let i=0;i<n;i++){const v=index.getX(start+i);for(let c=0;c<size;c++)out.array[i*size+c]=a.getComponent(v,c);}
-        out.needsUpdate=true;
-      }
-      view.versions=versions;
-    }
-    return view.geometry;
-  }
-  /** Programs of morphed indexed points read the de-indexed geometry (morph
-   * texture and gl_VertexID agree); a view of the object carries it. */
-  const pointProxies=new WeakMap();
-  function programObject(object){
-    if(!object?.isPoints||!object.geometry.index||!Object.values(object.geometry.morphAttributes).some(a=>a?.length))return object;
-    const derived=pointsGeometry(object.geometry);
-    let proxy=pointProxies.get(object);
-    if(!proxy||proxy.geometry!==derived){proxy=Object.create(object,{geometry:{value:derived,configurable:true}});pointProxies.set(object,proxy);}
-    return proxy;
   }
   const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:object.geometry;
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
@@ -788,7 +745,9 @@ export async function createGpuThreeScene(device,scene,{
     }
     return null;
   }
-  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls,updateObject,captureBatch:captureProgramBatch})??
+  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),
+    sourceOf:programSource,
+    clipping:programClippingControls,updateObject,captureBatch:captureProgramBatch})??
     fail('SHADOW','Program shadow maps need the program shadow owner'));
   // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
   const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
@@ -892,7 +851,7 @@ export async function createGpuThreeScene(device,scene,{
     return sides.map(side=>{
       const clip=programSupport.clippingState(programClippingControls(),m,direct?.camera??programCamera??new three.Camera());
       const compileOptions={fog,side,envMap,shadows:programShadowMode&&shadows,clipping:{numPlanes:clip.numPlanes,numIntersection:clip.numIntersection}};
-      const compiled=programSupport.compile(m,programObject(object),compileOptions);
+      const compiled=programSupport.compile(m,object,compileOptions);
       const reflection=compiled.program.reflection;
       const refreshOptions={fog,envMap,envMapRotation,...(m.transmission>0?{transmissionRenderTarget:transmissionTarget()}:{})};
       const previous=direct?.previous;
@@ -900,7 +859,7 @@ export async function createGpuThreeScene(device,scene,{
         previous.desc.program.key===compiled.key&&m.uniformsNeedUpdate!==true?previous:null;
       const uniforms=retained?null:programSupport.refresh(m,refreshOptions);
       const sourceTextures=[],bindings=[],textureKey=[];
-      const samplers=programSupport.objectSamplers?.(m,programObject(object))??null;
+      const samplers=programSupport.objectSamplers?.(m,object)??null;
       for(const t of reflection.textures){
         if(retained){
           const index=sourceTextures.length,texture=retained.desc.programTextures[index],binding=retained.desc.options.textures[index];
@@ -950,6 +909,7 @@ export async function createGpuThreeScene(device,scene,{
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
+        materialState(m).wireframe===true&&(object.isInstancedMesh||hasThreeDeformation(object))||
         m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||m.onBeforeRender!==three.Material.prototype.onBeforeRender)return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programLightMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
@@ -1842,12 +1802,12 @@ export async function createGpuThreeScene(device,scene,{
         const passItem=(item,d,i,side=d.programSide)=>{
           const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
-          return {object,material:m,group:item.group,side,gpu,sourceObject:programObject(object),topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
-            compile:()=>programSupport.compile(m,programObject(object),{...d.compileOptions,side,renderTarget:true}),
+          return {object,material:m,group:item.group,side,gpu,sourceObject:object,topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
+            compile:()=>programSupport.compile(m,object,{...d.compileOptions,side,renderTarget:true}),
             refresh:()=>programSupport.refresh(m,d.refreshOptions),
             pack:(bytes,cam,size,reflection,drawId=null)=>{
               const clip=programSupport.clippingState(programClippingControls(),m,cam);
-              return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),programObject(object),cam,bytes,{targetSize:size,material:m,
+              return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),object,cam,bytes,{targetSize:size,material:m,
                 values:{...(programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:{}),...(drawId!==null?{_gl_DrawID:drawId}:{})}});
             }};
         };
@@ -1995,7 +1955,7 @@ export async function createGpuThreeScene(device,scene,{
           const desc=programDescription(material,topology,sourceObject,{scene:drawScene,camera:drawCamera,previous:boundary.last})[0];
           const reflection=desc.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
           const clipState=programSupport.clippingState(programClippingControls(),material,drawCamera);
-          const current=programSupport.pack(reflection,desc.retained?null:programSupport.uniformsFor(material),programObject(sourceObject),drawCamera,bytes,
+          const current=programSupport.pack(reflection,desc.retained?null:programSupport.uniformsFor(material),sourceObject,drawCamera,bytes,
             {targetSize:programTargetSize,material,retainedUniforms:desc.retained,values:programSupport.bindsClippingPlanes(material)?{clippingPlanes:clipState.planes}:{}});
           if(current.some((texture,index)=>(texture??null)!==desc.programTextures[index]))
             fail('MATERIAL','A direct program changed sampler identities while packing its uniforms');
@@ -2117,7 +2077,7 @@ export async function createGpuThreeScene(device,scene,{
               const values={...(programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:{}),...(sub?{_gl_DrawID:sub.id}:{})};
               const targetSize=view?.viewport&&programTargetSize?[...programTargetSize.slice(0,2),...view.viewport.slice(2,4)]:programTargetSize;
               const uniforms=programArray?programSupport.refresh(item.material,d.refreshOptions):programSupport.uniformsFor(item.material);
-              const current=programSupport.pack(reflection,uniforms,programObject(object),drawCamera,bytes,{targetSize,material:item.material,values});
+              const current=programSupport.pack(reflection,uniforms,object,drawCamera,bytes,{targetSize,material:item.material,values});
               if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
               for(const t of current)if(t)frameTextures?.add(t);
               // Programs evaluate fog/lighting in their own source; never core receivers.

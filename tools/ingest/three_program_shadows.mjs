@@ -32,7 +32,8 @@
  * WebGLLights selects. Caster passes skip the RG color writes r186 makes with
  * the depth material: the horizontal pass clears and covers every texel, so the
  * final map contents are the same. VSM point lights warn and are skipped as in
- * r186. Explicit errors: point casters, wireframe casters, reversed depth,
+ * r186. Point casters use the existing source-sized quad program; mesh
+ * wireframes share the scene's derived edge indices. Explicit errors: reversed depth,
  * a point light whose existing map changes to VSM. A new light, a map-size change or a shadow-type change is a
  * preparation boundary (the map's GPU texture and the receivers' programs change).
  * No performance claim.
@@ -111,10 +112,15 @@ function scoped(device, operation) {
 }
 
 /** support: createThreeProgramSupport(); bindingOf(texture) -> {view, sampler, sampleType};
- * sourceOf(object) -> the attribute source a program reads (geometry or InstancedMesh view).
+ * sourceOf(object, wireframe) -> the attribute source a program reads, including
+ * the scene's derived edge index when wireframe is true. Indexed points keep
+ * their source index and use the existing bounded point-run draw lowering.
  * captureBatch(object) captures uploaded batch textures and returns an encoder
  * callback restoring those bytes outside a render pass before its subdraws. */
-export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, updateObject = () => {}, captureBatch = null, label = 'f3d-program-shadows',
+export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = (o, wireframe) => {
+  if (wireframe) fail('CASTER', 'Wireframe shadows require the source edge-index adapter');
+  return o.geometry;
+}, clipping = () => null, updateObject = () => {}, captureBatch = null, label = 'f3d-program-shadows',
   maxDraws = 4096, maxGeometryBytes = 256 * 1024 * 1024}) {
   const maxTextureSize = device.limits.maxTextureDimension2D ?? 8192;
   const depthMaterialBase = new T.MeshDepthMaterial(), distanceMaterialBase = new T.MeshDistanceMaterial();
@@ -357,7 +363,6 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const visible = object.layers.test(camera.layers);
     if (visible && (object.isMesh || object.isLine || object.isPoints)) {
       if ((object.castShadow || (object.receiveShadow && type === T.VSMShadowMap)) && (frustum === null || !object.frustumCulled || object.intersectsFrustum(frustum))) {
-        if (object.isPoints) fail('CASTER', 'Point shadow casters are not admitted yet');
         const material = object.material;
         if (Array.isArray(material)) {
           for (const group of object.geometry.groups) {
@@ -369,17 +374,17 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     for (const child of object.children) casters(child, camera, light, type, frustum, visit);
   }
-  // renderBufferDirect's mode: gl.LINES / gl.LINE_STRIP (LineLoop: the source view's closing strip) / gl.TRIANGLES.
-  const topologyOf = object => object.isLineSegments ? 'lines' : object.isLine ? 'line-strip' : 'triangles';
+  // renderBufferDirect selects primitive mode after deriving wireframe indices.
+  const topologyOf = (object, material) => object.isPoints ? 'points' :
+    object.isLineSegments || object.isMesh && material.wireframe === true ? 'lines' : object.isLine ? 'line-strip' : 'triangles';
   const stripFormat = (object, topology) => topology === 'line-strip' && sourceOf(object).index ? (sourceOf(object).index.array instanceof Uint32Array ? 'uint32' : 'uint16') : undefined;
   function compile(depthMaterial, object) {
-    if (depthMaterial.wireframe) fail('CASTER', 'Wireframe shadow casters are not admitted yet');
     // WebGLClipping during shadows: local planes only, and only with clipShadows.
     const clip = support.clippingState(clipping(), depthMaterial, identityCamera, {shadows: true});
     return support.compile(depthMaterial, object, {renderTarget: true, clipping: {numPlanes: clip.numPlanes, numIntersection: clip.numIntersection}});
   }
-  function geometryFor(object, compiled) {
-    const source = sourceOf(object);
+  function geometryFor(object, compiled, depthMaterial) {
+    const source = sourceOf(object, depthMaterial.wireframe === true);
     let byKey = geometries.get(source);
     if (!byKey) geometries.set(source, byKey = new Map());
     let gpu = byKey.get(compiled.attributesKey);
@@ -404,11 +409,11 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   /** One record per (program, geometry layout, textures, side); built at preparation. */
   async function recordFor(depthMaterial, object) {
     const compiled = compile(depthMaterial, object);
-    const gpu = geometryFor(object, compiled);
+    const gpu = geometryFor(object, compiled, depthMaterial);
     gpu.update({maxAdditionalBytes: maxGeometryBytes});
     const geometry = support.geometrySnapshot(gpu, device);
     const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
-    const topology = topologyOf(object), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
+    const topology = topologyOf(object, depthMaterial), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
     // rows:'gl' mirrors clip Y: GL's counter-clockwise front faces are clockwise here.
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
     const key = recordKey(compiled, gpu, geometry, glRaster, textures) + '\u0001' + topology;
@@ -517,7 +522,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
           const geometry = object.geometry;
           object.onBeforeShadow(renderer, object, camera, shadowCamera, geometry, depthMaterial, group);
           // renderBufferDirect(shadowCamera, null, geometry, depthMaterial, object, group)
-          pass.commands.push(...draw(object, depthMaterial, group, shadowCamera));
+          pass.commands.push(...draw(object, depthMaterial, group, shadowCamera, [map.width, map.height, rect[2], rect[3]]));
           object.onAfterShadow(renderer, object, camera, shadowCamera, geometry, depthMaterial, group);
         });
         passes.push(pass);
@@ -546,9 +551,9 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     return () => submit(passes);
   }
   const updated = new Set();
-  function batchRanges(object) {
+  function batchRanges(object, source) {
     const size = object._multiDrawCount, starts = object._multiDrawStarts, counts = object._multiDrawCounts;
-    const index = object.geometry.index, extent = index?.count ?? object.geometry.attributes.position?.count;
+    const index = source.index, extent = index?.count ?? source.attributes.position?.count;
     const stride = index ? index.array?.BYTES_PER_ELEMENT : 1;
     if (!(starts instanceof Int32Array) || !(counts instanceof Int32Array) ||
         !Number.isSafeInteger(size) || size < 0 || size > maxDraws || size > starts.length || size > counts.length ||
@@ -563,7 +568,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     return ranges;
   }
-  function draw(object, depthMaterial, group, shadowCamera) {
+  function draw(object, depthMaterial, group, shadowCamera, targetSize) {
     const entry = recordForSync(depthMaterial, object);
     const reflection = entry.record.reflection;
     const uniforms = refresh(depthMaterial);
@@ -571,7 +576,10 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const clip = support.clippingState(clipping(), depthMaterial, shadowCamera, {shadows: true});
     const g = object.geometry;
     const batch = object.isBatchedMesh === true;
-    const ranges = batch ? batchRanges(object) : [{first: group ? group.start : 0, count: group ? group.count : Number.MAX_SAFE_INTEGER}];
+    const rangeFactor = depthMaterial.wireframe === true ? 2 : 1;
+    const source = sourceOf(object, depthMaterial.wireframe === true);
+    const ranges = batch ? batchRanges(object, source) : [{first: (group?.start ?? 0) * rangeFactor,
+      count: group && group.count !== Infinity ? group.count * rangeFactor : 0xffffffff}];
     // WebGLShadowMap calls renderBufferDirect directly: material.onBeforeRender
     // is not part of this lifecycle. onBeforeShadow has already selected the
     // batch for this face; later faces must not replace its uploaded texels.
@@ -582,11 +590,11 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     for (const {id, first, count} of ranges) {
       const bytes = new Uint8Array(reflection.uniformBufferSize);
       const values = {...(support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : {}), ...(batch ? {_gl_DrawID: id} : {})};
-      const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values});
+      const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values, targetSize});
       if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
       const command = {};
       meshes.stage(entry.record, {programUniforms: bytes, first, count, programRangeCaptured: batch,
-        ...(batch && group ? {programRangeGroup: {start: group.start, count: group.count}} : {}),
+        ...(batch && group ? {programRangeGroup: {start: group.start * rangeFactor, count: group.count * rangeFactor}} : {}),
         frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
       if (batch && commands.length === 0) command.encodeBatch = encodeBatch;
       commands.push(command);
@@ -596,13 +604,13 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   function recordForSync(depthMaterial, object) {
     // Same key as recordFor(), but frames never create pipelines.
     const compiled = compile(depthMaterial, object);
-    const source = sourceOf(object), gpu = geometries.get(source)?.get(compiled.attributesKey);
+    const source = sourceOf(object, depthMaterial.wireframe === true), gpu = geometries.get(source)?.get(compiled.attributesKey);
     if (!gpu) fail('PREPARE', 'A shadow caster geometry needs prepare()');
     // Same state as preparation: current residency before its layout signature.
     if (!updated.has(gpu)) { gpu.update({maxAdditionalBytes: maxGeometryBytes}); updated.add(gpu); }
     const geometry = support.geometrySnapshot(gpu, device);
     const uniforms = refresh(depthMaterial), textures = textureBindings(compiled.program.reflection, uniforms, object);
-    const topology = topologyOf(object), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
+    const topology = topologyOf(object, depthMaterial), raster = support.raster(depthMaterial, {side: depthMaterial.side, topology});
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null, writeMask: 0};
     const entry = records.get(recordKey(compiled, gpu, geometry, glRaster, textures) + '\u0001' + topology);
     if (!entry) fail('PREPARE', 'A shadow caster program or binding changed; call prepare()');
@@ -634,7 +642,11 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         p.setBindGroup(0, c.program.group, [c.program.offset]);
         if (c.record.textureGroup) p.setBindGroup(1, c.record.textureGroup);
         c.vertexBuffers.forEach((b, slot) => p.setVertexBuffer(slot, b));
-        if (c.indexBuffer) { p.setIndexBuffer(c.indexBuffer, c.indexFormat); p.drawIndexed(c.count, c.instanceCount, c.first, 0, 0); }
+        if (c.program.pointRuns) {
+          const runs = c.program.pointRuns;
+          for (let i = 0; i < runs.length; i += 2) p.draw(6, runs[i + 1], 0, runs[i]);
+        }
+        else if (c.indexBuffer) { p.setIndexBuffer(c.indexBuffer, c.indexFormat); p.drawIndexed(c.count, c.instanceCount, c.first, 0, 0); }
         else p.draw(c.count, c.instanceCount, c.first, c.firstInstance ?? 0);
       }
       if (p) p.end();
