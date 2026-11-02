@@ -6,7 +6,7 @@ import {registerThreePassState, getThreePassState, getThreeStencilConstants, cap
   beginThreePassState, applyThreePassMaterial, applyThreePassClear, finishThreePassState,
   recordThreePassMaterial, recordThreePassClear} from './three_pass_state.mjs';
 
-const material = overrides => ({colorWrite: true, depthWrite: true, stencilWrite: false,
+const material = overrides => ({colorWrite: true, depthWrite: true, depthTest: true, stencilWrite: false,
   stencilWriteMask: 0xff, stencilFunc: T.AlwaysStencilFunc, stencilRef: 0, stencilFuncMask: 0xff,
   stencilFail: T.KeepStencilOp, stencilZFail: T.KeepStencilOp, stencilZPass: T.KeepStencilOp, ...overrides});
 const raster = Object.freeze({writeMask: 15, depthWriteEnabled: true, depthCompare: 'less-equal',
@@ -130,7 +130,7 @@ test('a locked stencil-writing material changes func/ref/operations but inherits
   assert.equal(result.stencil.writeMask, 0x31); assert.equal(result.stencil.readMask, 0x65);
   assert.equal(result.stencilReference, 255); assert.equal(result.stencil.front.compare, 'less');
   assert.deepEqual(result.stencil.front, {compare: 'less', failOp: 'zero', depthFailOp: 'invert', passOp: 'replace'});
-  const inactive = {colorWrite: true, depthWrite: true, stencilWrite: false};
+  const inactive = {colorWrite: true, depthWrite: true, depthTest: true, stencilWrite: false};
   for (const key of ['stencilFunc', 'stencilRef', 'stencilFuncMask', 'stencilWriteMask', 'stencilFail', 'stencilZFail', 'stencilZPass'])
     Object.defineProperty(inactive, key, {get() { throw Error('inactive field read'); }});
   assert.equal(applyThreePassMaterial(token, inactive, result), result, 'an inherited equal raster reuses its immutable descriptor');
@@ -198,6 +198,18 @@ test('render completion resets only unlocked color/depth masks and clear-only co
   assert.equal(clearFinal.colorMask, false); assert.equal(clearFinal.depthMask, false);
   const third = capture();
   assert.equal(beginThreePassState(third).colorMask, false); finishThreePassState(third);
+});
+
+test('disabled depth testing suppresses fragment writes without changing a locked depth mask or later clears', () => {
+  const {state, capture} = fixture();
+  state.buffers.depth.setMask(true); state.buffers.depth.setLocked(true);
+  const token = capture(), untestedRaster = {...raster, depthCompare: 'always', depthWriteEnabled: false};
+  assert.equal(applyThreePassMaterial(token, material({depthTest: false, depthWrite: false}), untestedRaster), untestedRaster);
+  assert.equal(beginThreePassState(token).depthMask, true, 'the source write mask remains independent of DEPTH_TEST');
+  assert.equal(applyThreePassClear(token, frame).depthLoadOp, 'clear', 'a clear still honors the retained true mask');
+  const tested = applyThreePassMaterial(token, material({depthTest: true, depthWrite: false}), {...raster, depthWriteEnabled: false});
+  assert.equal(tested.depthWriteEnabled, true, 'reenabling the test exposes the locked mask again');
+  finishThreePassState(token);
 });
 
 test('cancelled queued requests retain explicit assignments without blocking later requests', () => {

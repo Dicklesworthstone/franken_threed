@@ -154,6 +154,119 @@ test('preserved color contributes to budget checks before native allocation', ()
   assert.equal(target.width, 16); assert.equal(f.textures.length, 1); target.dispose();
 });
 
+for (const sampleCount of [1, 4]) test(`callback history retains color/depth/stencil across fresh presentations (${sampleCount}x)`, async () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas,
+    {frameHistory: true, sampleCount, depthFormat: 'depth24plus-stencil8'});
+  const initialCost = 16 * 8 * sampleCount * (8 + (sampleCount > 1 ? 4 : 0));
+  assert.equal(target.diagnostics.attachmentBytes, initialCost);
+  assert.equal(f.textures.some(t => t.descriptor.label === 'f3d-canvas-preserved'), false);
+  assert.equal(f.calls.find(c => c[0] === 'configure')[1].usage, 23);
+  const frameToken = {}, frames = [], sources = [];
+  for (let index = 0; index < 3; index++) {
+    target.withFrame((frame, source) => { frames.push(frame); sources.push(source); }, {frameToken});
+    await tick();
+  }
+  assert.equal(new Set(sources).size, 1); assert.equal(sources[0].descriptor.sampleCount, 1);
+  assert.equal(new Set(frames.map(frame => frame.colorView)).size, 1);
+  assert.equal(new Set(frames.map(frame => frame.depthView)).size, 1);
+  for (const frame of frames)
+    assert.equal((frame.resolveTarget ?? frame.colorView).texture, sources[0]);
+  const copies = f.calls.filter(c => c[0] === 'copy');
+  assert.equal(copies.length, 3); assert.equal(new Set(copies.map(c => c[2].texture)).size, 3);
+  assert.ok(copies.every(c => c[1].texture === sources[0] && c[2].texture.descriptor.swapchain));
+  assert.equal(count(f, 'initialize'), 1); assert.equal(f.fences.length, 0);
+  target.withFrame((frame, source) => { assert.equal(source, sources[0]); assert.equal(frame.depthView, frames[0].depthView); },
+    {frameToken: {}});
+  const initialization = f.calls.filter(c => c[0] === 'initialize');
+  assert.equal(initialization.length, 2);
+  for (const [, descriptor] of initialization) {
+    assert.deepEqual(descriptor.colorAttachments[0].clearValue, [0, 0, 0, 0]);
+    assert.equal(descriptor.colorAttachments[0].view.texture.descriptor.sampleCount, sampleCount);
+    assert.equal(descriptor.depthStencilAttachment.depthClearValue, 1);
+    assert.equal(descriptor.depthStencilAttachment.stencilClearValue, 0);
+  }
+  assert.equal(target.diagnostics.attachmentBytes, initialCost + 16 * 8 * 4);
+  target.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
+});
+
+test('callback history allocation and token changes remain lazy through failed preflight and depth-only borrows', () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {frameHistory: true});
+  const first = {}, next = {}, error = new Error('needs preparation'), before = target.diagnostics;
+  assert.throws(() => target.withFrame(() => { throw error; }, {lazy: true, frameToken: first}), e => e === error);
+  assert.equal(f.textures.length, 1); assert.deepEqual(target.diagnostics, before);
+  assert.equal(count(f, 'initialize'), 0); assert.equal(count(f, 'acquire'), 0);
+  target.withFrame(frame => { void frame.colorView; }, {lazy: true, frameToken: first});
+  assert.equal(count(f, 'initialize'), 1); assert.equal(count(f, 'copy'), 1);
+  assert.throws(() => target.withFrame(() => { throw error; }, {lazy: true, frameToken: next}), e => e === error);
+  assert.equal(target.withFrame(() => {}, {lazy: true, frameToken: next}), false);
+  target.withFrame(frame => { void frame.colorView; }, {lazy: true, frameToken: first});
+  assert.equal(count(f, 'initialize'), 1, 'unconsumed token must not erase the preceding callback history');
+  const acquisitions = count(f, 'acquire');
+  let borrowedDepth;
+  assert.equal(target.withFrame((_views, _color, getDepth) => { borrowedDepth = getDepth(); },
+    {lazy: true, frameToken: next}), false);
+  assert.equal(borrowedDepth, f.textures[0]); assert.equal(count(f, 'initialize'), 2);
+  assert.equal(count(f, 'acquire'), acquisitions, 'depth-only initialization never acquires or presents a swapchain');
+  target.withFrame(frame => { void frame.colorView; }, {lazy: true, frameToken: next});
+  assert.equal(count(f, 'initialize'), 2); assert.equal(count(f, 'copy'), 3);
+  assert.throws(() => target.withFrame(frame => { void frame.colorView; throw error; }, {lazy: true, frameToken: {}}), e => e === error);
+  assert.equal(count(f, 'initialize'), 3); assert.equal(count(f, 'copy'), 4); assert.equal(target.failed, false);
+  target.dispose();
+});
+
+test('null tokens use direct swapchain views and disabled frame history never allocates a color image', () => {
+  for (const frameHistory of [false, true]) {
+    const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {frameHistory, depthFormat: null});
+    target.withFrame((_frame, texture) => assert.equal(texture.descriptor.swapchain, true));
+    assert.equal(f.textures.length, 0); assert.equal(target.diagnostics.attachmentBytes, 0);
+    const frameToken = {};
+    target.withFrame((_frame, texture) => assert.equal(!!texture.descriptor.swapchain, !frameHistory), {frameToken});
+    assert.equal(f.textures.length, frameHistory ? 1 : 0);
+    const copies = count(f, 'copy'), initializations = count(f, 'initialize');
+    target.withFrame((_frame, texture) => assert.equal(texture.descriptor.swapchain, true), {frameToken: null});
+    assert.equal(count(f, 'copy'), copies); assert.equal(count(f, 'initialize'), initializations);
+    target.withFrame(() => {}, {frameToken});
+    assert.equal(count(f, 'initialize'), frameHistory ? 2 : 0, 'direct uses invalidate the shared depth/MSAA history');
+    target.dispose();
+  }
+});
+
+test('preserveDrawingBuffer keeps its history across callback token changes and null direct requests', () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {frameHistory: true, preserveDrawingBuffer: true});
+  let color;
+  for (const frameToken of [{}, {}, null]) target.withFrame((_frame, texture) => {
+    if (color) assert.equal(texture, color); else color = texture;
+  }, {frameToken});
+  assert.equal(count(f, 'initialize'), 1); assert.equal(count(f, 'copy'), 3);
+  assert.equal(count(f, 'acquire'), 3); target.dispose();
+});
+
+test('lazy callback color charges its allocation and retired resize generations before creating native resources', async () => {
+  const limited = fixture(), direct = createGpuCanvasTarget(limited.device, limited.canvas, {frameHistory: true, maxBytes: 1023});
+  assert.throws(() => direct.withFrame(() => assert.fail('over-budget history draw'), {frameToken: {}}), failCode('BUDGET'));
+  assert.equal(limited.textures.length, 1); assert.equal(count(limited, 'acquire'), 0);
+  assert.equal(direct.failed, false); assert.equal(direct.diagnostics.attachmentBytes, 512);
+  direct.withFrame((_frame, texture) => assert.equal(texture.descriptor.swapchain, true)); direct.dispose();
+
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {frameHistory: true, maxBytes: 1279});
+  const frameToken = {};
+  let oldColor;
+  target.withFrame((_frame, texture) => { oldColor = texture; }, {frameToken});
+  const previous = [...f.textures]; assert.equal(target.diagnostics.attachmentBytes, 1024);
+  target.resize(8, 4);
+  assert.equal(target.diagnostics.attachmentBytes, 1152); assert.equal(f.textures.length, 3);
+  assert.throws(() => target.withFrame(() => assert.fail('over-budget replacement history'), {frameToken}), failCode('BUDGET'));
+  assert.equal(f.textures.length, 3); assert.equal(target.failed, false); assert.ok(previous.every(t => t.destroyed === 0));
+  f.fences[0].resolve(); await tick();
+  assert.ok(previous.every(t => t.destroyed === 1)); assert.equal(target.diagnostics.attachmentBytes, 128);
+  target.withFrame((_frame, texture) => {
+    assert.notEqual(texture, oldColor); assert.deepEqual(texture.descriptor.size, [8, 4]);
+  }, {frameToken});
+  assert.equal(count(f, 'initialize'), 2, 'same callback after resize starts fresh attachments');
+  assert.equal(target.diagnostics.attachmentBytes, 256);
+  target.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
+});
+
 test('same-size resize is allocation-free and does not invalidate attachments', () => {
   const f = fixture(), t = createGpuCanvasTarget(f.device, f.canvas), before = t.diagnostics;
   assert.equal(t.resize(16, 8), t); assert.deepEqual(t.diagnostics, before);
@@ -295,7 +408,7 @@ test('unsupported compositing and formats fail before taking canvas ownership', 
   const f = fixture();
   for (const options of [{format: 'rgba32float'}, {format: 'rgba16float', srgbView: true},
     {toneMappingMode: 'invalid'}, {depthFormat: 'invalid-depth'},
-    {sampleCount: 8}, {alphaMode: 'straight'}, {alphaMode: 'transparent'}, {maxBytes: -1}, {unknown: true}])
+    {sampleCount: 8}, {alphaMode: 'straight'}, {alphaMode: 'transparent'}, {maxBytes: -1}, {frameHistory: 1}, {unknown: true}])
     assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, options), GpuCanvasError);
   assert.equal(f.calls.length, 0); assert.equal(f.textures.length, 0);
 });

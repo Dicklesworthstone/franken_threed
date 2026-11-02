@@ -149,7 +149,9 @@ export function applyThreePassMaterial(token, material, baseRaster) {
     }
     mapped = capture.stencilRaster;
   }
-  const writeMask = state.colorMask ? 0xf : 0, depthWriteEnabled = state.depthMask;
+  // DEPTH_TEST suppresses GL fragment writes independently of the depth mask.
+  // Preserve that mask itself: a later clear or tested draw still consumes it.
+  const writeMask = state.colorMask ? 0xf : 0, depthWriteEnabled = !!material.depthTest && state.depthMask;
   if (baseRaster.writeMask === writeMask && baseRaster.depthWriteEnabled === depthWriteEnabled &&
       baseRaster.stencilReference === mapped.stencilReference && sameStencil(baseRaster.stencil, mapped.stencil)) return baseRaster;
   const {stencil, stencilReference, ...base} = baseRaster;

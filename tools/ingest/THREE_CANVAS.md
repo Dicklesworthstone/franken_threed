@@ -131,6 +131,17 @@ Do not retain these views, yield, or return a Promise. Detecting a thenable does
 not cancel work already started by the caller. Do not configure the canvas from
 another owner while this target is live.
 
+The lower-level target can opt into `frameHistory: true`. Its
+`withFrame(draw, {frameToken})` then uses a lazily allocated owned color image for
+non-null tokens: repeated tokens retain color/depth/MSAA across presentation
+turns, and a new token initializes a fresh drawing buffer. A null token keeps
+direct swapchain rendering. `preserveDrawingBuffer: true` instead retains across
+all tokens. These histories share the existing attachment and resize-overlap
+budget; they never retain a swapchain texture. The generic canvas session
+forwards the token through `render(input, frame, {frameToken})` and
+`withFramebufferTexture(callback, {frameToken})`. Source animation-frame capture
+belongs to the renderer facade; these lower-level owners add no scheduler.
+
 `createGpuCanvasRenderer(canvas, factory, options)` from `gpu_canvas_renderer.mjs`
 adds device negotiation and renderer lifetime ownership. The factory receives
 `(device, rendererOptions)` and returns an owner with `render(input, frame)`,

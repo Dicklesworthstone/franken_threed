@@ -561,6 +561,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...presentation,
             preserveDrawingBuffer: this._shaderEncodedOutput && this.preserveDrawingBuffer === true,
+            frameHistory: this._shaderEncodedOutput === true,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
       if (this._disposed) { session.dispose(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._session = session;
@@ -812,6 +813,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const sourceLevel = webgl ? this._activeMipmapLevel : 0, sourceFace = webgl ? this._activeCubeFace : 0;
       const [width, height] = source ? [Math.max(1, source.shape.width >> sourceLevel), Math.max(1, source.shape.height >> sourceLevel)] : this._bufferSize();
       const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement;
+      const canvasFrameToken = webgl ? this._webglFrameToken ?? null : null;
       if (!this._nodeFramebufferCopyRecorder &&
           (region[0] + region[2] > width || region[1] + region[3] > height))
         fail('COPY', 'Framebuffer copy rectangle exceeds the selected source');
@@ -848,7 +850,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               });
             };
             if (source) this._targets.withFramebufferTexture(source, encode, {depth});
-            else this._session.withFramebufferTexture(encode, {width, height, depth});
+            else this._session.withFramebufferTexture(encode, {width, height, depth, frameToken: canvasFrameToken});
           };
           const request = {framebufferCopy: true, releaseFramebuffer: release, issue: () => {
             // Invalid destinations must not acquire or replace presentation.
@@ -1141,6 +1143,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
           nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState,
+          canvasFrameToken: this._shaderEncodedOutput ? this._webglFrameToken ?? null : null,
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
             : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
@@ -1418,7 +1421,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _submit(request) {
       return request.frame.operations ? request.frame.operations.run(() => this._submitFrame(request)) : this._submitFrame(request);
     }
-    _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null,
+    _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1440,7 +1443,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._renderTarget = sourceTarget; this._activeCubeFace = face; this._activeMipmapLevel = mipLevel;
       }
       const previousSubmissionDepth = this._webglSubmissionDepth ?? 0;
+      const previousFrameToken = this._webglFrameToken;
       if (this._shaderEncodedOutput) this._webglSubmissionDepth = previousSubmissionDepth + 1;
+      if (this._shaderEncodedOutput) this._webglFrameToken = canvasFrameToken;
       const occlusion = nodeFrame && !clearOnly ? this._occlusionQueries?.begin(this._occlusionContexts.get(nodeFrame),
         {requested: nodeFrame.occlusionRequested, arrayCamera: camera.isArrayCamera === true && camera.cameras.length > 0}) : null;
       if (occlusion) frame = {...frame, occlusion};
@@ -1452,7 +1457,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         const issue = () => {
           if (destination === this) this._session.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState},
-            this._hdr ? {...frame, outputEnabled: nodeFrame?.phases?.output !== false} : frame);
+            this._hdr ? {...frame, outputEnabled: nodeFrame?.phases?.output !== false} : frame, {frameToken: canvasFrameToken});
           else {
             // Source Renderer initializes depth once per destination target,
             // even when that image is borrowed from an already rendered target.
@@ -1494,6 +1499,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       } catch (error) { occlusion?.cancel(); if (!isPrepareBoundary(error)) frame.timestamp?.cancel(); throw error; }
       finally {
         this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth;
+        this._webglFrameToken = previousFrameToken;
         if (previousTarget) {
           this._renderTarget = previousTarget.target; this._activeCubeFace = previousTarget.face; this._activeMipmapLevel = previousTarget.mip;
         }
@@ -1836,8 +1842,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           return;
         }
         schedule();
-        this._advanceAnimationFrame();
-        callback(time, null);
+        // Source WebGL submits this whole callback before the browser presents.
+        // Deferred preparation may span host turns: accepted draws/copies keep
+        // one private image, while a later callback starts a fresh buffer.
+        const previous = this._webglFrameToken;
+        this._webglFrameToken = {};
+        try { this._advanceAnimationFrame(); callback(time, null); }
+        finally { this._webglFrameToken = previous; }
       };
       schedule();
     }

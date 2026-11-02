@@ -46,6 +46,11 @@ test('raster state uses WebGLState: blend table, BACK culling with frontFace fli
   assert.deepEqual([threeProgramRaster(T, shader({side: T.BackSide})).cullMode, threeProgramRaster(T, shader({side: T.BackSide})).frontFace], ['back', 'cw']);
   assert.equal(threeProgramRaster(T, shader({side: T.BackSide}), {frontFaceCW: true}).frontFace, 'ccw');
   assert.equal(threeProgramRaster(T, shader({side: T.DoubleSide})).cullMode, 'none');
+  const untested = threeProgramRaster(T, shader({depthTest: false, depthWrite: true}));
+  assert.equal(untested.depthCompare, 'always');
+  assert.equal(untested.depthWriteEnabled, false, 'a depth-disabled backdrop cannot occlude later scene geometry');
+  assert.equal(threeProgramRaster(T, shader({depthTest: true, depthWrite: false})).depthWriteEnabled, false);
+  assert.equal(threeProgramRaster(T, shader()).depthWriteEnabled, true);
   assert.throws(() => threeProgramRaster(T, shader({blending: T.SubtractiveBlending, transparent: true})), {code: 'THREE_PROGRAM_MATERIAL'});
 });
 

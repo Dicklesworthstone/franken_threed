@@ -98,7 +98,7 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
     get lastFrameRendered() { return lastFrameRendered; },
     get disposed() { return disposed; }, get failed() { return terminal !== null || !!target?.failed || !!renderer?.failed; },
     get diagnostics() { return Object.freeze({canvas: target?.diagnostics ?? null, renderer: renderer?.diagnostics ?? null}); },
-    render(input, frame = {}) {
+    render(input, frame = {}, {frameToken = null} = {}) {
       return exclusive(() => {
         object(frame, 'frame options');
         // Capture getters before borrowing any current presentation texture.
@@ -109,18 +109,18 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         // Copy attachment descriptors rather than values: with lazyAttachments
         // the presentation texture is acquired only when the renderer reads a view.
         lastFrameRendered = target.withFrame((attachments, texture, depth) => renderer.render(input,
-          Object.defineProperties(packet, Object.getOwnPropertyDescriptors(attachments)), texture, depth), {lazy: lazyAttachments});
+          Object.defineProperties(packet, Object.getOwnPropertyDescriptors(attachments)), texture, depth), {lazy: lazyAttachments, frameToken});
         live(); return api;
       });
     },
-    withFramebufferTexture(callback, {width = target.width, height = target.height, depth = false} = {}) {
+    withFramebufferTexture(callback, {width = target.width, height = target.height, depth = false, frameToken = null} = {}) {
       return exclusive(() => {
         if (typeof callback !== 'function') fail('FRAME', 'Expected a synchronous framebuffer copy');
         if (typeof renderer.withFramebufferTexture === 'function')
           return renderer.withFramebufferTexture(callback, {width, height, depth});
         if (width !== target.width || height !== target.height)
           fail('SIZE_CHANGED', 'The direct canvas changed size before its framebuffer copy');
-        return target.withFrame((attachments, texture, depthTexture) => callback(depth ? depthTexture : texture));
+        return target.withFrame((attachments, texture, depthTexture) => callback(depth ? depthTexture : texture), {frameToken});
       });
     },
     resize(width, height) { return exclusive(() => { target.resize(width, height); return api; }); },

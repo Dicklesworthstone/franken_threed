@@ -18,7 +18,7 @@ function canvasFixture() {
   let config;
   const context = {
     configure(d) { config = d; calls.push(['configure', d]); }, unconfigure() { calls.push(['unconfigure']); },
-    getCurrentTexture() { const t = {width: canvas.width, height: canvas.height, dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, usage: 16, format: config?.format, swapchain: true, createView(d) { return {texture: t, ...d}; }}; calls.push(['acquire', t]); return t; },
+    getCurrentTexture() { const t = {width: canvas.width, height: canvas.height, dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, usage: config?.usage ?? 16, format: config?.format, swapchain: true, createView(d) { return {texture: t, ...d}; }}; calls.push(['acquire', t]); return t; },
   };
   const canvas = {width: 300, height: 150, style: {}, getContext() { return context; }};
   return {canvas, calls, acquired: () => calls.filter(c => c[0] === 'acquire').length};
@@ -43,10 +43,15 @@ function recordingDevice() {
   d.createRenderPipeline = desc => ({...desc, getBindGroupLayout: () => ({})});
   // Full-screen output passes draw without vertex streams; record them apart.
   d.outputPasses = [];
+  d.canvasCopies = [];
   const encode = d.createCommandEncoder;
   d.createCommandEncoder = () => {
     const e = encode();
-    return {...e, beginRenderPass(desc) {
+    return {...e, copyTextureToTexture(source, destination, extent) {
+      assert.ok(source.texture.usage & 1); assert.ok(destination.texture.usage & 2);
+      assert.equal(source.texture.sampleCount, 1); assert.equal(destination.texture.sampleCount, 1);
+      d.canvasCopies.push({source, destination, extent});
+    }, beginRenderPass(desc) {
       if (!desc.colorAttachments[0]?.view?.texture?.swapchain || desc.depthStencilAttachment) {
         const pass = e.beginRenderPass(desc), record = d.passes.at(-1);
         return {...pass, setViewport(...v) { record.viewport = v; }, setScissorRect(...r) { record.scissor = r; }};
@@ -672,6 +677,11 @@ test('WebGL animation preserves procedural updates across cold preparation and r
   assert.equal(c.acquired(), 1); assert.equal(host.scheduled.size, 1, 'one fresh RAF, with GPU execution still pending');
   host.step(64);
   assert.deepEqual(frames, [16, 64]); assert.equal(c.acquired(), 2); assert.equal(mesh.position.x, .25);
+  assert.equal(device.canvasCopies.length, 2, 'each accepted animation frame presents owned color');
+  assert.equal(device.canvasCopies[0].source.texture, device.canvasCopies[1].source.texture, 'reuse bounded history storage');
+  assert.equal(device.passes.filter(pass => pass.desc.colorAttachments[0]?.clearValue?.[3] === 0 &&
+    pass.desc.depthStencilAttachment?.depthClearValue === 1 && pass.draws.length === 0).length, 2,
+  'default non-preserved animation starts each callback with fresh color and depth');
   renderer.setAnimationLoop(null); assert.equal(host.scheduled.size, 0);
 });
 

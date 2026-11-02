@@ -4,6 +4,8 @@
  * argument depth texture only for synchronous, immediately submitted work.
  * Lazy texture arguments are accessors; borrowing depth does not present color.
  * Canvas textures are reacquired on every use, never retained across host turns.
+ * Optional frameHistory retains owned attachments for one non-null frameToken;
+ * a new token starts a fresh buffer, while null keeps direct canvas borrowing.
  */
 export class GpuCanvasError extends Error {
   constructor(code, message) {
@@ -23,16 +25,17 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected canvas options');
   for (const key of Object.keys(options))
-    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView', 'toneMappingMode', 'preserveDrawingBuffer'].includes(key))
+    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView', 'toneMappingMode', 'preserveDrawingBuffer', 'frameHistory'].includes(key))
       fail('OPTIONS', `Unknown canvas option: ${key}`);
   const {
     format: canvasFormat = 'bgra8unorm', depthFormat = 'depth24plus', sampleCount = 1,
     alphaMode = 'opaque', maxBytes = 128 * 1024 * 1024,
     width: initialWidth = canvas?.width, height: initialHeight = canvas?.height,
-    srgbView = canvasFormat !== 'rgba16float', toneMappingMode = 'standard', preserveDrawingBuffer = false,
+    srgbView = canvasFormat !== 'rgba16float', toneMappingMode = 'standard', preserveDrawingBuffer = false, frameHistory = false,
   } = options;
   if (typeof srgbView !== 'boolean') fail('OPTIONS', 'srgbView must be boolean');
   if (typeof preserveDrawingBuffer !== 'boolean') fail('OPTIONS', 'preserveDrawingBuffer must be boolean');
+  if (typeof frameHistory !== 'boolean') fail('OPTIONS', 'frameHistory must be boolean');
   if (!['rgba8unorm', 'bgra8unorm', 'rgba16float'].includes(canvasFormat) || canvasFormat === 'rgba16float' && srgbView)
     fail('FORMAT', 'Canvas format must be rgba8unorm, bgra8unorm or rgba16float without an sRGB view');
   if (!['standard', 'extended'].includes(toneMappingMode))
@@ -51,8 +54,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!device || typeof device.createTexture !== 'function' ||
       typeof device.pushErrorScope !== 'function' || typeof device.popErrorScope !== 'function' ||
       typeof device.queue?.onSubmittedWorkDone !== 'function') fail('DEVICE', 'Expected a WebGPU device');
-  if (preserveDrawingBuffer && (typeof device.createCommandEncoder !== 'function' || typeof device.queue.submit !== 'function'))
-    fail('DEVICE', 'Preserved drawing buffers require native encoded copies');
+  if ((preserveDrawingBuffer || frameHistory) && (typeof device.createCommandEncoder !== 'function' || typeof device.queue.submit !== 'function'))
+    fail('DEVICE', 'Drawing-buffer history requires native encoded copies');
   const limit = device.limits?.maxTextureDimension2D;
   if (!Number.isSafeInteger(limit) || limit < 1) fail('DEVICE', 'Missing device texture-dimension limit');
   const dimension = value => {
@@ -64,6 +67,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   // srgbView:false lends the plain 8-bit view; the renderer must then encode
   // sRGB itself (shader-side transfer, WebGL-style encoded blending).
   const format = srgbView ? `${canvasFormat}-srgb` : canvasFormat;
+  const colorBytes = canvasFormat === 'rgba16float' ? 8 : 4;
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let context, configured = false, current = null, width = 0, height = 0;
   let disposed = false, terminal = null, busy = false, version = 0, frames = 0;
@@ -113,6 +117,12 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     if (thrown) { stop(thrown); throw thrown; }
     return result;
   }
+  function allocatePreserved(allocation, w, h) {
+    allocation.preserved = device.createTexture({size: [w, h], sampleCount: 1,
+      format: canvasFormat, viewFormats: srgbView ? [format] : [],
+      usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING, label: 'f3d-canvas-preserved'});
+    allocation.preservedView = allocation.preserved.createView({format});
+  }
   function resize(w, h) {
     dimension(w); dimension(h);
     if (version && width === w && height === h && canvas.width === w && canvas.height === h) return target;
@@ -120,14 +130,13 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     // offscreen owner does; depth24plus alone uses four. Swapchain/driver
     // allocations are outside this owned-attachment budget.
     const depthBytes = depthFormat === 'depth24plus-stencil8' ? 8 : depthFormat ? 4 : 0;
-    const colorBytes = canvasFormat === 'rgba16float' ? 8 : 4;
     const cost = w * h * (sampleCount * (depthBytes + (sampleCount > 1 ? colorBytes : 0)) +
       (preserveDrawingBuffer ? colorBytes : 0));
     const overlap = bytes();
     if (!Number.isSafeInteger(cost) || cost > maxBytes - overlap)
       fail('BUDGET', 'Resize exceeds the attachment budget including in-flight old targets');
     const next = {color: null, depth: null, depthView: null, colorView: null,
-      preserved: null, preservedView: null, initialized: false, bytes: cost, used: false};
+      preserved: null, preservedView: null, initialized: false, frameToken: null, bytes: cost, used: false};
     checked(() => {
       try {
         const descriptor = {size: [w, h], sampleCount, usage: RENDER_ATTACHMENT};
@@ -141,12 +150,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
               format: depthFormat, label: 'f3d-canvas-depth'});
             next.depthView = next.depth.createView();
           }
-          if (preserveDrawingBuffer) {
-            next.preserved = device.createTexture({size: [w, h], sampleCount: 1,
-              format: canvasFormat, viewFormats: srgbView ? [format] : [],
-              usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING, label: 'f3d-canvas-preserved'});
-            next.preservedView = next.preserved.createView({format});
-          }
+          if (preserveDrawingBuffer) allocatePreserved(next, w, h);
         }
         canvas.width = w; canvas.height = h;
       } catch (error) { destroy(next); throw error; }
@@ -165,19 +169,32 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     } else destroy(previous);
     return target;
   }
-  function withFrame(draw, {lazy = false} = {}) {
+  function withFrame(draw, {lazy = false, frameToken = null} = {}) {
     if (typeof draw !== 'function') fail('FRAME', 'Expected a synchronous draw function');
     if (typeof lazy !== 'boolean') fail('FRAME', 'Expected a boolean lazy acquisition flag');
     if (canvas.width !== width || canvas.height !== height)
       fail('SIZE_CHANGED', 'Canvas dimensions changed outside the target; call resize() first');
     if (!width || !height) return false;
+    const history = preserveDrawingBuffer || frameHistory && frameToken !== null;
     let presentation, views = null;
     const initialize = () => {
-      if (!current.preserved || current.initialized) return;
+      if (!history) {
+        // Direct uses may modify shared depth/MSAA attachments. A later history
+        // borrow must not combine that state with an older owned color image.
+        current.initialized = false; current.frameToken = null;
+        return;
+      }
+      if (current.initialized && (preserveDrawingBuffer || current.frameToken === frameToken)) return;
+      const extra = current.preserved ? 0 : width * height * colorBytes;
+      if (!Number.isSafeInteger(extra) || extra > maxBytes - bytes())
+        fail('BUDGET', 'Frame history exceeds the attachment budget including in-flight old targets');
       // A fresh WebGL drawing buffer begins with transparent black, depth one
       // and stencil zero, independently of clear masks. A depth-only borrower
       // also needs these initialized contents, without acquiring presentation.
+      // A callback token can span several browser presentation turns; only the
+      // first actual borrow for its token starts a new drawing buffer.
       checked(() => {
+        if (!current.preserved) { allocatePreserved(current, width, height); current.bytes += extra; }
         const encoder = device.createCommandEncoder({label: 'f3d-canvas-initialize'});
         const depth = current.depthView ? {view: current.depthView, depthLoadOp: 'clear',
           depthStoreOp: 'store', depthClearValue: 1,
@@ -187,13 +204,13 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
           ...(current.colorView ? {resolveTarget: current.preservedView} : {}),
           clearValue: [0, 0, 0, 0], loadOp: 'clear', storeOp: 'store'}],
           ...(depth ? {depthStencilAttachment: depth} : {})});
-        pass.end(); device.queue.submit([encoder.finish()]); current.initialized = true;
+        pass.end(); device.queue.submit([encoder.finish()]); current.initialized = true; current.frameToken = frameToken;
       });
     };
     const acquire = () => {
       initialize();
       views ??= checked(() => {
-        if (current.preserved) {
+        if (history) {
           presentation = current.preserved;
           return {colorView: current.colorView ?? current.preservedView, depthView: current.depthView,
             resolveTarget: current.colorView ? current.preservedView : undefined};
@@ -235,7 +252,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
       // The swapchain remains a same-turn borrow, and copying raw texels adds
       // no transfer, tone mapping or alpha round-trip. Issued partial draws
       // remain visible even when a later source callback throws.
-      if (views && current?.preserved && !terminal) checked(() => {
+      if (views && history && current?.preserved && !terminal) checked(() => {
         const target = context.getCurrentTexture(), encoder = device.createCommandEncoder({label: 'f3d-canvas-present'});
         encoder.copyTextureToTexture({texture: current.preserved}, {texture: target}, [width, height, 1]);
         device.queue.submit([encoder.finish()]);
@@ -280,7 +297,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     exclusive(() => {
       checked(() => {
         configured = true;
-        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING | (preserveDrawingBuffer ? COPY_DST : 0),
+        context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING | (preserveDrawingBuffer || frameHistory ? COPY_DST : 0),
           alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : [], toneMapping: {mode: toneMappingMode}});
       });
       resize(initialWidth, initialHeight);

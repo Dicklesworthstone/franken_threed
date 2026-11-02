@@ -113,7 +113,8 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
   return {
     ...threeProgramStencil(T, m, fail),
     blend, blendConstant, writeMask: m.colorWrite ? 0xf : 0,
-    depthCompare: m.depthTest ? DEPTH[m.depthFunc] : 'always', depthWriteEnabled: m.depthTest ? m.depthWrite : m.depthWrite,
+    // GL disables depth writes together with DEPTH_TEST, even if depthMask is true.
+    depthCompare: m.depthTest ? DEPTH[m.depthFunc] : 'always', depthWriteEnabled: m.depthTest && m.depthWrite,
     cullMode: side === T.DoubleSide || !triangles ? 'none' : 'back', frontFace: flip ? 'cw' : 'ccw',
     depthBias: m.polygonOffset && triangles ? m.polygonOffsetUnits : 0, depthBiasSlopeScale: m.polygonOffset && triangles ? m.polygonOffsetFactor : 0,
     // SAMPLE_ALPHA_TO_COVERAGE: GL ignores it on single-sampled framebuffers;

@@ -442,6 +442,46 @@ empty loads, changed dimensions, same-size `setSize` and same-value pixel ratio.
 There were zero GPU/browser errors. These are rendering-correctness results,
 not physical-device performance measurements.
 
+## Deferred multi-viewport WebGL animation frames
+
+The WebGL facade retains one drawing buffer for each accepted
+`setAnimationLoop` callback, including when `preserveDrawingBuffer` is false.
+Cold shader/scene preparation can cross several browser presentation turns;
+all canvas renders and framebuffer copies accepted by that callback keep the
+same private frame token. Each presentation copies the accumulated owned color
+into a freshly acquired swapchain texture. A later callback starts transparent
+black, depth one and stencil zero, so this does not turn the default canvas into
+a permanently preserved buffer. Explicit `preserveDrawingBuffer: true` retains
+its existing cross-frame behavior. Manual render calls outside these callbacks
+keep their direct presentation path.
+
+The existing canvas owner allocates history color lazily on the first actual
+attachment use. Warm callbacks reuse that storage; resize, in-flight old
+attachments and MSAA resolve storage remain charged to the existing byte budget.
+Stopping/replacing an animation loop does not invalidate work already accepted
+with its token. Deferred draw callbacks and public framebuffer copies inherit
+the accepted frame, without retaining a swapchain texture across host turns.
+
+The legacy program raster also matches GL's disabled depth test: fragments do
+not write depth when `depthTest` is false, even if the material's depth mask is
+true. The private mask state retains that mask for later clears and draws.
+This prevents fullscreen backgrounds from occluding later model passes.
+
+The extended `program_preserved_canvas.mjs` passes all 42 checkpoints and
+175,104 RGBA bytes exactly on Chromium 151.0.7922.34 / SwiftShader, including
+12 default-canvas animation checks at one/four samples. One cold callback spans
+five actual presentation textures while retaining four viewports and depth;
+warm/new-shader frames, a partial next frame, resize and queued work after loop
+stop also match source. The existing 30 explicitly preserved-canvas checks stay
+exact, with zero GPU/browser errors throughout.
+
+The unchanged original H6 `webgl_postprocessing_advanced` application now builds
+and renders all four quadrants through owned WebGPU with its real assets; the
+model remains visible across three controlled frames with no missing assets or
+GPU/browser errors. This is functional application evidence, not complete
+numerical closure: full-page comparison still has differences concentrated in
+FilmPass grain, and hardware performance remains unmeasured.
+
 ## WebGL-authored framebuffer snapshots
 
 `renderer.copyFramebufferToTexture(texture, position = null, level = 0)` now
