@@ -144,7 +144,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
             // Only its quad draw is suppressed; successful empty passes retain
             // the same presentation lifecycle as the pinned renderer.
             const target = typeof texture === 'function' ? texture() : texture;
-            if (outputEnabled) finalOutput.render({source, target, ...selected});
+            if (outputEnabled) finalOutput.render({source, target, ...selected, timestamp: frame.timestamp});
           });
           live(); return api;
         } catch (error) { return childFailure(error); }

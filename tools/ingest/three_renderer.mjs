@@ -36,6 +36,7 @@ import {createGpuHdrCanvasRenderer} from './gpu_hdr_canvas.mjs';
 import {createGpuThreeScene} from './three_scene.mjs';
 import {createThreeRenderTargets, inspectThreeRenderTargetMip} from './three_render_targets.mjs';
 import {createThreeRendererTransfers} from './three_renderer_transfers.mjs';
+import {createThreeTimestampQueries} from './three_timestamp_queries.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
@@ -414,11 +415,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         pendingTransferBytes: {enumerable: true, get: () => this._transfers.allocatedBytes},
       });
       this._renderUid = 0;
-      // Tooling surface (e.g. the r186 Inspector addon). This backend records no
-      // GPU timestamps: hasTimestamp stays false and no timing is reported.
-      this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: false, hasTimestamp: false,
+      const timestamps = this._timestamps = createThreeTimestampQueries({getDevice: () => this._device,
+        enabled: () => this._backend?.trackTimestamp === true, signal: this._targetLifetime.signal, warn: THREE.warnOnce});
+      this._backend = {isWebGPUBackend: true, isF3DBackend: true, device: null, trackTimestamp: parameters.trackTimestamp === true,
+        get hasTimestamp() { return timestamps.supported; },
         capabilities: {getUniformBufferLimit: () => this._device.limits.maxUniformBufferBindingSize},
-        hasTimestampQuery: () => false, getTimestampUID: () => null, delete: target => this._canvases.forget(target)};
+        hasTimestampQuery: timestamps.hasTimestampQuery, getTimestampUID: timestamps.getTimestampUID,
+        getTimestamp: timestamps.getTimestamp, getTimestampFrames: timestamps.getTimestampFrames,
+        resolveTimestampsAsync: type => this.resolveTimestampsAsync(type), delete: target => this._canvases.forget(target)};
       // The source frame clock (Animation advances it once per loop tick).
       this._nodes = {nodeFrame: typeof THREE.NodeFrame === 'function' ? new THREE.NodeFrame() : {frameId: 0, time: 0, deltaTime: 0, update() { this.frameId++; }}};
       this._inspector = typeof THREE.InspectorBase === 'function' ? new THREE.InspectorBase() : inspectorStub();
@@ -432,6 +436,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     get inspector() { return this._inspector; }
     hasFeature(name) { return !!this._device?.features?.has(name); }
     async hasFeatureAsync(name) { await this.init(); return this.hasFeature(name); }
+    async resolveTimestampsAsync(type = 'render') {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (!this._initialized) await this.init();
+      // Resolve at this FIFO position, after already accepted native passes.
+      // Mapping the result never holds later render/compute submissions up.
+      const duration = await (this._drain || this._preparing || this._timestampScope
+        ? new Promise((resolve, reject) => this._enqueue({readback: true,
+          issue: () => this._timestamps.resolve(type), resolve, reject}))
+        : this._timestamps.resolve(type));
+      if (duration !== undefined) this.info[type].timestamp = duration;
+      return duration;
+    }
 
     get domElement() { return this._canvasTarget.domElement; }
     get initialized() { return this._initialized; }
@@ -1042,8 +1058,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.info.render.calls++;
       this.info.render.frameCalls++;
       // Source timestamp UID shape `<call id>:f<frame>` (Inspector groups by call id).
-      this._inspector.beginRender(`render:${++this._renderUid}:f${this.info.frame}`, scene, camera, this._renderTarget);
-      try { return this._renderFrame(scene, camera); } finally { this._inspector.finishRender(); }
+      const uid = `render:${++this._renderUid}:f${this.info.frame}`, previousTimestamp = this._timestampScope;
+      const timestamp = this._timestamps.begin('render', uid);
+      this._inspector.beginRender(uid, scene, camera, this._renderTarget);
+      this._timestampScope = timestamp;
+      try { return this._renderFrame(scene, camera); }
+      finally { this._timestampScope = previousTimestamp; this._inspector.finishRender(); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
@@ -1058,6 +1078,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
       const outputProfile = target ? null : this._captureOutputProfile();
       const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile), key = sceneKey(this, scene, backgroundState);
+      if (!clearOnly && this._timestampScope) frame.timestamp = this._timestampScope;
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
@@ -1416,7 +1437,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           textures.withDispatch(nodeFrame.textureUses, readStorage);
         } else readStorage();
         occlusion?.commit();
-      } catch (error) { occlusion?.cancel(); throw error; }
+      } catch (error) { occlusion?.cancel(); if (!isPrepareBoundary(error)) frame.timestamp?.cancel(); throw error; }
       finally {
         this._programFrame = previous; this._programFramebufferFrame = previousFramebufferFrame; this._webglSubmissionDepth = previousSubmissionDepth;
         if (previousTarget) {
@@ -1782,6 +1803,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this.setAnimationLoop(null);
       this._disposed = true;
       this._occlusionQueries?.dispose();
+      this._timestamps.dispose();
       if (this._animationStarted) {
         this._animationStarted = false;
         if (this._animationHandle !== null) this._animationHost?.cancelAnimationFrame?.(this._animationHandle);

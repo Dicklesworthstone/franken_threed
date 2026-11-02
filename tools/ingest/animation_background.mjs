@@ -219,7 +219,7 @@ export async function createGpuAnimationBackground(device, source, options = {})
         const work = checked(() => {
           device.queue.writeBuffer(buffer, 0, packet);
           const encoder = device.createCommandEncoder({label});
-          const pass = encoder.beginRenderPass({colorAttachments: [{view: colorView, loadOp, clearValue,
+          const pass = encoder.beginRenderPass({timestampWrites: frame.timestamp?.writes(), colorAttachments: [{view: colorView, loadOp, clearValue,
             ...(depthSlice === undefined ? {} : {depthSlice}),
             storeOp: 'store', ...(resolveTarget ? {resolveTarget} : {})}]});
           if (viewport) pass.setViewport(...viewport);
@@ -227,6 +227,7 @@ export async function createGpuAnimationBackground(device, source, options = {})
           pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
           device.queue.submit([encoder.finish()]);
         });
+        frame.timestamp?.validate(work);
         pending = Promise.all([pending, work]).then(() => {}); pending.catch(() => {});
         live(); frames++; return renderer;
       } catch (error) { stop(error); throw error; }

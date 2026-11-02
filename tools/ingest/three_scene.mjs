@@ -2194,7 +2194,7 @@ export async function createGpuThreeScene(device,scene,{
           let end=first;while(drawObjects[end]?.view===view)end++;
           if(!activeViewport||activeViewport[2]!==0&&activeViewport[3]!==0){
             if(view.background){backgroundOwner.render(view.background,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:'load',
-              viewport:activeViewport,scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});backgrounds++;live();}
+              viewport:activeViewport,scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null,timestamp:prepared.timestamp});backgrounds++;live();}
             const boundaries=[first,...[...batchHistory.updates.keys()].filter(index=>index>first&&index<end),end];
             for(let part=0;part<boundaries.length-1;part++){
               const start=boundaries[part],snapshot=batchHistory.updates.get(start);
@@ -2222,7 +2222,7 @@ export async function createGpuThreeScene(device,scene,{
           activeViewport=view.viewport??activeViewport;
           if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
           backgroundOwner.render(view.background,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:'load',viewport:activeViewport,
-            scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null});
+            scissor:frame.scissor??null,screenSize:arrayProfile.targetSize??null,timestamp:prepared.timestamp});
           backgrounds++;live();
         }
         let nextCopy=0;
@@ -2274,7 +2274,7 @@ export async function createGpuThreeScene(device,scene,{
       }else{
       if(backgroundFrame){
         if(sourceBackground()!==backgroundOwner.source)fail('PREPARE','Source background changed during frame preparation');
-        backgroundOwner.render(backgroundFrame,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:prepared.loadOp,clearColor:prepared.clearColor});
+        backgroundOwner.render(backgroundFrame,{colorView:prepared.colorView,depthSlice:prepared.depthSlice,loadOp:prepared.loadOp,clearColor:prepared.clearColor,timestamp:prepared.timestamp});
         backgroundSubmitted=true;live();
         // Only color loads the prefix. The first geometry pass still honors the
         // original depth clear/load policy; later receiver spans load both.

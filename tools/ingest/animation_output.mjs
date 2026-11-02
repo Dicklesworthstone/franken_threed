@@ -405,7 +405,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
         object(frame, "output frame");
         for (const key of Object.keys(frame))
           if (
-            !["source", "target", "toneMapping", "exposure", "inputAlpha", "outputAlpha"].includes(
+            !["source", "target", "toneMapping", "exposure", "inputAlpha", "outputAlpha", "timestamp"].includes(
               key,
             )
           )
@@ -465,6 +465,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
             device.queue.writeBuffer(uniform, 0, bytes);
             const encoder = device.createCommandEncoder({ label: "Animation output" });
             const pass = encoder.beginRenderPass({
+              timestampWrites: frame.timestamp?.writes(),
               colorAttachments: [
                 { view, loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] },
               ],
@@ -479,6 +480,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
             throw error;
           }
         });
+        frame.timestamp?.validate(next);
         validation = Promise.all([validation, next]);
         validation.catch(stop);
         if (syncError) {

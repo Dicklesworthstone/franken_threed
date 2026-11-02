@@ -2579,6 +2579,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           "renderBundles",
           "clippingPlanes",
           "occlusion",
+          "timestamp",
         ],
         "frame",
       );
@@ -2993,6 +2994,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         if (scissoredClear) {
           // Its own pass, ahead of the frame's, so no pass state leaks into draws.
           const clearPass = encoder.beginRenderPass({label: `${label}/scissor-clear`,
+            timestampWrites: frame.timestamp?.writes(),
             colorAttachments: colorViews.map(view => ({view, ...(depthSlice === undefined ? {} : {depthSlice}), loadOp: "load", storeOp: "store"})),
             ...(depthFormat ? {depthStencilAttachment: {view: depthView, depthLoadOp: "load", depthStoreOp: "store",
               ...(stencilAttachment ? {stencilLoadOp: "load", stencilStoreOp: "store"} : {})}} : {})});
@@ -3004,6 +3006,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         const queryPlan = frame.occlusion?.session.plan(frame.occlusion.objects, commands, draws.length);
         const pass = encoder.beginRenderPass({
           label,
+          timestampWrites: frame.timestamp?.writes(),
           ...(queryPlan ? {occlusionQuerySet: queryPlan.querySet} : {}),
           colorAttachments: colorViews.map((view, index) => ({view,
             ...(depthSlice === undefined ? {} : {depthSlice}),
@@ -3052,6 +3055,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           device.queue.writeBuffer(environmentBuffer, 0, environmentWords);
         device.queue.submit([command]);
       });
+      frame.timestamp?.validate(submitted.errors);
       if (submitted.error) {
         submitted.errors.catch(() => {});
         terminal ??= submitted.error;

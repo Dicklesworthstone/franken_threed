@@ -295,7 +295,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return pipeline;
   }
-  function dispatch(pipeline, groups, workgroups) {
+  function dispatch(pipeline, groups, workgroups, timestamp = null) {
     live();
     if (!ready.has(pipeline)) fail('PIPELINE', 'Prepare the compute pipeline before dispatch');
     let direct = null;
@@ -312,16 +312,19 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
         fail('DISPATCH', 'Indirect dispatch requires twelve in-bounds bytes of owned storage');
     }
     const snapshots = captureGroups(groups);
-    checked(() => {
+    const validations = timestamp ? [] : null;
+    try { checked(() => {
       const bindings = snapshots.map(snapshot => resolveGroup(pipeline, snapshot));
       const encoder = device.createCommandEncoder({label: 'f3d-compute'});
-      const pass = encoder.beginComputePass({label: 'f3d-compute'});
+      const pass = encoder.beginComputePass({label: 'f3d-compute', timestampWrites: timestamp?.writes()});
       pass.setPipeline(pipeline);
       for (const {index, group} of bindings) pass.setBindGroup(index, group);
       if (direct) pass.dispatchWorkgroups(...direct);
       else pass.dispatchWorkgroupsIndirect(workgroups.buffer, workgroups.offset ?? 0);
       pass.end(); device.queue.submit([encoder.finish()]);
-    });
+    }, validations); }
+    catch (error) { timestamp?.cancel(); throw error; }
+    if (timestamp) timestamp.validate(Promise.all(validations));
   }
   async function read(key) {
     live();

@@ -364,7 +364,7 @@ function createThreeCompute(renderer, three) {
       frame[method](node);
     }
   }
-  function capture(node, entry, override, deferred) {
+  function capture(node, entry, override, deferred, timestamp = null) {
     // Validate live binding identities before capturing any upload histories.
     // onInit kernels enter this same boundary independently of their parent.
     const resources = entry.groups.flatMap(group => group.bindings.map(binding => binding.isStorageBuffer
@@ -437,7 +437,7 @@ function createThreeCompute(renderer, three) {
           const dimensions = indirect ? {buffer: upload(indirect), offset: 0} : direct;
           textureOwner.validateDispatch(textureUses);
           if (dispatch) {
-            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions);
+            gpu.dispatch(gpu.prepareSync(shader), bindings, dimensions, timestamp);
             textureOwner.written(textureUses);
           }
         }); } finally { issuing = false; }
@@ -455,7 +455,9 @@ function createThreeCompute(renderer, three) {
     assertThreeNativeComputeOutsideCapture(renderer);
     if (issuing || capturingReads) fail('REENTRY', 'Cannot compute from an upload callback or native storage capture');
     renderer.info.calls++; renderer.info.compute.calls++; renderer.info.compute.frameCalls++;
-    renderer.inspector?.beginCompute?.(`compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`, list);
+    const uid = `compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`;
+    const timestamp = renderer._timestamps?.begin('compute', uid, list.length === 1 ? list[0] : list);
+    renderer.inspector?.beginCompute?.(uid, list);
     const pending = [];
     try {
       for (const node of list) {
@@ -463,7 +465,7 @@ function createThreeCompute(renderer, three) {
         withFrame(node, () => {
           update(entry, 'before'); update(entry, 'current');
           textureOwner.captureDispatch(() => {
-            const request = capture(node, entry, override, deferred());
+            const request = capture(node, entry, override, deferred(), timestamp);
             let result;
             try { result = schedule(() => request.issue(), request.asynchronous); }
             catch (error) { request.release(); throw error; }
