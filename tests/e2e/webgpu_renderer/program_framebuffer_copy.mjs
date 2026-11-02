@@ -143,10 +143,10 @@ async function capture(mode) {
         {
           const name = 'array', depth = 3;
           const layered = new T.WebGLArrayRenderTarget(width, height, depth, {depthBuffer: false,
-            generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+            generateMipmaps: false, minFilter: T.NearestMipmapNearestFilter, magFilter: T.NearestFilter});
           targets.push(layered);layered.texture.mipmaps = Array.from({length: 6}, () => ({}));
           const writeLayer = (slice, level, phase) => {
-            layered.viewport.set(0, 0, Math.max(1, width >> level), Math.max(1, height >> level));
+            layered.viewport.set(0, 0, Math.max(1, layered.width >> level), Math.max(1, layered.height >> level));
             renderer.setRenderTarget(layered, slice, level);producerMaterial.uniforms.phase.value = phase;
             renderer.render(producer, camera);
           };
@@ -167,6 +167,33 @@ async function capture(mode) {
           const last = framebuffer(1, 1);
           writeLayer(2, 5, 0);
           copy(`${name}-last-authored-mip`, last);show(last);await read(`${name}-last-authored-mip`);
+          const arraySampler = new T.ShaderMaterial({glslVersion: T.GLSL3, depthTest: false, depthWrite: false,
+            uniforms: {atlas: {value: layered.texture}, selectedLayer: {value: 0}, lod: {value: 0}},
+            vertexShader: 'out vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+            fragmentShader: 'precision highp sampler2DArray;uniform sampler2DArray atlas;uniform int selectedLayer;uniform float lod;in vec2 vUv;out vec4 color;void main(){color=textureLod(atlas,vec3(vUv,float(selectedLayer)),lod);}'});
+          materials.push(arraySampler);const arrayConsumer = new T.Mesh(geometry, arraySampler);
+          const sampleArray = (texture, layer, level, destination = output) => {
+            renderer.setRenderTarget(destination);arraySampler.uniforms.atlas.value = texture;
+            arraySampler.uniforms.selectedLayer.value = layer;arraySampler.uniforms.lod.value = level;
+            renderer.render(arrayConsumer, camera);
+          };
+          // Queue distinct views of one source before awaiting either consumer.
+          sampleArray(layered.texture, 0, 1);sampleArray(layered.texture, 1, 1, queuedOutput);
+          await read('array-sampled-mip-updated');await read('array-sampled-mip-sibling', queuedOutput);
+          sampleArray(layered.texture, 2, 2);await read('array-sampled-other-mip');
+          sampleArray(layered.texture, 2, 0);await read('array-sampled-base');
+          sampleArray(layered.texture, 2, 5);await read('array-sampled-last-mip');
+          sampleArray(array.texture, 2, 3);await read('array-sampled-nonmip-filter');
+          writeLayer(1, 1, 1);sampleArray(layered.texture, 1, 1);await read('array-sampled-rewritten-layer');
+          const generated = new T.WebGLArrayRenderTarget(width, height, 3, {depthBuffer: false,
+            generateMipmaps: true, minFilter: T.NearestMipmapNearestFilter, magFilter: T.NearestFilter});
+          targets.push(generated);produce(generated, 0, 2);
+          sampleArray(generated.texture, 2, 2);await read('array-sampled-generated-mip');
+          const sourceTexture = layered.texture;layered.setSize(16, 12, 4);
+          layered.texture.mipmaps = Array.from({length: 5}, () => ({}));
+          if (layered.texture !== sourceTexture) throw new Error('Array resize replaced the public texture');
+          writeLayer(3, 1, 0);sampleArray(layered.texture, 3, 1);await read('array-sampled-resized');
+          layered.dispose();writeLayer(3, 0, 1);sampleArray(layered.texture, 3, 0);await read('array-sampled-recreated');
         }
         if (mode === 'source') {
           const probe = target(40, 28);probe.texture.type = T.FloatType;
@@ -258,6 +285,9 @@ try {
     ['resized-source', false], ['explicit-destination-mip', false], ['lower-mip-preserved', false],
     ['array-authored-mip-initial', false], ['array-authored-mip-updated', true],
     ['array-authored-mip-sibling', false], ['array-authored-other-mip', false], ['array-authored-base-preserved', true],
+    ['array-sampled-mip-updated', true], ['array-sampled-mip-sibling', false], ['array-sampled-other-mip', false],
+    ['array-sampled-base', true], ['array-sampled-nonmip-filter', false], ['array-sampled-rewritten-layer', true],
+    ['array-sampled-generated-mip', false], ['array-sampled-resized', false], ['array-sampled-recreated', true],
     ['half-float-destination', false], ['initialization-retarget', true], ['draw-before-copy', false], ['draw-after-copy', true],
   ]) for (let index = 0; index < corners.length; index++) {
     const expected = colors[index].map((value, channel) => inverted && channel < 3 ? 255 - value : value);
@@ -265,8 +295,8 @@ try {
   }
   for (const name of ['canvas-default-position', 'overwritten-base'])
     for (const [x, y] of corners) assert.deepEqual(pixel(frames[name], x, y), [223,191,159,255], `${name}: source uniform crop`);
-  for (const [x, y] of corners)
-    assert.deepEqual(pixel(frames['array-last-authored-mip'], x, y), colors[3], 'source last array mip texel');
+  for (const name of ['array-last-authored-mip', 'array-sampled-last-mip'])
+    for (const [x, y] of corners) assert.deepEqual(pixel(frames[name], x, y), colors[3], 'source last array mip texel');
   for (let index = 0; index < corners.length; index++) {
     const [x, y] = corners[index], expected = pixel(frames['srgb-direct-sample'], x, y);
     assert.ok(expected[3] === 255 && expected.slice(0, 3).some(channel => channel > 0), 'source sRGB sample is nonblank');

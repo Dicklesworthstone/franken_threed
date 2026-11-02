@@ -30,7 +30,8 @@
  * storage; the selected face integer addresses one array layer. Shared ordinary
  * depth is the source default, while useArrayDepthTexture or authored array
  * depth preserves independent layers. Native sampling borrows whole arrays;
- * explicit transfers/readbacks select one color or depth layer at a time.
+ * WebGL array sampling retains every layer/mip in an oriented GPU replica.
+ * Explicit transfers/readbacks select one color or depth layer at a time.
  * RenderTarget3D and WebGL3DRenderTarget retain 3D color storage. Their selected
  * face is a mip-local depth slice; native sampling borrows the entire volume.
  * Color mip extents shrink in XYZ while attached depth remains 2D or an
@@ -730,12 +731,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function sampling(entry, texture) {
     assertCurrent(entry);
-    if (entry.shape.cube && !entry.shape.webglCube || entry.shape.array || entry.shape.volume)
+    if (entry.shape.cube && !entry.shape.webglCube || entry.shape.array && !entry.shape.webglArray || entry.shape.volume)
       fail('UNSUPPORTED', 'Native layered target color sampling requires native texture bindings');
     if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
     const {descriptor, sampleType} = colorSampler(entry, texture);
+    if (entry.shape.webglArray && entry.shape.mipLevelCount !== entry.shape.maximumMipLevels &&
+        ![three.NearestFilter, three.LinearFilter].includes(texture.minFilter))
+      fail('UNSUPPORTED', 'Mip-filtered WebGL arrays require a complete source mip chain');
     if (entry.shape.webglCube && descriptor.lodMaxClamp > 0 && !entry.cubeMipReady)
       fail('UNSUPPORTED', 'Mip-filtered WebGL cubes require a completed source mip generation');
     const samplerKey = JSON.stringify(descriptor);
@@ -745,11 +749,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (!entry.sample) {
         budget(entry.shape.colorBytes);
         checked(entry, device => {
-          const {width, height, format, mipLevelCount, layers, cube} = entry.shape;
+          const {width, height, format, mipLevelCount, layers, cube, array} = entry.shape;
           entry.sample = device.createTexture({label: 'Source target UV sampling image',
             size: {width, height, depthOrArrayLayers: layers}, format, dimension: '2d', sampleCount: 1, mipLevelCount, usage: 4 | 16});
           entry.charged += entry.shape.colorBytes; allocatedBytes += entry.shape.colorBytes;
-          entry.view = entry.sample.createView(cube ? {dimension: 'cube'} : {});
+          entry.view = entry.sample.createView(cube ? {dimension: 'cube'} : array ? {dimension: '2d-array'} : {});
           let pipeline = pipelines.get(format);
           if (!pipeline) {
             const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL(flipY)});
@@ -768,7 +772,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
             entry.flipSteps = [];
             for (let level = 0; level < mipLevelCount; level++) for (let face = 0; face < layers; face++) {
               const settings = {baseMipLevel: level, mipLevelCount: 1,
-                ...(cube ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})};
+                ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})};
               const view = entry.sample.createView(settings);
               const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
                 entries: [{binding: 0, resource: source.createView(settings)}]});

@@ -67,6 +67,73 @@ test('legacy source array target keeps its null texture owner pointer while nati
   assert.equal(source.texture.renderTarget, null); assert.equal(source.texture.image.depth, 3);
 });
 
+for (const authored of [false, true]) test(`WebGL array sampling orients every layer and authored mip (authored=${authored})`, async t => {
+  const f = fixture(), source = new THREE.WebGLArrayRenderTarget(8, 4, 3, {depthBuffer: false,
+    minFilter: authored ? THREE.NearestMipmapNearestFilter : THREE.NearestFilter, magFilter: THREE.NearestFilter});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose());
+  if (authored) source.texture.mipmaps = [{}, {}, {}, {}];
+  const entry = f.owner.capture(source), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, () => {}, {face: 2});
+  const binding = bindings.get(source.texture), levels = authored ? 4 : 1;
+  assert.equal(binding.viewDimension, '2d-array'); assert.equal(binding.view.descriptor.dimension, '2d-array');
+  assert.equal(binding.view.texture.size.depthOrArrayLayers, 3);
+  assert.equal(binding.view.texture.mipLevelCount, levels); assert.equal(binding.sampler.lodMaxClamp, levels - 1);
+  assert.equal(f.owner.allocatedBytes, 2 * entry.shape.colorBytes);
+  const passes = f.calls.submissions.at(-1).passes;
+  assert.equal(passes.length, levels * 3);
+  assert.deepEqual(passes.map(pass => {
+    const output = pass.descriptor.colorAttachments[0].view, input = pass.group.entries[0].resource;
+    assert.notEqual(output.texture, input.texture);
+    assert.deepEqual(output.descriptor, input.descriptor);
+    assert.equal(output.descriptor.dimension, '2d'); assert.equal(output.descriptor.arrayLayerCount, 1);
+    assert.equal(output.descriptor.mipLevelCount, 1);
+    return [output.descriptor.baseMipLevel, output.descriptor.baseArrayLayer];
+  }), Array.from({length: levels}, (_, level) => [0, 1, 2].map(layer => [level, layer])).flat());
+  assert.match(f.calls.modules[0].code, /i32\(size.y\) - 1 - i32\(p.y\)/);
+  assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 1);
+  f.owner.render(entry, () => {}, {face: 1, mipLevel: authored ? 1 : 0});
+  assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 2);
+  source.texture.minFilter = THREE.LinearFilter;
+  assert.equal(bindings.get(source.texture).sampler.lodMaxClamp, 0, 'source nonmip filters clamp explicit LOD');
+  assert.equal(entry.copies, 2, 'sampler edits retain the oriented image');
+  assert.throws(() => f.owner.bindingsFor(source).get(source.texture), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.equal(source.texture.renderTarget, null); await f.owner.whenIdle();
+});
+
+test('WebGL array sampling preserves borrowed generations across resize and disposal', async t => {
+  const f = fixture(), source = new THREE.WebGLArrayRenderTarget(8, 4, 3, {depthBuffer: false});
+  t.after(() => f.owner.dispose()); const texture = source.texture;
+  f.owner.capture(source); const first = f.owner.bindingsFor().get(texture), release = first.retain();
+  const old = f.calls.textures.slice(), oldBytes = f.owner.allocatedBytes;
+  source.setSize(4, 2, 4); assert.equal(source.texture, texture);
+  assert.throws(first.validate, {code: 'THREE_TARGET_STALE'});
+  assert.ok(old.every(value => value.destroyed === 0));
+  f.owner.capture(source); const next = f.owner.bindingsFor().get(texture);
+  assert.notEqual(next.view, first.view);
+  assert.deepEqual(next.view.texture.size, {width: 4, height: 2, depthOrArrayLayers: 4});
+  assert.equal(f.owner.allocatedBytes, oldBytes + 2 * 4 * 2 * 4 * 4);
+  release(); await Promise.resolve(); await Promise.resolve();
+  assert.ok(old.every(value => value.destroyed === 1));
+  source.dispose(); await f.owner.whenIdle();
+  assert.equal(f.owner.allocatedBytes, 0); assert.ok(f.calls.textures.every(value => value.destroyed === 1));
+});
+
+test('WebGL array sampling rejects incomplete mip filters and accounts for the full oriented replica', t => {
+  for (const count of [0, 2]) {
+    const f = fixture(), source = new THREE.WebGLArrayRenderTarget(8, 4, 3, {depthBuffer: false,
+      minFilter: THREE.NearestMipmapNearestFilter});
+    t.after(() => f.owner.dispose()); t.after(() => source.dispose());
+    source.texture.mipmaps = Array.from({length: count}, () => ({})); f.owner.capture(source);
+    assert.throws(() => f.owner.bindingsFor().get(source.texture), {code: 'THREE_TARGET_UNSUPPORTED'});
+    assert.equal(f.calls.textures.length, 0); assert.equal(f.owner.allocatedBytes, 0);
+  }
+  const f = fixture({maxBytes: 767}), source = new THREE.WebGLArrayRenderTarget(8, 4, 3, {depthBuffer: false});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose()); f.owner.capture(source);
+  assert.throws(() => f.owner.bindingsFor().get(source.texture), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.owner.allocatedBytes, 384); assert.equal(f.calls.textures.length, 1);
+  assert.equal(f.calls.submissions.length, 0);
+});
+
 test('source array size/depth changes invalidate earlier generations and reallocate the full new layer count', t => {
   const f = fixture(), source = target({useArrayDepthTexture: true}); t.after(() => f.owner.dispose());
   source.depthTexture = new THREE.DepthTexture(8, 4); source.depthTexture.image.depth = 3;

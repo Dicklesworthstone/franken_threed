@@ -156,6 +156,36 @@ test('WebGL authored array mips reject invalid layers and unsupported profiles b
   assert.deepEqual([f.textures.length, f.device.buffers.length], allocations); assert.equal(f.device.passes.length, 0);
 });
 
+test('WebGL shaders consume rendered arrays through a persistent oriented GPU binding', async t => {
+  const f = fixture(t, true), array = new GL.WebGLArrayRenderTarget(8, 6, 3, {depthBuffer: false});
+  f.renderer.outputColorSpace = GL.SRGBColorSpace;
+  t.after(() => array.dispose()); await f.renderer.init();
+  f.renderer.setRenderTarget(array, 2); await f.renderer.renderAsync(f.scene, f.camera);
+  const native = drawPasses(f.device)[0].desc.colorAttachments[0].view.texture;
+  const material = new GL.ShaderMaterial({glslVersion: GL.GLSL3,
+    uniforms: {atlas: {value: array.texture}, selectedLayer: {value: 2}},
+    vertexShader: 'out vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+    fragmentShader: 'precision highp sampler2DArray;uniform sampler2DArray atlas;uniform int selectedLayer;in vec2 vUv;out vec4 color;void main(){color=texture(atlas,vec3(vUv,float(selectedLayer)));}'});
+  const consumer = new GL.Mesh(new GL.PlaneGeometry(2, 2), material);
+  t.after(() => { material.dispose(); consumer.geometry.dispose(); });
+  f.renderer.setRenderTarget(null); await f.renderer.compileAsync(consumer, f.camera);
+  f.renderer.render(consumer, f.camera); material.uniforms.selectedLayer.value = 0;
+  f.renderer.render(consumer, f.camera); await f.renderer.waitForGPU();
+  const draws = f.device.snapshots.flat().filter(draw => /texture_2d_array/.test(draw.pipeline.fragment.module.code));
+  assert.equal(draws.length, 2);
+  const views = draws.map(draw => textureEntries(draw)[0].resource);
+  assert.equal(views[0], views[1]); assert.equal(views[0].dimension, '2d-array');
+  assert.notEqual(views[0].texture, native); assert.equal(views[0].texture.depthOrArrayLayers, 3);
+  assert.equal(f.renderer._targets.capture(array).copies, 1);
+  const uniforms = draws.map(draw => [...draw.contents.values()].map(bytes => Array.from(bytes)));
+  assert.notDeepEqual(uniforms[0], uniforms[1], 'queued source layer uniforms retain their call-time values');
+  f.renderer.setRenderTarget(array, 1); await f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); await f.renderer.renderAsync(consumer, f.camera);
+  assert.equal(f.renderer._targets.capture(array).copies, 2);
+  assert.equal(f.copies.length, 0); assert.equal(f.reads.length, 0);
+  assert.equal(array.texture.renderTarget, null);
+});
+
 for (const Type of [T.RenderTarget, T.WebGLArrayRenderTarget])
 test(`${Type.name} color sampling binds the whole array and preserves queued layer uniforms`, async t => {
   const f = fixture(t), array = Type === T.RenderTarget ? target(t) : new Type(8, 6, 3);
