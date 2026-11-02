@@ -131,6 +131,59 @@ function sampledCopies(T, renderer, imageDestination, aliases, bundled = false, 
   return {scene, camera};
 }
 
+function sampledMipCopies(T, renderer, generated) {
+  const N = T.TSL, scene = new T.Scene();
+  const pixels = (size, level, seed) => Uint8Array.from({length: size * size * 4}, (_, offset) => {
+    const channel = offset % 4, pixel = Math.floor(offset / 4);
+    return channel === 3 ? 255 : (seed + level * 53 + channel * 47 + pixel * (channel + 1) * 7) % 256;
+  });
+  const chain = (size, seed) => Array.from({length: 1 + Math.log2(size)}, (_, level) => {
+    const width = size >> level; return {width, height: width, data: pixels(width, level, seed)};
+  });
+  const destination = new T.DataTexture(pixels(8, 0, 17), 8, 8);
+  destination.generateMipmaps = generated; destination.minFilter = T.NearestMipmapNearestFilter;
+  if (!generated) destination.mipmaps = chain(8, 17);
+  destination.needsUpdate = true;
+  const alias = destination.clone();
+  const source = new T.DataTexture(pixels(4, 0, 91), 4, 4);
+  source.mipmaps = chain(4, 91); source.minFilter = T.NearestMipmapNearestFilter; source.needsUpdate = true;
+  for (const [row, texture] of [destination, alias].entries()) for (let level = 0; level < 4; level++) {
+    const size = 8 >> level, material = new T.MeshBasicNodeMaterial();
+    material.colorNode = N.textureLoad(texture, N.ivec2(N.uv().mul(size)), N.int(level)).rgb;
+    const mesh = new T.Mesh(new T.PlaneGeometry(.95, 1.1), material);
+    mesh.position.set((level - 1.5) * 1.15, row === 0 ? .7 : -.7, 0); mesh.frustumCulled = false; scene.add(mesh);
+  }
+  const camera = new T.OrthographicCamera(-2.5, 2.5, 1.8, -1.8, .1, 10); camera.position.z = 3;
+  const region = size => new T.Box2(new T.Vector2(), new T.Vector2(size, size));
+  const render = renderer.render.bind(renderer); let frame = 0;
+  renderer.render = (...args) => {
+    frame++;
+    if (frame === 2) renderer.copyTextureToTexture(source, destination, region(4), new T.Vector2(2, 2));
+    if (frame === 7) renderer.copyTextureToTexture(source, destination, region(2), new T.Vector2(1, 1), 1, 1);
+    if (frame === 8) {
+      destination.generateMipmaps = true;
+      source.mipmaps[2].data.set([240, 40, 80, 255]); source.needsUpdate = true;
+      renderer.copyTextureToTexture(source, destination, region(1), new T.Vector2(0, 0), 2, 2);
+    }
+    if (frame === 10) {
+      destination.generateMipmaps = false;
+      destination.image.data.fill(153);
+      if (!generated) destination.mipmaps.forEach(mip => mip.data.fill(153));
+      renderer.copyTextureToTexture(source, destination, region(4), new T.Vector2(4, 4));
+    }
+    if (frame === 12) {
+      destination.generateMipmaps = true; destination.dispose();
+      renderer.copyTextureToTexture(source, destination, region(2), new T.Vector2(0, 0), 1, 1);
+    }
+    if (frame === 13) {
+      destination.needsUpdate = true;
+      renderer.copyTextureToTexture(source, destination, region(1), new T.Vector2(0, 0), 2, 0);
+    }
+    return render(...args);
+  };
+  return {scene, camera};
+}
+
 // GPU-authored source bytes are copied directly into an ordinary material map.
 // A compute consumer reads that same map in the next FIFO slot; the two planes
 // therefore prove both consumers observe the copy, including warm bundles.
@@ -221,6 +274,8 @@ export const storageReadScenarios = {
   native_sampled_copy_aliases(T, renderer) { return sampledCopies(T, renderer, false, true, false, true); },
   native_sampled_copy_bundle(T, renderer) { return sampledCopies(T, renderer, false, false, true); },
   native_sampled_copy_history(T, renderer) { return sampledCopies(T, renderer, false, false, false, true); },
+  native_sampled_copy_authored_mips(T, renderer) { return sampledMipCopies(T, renderer, false); },
+  native_sampled_copy_generated_mips(T, renderer) { return sampledMipCopies(T, renderer, true); },
   native_sampled_copy_storage(T, renderer) { return producedCopies(T, renderer); },
   native_sampled_copy_storage_array_mip(T, renderer) { return producedCopies(T, renderer, {array: true, mip: true}); },
   native_sampled_copy_storage_volume_mip(T, renderer) { return producedCopies(T, renderer, {volume: true, mip: true}); },

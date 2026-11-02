@@ -384,7 +384,7 @@ function textureInspector(T,{
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
     return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,
-      native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
+      native2D:nativeMedia&&!layered&&!cube,native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
@@ -460,8 +460,8 @@ export function createGpuThreeTextures(device,{
       else rs[++last]=b;}
     rs.length=last+1;return rs;
   }
-  function downsample(resource,d){
-    if(d.manual||d.levels===1)return;
+  function downsample(resource,d,force=false){
+    if(d.manual&&!force||d.levels===1)return;
     const key=(d.volume?'3d/':'2d/')+d.viewFormat,code=d.volume?VOLUME_MIP_SHADER:MIP_SHADER;
     let pipeline=pipelines.get(key);
     if(!pipeline){pipeline=native(()=>device.createRenderPipeline({label:label+'/mips',layout:'auto',
@@ -553,7 +553,7 @@ export function createGpuThreeTextures(device,{
       }
       downsample(a,d);stats.uploads++;a.sourceVersion=t.source.version;
       // WebGLTextures.uploadTexture: authored 2D mips turn generation off.
-      if(d.manual&&!d.cube)t.generateMipmaps=false;
+      if(d.manual&&!d.cube&&!d.native2D)t.generateMipmaps=false;
       // Upstream acknowledges the source BEFORE onUpdate, and the texture AFTER.
       // A callback exception is not a driver error and is not replayed on retry.
       if(t.onUpdate)t.onUpdate(t);
@@ -576,9 +576,9 @@ export function createGpuThreeTextures(device,{
         if(list.length!==1)fail('OPTIONS','A GPU seed requires exactly one sampled destination');
         seed=check(copyFrom);
         const d=list[0].d,s=seed.d;
-        if(d.viewDimension!=='2d'||s.viewDimension!=='2d'||d.levels!==1||s.levels!==1||
+        if(d.viewDimension!=='2d'||s.viewDimension!=='2d'||d.levels!==s.levels||
           d.width!==s.width||d.height!==s.height||d.format!==s.format)
-          fail('COPY','Sampled GPU seeds require matching base-level 2D storage');
+          fail('COPY','Sampled GPU seeds require matching complete 2D mip storage');
         if(d.source===s.source&&d.key===s.key)fail('COPY','A sampled GPU seed requires independent storage');
       }else if(copyOnly)fail('OPTIONS','A copy-only initialization requires a GPU seed');
       validatePlans(list);
@@ -606,8 +606,9 @@ export function createGpuThreeTextures(device,{
         }
         if(seed&&created){
           const encoder=native(()=>device.createCommandEncoder({label:label+'/preserve-copy'}));
-          native(()=>encoder.copyTextureToTexture({texture:seed.r.resource.texture,origin:[0,0,0]},
-            {texture:r.resource.texture,origin:[0,0,0]},[d.width,d.height,1]));
+          for(let level=0;level<d.levels;level++)native(()=>encoder.copyTextureToTexture(
+            {texture:seed.r.resource.texture,mipLevel:level,origin:[0,0,0]},
+            {texture:r.resource.texture,mipLevel:level,origin:[0,0,0]},[Math.max(1,d.width>>level),Math.max(1,d.height>>level),1]));
           native(()=>device.queue.submit([encoder.finish()]));
           if(copyOnly){r.resource.sourceVersion=t.source.version;r.version=t.version;}
         }
@@ -632,16 +633,18 @@ export function createGpuThreeTextures(device,{
     nativeTexture(t){return check(t).r.resource.texture;},
     // The caller has already prepared both copy endpoints. Keep the submitted
     // write in this owner's native validation and completion history.
-    writeTexture(t,run,{validation=null}={}){
+    writeTexture(t,run,{validation=null,generateMipmaps=false}={}){
       live();if(busy)fail('REENTRANT','Cannot write during a texture operation');
       if(typeof run!=='function')fail('OPTIONS','Expected a synchronous native texture write');
-      const {r,d}=check(t);if(d.viewDimension!=='2d'||d.levels!==1)
-        fail('COPY','Sampled writes require base-level 2D storage');
+      const {r,d}=check(t);if(d.viewDimension!=='2d')
+        fail('COPY','Sampled writes require 2D storage');
+      if(generateMipmaps&&d.levels>1&&(d.integral||d.sampleType==='unfilterable-float'))
+        fail('COPY','Generated sampled mips require filterable floating-point samples');
       busy=true;
       try{return checked(()=>{
         const value=run(r.resource.texture);
         if(value?.then){Promise.resolve(value).catch(()=>{});fail('OPTIONS','Native sampled writes cannot cross an await');}
-        live();return value;
+        live();if(generateMipmaps)downsample(r.resource,d,true);return value;
       });}finally{
         busy=false;
         if(validation){pending=Promise.all([pending,validation]).then(()=>{}).catch(error=>{throw stop(error);});pending.catch(()=>{});}

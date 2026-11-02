@@ -225,6 +225,113 @@ function sampledNative(f, texture) {
   finally { f.inputs.release(lease); }
 }
 
+function mipTexture(T, width, height, value = 1) {
+  const texture = new T.DataTexture(rgba(Array(width * height).fill(value)), width, height);
+  texture.minFilter = T.NearestMipmapNearestFilter;
+  texture.mipmaps = Array.from({length: 1 + Math.floor(Math.log2(Math.max(width, height)))}, (_, level) => {
+    const w = Math.max(1, width >> level), h = Math.max(1, height >> level);
+    return {width: w, height: h, data: rgba(Array(w * h).fill(value + level))};
+  });
+  return texture;
+}
+
+// The existing byte-copy fixture cannot execute mip shaders. Record only their
+// selected attachments here; actual filtered values belong to the GPU oracle.
+function recordMipPasses(f) {
+  const passes = [], encoder = f.device.createCommandEncoder;
+  f.device.createShaderModule = descriptor => descriptor;
+  f.device.createRenderPipeline = () => ({getBindGroupLayout: () => ({})});
+  f.device.createBindGroup = descriptor => descriptor;
+  f.device.createCommandEncoder = () => ({...encoder(), beginRenderPass(descriptor) {
+    passes.push(descriptor);
+    return {setPipeline() {}, setBindGroup() {}, draw() {}, end() {}};
+  }});
+  return passes;
+}
+
+test('ordinary sampled mip copies preserve complete authored pyramids and isolate uploaded Source aliases', async t => {
+  const f = cubeSetup(t), source = mipTexture(f.T, 8, 4, 21), destination = mipTexture(f.T, 4, 2, 1);
+  const alias = mipTexture(f.T, 4, 2, 1); alias.source = destination.source; alias.mipmaps = destination.mipmaps;
+  const original = sampledNative(f, destination); assert.equal(sampledNative(f, alias), original);
+  const before = destination.mipmaps.map(mip => mip.data.slice());
+  destination.mipmaps.forEach(mip => mip.data.fill(99));
+  f.renderer.copyTextureToTexture(source, destination, box(0, 0, 0, 2, 1, 1), point(0, 0, 0), 2, 1);
+  const copied = sampledNative(f, destination);
+  assert.notEqual(copied, original);
+  assert.deepEqual(copied.levels.map(level => [...level.data]), [[...before[0]], [...rgba([23, 23])], [...before[2]]]);
+  assert.deepEqual(original.levels.map(level => [...level.data]), before.map(bytes => [...bytes]));
+  assert.equal(sampledNative(f, alias), original);
+  assert.deepEqual(f.commands.slice(0, 3).map(command => [command.from.mipLevel, command.to.mipLevel, command.size]),
+    [[0, 0, [4, 2, 1]], [1, 1, [2, 1, 1]], [2, 2, [1, 1, 1]]]);
+  const allocated = f.textures.length, count = f.commands.length;
+  f.renderer.copyTextureToTexture(source, destination, box(1, 0, 0, 1, 1, 1), point(0, 0, 0), 1, 2);
+  assert.equal(sampledNative(f, destination), copied);
+  assert.equal(f.textures.length, allocated); assert.equal(f.commands.length, count + 1);
+  assert.deepEqual(copied.levels[2].data, rgba([22]));
+  assert.ok(destination.mipmaps.every(mip => mip.data.every(byte => byte === 99)), 'GPU patches never rewrite authored CPU mips');
+  destination.dispose();
+  f.renderer.copyTextureToTexture(source, destination, box(0, 0, 0, 1, 1, 1), point(0, 0, 0), 2, 2);
+  const recreated = sampledNative(f, destination);
+  assert.ok(recreated.levels[0].data.every(byte => byte === 99));
+  assert.ok(recreated.levels[1].data.every(byte => byte === 99));
+  assert.deepEqual(recreated.levels[2].data, rgba([23]));
+  assert.equal(sampledNative(f, alias), original, 'fresh destination residency must not revive or overwrite alias pixels');
+  await f.renderer.waitForGPU();
+});
+
+test('queued mip copies preserve captured source versions, selected levels and requested destination replacement', async t => {
+  const f = cubeSetup(t), source = mipTexture(f.T, 4, 4, 20), destination = mipTexture(f.T, 4, 4, 1);
+  f.renderer._preparing = true;
+  const region = box(0, 0, 0, 1, 1, 1), position = point(0, 0, 0);
+  f.renderer.copyTextureToTexture(source, destination, region, position, 2, 2);
+  source.mipmaps[2].data.set(rgba([31])); source.needsUpdate = true;
+  f.renderer.copyTextureToTexture(source, destination, region, position, 2, 1);
+  source.mipmaps[2].data.fill(99); destination.mipmaps.forEach(mip => mip.data.fill(99));
+  region.max.x = 99; position.x = 99;
+  f.flush();
+  const copied = sampledNative(f, destination);
+  assert.deepEqual(copied.levels[0].data, rgba(Array(16).fill(1)));
+  assert.deepEqual(copied.levels[1].data, rgba([31, 2, 2, 2]));
+  assert.deepEqual(copied.levels[2].data, rgba([22]));
+  destination.needsUpdate = true;
+  const replacement = sampledNative(f, destination);
+  assert.ok(replacement.levels.every(level => level.data.every(byte => byte === 99)));
+  await f.renderer.waitForGPU();
+});
+
+test('sampled base copies regenerate mips while authored nonzero writes retain their level and call-time policy', async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), source = new f.T.DataTexture(rgba([21]), 1, 1);
+  const destination = new f.T.DataTexture(rgba(Array(16).fill(1)), 4, 4);
+  destination.generateMipmaps = true; destination.minFilter = f.T.NearestMipmapNearestFilter;
+  sampledNative(f, destination); assert.equal(passes.length, 2);
+  f.renderer.copyTextureToTexture(source, destination, null, point(0, 0, 0), 0, 1);
+  assert.equal(passes.length, 2, 'nonzero source destination levels never generate a pyramid');
+  assert.deepEqual(sampledNative(f, destination).levels[1].data.subarray(0, 4), rgba([21]));
+  f.renderer._preparing = true;
+  f.renderer.copyTextureToTexture(source, destination, null, point(0, 0, 0));
+  destination.generateMipmaps = false;
+  f.renderer.copyTextureToTexture(source, destination, null, point(1, 1, 0));
+  destination.generateMipmaps = true;
+  f.flush();
+  assert.equal(passes.length, 4, 'only the first queued base copy captured generation');
+  assert.deepEqual(passes.slice(2).map(pass => pass.colorAttachments[0].view.view.baseMipLevel), [1, 2]);
+  await f.renderer.waitForGPU();
+});
+
+test('native authored mip uploads retain generateMipmaps and a base copy can replace their lower levels', async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), destination = mipTexture(f.T, 4, 4, 1);
+  const source = new f.T.DataTexture(rgba([21]), 1, 1);
+  destination.generateMipmaps = true;
+  let observed; destination.onUpdate = texture => { observed = texture.generateMipmaps; };
+  sampledNative(f, destination);
+  assert.equal(observed, true); assert.equal(destination.generateMipmaps, true);
+  assert.equal(passes.length, 0, 'source upload uses authored mip contents');
+  f.renderer.copyTextureToTexture(source, destination, null, point(0, 0, 0));
+  assert.equal(passes.length, 2, 'source base-copy policy regenerates even an authored chain');
+  assert.equal(destination.generateMipmaps, true);
+  await f.renderer.waitForGPU();
+});
+
 test('ordinary sampled copies retain resident patches and isolate Source aliases without CPU mutation', async t => {
   const f = cubeSetup(t), source = new f.T.DataTexture(rgba([11, 12, 13, 14]), 2, 2);
   let fences = 0;
@@ -412,7 +519,7 @@ test('ordinary copy feedback, unsupported destinations and invalid regions rejec
   for (const change of [
     f => ({source: f.destination}),
     f => { f.destination.type = f.T.HalfFloatType; f.destination.image.data = new Uint16Array(16); return {}; },
-    f => { f.destination.generateMipmaps = true; return {}; },
+    f => { f.destination.mipmaps = [{width: 1, height: 1, data: rgba([1])}]; return {}; },
     () => ({position: point(2, 0, 0)}),
     () => ({destinationLevel: 1}),
   ]) {

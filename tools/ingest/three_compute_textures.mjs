@@ -270,7 +270,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (original.layerUpdates instanceof Set) texture.layerUpdates = new Set();
     return texture;
   }
-  function snapshot(original, shape, existingPixels = null) {
+  function snapshot(original, shape, existingPixels = null, privateDestination = false) {
     const texture = privateDescriptor(original);
     const updates = updatePlan(original, shape), imageAtCapture = original.image;
     const rangesAtCapture = original.updateRanges, rangeValues = (rangesAtCapture ?? []).map(r => ({ref: r, start: r.start, count: r.count}));
@@ -282,7 +282,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const source = original.source, version = original.version, sourceVersion = existingPixels?.source.version ?? source.version;
     // Modern Textures.updateTexture caches media by Texture/version, even when
     // Texture.copy shares Source. An alias must own its frame and onUpdate.
-    const key = JSON.stringify(shape.nativeMedia ? [sourceVersion, shape.key, original.id, version] : [sourceVersion, shape.key]);
+    // A copied texture owns its uploads independently of Source aliases. After
+    // disposal, the same public version must capture current CPU pixels instead
+    // of reviving an alias's older payload. Warm captures reuse their record.
+    const key = privateDestination ? {} : JSON.stringify(shape.nativeMedia
+      ? [sourceVersion, shape.key, original.id, version] : [sourceVersion, shape.key]);
     let pixels = existingPixels ?? sources.get(source)?.get(key);
     if (!pixels) {
       // Residency is keyed by the same complete descriptor as the native pool.
@@ -478,7 +482,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
           original.image === imageAtCapture && original.image?.data === dataAtCapture &&
           (!mipValues || original.mipmaps === mipsAtCapture && original.mipmaps.length === mipValues.length &&
             mipValues.every((value, i) => original.mipmaps[i] === value.image && value.image.data === value.data))) {
-        if (shape.manual && !shape.cube) original.generateMipmaps = false;
+        if (shape.manual && !shape.cube && !shape.native2D) original.generateMipmaps = false;
         if (updates && original.updateRanges === rangesAtCapture && rangesAtCapture?.length === rangeValues.length &&
             rangeValues.every((r, i) => rangesAtCapture[i] === r.ref && r.ref.start === r.start && r.ref.count === r.count))
           original.clearUpdateRanges?.();
@@ -533,7 +537,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       // A sampler change must not reread an advancing video or wait for an
       // earlier bitmap capture to finish. Its accepted frame remains immutable.
       const mediaPixels = shape.nativeMedia && record?.source === original.source && record.version === original.version ? record.pixels : null;
-      const replacement = snapshot(original, shape, sharedPixels ?? mediaPixels);
+      const replacement = snapshot(original, shape, sharedPixels ?? mediaPixels, privateDestination);
       const pixels = replacement.pixels;
       try { watch(original); }
       catch (error) { if (pixels.refs === 0) pixels.disposeImages?.(); throw error; }
@@ -569,9 +573,16 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   function captureCopyDestination(texture, level = 0) {
     const shape = describe({texture, isSampledTexture: true}, {copyDestination: true});
-    if (level !== 0 || shape.viewDimension !== '2d' || shape.levels !== 1 || shape.manual || shape.blockUploads || shape.nativeMedia)
-      fail('COPY', 'Ordinary sampled copy destinations require uncompressed base-level 2D storage');
+    if (!Number.isSafeInteger(level) || level < 0 || level >= shape.levels ||
+        shape.viewDimension !== '2d' || shape.blockUploads || shape.nativeMedia)
+      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D mip level');
+    // This policy belongs to the copy call, not the residency descriptor:
+    // r186 reads generateMipmaps even when updateTexture kept an older upload.
+    const generateMipmaps = level === 0 && texture.generateMipmaps === true;
+    if (generateMipmaps && shape.levels > 1 && (shape.integral || shape.sampleType === 'unfilterable-float'))
+      fail('COPY', 'Generated sampled mips require filterable floating-point samples');
     const lease = captureBinding({texture, isSampledTexture: true}, {copyDestination: true}), previous = lease.record;
+    lease.generateMipmaps = generateMipmaps;
     const markDestination = () => {
       if (!copyDestinations.has(texture)) { copyDestinations.add(texture); captureState?.copyDestinations.add(texture); }
     };
@@ -699,7 +710,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
           validate(destination);
           const result = run(nativeDestination);
           live(); validate(destination); return result;
-        }, {validation});
+        }, {validation, generateMipmaps: destination.generateMipmaps});
       } finally { resolving = false; if (poolDirty) syncPool(); }
     },
     /** Metadata and a synchronous native borrow for source-shaped copies.

@@ -168,8 +168,8 @@ export function copySampledTexture(renderer, sourceTexture, destinationTexture,
       if (producer && !destination.lease) fail('SOURCE', 'Raw producers on this path require an ordinary sampled destination');
       if (!producer) lease = inputs.captureBinding({texture: sourceTexture, isSampledTexture: true});
       const sourceShape = producer?.shape ?? inputs.copyShape(lease);
-      if (destination.lease && !producer && (sourceShape.viewDimension !== '2d' || sourceLevel !== 0))
-        fail('SOURCE', 'Ordinary sampled destinations require a base-level 2D source');
+      if (destination.lease && !producer && (sourceShape.viewDimension !== '2d' || sourceLevel !== 0 && region === null))
+        fail('SOURCE', 'Ordinary sampled destinations require a 2D source and an explicit region for nonzero source mips');
       // The pinned native API defaults to base image width/height and ONE
       // layer, including for a layered or nonzero-mip source. Explicit boxes
       // address mip-local texels. Never silently substitute a smaller extent.
