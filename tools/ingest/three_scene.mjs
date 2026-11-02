@@ -205,7 +205,7 @@ export async function createGpuThreeScene(device,scene,{
   const pendingDeformations=new Set(),deformationLifetime=new AbortController();
   let textureOwner=null,textureScan=null,frameTextures=null,retainedTextures=new Set();
   const batchHistoryBuffers=new Map();
-  let batchHistoryBytes=0,batchHistoryValidation=Promise.resolve();
+  let batchHistoryBytes=0,batchHistoryValidation=Promise.resolve(),passBatchHistory=null;
   let programShadowMode=false,programShadowSticky=false,preparedShadowMode=false,programShadowOwner=null,programLightMode=false,nativeLightMode=false;
   let programTransmissionMode=false,transmissionOwner=null,programViewportSize=null,transmissionCamera=null,transmissionView=null;
   const ownedTextures=()=>textureOwner??=createGpuThreeTextures(device,{...textureOptions,three});
@@ -347,7 +347,6 @@ export async function createGpuThreeScene(device,scene,{
         // BatchedMesh (WebGL surface): its ShaderLib program with r186's
         // no-WEBGL_multi_draw path, one draw per multi-draw entry.
         if(object.isBatchedMesh&&!capturedNodeObject(object)){
-          if(object.castShadow)fail('SHADOW','BatchedMesh shadow casters are not admitted yet');
           programDeformed.add(object);
         }
         if(!shadowEnabled&&!capturedNodeObject(object)&&(object.castShadow||object.receiveShadow))fail('SHADOW','Enable shadow:{} to own source shadows');
@@ -435,7 +434,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!lights.length)return false;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
-    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>o.isLine&&o.castShadow))return true;
+    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>(o.isLine||o.isBatchedMesh)&&o.castShadow))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_SHADOW_'))return true;throw error;}
   }
@@ -526,8 +525,8 @@ export async function createGpuThreeScene(device,scene,{
     for(const buffers of batchHistoryBuffers.values())for(const buffer of buffers)buffer.destroy();
     batchHistoryBuffers.clear();batchHistoryBytes=0;
   }
-  // A BatchedMesh can request different IDs, matrices and colors in each child
-  // camera callback. Capture actual uploaded texels, not current CPU arrays:
+  // A BatchedMesh can request different IDs, matrices and colors in each shadow,
+  // transmission or child-camera callback. Capture uploaded texels, not CPU arrays:
   // versionless CPU edits must never become visible through history replay.
   // Buffers are reused only in later synchronous frames, after all consumers
   // of this frame have been submitted to the same queue.
@@ -535,7 +534,7 @@ export async function createGpuThreeScene(device,scene,{
     const sources=[object._indirectTexture,object._matricesTexture,object._colorsTexture].filter(Boolean);
     for(const source of sources){
       textureBinding(source);
-      if(textures.has(source))fail('CAMERA','ArrayCamera batching requires owned source texture residency');
+      if(textures.has(source))fail('CAMERA','Batched texture history requires owned source texture residency');
     }
     textureOwner.update(sources);
     return checkedBatchHistory(()=>{
@@ -570,12 +569,20 @@ export async function createGpuThreeScene(device,scene,{
   function restoreBatchHistory(snapshots){
     checkedBatchHistory(()=>{
       const encoder=device.createCommandEncoder({label:'f3d-program-batch-restore'});
-      for(const {texture,buffer,bytesPerRow,width,height} of snapshots)
-        encoder.copyBufferToTexture({buffer,bytesPerRow,rowsPerImage:height},{texture},[width,height,1]);
+      encodeBatchHistory(encoder,snapshots);
       // Queue writes during later callbacks have already happened. Restore and
       // submit before the corresponding draws, not merely before encoding them.
       device.queue.submit([encoder.finish()]);
     });
+  }
+  function encodeBatchHistory(encoder,snapshots){
+    for(const {texture,buffer,bytesPerRow,width,height} of snapshots)
+      encoder.copyBufferToTexture({buffer,bytesPerRow,rowsPerImage:height},{texture},[width,height,1]);
+  }
+  function captureProgramBatch(object){
+    if(!passBatchHistory)fail('FRAME','Batch pass capture requires an active source render');
+    const snapshots=captureBatchHistory(object,passBatchHistory);
+    return encoder=>encodeBatchHistory(encoder,snapshots);
   }
   // Program variants depend on the object (instancing, geometry streams), not
   // only the material: WebGLPrograms.getParameters reads both.
@@ -780,14 +787,14 @@ export async function createGpuThreeScene(device,scene,{
     }
     return null;
   }
-  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls,updateObject})??
+  const programShadows=()=>programShadowOwner??=(programSupport.createShadows?.(device,{bindingOf:t=>textureBinding(t),sourceOf:programSource,clipping:programClippingControls,updateObject,captureBatch:captureProgramBatch})??
     fail('SHADOW','Program shadow maps need the program shadow owner'));
   // The renderer's shadowMap controls and the renderer object passed to shadow callbacks.
   const shadowControls=()=>programSupport.state?.().shadowMap??{enabled:true,autoUpdate:true,needsUpdate:false,type:three.PCFShadowMap};
   const shadowRenderer=()=>programSupport.state?.().renderer??null;
   const castingLights=camera=>programLightList(camera).filter(l=>l.castShadow);
   const shadowBoundary=error=>{if(error?.code==='THREE_PROGRAM_SHADOW_PREPARE')fail('PREPARE',error.message);throw error;};
-  const transmission=()=>transmissionOwner??=(programSupport.createTransmission?.(device,{scene:root,bindingOf:t=>t?textureBinding(t):placeholderBinding()})??
+  const transmission=()=>transmissionOwner??=(programSupport.createTransmission?.(device,{scene:root,bindingOf:t=>t?textureBinding(t):placeholderBinding(),captureBatch:captureProgramBatch})??
     fail('MATERIAL','Transmission needs the program transmission owner'));
   /** r186 transmissionRenderTarget[camera.id]: (camera.viewport || current viewport) x transmissionResolutionScale. */
   function transmissionSize(camera){
@@ -1631,7 +1638,8 @@ export async function createGpuThreeScene(device,scene,{
       const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
       const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
       const programArray=programRoute()&&arrayViews!==null;
-      const batchHistory=programArray?{used:new Map(),latest:new Map(),updates:new Map()}:null;
+      const batchHistory=programRoute()?{used:new Map(),latest:new Map(),updates:new Map()}:null;
+      passBatchHistory=batchHistory;
       const cullingFrustum=arrayViews&&!programArray?{
         intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object)),
         intersectsSprite:object=>arrayViews.some(view=>view.frustum.intersectsSprite(object)),
@@ -1832,15 +1840,14 @@ export async function createGpuThreeScene(device,scene,{
       if(transmissive.length&&passOverride===null){
         const passItem=(item,d,i,side=d.programSide)=>{
           const gpu=item.bindings[i].programGeometry,m=item.material,object=item.object;
-          if(object.isBatchedMesh)fail('MATERIAL','BatchedMesh draws in transmission passes are not admitted yet');
           if(!updated.has(gpu)){gpu.update({maxAdditionalBytes:Math.max(0,maxGeometryBytes-geometryBytes())});updated.add(gpu);}
           return {object,material:m,group:item.group,side,gpu,sourceObject:programObject(object),topology:d.options.topology,stripIndexFormat:d.options.stripIndexFormat,
             compile:()=>programSupport.compile(m,programObject(object),{...d.compileOptions,side,renderTarget:true}),
             refresh:()=>programSupport.refresh(m,d.refreshOptions),
-            pack:(bytes,cam,size,reflection)=>{
+            pack:(bytes,cam,size,reflection,drawId=null)=>{
               const clip=programSupport.clippingState(programClippingControls(),m,cam);
               return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),programObject(object),cam,bytes,{targetSize:size,material:m,
-                values:programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:null});
+                values:{...(programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:{}),...(drawId!==null?{_gl_DrawID:drawId}:{})}});
             }};
         };
         // r186 refreshes the material for the BackSide draw and again for its next draw.
@@ -1884,6 +1891,7 @@ export async function createGpuThreeScene(device,scene,{
       }
       textureOwner?.update(frameTextures);
       submitShadows?.();
+      if(submitShadows&&batchHistory?.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
       for(const [index,pass] of transmissionPasses.entries()){
         if(transmissionCameras[index]!==pass.child)fail('CAMERA','A transmission callback replaced an unprepared child camera');
         const [width,height]=transmissionSize(pass.child);
@@ -1894,6 +1902,7 @@ export async function createGpuThreeScene(device,scene,{
         try{transmission().render(pass.passItems,pass.transmissiveItems,pass.child,{width,height,prepared:pass.prepared,
           background:scene.background,renderer:shadowRenderer(),sourceScene:root})();}
         catch(error){if(error?.code==='THREE_PROGRAM_TRANSMISSION_PREPARE')fail('PREPARE',error.message);throw error;}
+        if(batchHistory?.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
       }
       // WebGL builds and sorts one parent-frustum list, then renders each
       // child's entire list. Pack uniforms and run callbacks in that same order;
@@ -1927,6 +1936,19 @@ export async function createGpuThreeScene(device,scene,{
       // replay or CPU readback is involved. The same boundary serves hidden
       // renderBufferDirect draws discovered during an addon callback.
       const boundary={first:0,started:false,logical:0,calls:0,passes:0,direct:0};
+      const submitProgramSpans=(prepared,first,end,loaded=false)=>{
+        const boundaries=[first,...[...(batchHistory?.updates.keys()??[])].filter(index=>index>first&&index<end),end];
+        let logical=0,calls=0,passes=0;
+        for(let part=0;part<boundaries.length-1;part++){
+          const start=boundaries[part],snapshot=batchHistory?.updates.get(start);
+          if(snapshot)restoreBatchHistory(snapshot);
+          renderer.render({...prepared,draws:draws.slice(start,boundaries[part+1]),...(loaded?{loadOp:'load',depthLoadOp:'load',
+            ...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})}:{})});
+          backgroundSubmitted=true;loaded=true;
+          logical+=renderer.drawCount;calls+=renderer.drawCallCount;passes+=renderer.colorPassCount??1;live();
+        }
+        return {logical,calls,passes};
+      };
       if(publicRenderer?._shaderEncodedOutput&&!programArray){
         const target=publicRenderer.getRenderTarget(),face=publicRenderer._activeCubeFace,mip=publicRenderer._activeMipmapLevel;
         const check=()=>{
@@ -1937,10 +1959,9 @@ export async function createGpuThreeScene(device,scene,{
           check();
           if(boundary.started&&boundary.first===draws.length)return;
           const prepared=preparedFrame();
-          renderer.render({...prepared,draws:draws.slice(boundary.first),...(boundary.started?{loadOp:'load',depthLoadOp:'load',
-            ...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})}:{})});
-          backgroundSubmitted=true;boundary.started=true;boundary.first=draws.length;
-          boundary.logical+=renderer.drawCount;boundary.calls+=renderer.drawCallCount;boundary.passes+=renderer.colorPassCount??1;live();
+          const result=submitProgramSpans(prepared,boundary.first,draws.length,boundary.started);
+          boundary.started=true;boundary.first=draws.length;
+          boundary.logical+=result.logical;boundary.calls+=result.calls;boundary.passes+=result.passes;
         };
         publicRenderer._programDrawContext={check,flush,copy(owner,lease){
           check();
@@ -2073,15 +2094,8 @@ export async function createGpuThreeScene(device,scene,{
           // (setProgram binds textures after the callback), then r186's
           // no-multi-draw loop: _gl_DrawID = i, render(starts[i] / bytes, counts[i]).
           if(object.isBatchedMesh){
-            if(programArray){
-              const snapshot=captureBatchHistory(object,batchHistory);
-              if(object._multiDrawCount>0)batchHistory.updates.set(draws.length,snapshot);
-            }else{
-              // The callback just changed the source version. Keep the prepared
-              // shared residency, validate borrowed versions, then upload ids.
-              textureBinding(object._indirectTexture);
-              if(!textures.has(object._indirectTexture))textureOwner.update([object._indirectTexture]);
-            }
+            const snapshot=captureBatchHistory(object,batchHistory);
+            if(object._multiDrawCount>0)batchHistory.updates.set(draws.length,snapshot);
           }
           const multi=object.isBatchedMesh?Array.from({length:object._multiDrawCount},(_,k)=>{
             const index=item.geometry.index,bpe=index?index.array.BYTES_PER_ELEMENT:1;
@@ -2102,6 +2116,8 @@ export async function createGpuThreeScene(device,scene,{
               // Programs evaluate fog/lighting in their own source; never core receivers.
               if(programArray)drawObjects.push({object,material:item.material,view});
               draws.push({mesh:item.bindings[i].mesh,first:sub?sub.first:start,count:sub?sub.count:count,programUniforms:bytes,frontFaceCW,instanceCount,
+                ...(sub?{programRangeCaptured:true}:{}),
+                ...(sub&&item.group?{programRangeGroup:{start:item.group.start*(item.material.wireframe?2:1),count:item.group.count*(item.material.wireframe?2:1)}}:{}),
                 ...(fogEnabled?{receiveFog:false}:{}),...(shadowEnabled?{receiveShadow:false}:{}),...(environmentEnabled?{receiveEnvironment:false}:{})});
             }
             if(programArray&&item.material.isShaderMaterial&&item.material.uniformsNeedUpdate===true)item.material.uniformsNeedUpdate=false;
@@ -2307,6 +2323,9 @@ export async function createGpuThreeScene(device,scene,{
           device.queue.submit([encoder.finish()]);live();
         }
         span(draws.length);
+      }else if(batchHistory?.updates.size){
+        const result=submitProgramSpans(prepared,0,draws.length);
+        logicalDraws=result.logical;drawCalls=result.calls;passes=result.passes;
       }else{
         renderer.render(prepared);live();logicalDraws=renderer.drawCount;drawCalls=renderer.drawCallCount;passes=renderer.colorPassCount??1;
       }
@@ -2314,6 +2333,7 @@ export async function createGpuThreeScene(device,scene,{
       backgroundPasses=backgroundFrame?1:0;
       if(backgroundEnabled)backgroundColorPasses=passes+backgroundPasses;
       }
+      if(!programArray&&batchHistory?.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
       shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
         mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;
       return bridge;
@@ -2324,7 +2344,7 @@ export async function createGpuThreeScene(device,scene,{
       return failed(error);
     }finally{
       if(publicRenderer)publicRenderer._programDrawContext=previousDrawContext;
-      busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;if(disposed||terminal)release();
+      busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;passBatchHistory=null;if(disposed||terminal)release();
     }
   }
   const bridge=Object.freeze({scene:root,prepare,render,assertNativePrepared,

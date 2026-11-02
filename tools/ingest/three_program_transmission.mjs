@@ -71,7 +71,7 @@ function scoped(device, operation) {
 /** items given to prepare/render: {object, material, group, side, gpu, compile(), refresh(), pack(bytes, camera, size)}
  * where compile() returns the render-target program variant for (material, object, side),
  * gpu is the program geometry residency it reads, and bindingOf(texture) resolves samplers. */
-export function createThreeProgramTransmission({three: T, device, support, bindingOf, scene = null, label = 'f3d-program-transmission', maxDraws = 4096}) {
+export function createThreeProgramTransmission({three: T, device, support, bindingOf, captureBatch = null, scene = null, label = 'f3d-program-transmission', maxDraws = 4096}) {
   const records = new Map(), lost = new Promise(() => {});
   const meshes = createProgramMeshes({device, format: COLOR_FORMAT, depthFormat: DEPTH_FORMAT, sampleCount: SAMPLES, maxDraws, label,
     fail: (code, message) => { throw new ThreeProgramTransmissionError(code.replace(/^ANIMATION_RENDER_/, ''), message); }, scoped, lost});
@@ -178,6 +178,7 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
     if (state.gpu !== prepared.gpu || state.target.width !== width || state.target.height !== height)
       fail('PREPARE', 'Transmission target changed after pass preparation');
     meshes.begin();
+    let stagedDraws = 0;
     const draw = (item, r, commands) => {
       if (!r?.entry) fail('PREPARE', 'Transmission side or layers introduced an unprepared back-face program');
       const object = item.object, geometry = object.geometry;
@@ -186,14 +187,39 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
       object.modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, object.matrixWorld);
       object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
       if (item.material.onBeforeRender !== T.Material.prototype.onBeforeRender) item.material.onBeforeRender(renderer, sourceScene, camera, geometry, object, item.group);
-      const reflection = r.entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
-      const current = item.pack(bytes, camera, [state.gpu.width, state.gpu.height, state.gpu.width, state.gpu.height], reflection);
-      if (current.some((t, k) => (t ?? null) !== r.entry.textures[k].texture)) fail('PREPARE', 'Transmission pass textures changed; call prepare()');
-      const start = item.group ? item.group.start : 0, count = item.group ? item.group.count : Number.MAX_SAFE_INTEGER;
+      const reflection = r.entry.record.reflection, batch = object.isBatchedMesh === true;
+      const drawCount = batch ? object._multiDrawCount : 1;
+      if (!Number.isSafeInteger(drawCount) || drawCount < 0 || drawCount > maxDraws - stagedDraws ||
+          batch && (drawCount > object._multiDrawStarts.length || drawCount > object._multiDrawCounts.length))
+        fail('LIMIT', 'Transmission batch subdraws exceed their source storage or draw budget');
+      // Batch starts use the selected source index, including generated
+      // wireframe edges, before any GPU residency index-format promotion.
+      const selectedIndex = support.geometrySnapshot(item.gpu, device).source.index;
+      const bytesPerElement = selectedIndex ? selectedIndex.array.BYTES_PER_ELEMENT : 1;
+      const ranges = Array.from({length: drawCount}, (_, id) => {
+        const first = batch ? object._multiDrawStarts[id] / bytesPerElement : item.group?.start ?? 0;
+        const count = batch ? object._multiDrawCounts[id] : item.group?.count ?? Number.MAX_SAFE_INTEGER;
+        if (!Number.isSafeInteger(first) || first < 0 || !Number.isSafeInteger(count) || count < 0)
+          fail('RANGE', 'Transmission subdraws require nonnegative aligned source ranges');
+        return {first, count};
+      });
+      // The source batch callback has selected IDs for this camera/pass. Keep
+      // actual uploaded texels before another callback can select a new set.
+      if (batch && typeof captureBatch !== 'function') fail('BATCH', 'Batch transmission requires captured texture history');
+      const encodeBatch = batch ? captureBatch(object) : null;
       const instanceCount = object.isInstancedMesh ? object.count : geometry.isInstancedBufferGeometry ? geometry.instanceCount : 1;
-      const command = {};
-      meshes.stage(r.entry.record, {programUniforms: bytes, first: start, count, frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
-      commands.push(command);
+      for (let id = 0; id < ranges.length; id++) {
+        const bytes = new Uint8Array(reflection.uniformBufferSize);
+        const current = item.pack(bytes, camera, [state.gpu.width, state.gpu.height, state.gpu.width, state.gpu.height], reflection, batch ? id : null);
+        if (current.some((t, k) => (t ?? null) !== r.entry.textures[k].texture)) fail('PREPARE', 'Transmission pass textures changed; call prepare()');
+        const command = {};
+        meshes.stage(r.entry.record, {programUniforms: bytes, ...ranges[id], programRangeCaptured: batch,
+          ...(batch && item.group ? {programRangeGroup: {start: item.group.start * (item.material.wireframe ? 2 : 1),
+            count: item.group.count * (item.material.wireframe ? 2 : 1)}} : {}),
+          frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
+        if (id === 0 && encodeBatch) command.encodeBatch = encodeBatch;
+        commands.push(command); stagedDraws++;
+      }
       if (hooked) object.onAfterRender(renderer, sourceScene, camera, geometry, item.material, item.group);
     };
     // _this.clear() then background.render(scene): see the header for the color rules.
@@ -241,8 +267,23 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
     const gpu = state.gpu;
     return () => submit(gpu, clear, opaqueCommands, backCommands);
   }
-  function encodeDraws(pass, commands) {
+  function encodeDraws(encoder, commands, descriptor, gpu) {
+    let pass = null, started = false;
+    const segmented = commands.some(command => command.encodeBatch);
+    const begin = () => {
+      const colorAttachments = descriptor.colorAttachments.map(attachment => ({...attachment,
+        ...(started ? {loadOp: 'load'} : {}), ...(segmented ? {storeOp: 'store'} : {})}));
+      const depthStencilAttachment = {...descriptor.depthStencilAttachment,
+        ...(started ? {depthLoadOp: 'load'} : {}), ...(segmented ? {depthStoreOp: 'store'} : {})};
+      pass = encoder.beginRenderPass({...descriptor, colorAttachments, depthStencilAttachment});
+      pass.setViewport(0, 0, gpu.width, gpu.height, 0, 1); started = true;
+    };
     for (const c of commands) {
+      if (c.encodeBatch) {
+        if (pass) { pass.end(); pass = null; }
+        c.encodeBatch(encoder);
+      }
+      if (!pass) begin();
       if (!c.count || !c.instanceCount) continue;
       pass.setPipeline(c.pipeline);
       pass.setBindGroup(0, c.program.group, [c.program.offset]);
@@ -251,23 +292,23 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
       if (c.indexBuffer) { pass.setIndexBuffer(c.indexBuffer, c.indexFormat); pass.drawIndexed(c.count, c.instanceCount, c.first, 0, 0); }
       else pass.draw(c.count, c.instanceCount, c.first, c.firstInstance ?? 0);
     }
+    // Empty source lists still clear and resolve the transmission target.
+    if (!pass) begin();
+    pass.end();
   }
   function submit(gpu, clear, opaqueCommands, backCommands) {
     meshes.write();
     const encoder = device.createCommandEncoder({label});
-    const viewport = pass => pass.setViewport(0, 0, gpu.width, gpu.height, 0, 1);
     const back = backCommands.length > 0;
-    const first = encoder.beginRenderPass({label,
+    encodeDraws(encoder, opaqueCommands, {label,
       colorAttachments: [{view: gpu.msaaView, resolveTarget: gpu.levels[0], clearValue: clear, loadOp: 'clear', storeOp: back ? 'store' : 'discard'}],
-      depthStencilAttachment: {view: gpu.depthView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: back ? 'store' : 'discard'}});
-    viewport(first); encodeDraws(first, opaqueCommands); first.end();
+      depthStencilAttachment: {view: gpu.depthView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: back ? 'store' : 'discard'}}, gpu);
     generateMips(encoder, gpu);
     if (back) {
       // The back faces sample the resolved texture, so this pass only writes the
       // multisampled attachment; an empty pass then resolves it.
-      const second = encoder.beginRenderPass({label, colorAttachments: [{view: gpu.msaaView, loadOp: 'load', storeOp: 'store'}],
-        depthStencilAttachment: {view: gpu.depthView, depthLoadOp: 'load', depthStoreOp: 'discard'}});
-      viewport(second); encodeDraws(second, backCommands); second.end();
+      encodeDraws(encoder, backCommands, {label, colorAttachments: [{view: gpu.msaaView, loadOp: 'load', storeOp: 'store'}],
+        depthStencilAttachment: {view: gpu.depthView, depthLoadOp: 'load', depthStoreOp: 'discard'}}, gpu);
       encoder.beginRenderPass({label, colorAttachments: [{view: gpu.msaaView, resolveTarget: gpu.levels[0], loadOp: 'load', storeOp: 'discard'}]}).end();
       generateMips(encoder, gpu);
     }

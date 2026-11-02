@@ -277,8 +277,8 @@ source callback and custom-sort order, live layers, viewport resizing, target
 identity across destinations, scene separation, front-face shader hooks and error
 restoration using pinned source objects and the real scene bridge. These are
 recorded-command and source integration checks; this addition has no browser
-pixel or performance result. Existing shader/material and BatchedMesh
-transmission boundaries remain in force.
+pixel or performance result. Existing shader/material boundaries remain in
+force; BatchedMesh composition is described below.
 
 ## WebGL-authored batched ArrayCamera draws
 
@@ -301,8 +301,43 @@ memory limits. `node tests/e2e/webgpu_renderer/program_array_batching.mjs`
 matches eight source checkpoints exactly: opposite/reordered views, culling,
 layers, callback updates, versionless edits, an empty final view and resize.
 Chromium 151.0.7922.34 / SwiftShader matched all 210,432 RGBA bytes and callback
-traces with 73 native draws and zero GPU/browser errors. The existing BatchedMesh
-transmission and shadow boundaries remain outside this addition.
+traces with 73 native draws and zero GPU/browser errors.
+
+## WebGL-authored BatchedMesh transmission and shadows
+
+Batches now participate in the program route's transmission and shadow passes.
+Opaque batches appear behind physical glass, and transmissive batches render
+their required back faces before their main draws. Directional and point-light
+shadow passes select batch instances for each shadow camera, including each
+point-light face. Source callbacks run once per logical object/pass, with one
+native draw and a captured `_gl_DrawID` per selected subdraw. Shadow draws retain
+the source `onBeforeShadow`/`onAfterShadow` lifecycle without adding material
+render callbacks.
+
+Every pass captures uploaded indirect-ID, matrix and color textures through the
+existing bounded GPU history buffers. Later cameras and callbacks cannot replace
+the data consumed by earlier draws; versionless CPU edits retain their source
+staleness. Copies occur between render passes, preserving accumulated depth and
+color, and the latest uploaded texture state is restored for subsequent source
+work. This composes with ArrayCamera transmission targets and ordinary main
+draws. Source geometry/group admission is checked before batch expansion; an
+admitted ordinary draw range does not clip individual batch subdraws.
+
+`three_scene_array_batching.test.mjs` and
+`tests/three_program_shadow_targets.test.mjs` check pass/face texture histories,
+selected ranges, callbacks, indexed/nonindexed draws, material groups and empty
+faces through the existing recording seams. The focused browser comparisons are
+`tests/e2e/webgpu_renderer/program_batch_transmission.mjs` and
+`tests/e2e/webgpu_renderer/program_batch_shadows.mjs`; they use the unchanged
+WebGL parity envelope of 12 channel levels and at most 2% outlying pixels.
+Chromium 151.0.7922.34 / SwiftShader matches all 294,912 shadow RGBA bytes exactly
+across 12 checkpoints. The 12 transmission checkpoints pass with at most
+25/6,144 outlying pixels (0.41%, below 2%; maximum channel difference 43).
+Both comparisons match source callback/instance traces and report zero GPU or
+browser errors against source commit `148ef33ecb6d2502ff796d4554abd1549c95d519`.
+Existing shader, material and shadow-map profile limits remain in force. This is
+retained-JavaScript program preparation with owned WebGPU rendering, without a
+performance claim or a claim of complete physical-material/shadow coverage.
 
 ## Logarithmic depth for WebGL-authored programs
 

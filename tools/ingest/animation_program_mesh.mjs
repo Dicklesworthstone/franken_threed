@@ -147,7 +147,24 @@ export function createProgramMeshes({device, format, depthFormat, sampleCount, m
     // expansion/range requests leave both per-frame budgets available for retry.
     const pointPlan = record.points ? snapshotProgramPointRuns(geometry, input, maxPointDraws - pointDraws, fail) : null;
     const extent = geometry.indexBuffer ? geometry.indexCount : geometry.vertexCount;
-    const range = geometry.drawRange;
+    if (input.programRangeCaptured !== undefined && typeof input.programRangeCaptured !== 'boolean')
+      fail('ANIMATION_RENDER_OPTIONS', 'programRangeCaptured must be boolean');
+    const group = input.programRangeGroup;
+    if (group !== undefined && (input.programRangeCaptured !== true || !group ||
+        ![group.start, group.count].every(value => Number.isSafeInteger(value) && value >= 0)))
+      fail('ANIMATION_RENDER_OPTIONS', 'programRangeGroup requires captured nonnegative source start/count');
+    // r186's BatchedMesh subdraws use their selected starts/counts after the
+    // ordinary geometry-range admission; that range does not clip each batch.
+    // Zero intersection admits batches, but a negative source draw count
+    // returns before drawing. The snapshot clamps both to zero, so retain
+    // the original geometry/group intersection for this admission check.
+    let range = geometry.drawRange;
+    if (input.programRangeCaptured === true) {
+      const source = geometry.source.drawRange ?? {start: 0, count: Infinity};
+      const start = Math.max(source.start, group?.start ?? 0);
+      const end = Math.min(source.start + source.count, group ? group.start + group.count : Infinity, extent);
+      range = {first: 0, count: end < start ? 0 : extent};
+    }
     let first = Math.max(input.first ?? 0, range.first), end = Math.min((input.first ?? 0) + (input.count ?? extent), range.first + range.count, extent);
     const instanceCount = geometry.instanced ? Math.min(input.instanceCount ?? 1, geometry.instanceCapacity) : input.instanceCount ?? 1;
     if (record.points) {

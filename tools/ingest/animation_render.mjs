@@ -2727,7 +2727,7 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           continue;
         }
         if (programRecord?.program) {
-          keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount"], "program draw");
+          keys(input, ["mesh", "first", "count", "programUniforms", "frontFaceCW", "instanceCount", "programRangeCaptured", "programRangeGroup"], "program draw");
           if (programRecord.disposed) fail("ANIMATION_RENDER_MESH", "Mesh is not live in this renderer");
           programs.stage(programRecord, input, commands[i] ?? (commands[i] = {}));
           dependencies.add(programRecord.gpu);

@@ -111,8 +111,10 @@ function scoped(device, operation) {
 }
 
 /** support: createThreeProgramSupport(); bindingOf(texture) -> {view, sampler, sampleType};
- * sourceOf(object) -> the attribute source a program reads (geometry or InstancedMesh view). */
-export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, updateObject = () => {}, label = 'f3d-program-shadows',
+ * sourceOf(object) -> the attribute source a program reads (geometry or InstancedMesh view).
+ * captureBatch(object) captures uploaded batch textures and returns an encoder
+ * callback restoring those bytes outside a render pass before its subdraws. */
+export function createThreeProgramShadows({three: T, device, support, bindingOf, sourceOf = o => o.geometry, clipping = () => null, updateObject = () => {}, captureBatch = null, label = 'f3d-program-shadows',
   maxDraws = 4096, maxGeometryBytes = 256 * 1024 * 1024}) {
   const maxTextureSize = device.limits.maxTextureDimension2D ?? 8192;
   const depthMaterialBase = new T.MeshDepthMaterial(), distanceMaterialBase = new T.MeshDistanceMaterial();
@@ -515,7 +517,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
           const geometry = object.geometry;
           object.onBeforeShadow(renderer, object, camera, shadowCamera, geometry, depthMaterial, group);
           // renderBufferDirect(shadowCamera, null, geometry, depthMaterial, object, group)
-          pass.commands.push(draw(object, depthMaterial, group, shadowCamera));
+          pass.commands.push(...draw(object, depthMaterial, group, shadowCamera));
           object.onAfterShadow(renderer, object, camera, shadowCamera, geometry, depthMaterial, group);
         });
         passes.push(pass);
@@ -544,20 +546,52 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     return () => submit(passes);
   }
   const updated = new Set();
+  function batchRanges(object) {
+    const size = object._multiDrawCount, starts = object._multiDrawStarts, counts = object._multiDrawCounts;
+    const index = object.geometry.index, extent = index?.count ?? object.geometry.attributes.position?.count;
+    const stride = index ? index.array?.BYTES_PER_ELEMENT : 1;
+    if (!(starts instanceof Int32Array) || !(counts instanceof Int32Array) ||
+        !Number.isSafeInteger(size) || size < 0 || size > maxDraws || size > starts.length || size > counts.length ||
+        !Number.isSafeInteger(extent) || extent < 0 || ![1, 2, 4].includes(stride))
+      fail('BATCH', 'Shadow batches require bounded source draw arrays and vertex/index storage');
+    const ranges = [];
+    for (let id = 0; id < size; id++) {
+      const first = starts[id] / stride, count = counts[id];
+      if (!Number.isSafeInteger(first) || first < 0 || count < 0 || first + count > extent)
+        fail('BATCH', 'Shadow batch subdraws must fit their source geometry');
+      ranges.push({id, first, count});
+    }
+    return ranges;
+  }
   function draw(object, depthMaterial, group, shadowCamera) {
     const entry = recordForSync(depthMaterial, object);
-    const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
+    const reflection = entry.record.reflection;
     const uniforms = refresh(depthMaterial);
     updateObject(object);
     const clip = support.clippingState(clipping(), depthMaterial, shadowCamera, {shadows: true});
-    const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values: support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : null});
-    if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
     const g = object.geometry;
-    const start = group ? group.start : 0, count = group ? group.count : Number.MAX_SAFE_INTEGER;
+    const batch = object.isBatchedMesh === true;
+    const ranges = batch ? batchRanges(object) : [{first: group ? group.start : 0, count: group ? group.count : Number.MAX_SAFE_INTEGER}];
+    // WebGLShadowMap calls renderBufferDirect directly: material.onBeforeRender
+    // is not part of this lifecycle. onBeforeShadow has already selected the
+    // batch for this face; later faces must not replace its uploaded texels.
+    const encodeBatch = batch ? captureBatch?.(object) : null;
+    if (batch && typeof encodeBatch !== 'function') fail('BATCH', 'Shadow batches require captured texture history');
     const instanceCount = object.isInstancedMesh ? object.count : g.isInstancedBufferGeometry ? g.instanceCount : 1;
-    const command = {};
-    meshes.stage(entry.record, {programUniforms: bytes, first: start, count, frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
-    return command;
+    const commands = [];
+    for (const {id, first, count} of ranges) {
+      const bytes = new Uint8Array(reflection.uniformBufferSize);
+      const values = {...(support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : {}), ...(batch ? {_gl_DrawID: id} : {})};
+      const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values});
+      if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
+      const command = {};
+      meshes.stage(entry.record, {programUniforms: bytes, first, count, programRangeCaptured: batch,
+        ...(batch && group ? {programRangeGroup: {start: group.start, count: group.count}} : {}),
+        frontFaceCW: object.isMesh === true && object.matrixWorld.determinant() < 0, instanceCount}, command);
+      if (batch && commands.length === 0) command.encodeBatch = encodeBatch;
+      commands.push(command);
+    }
+    return commands;
   }
   function recordForSync(depthMaterial, object) {
     // Same key as recordFor(), but frames never create pipelines.
@@ -580,15 +614,22 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     meshes.write(); blurMeshes.write();
     const encoder = device.createCommandEncoder({label});
     for (const pass of passes) {
-      // VSM blur passes: renderer.clear() on an RG16F target with a depth buffer.
-      const colorAttachments = pass.color ? [{view: pass.color, clearValue: {r: 0, g: 0, b: 0, a: 0}, loadOp: 'clear', storeOp: 'store'}] : [];
-      const p = encoder.beginRenderPass({label, colorAttachments,
-        depthStencilAttachment: {view: pass.view, depthClearValue: 1, depthLoadOp: pass.clear ? 'clear' : 'load', depthStoreOp: 'store'}});
-      // rows:'gl': WebGPU row index equals GL's bottom-up window y.
-      const [x, y, w, h] = pass.rect;
-      p.setViewport(x, y, w, h, 0, 1);
+      let p = null, clear = pass.clear, emitted = false;
+      const begin = () => {
+        // Replay copies cannot occur inside a render pass. A resumed face
+        // loads its earlier depth/color instead of clearing those draws away.
+        const colorAttachments = pass.color ? [{view: pass.color, clearValue: {r: 0, g: 0, b: 0, a: 0}, loadOp: clear ? 'clear' : 'load', storeOp: 'store'}] : [];
+        const next = encoder.beginRenderPass({label, colorAttachments,
+          depthStencilAttachment: {view: pass.view, depthClearValue: 1, depthLoadOp: clear ? 'clear' : 'load', depthStoreOp: 'store'}});
+        clear = false; emitted = true;
+        // rows:'gl': WebGPU row index equals GL's bottom-up window y.
+        const [x, y, w, h] = pass.rect; next.setViewport(x, y, w, h, 0, 1);
+        return next;
+      };
       for (const c of pass.commands) {
+        if (c.encodeBatch) { if (p) { p.end(); p = null; } c.encodeBatch(encoder); }
         if (!c.count || !c.instanceCount) continue;
+        p ??= begin();
         p.setPipeline(c.pipeline);
         p.setBindGroup(0, c.program.group, [c.program.offset]);
         if (c.record.textureGroup) p.setBindGroup(1, c.record.textureGroup);
@@ -596,7 +637,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         if (c.indexBuffer) { p.setIndexBuffer(c.indexBuffer, c.indexFormat); p.drawIndexed(c.count, c.instanceCount, c.first, 0, 0); }
         else p.draw(c.count, c.instanceCount, c.first, c.firstInstance ?? 0);
       }
-      p.end();
+      if (p) p.end();
+      else if (!emitted) begin().end(); // Empty faces still perform their source clear.
     }
     device.queue.submit([encoder.finish()]);
   }
