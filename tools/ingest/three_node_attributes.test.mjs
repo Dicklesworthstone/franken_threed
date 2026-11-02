@@ -73,6 +73,31 @@ test('dynamic generated attributes update without flags once per logical render'
   assert.equal(color.updateRanges.length,0);histories.dispose();
 });
 
+for(const [Type,otherType,word] of [[Uint32Array,Int32Array,0xf0000001],[Int32Array,Uint32Array,-0x70000001]])
+test(`${Type.name} generated interleaved inputs preserve queued partial updates and signedness`,()=>{
+  const histories=createThreeNodeAttributes(T),descriptor={},geometry=new T.PlaneGeometry();
+  const source=new T.InstancedInterleavedBuffer(new Type([word,11,word+2,13,word+4,15,word+6,17]),4,1);
+  const attributes=[0,2].map((offset,i)=>({name:`input${i}`,attribute:new T.InterleavedBufferAttribute(source,2,offset)}));
+  const view=histories.register(descriptor,geometry,attributes),first=histories.capture(descriptor,1);
+  source.array[0]=word+20;source.array[4]=word+40;
+  const stale=histories.capture(descriptor,2);
+  source.addUpdateRange(4,1);source.needsUpdate=true;
+  const partial=histories.capture(descriptor,3);
+  assert.deepEqual(source.updateRanges,[]);assert.equal(partial.bytes,32);
+  source.array.fill(0);
+  first.install();assert.equal(view.attributes.input0.data.array.constructor,Type);
+  assert.deepEqual([...view.attributes.input0.data.array],[word,11,word+2,13,word+4,15,word+6,17]);
+  stale.install();assert.equal(view.attributes.input0.data.array[0],word);
+  partial.install();assert.equal(view.attributes.input0.data.array[0],word);assert.equal(view.attributes.input0.data.array[4],word+40);
+  assert.equal(view.attributes.input0.data,view.attributes.input1.data);
+  assert.deepEqual([...source.array],Array(8).fill(0));
+  const replacement={};const next=histories.register(replacement,geometry,attributes);
+  histories.capture(replacement,4).install();assert.equal(next.attributes.input0.data.array[4],word+40);
+  source.array=new otherType(source.array.buffer);
+  assert.throws(()=>histories.capture(descriptor,5),/identity or layout changed/);
+  histories.dispose();
+});
+
 test('generated attribute history validates the whole selection before consuming ranges',()=>{
   const histories=createThreeNodeAttributes(T),descriptor={};
   const left=new T.InstancedBufferAttribute(new Float32Array([1,2,3]),3);

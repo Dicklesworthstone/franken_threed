@@ -4,6 +4,9 @@ import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms, hasThreeNodeProgram} from './three_node_program.mjs';
 import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
 import {inspectThreeLightingContext} from './three_node_passes.mjs';
+import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 const N = THREE.TSL;
 function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
@@ -1512,6 +1515,47 @@ test('generated Float32 nodes retain private history across recompiles and rejec
   assert.throws(() => f.owner.captureDraw(changed, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_CHANGED'});
   f.material.colorNode = N.bufferAttribute(color.value, 'vec3'); assert.doesNotThrow(f.compile);
+});
+for (const [Type, scalar, prefix, word] of [[Uint32Array, 'uint', 'u', 0xf0000001], [Int32Array, 'int', 'i', -0x70000001]])
+for (const width of [1, 2, 3, 4]) for (const instanced of [false, true])
+test(`generated ${scalar} width ${width} instanced flag=${instanced} preserves source WGSL, layouts and exact integer bytes`, t => {
+  const f = rig(t), stride = width + 2, array = new Type(4 * stride).fill(word);
+  const type = width === 1 ? scalar : `${prefix}vec${width}`;
+  // r186's scalar/vector factory omits its instanced argument. Even an explicit
+  // setter leaves the plain interleaved owner in source per-vertex step mode.
+  const input = (instanced ? N.instancedBufferAttribute : N.bufferAttribute)(array, type, stride, 1).setInstanced(instanced);
+  const value = width === 1 ? input : input.x;
+  f.material.colorNode = N.vec3(N.float(value.bitAnd(255)).div(255), .25, .5);
+  const descriptor = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+  const reflected = descriptor.attributes.find(attribute => !f.object.geometry.attributes[attribute.name]);
+  assert.equal(reflected.scalar, scalar); assert.equal(reflected.components, width);
+  const view = f.owner.geometry(descriptor), generated = view.attributes[reflected.name];
+  const first = f.owner.captureDraw(descriptor, f.context);
+  first.attributes.install();
+  assert.equal(generated.data.array.constructor, Type); assert.equal(generated.data.array[1], word);
+  assert.equal(generated.data.stride, stride); assert.equal(generated.offset, 1);
+  assert.equal(generated.data.isInstancedInterleavedBuffer === true, false);
+  assert.notEqual(generated.data, input.attribute.data); assert.equal(input.attribute.data.array, array);
+  assert.match(descriptor.fragment, /@interpolate\(flat, either\)/);
+  const device = geometryDevice(), gpu = createGpuProgramGeometry(device, view, descriptor.attributes, {attributeTypes: 'webgpu'});
+  t.after(() => gpu.dispose());
+  const snapshot = programGeometrySnapshot(gpu, device);
+  const expected = new SourceWebGPUAttributeUtils(null).createShaderVertexBuffers({getAttributes: () =>
+    descriptor.attributes.map(attribute => attribute.name === reflected.name ? input.attribute : f.object.geometry.attributes[attribute.name])});
+  assert.deepEqual(snapshot.layouts, expected);
+  const slot = snapshot.layouts.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === reflected.location));
+  assert.deepEqual([...new Type(snapshot.vertexBuffers[slot].data)], [...array]);
+});
+test('generated integer stream scalar mismatches refuse before callbacks', t => {
+  for (const [Type, type] of [[Uint32Array, 'vec3'], [Int32Array, 'uvec3'], [Uint32Array, 'ivec3'], [Float32Array, 'ivec3']]) {
+    const f = rig(t); let calls = 0;
+    const input = N.bufferAttribute(new Type(12), type);
+    f.material.colorNode = N.vec3(input).mul(N.uniform(1).onObjectUpdate(() => { calls++; return 1; }));
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(calls, 0);
+    assert.equal(f.owner.diagnostics.programs, 0);
+  }
 });
 test('native generated, instance and storage bindings ignore WebGL upload callbacks without rebuilding programs', t => {
   const inert = attribute => Object.defineProperty(attribute, 'onUploadCallback', {

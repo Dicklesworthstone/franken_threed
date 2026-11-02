@@ -1,4 +1,4 @@
-/** Captured source-generated Float32 vertex streams for native node programs.
+/** Captured source-generated 32-bit vertex streams for native node programs.
  * The pinned Instance/BufferAttribute nodes own their public attributes. Keep
  * their WebGPU version/range history at the logical render boundary, then give
  * the existing geometry uploader private owners containing that history. A
@@ -39,22 +39,24 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
       return inspectThreeNodeStorageAttribute(three, attribute, reject);
     const interleaved = attribute?.isInterleavedBufferAttribute === true;
     const owner = interleaved ? attribute.data : attribute, array = owner?.array;
-    if (!(array instanceof Float32Array) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+    if (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
         !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
         !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
         attribute.normalized || attribute.gpuType === three.IntType ||
         !Number.isSafeInteger(owner.version) || owner.version < 0)
-      reject('ATTRIBUTE', 'Native generated attributes require fixed, unshared Float32 scalar/vector streams');
+      reject('ATTRIBUTE', 'Native generated attributes require fixed, unshared Float32, Int32 or Uint32 scalar/vector streams');
     try { new Uint8Array(array.buffer, 0, 0); }
     catch { reject('ATTRIBUTE', 'Native generated attribute storage is detached'); }
     const stride = interleaved ? owner.stride : attribute.itemSize, offset = interleaved ? attribute.offset : 0;
-    const instanced = owner.isInstancedInterleavedBuffer === true || attribute.isInstancedBufferAttribute === true;
+    // Source WebGPU selects interleaved step mode from the owner only. A raw
+    // BufferAttributeNode's instanced flag does not promote its plain owner.
+    const instanced = interleaved ? owner.isInstancedInterleavedBuffer === true : attribute.isInstancedBufferAttribute === true;
     if (!Number.isSafeInteger(stride) || stride < attribute.itemSize || stride > 512 ||
         !Number.isSafeInteger(offset) || offset < 0 || offset + attribute.itemSize > stride ||
         array.length !== attribute.count * stride || (instanced && owner.meshPerAttribute !== 1))
       reject('ATTRIBUTE', 'Native generated streams require a complete source stride and instance divisor one');
     return {owner, array, interleaved, instanced, stride, offset,
-      signature: JSON.stringify([array.length, attribute.count, stride, offset, attribute.itemSize, interleaved, instanced, owner.meshPerAttribute])};
+      signature: JSON.stringify([array.constructor.name, array.length, attribute.count, stride, offset, attribute.itemSize, interleaved, instanced, owner.meshPerAttribute])};
   }
   function register(descriptor, geometry, attributes) {
     live();

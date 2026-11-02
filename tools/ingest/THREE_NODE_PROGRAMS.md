@@ -831,10 +831,22 @@ inverse transpose, and multiplies instance RGB into the material color.
 Authored `positionNode` runs after the instance transform, and its graph can read
 other storage through `instanceIndex`.
 
-Source-generated `BufferAttributeNode` scalar/vector streams from raw Float32
-arrays also use private captured geometry views. Ordinary geometry attributes
-remain live and can be replaced without being trapped in a stale private view.
-Generated streams require fixed, unshared arrays and unnormalized float input.
+Source-generated `BufferAttributeNode` scalar/vector streams from raw Float32,
+Int32 and Uint32 arrays also use private captured geometry views. Integer streams
+retain their exact signed or unsigned bits, including values beyond Float32's
+exact integer range, through interleaved strides, offsets, queued partial uploads
+and shader replacement. Their `int`/`ivec2`/`ivec3`/`ivec4` or
+`uint`/`uvec2`/`uvec3`/`uvec4` input type must match the array's scalar type;
+the pinned WebGPU source does not convert a mismatched vertex format. Generated
+streams require fixed, unshared, unnormalized 32-bit arrays. Interleaved step
+mode follows the source owner. In pinned r186, raw scalar/vector arrays receive
+a plain `InterleavedBuffer`: even `.setInstanced(true)` leaves them per-vertex
+on WebGPU. The private view retains that behavior; the existing source-derived
+`InstancedInterleavedBuffer` owners remain per-instance.
+Ordinary geometry attributes remain live and can be replaced without being
+trapped in a stale private view. `native_integer_attributes.mjs` compares signed
+and unsigned streams with the pinned renderer, including repeated mesh draws,
+unmarked CPU edits, partial and empty update ranges, and material recompilation.
 Native WebGPU uploads leave `BufferAttribute.onUploadCallback` and the
 interleaved owner's callback unread, matching r186 `Attributes` and
 `WebGPUAttributeUtils`. Custom functions, non-callable values and accessors on

@@ -217,7 +217,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('ATTRIBUTE', 'Native storage vertex inputs require the source scalar/vector attribute without interleaved conversion');
       return;
     }
-    if (node.value instanceof Float32Array) return;
+    if ([Float32Array, Int32Array, Uint32Array].includes(node.value?.constructor)) return;
     const inputs = object?.isInstancedMesh ? [object.instanceMatrix, object.instanceColor].filter(Boolean) : [];
     const value = node.value;
     // Raw arrays receive a private owner from BufferAttributeNode. Instance.js
@@ -234,7 +234,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       inputs.some(input => input instanceof three.InstancedBufferAttribute && !input.isStorageInstancedBufferAttribute &&
         value.array === input.array);
     if (!derivedInstance)
-      fail('ATTRIBUTE', 'Native generated streams require raw Float32Array inputs or the source-derived CPU instance owners; public attribute inputs need shared residency');
+      fail('ATTRIBUTE', 'Native generated streams require raw Float32Array, Int32Array or Uint32Array inputs or the source-derived CPU instance owners; public attribute inputs need shared residency');
   }
   function attributeSignature(nodes, object) {
     return JSON.stringify(nodes.map(node => {
@@ -1454,6 +1454,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
+      if (ArrayBuffer.isView(node?.value)) {
+        // r186 derives the vertex format from the source array. A differently
+        // signed or floating shader input is invalid even if our general
+        // geometry uploader could convert its elements to that requested type.
+        const expected = node.value instanceof Uint32Array ? 'uint' : node.value instanceof Int32Array ? 'int' : 'float';
+        if (scalar !== expected)
+          fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
+      }
       if (node || storage) generated.push({name: attribute.name, attribute: source});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
