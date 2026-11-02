@@ -50,6 +50,7 @@ import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
+import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -1312,7 +1313,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     specializeNumeric: options.specializeNumeric,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
     ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites,
-      postprocessingTransforms: rendererRoute.postprocessingTransforms } } : {}),
+      postprocessingTransforms: rendererRoute.postprocessingTransforms,
+      gpuComputationTransforms: rendererRoute.gpuComputationTransforms } } : {}),
   });
   if (rendererRoute?.routed && bundleResult.routedRendererModules.length === 0) {
     throw new Error("A renderer route was decided but no pinned three build import was substituted");
@@ -1486,7 +1488,11 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSou
   const postprocessingTransforms = targets.some(target => target.exportName === 'WebGLRenderer')
     ? Object.entries(graph.modules).filter(([, mod]) => mod.postprocessing_transform)
       .map(([id, mod]) => ({id, ...mod.postprocessing_transform})) : [];
-  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets, exactSites, postprocessingTransforms };
+  const gpuComputationTransforms = targets.some(target => target.exportName === 'WebGLRenderer')
+    ? Object.entries(graph.modules).filter(([, mod]) => mod.gpu_computation_transform)
+      .map(([id, mod]) => ({id, ...mod.gpu_computation_transform})) : [];
+  return { routed: targets.length > 0, reason: targets.length ? "routed" : reasons.join(","), decisions, targets, exactSites,
+    postprocessingTransforms, gpuComputationTransforms };
 }
 
 const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttributes", "forceContextLoss", "forceContextRestore"]);
@@ -1514,7 +1520,9 @@ export function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSourc
     if (/\/upstream\/three\.js\/(examples\/jsm|src)\//.test(new URL(id).pathname)) continue;
     let ast;
     try {
-      const source = moduleSources.read(id, {source: inline.get(id)}).code;
+      let source = moduleSources.read(id, {source: inline.get(id)}).code;
+      if (graph.modules[id].gpu_computation_transform)
+        source = transformThreeGpuComputation(source, graph.modules[id].gpu_computation_transform);
       ast = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module" });
     } catch {
       return true; // Unparseable application code cannot be cleared.

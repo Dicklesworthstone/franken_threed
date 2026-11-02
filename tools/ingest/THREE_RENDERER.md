@@ -661,6 +661,39 @@ performance closure are separate gates. Locked partial stencil clears and
 locked masks combined with shadow/transmission prepasses are explicit runtime
 boundaries.
 
+## GPUComputationRenderer texture simulations
+
+The pinned `GPUComputationRenderer` addon now runs its floating-point texture
+simulations through the owned WebGPU program and render-target paths. Its
+original class, synchronous `init()` and `compute()` methods, variable objects,
+dependency lists and alternating targets remain retained source JavaScript.
+Each variable reads the previous step's inputs while writing its own next
+target. Queued calls retain their accepted uniforms and texture identities;
+the resulting textures can feed ordinary vertex and fragment shaders without
+an intermediate CPU copy.
+
+The addon originally checks `renderer.capabilities.maxVertexTextures`. The
+compiler verifies the exact r186 addon, resolved `Pass.js` and core/build bytes,
+then lowers only that guard to a private vertex-sampling availability query.
+Every admitted WebGPU device supports this operation. The native renderer is
+identified by a private registry; public flags cannot establish this identity.
+Actual source renderers still perform the original strict-zero comparison and
+capability access. Public GL limits are not fabricated or exposed by this
+adapter. Modified dependencies, open extensions, escaped instances and replaced
+methods retain exact ownership.
+
+`gpu_computation_renderer.mjs` builds the unchanged addon through production
+routing and compares it with source WebGL. Ten checkpoints cover float32 and
+float16 targets, two mutually dependent variables, cold initialization, queued
+uniform changes, current/alternate histories, explicit texture resets, manual
+filtering and vertex/fragment texture consumers. Chromium 151.0.7922.34 /
+SwiftShader matched all **5,120 state components and 122,880 RGBA bytes
+exactly**, with zero browser or GPU errors. The browser fixture retains the
+existing WebGL image tolerance of 12 channel values over at most 2% of pixels;
+this run required none of that allowance. Six source-proof and ownership test
+groups also pass. These checks establish this addon execution path, not full
+simulation-family closure or hardware performance.
+
 ## Native multiple-render-target mip chains
 
 Native 2D targets can render and sample mip chains on multiple

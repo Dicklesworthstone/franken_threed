@@ -11,6 +11,7 @@
  * evidence/01.1/build_sha256.txt; the addon hash is from the pinned source tree.
  */
 import {verifiedPostProcessingSources} from './postprocessing_contracts.mjs';
+import {verifiedGpuComputationSources} from './gpu_computation_contracts.mjs';
 
 const ORBIT = 'sha256:3d79d07ecb686b4e5d93232eedab255331c1beef711e13164eaa1f68655a5f2b';
 const FIRST_PERSON = 'sha256:4f6c4bf60c8956a1201c966de1592f4f035be47b4f6fe97879a782898945992c';
@@ -46,22 +47,26 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
   }
   const passes = verifiedPostProcessingSources(modules, bases);
   contracts.postprocessingSources = passes;
-  if (!orbits.size && !firstPersons.size && !passes.size) return contracts;
+  const computations = verifiedGpuComputationSources(modules, bases, passes);
+  contracts.gpuComputationSources = computations;
+  if (!orbits.size && !firstPersons.size && !passes.size && !computations.size) return contracts;
 
-  const role = (id, name) => passes.get(id)?.exports[name] ?? (orbits.has(id) && name === 'OrbitControls' ? 'orbit' :
+  const role = (id, name) => computations.has(id) && name === 'GPUComputationRenderer' ? 'gpu-computation' :
+    passes.get(id)?.exports[name] ?? (orbits.has(id) && name === 'OrbitControls' ? 'orbit' :
     firstPersons.has(id) && name === 'FirstPersonControls' ? 'first-person' :
     bases.has(id) && BASE_EXPORTS.has(name) ? 'base' :
     bases.has(id) && name === 'WebGPURenderer' ? 'webgpu' :
     bases.has(id) && name === 'WebGLRenderer' ? 'webgl' : null);
   for (const [id, mod] of modules) {
     // These exact implementations are the audited contract, not its callers.
-    if (bases.has(id) || orbits.has(id) || firstPersons.has(id) || passes.has(id)) continue;
+    if (bases.has(id) || orbits.has(id) || firstPersons.has(id) || passes.has(id) || computations.has(id)) continue;
     const bindings = new Map(), namespaces = new Map(), reexports = new Set();
     for (const request of mod.static_imports) {
       for (const binding of request.imported_bindings ?? []) {
         if (binding.type === 'namespace') {
           if (orbits.has(request.resolved_id)) namespaces.set(binding.local, 'orbit');
           else if (firstPersons.has(request.resolved_id)) namespaces.set(binding.local, 'first-person');
+          else if (computations.has(request.resolved_id)) namespaces.set(binding.local, 'gpu-computation');
           else if (bases.has(request.resolved_id)) namespaces.set(binding.local, 'base');
         } else {
           const kind = role(request.resolved_id, binding.imported);

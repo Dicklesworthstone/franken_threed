@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { analyzeModuleAst } from "./ast_analyzer.mjs";
 import { verifiedRendererConsumerContracts } from "./renderer_consumer_contracts.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
+import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
@@ -538,6 +539,13 @@ export async function buildModuleGraph(entryPath, options = {}) {
     const code = transformThreePostProcessing(input.code, record);
     node.routing_facts = node.routingFacts = analyzeModuleAst(code, input.sourceUrl).routing_facts;
     node.postprocessing_transform = record;
+  }
+  for (const [id, record] of consumerContracts.gpuComputationSources ?? []) {
+    const input = sourceInputs.get(id), node = modules.get(id);
+    const code = transformThreeGpuComputation(input.code, record);
+    const contract = {bindings: new Map(), namespaces: new Map(), reexports: new Set(), sourceConsumer: 'gpu-computation'};
+    node.routing_facts = node.routingFacts = analyzeModuleAst(code, input.sourceUrl, {}, contract).routing_facts;
+    node.gpu_computation_transform = record;
   }
 
   // Build adjacency map for cycle detection

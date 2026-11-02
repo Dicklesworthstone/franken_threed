@@ -42,6 +42,7 @@ import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, c
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {registerThreePassState, captureThreePassState, finishThreePassState} from './three_pass_state.mjs';
+import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
@@ -1969,6 +1970,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       this._contextAlpha = true;
       this._pixelRound = Math.round;
       registerThreePassState(this, THREE);
+      registerThreeGpuComputation(this);
       // Source construction is synchronous: start device negotiation now.
       this.init().catch(error => { this._deferredError ??= error; });
     }

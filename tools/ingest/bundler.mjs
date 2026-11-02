@@ -19,6 +19,7 @@ import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
+import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
@@ -598,13 +599,14 @@ const RENDERER_FACTORIES = {
  * @param {{ targets: Array<{ url: string, exportName: 'WebGPURenderer' | 'WebGLRenderer' }> }} options
  * @returns {import('rollup').Plugin}
  */
-export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTransforms = [] }) {
+export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTransforms = [], gpuComputationTransforms = [] }) {
   const byUrl = new Map(targets.map((t) => [t.url, t.exportName]));
   if (byUrl.size === 0) throw new Error("rendererRoutePlugin requires target modules");
   for (const name of byUrl.values())
     if (!RENDERER_FACTORIES[name]) throw new Error(`Unsupported routed renderer export: ${name}`);
   const routed = new Set();
   const passes = new Map(postprocessingTransforms.map(record => [record.id, record]));
+  const computations = new Map(gpuComputationTransforms.map(record => [record.id, record]));
   const sourceSites = new Map();
   for (const site of exactSites) {
     if (!sourceSites.has(site.moduleId)) sourceSites.set(site.moduleId, []);
@@ -614,6 +616,7 @@ export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTr
     name: "f3d-renderer-route",
     transform(code, id) {
       if (passes.has(id)) return {code: transformThreePostProcessing(code, passes.get(id)), map: null};
+      if (computations.has(id)) return {code: transformThreeGpuComputation(code, computations.get(id)), map: null};
       const sites = sourceSites.get(id);
       if (!sites?.length) return null;
       const hash = 'sha256:' + createHash('sha256').update(code).digest('hex');
