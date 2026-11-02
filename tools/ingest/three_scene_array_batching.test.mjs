@@ -291,6 +291,41 @@ test('point-shadow faces and ArrayCamera views consume their own captured batch 
   assert.notDeepEqual(expected[5].matrices, expected[6].matrices);
 });
 
+for (const requested of [true, false])
+test(`afterShadow ${requested ? 'requested uploads survive' : 'versionless matrix edits stay stale across'} batch replay before color draws`, async t => {
+  const f = await fixture(t, 1, {}, {configure({scene, renderer, batch}) {
+    renderer.shadowMap.enabled = true; renderer.shadowMap.type = T.BasicShadowMap; batch.castShadow = true;
+    const light = new T.DirectionalLight(); light.position.z = 3; light.castShadow = true;
+    light.shadow.mapSize.set(8, 8); scene.add(light);
+  }});
+  let shadowMatrix, colorMatrix, colorValues;
+  f.batch.onBeforeShadow = function(...args) {
+    this.setMatrixAt(f.ids[0], new T.Matrix4().makeTranslation(-.25, 0, 0));
+    this.setColorAt(f.ids[0], new T.Color(0xff0000));
+    T.BatchedMesh.prototype.onBeforeShadow.apply(this, args);
+    shadowMatrix = [...this._matricesTexture.image.data];
+    colorValues = [...this._colorsTexture.image.data];
+  };
+  f.batch.onAfterShadow = function() {
+    if (requested) {
+      this.setMatrixAt(f.ids[0], new T.Matrix4().makeTranslation(.875, 0, 0));
+      this.setColorAt(f.ids[0], new T.Color(0x00ff00));
+      colorMatrix = [...this._matricesTexture.image.data]; colorValues = [...this._colorsTexture.image.data];
+    } else {
+      this._matricesTexture.image.data[12] = .875;
+      colorMatrix = shadowMatrix;
+    }
+  };
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const draws = submitted(f.device); assert.equal(draws.length, 4);
+  for (const draw of draws.slice(0, 2))
+    assert.deepEqual(words(draw, f.batch._matricesTexture, 'rgba32float', Float32Array), shadowMatrix);
+  for (const draw of draws.slice(2)) {
+    assert.deepEqual(words(draw, f.batch._matricesTexture, 'rgba32float', Float32Array), colorMatrix);
+    assert.deepEqual(words(draw, f.batch._colorsTexture, 'rgba32float', Float32Array), colorValues);
+  }
+});
+
 test('nonindexed batch wireframe transmission uses the selected source edge-index stride', async t => {
   const f = await fixture(t, 1, {}, {indexed: false, configure({scene, batch, ids}) {
     const plane = new T.PlaneGeometry(.5, .5), extra = plane.toNonIndexed();

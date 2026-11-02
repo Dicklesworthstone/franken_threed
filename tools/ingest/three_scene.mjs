@@ -581,6 +581,7 @@ export async function createGpuThreeScene(device,scene,{
   }
   function captureProgramBatch(object){
     if(!passBatchHistory)fail('FRAME','Batch pass capture requires an active source render');
+    passBatchHistory.objects.add(object);
     const snapshots=captureBatchHistory(object,passBatchHistory);
     return encoder=>encodeBatchHistory(encoder,snapshots);
   }
@@ -1638,7 +1639,7 @@ export async function createGpuThreeScene(device,scene,{
       const lighting=cameraFrame(camera,options.matricesUpdated===true);lighting.lights=[];
       const arrayViews=arrayCameraViews(camera,arrayProfile,frame);
       const programArray=programRoute()&&arrayViews!==null;
-      const batchHistory=programRoute()?{used:new Map(),latest:new Map(),updates:new Map()}:null;
+      const batchHistory=programRoute()?{used:new Map(),latest:new Map(),updates:new Map(),objects:new Set()}:null;
       passBatchHistory=batchHistory;
       const cullingFrustum=arrayViews&&!programArray?{
         intersectsObject:object=>arrayViews.some(view=>view.frustum.intersectsObject(object)),
@@ -1890,7 +1891,13 @@ export async function createGpuThreeScene(device,scene,{
         programSupport.setLights(programLightList(camera));programSupport.setLightsView(camera);
       }
       textureOwner?.update(frameTextures);
-      submitShadows?.();
+      if(submitShadows){
+        // onAfterShadow can request another upload after its draw was captured.
+        // Save those accepted bytes before replay replaces the shared residency;
+        // restoring an older snapshot would leave a fresh version with stale texels.
+        for(const object of batchHistory.objects)captureBatchHistory(object,batchHistory);
+        submitShadows();
+      }
       if(submitShadows&&batchHistory?.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
       for(const [index,pass] of transmissionPasses.entries()){
         if(transmissionCameras[index]!==pass.child)fail('CAMERA','A transmission callback replaced an unprepared child camera');

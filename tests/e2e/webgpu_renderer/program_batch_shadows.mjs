@@ -84,7 +84,7 @@ async function capture(mode) {
             list.sort((a, b) => a.z - b.z || a.index - b.index);
           });
           batch.onBeforeRender = function(renderer, sourceScene, child, geometry, currentMaterial, group) {
-            if (sourceScene !== null) basePoses();
+            if (sourceScene !== null && !phase.startsWith('after-shadow-')) basePoses();
             T.BatchedMesh.prototype.onBeforeRender.call(this, renderer, sourceScene, child, geometry, currentMaterial, group);
             if (sourceScene !== null) trace.push(['main', child.name, Array.from(this._indirectTexture.image.data.slice(0, this._multiDrawCount))]);
           };
@@ -100,7 +100,15 @@ async function capture(mode) {
               Array.from(this._multiDrawStarts.slice(0, this._multiDrawCount)),
               Array.from(this._multiDrawCounts.slice(0, this._multiDrawCount))]);
           };
-          batch.onAfterShadow = (_, __, ___, child) => trace.push(['after-shadow', child.name, direction(child)]);
+          batch.onAfterShadow = (_, __, ___, child) => {
+            trace.push(['after-shadow', child.name, direction(child)]);
+            if (phase === 'after-shadow-updates') {
+              const p = positions[0]; batch.setMatrixAt(ids[0], new T.Matrix4().makeTranslation(p[0] + .55, p[1], p[2]));
+              batch.setColorAt(ids[0], new T.Color(0x22ff44));
+            } else if (phase === 'after-shadow-versionless') {
+              batch._matricesTexture.image.data[12] = positions[0][0] + .55;
+            }
+          };
           material.onBeforeRender = (_, __, child) => trace.push(['material', child.name]);
           const floor = new T.Mesh(new T.PlaneGeometry(7, 7), new T.MeshPhongMaterial({color: 0xbfc6cb, shininess: 10}));
           floor.rotation.x = -Math.PI / 2; floor.position.y = -.7; floor.receiveShadow = true;
@@ -125,6 +133,8 @@ async function capture(mode) {
             await checkpoint('directional-shadow');
             batch.castShadow = false; await checkpoint('directional-no-caster');
             batch.castShadow = true; phase = 'moved-hidden'; await checkpoint('directional-moved-hidden');
+            phase = 'after-shadow-updates'; await checkpoint('directional-after-shadow-updates');
+            phase = 'after-shadow-versionless'; await checkpoint('directional-after-shadow-versionless');
             phase = 'ordinary'; scene = new T.Scene(); scene.background = new T.Color(.025, .04, .065);
             scene.add(batch, floor, wall, point, new T.AmbientLight(0xffffff, .2)); await checkpoint('point-shadow');
             batch.castShadow = false; await checkpoint('point-no-caster');
@@ -145,11 +155,12 @@ async function capture(mode) {
 }
 try {
   const source = await capture('source');
-  for (let start = 0; start < source.frames.length; start += 6) {
-    const frames = source.frames.slice(start, start + 6);
-    for (const [a, b] of [[0, 1], [0, 2], [3, 4], [3, 5]])
+  for (let start = 0; start < source.frames.length; start += 8) {
+    const frames = source.frames.slice(start, start + 8);
+    for (const [a, b] of [[0, 1], [0, 2], [0, 3], [5, 6], [5, 7]])
       assert.notDeepEqual(frames[a].pixels, frames[b].pixels, `${frames[b].name}: source shadows must visibly change`);
-    for (const index of [3, 5]) {
+    assert.deepEqual(frames[0].pixels, frames[4].pixels, 'versionless afterShadow matrix edits stay GPU-stale in the source');
+    for (const index of [5, 7]) {
       const faces = frames[index].trace.filter(event => event[0] === 'shadow');
       assert.equal(faces.length, 6, 'point caster receives one source callback per cube face');
       assert.equal(new Set(faces.map(event => JSON.stringify(event[2]))).size, 6);
