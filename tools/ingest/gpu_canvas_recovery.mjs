@@ -63,6 +63,13 @@ async function createRecoverableCanvas(createSession, canvas, createRenderer, in
   options.gpu ??= globalThis.navigator?.gpu;
   for (const key of ['target', 'requiredLimits', 'renderTarget', 'output'])
     if (options[key] !== undefined) options[key] = Object.freeze({...object(options[key], key + ' options')});
+  if (options.outputColorMatrix != null) {
+    const matrix = options.outputColorMatrix;
+    if ((!Array.isArray(matrix) && !ArrayBuffer.isView(matrix)) || matrix.length !== 9 ||
+        Array.from(matrix).some(value => typeof value !== 'number' || !Number.isFinite(Math.fround(value))))
+      fail('OPTIONS', 'Expected nine finite output color matrix elements');
+    options.outputColorMatrix = Object.freeze(Array.from(matrix, Math.fround));
+  }
   if (options.requiredFeatures !== undefined) {
     if (!Array.isArray(options.requiredFeatures)) fail('FEATURE', 'Expected required feature names');
     options.requiredFeatures = Object.freeze([...options.requiredFeatures]);

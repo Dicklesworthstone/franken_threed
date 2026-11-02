@@ -1,6 +1,6 @@
 /** Device negotiation and owned canvas execution for explicit renderer factories.
  * A factory receives (device, rendererOptions, {signal}) and returns
- * {render(input, frame, presentationTexture), dispose(), whenIdle(), prepare?()}.
+ * {render(input, frame, presentationTexture), dispose(), whenIdle(), prepare?(options)}.
  * Extra arguments are optional for existing factories. The texture must not
  * escape its synchronous submitted use; signal ends on session teardown.
  * It borrows the device; the session owns the returned renderer. No frame loop.
@@ -133,11 +133,11 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
         return api;
       });
     },
-    async prepare() {
+    async prepare(options) {
       live();
       if (busy || preparing) fail('REENTRANT', 'Preparation cannot overlap another operation');
       preparing = true;
-      try { await wait(renderer.prepare?.()); live(); return api; }
+      try { await wait(renderer.prepare?.(options)); live(); return api; }
       catch (error) { if (target?.failed || renderer?.failed) stop(error); throw error; }
       finally { preparing = false; }
     },

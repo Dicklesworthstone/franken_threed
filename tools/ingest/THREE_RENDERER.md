@@ -469,6 +469,32 @@ events, 14 framebuffer copies and 35 direct draws match, with zero GPU/browser
 errors and the owned `general-webgpu` route. Hardware performance remains
 unmeasured.
 
+## Registered native output color spaces
+
+The native `WebGPURenderer` route accepts output spaces registered through the
+pinned `ColorManagement.define()` API, including the optional `ColorSpaces.js`
+addon's Display-P3, linear Display-P3 and extended-sRGB definitions. The working
+space remains linear-sRGB. Output follows the source transfer and matrix
+construction after tone mapping and before alpha premultiplication. Disabling
+color management skips both the primaries conversion and transfer.
+
+Queued draws and clears retain their accepted output profiles and exposure.
+Changing only the output conversion replaces the final output program while
+preserving linear scene color, depth and stencil history. Independent canvas
+targets retain their own sessions, and native framebuffer copies continue to
+read the same linear scene storage. Output matrices are captured before
+asynchronous preparation and remain stable across explicit device recovery.
+
+This preserves the pinned backend's canvas configuration: its effective display
+color space remains sRGB. Selecting Display-P3 changes the source-authored
+output transform; it does not establish physical wide-gamut display accuracy.
+`native_color_spaces.mjs` compares actual canvas storage with unchanged r186:
+10 cases and 16 presentations match all 15,872 bytes exactly in Chromium
+141.0.7390.37 / SwiftShader, with zero GPU/browser errors. Cases include byte and
+half-float output, ordinary and node materials, signed/HDR values, tone mapping,
+alpha, MSAA, queued changes and retained drawing. Hardware performance remains
+unmeasured.
+
 ## Explicit differences
 
 - Structural edits (new objects/materials, material structure, enabling fog,
@@ -486,7 +512,7 @@ unmeasured.
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
   XR, custom tone mapping, reversed depth on the WebGL-authored facade, non-sRGB
-  output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
+  WebGL-authored canvas output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.
 - Upstream passes non-one factors with Min/Max blend equations, which WebGPU

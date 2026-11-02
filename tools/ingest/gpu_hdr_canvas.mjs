@@ -5,7 +5,7 @@
  */
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
-import {animationOutputSettings, createGpuAnimationOutput} from './animation_output.mjs';
+import {animationOutputSettings, animationOutputColorMatrix, createGpuAnimationOutput} from './animation_output.mjs';
 
 export class GpuHdrCanvasError extends Error {
   constructor(code, message) {
@@ -25,9 +25,11 @@ const DEFAULTS = Object.freeze({toneMapping: 'aces-filmic', exposure: 1, inputAl
 
 export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options = {}) {
   const all = capture(options, ['device', 'gpu', 'powerPreference', 'requiredFeatures', 'requiredLimits',
-    'target', 'signal', 'renderTarget', 'output', 'outputColorSpace', 'sourceOutput'], 'HDR canvas');
+    'target', 'signal', 'renderTarget', 'output', 'outputColorSpace', 'outputColorMatrix', 'sourceOutput'], 'HDR canvas');
   if (typeof createRenderer !== 'function') fail('FACTORY', 'Expected a linear-scene renderer factory');
-  const {renderTarget = {}, output = {}, outputColorSpace, sourceOutput = false, ...session} = all;
+  const {renderTarget = {}, output = {}, outputColorSpace, outputColorMatrix: selectedMatrix,
+    sourceOutput = false, ...session} = all;
+  const outputColorMatrix = animationOutputColorMatrix(selectedMatrix);
   const hdr = {format: 'rgba16float', depthFormat: 'depth24plus', sampleCount: 1, maxBytes: 256 * 1024 * 1024,
     ...capture(renderTarget, ['format', 'depthFormat', 'sampleCount', 'maxBytes', 'label'], 'HDR target')};
   if (!['rgba8unorm', 'rgba16float', 'rgba32float'].includes(hdr.format))
@@ -47,8 +49,9 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   const transparent = target.alphaMode === 'premultiplied';
   if (target.alphaMode !== undefined && !['opaque', 'premultiplied'].includes(target.alphaMode))
     fail('OPTIONS', 'HDR canvas alpha mode must be opaque or premultiplied');
-  const defaults = Object.freeze(animationOutputSettings(capture(output, OUTPUT_KEYS, 'output'),
-    transparent || sourceOutput ? {...DEFAULTS, inputAlpha: 'premultiplied', outputAlpha: 'premultiplied'} : DEFAULTS));
+  const initialDefaults = Object.freeze(animationOutputSettings(capture(output, OUTPUT_KEYS, 'output'), DEFAULTS));
+  const defaultsFor = source => Object.freeze(transparent || source
+    ? {...initialDefaults, inputAlpha: 'premultiplied', outputAlpha: 'premultiplied'} : initialDefaults);
   if ((target.depthFormat !== undefined && target.depthFormat !== null) ||
       (target.sampleCount !== undefined && target.sampleCount !== 1))
     fail('OPTIONS', 'Use renderTarget for scene depth/MSAA; the output pass is single-sample and depthless');
@@ -56,6 +59,9 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   session.lazyAttachments = true;
   return createGpuCanvasRenderer(canvas, async (device, presentation, {signal}) => {
     let offscreen = null, finalOutput = null, renderer = null;
+    let outputProfile = {outputColorSpace: outputColorSpace ?? (target.srgbView === false ? 'linear' : 'srgb'),
+      outputColorMatrix, sourceOutput};
+    let defaults = defaultsFor(sourceOutput);
     let disposed = false, terminal = null, busy = false, preparing = false;
     let rejectStopped;
     const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
@@ -85,6 +91,17 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
       if (renderer?.failed || finalOutput?.failed || offscreen?.failed) stop(error);
       throw error;
     }
+    function createOutput(profile) {
+      // A native output graph writes encoded values into the base canvas view.
+      // Keep the existing presentation configuration and linear history when
+      // its transform changes; creating a plain view needs no new viewFormat.
+      const format = profile.sourceOutput || profile.outputColorSpace === 'linear'
+        ? presentation.format.replace(/-srgb$/, '') : presentation.format;
+      return createGpuAnimationOutput(device, {...defaultsFor(profile.sourceOutput), format, ...profile, signal}).then(value => {
+        if (closed()) { value.dispose(); throw terminal; }
+        return value;
+      });
+    }
     const api = Object.freeze({
       get disposed() { return disposed; },
       get failed() { return terminal !== null || !!renderer?.failed || !!finalOutput?.failed || !!offscreen?.failed; },
@@ -112,7 +129,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
             fail('FRAME', 'Expected an opaque RGBA clear color');
           sceneFrame.clearColor = Array.from(clear);
           if (sceneFrame.clearColor.some((v, i) => typeof v !== 'number' || !Number.isFinite(Math.fround(v)) ||
-              v < 0 && (!sourceOutput || i === 3)) || sceneFrame.clearColor[3] > 1 ||
+              v < 0 && (!outputProfile.sourceOutput || i === 3)) || sceneFrame.clearColor[3] > 1 ||
               (!transparent && sceneFrame.clearColor[3] !== 1)) fail('FRAME', 'Opaque HDR canvas clear alpha must be one');
           live();
           offscreen.resize(canvas.width, canvas.height);
@@ -143,12 +160,37 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
         catch (error) { return childFailure(error); }
         finally { busy = false; if (closed()) release(); }
       },
-      async prepare() {
+      async prepare(options) {
         live(); if (busy || preparing) fail('REENTRANT', 'HDR preparation cannot overlap another operation');
+        // Capture before pipeline construction yields. One replacement output
+        // pass is enough; source color/depth/stencil and renderer residency must
+        // survive changing only the output primaries or transfer.
+        const selected = options === undefined ? null
+          : capture(options, ['outputColorSpace', 'outputColorMatrix', 'sourceOutput'], 'prepared output');
+        const next = selected ? {
+          outputColorSpace: selected.outputColorSpace ?? outputProfile.outputColorSpace,
+          outputColorMatrix: animationOutputColorMatrix(selected.outputColorMatrix),
+          sourceOutput: selected.sourceOutput ?? outputProfile.sourceOutput,
+        } : outputProfile;
+        if (!['linear', 'srgb'].includes(next.outputColorSpace) || typeof next.sourceOutput !== 'boolean')
+          fail('OPTIONS', 'Expected a linear/sRGB output transfer and boolean source-output selection');
         preparing = true;
-        try { await wait(renderer.prepare?.()); live(); return api; }
+        let replacement = null;
+        try {
+          if (JSON.stringify(next) !== JSON.stringify(outputProfile)) {
+            replacement = await wait(createOutput(next)); live();
+            // Retain delayed errors and in-flight uniforms from the preceding
+            // output. Preparation is serialized by the enclosing canvas owner.
+            await wait(finalOutput.whenIdle()); live();
+            const previous = finalOutput;
+            finalOutput = replacement; replacement = null;
+            outputProfile = next; defaults = defaultsFor(next.sourceOutput);
+            previous.dispose();
+          }
+          await wait(renderer.prepare?.()); live(); return api;
+        }
         catch (error) { return childFailure(error); }
-        finally { preparing = false; }
+        finally { replacement?.dispose(); preparing = false; }
       },
       async whenReady() {
         live();
@@ -173,9 +215,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
     try {
       if (signal.aborted) aborted(); live();
       offscreen = createGpuRenderTarget(device, {...hdr, width: canvas.width, height: canvas.height});
-      const outputReady = createGpuAnimationOutput(device, {...defaults, format: presentation.format,
-        outputColorSpace: outputColorSpace ?? (target.srgbView === false ? 'linear' : 'srgb'), sourceOutput, signal}).then(value => {
-        if (closed()) { value.dispose(); throw terminal; }
+      const outputReady = createOutput(outputProfile).then(value => {
         finalOutput = value; return value;
       });
       await wait(outputReady);

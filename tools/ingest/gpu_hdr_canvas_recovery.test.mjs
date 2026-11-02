@@ -46,14 +46,22 @@ for (const sampleCount of [1, 4]) test(`HDR recovery rebuilds real targets, outp
 
 test('HDR configuration snapshots precede lazy loading, and last-frame output overrides are never replayed', async () => {
   const f = recoveryFixture(); f.enqueue(f.device('first'));
-  const options = {gpu: f.gpu, renderTarget: {sampleCount: 4}, output: {toneMapping: 'agx', exposure: 2}};
+  const matrix = [.9, .1, 0, .2, .8, 0, 0, .05, .95], expected = matrix.map(Math.fround);
+  const options = {gpu: f.gpu, renderTarget: {sampleCount: 4}, output: {toneMapping: 'agx', exposure: 2}, outputColorMatrix: matrix};
   const pending = createRecoverableGpuHdrCanvasRenderer(f.canvas, f.factory, options);
   options.renderTarget.sampleCount = 1; options.output.exposure = 99; options.output.toneMapping = 'none';
+  matrix.fill(9);
   f.app = await pending;
   assert.equal(f.renderers[0].attachments.sampleCount, 4);
   f.app.render({}, {output: {toneMapping: 'neutral', exposure: 3}}); assert.deepEqual(settings(f.app.device), [3, 6, 0, 2]);
+  const uploadedMatrix = device => {
+    const bytes = device.writes.at(-1).bytes, view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return [0, 1, 2].flatMap(column => [0, 1, 2].map(row => view.getFloat32(16 + column * 16 + row * 4, true)));
+  };
+  assert.deepEqual(uploadedMatrix(f.app.device), expected);
   await lose(f); const next = f.enqueue(f.device('next')); await f.app.recover(); f.app.render({});
-  assert.deepEqual(settings(next), [2, 5, 0, 2]); assert.equal(f.renderers[1].attachments.sampleCount, 4); f.app.dispose();
+  assert.deepEqual(settings(next), [2, 5, 0, 2]); assert.deepEqual(uploadedMatrix(next), expected);
+  assert.equal(f.renderers[1].attachments.sampleCount, 4); f.app.dispose();
 });
 
 test('HDR size is reconstructed from current drawing-buffer dimensions instead of initial options', async () => {

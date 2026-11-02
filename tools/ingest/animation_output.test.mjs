@@ -155,6 +155,68 @@ test('native half-float output preserves signed RGB and the pinned source sRGB e
   assert.equal(g.calls.filter(call => call[0] === 'submit').length, 1);
   out.dispose();
 });
+
+test('output primaries use an immutable column-major matrix after tone mapping and before transfer', async () => {
+  const compilation = later(), g = gpu({compilation});
+  const matrix = [0.8, 0.1, 0.05, 0.15, 0.85, 0.2, -0.02, 0.03, 0.75];
+  const expected = matrix.map(Math.fround);
+  const building = createGpuAnimationOutput(g.device, {
+    format: 'rgba16float', outputColorMatrix: matrix, sourceOutput: true,
+    toneMapping: 'reinhard', exposure: 2,
+  });
+  matrix.fill(4);
+  compilation.resolve({});
+  const out = await building, source = g.texture(), target = g.texture();
+  out.render({source, target});
+  out.render({source, target, exposure: 3});
+  assert.deepEqual(out.outputColorMatrix, expected);
+  assert.ok(Object.isFrozen(out.outputColorMatrix));
+  assert.equal(out.allocatedBytes, 64);
+  const shader = g.calls.find(call => call[0] === 'shader')[1].code;
+  assert.match(shader, /output_matrix: mat3x3<f32>/);
+  const tone = shader.indexOf('color=tone_map(color);');
+  const gamut = shader.indexOf('color=info.output_matrix*color;');
+  const transfer = shader.indexOf('color=linear_to_srgb(color);');
+  const premultiply = shader.indexOf('color*=alpha;');
+  assert.ok(tone < gamut && gamut < transfer && transfer < premultiply);
+  for (const [index, [, bytes]] of g.calls.filter(call => call[0] === 'write').entries()) {
+    assert.equal(bytes.byteLength, 64);
+    const view = new DataView(bytes.buffer);
+    assert.equal(view.getFloat32(0, true), index + 2);
+    for (let column = 0; column < 3; column++) {
+      assert.deepEqual([0, 1, 2].map(row => view.getFloat32(16 + column * 16 + row * 4, true)),
+        expected.slice(column * 3, column * 3 + 3));
+      assert.equal(view.getUint32(28 + column * 16, true), 0, 'mat3 column padding stays initialized');
+    }
+  }
+  const pipeline = g.calls.find(call => call[0] === 'pipeline')[1];
+  assert.equal(pipeline.layout.bindGroupLayouts[0].entries[1].buffer.minBindingSize, 64);
+  assert.equal(g.calls.find(call => call[0] === 'bind')[1].entries[1].resource.size, 64);
+  assert.deepEqual(g.calls.filter(call => ['write', 'submit'].includes(call[0])).map(call => call[0]),
+    ['write', 'submit', 'write', 'submit']);
+  out.dispose(); assert.equal(out.allocatedBytes, 0);
+});
+
+test('linear output can convert primaries without applying an output transfer', async () => {
+  const g = gpu(), out = await createGpuAnimationOutput(g.device, {
+    outputColorSpace: 'linear', outputColorMatrix: new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+  });
+  const shader = g.calls.find(call => call[0] === 'shader')[1].code;
+  assert.match(shader, /color=info.output_matrix\*color;/);
+  assert.doesNotMatch(shader, /color=linear_to_srgb\(color\);/);
+  out.dispose();
+});
+
+test('invalid output matrices fail before allocating or compiling GPU resources', async () => {
+  for (const matrix of [[1, 0, 0], new Array(9), [...Array(8).fill(0), Infinity],
+    [...Array(8).fill(0), 1e100], [...Array(8).fill(0), '1'], new DataView(new ArrayBuffer(36))]) {
+    const g = gpu();
+    await assert.rejects(createGpuAnimationOutput(g.device, {outputColorMatrix: matrix}),
+      {code: 'ANIMATION_OUTPUT_COLOR_SPACE'});
+    assert.equal(g.calls.length, 0);
+  }
+});
+
 for (const [id, toneMapping] of ANIMATION_TONE_MAPPINGS.entries())
   test(`${toneMapping}: uploads frame-selected exposure, mode and alpha conventions`, async () => {
     const g = gpu(),

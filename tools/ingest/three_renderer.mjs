@@ -396,6 +396,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._preparing = null;
       this._hdr = false;
       this._srgbView = true;
+      this._outputProfileKey = null;
       this._wanted = new Map();
       this._pending = [];
       this._drain = null;
@@ -510,7 +511,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * framebuffer target. Preserve working-linear scene color from the first
      * render, including when no tone mapping is selected. */
     async _createSession(hdr, srgbView = this._canvasSrgbView(this.outputColorSpace, hdr),
-      canvasTarget = this.getCanvasTarget(), canvasSize = this._bufferSize(), canvas = canvasTarget.domElement) {
+      canvasTarget = this.getCanvasTarget(), canvasSize = this._bufferSize(), canvas = canvasTarget.domElement,
+      outputProfile = this._captureOutputProfile()) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       const release = this._canvases.retain(canvasTarget, canvas);
       this._canvases.activate(canvasTarget, canvas);
@@ -527,12 +529,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         toneMappingMode: extended ? 'extended' : 'standard'};
       this._hdr = hdr;
       this._srgbView = srgbView;
+      this._outputProfileKey = outputProfile?.key ?? null;
       this._dispatcher = null;
       const session = hdr
         ? await createGpuHdrCanvasRenderer(canvas, createDispatcher(this), {...common,
           target: {width, height, ...presentation, alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'},
           renderTarget: {depthFormat, sampleCount, format: this._outputBufferFormat()},
-          outputColorSpace: srgbView ? 'srgb' : 'linear', sourceOutput: extended,
+          outputColorSpace: outputProfile?.transfer ?? (srgbView ? 'srgb' : 'linear'),
+          ...(outputProfile?.matrix ? {outputColorMatrix: outputProfile.matrix} : {}),
+          sourceOutput: extended || outputProfile?.sourceOutput === true,
           output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
         : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...presentation,
@@ -573,11 +578,46 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return this._outputBufferType === THREE.UnsignedByteType ? 'rgba8unorm' :
         this._outputBufferType === THREE.FloatType ? 'rgba32float' : 'rgba16float';
     }
+    _captureOutputProfile(space = this.outputColorSpace) {
+      if (this._shaderEncodedOutput) return null;
+      const management = THREE.ColorManagement;
+      if (management && management.workingColorSpace !== THREE.LinearSRGBColorSpace)
+        fail('UNSUPPORTED', 'Native output conversion requires the linear-sRGB working color space');
+      let transfer = space === SRGBColorSpace ? 'srgb' : 'linear', matrix = null;
+      const standard = space === SRGBColorSpace || space === THREE.LinearSRGBColorSpace;
+      // RenderOutputNode delegates to ColorSpaceNode, which skips both the
+      // primary conversion and transfer when color management is disabled.
+      const enabled = management?.enabled !== false;
+      if (!enabled || space === THREE.NoColorSpace) transfer = 'linear';
+      else if (management) {
+        if (typeof space !== 'string' || !management.spaces[space])
+          fail('UNSUPPORTED', `Native output color space is not registered: ${space}`);
+        const sourceTransfer = management.getTransfer(space);
+        if (sourceTransfer !== THREE.LinearTransfer && sourceTransfer !== THREE.SRGBTransfer)
+          fail('UNSUPPORTED', 'Native output color spaces require the source linear or sRGB transfer');
+        transfer = sourceTransfer === THREE.SRGBTransfer ? 'srgb' : 'linear';
+        if (management.getPrimaries(THREE.LinearSRGBColorSpace) !== management.getPrimaries(space)) {
+          // Preserve the pinned node's matrix construction and column ordering,
+          // rather than substituting a separately derived color-science matrix.
+          const elements = management._getMatrix(new THREE.Matrix3(), THREE.LinearSRGBColorSpace, space).elements;
+          if (elements.length !== 9 || elements.some(value => typeof value !== 'number' || !Number.isFinite(Math.fround(value))))
+            fail('UNSUPPORTED', 'Native output conversion requires a finite 3x3 color matrix');
+          matrix = Object.freeze(Array.from(elements));
+        }
+      } else if (!standard) fail('UNSUPPORTED', `Native output color space is not registered: ${space}`);
+      const sourceOutput = !standard || !enabled || matrix !== null;
+      return Object.freeze({space, transfer, matrix, sourceOutput,
+        key: JSON.stringify([space, transfer, matrix, sourceOutput])});
+    }
     // Source RenderPipeline writes its output transform in the graph and sets
     // working-linear output to suppress a second transfer. Each queued frame
     // captures the attachment view separately from the live renderer property.
-    _canvasSrgbView(space = this.outputColorSpace, hdr = this._wantsHdr(this._toneMapping())) {
-      return this._shaderEncodedOutput ? hdr : space === SRGBColorSpace;
+    _canvasSrgbView(space = this.outputColorSpace, hdr = this._wantsHdr(this._toneMapping()),
+      outputProfile = this._captureOutputProfile(space)) {
+      // Registered source output writes its encoded values to the plain canvas
+      // view. r186 leaves GPUCanvasContext's display color space at default sRGB;
+      // selecting another shader output space does not reconfigure its gamut.
+      return this._shaderEncodedOutput ? hdr : space === SRGBColorSpace && !outputProfile.sourceOutput;
     }
     /** Whether the canvas composites with the page by alpha. WebGLRenderer (r186)
      * always creates an alpha:true context; its `alpha` option only sets the
@@ -775,7 +815,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           releaseSource = source ? this._targets.retainGeneration(source) : null;
           releaseCanvas = source ? null : this._canvases.retain(canvasTarget, canvas);
           const hdr = !source && this._wantsHdr(this._toneMapping());
-          const srgbView = this._canvasSrgbView(this.outputColorSpace, hdr);
+          const outputProfile = source ? null : this._captureOutputProfile();
+          const srgbView = source ? false : this._canvasSrgbView(this.outputColorSpace, hdr, outputProfile);
           const copy = () => {
             if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
             textures.validateDispatch([lease]);
@@ -795,9 +836,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             textures.validateDispatch([lease]);
             if (!source) {
               this._canvases.activate(canvasTarget, canvas);
-              if (!this._session || hdr !== this._hdr || srgbView !== this._srgbView) {
+              // HDR snapshots read the persistent working-linear target. A
+              // changed presentation transform must not discard its history.
+              if (!this._session || hdr !== this._hdr || !hdr && srgbView !== this._srgbView) {
                 this._session?.dispose();
-                return this._createSession(hdr, srgbView, canvasTarget, [width, height], canvas).then(copy);
+                return this._createSession(hdr, srgbView, canvasTarget, [width, height], canvas, outputProfile).then(copy);
               }
               this._session.resize(width, height);
             }
@@ -806,7 +849,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           // Public void calls share the render FIFO. An already prepared copy
           // submits now; pending renders keep their original producer boundary.
           if (!this._drain && !this._preparing && !this._pending.length &&
-              (source || this._canvases.matches(canvasTarget, width, height, canvas) && hdr === this._hdr && srgbView === this._srgbView)) {
+              (source || this._canvases.matches(canvasTarget, width, height, canvas) && hdr === this._hdr &&
+                (hdr || srgbView === this._srgbView && (outputProfile?.key ?? null) === this._outputProfileKey))) {
             try { request.issue(); } finally { this._releaseRequest(request); }
           } else this._enqueue(request);
         } catch (error) { release(); throw error; }
@@ -860,18 +904,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
     // ---- frames ----
-    _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel) {
+    _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel,
+      outputProfile = target ? null : this._captureOutputProfile()) {
       const targetShape = target ? this._targets.capture(target).shape : null;
       const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel, 0,
         {webgl: this._shaderEncodedOutput, generateMipmaps: target.texture.generateMipmaps}) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
-      if (!target && this.outputColorSpace !== SRGBColorSpace &&
-          (this._shaderEncodedOutput || this.outputColorSpace !== THREE.LinearSRGBColorSpace))
-        fail('UNSUPPORTED', 'Native canvas output requires sRGB or linear-sRGB');
+      if (!target && this._shaderEncodedOutput && this.outputColorSpace !== SRGBColorSpace)
+        fail('UNSUPPORTED', 'WebGL-authored canvas output requires sRGB');
       const tone = this._toneMapping();
       // Switching between direct and tone-mapped output rebuilds the canvas
       // session (same device) at the next preparation boundary.
-      if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr || this._canvasSrgbView() !== this._srgbView;
+      if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr ||
+        !this._hdr && this._canvasSrgbView(this.outputColorSpace, this._wantsHdr(tone), outputProfile) !== this._srgbView ||
+        (outputProfile?.key ?? null) !== this._outputProfileKey;
       const hdr = !target && this._wantsHdr(tone);
       const clear = this.autoClear === true;
       const color = this._clearColor, a = this._clearAlpha;
@@ -1009,7 +1055,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target, {initialize: !this._shaderEncodedOutput}) : this;
       const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
-      const frame = this._frame(scene, clearOnly, target, mipLevel), key = sceneKey(this, scene, backgroundState);
+      const outputProfile = target ? null : this._captureOutputProfile();
+      const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile), key = sceneKey(this, scene, backgroundState);
       // RenderPass/normal/depth passes restore this property immediately after
       // render(). Capture its selector now; source objects stay application-owned.
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
@@ -1065,7 +1112,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
             : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
           linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
-          hdr: !target && this._wantsHdr(this._toneMapping()), srgbView: this._canvasSrgbView(), key,
+          hdr: !target && this._wantsHdr(this._toneMapping()),
+          srgbView: target ? false : this._canvasSrgbView(outputProfile?.space ?? this.outputColorSpace,
+            this._wantsHdr(this._toneMapping()), outputProfile), outputProfile, key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true}});
@@ -1283,7 +1332,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const entry = destination._dispatcher?.entry(scene);
       if (this._drain || this._preparing || (destination === this &&
           (!this._canvases.matches(request.canvasTarget, ...request.canvasSize, request.canvas) ||
-            request.hdr !== this._hdr || request.srgbView !== this._srgbView)) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
+            request.hdr !== this._hdr || !request.hdr && request.srgbView !== this._srgbView ||
+            (request.outputProfile?.key ?? null) !== this._outputProfileKey)) || !entry || entry.key !== request.key || (!entry.clipping && request.overrideMaterial?.clippingPlanes?.length))
         return this._defer(request);
       try {
         const captured = request.nodeFrame;
@@ -1580,13 +1630,26 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               }
               return hdr;
             };
+            const outputProfile = request ? request.outputProfile : this._captureOutputProfile();
             const hdr = selectOutput(), srgbView = this._shaderEncodedOutput ? hdr : request?.srgbView ?? this._canvasSrgbView();
             if (request) request.srgbView = srgbView;
-            if (!this._session || hdr !== this._hdr || srgbView !== this._srgbView) {
-              this._session?.dispose(); await this._createSession(hdr, srgbView, canvasTarget, canvasSize, canvas);
+            if (!this._session || hdr !== this._hdr || !hdr && srgbView !== this._srgbView) {
+              this._session?.dispose(); await this._createSession(hdr, srgbView, canvasTarget, canvasSize, canvas, outputProfile);
             } else this._session.resize(...canvasSize);
             this._rebuild = false;
-            try { await this._session.prepare(); }
+            try {
+              // The source's working-linear color/depth/stencil target survives
+              // output-space changes. Only its final conversion program changes.
+              // Keep the actual canvas view selection separate from that program.
+              const changeOutput = hdr && (outputProfile?.key ?? null) !== this._outputProfileKey;
+              await this._session.prepare(changeOutput ? {
+                outputColorSpace: outputProfile.transfer,
+                outputColorMatrix: outputProfile.matrix ?? undefined,
+                sourceOutput: this._preferredFormat === 'rgba16float' || outputProfile.sourceOutput,
+              } : undefined);
+              this._outputProfileKey = outputProfile?.key ?? null;
+              this._canvases.save();
+            }
             catch (error) {
               // Encoded history cannot move into a linear whole-image output
               // target: it would be lost or tone-mapped again on later frames.
@@ -1598,7 +1661,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               this._session.dispose();
               const fallbackHdr = selectOutput();
               if (request && this._shaderEncodedOutput) request.srgbView = fallbackHdr;
-              await this._createSession(fallbackHdr, this._shaderEncodedOutput ? fallbackHdr : srgbView, canvasTarget, canvasSize, canvas);
+              await this._createSession(fallbackHdr, this._shaderEncodedOutput ? fallbackHdr : srgbView, canvasTarget, canvasSize, canvas, outputProfile);
               this._rebuild = false;
               await this._session.prepare();
             }

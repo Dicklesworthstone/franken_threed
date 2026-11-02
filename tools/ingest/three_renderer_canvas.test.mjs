@@ -4,6 +4,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {DisplayP3ColorSpace, LinearDisplayP3ColorSpace, ExtendedSRGBColorSpace,
+  DisplayP3ColorSpaceImpl, LinearDisplayP3ColorSpaceImpl, ExtendedSRGBColorSpaceImpl} from '../../upstream/three.js/examples/jsm/math/ColorSpaces.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -60,6 +62,140 @@ function fixture(t, options = {}) {
 }
 const presented = device => device.passes.filter(pass => pass.desc.colorAttachments[0]?.view?.texture?.canvasName);
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
+function registerOutputSpaces(t) {
+  const entries = {[DisplayP3ColorSpace]: DisplayP3ColorSpaceImpl,
+    [LinearDisplayP3ColorSpace]: LinearDisplayP3ColorSpaceImpl, [ExtendedSRGBColorSpace]: ExtendedSRGBColorSpaceImpl};
+  const old = new Map(Object.keys(entries).map(key => [key, T.ColorManagement.spaces[key]]));
+  const enabled = T.ColorManagement.enabled, working = T.ColorManagement.workingColorSpace;
+  T.ColorManagement.define(entries);
+  t.after(() => {
+    for (const [key, value] of old) {
+      if (value === undefined) delete T.ColorManagement.spaces[key]; else T.ColorManagement.spaces[key] = value;
+    }
+    T.ColorManagement.enabled = enabled; T.ColorManagement.workingColorSpace = working;
+  });
+}
+const outputDraws = device => device.snapshots.flat().filter(draw => draw.pipeline.label?.startsWith('Animation HDR output'));
+function outputPacket(draw) {
+  const code = draw.pipeline.fragment.module.code;
+  const resource = draw.groups.get(0).group.entries.find(entry => entry.binding === 1).resource;
+  const bytes = draw.contents.get(resource.buffer), data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const matrix = resource.size === 64 ? Array.from({length: 9}, (_, i) =>
+    data.getFloat32(16 + Math.floor(i / 3) * 16 + i % 3 * 4, true)) : null;
+  return {code, matrix, exposure: data.getFloat32(0, true), transfer: code.includes('color=linear_to_srgb(color);')};
+}
+
+for (const [space, matrix, transfer] of [[DisplayP3ColorSpace, true, true],
+  [LinearDisplayP3ColorSpace, true, false], [ExtendedSRGBColorSpace, false, true]])
+test(`registered ${space} output retains the source conversion and default canvas color space`, async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t, {alpha: true}), r = f.renderer; r.outputColorSpace = space;
+  await r.init(); f.quad.render(r); await r.waitForGPU();
+  const output = outputDraws(f.device); assert.equal(output.length, 1);
+  const packet = outputPacket(output[0]);
+  assert.equal(packet.transfer, transfer); assert.match(packet.code, /var color=pixel.rgb;/);
+  assert.deepEqual(packet.matrix, matrix ? T.ColorManagement._getMatrix(new T.Matrix3(), T.LinearSRGBColorSpace, space).elements.map(Math.fround) : null);
+  assert.equal(output[0].pipeline.fragment.targets[0].format, 'bgra8unorm');
+  assert.equal(f.main.configuration.colorSpace, 'srgb', 'r186 leaves native canvas interpretation at its sRGB default');
+  assert.deepEqual(f.main.configuration.viewFormats, []);
+  assert.equal(r._nodeCaptureBytes, 0);
+});
+
+test('queued registered output changes retain matrices, transfers and exposure without replaying callbacks', async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t), r = f.renderer; r.outputColorSpace = DisplayP3ColorSpace;
+  let updates = 0; f.quad.material.fragmentNode = N.vec4(N.uniform(.25).onRenderUpdate(() => { updates++; return .25; }), .5, .75, 1);
+  r.toneMapping = T.ReinhardToneMapping; await r.init();
+  const spaces = [DisplayP3ColorSpace, LinearDisplayP3ColorSpace, ExtendedSRGBColorSpace, T.SRGBColorSpace];
+  for (const [index, space] of spaces.entries()) {
+    r.outputColorSpace = space; r.toneMappingExposure = index + .5; f.quad.render(r);
+  }
+  r.outputColorSpace = T.LinearSRGBColorSpace; r.toneMappingExposure = 10;
+  await r.waitForGPU();
+  const packets = outputDraws(f.device).map(outputPacket);
+  assert.equal(updates, 4); assert.equal(packets.length, 4);
+  assert.deepEqual(packets.map(value => value.transfer), [true, false, true, true]);
+  assert.deepEqual(packets.map(value => value.matrix !== null), [true, true, false, false]);
+  assert.deepEqual(packets.map(value => value.exposure), [.5, 1.5, 2.5, 3.5]);
+  assert.deepEqual(packets[0].matrix, packets[1].matrix);
+  assert.equal(f.main.counts.configure, 1, 'conversion changes retain the original canvas owner');
+  assert.equal(r.outputColorSpace, T.LinearSRGBColorSpace); assert.equal(r.toneMappingExposure, 10);
+});
+
+test('output conversion changes preserve loaded linear color, depth and stencil history', async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t, {stencil: true}), r = f.renderer;
+  r.outputColorSpace = DisplayP3ColorSpace; await r.init();
+  f.quad.render(r); await r.waitForGPU();
+  const scenePass = () => f.device.passes.filter(pass => pass.draws.length && !pass.desc.colorAttachments[0].view.texture.canvasName);
+  const first = scenePass()[0], color = first.desc.colorAttachments[0].view.texture,
+    depth = first.desc.depthStencilAttachment.view.texture;
+  r.autoClear = false;
+  for (const space of [LinearDisplayP3ColorSpace, T.SRGBColorSpace, ExtendedSRGBColorSpace, DisplayP3ColorSpace]) {
+    r.outputColorSpace = space; f.quad.render(r);
+  }
+  await r.waitForGPU();
+  const later = scenePass().slice(1); assert.equal(later.length, 4);
+  for (const pass of later) {
+    assert.equal(pass.desc.colorAttachments[0].view.texture, color);
+    assert.equal(pass.desc.depthStencilAttachment.view.texture, depth);
+    assert.equal(pass.desc.colorAttachments[0].loadOp, 'load');
+    assert.equal(pass.desc.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(pass.desc.depthStencilAttachment.stencilLoadOp, 'load');
+  }
+  assert.equal(color.destroyed, undefined); assert.equal(depth.destroyed, undefined);
+  assert.equal(f.main.counts.configure, 1); assert.equal(f.main.counts.unconfigure, 0);
+});
+
+test('registered clears and framebuffer copies keep linear storage across later output changes', async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t), r = f.renderer, image = new T.FramebufferTexture(8, 8);
+  t.after(() => image.dispose()); r.outputColorSpace = LinearDisplayP3ColorSpace;
+  await r.init(); r.setClearColor(new T.Color(-.25, 2, .5)); r.clear(); r.copyFramebufferToTexture(image);
+  r.outputColorSpace = DisplayP3ColorSpace; f.quad.render(r); r.outputColorSpace = T.SRGBColorSpace;
+  await r.waitForGPU();
+  const output = outputDraws(f.device); assert.equal(output.length, 2);
+  const source = output[0].groups.get(0).group.entries.find(entry => entry.binding === 0).resource.texture;
+  const copy = f.events.find(event => event.copy); assert.equal(copy.source.texture, source);
+  assert.equal(source.format, 'rgba16float'); assert.equal(source.canvasName, undefined);
+  assert.deepEqual(output.map(draw => outputPacket(draw).transfer), [false, true]);
+  assert.equal(f.main.counts.acquire, 2, 'copying linear history does not acquire another presentation texture');
+  assert.equal(f.main.counts.configure, 1);
+});
+
+test('disabled color management skips registered primary and transfer conversions for its accepted request', async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t), r = f.renderer; r.outputColorSpace = DisplayP3ColorSpace;
+  T.ColorManagement.enabled = false; await r.init(); f.quad.render(r);
+  T.ColorManagement.enabled = true; f.quad.render(r); await r.waitForGPU();
+  const packets = outputDraws(f.device).map(outputPacket); assert.equal(packets.length, 2);
+  assert.deepEqual(packets.map(packet => packet.transfer), [false, true]);
+  assert.equal(packets[0].matrix, null); assert.notEqual(packets[1].matrix, null);
+  assert.equal(f.main.counts.configure, 1);
+});
+
+test('registered transforms remain independent for queued Inspector canvases and subsequent reuse', async t => {
+  registerOutputSpaces(t);
+  const f = fixture(t), r = f.renderer; r.outputColorSpace = DisplayP3ColorSpace;
+  await r.init(); f.quad.render(r);
+  r.setCanvasTarget(f.previewTarget); r.outputColorSpace = LinearDisplayP3ColorSpace; f.quad.render(r);
+  r.setCanvasTarget(f.mainTarget); r.outputColorSpace = DisplayP3ColorSpace; f.quad.render(r);
+  await r.waitForGPU();
+  assert.deepEqual(presented(f.device).filter(pass => pass.draws.length).map(pass => pass.desc.colorAttachments[0].view.texture.canvasName), ['main', 'preview', 'main']);
+  assert.deepEqual(outputDraws(f.device).map(draw => outputPacket(draw).transfer), [true, false, true]);
+  assert.equal(f.main.counts.configure, 1); assert.equal(f.preview.counts.configure, 1);
+  assert.equal(r.getCanvasTarget(), f.mainTarget);
+  f.quad.render(r); assert.equal(r._drain, null, 'returning to a prepared profile does not rebuild its session');
+});
+
+test('unregistered output and non-linear working spaces fail before native canvas allocation', async t => {
+  registerOutputSpaces(t);
+  const missing = fixture(t); missing.renderer.outputColorSpace = 'not-registered';
+  await assert.rejects(missing.renderer.init(), /not registered/); assert.equal(missing.main.counts.configure, 0);
+  const working = fixture(t); working.renderer.outputColorSpace = DisplayP3ColorSpace;
+  T.ColorManagement.workingColorSpace = LinearDisplayP3ColorSpace;
+  await assert.rejects(working.renderer.init(), /linear-sRGB working color space/); assert.equal(working.main.counts.configure, 0);
+});
 
 for (const antialias of [false, true])
 test(`half-float linear canvas keeps source output format and ${antialias ? 4 : 1}-sample attachments`, async t => {

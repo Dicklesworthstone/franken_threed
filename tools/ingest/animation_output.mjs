@@ -66,6 +66,18 @@ export function animationOutputSettings(input, defaults) {
     fail("ALPHA", "Invalid alpha convention");
   return { toneMapping: mode, exposure, inputAlpha, outputAlpha };
 }
+/** Capture a working-linear to output-linear transform before preparation can
+ * yield. WGSL mat3 columns each occupy 16 bytes, including their fourth padding
+ * word; callers supply only the nine column-major matrix elements. */
+export function animationOutputColorMatrix(input) {
+  if (input === undefined || input === null) return null;
+  if ((!Array.isArray(input) && !ArrayBuffer.isView(input)) || input.length !== 9)
+    fail("COLOR_SPACE", "Expected nine column-major output matrix elements");
+  const matrix = Array.from(input);
+  if (matrix.some(value => typeof value !== "number" || !Number.isFinite(Math.fround(value))))
+    fail("COLOR_SPACE", "Output matrix elements must be finite f32 values");
+  return Object.freeze(matrix.map(Math.fround));
+}
 // Column-major matrices, like the pinned GLSL constructors. Do not transpose
 // these a second time when moving between GLSL, WGSL and scalar test oracles.
 export const ANIMATION_OUTPUT_WGSL = /* wgsl */ `
@@ -130,6 +142,7 @@ fn tone_map(input_color: vec3<f32>) -> vec3<f32> {
     if (alpha>0.0) { color/=alpha; } else { color=vec3<f32>(0.0); }
   }
   color=tone_map(color);
+  // OUTPUT_GAMUT
   // OUTPUT_TRANSFER
   if (info.output_alpha == 1u) { color*=alpha; }
   // ATTACHMENT_TRANSFER: inverse only when hardware performs the final OETF.
@@ -141,7 +154,10 @@ fn tone_map(input_color: vec3<f32>) -> vec3<f32> {
  * before writes. A canvas current texture is a valid destination. An -srgb view
  * is created only for an explicitly configured -srgb format; the caller must
  * have enabled that viewFormat on a non-sRGB base texture/canvas configuration.
- * Output color space is 'srgb' or 'linear'. Premultiplication happens AFTER
+ * Output color space selects the 'srgb' or 'linear' transfer. An optional
+ * outputColorMatrix converts linear primaries after tone mapping and before
+ * that transfer. It is captured at construction, independent of caller edits.
+ * Premultiplication happens AFTER
  * the chosen transfer, matching canvas premultiplied display storage. For an
  * -srgb attachment the shader undoes that transfer before hardware reapplies it;
  * otherwise semi-transparent pixels would be double-encoded or darkened.
@@ -154,6 +170,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
       ![
         "format",
         "outputColorSpace",
+        "outputColorMatrix",
         "toneMapping",
         "exposure",
         "inputAlpha",
@@ -166,6 +183,8 @@ export async function createGpuAnimationOutput(device, options = {}) {
   const format = options.format ?? "bgra8unorm",
     outputColorSpace = options.outputColorSpace ?? "srgb",
     signal = options.signal;
+  const outputColorMatrix = animationOutputColorMatrix(options.outputColorMatrix);
+  const parameterBytes = outputColorMatrix ? 64 : 16;
   if (options.sourceOutput !== undefined && typeof options.sourceOutput !== 'boolean')
     fail("OPTIONS", "sourceOutput must be boolean");
   if (
@@ -289,6 +308,12 @@ export async function createGpuAnimationOutput(device, options = {}) {
       .replace('let d=0.24;', 'let d=1.0-0.76;')
       .replace('(peak+d-0.76)', '(peak+(d-0.76))') : ANIMATION_OUTPUT_WGSL;
     const code = shader.replace(
+      "output_alpha: u32 }",
+      outputColorMatrix ? "output_alpha: u32, output_matrix: mat3x3<f32> }" : "output_alpha: u32 }",
+    ).replace(
+      "// OUTPUT_GAMUT",
+      outputColorMatrix ? "color=info.output_matrix*color;" : "",
+    ).replace(
       "// OUTPUT_TRANSFER",
       outputColorSpace === "srgb" ? "color=linear_to_srgb(color);" : "",
     ).replace(
@@ -304,7 +329,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
             visibility: 2,
             texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
           },
-          { binding: 1, visibility: 2, buffer: { type: "uniform", minBindingSize: 16 } },
+          { binding: 1, visibility: 2, buffer: { type: "uniform", minBindingSize: parameterBytes } },
         ],
       });
       return device.createRenderPipelineAsync({
@@ -322,7 +347,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
       checked(() => {
         uniform = device.createBuffer({
           label: "Animation output parameters",
-          size: 16,
+          size: parameterBytes,
           usage: 8 | 64,
         });
       }),
@@ -358,12 +383,13 @@ export async function createGpuAnimationOutput(device, options = {}) {
   const result = Object.freeze({
     format,
     outputColorSpace,
+    outputColorMatrix,
     defaults,
     get version() {
       return version;
     },
     get allocatedBytes() {
-      return uniform ? 16 : 0;
+      return uniform ? parameterBytes : 0;
     },
     get disposed() {
       return disposed;
@@ -399,12 +425,15 @@ export async function createGpuAnimationOutput(device, options = {}) {
         if (source.width !== target.width || source.height !== target.height)
           fail("EXTENT", "Source and target sizes must match");
         if (version === Number.MAX_SAFE_INTEGER) fail("VERSION", "Submission counter exhausted");
-        const bytes = new ArrayBuffer(16),
+        const bytes = new ArrayBuffer(parameterBytes),
           data = new DataView(bytes);
         data.setFloat32(0, selected.exposure, true);
         data.setUint32(4, ANIMATION_TONE_MAPPINGS.indexOf(selected.toneMapping), true);
         data.setUint32(8, selected.inputAlpha === "premultiplied" ? 1 : 0, true);
         data.setUint32(12, alphaModes.indexOf(selected.outputAlpha), true);
+        if (outputColorMatrix) for (let column = 0; column < 3; column++)
+          for (let row = 0; row < 3; row++)
+            data.setFloat32(16 + column * 16 + row * 4, outputColorMatrix[column * 3 + row], true);
         let syncError;
         const next = checked(() => {
           try {
@@ -420,7 +449,7 @@ export async function createGpuAnimationOutput(device, options = {}) {
                 layout,
                 entries: [
                   { binding: 0, resource: view },
-                  { binding: 1, resource: { buffer: uniform, size: 16 } },
+                  { binding: 1, resource: { buffer: uniform, size: parameterBytes } },
                 ],
               });
               boundSource = source.texture;

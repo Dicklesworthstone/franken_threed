@@ -110,6 +110,76 @@ test('HDR defaults and target options are captured before initialization yields'
   r.dispose();
 });
 
+test('HDR output captures its primaries before preparation and preserves the linear scene target', async () => {
+  const f = fixture(), matrix = [.9, .1, 0, .2, .8, 0, 0, .05, .95];
+  const expected = matrix.map(Math.fround);
+  const promise = make(f, {outputColorSpace: 'srgb', outputColorMatrix: matrix, sourceOutput: true,
+    target: {srgbView: false}, output: {toneMapping: 'none'}});
+  matrix.fill(7);
+  const r = await promise;
+  r.render(null);
+  assert.equal(f.factoryOptions.format, 'rgba16float');
+  assert.equal(r.rendererOptions.format, 'bgra8unorm');
+  assert.match(f.calls.modules[0].code, /color=info.output_matrix\*color;/);
+  const view = new DataView(f.calls.writes[0].bytes.buffer);
+  const stored = [0, 1, 2].flatMap(column => [0, 1, 2].map(row => view.getFloat32(16 + column * 16 + row * 4, true)));
+  assert.deepEqual(stored, expected);
+  assert.equal(f.calls.submissions.length, 2);
+  assert.equal(r.diagnostics.renderer.outputBytes, 64);
+  r.dispose(); drained(f);
+});
+
+test('changing output conversion preserves the scene renderer, linear history and canvas ownership', async () => {
+  const f = fixture(), r = await make(f);
+  r.render(null);
+  const history = f.sceneFrames[0].frame.colorView.texture;
+  const textures = f.calls.textures.length, firstBuffer = f.calls.buffers[0];
+  const matrix = [.9, .1, 0, .2, .8, 0, 0, .05, .95], expected = matrix.map(Math.fround);
+  const compilation = deferred(); f.controls.compile = compilation;
+  const preparing = r.prepare({outputColorSpace: 'linear', outputColorMatrix: matrix, sourceOutput: true});
+  matrix.fill(9);
+  assert.throws(() => r.render(null), {code: 'GPU_CANVAS_REENTRANT'});
+  compilation.resolve(); await preparing; f.controls.compile = null;
+  r.render(null, {loadOp: 'load', depthLoadOp: 'load', clearColor: [-1, 0, 0, 1]});
+  assert.equal(f.sceneFrames[1].frame.colorView.texture, history);
+  assert.equal(f.sceneFrames[1].frame.loadOp, 'load');
+  assert.equal(f.calls.textures.length, textures);
+  assert.equal(f.sceneDisposed, 0); assert.equal(f.unconfigured, 0);
+  assert.equal(firstBuffer.destroyed, 1);
+  const packet = f.calls.writes.at(-1).bytes, view = new DataView(packet.buffer);
+  assert.deepEqual([0, 1, 2].flatMap(column => [0, 1, 2].map(row => view.getFloat32(16 + column * 16 + row * 4, true))), expected);
+  const output = f.calls.submissions.at(-1)[0].passes[0];
+  assert.equal(output.pipeline.fragment.targets[0].format, 'bgra8unorm', 'plain base view remains legal on an sRGB-view canvas');
+  assert.doesNotMatch(output.pipeline.fragment.module.code, /color=linear_to_srgb\(color\);/);
+  const count = f.calls.pipelines.length;
+  await r.prepare();
+  await r.prepare({outputColorSpace: 'linear', outputColorMatrix: expected, sourceOutput: true});
+  assert.equal(f.calls.pipelines.length, count, 'unchanged output prepares only the scene');
+  await r.prepare({outputColorSpace: 'linear', sourceOutput: false});
+  r.render(null, {loadOp: 'load'});
+  assert.equal(f.sceneFrames[2].frame.colorView.texture, history);
+  assert.equal(f.calls.submissions.at(-1)[0].passes[0].pipeline.fragment.targets[0].format, 'bgra8unorm');
+  r.dispose(); drained(f);
+});
+
+test('failed output compilation leaves the previous output and linear history usable', async () => {
+  const f = fixture(), r = await make(f);
+  r.render(null);
+  const history = f.sceneFrames[0].frame.colorView.texture, original = f.calls.buffers[0];
+  f.controls.pipelineFailure = new Error('output conversion failed');
+  await assert.rejects(r.prepare({outputColorSpace: 'linear', sourceOutput: true}), /output conversion failed/);
+  assert.equal(r.failed, false); assert.equal(original.destroyed, 0);
+  r.render(null, {loadOp: 'load'});
+  assert.equal(f.sceneFrames[1].frame.colorView.texture, history);
+  assert.equal(f.calls.submissions.at(-1)[0].passes[0].pipeline.fragment.targets[0].format, 'bgra8unorm-srgb');
+  f.controls.pipelineFailure = null;
+  await r.prepare({outputColorSpace: 'linear', sourceOutput: true});
+  r.render(null, {loadOp: 'load'});
+  assert.equal(f.sceneFrames[2].frame.colorView.texture, history);
+  assert.equal(original.destroyed, 1);
+  r.dispose(); drained(f);
+});
+
 test('resizing retains HDR dependencies until both submitted passes finish', async () => {
   const f = fixture(), r = await make(f, {renderTarget: {sampleCount: 4}});
   r.render(null); const old = f.calls.textures.slice(), fence = deferred();
