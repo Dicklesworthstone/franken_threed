@@ -738,6 +738,38 @@ performance result. `SAOPass` remains on the exact route: its sinusoidal random
 hash amplifies fullscreen interpolation differences at some image sizes, and
 its numerical parity has not been established.
 
+## Selection outlines and queued mask inputs
+
+The pinned `OutlinePass` now executes its original selected-object depth/mask
+draws, visible/hidden edge classification, downsampling, separable blur and glow
+composition through the owned WebGPU renderer. Source and dependency
+fingerprints authorize its finite visibility/stencil operations; original
+classes and shaders remain intact, and changed or escaped consumers retain
+exact routing.
+
+Each verified scene draw retains its temporary visibility exclusions and
+background selection. A shader override uses the existing pass snapshot owner
+to retain its uniform values and sampled target generations. That keeps the
+mask camera's near/far values and depth-comparison texture matrix associated
+with the accepted draw, even when the application queues another selection,
+camera pose or composer resize. Stable private material views reuse the
+existing program caches and snapshot budgets. Ordinary unscoped materials keep
+their existing live-uniform behavior.
+
+`program_outline_pass.mjs` compares 17 source/candidate checkpoints and
+201,728 RGBA bytes on Chromium 151.0.7922.34 / SwiftShader, with zero GPU/browser
+errors. It includes intermediate masks/depth/edges, cold and warm camera
+movement, queued selections and camera/frustum/control changes, two queued
+resizes and empty selection. Cold output, mask and edges, the moved camera,
+the first queued frame, queued resizes and empty selection are byte-exact.
+Packed depth differs by at most two channel values and the third queued frame
+by at most one. A multi-selection frame has five differing silhouette pixels
+in its mask; blur/glow expands these to 53 output pixels above the 12-channel
+threshold (1.73%, within the existing 2% budget; maximum difference 126).
+These are the established lane's tolerance results, not byte-exact family
+closure or a physical-device performance measurement. Required captured scene
+draws retain the callback-free ordinary scene/camera profile described above.
+
 ## GPUComputationRenderer texture simulations
 
 The pinned `GPUComputationRenderer` addon now runs its floating-point texture

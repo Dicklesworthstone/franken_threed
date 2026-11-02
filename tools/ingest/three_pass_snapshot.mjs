@@ -150,11 +150,18 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
     record.targetReleases.length = 0;
     record.data = record.camera = null;
   }
-  function capture(root, camera) {
+  function capture(root, camera, overrideMaterial = null) {
     live();
-    if (!eligible(root, camera)) return null;
-    let state = states.get(root);
-    if (!state && retained.size >= maxRoots) fail('BUDGET', 'Too many retained fullscreen pass roots');
+    if (overrideMaterial) {
+      if (![T.ShaderMaterial?.prototype, T.RawShaderMaterial?.prototype].includes(Object.getPrototypeOf(overrideMaterial)) ||
+          Object.values(Object.getOwnPropertyDescriptors(overrideMaterial)).some(d => !Object.hasOwn(d, 'value')) ||
+          overrideMaterial.onBeforeRender !== T.Material.prototype.onBeforeRender ||
+          overrideMaterial.onBeforeCompile !== T.Material.prototype.onBeforeCompile ||
+          overrideMaterial.customProgramCacheKey !== T.Material.prototype.customProgramCacheKey) return null;
+    } else if (!eligible(root, camera)) return null;
+    const identity = overrideMaterial ?? root;
+    let state = states.get(identity);
+    if (!state && retained.size >= maxRoots) fail('BUDGET', 'Too many retained pass inputs');
     let bytes = 0, values = 0;
     const charge = n => {
       bytes += n;
@@ -225,7 +232,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       for (const [key, value] of Object.entries(special)) put(out, key, value);
       return out;
     }
-    const sourceMaterial = root.material, sourceGeometry = root.geometry;
+    const sourceMaterial = overrideMaterial ?? root.material, sourceGeometry = root?.geometry;
     const attributes = {}, attributeSources = {}, owners = new Map(), interleavedSources = new Map();
     function attribute(a) {
       if (owners.has(a)) return owners.get(a);
@@ -233,21 +240,21 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       if (a.isInterleavedBufferAttribute) { const data = a.data; interleavedSources.set(a, data); special.data = attribute(data); }
       const cloned = fields(a, special); owners.set(a, cloned); return cloned;
     }
-    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(sourceGeometry.attributes))) {
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(sourceGeometry?.attributes ?? {}))) {
       if (!Object.hasOwn(descriptor, 'value')) fail('ACCESSOR', `Accessor-backed geometry attribute: ${name}`);
       attributes[name] = attribute(descriptor.value); attributeSources[name] = descriptor.value;
     }
-    const indexSource = sourceGeometry.index, index = indexSource ? attribute(indexSource) : null;
-    const geometry = fields(sourceGeometry, {attributes, index, morphAttributes: {}, indirect: null});
+    const indexSource = sourceGeometry?.index, index = indexSource ? attribute(indexSource) : null;
+    const geometry = sourceGeometry ? fields(sourceGeometry, {attributes, index, morphAttributes: {}, indirect: null}) : null;
     const material = fields(sourceMaterial);
     // Updating default transforms is part of the source render boundary. Do this
     // once on the original, then freeze only the private execution matrices.
-    if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
-    if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
-    const rootData = fields(root, {geometry, material, parent: null, children: [], animations: [],
-      matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false});
-    const cameraData = fields(camera, {parent: null, children: [], animations: [],
-      matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false});
+    if (root?.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+    if (camera?.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+    const rootData = root ? fields(root, {geometry, material, parent: null, children: [], animations: [],
+      matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false}) : null;
+    const cameraData = camera ? fields(camera, {parent: null, children: [], animations: [],
+      matrixAutoUpdate: false, matrixWorldAutoUpdate: false, matrixWorldNeedsUpdate: false}) : null;
     const targetReleases = [], heldTargets = new Set();
     try {
       for (const texture of textures.keys()) {
@@ -265,11 +272,12 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       throw error;
     }
     if (!state) {
-      state = {root: view(root), record: null, material: null, geometry: null, attributeViews: new Map()};
+      state = {root: root ? view(root) : null, record: null, material: overrideMaterial ? view(material) : null,
+        materialSource: overrideMaterial, geometry: null, attributeViews: new Map()};
       // Type flags suffice until the first serialized install; it is not an
       // independently traversed render root until that request is prepared.
-      put(state.root, 'isMesh', true); put(state.root, 'isObject3D', true);
-      states.set(root, state); retained.add(state);
+      if (state.root) { put(state.root, 'isMesh', true); put(state.root, 'isObject3D', true); }
+      states.set(identity, state); retained.add(state);
     }
     const record = {state, data: rootData, camera: cameraData, bytes, pending: true, installed: false, listeners: [], stale: false,
       targetReleases};
@@ -309,6 +317,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       if (previous) { previous.installed = false; collect(previous); }
       if (state.materialSource !== sourceMaterial) { state.material = view(material); state.materialSource = sourceMaterial; }
       overwrite(state.material, material);
+      if (overrideMaterial) { record.installed = true; state.record = record; return; }
       if (state.geometrySource !== sourceGeometry) {
         state.geometry = view(geometry); state.geometrySource = sourceGeometry; state.attributeViews.clear();
       }
@@ -329,10 +338,15 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       overwrite(state.root, rootData); state.root.material = state.material; state.root.geometry = state.geometry;
       record.installed = true; state.record = record;
     }
-    return Object.freeze({root: state.root, camera: cameraData, bytes, targetEntries, check, install,
+    return Object.freeze({root: state.root, camera: cameraData, material: overrideMaterial ? state.material : null,
+      bytes, targetEntries, check, install,
       release() { if (!record.pending) return; record.pending = false; collect(record); }});
   }
   return Object.freeze({capture,
+    // A verified pass's scene-wide ShaderMaterial override reuses the same
+    // bounded value copies and sampled-target leases as a fullscreen pass.
+    // Its stable private material is installed only during serialized work.
+    captureMaterial(material) { return material ? capture(null, null, material) : null; },
     get allocatedBytes() { return allocatedBytes; }, get rootCount() { return retained.size; },
     dispose() {
       if (disposed) return; disposed = true;
@@ -340,7 +354,8 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       // WeakMap entries and renderer lookup keys may outlive disposal. Leave no
       // copied uniform/geometry payload reachable through those private views.
       for (const state of retained) {
-        for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key];
+        const data = state.root ?? state.material;
+        if (data) for (const key of Object.getOwnPropertyNames(data)) delete data[key];
         state.record = state.material = state.geometry = state.materialSource = state.geometrySource = null;
         state.attributeViews.clear();
       }

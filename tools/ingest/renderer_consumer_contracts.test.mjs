@@ -406,6 +406,60 @@ test('SAOPass retains exact execution while its source random hash differs on th
   assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
 });
 
+test('pinned OutlinePass retains selection/style controls and both scoped scene draws', async () => {
+  const graph = await buildModuleGraph(passFixture(`import {OutlinePass as Outline} from 'outline';
+    const mesh = new THREE.Mesh(), group = new THREE.Group(); group.add(mesh); scene.add(group);
+    const pass = new Outline(new THREE.Vector2(64, 32), scene, camera, [group]);
+    pass.selectedObjects = [mesh]; pass.selectedObjects.push(group);
+    pass.visibleEdgeColor.setRGB(.1, 1, .3); pass.hiddenEdgeColor.setRGB(1, .1, .05);
+    pass.edgeGlow = .4; pass.edgeThickness = 2; pass.edgeStrength = 4;
+    pass.downSampleRatio = 3; pass.pulsePeriod = 1.5; pass.usePatternTexture = true;
+    pass.patternTexture = new THREE.DataTexture(new Uint8Array(16), 2, 2);
+    pass.renderScene = scene; pass.renderCamera = camera; pass.resolution.set(48, 32);
+    composer.addPass(pass); composer.setSize(48, 32); composer.render(.016); pass.dispose();`,
+  {outline: new URL('examples/jsm/postprocessing/OutlinePass.js', upstream).href}).entry);
+  assert.deepEqual(extractGraphRoutingFacts(graph).escapes, []);
+  assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  const mod = Object.values(graph.modules).find(mod => mod.postprocessing_transform?.name === 'OutlinePass.js');
+  assert.ok(mod);
+  const source = fs.readFileSync(new URL('examples/jsm/postprocessing/OutlinePass.js', upstream), 'utf8');
+  const lowered = transformThreePostProcessing(source, mod.postprocessing_transform);
+  assert.equal([...lowered.matchAll(/__f3dRenderPassScene\(renderer, this\.renderScene, this\.renderCamera, this\._visibilityCache\)/g)].length, 2);
+  assert.equal([...lowered.matchAll(/__f3dPassState\(renderer\)\.buffers\.stencil\.setTest/g)].length, 2);
+  assert.doesNotMatch(lowered, /\brenderer\.state\b/);
+});
+
+test('OutlinePass source, inline shaders and resolved dependencies must all retain their exact pins', async () => {
+  const source = `import {OutlinePass} from 'outline';
+    const pass = new OutlinePass(new THREE.Vector2(64, 32), scene, camera, []);
+    composer.addPass(pass); composer.render();`;
+  const map = {outline: new URL('examples/jsm/postprocessing/OutlinePass.js', upstream).href};
+  const entry = passFixture(source, map).entry;
+  for (const dependency of ['OutlinePass.js', 'CopyShader.js', 'Pass.js', 'three.core.js', 'inline-shader']) {
+    let changed = false;
+    const graph = await buildModuleGraph(entry, {
+      transformModule: (text, {url}) => {
+        if (dependency === 'inline-shader' && url.endsWith('/OutlinePass.js')) {
+          const next = text.replace('float depthTest = (-vPosition.z > viewZ) ? 1.0 : 0.0;',
+            'float depthTest = (-vPosition.z > viewZ) ? 0.0 : 1.0;');
+          assert.ok(next !== text, 'the pinned inline depth comparison was changed'); changed = true; return next;
+        }
+        if (url.endsWith(`/${dependency}`)) { changed = true; return text + '\n// changed implementation\n'; }
+        return null;
+      },
+    });
+    assert.equal(changed, true, dependency);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', dependency);
+    assert.equal(Object.values(graph.modules).some(mod => mod.postprocessing_transform?.name === 'OutlinePass.js'), false, dependency);
+  }
+  for (const extra of ['plugin(pass);', 'pass.render = plugin;', 'pass._visibilityCache = new Map();',
+    'pass.prepareMaskMaterial.fragmentShader = customShader;', 'pass.selectedObjects.push(renderer);',
+    'OutlinePass.prototype.render = plugin;', 'class CustomOutline extends OutlinePass {}']) {
+    const graph = await buildModuleGraph(passFixture(source + extra, map).entry);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', extra);
+  }
+});
+
 test('custom passes, carrier escapes and source mutations retain exact renderer ownership', () => {
   for (const body of [
     'composer.addPass(plugin);', 'composer.insertPass(new CustomPass(), 0);',

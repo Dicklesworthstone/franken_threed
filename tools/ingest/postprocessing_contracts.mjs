@@ -22,6 +22,7 @@ const pins = new Map([
   ['TAARenderPass.js', ['463dbda5d1f0f401b3575f60eddd2a84234ff5be44d29a3dc41129c34aba0f47', {TAARenderPass: 'pass'}]],
   ['SSAOPass.js', ['2f9c02a53e09917d039c07c5bd7a110f1ce39bc5ab2affa316ea94f5198ec586', {SSAOPass: 'pass'}]],
   ['GTAOPass.js', ['a277f848d1035c751c54d9706e579aeb74689126ced25723e53d52ac3f26f445', {GTAOPass: 'pass'}]],
+  ['OutlinePass.js', ['8eb486b1436432cf6f080c4a55b027f6d56b3ea66a9735c140a8be986107667b', {OutlinePass: 'pass'}]],
   ['CopyShader.js', ['a33057d5ac91c43304c186ac0e8816e62bb2ed471d3a00ff3018dfd5c0389718', {}]],
   ['ConvolutionShader.js', ['bad71ed02351acb701e62e21a9d11f044c2c689d924d714061edb756fbea8ace', {}]],
   ['FilmShader.js', ['744c619c70f949af5d3f0f9edb27573743ab9ad12869e7c306ffb3d0caff7bb5', {}]],
@@ -43,7 +44,7 @@ const pins = new Map([
 ]);
 const byHash = new Map([...pins].map(([name, [hash, exports]]) => ['sha256:' + hash, {name, exports}]));
 const transformed = new Set(['MaskPass.js', 'EffectComposer.js', 'BloomPass.js', 'UnrealBloomPass.js',
-  'SSAARenderPass.js', 'TAARenderPass.js', 'SSAOPass.js', 'GTAOPass.js']);
+  'SSAARenderPass.js', 'TAARenderPass.js', 'SSAOPass.js', 'GTAOPass.js', 'OutlinePass.js']);
 
 export function verifiedPostProcessingSources(modules, bases) {
   const result = new Map(), visiting = new Set();
@@ -88,6 +89,11 @@ export function transformThreePostProcessing(code, record,
   if (['SSAOPass.js', 'GTAOPass.js'].includes(record.name))
     code = code.replaceAll('renderer.render( this.scene, this.camera );',
       `${renderScene}(renderer, this.scene, this.camera, this._visibilityCache);`);
+  // Each Outline draw's cache contains exactly the currently hidden objects:
+  // selected meshes for depth, then nonselected objects for the selected mask.
+  if (record.name === 'OutlinePass.js')
+    code = code.replaceAll('renderer.render( this.renderScene, this.renderCamera );',
+      `${renderScene}(renderer, this.renderScene, this.renderCamera, this._visibilityCache);`);
   if (record.name === 'EffectComposer.js') {
     // Retain the exact size calculation and pass iteration. The private scope
     // preserves accepted target generations across the source's resize-dispose

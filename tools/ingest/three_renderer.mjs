@@ -1100,7 +1100,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const renderId = this.info.calls;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target, {initialize: !this._shaderEncodedOutput}) : this;
-      const backgroundState = !this._shaderEncodedOutput ? captureThreeBackground(THREE, scene) : undefined;
+      const backgroundState = !this._shaderEncodedOutput || passCameraRequired ? captureThreeBackground(THREE, scene) : undefined;
       const outputProfile = target ? null : this._captureOutputProfile();
       const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile), key = sceneKey(this, scene, backgroundState);
       if (!clearOnly && this._timestampScope) frame.timestamp = this._timestampScope;
@@ -1161,6 +1161,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // lease immediately so a later acquisition failure can release all of it.
       const request = {snapshot, nodeFrame, materialFrame};
       try {
+        if (passCameraRequired && overrideMaterial?.isShaderMaterial) {
+          request.overrideSnapshot = this._passSnapshots.captureMaterial(overrideMaterial);
+          if (!request.overrideSnapshot) fail('UNSUPPORTED', 'Pinned pass shader overrides require ordinary callback-free material values');
+        }
         let webglSourceCamera = null;
         if (this._shaderEncodedOutput && captureCameras && !snapshot && materialFrame?.cameraSafe?.() &&
             !(this.sortObjects && (this._opaqueSort || this._transparentSort))) {
@@ -1173,7 +1177,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           cameraSource ??= camera;
           camera = captureThreeCamera(THREE, camera);
         }
-        Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame, overrideMaterial, mrt,
+        Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame,
+          overrideMaterial: request.overrideSnapshot?.material ?? overrideMaterial, mrt,
           webglSourceCamera, passCameraRequired,
           nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState,
           canvasFrameToken: this._shaderEncodedOutput ? this._webglFrameToken ?? null : null,
@@ -1188,7 +1193,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           srgbView: target ? false : this._canvasSrgbView(outputProfile?.space ?? this.outputColorSpace,
             this._wantsHdr(this._toneMapping()), outputProfile), outputProfile, key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
-            passTextureEntries: snapshot?.targetEntries,
+            passTextureEntries: snapshot?.targetEntries ?? request.overrideSnapshot?.targetEntries,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
             reversedDepthBuffer: this.reversedDepthBuffer === true,
@@ -1420,6 +1425,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         request.programTextures = null;
       }
       request.snapshot?.release();
+      request.overrideSnapshot?.release();
       if (request.materialFrame) {
         this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
       }
@@ -1457,7 +1463,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _submit(request) {
       return request.frame.operations ? request.frame.operations.run(() => this._submitFrame(request)) : this._submitFrame(request);
     }
-    _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
+    _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideSnapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
       webglSourceCamera = null, passCameraRequired = false,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (webglSourceCamera && !materialFrame?.cameraSafe()) {
@@ -1471,6 +1477,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (this._targetDepthInitialized.has(initializeOutputDepth)) return;
       }
       snapshot?.install();
+      overrideSnapshot?.install();
       nodeFrame?.installAttributes?.();
       if (nodeFrame) {
         const entry = destination._dispatcher?.entry(scene);
@@ -1729,6 +1736,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           backgroundState: request.backgroundState, materialFrame: request.materialFrame} : undefined;
         try {
           request?.snapshot?.install();
+          request?.overrideSnapshot?.install();
           const prepare = async () => {
           captured?.installAttributes?.();
           if (destination !== this) {

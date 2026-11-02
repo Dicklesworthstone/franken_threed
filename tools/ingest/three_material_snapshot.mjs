@@ -20,6 +20,8 @@ const data = (object, key) => {
 };
 const dataOnly = object => Object.values(Object.getOwnPropertyDescriptors(object))
   .every(descriptor => Object.hasOwn(descriptor, 'value'));
+const mapPrototype = Map.prototype, mapForEach = mapPrototype.forEach;
+const mapSize = Object.getOwnPropertyDescriptor(mapPrototype, 'size').get;
 const selectorArray = (array, limit) => {
   if (!Array.isArray(array) || Object.getPrototypeOf(array) !== Array.prototype) return null;
   const descriptors = Object.getOwnPropertyDescriptors(array);
@@ -42,9 +44,18 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, m
     if (count > maxValues - values) fail('LIMIT', 'Pending material snapshot value capacity exceeded');
     values += count;
   };
-  // Only the pinned pass's temporary hidden list is captured. Ordinary scene
+  // Only the pinned pass's temporary hidden list/cache is captured. Ordinary scene
   // visibility and LOD updates retain their existing submission behavior.
-  const excluded = exclusions === null ? null : selectorArray(exclusions, maxNodes);
+  let excluded = null;
+  if (exclusions !== null && Object.getPrototypeOf(exclusions) === mapPrototype) {
+    // OutlinePass owns an ordinary Map. Do not call application-overridable
+    // keys()/iterators or Array.from() while retaining its temporary selection.
+    if (Reflect.ownKeys(exclusions).length) return null;
+    let size;
+    try { size = mapSize.call(exclusions); } catch { return null; }
+    if (size > maxNodes) fail('LIMIT', 'Pass exclusion cache capacity exceeded');
+    excluded = []; mapForEach.call(exclusions, (_visible, object) => excluded.push(object));
+  } else if (exclusions !== null) excluded = selectorArray(exclusions, maxNodes);
   if (exclusions !== null && (!excluded || excluded.some(object => !(object instanceof three.Object3D)))) return null;
   const excludedObjects = excluded ? new Set(excluded) : null;
   if (excludedObjects) claim(excludedObjects.size);

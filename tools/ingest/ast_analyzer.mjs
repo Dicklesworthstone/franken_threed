@@ -1060,7 +1060,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "materialBokeh", "compFsMaterial", "copyFsMaterial",
     "output", "width", "height", "kernelRadius", "minDistance", "maxDistance", "blendIntensity",
     "normalMaterial", "ssaoMaterial", "gtaoMaterial", "pdMaterial", "blurMaterial", "depthRenderMaterial", "copyMaterial", "blendMaterial",
-    "normalRenderTarget", "ssaoRenderTarget", "blurRenderTarget", "gtaoRenderTarget", "pdRenderTarget", "gtaoMap", "depthTexture", "normalTexture"]);
+    "normalRenderTarget", "ssaoRenderTarget", "blurRenderTarget", "gtaoRenderTarget", "pdRenderTarget", "gtaoMap", "depthTexture", "normalTexture",
+    "selectedObjects", "visibleEdgeColor", "hiddenEdgeColor", "edgeGlow", "usePatternTexture", "patternTexture",
+    "edgeThickness", "edgeStrength", "downSampleRatio", "pulsePeriod", "renderScene", "renderCamera"]);
   const computationMethods = new Set(["setDataType", "addVariable", "setVariableDependencies", "init", "compute",
     "getCurrentRenderTarget", "getAlternateRenderTarget", "dispose", "addResolutionDefine", "createShaderMaterial",
     "createRenderTarget", "createTexture", "renderTexture", "doRenderTarget"]);
