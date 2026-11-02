@@ -81,14 +81,23 @@ updates/disposal are refused. The stricter automatic scene integration rejects
 custom upload callbacks before using this explicit owner.
 
 Automatic WebGL-authored scenes enable `webglVersioning: true` on this owner.
-For nonvideo textures, that profile retains each Texture's accepted source,
-storage and sampler description until its Texture.version changes. Versionless
-wrap/filter, image, Source, dimensions or mip edits remain GPU-stale across
-inspection, preparation and draws. A requested `needsUpdate` revalidates the
-current description, and disposal followed by preparation admits current source
-state again. Source aliases retain shared pixels and independent sampler
-histories. Cached descriptions contain metadata without retaining obsolete
-image or mip upload arrays. Video keeps its existing frame-update path.
+For ordinary textures and frame-callback video, that profile retains each
+Texture's accepted source, storage and sampler description until its
+Texture.version changes. Versionless wrap/filter, image, Source, dimensions or
+mip edits remain GPU-stale across inspection, preparation and draws. A requested
+`needsUpdate` revalidates the current description, and disposal followed by
+preparation admits current source state again. Source aliases retain shared
+pixels and independent sampler histories. Cached descriptions contain metadata
+without retaining obsolete image or mip upload arrays.
+
+A WebGL video using `requestVideoFrameCallback` remains on the automatic default
+binding until its first source version request, from a frame callback or an
+explicit `needsUpdate`. Subsequent unrequested media and sampler changes retain
+the accepted frame. Cache reuse checks the current image and the built-in
+update hook: replacement with fallback media still invokes the source's
+existing version-requesting hook after admission, and switching back retains
+the latest accepted fallback frame. The owner installs no media callbacks and
+does not control playback. The default/native video profile is unchanged.
 
 Without that profile, sampling/storage/source identity changes require
 prepare(). New allocations are charged before old ones retire, so the peak
@@ -140,7 +149,11 @@ uploader from commit `148ef33ecb6d2502ff796d4554abd1549c95d519`. Eighty determin
 update frames compare byte histories, source range mutations, callback traces
 and requested/unrequested wrapping and magnification changes. Automatic binding
 regressions also cover shared Source uploads, source/mip replacement, disposal
-and callback acknowledgment. Other tests cover pooling, sampling, mips, external-copy descriptors, exact
+and callback acknowledgment. A second differential executes the actual pinned
+VideoTexture and WebGLTextures to compare first-frame admission, upload and
+sampler histories, explicit source replacement and fallback-media transitions.
+Its media boundary records submission parameters; browser decoding and frame
+pixels are not executed. Other tests cover pooling, sampling, mips, external-copy descriptors, exact
 budgets, native errors, disposal and pending completion. The device boundary is
 a byte/command recorder: mip shaders and external-image conversions are not
 executed in those tests. No native pixel parity or measured speedup is claimed.

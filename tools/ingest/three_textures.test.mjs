@@ -319,3 +319,71 @@ test('WebGL accepted descriptor history preserves callback acknowledgment and fa
   failed.wrapS=T.MirroredRepeatWrapping;
   assert.equal(p.binding(failed).samplerDescriptor.addressModeU,'clamp-to-edge');p.dispose();
 });
+
+// Execute the pinned uploader and VideoTexture. These media and GPU boundaries
+// record frame admission/parameters only; browser decoding and pixels are not run.
+test('WebGL video frame and sampler histories match the retained r186 source',async()=>{
+  const {WebGLTextures}=await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLTextures.js')));
+  const {WebGLProperties}=await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLProperties.js')));
+  class Video {
+    constructor(callbacks=true,width=4,height=2,frame=1){
+      Object.assign(this,{width,height,videoWidth:width,videoHeight:height,readyState:2,HAVE_CURRENT_DATA:2,
+        frame,requests:0,cancellations:0,callbacks:new Map()});
+      if(callbacks)this.requestVideoFrameCallback=fn=>{const id=++this.requests;this.callbacks.set(id,fn);return id;};
+    }
+    notify(){const callbacks=[...this.callbacks.values()];this.callbacks.clear();for(const fn of callbacks)fn();}
+    cancelVideoFrameCallback(id){this.cancellations++;this.callbacks.delete(id);}
+  }
+  const previous=globalThis.HTMLVideoElement;globalThis.HTMLVideoElement=Video;
+  const d=textureDevice(),p=pool(d,{webglVersioning:true}),copies=[],writes=[],allocations=[],parameters=new Map();
+  const copy=d.queue.copyExternalImageToTexture;
+  d.queue.copyExternalImageToTexture=(source,destination,size)=>{
+    copy(source,destination,size);
+    copies.push({frame:source.source.frame,size:size.slice(0,2),flipY:source.flipY});
+  };
+  let bound,next=1;
+  const gl=new Proxy({TEXTURE0:0,createTexture(){const t={parameters:new Map()};allocations.push(t);return t;},
+    deleteTexture(t){t.destroyed=true;},texParameteri(_target,key,value){bound.parameters.set(key,value);},
+    generateMipmap(){}},{get(o,k){if(!(k in o))o[k]=next++;return o[k];}});
+  const properties=WebGLProperties(),info={memory:{textures:0},render:{frame:0}};
+  const state={activeTexture(){},bindTexture(_target,t){bound=t;},pixelStorei(key,value){parameters.set(key,value);},
+    texImage2D(...args){const video=args.at(-1);
+      writes.push({frame:video.frame,size:[video.videoWidth,video.videoHeight],flipY:parameters.get(gl.UNPACK_FLIP_Y_WEBGL)});}};
+  const uploader=new WebGLTextures(gl,{has:()=>false},state,properties,{maxTextures:16,maxTextureSize:8192},
+    {convert:value=>value===T.RGBAFormat?gl.RGBA:value===T.UnsignedByteType?gl.UNSIGNED_BYTE:value},info);
+  const av=new Video(),bv=new Video(),a=new T.VideoTexture(av),b=new T.VideoTexture(bv);
+  const wrap=value=>value===gl.REPEAT?'repeat':value===gl.MIRRORED_REPEAT?'mirror-repeat':'clamp-to-edge';
+  const consume=()=>{
+    info.render.frame++;p.prepare([a]);uploader.setTexture2D(b,0);
+    assert.deepEqual(copies,writes);assert.deepEqual([a.version,a.source.version],[b.version,b.source.version]);
+    const actual=p.binding(a).samplerDescriptor,expected=properties.get(b).__webglTexture.parameters;
+    assert.equal(actual.addressModeU,wrap(expected.get(gl.TEXTURE_WRAP_S)));
+    assert.equal(actual.addressModeV,wrap(expected.get(gl.TEXTURE_WRAP_T)));
+    assert.equal(actual.magFilter,expected.get(gl.TEXTURE_MAG_FILTER)===gl.LINEAR?'linear':'nearest');
+  };
+  try{
+    uploader.setTexture2D(b,0);assert.throws(()=>p.prepare([a]),{code:'THREE_TEXTURE_NOT_READY'});
+    assert.equal(a.version,0);assert.equal(b.version,0);assert.equal(allocations.length,0);
+    assert.equal(d.textures.length,0);assert.equal(copies.length,0);assert.equal(writes.length,0);
+    av.notify();bv.notify();consume();const first=p.binding(a);
+    // A replacement Source and edited sampling remain invisible without a version.
+    const nextA=new Video(true,8,4,2),nextB=new Video(true,8,4,2);
+    a.source=new T.TextureSource(nextA);b.source=new T.TextureSource(nextB);
+    a.wrapS=b.wrapS=T.RepeatWrapping;a.magFilter=b.magFilter=T.NearestFilter;a.flipY=b.flipY=false;
+    consume();assert.equal(p.binding(a).view,first.view);assert.equal(copies.length,1);
+    a.needsUpdate=true;b.needsUpdate=true;consume();
+    assert.deepEqual(p.binding(a).view.texture.size,[8,4,1]);assert.equal(copies.length,2);
+    // The live fallback hook requests its own version before the source upload.
+    a.image=new Video(false,2,2,3);b.image=new Video(false,2,2,3);
+    a.wrapT=b.wrapT=T.MirroredRepeatWrapping;consume();const fallback=p.binding(a);
+    assert.equal(copies.length,3);assert.deepEqual(fallback.view.texture.size,[2,2,1]);
+    // Switching back to rVFC keeps that newly accepted fallback descriptor.
+    a.image=new Video(true,4,2,4);b.image=new Video(true,4,2,4);
+    a.wrapS=b.wrapS=T.ClampToEdgeWrapping;consume();
+    assert.equal(p.binding(a).view,fallback.view);assert.equal(copies.length,3);
+    a.needsUpdate=true;b.needsUpdate=true;consume();assert.equal(copies.length,4);
+    assert.equal(av.requests,2);assert.equal(bv.requests,2);
+    assert.equal(nextA.requests+nextB.requests+a.image.requests+b.image.requests,0);
+    assert.equal(av.cancellations+bv.cancellations,0);
+  }finally{p.dispose();if(previous===undefined)delete globalThis.HTMLVideoElement;else globalThis.HTMLVideoElement=previous;}
+});

@@ -406,13 +406,23 @@ export function createGpuThreeTextures(device,{
   const stopped=new Promise((_,reject)=>{rejectStop=reject;});stopped.catch(()=>{});
   const stats={allocations:0,uploads:0,writeCalls:0,externalCopies:0,mipPasses:0};
   function inspect(t,options){
-    const r=records.get(t);
+    const r=records.get(t),accepted=r?.description;
     // WebGL checks Texture.version before reading upload/sampler parameters.
-    // Unrequested edits cannot reallocate storage or expose newer CPU pixels.
-    return webglVersioning&&r?.description&&r.version===t.version?r.description:describe(t,options);
+    // Video's fallback hook can request a version from the current image, so
+    // only a built-in rVFC no-op may reuse accepted video metadata unchanged.
+    if(webglVersioning&&accepted&&r.version===t.version&&
+        (!accepted.video||accepted.nativeMedia||
+          t.update===T.VideoTexture.prototype.update&&instance(t.image,'HTMLVideoElement')&&
+          'requestVideoFrameCallback' in t.image))return accepted;
+    const d=describe(t,options);
+    // A ready rVFC video has no source upload until its first requested version.
+    // Automatic bindings use their existing default texture while it is pending.
+    if(webglVersioning&&d.video&&!d.nativeMedia&&t.version===0&&
+        'requestVideoFrameCallback' in t.image)fail('NOT_READY','Video has not requested its first frame upload');
+    return d;
   }
   function remember(r,d){
-    if(!webglVersioning||d.video||r.description===d)return;
+    if(!webglVersioning||r.description===d)return;
     // Warm inspection needs metadata only. Do not keep replaced image/mipmap
     // payloads alive; Source and GPU residency already have their existing owner.
     const {images,uploads,layerUpdates,...description}=d;

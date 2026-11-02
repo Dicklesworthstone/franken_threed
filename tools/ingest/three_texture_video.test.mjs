@@ -2,7 +2,7 @@
  * recorder. No browser decoding, shader execution or pixel parity is implied. */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {createGpuThreeTextures,inspectThreeTexture} from './three_textures.mjs';
+import {createGpuThreeTextures,createThreeTextureBindings,inspectThreeTexture} from './three_textures.mjs';
 import {textureDevice} from './fixtures/gpu_texture_device.mjs';
 
 class Texture {
@@ -133,4 +133,63 @@ for(const kind of ['copy','scope','loss','dispose'])test('video '+kind+' failure
   else if(kind==='scope'){d.scopeError={message:'invalid copy'};t.needsUpdate=true;p.update([t]);await assert.rejects(p.whenIdle(),code('DEVICE'));}
   else{d.completion=new Promise(()=>{});const wait=p.whenIdle();if(kind==='loss')d.lose();else p.dispose();await assert.rejects(wait);}
   assert.equal(native.destroyed,true);assert.equal(p.diagnostics.textureBytes,0);assert.equal(video.playCalls+video.pauseCalls+video.callbackCalls,0);p.dispose();
+});
+
+test('WebGL rVFC videos use the automatic default binding until their first requested frame',()=>{
+  const {d,t,p,video}=setup(true,{webglVersioning:true});
+  let scan=new Set(),pending=new WeakSet();
+  const bindings=createThreeTextureBindings(d,{three:T,textures:new Map(),autoTextures:true,ownedTextures:()=>p,
+    get textureScan(){return scan;},get pendingTextures(){return pending;},frameTextures:new Set(),
+    fail(name,message){throw Object.assign(new Error(message),{code:'THREE_SCENE_'+name});}});
+  const empty=bindings.binding(t);
+  assert.deepEqual(empty.view.texture.size,[1,1,1]);assert.equal(scan.size,0);assert.equal(p.diagnostics.textures,0);
+  assert.throws(()=>p.prepare([t]),code('NOT_READY'));
+  assert.equal(d.externalCopies.length,0);assert.equal(t.version,0);assert.equal(t.updates,0);
+  t.needsUpdate=true;scan=null;assert.throws(()=>bindings.binding(t),{code:'THREE_SCENE_PREPARE'});
+  pending=new WeakSet();scan=new Set();bindings.binding(t);p.prepare(scan);scan=null;
+  const frame=bindings.binding(t);
+  assert.notEqual(frame.view,empty.view);assert.deepEqual(frame.view.texture.size,[4,2,1]);
+  assert.equal(d.externalCopies.length,1);assert.equal(frame.version,t.version);assert.equal(video.callbackCalls,0);
+  bindings.dispose();p.dispose();
+});
+
+test('WebGL rVFC versions retain accepted sampler and media dimensions across unrequested replacements',()=>{
+  const {d,t,p,video}=setup(true,{webglVersioning:true});t.needsUpdate=true;p.prepare([t]);
+  const first=p.binding(t),replacement=new VideoElement();replacement.videoWidth=8;replacement.videoHeight=4;
+  t.image=replacement;t.wrapS=T.RepeatWrapping;t.magFilter=T.NearestFilter;t.flipY=false;
+  assert.equal(p.binding(t).view,first.view);assert.equal(p.binding(t).sampler,first.sampler);
+  assert.equal(p.inspect(t).width,4);assert.equal(p.inspect(t).height,2);
+  p.prepare([t]);p.update([t]);
+  assert.equal(d.textures.length,1);assert.equal(d.externalCopies.length,1);
+  assert.equal(p.binding(t).samplerDescriptor.addressModeU,'clamp-to-edge');
+  t.needsUpdate=true;assert.throws(()=>p.binding(t),code('PREPARE'));p.prepare([t]);
+  const changed=p.binding(t);
+  assert.deepEqual(changed.view.texture.size,[8,4,1]);assert.equal(first.view.texture.destroyed,true);
+  assert.equal(changed.samplerDescriptor.addressModeU,'repeat');assert.equal(changed.samplerDescriptor.magFilter,'nearest');
+  assert.equal(d.externalCopies.length,2);assert.equal(d.externalCopies[1].source.source,replacement);
+  assert.equal(d.externalCopies[1].source.flipY,false);
+  assert.equal(video.callbackCalls+replacement.callbackCalls,0);p.dispose();
+});
+
+test('WebGL video history preserves fallback hook admission when the live media profile changes',()=>{
+  const {d,t,p}=setup(true,{webglVersioning:true});t.needsUpdate=true;p.prepare([t]);
+  const fallback=new VideoElement(false);fallback.videoWidth=8;
+  t.image=fallback;t.wrapS=T.RepeatWrapping;
+  const updates=t.updates,version=t.version;
+  assert.equal(p.inspect(t).width,8);assert.throws(()=>p.binding(t),code('PREPARE'));
+  const invalid=new VideoTexture(new VideoElement());invalid.type=1015;
+  assert.throws(()=>p.prepare([t,invalid]),code('FORMAT'));
+  assert.equal(t.updates,updates);assert.equal(t.version,version);assert.equal(d.externalCopies.length,1);
+  p.prepare([t]);const accepted=p.binding(t);
+  assert.deepEqual(accepted.view.texture.size,[8,2,1]);assert.equal(t.version,version+1);
+  assert.equal(d.externalCopies.length,2);assert.equal(d.externalCopies[1].source.source,fallback);
+  // Returning to rVFC must retain the most recently accepted fallback frame.
+  const notified=new VideoElement();notified.videoWidth=2;
+  t.image=notified;t.wrapS=T.ClampToEdgeWrapping;p.prepare([t]);p.update([t]);
+  assert.equal(p.binding(t).view,accepted.view);assert.equal(p.inspect(t).width,8);
+  assert.equal(p.binding(t).samplerDescriptor.addressModeU,'repeat');assert.equal(t.version,version+1);
+  assert.equal(d.externalCopies.length,2);
+  t.update=()=>{throw Error('custom video update must not run');};
+  assert.throws(()=>p.update([t]),code('SOURCE'));t.update=VideoTexture.prototype.update;
+  assert.equal(fallback.playCalls+fallback.pauseCalls+notified.callbackCalls,0);p.dispose();
 });
