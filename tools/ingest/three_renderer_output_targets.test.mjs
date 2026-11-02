@@ -11,6 +11,7 @@ const Renderer = createWebGPURendererClass(T);
 function fixture(t) {
   const device = geometryDevice(); device.limits.maxTextureDimension2D = 8192; device.limits.maxBindingsPerBindGroup = 1000;
   device.limits.maxTextureArrayLayers = 256; device.limits.maxTextureDimension3D = 256;
+  device.limits.maxColorAttachments = 8; device.limits.maxColorAttachmentBytesPerSample = 32;
   device.textures = [];
   device.createTexture = desc => {
     const texture = {dimension: '2d', sampleCount: 1, ...desc,
@@ -352,8 +353,76 @@ test(`converted array scene observes source face zero while writing its selected
   assert.equal(f.renderer.getActiveCubeFace(), 2);
 });
 
-test('multiple-color output targets remain refused before allocation', t => {
+for (const [name, create, lastLayer, samples] of [
+  ['mixed precision', () => new T.RenderTarget(8, 6, {count: 2}), 0, 1],
+  ['multisampled', () => new T.RenderTarget(8, 6, {count: 2, samples: 4}), 0, 4],
+  ['array', () => new T.RenderTarget(8, 6, {count: 2, depth: 3}), 2, 1],
+  ['volume', () => new T.RenderTarget3D(8, 6, 3, {count: 2}), 2, 1],
+]) test(`${name} MRT default output preserves ordered attachments and queued values`, async t => {
+  const f = fixture(t), target = create(), gain = T.TSL.uniform(.25);
+  target.textures[1].type = T.HalfFloatType; t.after(() => target.dispose());
+  const material = new T.NodeMaterial(); material.depthTest = material.depthWrite = false;
+  material.fragmentNode = T.TSL.outputStruct(T.TSL.vec4(gain, 0, .5, 1), T.TSL.vec4(0, gain.mul(4), .75, 1));
+  f.scene.children[0].material = material; t.after(() => material.dispose());
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  assert.equal(f.renderer.setOutputRenderTarget(target), undefined);
+  assert.equal(f.device.textures.length, 0);
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer.getRenderTarget(), null);
+  f.renderer.render(f.scene, f.camera); assert.equal(f.renderer.getRenderTarget(), null);
+  f.renderer.setRenderTarget(target, lastLayer); gain.value = .75; f.renderer.render(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); await drain(f.renderer);
+  const passes = drawPasses(f.device), draws = nativeDraws(f.device);
+  assert.equal(passes.length, 2); assert.equal(draws.length, 2);
+  for (const [i, pass] of passes.entries()) {
+    const colors = pass.desc.colorAttachments;
+    assert.deepEqual(colors.map(color => color.view.texture.format), ['rgba8unorm', 'rgba16float']);
+    assert.ok(colors.every(color => color.view.texture.sampleCount === samples));
+    assert.deepEqual(colors.map(color => attachmentSlice(samples === 4 ? {view: color.resolveTarget} : color)), [i ? lastLayer : 0, i ? lastLayer : 0]);
+    assert.equal(draws[i].pipeline.fragment.targets.length, 2);
+  }
+  assert.ok(uniformWords(draws[0]).includes(.25)); assert.ok(uniformWords(draws[1]).includes(.75));
+  assert.equal(f.renderer._outputQuads.size, 0); assert.equal(f.acquired(), 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('explicitly selected MRT output retains renderer-level named output graphs', async t => {
   const f = fixture(t), target = new T.RenderTarget(8, 6, {count: 2}); t.after(() => target.dispose());
-  assert.throws(() => f.renderer.setOutputRenderTarget(target), {code: 'F3D_RENDERER_UNSUPPORTED'});
-  assert.equal(f.device.textures.length, 0); assert.equal(f.renderer.getOutputRenderTarget(), null);
+  target.texture.name = 'output'; target.textures[1].name = 'aux';
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace; f.renderer.setOutputRenderTarget(target);
+  f.renderer.setMRT(T.TSL.mrt({output: T.TSL.output, aux: T.TSL.vec4(.2, .4, .6, 1)}));
+  f.renderer.setRenderTarget(target); await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(nativeDraws(f.device)[0].pipeline.fragment.targets.length, 2);
+  assert.equal(f.renderer.getRenderTarget(), target); assert.equal(f.acquired(), 0);
+});
+
+test('deferred MRT output captures physical attachment count and invalidates a mismatched cached program', async t => {
+  const f = fixture(t), target = new T.RenderTarget(8, 6, {count: 2}); t.after(() => target.dispose());
+  const material = new T.NodeMaterial();
+  material.fragmentNode = T.TSL.outputStruct(T.TSL.vec4(.2, .4, .6, 1), T.TSL.vec4(.7, .5, .3, 1));
+  f.scene.children[0].material = material; t.after(() => material.dispose());
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace; f.renderer.setOutputRenderTarget(target);
+  const accepted = f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.setOutputRenderTarget(f.target); await accepted;
+  assert.equal(drawPasses(f.device)[0].desc.colorAttachments.length, 2);
+  assert.equal(f.renderer.getOutputRenderTarget(), f.target); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_MRT'});
+  assert.equal(drawPasses(f.device).length, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('MRT output conversion fails at use while explicit clears retain every attachment', async t => {
+  const f = fixture(t), target = new T.RenderTarget(8, 6, {count: 2}); t.after(() => target.dispose());
+  f.renderer.setOutputRenderTarget(target); await f.renderer.init();
+  const textureCount = f.device.textures.length;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.throws(() => f.renderer.clear(), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(f.device.textures.length, textureCount); assert.equal(f.renderer._pending.length, 0);
+  assert.equal(f.renderer.getOutputRenderTarget(), target); assert.equal(f.renderer.getRenderTarget(), null);
+  f.renderer.setRenderTarget(target); f.renderer.setClearColor(new T.Color(.125, .25, .5), 1);
+  f.renderer.clear(); await drain(f.renderer);
+  const colors = f.device.passes.at(-1).desc.colorAttachments;
+  assert.equal(colors.length, 2);
+  assert.deepEqual(colors.map(color => color.clearValue), [{r: .125, g: .25, b: .5, a: 1}, {r: 0, g: 0, b: 0, a: 1}]);
+  assert.equal(nativeDraws(f.device).length, 0); assert.equal(f.acquired(), 0);
 });

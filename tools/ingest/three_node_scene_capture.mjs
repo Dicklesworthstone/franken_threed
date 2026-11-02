@@ -513,7 +513,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const frameStamp = {frameId: frame.frameId, time: frame.time, deltaTime: frame.deltaTime,
     renderId};
   let programs = null;
-  const context = {scene: root, camera, lights: Object.freeze([]),
+  const context = {scene: root, camera, lights: Object.freeze([]), colorAttachmentCount: destination?.textures.length ?? 1,
     lightingEnabled: renderer.lighting?.enabled !== false};
   const withBinding = (binding, run) => {
     const previous = context.clippingContext, previousPass = context.passId, previousSide = binding.material.side;

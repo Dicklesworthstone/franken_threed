@@ -879,11 +879,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     setOutputRenderTarget(target) {
       if (target !== null) {
         if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Custom output targets require the native WebGPU route');
-        const shape = this._targets.capture(target).shape;
-        // The existing target owner supplies each selected face/layer/slice.
-        // Converted array output prepares its layer-specific source quads below.
-        if (shape.textures.length !== 1)
-          fail('UNSUPPORTED', 'Custom output targets require one color attachment');
+        // The target owner validates dimensions, formats and attachment count.
+        // Conversion is a render-time choice; working-linear MRT output uses
+        // the original fragment outputs directly, with no private framebuffer.
+        this._targets.capture(target);
       }
       this._outputRenderTarget = target;
     }
@@ -1213,6 +1212,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // clear() selects an explicit target first and only otherwise the private
       // framebuffer. With no conversion, a null selection still clears canvas.
       const convert = this.needsFrameBufferTarget && (!clearOnly || previousTarget === null);
+      if (convert && this._targets.capture(outputTarget).shape.textures.length !== 1)
+        fail('UNSUPPORTED', 'Multiple-color output targets require working-linear output without tone mapping');
       if (convert && captureCameras && (previousFace !== 0 || previousMip !== 0)) {
         const shape = this._targets.capture(outputTarget).shape;
         // The pinned private image has one mip and, for a cube output, one

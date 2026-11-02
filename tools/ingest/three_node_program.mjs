@@ -1175,7 +1175,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, scene, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0') {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -1185,7 +1185,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
       material.alphaTest > 0, material.alphaHash === true, material.alphaToCoverage, material.alphaToCoverage && renderer.currentSamples > 1,
       wideLineCoverage(material),
-      material.depthWrite, material.depthTest, material.lights, clippingKey,
+      material.depthWrite, material.depthTest, material.lights, clippingKey, colorAttachmentCount,
       spriteSignature(material, object), wideLineSignature(material), volumeSignature(material), sssSignature(material), geometrySignature(material),
       primitiveLayout(object, material),
       object.geometry.id, object.geometry.isInstancedBufferGeometry === true,
@@ -1452,7 +1452,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     builder.vertexShader = shaders.vertex; builder.fragmentShader = shaders.fragment;
     const outputStruct = builder.structs.fragment.find(struct => struct.output === true);
     const colorCount = outputStruct?.members.length ?? 1;
-    if (colorCount > (renderer.getRenderTarget?.()?.textures.length ?? 1))
+    // Default output keeps the public target null even when its physical
+    // destination has multiple colors. Validate against the captured image.
+    if (colorCount > (context.colorAttachmentCount ?? renderer.getRenderTarget?.()?.textures.length ?? 1))
       fail('MRT', 'Native fragment outputs exceed the current color attachments');
     let cameraIndex = null;
     if (context.camera?.isArrayCamera && context.camera.cameras.length) {

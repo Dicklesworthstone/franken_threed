@@ -109,6 +109,80 @@ async function capture(mode) {
             target.dispose();material.dispose();renderer.dispose();canvas.remove();
           }
         }
+        for (const profile of [
+          {name: 'mrt_mixed'}, {name: 'mrt_msaa', samples: 4}, {name: 'mrt_named', named: true},
+          {name: 'mrt_array', layers: 3}, {name: 'mrt_volume', layers: 3, volume: true},
+          {name: 'mrt_authored_mip', mip: true},
+        ]) {
+          const canvas = document.createElement('canvas');document.body.appendChild(canvas);
+          const renderer = new Renderer({canvas, device}), layers = profile.layers ?? 1;
+          const width = profile.mip ? 128 : 64, height = 16;
+          const options = {count: 2, depthBuffer: false, samples: profile.samples ?? 0, generateMipmaps: false};
+          const target = profile.volume ? new T.RenderTarget3D(width, height, layers, options)
+            : new T.RenderTarget(width, height, {...options, depth: layers});
+          target.texture.name = 'output';target.textures[1].name = 'aux';target.textures[1].type = T.HalfFloatType;
+          if (profile.mip) target.textures.forEach(texture => {texture.mipmaps = [{}, {}];});
+          const phase = N.uniform(.125), uv = N.uv();
+          const primary = N.vec4(uv.x.mul(.375).add(phase), uv.y.mul(.5), phase.mul(.5), 1);
+          const auxiliary = N.vec4(phase.mul(4).sub(1), uv.y.mul(1.5).add(.125), .25, 1);
+          const material = profile.named ? new T.MeshBasicNodeMaterial() : new T.NodeMaterial();
+          material.depthTest = material.depthWrite = false;material.blending = T.NoBlending;
+          if (profile.named) material.outputNode = primary;
+          else material.fragmentNode = N.outputStruct(primary, auxiliary);
+          if (profile.samples) material.vertexNode = N.vec4(N.positionGeometry.x.mul(.8).sub(N.positionGeometry.y.mul(.25)),
+            N.positionGeometry.x.mul(.25).add(N.positionGeometry.y.mul(.8)), 0, 1);
+          const quad = new T.QuadMesh(material), states = [], copies = [];
+          const selection = () => ({active: renderer.getRenderTarget() === target ? 'output' : 'null',
+            face: renderer.getActiveCubeFace(), mip: renderer.getActiveMipmapLevel()});
+          const idle = async () => {if (mode === 'candidate') await renderer.waitForGPU();await device.queue.onSubmittedWorkDone();};
+          device.pushErrorScope('validation');
+          try {
+            await renderer.init();renderer.setSize(width, height, false);
+            renderer.outputColorSpace = T.LinearSRGBColorSpace;renderer.toneMapping = T.NoToneMapping;
+            renderer.setOutputRenderTarget(target);renderer.setClearColor(new T.Color(.03125, .0625, .09375), 1);
+            for (let layer = 0; layer < layers; layer++) {renderer.setRenderTarget(target, layer);renderer.clear();}
+            renderer.setRenderTarget(profile.named ? target : null);
+            if (profile.named) renderer.setMRT(N.mrt({output: N.output, aux: auxiliary}));
+            states.push(selection());await renderer.compileAsync(quad, quad.camera);states.push(selection());
+            renderer.render(quad, quad.camera);states.push(selection());
+            if (layers > 1) {
+              renderer.setRenderTarget(target, layers - 1);phase.value = .5;renderer.render(quad, quad.camera);
+              renderer.setRenderTarget(target, 1);phase.value = .75;renderer.render(quad, quad.camera);
+            } else {
+              // Preserve the first call's right half while the queued call
+              // replaces its left half. The mip case preserves the base image.
+              renderer.autoClear = false;phase.value = .75;
+              if (profile.mip) renderer.setRenderTarget(target, 0, 1);
+              else target.viewport.set(0, 0, width / 2, height);
+              renderer.render(quad, quad.camera);
+            }
+            states.push(selection());renderer.setRenderTarget(null);target.viewport.set(0, 0, width, height);
+            await idle();const pixels = [], imageNames = [], auxiliaryValues = [];
+            for (let level = 0; level < (profile.mip ? 2 : 1); level++) for (let layer = 0; layer < layers; layer++) {
+              for (let color = 0; color < 2; color++) {
+                const w = width >> level, h = height >> level;let imageTarget = target, imageColor = color;
+                if (level) {
+                  imageTarget = new T.RenderTarget(w, h, {depthBuffer: false, type: target.textures[color].type});
+                  copies.push(imageTarget);imageColor = 0;renderer.initRenderTarget(imageTarget);
+                  renderer.copyTextureToTexture(target.textures[color], imageTarget.texture,
+                    new T.Box2(new T.Vector2(), new T.Vector2(w, h)), null, level, 0);
+                  await idle();
+                }
+                const data = await renderer.readRenderTargetPixelsAsync(imageTarget, 0, 0, w, h, imageColor, layer);
+                imageNames.push(`${level}/${layer}/${color}`);
+                pixels.push(Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
+                if (color === 1) auxiliaryValues.push(...Array.from(data, T.DataUtils.fromHalfFloat));
+              }
+            }
+            results.push({name: profile.name, pixels, imageNames, attachments: 2, states,
+              auxiliaryRange: [Math.min(...auxiliaryValues), Math.max(...auxiliaryValues)],
+              route: renderer.info.f3d?.route, native: renderer.backend?.isF3DBackend, draws: renderer.info.f3d?.nativeDrawCalls});
+          } catch (error) {throw new Error(`${mode}/${profile.name}: ${error.message}`, {cause: error});}
+          finally {
+            const invalid = await device.popErrorScope();if (invalid) errors.push(`${profile.name}: ${invalid.message}`);
+            for (const copy of copies) copy.dispose();target.dispose();material.dispose();renderer.dispose();canvas.remove();
+          }
+        }
         return {results, errors};
       } finally {device.destroy();}
     }, mode);
@@ -129,10 +203,18 @@ try {
       const mismatch = pixels.findIndex((value, i) => value !== actual.pixels[layer][i]);
       assert.equal(mismatch, -1, `${expected.name}, layer ${layer}, byte ${mismatch}: ${pixels[mismatch]} != ${actual.pixels[layer][mismatch]}`);
     }
-    const cubeConversion = expected.name === 'cube_srgb_reinhard';
-    assert.equal(new Set([0, 1, actual.pixels.length - 1].map(layer => digest(Uint8Array.from(actual.pixels[layer])))).size, cubeConversion ? 2 : 3,
-      `${expected.name}: rendered and preserved layers must have distinct contents`);
-    console.log(JSON.stringify({case: expected.name, status: 'pass', layers: actual.pixels.length,
+    if (expected.attachments) {
+      assert.deepEqual(actual.imageNames, expected.imageNames);
+      assert.deepEqual(actual.auxiliaryRange, expected.auxiliaryRange);
+      assert.ok(actual.auxiliaryRange[0] < 0 && actual.auxiliaryRange[1] > 1, 'secondary half-float output retains signed HDR values');
+    } else {
+      const cubeConversion = expected.name === 'cube_srgb_reinhard';
+      assert.equal(new Set([0, 1, actual.pixels.length - 1].map(layer => digest(Uint8Array.from(actual.pixels[layer])))).size, cubeConversion ? 2 : 3,
+        `${expected.name}: rendered and preserved layers must have distinct contents`);
+    }
+    console.log(JSON.stringify({case: expected.name, status: 'pass', ...(expected.attachments
+      ? {attachments: expected.attachments, images: actual.pixels.length, auxiliaryRange: actual.auxiliaryRange}
+      : {layers: actual.pixels.length}),
       bytesCompared: actual.pixels.flat().length, exactComparison: true, gpuErrors: 0, route: actual.route,
       nativeDrawCalls: actual.draws, browserVersion: candidate.browserVersion, sourcePin: pin.source_commit}));
   }

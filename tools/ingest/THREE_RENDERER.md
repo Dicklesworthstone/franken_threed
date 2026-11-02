@@ -115,7 +115,7 @@ older offscreen tests drops the WebGPU instance during canvas readback on this
 host, including in a renderer-free reference probe.
 
 Native `setOutputRenderTarget(target)` / `getOutputRenderTarget()` select a
-single-color 2D, cube, array or 3D volume target for final output. Working-linear
+2D, cube, array or 3D volume target for final output. Working-linear
 output renders directly;
 tone mapping or color conversion first renders into the pinned source's private
 linear framebuffer, then executes its retained TSL output graph on the same new
@@ -124,6 +124,20 @@ come from the selected target. An explicit unrelated `setRenderTarget()` takes
 precedence. Queued output passes keep their own target generations, tone operator,
 exposure and render-frequency updates; `compileAsync()` prepares the scene and
 output passes.
+
+Multiple-color output targets support working-linear rendering with
+`outputColorSpace = LinearSRGBColorSpace` and `toneMapping = NoToneMapping`.
+Their attachments retain the ordinary target owner's formats, independent
+precision, multisample resolves, array/volume layers and authored 2D mip levels.
+When the public render-target selector is null, use an explicit
+`TSL.outputStruct(...)` fragment graph to write each attachment. As in the
+pinned source, renderer-level `setMRT()` output selection applies after an
+explicit `setRenderTarget(outputTarget)`; it does not replace the fragment
+graph for a null selection. The native compiler validates against the captured
+physical attachment count while preserving that public null selector, including
+queued target changes and program-cache reuse. Tone mapping or renderer color
+conversion into MRT remains refused because the pinned private output pass
+produces one color. Explicit clears still clear every selected attachment.
 
 Direct layered output retains the target owner's face/layer/slice and mip
 selection. Converted array and volume output renders the scene into the selected
@@ -140,16 +154,18 @@ render leaves the effective output target selected by `getRenderTarget()`; direc
 working-linear output keeps a null active selection. With a null active selection,
 `clear()` clears the private framebuffer and draws its output when conversion is
 needed, but otherwise clears the canvas. An explicit target clear never performs
-the output transform. Multiview and multiple-color output targets, and output
+the output transform. Multiview output targets and output
 targets on the WebGL-authored facade, remain unsupported. See
 [THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for target profiles and lifetime.
 
-`node tests/e2e/webgpu_renderer/native_output_targets.mjs` checks all six
-cube/array/volume direct and sRGB/Reinhard profiles against the pinned source.
-Chromium 151.0.7922.34 / SwiftShader matched all 233,472 storage bytes, including
-queued layer changes, per-call exposure, untouched cube faces and retained
-selection state, with no GPU or browser errors. This is native WebGPU correctness
-evidence; it is not a hardware-performance measurement.
+`node tests/e2e/webgpu_renderer/native_output_targets.mjs` checks twelve profiles
+against the pinned source: six cube/array/volume direct and sRGB/Reinhard cases,
+plus six MRT cases covering mixed precision, four-sample MSAA, named outputs,
+arrays, volumes and authored mips. Chromium 151.0.7922.34 / SwiftShader matched
+all 374,784 storage bytes, including queued layer/viewport changes, per-call
+exposure, untouched cube faces, retained selection state and signed half-float
+MRT values from -0.5 to 2, with no GPU or browser errors. This is native WebGPU
+correctness evidence; it is not a hardware-performance measurement.
 
 Scene content is whatever `three_scene.mjs` admits: Mesh/InstancedMesh/skinned and
 morphed meshes; Sprite; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is
