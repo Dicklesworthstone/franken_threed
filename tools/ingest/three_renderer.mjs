@@ -1508,7 +1508,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         memory.attributesSize = d.geometryBytes + d.instanceBytes + d.deformationBytes;
         memory.uniformBuffersSize = d.rendererBytes;
         memory.renderTargets = this._targets.size;
-        memory.total = memory.attributesSize + memory.uniformBuffersSize + this._targets.allocatedBytes;
+        memory.total = memory.attributesSize + memory.uniformBuffersSize + this._targets.allocatedBytes + memory.readbackBuffersSize;
       }
       if (destination === this) this.info.f3d.presentedRenders++;
       else this.info.f3d.offscreenRenders++;

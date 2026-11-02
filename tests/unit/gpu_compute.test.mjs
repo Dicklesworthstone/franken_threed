@@ -17,10 +17,14 @@ function gpu(options = {}) {
     popErrorScope: () => { const error = scopeError; scopeError = null; calls.push(['pop']); return Promise.resolve(error); },
     validationError: message => { scopeError = {message}; },
     createBuffer({size, usage}) {
+      const mapped = [];
+      const detach = () => { for (const array of mapped.splice(0)) structuredClone(array, {transfer: [array]}); };
       const buffer = {size, usage, data: new Uint8Array(size), destroyed: 0, unmapped: 0,
-        destroy() { this.destroyed++; }, unmap() { this.unmapped++; },
+        destroy() { this.destroyed++; detach(); }, unmap() { this.unmapped++; detach(); },
         mapAsync: () => options.mapping?.promise ?? Promise.resolve(),
-        getMappedRange() { return this.data.buffer; }};
+        getMappedRange(offset = 0, length = size - offset) {
+          const array = this.data.buffer.slice(offset, offset + length); mapped.push(array); return array;
+        }};
       buffers.push(buffer); return buffer;
     },
     createShaderModule: ({code}) => ({code, getCompilationInfo: async () => ({messages: options.messages ?? []})}),
@@ -37,7 +41,8 @@ function gpu(options = {}) {
           dispatchWorkgroupsIndirect: (buffer, offset) => operations.push(() => calls.push(['indirect', buffer, offset])),
           end: () => calls.push(['end'])}; },
         copyBufferToBuffer(source, sourceOffset, target, targetOffset, size) {
-          operations.push(() => { target.data.set(source.data.subarray(sourceOffset, sourceOffset + size), targetOffset); calls.push(['copy']); });
+          operations.push(() => { target.data.set(source.data.subarray(sourceOffset, sourceOffset + size), targetOffset);
+            calls.push(['copy', sourceOffset, size, target]); });
         },
         finish: () => operations,
       };
@@ -54,6 +59,15 @@ function gpu(options = {}) {
   return device;
 }
 const shader = {code: '@compute @workgroup_size(1) fn main() {}'};
+function readbackTarget(maxByteLength) {
+  const listeners = new Map();
+  return {isReadbackBuffer: true, maxByteLength, buffer: null, _mapped: false,
+    addEventListener(type, listener) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(listener); },
+    removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
+    release() { for (const listener of [...listeners.get('release') ?? []]) listener(); },
+    dispose() { for (const listener of [...listeners.get('dispose') ?? []]) listener(); },
+    get listenerCount() { return [...listeners.values()].reduce((sum, group) => sum + group.size, 0); }};
+}
 
 function delayedScopes() {
   const device = gpu(), scopes = [];
@@ -111,6 +125,93 @@ test('readback snapshots are submitted before later work and mappings may finish
   assert.equal(owner.allocatedBytes, 4);
   assert.equal(device.buffers[1].unmapped, 1);
   assert.equal(device.buffers[2].destroyed, 1); owner.dispose();
+});
+
+test('ranged readback copies only selected bytes and preserves caller-owned ArrayBuffer tails', async t => {
+  const device = gpu(), owner = createGpuCompute(device), key = {};
+  t.after(() => owner.dispose());
+  owner.upload(key, new Uint32Array([10, 20, 30, 40, 50, 60]));
+  const target = new Uint32Array([99, 99, 99, 99]).buffer;
+  assert.equal(await owner.read(key, target, 4, 8), target);
+  assert.deepEqual([...new Uint32Array(target)], [20, 30, 99, 99]);
+  assert.deepEqual([...new Uint32Array(await owner.read(key, null, 16))], [50, 60]);
+  assert.equal((await owner.read(key, null, 24, 0)).byteLength, 0);
+  assert.deepEqual(device.calls.filter(c => c[0] === 'copy').map(c => c.slice(1, 3)), [[4, 8], [16, 8], [24, 0]]);
+  assert.deepEqual(device.buffers.slice(1).map(buffer => buffer.size), [8, 8, 0]);
+  assert.equal(owner.allocatedBytes, 24);
+});
+
+test('invalid readback ranges and destinations fail without allocating or copying', async t => {
+  const device = gpu(), owner = createGpuCompute(device), key = {};
+  t.after(() => owner.dispose()); owner.upload(key, new Uint32Array([1, 2, 3, 4]));
+  const detached = new ArrayBuffer(16); structuredClone(detached, {transfer: [detached]});
+  for (const [target, offset, count] of [[null, -4, 4], [null, 2, 4], [null, 0, 2], [null, 0, -2],
+    [null, 0, NaN], [null, 0, Infinity], [null, 0, 1.5], [null, 20, -1], [null, 12, 8],
+    [new ArrayBuffer(4), 0, 8], [new ArrayBuffer(4), 4, -1], [new Uint32Array(4), 0, 4], [detached, 0, 4],
+    [readbackTarget(4), 0, 8]]) await assert.rejects(owner.read(key, target, offset, count), /READBACK_(RANGE|TARGET)/);
+  assert.equal(device.buffers.length, 1); assert.equal(device.calls.some(c => c[0] === 'copy'), false);
+});
+
+test('source readback handles retain one staging buffer until release or disposal', async t => {
+  const changes = [], device = gpu(), owner = createGpuCompute(device, {onReadbackChange: (...change) => changes.push(change)}), key = {};
+  t.after(() => owner.dispose());
+  const storage = owner.upload(key, new Uint32Array([10, 20, 30, 40, 50, 60])), target = readbackTarget(32);
+  const first = owner.read(key, target, 4, 8);
+  assert.equal(target._mapped, true); assert.equal(target.buffer, null);
+  await assert.rejects(owner.read(key, target, 0, 4), /READBACK_MAPPED/);
+  assert.equal(await first, target); assert.deepEqual([...new Uint32Array(target.buffer)], [20, 30]);
+  const mapped = target.buffer, native = device.buffers[1];
+  target.release(); assert.equal(mapped.byteLength, 0); assert.equal(target.buffer, null); assert.equal(target._mapped, false);
+  target.maxByteLength = 4; // Source retains its first native capacity until disposal.
+  new Uint32Array(storage.data.buffer)[4] = 123;
+  assert.equal(await owner.read(key, target, 16, 8), target);
+  assert.deepEqual([...new Uint32Array(target.buffer)], [123, 60]);
+  assert.equal(device.buffers.length, 2); assert.equal(native.destroyed, 0);
+  assert.equal(owner.readbackBufferCount, 1); assert.equal(owner.readbackBytes, 32); assert.equal(owner.allocatedBytes, 56);
+  target.dispose(); assert.equal(native.destroyed, 1); assert.equal(target._mapped, false); assert.equal(target.buffer, null);
+  assert.equal(target.listenerCount, 0); assert.equal(owner.allocatedBytes, 24);
+  assert.deepEqual(changes, [[1, 32], [0, 0]]);
+  await owner.read(key, target, 0, 4); assert.equal(device.buffers.length, 3); assert.equal(device.buffers[2].size, 4);
+});
+
+for (const action of ['release', 'dispose'])
+test(`${action} cancels a pending handle map without invalidating its next use`, async t => {
+  const mapping = deferred(), device = gpu({mapping}), owner = createGpuCompute(device), key = {}, target = readbackTarget(16);
+  t.after(() => { mapping.resolve(); owner.dispose(); });
+  const storage = owner.upload(key, new Uint32Array([1, 2, 3, 4]));
+  const first = owner.read(key, target, 0, 8), rejected = assert.rejects(first, /READBACK_(RELEASED|DISPOSED)/);
+  target[action]();
+  new Uint32Array(storage.data.buffer)[2] = 77;
+  const second = owner.read(key, target, 8, 4);
+  await rejected; assert.equal(target._mapped, true);
+  mapping.resolve(); await second;
+  assert.deepEqual([...new Uint32Array(target.buffer)], [77]);
+  assert.equal(target._mapped, true); assert.equal(device.buffers.length, action === 'release' ? 2 : 3);
+});
+
+test('mapped handle disposal and device loss release retained allocation and source state once', async () => {
+  const device = gpu(), owner = createGpuCompute(device), key = {}, target = readbackTarget(16);
+  owner.upload(key, new Uint32Array([1, 2])); await owner.read(key, target);
+  const mapped = target.buffer;
+  device.lose({message: 'readback device lost'}); await Promise.resolve();
+  assert.equal(mapped.byteLength, 0); assert.equal(target.buffer, null); assert.equal(target._mapped, false);
+  assert.equal(target.listenerCount, 0); assert.equal(owner.readbackBufferCount, 0); assert.equal(owner.allocatedBytes, 0);
+  target.release(); target.dispose(); owner.dispose();
+  for (const buffer of device.buffers) assert.equal(buffer.destroyed, 1);
+});
+
+test('reusable readbacks enforce device and shared budgets while allowing small ranges of large buffers', async t => {
+  const device = gpu(), owner = createGpuCompute(device, {maxBytes: 40}), key = {};
+  t.after(() => owner.dispose()); owner.upload(key, new Uint32Array([1, 2, 3, 4, 5, 6, 7, 8]));
+  await assert.rejects(owner.read(key), /BUDGET/);
+  const target = readbackTarget(8);
+  await owner.read(key, target, 24, 8); assert.deepEqual([...new Uint32Array(target.buffer)], [7, 8]);
+  target.release();
+  await assert.rejects(owner.read(key, readbackTarget(4), 0, 4), /BUDGET/);
+  target.dispose(); device.limits.maxBufferSize = 32;
+  const oversized = readbackTarget(36);
+  await assert.rejects(owner.read(key, oversized, 0, 4), /LIMIT/); assert.equal(oversized._mapped, false);
+  assert.equal(device.buffers.length, 2); assert.equal(owner.allocatedBytes, 32);
 });
 
 test('indirect dispatch uses GPU-resident counts, not the stale CPU array', async () => {

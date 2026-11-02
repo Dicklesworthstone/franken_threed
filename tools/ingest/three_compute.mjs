@@ -10,7 +10,7 @@
  * the FIFO submission, including both aspects of one target. No UV replica,
  * readback or CPU upload is introduced. Sampled image/canvas inputs retain
  * private call-time pixels through the same source texture owner. */
-import {createGpuCompute} from './gpu_compute.mjs';
+import {createGpuCompute, captureGpuReadback} from './gpu_compute.mjs';
 import {captureComputeAttributeView, refreshComputeAttributeView} from './gpu_compute_attributes.mjs';
 import {copyComputeBufferToTarget} from './gpu_compute_texture_copy.mjs';
 import {createThreeStorageTextures, inspectThreeStorageTexture} from './three_storage_textures.mjs';
@@ -41,7 +41,13 @@ function createThreeCompute(renderer, three) {
     fail('SOURCE', 'Supply the pinned r186 three/webgpu namespace for TSL compute');
   const device = renderer._device, frame = renderer._nodes.nodeFrame;
   const textureOwner = renderer._getSampledTextureInputs();
-  const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal});
+  const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal,
+    onReadbackChange(count, bytes) {
+      const memory = renderer.info.memory;
+      if (!memory) return;
+      memory.total += bytes - memory.readbackBuffersSize;
+      memory.readbackBuffers = count; memory.readbackBuffersSize = bytes;
+    }});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
   const readLeases = new WeakMap(), readResources = new WeakMap();
@@ -536,10 +542,12 @@ function createThreeCompute(renderer, three) {
       if (transferFailure) throw transferFailure;
       await Promise.all([gpu.whenIdle(), textureOwner.whenIdle()]);
     },
-    read(attribute) {
+    read(attribute, request) {
       live(); validateAttribute(attribute);
       // Submit the buffer snapshot before waiting for texture-owner errors.
-      return Promise.all([gpu.read(attribute), textureOwner.whenIdle()]).then(([bytes]) => bytes);
+      return Promise.all([gpu.readCaptured(attribute, request), textureOwner.whenIdle()]).then(([bytes]) => {
+        request.check(); return bytes;
+      });
     },
     dispose() {
       if (disposed) return; disposed = true;
@@ -719,7 +727,17 @@ export function withThreeCompute(Base, THREE) {
       try { return await submit(this, () => owner(this).copyToTarget(attribute, destination, copiedOptions)); }
       finally { release(); }
     }
-    async getArrayBufferAsync(attribute) { return await submit(this, () => owner(this).read(attribute)); }
+    async getArrayBufferAsync(attribute, target = null, offset = 0, count = -1) {
+      check(this);
+      // Reserve source ReadbackBuffer state at the public call, even when an
+      // earlier render/compile has delayed this copy's FIFO submission slot.
+      const request = captureGpuReadback(target, offset, count);
+      let success = false;
+      try {
+        const result = await submit(this, () => owner(this).read(attribute, request));
+        success = true; return result;
+      } finally { request.finish(success); }
+    }
     async waitForGPU() {
       await super.waitForGPU();
       const value = owners.get(this); if (value) await value.whenIdle();

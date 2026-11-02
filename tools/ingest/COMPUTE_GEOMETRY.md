@@ -54,6 +54,52 @@ Compute-authored indices, integer vertex fetch and repeated instance divisors
 must not be inferred from Float32 vertex-buffer support. Shader storage reads
 through authored node-material slots use the separate profile below.
 
+## Ranged and reusable compute readback
+
+`renderer.getArrayBufferAsync(attribute, target = null, offset = 0, count = -1)`
+reads the selected **byte range** of the resident GPU allocation. Offsets and
+explicit counts are multiples of four. A count of `-1` selects the remaining
+bytes; zero reads an empty range. The range addresses the actual storage layout,
+including padding such as the fourth word in a source `vec3` item.
+
+With a null target, the result is a new ArrayBuffer containing that range. A
+caller-provided ArrayBuffer is returned unchanged in identity: the selected
+bytes are copied to its beginning and any unused tail retains its previous
+contents. Reads never upload newer CPU edits or overwrite the source array.
+
+A source `ReadbackBuffer` retains its native staging allocation between reads:
+
+```js
+const result = new THREE.ReadbackBuffer(8);
+renderer.compute(reductionKernels);
+await renderer.getArrayBufferAsync(state.value, result, summaryByteOffset, 8);
+const [sum, activeCount] = new Uint32Array(result.buffer);
+result.release(); // Unmaps and detaches result.buffer; reuse the same handle.
+// Repeat compute/read/release as needed.
+result.dispose(); // Frees the staging allocation.
+```
+
+ReadbackBuffer capacity is charged to the existing compute byte budget and
+reported by `info.memory.readbackBuffers` / `readbackBuffersSize`. The handle
+remains busy until `release()` or `dispose()`, including while mapping is pending.
+The first native capacity remains in effect until disposal, even if the public
+`maxByteLength` changes. Disposal permits a later fresh use of the same source
+handle. Release/disposal before a queued copy cancels that copy;
+cleanup of an older cancelled read cannot clear a newer use. Renderer disposal
+and device loss release retained mappings and native buffers.
+
+Copies keep their position between queued compute and render calls. Mapping
+completion does not block later GPU submissions. Invalid alignment, source
+ranges, target capacities and detached caller buffers fail explicitly.
+
+`node tests/e2e/webgpu_renderer/native_compute_readback.mjs` compares the pinned
+renderer with the owned backend on three 32,768-value integer reductions using
+workgroup arrays and barriers. Chromium 151.0.7922.34 / SwiftShader matched all
+results and lifecycle observations with zero GPU errors. Seven readbacks copied
+36 bytes total from the 131,072-byte storage allocation, with a reusable
+32-byte staging buffer. This verifies the copied ranges and allocation reuse;
+it is not a hardware throughput measurement.
+
 ## Native indirect geometry
 
 The native renderer executes `BufferGeometry.setIndirect(attribute, offset)`

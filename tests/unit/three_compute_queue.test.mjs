@@ -24,7 +24,8 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
     createBindGroup: descriptor => descriptor,
     createBuffer({size, usage}) {
       const buffer = {size, usage, data: new Uint8Array(size), destroyed: 0, destroy() { this.destroyed++; }, unmap() {},
-        mapAsync: () => mapping?.promise ?? Promise.resolve(), getMappedRange() { return this.data.buffer; }};
+        mapAsync: () => mapping?.promise ?? Promise.resolve(),
+        getMappedRange(offset = 0, length = size - offset) { return this.data.buffer.slice(offset, offset + length); }};
       buffers.push(buffer); return buffer;
     },
     createCommandEncoder() {
@@ -47,7 +48,7 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
             dispatchWorkgroupsIndirect: (buffer, offset) => dispatch(() => [...new Uint32Array(buffer.data.buffer, offset, 3)]), end() {}};
         },
         copyBufferToBuffer(source, from, target, to, size) {
-          commands.push(() => { events.push(['read']); target.data.set(source.data.subarray(from, from + size), to); });
+          commands.push(() => { events.push(['read', from, size]); target.data.set(source.data.subarray(from, from + size), to); });
         },
         copyBufferToTexture(source, target, size) {
           commands.push(() => {
@@ -87,7 +88,8 @@ function setup({initialization = null, compilation = null, mapping = null} = {})
       this._targetLifetime = new AbortController();
       this._nodes = {nodeFrame: {renderId: 17, compute: null, renderer: null,
         updateBeforeNode(value) { value(this); }, updateNode(value) { value(this); }, updateAfterNode(value) { value(this); }}};
-      this.info = {calls: 0, frame: 0, compute: {calls: 0, frameCalls: 0}};
+      this.info = {calls: 0, frame: 0, compute: {calls: 0, frameCalls: 0},
+        memory: {total: 0, readbackBuffers: 0, readbackBuffersSize: 0}};
       this.inspector = {beginCompute() {}, finishCompute() {}};
     }
     async init() { if (initialization) await initialization.promise; this._initialized = true; }
@@ -136,6 +138,14 @@ function node(bindings = [], options = {}) {
 }
 const storage = attribute => ({isStorageBuffer: true, attribute});
 const read = async (renderer, data) => [...new Float32Array(await renderer.getArrayBufferAsync(data))];
+function readbackTarget(maxByteLength) {
+  const listeners = new Map();
+  return {isReadbackBuffer: true, maxByteLength, buffer: null, _mapped: false,
+    addEventListener(type, listener) { if (!listeners.has(type)) listeners.set(type, new Set()); listeners.get(type).add(listener); },
+    removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
+    release() { for (const listener of [...listeners.get('release') ?? []]) listener(); },
+    dispose() { for (const listener of [...listeners.get('dispose') ?? []]) listener(); }};
+}
 
 test('asynchronous compilation joins storage upload validation before progress', async t => {
   const {renderer, device} = setup(), validation = deferred(), data = attribute(new Float32Array([1]));
@@ -306,6 +316,109 @@ test('readback mappings do not hold the submit FIFO', async () => {
   gate.open(); await Promise.all([first, second]);
   assert.deepEqual(events.filter(e => ['dispatch', 'read'].includes(e[0])).map(e => e[0]), ['dispatch', 'read', 'dispatch']);
   mapping.resolve(); assert.deepEqual([...new Float32Array(await result)], [1]); renderer.dispose();
+});
+
+test('public readback forwards byte ranges and caller targets without copying the full storage buffer', async t => {
+  const {renderer, buffers, events} = setup(), data = attribute(new Float32Array([10, 20, 30, 40]));
+  t.after(() => renderer.dispose()); renderer.compute(node([storage(data)]));
+  const target = new Float32Array([-1, -1, -1]).buffer;
+  assert.equal(await renderer.getArrayBufferAsync(data, target, 4, 8), target);
+  assert.deepEqual([...new Float32Array(target)], [21, 31, -1]);
+  assert.deepEqual([...new Float32Array(await renderer.getArrayBufferAsync(data, null, 12))], [41]);
+  assert.deepEqual(events.filter(event => event[0] === 'read'), [['read', 4, 8], ['read', 12, 4]]);
+  assert.deepEqual(buffers.filter(buffer => buffer.usage & 1).map(buffer => buffer.size), [8, 4]);
+});
+
+test('queued source readback handles reserve immediately and preserve their compute/read/compute position', async t => {
+  const mapping = deferred(), {renderer, block, buffers, events} = setup({mapping});
+  t.after(() => { mapping.resolve(); renderer.dispose(); });
+  const data = attribute(new Float32Array([10, 20, 30, 40])), kernel = node([storage(data)]), target = readbackTarget(16), gate = block();
+  const first = renderer.computeAsync(kernel), result = renderer.getArrayBufferAsync(data, target, 4, 8), second = renderer.computeAsync(kernel);
+  assert.equal(target._mapped, true); assert.equal(target.buffer, null);
+  await assert.rejects(renderer.getArrayBufferAsync(data, target, 0, 4), /READBACK_MAPPED/);
+  gate.open(); await Promise.all([first, second]);
+  assert.deepEqual(events.filter(event => ['dispatch', 'read'].includes(event[0])).map(event => event[0]), ['dispatch', 'read', 'dispatch']);
+  mapping.resolve(); assert.equal(await result, target);
+  assert.deepEqual([...new Float32Array(target.buffer)], [21, 31]);
+  assert.deepEqual(renderer.info.memory, {total: 16, readbackBuffers: 1, readbackBuffersSize: 16});
+  target.release(); await renderer.getArrayBufferAsync(data, target, 12, 4);
+  assert.deepEqual([...new Float32Array(target.buffer)], [42]);
+  assert.equal(buffers.filter(buffer => buffer.usage & 1).length, 1);
+  target.dispose(); assert.deepEqual(renderer.info.memory, {total: 0, readbackBuffers: 0, readbackBuffersSize: 0});
+});
+
+for (const action of ['release', 'dispose'])
+test(`source ${action} cancels a readback still waiting for submission without affecting reuse`, async t => {
+  const {renderer, block, buffers, events} = setup(), data = attribute(new Float32Array([1, 2, 3, 4])), target = readbackTarget(16);
+  t.after(() => renderer.dispose()); renderer.compute(node([storage(data)]));
+  const gate = block(), first = renderer.getArrayBufferAsync(data, target, 0, 4);
+  const rejected = assert.rejects(first, /READBACK_(RELEASED|DISPOSED)/);
+  target[action](); assert.equal(target._mapped, false);
+  const second = renderer.getArrayBufferAsync(data, target, 8, 8);
+  gate.open(); await rejected; await second;
+  assert.deepEqual([...new Float32Array(target.buffer)], [4, 5]); assert.equal(target._mapped, true);
+  assert.deepEqual(events.filter(event => event[0] === 'read'), [['read', 8, 8]]);
+  assert.equal(buffers.filter(buffer => buffer.usage & 1).length, 1);
+});
+
+test('pre-init ranged readback handles and failed queue admission release their reservations', async t => {
+  const initialization = deferred(), {renderer, events} = setup({initialization});
+  t.after(() => { initialization.resolve(); renderer.dispose(); });
+  const data = attribute(new Float32Array([3, 6, 9, 12])), target = readbackTarget(8);
+  const compute = renderer.computeAsync(node([storage(data)])), result = renderer.getArrayBufferAsync(data, target, 8, 8);
+  assert.equal(target._mapped, true); assert.equal(events.length, 0);
+  initialization.resolve(); await compute; await result;
+  assert.deepEqual([...new Float32Array(target.buffer)], [10, 13]);
+  target.release();
+  const enqueue = renderer._enqueue, previousDrain = renderer._drain;
+  renderer._drain = Promise.resolve(); renderer._enqueue = () => { throw new Error('queue full'); };
+  await assert.rejects(renderer.getArrayBufferAsync(data, target, 0, 4), /queue full/);
+  assert.equal(target._mapped, false); assert.equal(target.buffer, null);
+  renderer._enqueue = enqueue; renderer._drain = previousDrain;
+  await renderer.getArrayBufferAsync(data, target, 0, 4);
+  assert.deepEqual([...new Float32Array(target.buffer)], [4]);
+});
+
+for (const failure of ['resource completion', 'released mapping'])
+test(`late ${failure} cannot leak or overwrite a reusable native mapping`, async t => {
+  const {renderer, device, buffers} = setup(), data = attribute(new Float32Array([1, 2, 3, 4])), target = readbackTarget(16);
+  t.after(() => renderer.dispose());
+  const createBuffer = device.createBuffer;
+  device.createBuffer = options => {
+    const buffer = createBuffer(options), map = buffer.mapAsync;
+    buffer.nativeMapped = false; buffer.unmapCount = 0;
+    buffer.mapAsync = async (...args) => { await map(...args); buffer.nativeMapped = true; };
+    buffer.unmap = () => { buffer.nativeMapped = false; buffer.unmapCount++; };
+    return buffer;
+  };
+  const createEncoder = device.createCommandEncoder;
+  device.createCommandEncoder = () => {
+    const encoder = createEncoder(), copy = encoder.copyBufferToBuffer;
+    encoder.copyBufferToBuffer = (source, from, destination, to, size) => {
+      assert.equal(destination.nativeMapped, false, 'a mapped staging buffer cannot accept a new GPU copy');
+      copy(source, from, destination, to, size);
+    };
+    return encoder;
+  };
+  renderer.compute(node([storage(data)]));
+  const textures = renderer._getSampledTextureInputs(), idle = deferred();
+  textures.whenIdle = () => idle.promise;
+  const first = renderer.getArrayBufferAsync(data, target, 0, 4);
+  const rejected = assert.rejects(first, failure === 'resource completion' ? /late resource failure/ : /READBACK_RELEASED/);
+  await new Promise(resolve => setImmediate(resolve));
+  const staging = buffers.find(buffer => buffer.usage === 9);
+  assert.equal(staging.nativeMapped, true); assert.equal(target._mapped, true);
+  textures.whenIdle = async () => {};
+  if (failure === 'resource completion') {
+    idle.reject(new Error('late resource failure')); await rejected;
+  } else target.release();
+  assert.equal(staging.nativeMapped, false); assert.equal(staging.unmapCount, 1);
+  assert.equal(target._mapped, false); assert.equal(target.buffer, null);
+  await renderer.getArrayBufferAsync(data, target, 4, 4);
+  if (failure === 'released mapping') { idle.resolve(); await rejected; }
+  assert.equal(target._mapped, true); assert.equal(staging.nativeMapped, true);
+  assert.deepEqual([...new Float32Array(target.buffer)], [3]);
+  assert.equal(buffers.filter(buffer => buffer.usage === 9).length, 1);
 });
 
 test('waitForGPU also waits for outstanding asynchronous compilation', async () => {

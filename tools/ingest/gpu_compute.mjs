@@ -17,19 +17,80 @@ const fail = (code, message) => { throw new GpuComputeError(code, message); };
 // WebGPU constants are also usable in command-recording Node tests.
 const COPY_SRC = 4, COPY_DST = 8, INDEX = 16, VERTEX = 32, UNIFORM = 64, STORAGE = 128, INDIRECT = 256, MAP_READ = 1;
 const positive = n => Number.isSafeInteger(n) && n > 0;
+const readbackReservations = new WeakMap(), capturedReadbacks = new WeakSet();
+
+/** Reserve a source readback handle before a deferred FIFO submission. A
+ * release/dispose before submission cancels that request, and cannot let its
+ * eventual cleanup reset a newer use of the same public handle. */
+export function captureGpuReadback(target = null, offset = 0, count = -1) {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset % 4 ||
+      count !== -1 && (!Number.isSafeInteger(count) || count < 0 || count % 4))
+    fail('READBACK_RANGE', 'Readback offset and count must be nonnegative byte multiples of four, or count -1 for the remainder');
+  const reusable = target?.isReadbackBuffer === true;
+  if (target !== null && !reusable && !(target instanceof ArrayBuffer))
+    fail('READBACK_TARGET', 'Readback target must be an ArrayBuffer or source ReadbackBuffer');
+  if (reusable && (!Number.isSafeInteger(target.maxByteLength) || target.maxByteLength < 0 ||
+      typeof target.addEventListener !== 'function' || typeof target.removeEventListener !== 'function'))
+    fail('READBACK_TARGET', 'ReadbackBuffer requires a nonnegative byte capacity and source release/dispose events');
+  if (reusable && target._mapped === true)
+    fail('READBACK_MAPPED', 'ReadbackBuffer must be released before being used again');
+  let invalid = null, finished = false, rejectCancellation;
+  const cancellation = reusable ? new Promise((_, reject) => { rejectCancellation = reject; }) : null;
+  cancellation?.catch(() => {});
+  const request = {target, offset, count, reusable, capacity: reusable ? target.maxByteLength : null,
+    check(bytes = 0) {
+      if (invalid) throw invalid;
+      if (finished) fail('READBACK_STALE', 'Readback request has already completed');
+      if (target instanceof ArrayBuffer) {
+        let view;
+        try { view = new Uint8Array(target); } catch { fail('READBACK_TARGET', 'Readback target ArrayBuffer is detached'); }
+        if (view.byteLength < bytes) fail('READBACK_TARGET', 'Readback target is smaller than the requested byte range');
+      }
+    },
+    wait(promise) { return cancellation ? Promise.race([promise, cancellation]) : promise; },
+    cancel(error) {
+      if (invalid) return;
+      invalid = error;
+      if (reusable && readbackReservations.get(target) === request) {
+        readbackReservations.delete(target); target.buffer = null; target._mapped = false;
+      }
+      request.onCancel?.(error);
+      rejectCancellation?.(error);
+    },
+    finish(success) {
+      if (finished) return;
+      if (!success) request.cancel(new GpuComputeError('READBACK_CANCELLED', 'Readback did not complete'));
+      finished = true;
+      if (reusable) {
+        target.removeEventListener('release', onRelease); target.removeEventListener('dispose', onDispose);
+        if (readbackReservations.get(target) === request) readbackReservations.delete(target);
+      }
+    }};
+  const onRelease = () => request.cancel(new GpuComputeError('READBACK_RELEASED', 'ReadbackBuffer was released before completion'));
+  const onDispose = () => request.cancel(new GpuComputeError('READBACK_DISPOSED', 'ReadbackBuffer was disposed before completion'));
+  request.check(count < 0 ? 0 : count);
+  if (reusable) {
+    target._mapped = true;
+    readbackReservations.set(target, request);
+    target.addEventListener('release', onRelease); target.addEventListener('dispose', onDispose);
+  }
+  capturedReadbacks.add(request);
+  return request;
+}
 
 export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffers = 1024,
-  maxPipelines = 256, maxCachedBindGroups = 256, signal = null} = {}) {
+  maxPipelines = 256, maxCachedBindGroups = 256, signal = null, onReadbackChange = null} = {}) {
   if (!device?.queue || typeof device.createBuffer !== 'function' ||
       ![maxBytes, maxBuffers, maxPipelines].every(positive) ||
       !Number.isSafeInteger(maxCachedBindGroups) || maxCachedBindGroups < 0)
     fail('OPTIONS', 'Expected a GPUDevice, positive resource limits and a nonnegative bind-group cache limit');
   const buffers = new Map(), pipelines = new Map(), compiled = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
+  const readbacks = new Map();
   const bindGroups = new Map();
   let bindingIds = new WeakMap(), bindingUsers = new WeakMap(), bindingLayouts = new WeakMap(), nextBindingId = 0;
   const lifetime = new AbortController();
   const attributeOwner = createComputeAttributeOwner(device);
-  let terminal = null, allocatedBytes = 0;
+  let terminal = null, allocatedBytes = 0, readbackBytes = 0;
   const live = () => { if (terminal) throw terminal; };
   function stop(error) {
     if (terminal) return;
@@ -38,6 +99,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     attributeOwner.dispose();
     bindGroups.clear();
     bindingIds = new WeakMap(); bindingUsers = new WeakMap(); bindingLayouts = new WeakMap();
+    for (const entry of [...readbacks.values()]) disposeReadback(entry, terminal);
     for (const entry of buffers.values()) entry.buffer.destroy();
     for (const buffer of staging) buffer.destroy();
     buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); compiled.clear(); allocatedBytes = 0;
@@ -78,7 +140,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     }
   }
   function budget(bytes) {
-    if (!positive(bytes) || bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Compute buffers exceed their shared byte budget');
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Compute buffers exceed their shared byte budget');
   }
   function upload(key, array, version = 0, {uniform = false, ranges = [], admission = null} = {}) {
     live();
@@ -336,30 +398,104 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     catch (error) { timestamp?.cancel(); throw error; }
     if (timestamp) timestamp.validate(Promise.all(validations));
   }
-  async function read(key) {
+  function releaseReadback(entry, error) {
+    const request = entry.request;
+    if (!request) return;
+    entry.request = null;
+    request.cancel(error);
+    entry.target.buffer = null; entry.target._mapped = false;
+    entry.buffer.unmap();
+  }
+  function disposeReadback(entry, error = new GpuComputeError('READBACK_DISPOSED', 'ReadbackBuffer was disposed')) {
+    if (readbacks.get(entry.target) !== entry) return;
+    releaseReadback(entry, error);
+    readbacks.delete(entry.target);
+    entry.target.removeEventListener('release', entry.onRelease);
+    entry.target.removeEventListener('dispose', entry.onDispose);
+    entry.buffer.destroy(); allocatedBytes -= entry.size; readbackBytes -= entry.size;
+    onReadbackChange?.(readbacks.size, readbackBytes);
+  }
+  function reusableReadback(request, copySize) {
+    let entry = readbacks.get(request.target);
+    // r186 retains the first native capacity until disposal, even if the
+    // application later edits the public maxByteLength property.
+    if (copySize > (entry?.size ?? request.capacity))
+      fail('READBACK_TARGET', 'ReadbackBuffer capacity is smaller than the requested byte range');
+    if (!entry) {
+      if (request.capacity > (device.limits?.maxBufferSize ?? Infinity))
+        fail('LIMIT', 'ReadbackBuffer capacity exceeds the device buffer size limit');
+      if (staging.size + readbacks.size >= maxBuffers) fail('BUDGET', 'Readback buffers exceed the compute buffer count budget');
+      budget(request.capacity);
+      const buffer = checked(() => device.createBuffer({label: request.target.name || 'f3d-compute-readback',
+        size: request.capacity, usage: MAP_READ | COPY_DST}));
+      entry = {target: request.target, buffer, size: request.capacity, request: null};
+      entry.onRelease = () => releaseReadback(entry, new GpuComputeError('READBACK_RELEASED', 'ReadbackBuffer was released before completion'));
+      entry.onDispose = () => disposeReadback(entry);
+      readbacks.set(entry.target, entry); allocatedBytes += entry.size; readbackBytes += entry.size;
+      entry.target.addEventListener('release', entry.onRelease); entry.target.addEventListener('dispose', entry.onDispose);
+      onReadbackChange?.(readbacks.size, readbackBytes);
+    }
+    entry.request = request;
+    // Mapping can finish before another resource owner's completion proof.
+    // A later facade failure must still release this native mapping, without
+    // touching a newer request that reused the same public handle.
+    request.onCancel = error => { if (entry.request === request) releaseReadback(entry, error); };
+    return entry;
+  }
+  async function readCaptured(key, request) {
     live();
+    if (!capturedReadbacks.has(request)) fail('READBACK_TARGET', 'Expected a captured readback request');
+    request.check();
     const entry = buffers.get(key);
     if (!entry) fail('BUFFER', 'The storage attribute has not been uploaded');
-    const {size, bytes, buffer: source} = entry;
-    budget(size);
-    const buffer = checked(() => device.createBuffer({label: 'f3d-compute-readback', size, usage: MAP_READ | COPY_DST}));
-    staging.add(buffer); allocatedBytes += size;
+    const {buffer: source} = entry, {offset, count, target} = request;
+    const bytes = count === -1 ? entry.bytes - offset : count;
+    if (offset > entry.bytes || bytes < 0 || bytes > entry.bytes - offset)
+      fail('READBACK_RANGE', 'Readback byte range exceeds the resident storage allocation');
+    request.check(bytes);
+    // Low-level byte uploads may have a padded tail; the public source storage
+    // API uses 32-bit components. Copy that padding only for an implicit tail.
+    const size = Math.ceil(bytes / 4) * 4;
+    let reusable = null, buffer;
+    if (request.reusable) { reusable = reusableReadback(request, size); buffer = reusable.buffer; }
+    else {
+      if (staging.size + readbacks.size >= maxBuffers) fail('BUDGET', 'Readback buffers exceed the compute buffer count budget');
+      budget(size);
+      buffer = checked(() => device.createBuffer({label: 'f3d-compute-readback', size, usage: MAP_READ | COPY_DST}));
+      staging.add(buffer); allocatedBytes += size;
+    }
+    let success = false;
     try {
       // Submit the snapshot before the first await so a following dispatch
       // cannot overtake this readback while mapAsync waits for completion.
       checked(() => {
         const encoder = device.createCommandEncoder({label: 'f3d-compute-readback'});
-        encoder.copyBufferToBuffer(source, 0, buffer, 0, size);
+        encoder.copyBufferToBuffer(source, offset, buffer, 0, size);
         device.queue.submit([encoder.finish()]);
       });
-      await interrupted(buffer.mapAsync(MAP_READ));
-      await interrupted(Promise.all([...pending]));
-      live();
-      return buffer.getMappedRange().slice(0, bytes);
+      await interrupted(request.wait(buffer.mapAsync(MAP_READ, 0, size)));
+      await interrupted(request.wait(Promise.all([...pending])));
+      live(); request.check(bytes);
+      const mapped = buffer.getMappedRange(0, size);
+      let result;
+      if (reusable) { target.buffer = mapped; result = target; }
+      else if (target === null) result = mapped.slice(0, bytes);
+      else { new Uint8Array(target).set(new Uint8Array(mapped, 0, bytes)); result = target; }
+      success = true;
+      return result;
     } finally {
       // stop() already destroyed and uncharged buffers on terminal paths.
-      if (staging.delete(buffer)) { buffer.unmap(); buffer.destroy(); allocatedBytes -= size; }
+      if (reusable) {
+        if (!success && reusable.request === request)
+          releaseReadback(reusable, new GpuComputeError('READBACK_CANCELLED', 'Readback did not complete'));
+      } else if (staging.delete(buffer)) { buffer.unmap(); buffer.destroy(); allocatedBytes -= size; }
     }
+  }
+  async function read(key, target = null, offset = 0, count = -1) {
+    const request = captureGpuReadback(target, offset, count);
+    let success = false;
+    try { const result = await readCaptured(key, request); success = true; return result; }
+    finally { request.finish(success); }
   }
   async function whenIdle() {
     live();
@@ -373,11 +509,12 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     await interrupted(Promise.all([...pending]));
     live();
   }
-  return {upload, release, prepare, prepareSync, dispatch, read, whenIdle, validationSnapshot,
+  return {upload, release, prepare, prepareSync, dispatch, read, readCaptured, whenIdle, validationSnapshot,
     captureUpload: (key, array, version) => { live(); return attributeOwner.capture(key, array, version); },
     releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },
     get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
+    get readbackBufferCount() { return readbacks.size; }, get readbackBytes() { return readbackBytes; },
     get cachedBindGroupCount() { return bindGroups.size; },
     dispose: () => stop(new GpuComputeError('DISPOSED', 'Compute owner is disposed'))};
 }
