@@ -2238,6 +2238,50 @@ horizontal/vertical intermediates and Float32 readbacks, with zero validation
 errors on the same Chromium/SwiftShader environment. Focused recording tests
 also cover queued Float32 resize/parameter snapshots and capability refusal.
 
+## Native screen-space reflections
+
+The pinned `SSRNode` executes its original reflection ray marching and roughness
+filtering through the native renderer. Its five authored blur mips retain
+separate render selections within one GPU texture; the source shader selects
+the reflection LOD from material roughness. The stochastic mode executes the
+original GGX sampling graph and leaves the unused blur target unallocated.
+Scene MRT normals, metalness and roughness remain ordinary source inputs:
+
+```js
+import { ssr } from 'three/addons/tsl/display/SSRNode.js';
+
+const scenePass = TSL.pass(scene, camera);
+scenePass.setMRT(TSL.mrt({
+  output: TSL.output, normal: TSL.normalView,
+  metalness: TSL.metalness, roughness: TSL.roughness,
+}));
+const color = scenePass.getTextureNode();
+const reflections = ssr(color, scenePass.getTextureNode('depth'),
+  scenePass.getTextureNode('normal'), {
+    camera, metalnessNode: scenePass.getTextureNode('metalness'),
+    roughnessNode: scenePass.getTextureNode('roughness'),
+  });
+const pipeline = new THREE.RenderPipeline(renderer, color.add(reflections));
+```
+
+Cold target layout queries do not capture an allocation: the source effect
+constructs a 1×1 placeholder with five mip descriptors, then chooses its actual
+extent in `updateBefore()`. Shader construction checks binding formats and
+device capabilities without mistaking that placeholder for a usable mip chain.
+Actual draws and texture inputs still validate the complete extent, mip count,
+sampler and resource budgets. Source resizes preserve every previously accepted
+generation; intermediate images remain on the GPU.
+
+`native_ssr.mjs` compares the unchanged pinned effect on Chromium
+151.0.7922.34/SwiftShader. Eight checkpoints cover cold startup, changing
+reflection parameters and geometry, shader rebuilding, queued resizes and both
+roughness-mip and stochastic modes. All 376,760 RGBA16F channel words across 44
+images matched exactly, including each authored mip, with nonzero reflections
+and zero GPU/browser errors. Both renderers use the same identity-swizzle
+adapter and logical frame clock; source readback padding is excluded. This is
+rendering correctness evidence, without a hardware performance claim or closure
+of the separate temporal reflection-denoising pipeline.
+
 ## Native screen-space global illumination
 
 The pinned `SSGINode` executes its original hemisphere sampling, occlusion

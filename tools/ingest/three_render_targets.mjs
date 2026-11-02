@@ -1056,12 +1056,18 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     live();
     if (!Array.isArray(targets) || !targets.length || targets.length > 64 || typeof run !== 'function')
       fail('OPTIONS', 'Expected a finite native effect target set and synchronous callback');
-    // Preflight every target before registering any scope. The effect computes
-    // its own dimensions in retained source code, so admit only an actual size
-    // change with stable attachments, formats and samples at the dispose event.
+    // This scope observes source resizing; it is not an allocation or a use of
+    // every declared target. SSR, for example, constructs a 1x1 placeholder with
+    // five authored mips, then sets the actual extent in updateBefore(). Cold
+    // targets must reach the normal capture/admission boundary at their first
+    // real use. Existing generations still require complete admission before
+    // an actual size change can preserve their attachments and formats.
     const scopes = [...new Set(targets)].map(target => {
-      const shape = inspectThreeRenderTarget(target, three);
-      if (shape.cube || shape.volume) fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D or 2D-array targets');
+      if (!(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
+      if (target.isCubeRenderTarget || target.isWebGLCubeRenderTarget || target.isRenderTarget3D ||
+          target.isWebGL3DRenderTarget || target.texture?.isData3DTexture)
+        fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D or 2D-array targets');
+      if (entries.has(target)) inspectThreeRenderTarget(target, three);
       if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
       const scope = {width: target.width, height: target.height, depth: target.depth,
         dynamic: true, event: null, shape: null};
@@ -1097,6 +1103,31 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     withNativeShadowResize: withNativeResize,
     withNativePassResize: withNativeResize,
     withNativeEffectTargets,
+    // Building a shader requires a binding layout, not a usable allocation.
+    // Source effects can describe an authored mip chain on a 1x1 placeholder
+    // and select its actual size only in updateBefore(). For cold ordinary 2D
+    // colors, inspect the base layout without capturing a generation or freezing
+    // that placeholder's mip count. Actual capture below validates every level.
+    // Keep established depth/layer/history initialization on its existing path.
+    describeNativeTexture(texture, {comparison = false} = {}) {
+      live();
+      const target = textureTarget(texture);
+      if (!target || flipY || entries.has(target) || nativePasses.has(target) || texture.isDepthTexture ||
+          target.isCubeRenderTarget || target.isWebGLCubeRenderTarget || target.isRenderTarget3D ||
+          target.isWebGL3DRenderTarget || target.isWebGLArrayRenderTarget || target.depth !== 1 ||
+          texture.isDataArrayTexture || texture.isArrayTexture || texture.isData3DTexture)
+        return this.captureNativeTexture(texture, {comparison});
+      const shape = inspectThreeRenderTarget(target, three, {colorMipProfiles:
+        Array.isArray(target.textures) ? target.textures.map(() => ({mipLevelCount: 1})) : null});
+      const device = getDevice();
+      if (!device) fail('DEVICE', 'Initialize the renderer before describing native target inputs');
+      if (shape.textures.length > 1 || shape.colorFormats.includes('rg11b10ufloat'))
+        gpuTargets.inspectGpuRenderTargetColors(device, shape.colorFormats);
+      if (comparison) fail('SAMPLER', 'Comparison sampling requires a source depth texture with compareFunction');
+      const {descriptor, sampleType} = colorSampler({shape}, texture), samples = shape.sampleCount;
+      return Object.freeze({device, sampler: Object.freeze(descriptor), sampleType, viewDimension: shape.viewDimension,
+        sampleData: Object.freeze({samples, primarySamples: 1, isMSAA: samples > 1})});
+    },
     // Native WGSL uses the attachment's top-left coordinates, not the WebGL
     // bridge's UV-flipped sampling replica. Capture only generation and sampler
     // metadata; GPU contents are observed at the consumer's FIFO submission.

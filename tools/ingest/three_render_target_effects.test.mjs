@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeRenderTargets} from './three_render_targets.mjs';
+import {createThreeComputeTargets} from './three_compute_targets.mjs';
 import {gpuPostprocessFixture} from './fixtures/animation/gpu_postprocess_fixture.mjs';
 
 function fixture(t, options = {}) {
@@ -12,6 +13,38 @@ function fixture(t, options = {}) {
   t.after(() => { owner.dispose(); target.dispose(); });
   return {...f, owner, target};
 }
+
+test('cold authored mip placeholders expose only binding layout before their source effect sizes them', t => {
+  const f = fixture(t, {flipY: false}), inputs = createThreeComputeTargets({targets: f.owner, device: f.device});
+  t.after(() => inputs.dispose());
+  f.target.setSize(1, 1); f.target.texture.mipmaps.push({}, {}, {}, {}, {});
+  f.target.texture.minFilter = T.LinearMipmapLinearFilter;
+  const binding = {texture: f.target.texture, isSampledTexture: true};
+  assert.deepEqual(inputs.layoutOf(binding), {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}});
+  assert.deepEqual(inputs.layoutOf({...binding, isSampledTexture: false, isSampler: true}), {sampler: {type: 'filtering'}});
+  assert.deepEqual(inputs.sampleData(f.target.texture), {samples: 1, primarySamples: 1, isMSAA: false});
+  assert.equal(f.owner.describeNativeTexture(f.target.texture).entry, undefined, 'layout is not a captured generation');
+  assert.equal(f.owner.allocatedBytes, 0);
+  assert.equal(f.target._listeners?.dispose?.length ?? 0, 0);
+  assert.throws(() => inputs.captureBinding(binding), {code: 'THREE_TARGET_SIZE'}, 'an unsized use still refuses');
+  f.owner.withNativeEffectTargets([f.target], () => f.target.setSize(32, 24));
+  const snapshot = inputs.captureBinding(binding), captured = f.owner.captureNativeTexture(f.target.texture);
+  assert.equal(captured.entry.shape.mipLevelCount, 5);
+  assert.equal(captured.sampler.lodMaxClamp, 4);
+  assert.equal(inputs.diagnostics.bindings, 1);
+  inputs.release(snapshot);
+});
+
+test('declared but unused cold effect targets need no backing allocation or resize', t => {
+  const f = fixture(t);
+  f.target.setSize(1, 1); f.target.texture.mipmaps.push({}, {}, {}, {}, {});
+  let updated = false;
+  f.owner.withNativeEffectTargets([f.target], () => { updated = true; });
+  assert.equal(updated, true);
+  assert.equal(f.owner.allocatedBytes, 0);
+  assert.throws(() => f.owner.captureNativeTexture(f.target.texture), {code: 'THREE_TARGET_SIZE'});
+  assert.equal(f.target._listeners?.dispose?.length ?? 0, 0);
+});
 
 test('effect resize scopes preserve every accepted generation across successive source updates', async t => {
   const f = fixture(t), first = f.owner.captureNativeTexture(f.target.texture);

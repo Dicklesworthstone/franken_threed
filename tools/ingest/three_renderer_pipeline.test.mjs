@@ -11,6 +11,7 @@ import {bloom} from '../../upstream/three.js/examples/jsm/tsl/display/BloomNode.
 import {gaussianBlur} from '../../upstream/three.js/examples/jsm/tsl/display/GaussianBlurNode.js';
 import {ssgi} from '../../upstream/three.js/examples/jsm/tsl/display/SSGINode.js';
 import {traa} from '../../upstream/three.js/examples/jsm/tsl/display/TRAANode.js';
+import {ssr} from '../../upstream/three.js/examples/jsm/tsl/display/SSRNode.js';
 
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
@@ -77,6 +78,62 @@ function traaPipeline(t, f) {
   t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
   return {pass, effect, pipeline};
 }
+
+for (const stochastic of [false, true]) test(`native SSR starts from its cold authored mip target (stochastic ${stochastic})`, async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera);
+  pass.setMRT(N.mrt({output: N.output, normal: N.normalView, metalness: N.float(1), roughness: N.float(.45)}));
+  const effect = ssr(pass.getTextureNode(), pass.getTextureNode('depth'), pass.getTextureNode('normal'),
+    {camera: f.camera, metalnessNode: pass.getTextureNode('metalness'),
+      roughnessNode: pass.getTextureNode('roughness'), stochastic});
+  const pipeline = new T.RenderPipeline(f.renderer, effect);
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  assert.deepEqual([effect._blurRenderTarget.width, effect._blurRenderTarget.height], [1, 1]);
+  assert.equal(effect._blurRenderTarget.texture.mipmaps.length, 5);
+  f.renderer._nodes.nodeFrame.update(); pipeline.render(); await drain(f.renderer);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, stochastic ? 3 : 8, 'scene, original SSR, optional five blur levels, output');
+  const blur = f.device.passes.filter(pass => pass.desc.colorAttachments[0]?.view.texture.mipLevelCount === 5);
+  assert.equal(blur.length, stochastic ? 0 : 5, 'unused private blur target has no GPU work');
+  if (!stochastic) {
+    assert.deepEqual(blur.map(pass => pass.desc.colorAttachments[0].view.baseMipLevel), [0, 1, 2, 3, 4]);
+    assert.equal(new Set(blur.map(pass => pass.desc.colorAttachments[0].view.texture)).size, 1);
+  }
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.getRenderTarget(), null);
+});
+
+test('queued SSR roughness passes retain every authored mip generation and per-frame uniforms across resize', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = N.pass(f.scene, f.camera);
+  pass.setMRT(N.mrt({output: N.output, normal: N.normalView, metalness: N.float(1), roughness: N.float(.45)}));
+  const effect = ssr(pass.getTextureNode(), pass.getTextureNode('depth'), pass.getTextureNode('normal'),
+    {camera: f.camera, metalnessNode: pass.getTextureNode('metalness'), roughnessNode: pass.getTextureNode('roughness')});
+  effect.maxDistance.setName('ssrFrameDistance');
+  const pipeline = new T.RenderPipeline(f.renderer, effect), sizes = [[64, 48], [96, 60], [32, 24]], distances = [3.25, 7.5, 11.75];
+  t.after(() => { pipeline.dispose(); effect.dispose(); pass.dispose(); });
+  for (let i = 0; i < sizes.length; i++) {
+    f.renderer.setSize(...sizes[i], false); effect.maxDistance.value = distances[i];
+    f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  }
+  assert.equal(f.device.submissions.length, 0);
+  effect.maxDistance.value = 99; await drain(f.renderer);
+  const blur = f.device.passes.filter(pass => pass.desc.colorAttachments[0]?.view.texture.mipLevelCount === 5);
+  assert.equal(blur.length, 15);
+  for (let frame = 0; frame < sizes.length; frame++) {
+    const levels = blur.slice(frame * 5, frame * 5 + 5), images = levels.map(pass => pass.desc.colorAttachments[0].view.texture);
+    assert.equal(new Set(images).size, 1);
+    assert.deepEqual([images[0].width, images[0].height], sizes[frame]);
+    assert.deepEqual(levels.map(pass => pass.desc.colorAttachments[0].view.baseMipLevel), [0, 1, 2, 3, 4]);
+  }
+  assert.equal(new Set(blur.map(pass => pass.desc.colorAttachments[0].view.texture)).size, 3);
+  const reflections = nativeDraws(f.device).filter(draw => shader(draw).includes('ssrFrameDistance'));
+  assert.equal(reflections.length, 3);
+  for (let frame = 0; frame < reflections.length; frame++) {
+    assert.ok(uniformWords(reflections[frame]).includes(distances[frame]));
+    assert.ok(!uniformWords(reflections[frame]).includes(99));
+  }
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.getRenderTarget(), null);
+});
 
 for (const Class of [T.MeshStandardMaterial, T.MeshBasicMaterial]) test(`pass lighting contexts route ordinary ${Class.name} through source lighting and retain queued inputs`, async t => {
   const f = fixture(t); f.mesh.material = new Class(); await f.renderer.init();

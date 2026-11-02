@@ -45,11 +45,13 @@ export function createThreeComputeTargets({targets, device, signal = null,
     if (validation) validations.add(task);
     task.finally(() => { pending.delete(task); validations.delete(task); }).catch(() => {});
   }
-  function describe(binding) {
+  function describe(binding, capture = true) {
     live();
     if (!binding?.isSampler && !binding?.isSampledTexture) fail('BINDING', 'Expected a texture or sampler binding');
     if (binding.store) fail('ACCESS', 'Render-target inputs are read-only; use StorageTexture for compute writes');
-    const source = targets.captureNativeTexture(binding.texture, {comparison: binding.comparison === true});
+    const inspect = !capture && typeof targets.describeNativeTexture === 'function'
+      ? targets.describeNativeTexture : targets.captureNativeTexture;
+    const source = inspect.call(targets, binding.texture, {comparison: binding.comparison === true});
     if (source.device !== device) fail('DEVICE', 'Compute and render targets must use the same GPUDevice');
     const sampler = binding.isSampler && !binding.isSampledTexture;
     const layout = sampler ? {sampler: {type: source.sampler.compare !== undefined ? 'comparison'
@@ -83,8 +85,8 @@ export function createThreeComputeTargets({targets, device, signal = null,
   }
   return {
     owns(snapshot) { return leases.has(snapshot); },
-    layoutOf(binding) { return describe(binding).layout; },
-    sampleData(texture) { return describe({texture, isSampledTexture: true}).source.sampleData; },
+    layoutOf(binding) { return describe(binding, false).layout; },
+    sampleData(texture) { return describe({texture, isSampledTexture: true}, false).source.sampleData; },
     captureBinding(binding) {
       if (active) fail('REENTRY', 'Cannot capture target inputs during a borrowed dispatch');
       const record = describe(binding);
