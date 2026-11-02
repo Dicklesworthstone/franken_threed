@@ -59,8 +59,13 @@ export function captureThreeCamera(T, source, array = false) {
     fail('CAMERA', 'Native camera views require perspective or orthographic cameras');
   const result = view(source);
   for (const key of ['id', 'uuid', 'name', 'type', 'isCamera', 'isPerspectiveCamera', 'isOrthographicCamera',
-    'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth'])
+    'isArrayCamera', 'isMultiViewCamera', 'coordinateSystem', 'near', 'far', 'zoom', 'fov', 'aspect', '_reversedDepth',
+    'filmGauge', 'filmOffset', 'left', 'right', 'top', 'bottom'])
     if (key in source) put(result, key, source[key]);
+  // WebGL cube captures can reach their first reversed-depth draw after being
+  // queued. Their projection update needs the accepted lens/frustum inputs,
+  // including a private view offset, rather than later source-camera edits.
+  put(result, 'view', source.view === null ? null : {...source.view});
   for (const key of ['matrixWorld', 'matrixWorldInverse', 'projectionMatrix', 'projectionMatrixInverse'])
     put(result, key, new T.Matrix4().copy(source[key]));
   const layers = new T.Layers(); layers.mask = source.layers.mask; put(result, 'layers', layers);

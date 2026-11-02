@@ -26,7 +26,7 @@
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
- *   mapping, logarithmic/reversed depth, unsupported output color spaces,
+ *   mapping, unsupported output color spaces,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
  */
@@ -230,6 +230,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 state: () => ({toneMapping: owner.toneMapping, toneMappingExposure: owner.toneMappingExposure, outputColorSpace: owner.outputColorSpace,
                   pixelRatio: owner._pixelRatio, height: owner._height, shadowMap: owner.shadowMap, shadowMapType: owner.shadowMap.type, renderer: owner,
                   logarithmicDepthBuffer: owner.logarithmicDepthBuffer === true,
+                  reversedDepthBuffer: owner.reversedDepthBuffer === true,
                   floatLinear: device.features?.has?.('float32-filterable') === true, ...owner._programFrame,
                   // Public targets keep top-down native storage (the target owner
                   // provides UV-oriented sampling). Do not use the compiler's
@@ -470,8 +471,6 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     async _init() {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
-      if (this._shaderEncodedOutput && this.reversedDepthBuffer)
-        fail('UNSUPPORTED', 'Reversed depth requires the native WebGPU renderer');
       if (this.stencil && !this.depth) fail('UNSUPPORTED', 'Stencil framebuffers currently require a depth attachment');
       const p = this._parameters;
       if (p.outputType !== undefined && ![THREE.UnsignedByteType, THREE.HalfFloatType].includes(p.outputType))
@@ -1094,11 +1093,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
       const snapshot = this._shaderEncodedOutput ? this._passSnapshots.capture(scene, camera) : null;
+      let cameraSource = snapshot ? camera : null;
       if (this._shaderEncodedOutput && destination.shape?.webglCube && !snapshot && captureCameras) {
         // CubeCamera submits six public renders before preparation can finish.
         // Keep those source face poses even if the next capture moves it while
         // the first cube is queued. Scene/material ownership is unchanged.
         if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+        cameraSource = camera;
         camera = captureThreeCamera(THREE, camera);
       }
       let matricesUpdated = false;
@@ -1157,6 +1158,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
+            reversedDepthBuffer: this.reversedDepthBuffer === true,
+            ...(cameraSource ? {cameraSource, cameraSnapshot: snapshot?.camera ?? camera} : {}),
             ...(this._shaderEncodedOutput ? {
               passClear: clearOnly ? {...clearOnly} : {color: this.autoClear && this.autoClearColor,
                 depth: this.autoClear && this.autoClearDepth, stencil: this.autoClear && this.autoClearStencil},
@@ -1453,6 +1456,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // state. Only deferred calls need the queued renderer-state snapshot.
       this._programFrame = deferred ? programFrame : this._shaderEncodedOutput ? {
         passState: programFrame.passState, passClear: programFrame.passClear, passBackgroundClear: programFrame.passBackgroundClear,
+        cameraSource: programFrame.cameraSource, cameraSnapshot: programFrame.cameraSnapshot,
       } : undefined;
       try {
         const issue = () => {
@@ -1738,7 +1742,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // Even auto-clears can be scissored or retain other attachments.
               // Logarithmic fragment depth also requires the source programs.
               if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true ||
-                  this._shaderEncodedOutput && (this.preserveDrawingBuffer === true || this.logarithmicDepthBuffer === true)) throw error;
+                  this._shaderEncodedOutput && (this.preserveDrawingBuffer === true || this.logarithmicDepthBuffer === true || this.reversedDepthBuffer === true)) throw error;
               this._hdrFallback = true;
               this._session.dispose();
               const fallbackHdr = selectOutput();
@@ -2026,8 +2030,8 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
   }
   for (const name of ['extensions', 'properties', 'renderLists'])
     Object.defineProperty(WebGLRenderer.prototype, name, glOnly(name));
-  // WebGLState: only facts true of THIS renderer are served. Depth is never
-  // reversed (capabilities.reversedDepthBuffer is false). setMask(true) is what
+  // WebGLState: only facts true of THIS renderer are served. Reversed depth
+  // reports the active owned depth mode. setMask(true) is what
   // CubeCamera/Reflector/Water call before clearing depth. Preserve that request
   // in the private state too, where a retained MaskPass may hold its lock. Any
   // other GL state access (masks off, stencil, raw viewport) throws explicitly.
@@ -2039,7 +2043,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
   Object.defineProperty(WebGLRenderer.prototype, 'state', {configurable: true, get() {
     if (!webglStates.has(this)) {
       const depthState = glState('buffers.depth.', {
-        getReversed: () => false,
+        getReversed: () => this.reversedDepthBuffer === true,
         setMask: mask => {
           if (mask !== true) fail('UNSUPPORTED', 'WebGLRenderer.state.buffers.depth.setMask(false) needs GL depth-mask state; this route has none');
           registerThreePassState(this, THREE).buffers.depth.setMask(true);
@@ -2054,7 +2058,7 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
   // r186's WebGPU backend reports) and the depth/precision modes it admits.
   // GL-context limits (texture units, uniform vectors, ...) throw explicitly.
   Object.defineProperty(WebGLRenderer.prototype, 'capabilities', {configurable: true, get() {
-    const known = {getMaxAnisotropy: () => 16, logarithmicDepthBuffer: this.logarithmicDepthBuffer === true, reversedDepthBuffer: false, precision: 'highp',
+    const known = {getMaxAnisotropy: () => 16, logarithmicDepthBuffer: this.logarithmicDepthBuffer === true, reversedDepthBuffer: this.reversedDepthBuffer === true, precision: 'highp',
       getMaxPrecision: () => 'highp', isWebGL2: true};
     return new Proxy(known, {get(target, key) {
       if (typeof key === 'symbol' || Object.hasOwn(target, key)) return target[key];

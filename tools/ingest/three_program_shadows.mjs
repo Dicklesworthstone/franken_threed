@@ -4,7 +4,7 @@
  * `WebGLShadowMap.render` / `getDepthMaterial` / `renderObject`, operating on the
  * application's own THREE classes: it allocates `light.shadow.map` as r186 does
  * (WebGLRenderTarget + DepthTexture, or WebGLCubeRenderTarget + CubeDepthTexture
- * for point lights; LessEqual compare and linear filtering for PCF, nearest for
+ * for point lights; LessEqual/GreaterEqual compare and linear filtering for PCF, nearest for
  * Basic), updates shadow cameras/matrices/frustums, culls casters per face,
  * selects MeshDepthMaterial / MeshDistanceMaterial (or the object's custom
  * depth/distance material, or a per-material clone when alpha test, displacement
@@ -16,7 +16,8 @@
  * a depth32float map (cube maps: one 2D layer per face) with the shadow
  * camera's uniforms packed at the draw's source call. Receivers bind the same
  * map: PCF as `sampler2DShadow` / `samplerCubeShadow` (comparison sampler,
- * less-equal, linear), Basic as an unfilterable `sampler2D` / `samplerCube`.
+ * less-equal or reversed greater-equal, linear), Basic as an unfilterable
+ * `sampler2D` / `samplerCube`.
  *
  * Differences stated, not hidden: maps are depth32float where r186 WebGL
  * allocates 24-bit DEPTH_COMPONENT24 (UnsignedIntType); comparisons are at least
@@ -33,8 +34,10 @@
  * the depth material: the horizontal pass clears and covers every texel, so the
  * final map contents are the same. VSM point lights warn and are skipped as in
  * r186. Point casters use the existing source-sized quad program; mesh
- * wireframes share the scene's derived edge indices. Explicit errors: reversed depth,
- * a point light whose existing map changes to VSM. A new light, a map-size change or a shadow-type change is a
+ * wireframes share the scene's derived edge indices. Reversed depth preserves
+ * the source camera projection, comparison sampler and zero depth clears.
+ * Explicit errors: a point light whose existing map changes to VSM.
+ * A new light, a map-size change or a shadow-type change is a
  * preparation boundary (the map's GPU texture and the receivers' programs change).
  * No performance claim.
  */
@@ -156,6 +159,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     [compiled.key, idOf(gpu), geometry.signature, JSON.stringify(glRaster), ...textures.map(t => idOf(t.view) + ':' + idOf(t.sampler))].join('\u0001');
   const live = () => { if (disposed) fail('DISPOSED', 'Program shadow owner is disposed'); };
   const normalizedType = settings => settings.type === T.PCFSoftShadowMap ? T.PCFShadowMap : settings.type;
+  const reversedDepth = () => support.state().reversedDepthBuffer === true;
   const runs = settings => settings.enabled === true && (settings.autoUpdate !== false || settings.needsUpdate === true);
   const updates = light => !(light.shadow.autoUpdate === false && light.shadow.needsUpdate === false);
 
@@ -210,7 +214,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
       if (shadowMapSize.x > maxTextureSize) { viewportSize.x = Math.floor(maxTextureSize / frameExtents.x); shadowMapSize.x = viewportSize.x * frameExtents.x; shadow.mapSize.x = viewportSize.x; }
       if (shadowMapSize.y > maxTextureSize) { viewportSize.y = Math.floor(maxTextureSize / frameExtents.y); shadowMapSize.y = viewportSize.y * frameExtents.y; shadow.mapSize.y = viewportSize.y; }
     }
-    shadow.camera._reversedDepth = false;
+    shadow.camera._reversedDepth = reversedDepth();
     if (shadow.map === null || typeChanged === true) {
       if (shadow.map !== null) {
         if (shadow.map.depthTexture !== null) { shadow.map.depthTexture.dispose(); shadow.map.depthTexture = null; }
@@ -242,7 +246,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
       shadow.map.depthTexture.name = light.name + '.shadowMap';
       shadow.map.depthTexture.format = T.DepthFormat;
       if (type === T.PCFShadowMap) {
-        shadow.map.depthTexture.compareFunction = T.LessEqualCompare;
+        shadow.map.depthTexture.compareFunction = reversedDepth() ? T.GreaterEqualCompare : T.LessEqualCompare;
         shadow.map.depthTexture.minFilter = T.LinearFilter; shadow.map.depthTexture.magFilter = T.LinearFilter;
       } else {
         shadow.map.depthTexture.compareFunction = null;
@@ -332,13 +336,14 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     if (m) destroyMap(m);
     const texture = device.createTexture({label: `${label}/${depth.name}`, size: [target.width, target.height, cube ? 6 : 1], format: DEPTH_FORMAT, usage: 16 | 4});
     const compare = depth.compareFunction != null;
+    if (compare && depth.compareFunction !== T.LessEqualCompare && depth.compareFunction !== T.GreaterEqualCompare)
+      fail('MAP', 'Source shadow maps require LessEqual or GreaterEqual depth comparisons');
     m = {texture, width: target.width, height: target.height, cube, depth,
       faces: Array.from({length: cube ? 6 : 1}, (_, face) => texture.createView({dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1})),
       binding: {view: texture.createView({dimension: cube ? 'cube' : '2d'}),
-        sampler: device.createSampler({label, ...(compare ? {compare: 'less-equal', magFilter: 'linear', minFilter: 'linear'} : {}),
+        sampler: device.createSampler({label, ...(compare ? {compare: depth.compareFunction === T.GreaterEqualCompare ? 'greater-equal' : 'less-equal', magFilter: 'linear', minFilter: 'linear'} : {}),
           addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge'}),
         sampleType: compare ? 'depth' : 'unfilterable-float'}};
-    if (compare && depth.compareFunction !== T.LessEqualCompare) fail('MAP', 'Only LessEqual shadow comparisons are produced by r186 WebGLShadowMap');
     if (isVSMTarget(target)) {
       // map.texture / mapPass.texture: RG16F with linear filtering (r186 options);
       // mapPass also owns a depth buffer that VSMPass clears and tests against.
@@ -548,7 +553,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     }
     previousType = type;
     settings.needsUpdate = false;
-    return () => submit(passes);
+    const depthClearValue = reversedDepth() ? 0 : 1;
+    return () => submit(passes, depthClearValue);
   }
   const updated = new Set();
   function batchRanges(object, source) {
@@ -616,7 +622,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     if (!entry) fail('PREPARE', 'A shadow caster program or binding changed; call prepare()');
     return entry;
   }
-  function submit(passes) {
+  function submit(passes, depthClearValue) {
     updated.clear();
     if (!passes.length) return;
     meshes.write(); blurMeshes.write();
@@ -628,7 +634,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
         // loads its earlier depth/color instead of clearing those draws away.
         const colorAttachments = pass.color ? [{view: pass.color, clearValue: {r: 0, g: 0, b: 0, a: 0}, loadOp: clear ? 'clear' : 'load', storeOp: 'store'}] : [];
         const next = encoder.beginRenderPass({label, colorAttachments,
-          depthStencilAttachment: {view: pass.view, depthClearValue: 1, depthLoadOp: clear ? 'clear' : 'load', depthStoreOp: 'store'}});
+          depthStencilAttachment: {view: pass.view, depthClearValue, depthLoadOp: clear ? 'clear' : 'load', depthStoreOp: 'store'}});
         clear = false; emitted = true;
         // rows:'gl': WebGPU row index equals GL's bottom-up window y.
         const [x, y, w, h] = pass.rect; next.setViewport(x, y, w, h, 0, 1);

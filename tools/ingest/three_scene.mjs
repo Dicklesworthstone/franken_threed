@@ -295,7 +295,7 @@ export async function createGpuThreeScene(device,scene,{
     if(view.isInstancedBufferGeometry)programGeometries_.add(g);
     // Captured fixed views already proved rigid. A later geometry replacement
     // cannot redirect an accepted draw into the live deformation owner.
-    if(!fixed&&hasThreeDeformation(object)&&!programToneMapping()&&!programLogDepth()&&!capturedNodeObject(object)){
+    if(!fixed&&hasThreeDeformation(object)&&!programToneMapping()&&!programDepthMode()&&!capturedNodeObject(object)){
       try{inspectThreeDeformation(object,{...deformationOptions,three,sourceAttributeCallbacks});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
@@ -443,7 +443,7 @@ export async function createGpuThreeScene(device,scene,{
     if(!lights.length)return false;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
-    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programLogDepth()||nodes.some(o=>o.castShadow&&
+    if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programDepthMode()||nodes.some(o=>o.castShadow&&
       (o.isLine||o.isPoints||o.isBatchedMesh||sourceMaterials(o).some(m=>materialState(m)?.wireframe===true)||
         o.customDepthMaterial!=null||o.customDistanceMaterial!=null||
         o.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||o.onAfterShadow!==three.Object3D.prototype.onAfterShadow)))return true;
@@ -666,9 +666,10 @@ export async function createGpuThreeScene(device,scene,{
   // every draw is its ShaderLib program; anything else is a TONE_MAPPING error
   // (the facade then keeps its whole-image output pass instead).
   const programToneMapping=()=>programRoute()&&(programSupport.state?.().toneMapping??three.NoToneMapping)!==three.NoToneMapping;
-  // Logarithmic depth is authored in each source fragment shader, including
-  // shadow/deformation variants; the fixed material path cannot supply it.
-  const programLogDepth=()=>programRoute()&&programSupport.state?.().logarithmicDepthBuffer===true;
+  // Source logarithmic/reversed depth changes shader and raster conventions,
+  // including shadow/deformation variants; every material uses its program.
+  const programReversedDepth=()=>programRoute()&&programSupport.state?.().reversedDepthBuffer===true;
+  const programDepthMode=()=>programRoute()&&(programSupport.state?.().logarithmicDepthBuffer===true||programReversedDepth());
   // scene.environment read by programs through r186 PMREM instead of the core's
   // panorama owner: always under in-shader tone mapping, otherwise when the core
   // owner cannot take the source.
@@ -676,7 +677,7 @@ export async function createGpuThreeScene(device,scene,{
     const env=scene.environment;
     if(!programRoute()||!env)return false;
     // Renderer-route PMREMGenerator.fromScene captures: r186 PMREM through programs.
-    if(programToneMapping()||programLogDepth()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
+    if(programToneMapping()||programDepthMode()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
     try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
   }
@@ -914,7 +915,7 @@ export async function createGpuThreeScene(device,scene,{
       // material mapper below follows WebGPU's unsigned reference contract.
       if((m.stencilWrite&&stencilAttachment)||programSupport.state?.().passState)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
-      if(programLogDepth())return programDescription(m,topology,object);
+      if(programDepthMode())return programDescription(m,topology,object);
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
@@ -935,7 +936,7 @@ export async function createGpuThreeScene(device,scene,{
   function coreDescription(m,clippingFrame,topology='triangles'){
     const source=m;m=materialState(m);
     if(programToneMapping())fail('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${m?.type}`);
-    if(programLogDepth())fail('DEPTH_MODE',`Logarithmic depth needs the source material program: ${m?.type}`);
+    if(programDepthMode())fail('DEPTH_MODE',`The selected depth mode needs the source material program: ${m?.type}`);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
@@ -1498,7 +1499,7 @@ export async function createGpuThreeScene(device,scene,{
     }finally{busy=false;preparing=false;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;}
   }
   function checkCamera(camera){
-    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||(camera.reversedDepth&&!nativeLightMode))
+    if(!(camera instanceof three.Camera)||(!camera.isPerspectiveCamera&&!camera.isOrthographicCamera)||(camera.reversedDepth&&!nativeLightMode&&!programRoute()))
       fail('CAMERA','Supply a perspective or orthographic source camera; reversed depth requires a complete native draw capture');
     if(![three.WebGLCoordinateSystem,three.WebGPUCoordinateSystem].includes(camera.coordinateSystem))fail('CAMERA','Unknown source clip convention');
   }
@@ -1510,7 +1511,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     vp.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse);
     frustum.setFromProjectionMatrix(vp,camera.coordinateSystem,camera.reversedDepth);clip.copy(vp);
-    if(camera.coordinateSystem===three.WebGLCoordinateSystem)
+    if(camera.coordinateSystem===three.WebGLCoordinateSystem&&!programReversedDepth())
       for(let c=0;c<4;c++)clip.elements[c*4+2]=0.5*(vp.elements[c*4+2]+vp.elements[c*4+3]);
     return camera.isOrthographicCamera?{viewDirection:[camera.matrixWorld.elements[8],camera.matrixWorld.elements[9],camera.matrixWorld.elements[10]]}:
       {cameraPosition:position(camera)};
@@ -1533,7 +1534,7 @@ export async function createGpuThreeScene(device,scene,{
       const projected=new three.Matrix4().multiplyMatrices(child.projectionMatrix,child.matrixWorldInverse);
       const childFrustum=new three.Frustum().setFromProjectionMatrix(projected,child.coordinateSystem,child.reversedDepth);
       const viewProjection=projected.elements.slice();
-      if(child.coordinateSystem===three.WebGLCoordinateSystem&&profile.clipSpace!=='webgpu')
+      if(child.coordinateSystem===three.WebGLCoordinateSystem&&profile.clipSpace!=='webgpu'&&!programReversedDepth())
         for(let c=0;c<4;c++)viewProjection[c*4+2]=0.5*(projected.elements[c*4+2]+projected.elements[c*4+3]);
       if(viewProjection.some(n=>!Number.isFinite(Math.fround(n))))fail('CAMERA','ArrayCamera projection must fit finite f32');
       // Source culling uses the child's convention, but the native renderer

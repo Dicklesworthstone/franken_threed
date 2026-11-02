@@ -264,8 +264,8 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
       renderer.setClearColor(previousClear, previousAlpha);
       if (previousViewport !== undefined) camera.viewport = previousViewport;
     }
-    const gpu = state.gpu;
-    return () => submit(gpu, clear, opaqueCommands, backCommands);
+    const gpu = state.gpu, depthClearValue = support.state().reversedDepthBuffer === true ? 0 : 1;
+    return () => submit(gpu, clear, opaqueCommands, backCommands, depthClearValue);
   }
   function encodeDraws(encoder, commands, descriptor, gpu) {
     let pass = null, started = false;
@@ -296,13 +296,13 @@ export function createThreeProgramTransmission({three: T, device, support, bindi
     if (!pass) begin();
     pass.end();
   }
-  function submit(gpu, clear, opaqueCommands, backCommands) {
+  function submit(gpu, clear, opaqueCommands, backCommands, depthClearValue) {
     meshes.write();
     const encoder = device.createCommandEncoder({label});
     const back = backCommands.length > 0;
     encodeDraws(encoder, opaqueCommands, {label,
       colorAttachments: [{view: gpu.msaaView, resolveTarget: gpu.levels[0], clearValue: clear, loadOp: 'clear', storeOp: back ? 'store' : 'discard'}],
-      depthStencilAttachment: {view: gpu.depthView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: back ? 'store' : 'discard'}}, gpu);
+      depthStencilAttachment: {view: gpu.depthView, depthClearValue, depthLoadOp: 'clear', depthStoreOp: back ? 'store' : 'discard'}}, gpu);
     generateMips(encoder, gpu);
     if (back) {
       // The back faces sample the resolved texture, so this pass only writes the

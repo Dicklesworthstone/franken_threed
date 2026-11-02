@@ -1,5 +1,6 @@
 // Pinned WebGL BatchedMesh transmission vs F3D-owned WebGPU submission.
 // Raw target pixels and callback/instance order; SwiftShader correctness only.
+// Add --reversed-depth to exercise EXT_clip_control and the reversed prepass.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -13,6 +14,7 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.
 const {chromium} = createRequire(process.env.PLAYWRIGHT_MODULE_DIR ?? '/opt/node-tools/node_modules/')('playwright');
 const {rollup} = createRequire(path.join(repo, 'tools/package.json'))('rollup');
 const pin = '148ef33ecb6d2502ff796d4554abd1549c95d519';
+const reversedDepthBuffer = process.argv.includes('--reversed-depth');
 for (const file of ['build/three.core.js', 'build/three.module.js']) {
   const expected = execFileSync('git', ['show', `${pin}:${file}`],
     {cwd: path.join(repo, 'upstream/three.js'), maxBuffer: 16 * 1024 * 1024});
@@ -48,13 +50,15 @@ async function capture(mode) {
     page.on('pageerror', error => browserErrors.push(String(error)));
     page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    const result = await page.evaluate(async mode => {
+    const result = await page.evaluate(async ({mode, reversedDepthBuffer}) => {
       const T = await import('/upstream/three.js/build/three.module.js');
       const Renderer = mode === 'source' ? T.WebGLRenderer : (await import('/renderer.mjs')).createWebGLRendererClass(T);
       const canvas = document.createElement('canvas'); document.body.appendChild(canvas);
-      const renderer = new Renderer({canvas, antialias: false}), errors = [], frames = [];
+      const renderer = new Renderer({canvas, antialias: false, reversedDepthBuffer}), errors = [], frames = [];
       try {
         if (mode === 'candidate') { await renderer.init(); renderer._device.addEventListener('uncapturederror', event => errors.push(event.error.message)); }
+        if (mode === 'source' && reversedDepthBuffer && (!renderer.getContext().getExtension('EXT_clip_control') ||
+            renderer.capabilities.reversedDepthBuffer !== true)) throw Error('Source EXT_clip_control reversed depth is not active');
         renderer.setSize(96, 64, false); renderer.outputColorSpace = T.LinearSRGBColorSpace; renderer.toneMapping = T.NoToneMapping;
         for (const indexed of [true, false]) {
           const target = new T.WebGLRenderTarget(96, 64), scene = new T.Scene(), trace = [], resources = [];
@@ -137,10 +141,10 @@ async function capture(mode) {
             await checkpoint('reordered-half-resolution-views');
           } finally { for (const resource of resources) resource.dispose(); target.dispose(); }
         }
-        return {frames, errors, route: renderer.info.f3d?.route,
+        return {frames, errors, route: renderer.info.f3d?.route, reversedDepthBuffer: renderer.capabilities.reversedDepthBuffer,
           nativeDrawCalls: frames.reduce((sum, frame) => sum + frame.nativeDrawCalls, 0)};
       } finally { renderer.dispose(); canvas.remove(); }
-    }, mode);
+    }, {mode, reversedDepthBuffer});
     assert.deepEqual(browserErrors, [], `${mode} browser errors`); assert.deepEqual(result.errors, [], `${mode} GPU errors`);
     return {...result, browserVersion: browser.version()};
   } finally { await browser.close(); }
@@ -155,6 +159,7 @@ try {
       assert.notDeepEqual(frames[a].pixels, frames[b].pixels, `${frames[b].name}: source transition must change pixels`);
   }
   const candidate = await capture('candidate');
+  assert.equal(source.reversedDepthBuffer, reversedDepthBuffer); assert.equal(candidate.reversedDepthBuffer, reversedDepthBuffer);
   assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.nativeDrawCalls > 0);
   const results = source.frames.map((reference, i) => {
     const actual = candidate.frames[i]; assert.equal(actual.name, reference.name);
@@ -173,7 +178,7 @@ try {
     assert.ok(over / (reference.pixels.length / 4) <= .02, `${reference.name}: ${over} pixels exceed tolerance (max ${maxError})`);
     return {checkpoint: reference.name, maxError, differingBytes, pixelsOverTolerance: over};
   });
-  console.log(JSON.stringify({case: 'program_batch_transmission', status: 'pass', results,
+  console.log(JSON.stringify({case: 'program_batch_transmission', status: 'pass', reversedDepthBuffer, results,
     rgbaBytes: source.frames.reduce((sum, frame) => sum + frame.pixels.length, 0), channelTolerance: 12, pixelBudget: .02,
     route: candidate.route, nativeDrawCalls: candidate.nativeDrawCalls, gpuErrors: 0, browserErrors: 0,
     browserVersion: candidate.browserVersion, sourcePin: pin}));

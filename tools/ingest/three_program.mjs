@@ -18,7 +18,7 @@
  * leaves them) into the reflected uniform-buffer layout every frame.
  *
  * Not admitted yet (explicit errors): material.lights, skinning, morph targets,
- * batching, clipping planes, uniformsGroups, reversed depth, custom
+ * batching, clipping planes, uniformsGroups, custom
  * extensions, onBeforeCompile hooks. No performance claim.
  */
 import {compileEsslProgram} from './essl_wgsl.mjs';
@@ -76,7 +76,7 @@ export function threeClippingState(T, controls, material, camera, {shadows = fal
 export const bindsClippingPlanes = m => (!m.isShaderMaterial && !m.isRawShaderMaterial) || m.clipping === true;
 
 /** WebGLState.setMaterial raster state as WebGPU pipeline fragments. */
-export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'triangles', side = m.side} = {}) {
+export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'triangles', side = m.side, reversedDepthBuffer = false} = {}) {
   const factor = new Map([[T.ZeroFactor, 'zero'], [T.OneFactor, 'one'], [T.SrcColorFactor, 'src'], [T.OneMinusSrcColorFactor, 'one-minus-src'],
     [T.SrcAlphaFactor, 'src-alpha'], [T.OneMinusSrcAlphaFactor, 'one-minus-src-alpha'], [T.DstAlphaFactor, 'dst-alpha'], [T.OneMinusDstAlphaFactor, 'one-minus-dst-alpha'],
     [T.DstColorFactor, 'dst'], [T.OneMinusDstColorFactor, 'one-minus-dst'], [T.SrcAlphaSaturateFactor, 'src-alpha-saturated'],
@@ -107,6 +107,10 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
   const DEPTH = {[T.NeverDepth]: 'never', [T.AlwaysDepth]: 'always', [T.LessDepth]: 'less', [T.LessEqualDepth]: 'less-equal',
     [T.EqualDepth]: 'equal', [T.GreaterEqualDepth]: 'greater-equal', [T.GreaterDepth]: 'greater', [T.NotEqualDepth]: 'not-equal'};
   if (!DEPTH[m.depthFunc]) fail('MATERIAL', 'Unsupported depth function');
+  const depth = DEPTH[m.depthFunc];
+  const depthCompare = reversedDepthBuffer
+    ? ({never: 'always', always: 'never', less: 'greater', 'less-equal': 'greater-equal',
+      equal: 'not-equal', 'greater-equal': 'less-equal', greater: 'less', 'not-equal': 'equal'}[depth]) : depth;
   let flip = side === T.BackSide;
   if (frontFaceCW) flip = !flip;
   const triangles = topology === 'triangles';
@@ -114,9 +118,10 @@ export function threeProgramRaster(T, m, {frontFaceCW = false, topology = 'trian
     ...threeProgramStencil(T, m, fail),
     blend, blendConstant, writeMask: m.colorWrite ? 0xf : 0,
     // GL disables depth writes together with DEPTH_TEST, even if depthMask is true.
-    depthCompare: m.depthTest ? DEPTH[m.depthFunc] : 'always', depthWriteEnabled: m.depthTest && m.depthWrite,
+    depthCompare: m.depthTest ? depthCompare : 'always', depthWriteEnabled: m.depthTest && m.depthWrite,
     cullMode: side === T.DoubleSide || !triangles ? 'none' : 'back', frontFace: flip ? 'cw' : 'ccw',
-    depthBias: m.polygonOffset && triangles ? m.polygonOffsetUnits : 0, depthBiasSlopeScale: m.polygonOffset && triangles ? m.polygonOffsetFactor : 0,
+    depthBias: m.polygonOffset && triangles ? m.polygonOffsetUnits : 0,
+    depthBiasSlopeScale: m.polygonOffset && triangles ? m.polygonOffsetFactor * (reversedDepthBuffer ? -1 : 1) : 0,
     // SAMPLE_ALPHA_TO_COVERAGE: GL ignores it on single-sampled framebuffers;
     // the pipeline enables it only when its target is multisampled.
     alphaToCoverage: m.alphaToCoverage === true,
@@ -313,12 +318,13 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping, beforeCompile: p => beforeCompile(material, p),
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
       shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap,
-      logarithmicDepthBuffer: s.logarithmicDepthBuffer === true});
+      logarithmicDepthBuffer: s.logarithmicDepthBuffer === true, reversedDepthBuffer: s.reversedDepthBuffer === true});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
-    const points = object.isPoints === true, key = sources.key + (points ? '\u0000points' : '') + (renderTarget ? '\u0000gl-rows' : '');
+    const points = object.isPoints === true, clipDepth = s.reversedDepthBuffer === true ? 'webgpu' : 'gl';
+    const key = sources.key + (points ? '\u0000points' : '') + (renderTarget ? '\u0000gl-rows' : '') + '\u0000' + clipDepth;
     let entry = compiled.get(key);
     if (!entry) {
-      const program = compileEsslProgram(sources.vertex, sources.fragment, {points, maxPointSize, rows: renderTarget ? 'gl' : 'webgpu'});
+      const program = compileEsslProgram(sources.vertex, sources.fragment, {points, maxPointSize, clipDepth, rows: renderTarget ? 'gl' : 'webgpu'});
       entry = {key, program, attributesKey: JSON.stringify(program.reflection.attributes)};
       if (compiled.size >= maxPrograms) compiled.delete(compiled.keys().next().value);
       compiled.set(key, entry);
@@ -378,10 +384,20 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     setLights(list) { lightList = [...list]; lights.setup(lightList); return lights.state.version; },
     setLightsView(camera) { lights.setupView(lightList, camera); },
     get lightsVersion() { return lights.state.version; },
-    raster: (material, options) => threeProgramRaster(T, material, options),
+    raster: (material, options) => threeProgramRaster(T, material, {...options, reversedDepthBuffer: state().reversedDepthBuffer === true}),
     /** options.material: lit materials read shadow maps from the light state. */
     pack: (reflection, uniforms, object, camera, bytes, {material = null, ...options} = {}) => {
       const s = state();
+      // WebGLRenderer.setProgram changes the source camera immediately before
+      // packing its projection, after the object's before-render callback.
+      // Fullscreen snapshots keep their captured projection and also publish
+      // the one-way transition to the original camera at this boundary.
+      if (s.reversedDepthBuffer === true) for (const current of [camera,
+        s.cameraSnapshot === camera ? s.cameraSource : null]) {
+        if (current && current.reversedDepth !== true) {
+          current._reversedDepth = true; current.updateProjectionMatrix();
+        }
+      }
       const textures = packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: s.toneMappingExposure ?? 1,
         logarithmicDepthBuffer: s.logarithmicDepthBuffer === true,
         samplers: objectSamplers(material, object), ...options});

@@ -657,7 +657,9 @@ class Unit {
     const pointLines = !points ? [] : [
       // GL clips a point by its vertex: a center outside the clip volume drops the whole point.
       '  let f3d_p = f3d_Position;',
-      '  let f3d_inside = all(abs(f3d_p.xyz) <= vec3<f32>(f3d_p.w)) && f3d_p.w > 0.0;',
+      clipDepth === 'gl'
+        ? '  let f3d_inside = all(abs(f3d_p.xyz) <= vec3<f32>(f3d_p.w)) && f3d_p.w > 0.0;'
+        : '  let f3d_inside = all(abs(f3d_p.xy) <= vec2<f32>(f3d_p.w)) && f3d_p.z >= 0.0 && f3d_p.z <= f3d_p.w && f3d_p.w > 0.0;',
       `  let f3d_size = clamp(f3d_PointSize, 1.0, ${Number(maxPointSize).toFixed(1)});`,
       '  let f3d_corner = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0))[input.f3d_corner_index];',
       // Half-size in NDC is size / viewport (f3d_target.zw = viewport width/height in pixels).

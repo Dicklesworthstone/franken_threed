@@ -393,9 +393,8 @@ coordinate system.
 All affected materials select their source program, including the existing
 deformation and shadow-program routes. The separate whole-image HDR fallback
 cannot replace this route: it reports the existing tone-mapping admission error
-if a source program is unavailable. Reversed depth on the WebGL-authored facade
-remains outside this admission; native WebGPURenderer depth modes retain their
-existing behavior.
+if a source program is unavailable. Native WebGPURenderer depth modes retain
+their existing behavior.
 
 `three_program_log_depth.test.mjs` verifies built-in/custom shader compilation,
 camera coefficients, authored uniform precedence and actual facade submissions.
@@ -406,6 +405,53 @@ range where linear depth loses foreground separation, changed camera far planes,
 authored shaders, orthographic cameras and sampled one-half/one-quarter depths.
 Both enabled and disabled modes were compared, with zero GPU/browser errors.
 These are correctness results, not physical-device performance measurements.
+
+## Reversed depth for WebGL-authored programs
+
+`createWebGLRendererClass(THREE)` admits `reversedDepthBuffer: true` on canvas
+and render-target draws. Both `capabilities.reversedDepthBuffer` and
+`state.buffers.depth.getReversed()` report the owned mode. Source programs use
+the zero-to-one clip volume selected by r186's `EXT_clip_control` path, preserving
+their projection values and sampled depth without an additional GL-to-WebGPU
+depth conversion. Raw point programs use the same near-plane clipping rule.
+
+The source camera enters reversed mode when its program uniforms are packed,
+after the object's before-render callback and before its after-render callback.
+Fullscreen and cube-face snapshots preserve captured camera values, lens and
+view offsets while publishing that same one-way transition to the original
+camera. Program cache identity includes
+the clip-depth convention even when raw shader text is unchanged. Raster state
+uses all eight entries of r186's reversed comparison table, including its
+Never/Always and Equal/NotEqual swaps. Polygon-offset slope factors reverse sign
+while offset units retain the source value. Canvas, target, shadow and transmission
+depth attachments use the matching clear value. PCF shadow samplers use the
+source greater-equal comparison; Basic and VSM retain their source shader paths.
+
+`three_program_reversed_depth.test.mjs` covers the comparison table, source/raw
+shader cache separation, point clipping, actual canvas/target submissions and
+cold/warm fullscreen and six-face cube camera snapshots. `program_reversed_depth.mjs` compares
+ordinary and reversed modes against unchanged r186 WebGL on a host with
+`EXT_clip_control`: large depth ranges and changed far planes, built-in and
+authored shaders, orthographic cameras, all depth functions, point clipping,
+positive/negative polygon-offset slopes, all cube faces and their public camera
+projections, directional Basic/PCF/VSM shadows and point Basic/PCF shadows.
+
+Chromium 151.0.7922.34 / SwiftShader passes all 76 checkpoints, comparing
+1,228,800 RGBA bytes and 36,864 sampled depth values. All sampled depths and
+camera observations match exactly. Seventy-five checkpoints are exact; the
+reversed directional VSM checkpoint differs in 48 channel bytes by at most six,
+with no pixels outside the existing tolerance. GPU and browser errors are zero.
+This verifies the direct facade and this source host; automatic application
+routing, hosts without the source extension and physical-device performance
+are not established by this comparison.
+
+`program_batch_transmission.mjs --reversed-depth` additionally compares
+opaque geometry, glass back faces and transmission sampling in two ArrayCamera
+views, including live callback uploads and versionless edits. All 12 checkpoints
+and 294,912 RGBA bytes pass the existing channel-12 / two-percent pixel budget;
+the worst outlier fraction is 20 of 6,144 pixels (0.33%), with maximum channel
+difference 43. Callback/instance order matches exactly, with 160 native draws
+and zero GPU/browser errors on the same host.
 
 ## Preserved WebGL-authored canvases
 
@@ -734,7 +780,7 @@ unmeasured.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping, reversed depth on the WebGL-authored facade, non-sRGB
+  XR, custom tone mapping, non-sRGB
   WebGL-authored canvas output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.
