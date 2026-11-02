@@ -254,13 +254,14 @@ test('public array copy and source-shaped readback preserve selected layers acro
   assert.equal(f.reads[0].size.depthOrArrayLayers, 1);
 });
 
-test('invalid array layers and unsupported layered output targets fail before native allocation', async t => {
+test('invalid array layers fail before native allocation and default output selection stays allocation-free', async t => {
   const f = fixture(t), array = target(t);
   for (const layer of [-1, 3, .5, NaN, Infinity]) {
     assert.throws(() => f.renderer.setRenderTarget(array, layer), error => error.code?.endsWith('_FACE'));
     await assert.rejects(f.renderer.readRenderTargetPixelsAsync(array, 0, 0, 0, 0, 0, layer), error => error.code?.endsWith('_FACE'));
   }
-  assert.throws(() => f.renderer.setOutputRenderTarget(array), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(f.renderer.setOutputRenderTarget(array), undefined);
+  assert.equal(f.renderer.getOutputRenderTarget(), array);
   assert.equal(f.textures.length, 0); assert.equal(f.device.buffers.length, 0);
   assert.equal(f.renderer._pending.length, 0);
 });

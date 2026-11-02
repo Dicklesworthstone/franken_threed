@@ -279,6 +279,7 @@ test('invalid volume slice and mip selections fail before native allocation or q
     assert.throws(() => f.renderer.setRenderTarget(volume, slice, mip), error => error.code?.endsWith('_FACE'));
   for (const mip of [-1, 4, .5, NaN])
     assert.throws(() => f.renderer.setRenderTarget(volume, 0, mip), error => error.code?.endsWith('_MIP'));
-  assert.throws(() => f.renderer.setOutputRenderTarget(volume), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(f.renderer.setOutputRenderTarget(volume), undefined);
+  assert.equal(f.renderer.getOutputRenderTarget(), volume);
   assert.equal(f.textures.length, 0); assert.equal(f.device.buffers.length, 0); assert.equal(f.renderer._pending.length, 0);
 });

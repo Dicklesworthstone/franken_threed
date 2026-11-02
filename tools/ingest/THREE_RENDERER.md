@@ -115,22 +115,41 @@ older offscreen tests drops the WebGPU instance during canvas readback on this
 host, including in a renderer-free reference probe.
 
 Native `setOutputRenderTarget(target)` / `getOutputRenderTarget()` select a
-single-color 2D target for final output. Working-linear output renders directly;
+single-color 2D, cube, array or 3D volume target for final output. Working-linear
+output renders directly;
 tone mapping or color conversion first renders into the pinned source's private
 linear framebuffer, then executes its retained TSL output graph on the same new
 WebGPU owner. Target dimensions, viewport, scissor, attachment precision and MSAA
 come from the selected target. An explicit unrelated `setRenderTarget()` takes
 precedence. Queued output passes keep their own target generations, tone operator,
-exposure and render-frequency updates; `compileAsync()` prepares both passes.
+exposure and render-frequency updates; `compileAsync()` prepares the scene and
+output passes.
+
+Direct layered output retains the target owner's face/layer/slice and mip
+selection. Converted array and volume output renders the scene into the selected
+private array layer, then converts every private layer into its matching output
+layer/slice, as the pinned source does. Queued frames preserve each layer's scene
+values and the output transform for each call. Source node updates still observe
+face zero during the private scene, including deferred initialization. Converted
+layered output requires mip zero; converted cube output additionally requires
+face zero because the source private image has only one layer. Unsupported
+converted selectors fail before target allocation or queued submission.
 
 Selection follows the pinned source, including its asymmetries: a converted
 render leaves the effective output target selected by `getRenderTarget()`; direct
 working-linear output keeps a null active selection. With a null active selection,
 `clear()` clears the private framebuffer and draws its output when conversion is
 needed, but otherwise clears the canvas. An explicit target clear never performs
-the output transform. Cube, array, multiview and multiple-color output targets,
-and output targets on the WebGL-authored facade, remain unsupported. See
+the output transform. Multiview and multiple-color output targets, and output
+targets on the WebGL-authored facade, remain unsupported. See
 [THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for target profiles and lifetime.
+
+`node tests/e2e/webgpu_renderer/native_output_targets.mjs` checks all six
+cube/array/volume direct and sRGB/Reinhard profiles against the pinned source.
+Chromium 151.0.7922.34 / SwiftShader matched all 233,472 storage bytes, including
+queued layer changes, per-call exposure, untouched cube faces and retained
+selection state, with no GPU or browser errors. This is native WebGPU correctness
+evidence; it is not a hardware-performance measurement.
 
 Scene content is whatever `three_scene.mjs` admits: Mesh/InstancedMesh/skinned and
 morphed meshes; Sprite; Line/LineSegments/Points (one-pixel, as upstream WebGPU; LineLoop is

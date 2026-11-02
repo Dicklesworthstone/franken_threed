@@ -10,10 +10,12 @@ import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const Renderer = createWebGPURendererClass(T);
 function fixture(t) {
   const device = geometryDevice(); device.limits.maxTextureDimension2D = 8192; device.limits.maxBindingsPerBindGroup = 1000;
+  device.limits.maxTextureArrayLayers = 256; device.limits.maxTextureDimension3D = 256;
   device.textures = [];
   device.createTexture = desc => {
-    const texture = {dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...desc,
+    const texture = {dimension: '2d', sampleCount: 1, ...desc,
       width: desc.size.width ?? desc.size[0], height: desc.size.height ?? desc.size[1],
+      depthOrArrayLayers: desc.size.depthOrArrayLayers ?? desc.size[2] ?? 1,
       createView(options = {}) { return {texture, ...options}; }, destroy() { this.destroyed = true; }};
     device.textures.push(texture); return texture;
   };
@@ -258,4 +260,100 @@ test('disposing a queued direct output prevents its conditional canvas-depth sid
   const f = fixture(t); f.renderer.outputColorSpace = T.LinearSRGBColorSpace; f.renderer.autoClear = false;
   f.renderer.setOutputRenderTarget(f.target); await f.renderer.init(); f.renderer.render(f.scene, f.camera); f.target.dispose();
   await assert.rejects(drain(f.renderer), /disposed|replaced|stale/i); assert.equal(f.acquired(), 0);
+});
+
+const layeredTargets = [
+  ['cube', () => new T.CubeRenderTarget(8), 6],
+  ['array', () => new T.RenderTarget(8, 6, {depth: 3}), 3],
+  ['volume', () => new T.RenderTarget3D(8, 6, 3), 3],
+];
+const attachmentSlice = attachment => attachment.depthSlice ?? attachment.view.baseArrayLayer ?? 0;
+for (const [kind, create, layers] of layeredTargets) for (const convert of [false, true])
+test(`${kind} default output preserves source selection and queued direct/converted output (${convert})`, async t => {
+  const f = fixture(t), target = create(); target.texture.generateMipmaps = false;
+  t.after(() => target.dispose()); f.renderer.setOutputRenderTarget(target);
+  f.renderer.outputColorSpace = convert ? T.SRGBColorSpace : T.LinearSRGBColorSpace;
+  f.renderer.toneMapping = convert ? T.ReinhardToneMapping : T.NoToneMapping;
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  assert.equal(f.renderer.getRenderTarget(), convert ? target : null);
+  const slices = convert && kind === 'cube' ? [0, 0, 0] : [0, layers - 1, 1];
+  f.renderer.setRenderTarget(target, slices[1]); f.renderer.render(f.scene, f.camera);
+  f.renderer.setRenderTarget(target, slices[2]); f.renderer.render(f.scene, f.camera);
+  f.renderer.setRenderTarget(null);
+  await drain(f.renderer);
+  const convertedLayers = kind === 'cube' ? 1 : layers;
+  const passes = drawPasses(f.device), outputs = passes.filter((_, i) => !convert || i % (convertedLayers + 1) !== 0);
+  assert.equal(passes.length, convert ? 3 * (convertedLayers + 1) : 3);
+  const attachments = outputs.map(pass => pass.desc.colorAttachments[0]);
+  const outputSlices = convert ? Array.from({length: 3}, () => Array.from({length: convertedLayers}, (_, i) => i)).flat() : slices;
+  assert.deepEqual(attachments.map(attachmentSlice), outputSlices);
+  assert.equal(new Set(attachments.map(attachment => attachment.view.texture)).size, 1);
+  assert.equal(attachments[0].view.texture.depthOrArrayLayers, layers);
+  assert.equal(attachments[0].view.texture.dimension, kind === 'volume' ? '3d' : '2d');
+  if (convert) {
+    assert.deepEqual(passes.filter((_, i) => i % (convertedLayers + 1) === 0)
+      .map(pass => attachmentSlice(pass.desc.colorAttachments[0])), slices);
+    for (const pass of outputs) assert.equal(pass.desc.colorAttachments[0].loadOp, 'load');
+    for (const draw of nativeDraws(f.device).filter((_, i) => i % (convertedLayers + 1) !== 0)) assert.match(code(draw), /reinhardToneMapping/);
+  }
+  assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getActiveCubeFace(), 0);
+});
+
+for (const [kind, create, layers] of layeredTargets)
+test(`${kind} output compilation, explicit clears and disposal retain the selected subresource`, async t => {
+  const f = fixture(t), target = create(); target.texture.generateMipmaps = false;
+  t.after(() => target.dispose()); f.renderer.setOutputRenderTarget(target);
+  f.renderer.setRenderTarget(target, layers - 1);
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.renderer.getActiveCubeFace(), layers - 1);
+  f.renderer.setClearColor(0x13579b); f.renderer.clearColor(); await drain(f.renderer);
+  assert.equal(attachmentSlice(f.device.passes.at(-1).desc.colorAttachments[0]), layers - 1);
+  assert.equal(nativeDraws(f.device).length, 0, 'explicit clears do not execute output conversion');
+  f.renderer.setRenderTarget(target);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, kind === 'cube' ? 2 : layers + 1); assert.equal(f.acquired(), 0);
+  target.dispose(); await Promise.resolve();
+  assert.equal(f.renderer._outputQuads.size, 0); assert.equal(f.renderer._frameBufferTargets.size, 0);
+});
+
+for (const [kind, create] of layeredTargets)
+test(`${kind} converted selections outside the source private image fail before allocation or queued work`, async t => {
+  const f = fixture(t), target = create(); target.texture.generateMipmaps = false;
+  target.texture.mipmaps = [{}, {}]; t.after(() => target.dispose());
+  f.renderer.setOutputRenderTarget(target); await f.renderer.init();
+  const textureCount = f.device.textures.length;
+  for (const [slice, mip] of kind === 'cube' ? [[1, 0], [0, 1]] : [[0, 1]]) {
+    f.renderer.setRenderTarget(target, slice, mip);
+    assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'F3D_RENDERER_UNSUPPORTED'});
+    assert.equal(f.renderer.getRenderTarget(), target); assert.equal(f.renderer.getActiveCubeFace(), slice);
+    assert.equal(f.renderer.getActiveMipmapLevel(), mip);
+  }
+  assert.equal(f.device.textures.length, textureCount); assert.equal(f.renderer._pending.length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const initialized of [false, true])
+test(`converted array scene observes source face zero while writing its selected layer (initialized=${initialized})`, async t => {
+  const f = fixture(t), target = new T.RenderTarget(8, 6, {depth: 3}), observed = [];
+  t.after(() => target.dispose());
+  const color = new T.Color(.125, .375, .625);
+  f.scene.children[0].material.colorNode = T.TSL.uniform(color).onRenderUpdate(({renderer}) => {
+    observed.push(renderer.getActiveCubeFace()); return color;
+  });
+  f.renderer.setOutputRenderTarget(target); f.renderer.setRenderTarget(target, 2);
+  if (initialized) await f.renderer.init();
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.deepEqual(observed, [0]);
+  const passes = drawPasses(f.device);
+  assert.equal(attachmentSlice(passes[0].desc.colorAttachments[0]), 2);
+  assert.deepEqual(passes.slice(1).map(pass => attachmentSlice(pass.desc.colorAttachments[0])), [0, 1, 2]);
+  assert.equal(f.renderer.getActiveCubeFace(), 2);
+});
+
+test('multiple-color output targets remain refused before allocation', t => {
+  const f = fixture(t), target = new T.RenderTarget(8, 6, {count: 2}); t.after(() => target.dispose());
+  assert.throws(() => f.renderer.setOutputRenderTarget(target), {code: 'F3D_RENDERER_UNSUPPORTED'});
+  assert.equal(f.device.textures.length, 0); assert.equal(f.renderer.getOutputRenderTarget(), null);
 });

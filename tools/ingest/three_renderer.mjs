@@ -879,8 +879,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (target !== null) {
         if (this._shaderEncodedOutput) fail('UNSUPPORTED', 'Custom output targets require the native WebGPU route');
         const shape = this._targets.capture(target).shape;
-        if (target.isCubeRenderTarget || shape.array || shape.volume || shape.textures.length !== 1)
-          fail('UNSUPPORTED', 'Custom output targets require one 2D color attachment');
+        // The existing target owner supplies each selected face/layer/slice.
+        // Converted array output prepares its layer-specific source quads below.
+        if (shape.textures.length !== 1)
+          fail('UNSUPPORTED', 'Custom output targets require one color attachment');
       }
       this._outputRenderTarget = target;
     }
@@ -1168,7 +1170,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         }
       }
     }
-    _outputQuad(target) {
+    _outputQuad(target, layer = 0) {
       let cache = this._outputQuads.get(target);
       if (!cache) {
         cache = {quads: new Map(), dispose: () => {
@@ -1180,15 +1182,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         target.addEventListener('dispose', cache.dispose);
         this._outputQuads.set(target, cache);
       }
-      const key = `${this.toneMapping},${this.currentColorSpace}`;
+      const key = `${this.toneMapping},${this.currentColorSpace},${layer}`;
       let quad = cache.quads.get(key);
       if (!quad) {
         quad = new THREE.QuadMesh(new THREE.NodeMaterial());
         quad.name = 'Output Color Transform'; quad.material.name = 'outputColorTransform';
         // Retain the pinned NodeManager.getOutputNode construction, including
         // alpha un/premultiplication, exposure and the source tone operators.
-        quad.material.fragmentNode = THREE.TSL.texture(target.texture, THREE.TSL.screenUV)
-          .renderOutput(this.toneMapping, this.currentColorSpace);
+        let output = THREE.TSL.texture(target.texture, THREE.TSL.screenUV);
+        if (target.texture.isArrayTexture === true && target.texture.image.depth > 1)
+          output = output.depth(THREE.TSL.int(layer));
+        quad.material.fragmentNode = output.renderOutput(this.toneMapping, this.currentColorSpace);
         // Distinct graph identities keep earlier queued captures valid when a
         // later call changes the renderer's output transform before preparation.
         cache.quads.set(key, quad);
@@ -1204,6 +1208,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // clear() selects an explicit target first and only otherwise the private
       // framebuffer. With no conversion, a null selection still clears canvas.
       const convert = this.needsFrameBufferTarget && (!clearOnly || previousTarget === null);
+      if (convert && captureCameras && (previousFace !== 0 || previousMip !== 0)) {
+        const shape = this._targets.capture(outputTarget).shape;
+        // The pinned private image has one mip and, for a cube output, one
+        // layer. Reject selections that its source render context cannot use.
+        if (((shape.cube || shape.array || shape.volume) && previousMip !== 0) ||
+            (shape.cube && previousFace !== 0))
+          fail('UNSUPPORTED', 'Layered output conversion requires the base mip; cube conversion requires face zero');
+      }
       if (!convert && (previousTarget !== null || clearOnly)) {
         const request = this._makeRequest(scene, camera, clearOnly, captureCameras);
         request.outputPass = previousTarget === this._outputRenderTarget;
@@ -1240,18 +1252,28 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               this._outputRenderTarget.width, this._outputRenderTarget.height, construct) : construct();
           } finally { if (previousCache) previousCache.resizing = false; }
           this._renderTarget = internal; this._activeCubeFace = 0; this._activeMipmapLevel = 0;
-          requests.push(this._makeRequest(scene, camera, clearOnly, captureCameras));
+          const input = this._makeRequest(scene, camera, clearOnly, captureCameras);
+          // Source resets its public selector before callbacks, but its saved
+          // render context still writes the selected private array layer.
+          input.face = previousFace; input.sourceFace = 0; requests.push(input);
           this._renderTarget = outputTarget; this._activeCubeFace = previousFace; this._activeMipmapLevel = previousMip;
           outputState = {autoClear: this.autoClear, xrEnabled: this.xr.enabled};
           this.autoClear = false; this.xr.enabled = false;
-          const quad = this._outputQuad(internal);
-          if (captureCameras) {
-            this.info.calls++; this.info.render.calls++; this.info.render.frameCalls++;
+          // Source _renderOutputLayers converts every private array layer,
+          // including preserved/empty layers, into the matching output slice.
+          const layers = internal.texture.isArrayTexture === true && internal.texture.image.depth > 1
+            ? internal.texture.image.depth : 1;
+          for (let layer = 0; layer < layers; layer++) {
+            this._activeCubeFace = layers > 1 ? layer : previousFace;
+            const quad = this._outputQuad(internal, layer);
+            if (captureCameras) {
+              this.info.calls++; this.info.render.calls++; this.info.render.frameCalls++;
+            }
+            const output = this._makeRequest(quad, quad.camera, null, captureCameras, clearOnly ? previousTarget : outputTarget);
+            output.outputTransform = {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+              outputColorSpace: this.outputColorSpace};
+            requests.push(output);
           }
-          const output = this._makeRequest(quad, quad.camera, null, captureCameras, clearOnly ? previousTarget : outputTarget);
-          output.outputTransform = {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
-            outputColorSpace: this.outputColorSpace};
-          requests.push(output);
         }
         for (const request of requests) request.outputPass = true;
         completed = true;
@@ -1268,7 +1290,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
     }
     _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId, sortState = null,
-      canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target, mipLevel = 0, face = 0}) {
+      canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target, mipLevel = 0, face = 0, sourceFace = face}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let sourceRaster = this._nodeRaster.get(stencilAttachment);
@@ -1291,7 +1313,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // public selector null, although their GPU destination is a target.
         // ScreenNode therefore observes the canvas size on those source paths.
         this._renderTarget = sourceTarget; this._mrt = mrt;
-        this._activeMipmapLevel = mipLevel; this._activeCubeFace = face;
+        this._activeMipmapLevel = mipLevel; this._activeCubeFace = sourceFace;
         if (restoreCanvas) this._canvases.select(canvasTarget);
         if (outputTransform) Object.assign(this, outputTransform);
         if (destination === this && this.needsFrameBufferTarget) {
