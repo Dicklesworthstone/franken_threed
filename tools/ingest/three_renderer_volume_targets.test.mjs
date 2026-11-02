@@ -5,11 +5,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
-import {createWebGPURendererClass} from './three_renderer.mjs';
+import * as GL from '../../upstream/three.js/build/three.module.js';
+import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
-function fixture(t) {
+function fixture(t, webgl = false) {
   const device = geometryDevice(), textures = [], captures = [];
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureDimension3D: 256,
     maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000,
@@ -36,10 +37,12 @@ function fixture(t) {
     configure(value) { configured = value; }, unconfigure() {},
     getCurrentTexture() { return device.createTexture({size: [32, 32], format: configured.format, usage: 16}); },
   })};
-  const renderer = new Renderer({canvas, device}); renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  const Type = webgl ? createWebGLRendererClass(GL) : Renderer;
+  const renderer = new Type({canvas, device}); renderer.outputColorSpace = webgl ? GL.SRGBColorSpace : T.LinearSRGBColorSpace;
   t.after(() => renderer.dispose());
   const scene = new T.Scene(), camera = new T.PerspectiveCamera(50, 1, .1, 20); camera.position.z = 4;
-  const material = new T.MeshBasicNodeMaterial(); material.colorNode = N.vec3(.125, .375, .625);
+  const material = webgl ? new GL.MeshBasicMaterial({color: 0x20609f}) : new T.MeshBasicNodeMaterial();
+  if (!webgl) material.colorNode = N.vec3(.125, .375, .625);
   const mesh = new T.Mesh(new T.PlaneGeometry(), material); mesh.frustumCulled = false; scene.add(mesh);
   const capture = renderer._captureNodeFrame;
   renderer._captureNodeFrame = function(request) {
@@ -95,6 +98,36 @@ test('authored volume mips select shrinking Z slices and independent private dep
     return [texture.dimension, texture.width, texture.height, texture.depthOrArrayLayers];
   }), [['2d', 4, 3, 1], ['2d', 2, 1, 1], ['2d', 1, 1, 1]]);
   assert.equal(f.renderer.getActiveMipmapLevel(), 3); assert.deepEqual(volume.viewport, viewport);
+});
+
+test('WebGL shaders consume rendered volumes with one persistent 3D binding and queued Z coordinates', async t => {
+  const f = fixture(t, true), volume = target(t, {depthBuffer: false}, GL.WebGL3DRenderTarget);
+  volume.texture.wrapR = GL.RepeatWrapping; await f.renderer.init();
+  f.renderer.setRenderTarget(volume, 4); await f.renderer.renderAsync(f.scene, f.camera);
+  const native = drawPasses(f.device)[0].desc.colorAttachments[0].view.texture;
+  const material = new GL.ShaderMaterial({glslVersion: GL.GLSL3,
+    uniforms: {volumeData: {value: volume.texture}, sampleDepth: {value: .9}},
+    vertexShader: 'out vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+    fragmentShader: 'precision highp sampler3D;uniform sampler3D volumeData;uniform float sampleDepth;in vec2 vUv;out vec4 color;void main(){color=texture(volumeData,vec3(vUv,sampleDepth));}'});
+  const consumer = new GL.Mesh(new GL.PlaneGeometry(2, 2), material);
+  t.after(() => { material.dispose(); consumer.geometry.dispose(); });
+  f.renderer.setRenderTarget(null); await f.renderer.compileAsync(consumer, f.camera);
+  f.renderer.render(consumer, f.camera); material.uniforms.sampleDepth.value = .1;
+  f.renderer.render(consumer, f.camera); await f.renderer.waitForGPU();
+  const draws = f.device.snapshots.flat().filter(draw => /volumeData/.test(draw.pipeline.fragment.module.code));
+  assert.equal(draws.length, 2);
+  const views = draws.map(draw => textureEntries(draw)[0].resource);
+  assert.equal(views[0], views[1]); assert.equal(views[0].dimension, '3d'); assert.notEqual(views[0].texture, native);
+  assert.equal(views[0].texture.dimension, '3d'); assert.equal(views[0].texture.depthOrArrayLayers, 5);
+  const oriented = f.device.passes.filter(pass => pass.desc.colorAttachments[0].view.texture === views[0].texture);
+  assert.deepEqual(oriented.map(pass => pass.desc.colorAttachments[0].depthSlice), [0, 1, 2, 3, 4]);
+  assert.deepEqual(oriented.map(pass => pass.draws[0].args), [0, 1, 2, 3, 4].map(slice => [3, 1, 0, slice]));
+  const uniforms = draws.map(draw => [...draw.contents.values()].map(bytes => Array.from(bytes)));
+  assert.notDeepEqual(uniforms[0], uniforms[1], 'queued normalized Z coordinates retain call-time values');
+  assert.equal(f.renderer._targets.capture(volume).copies, 1);
+  f.renderer.setRenderTarget(volume, 1); await f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); await f.renderer.renderAsync(consumer, f.camera);
+  assert.equal(f.renderer._targets.capture(volume).copies, 2); assert.equal(volume.texture.renderTarget, null);
 });
 
 test('MRT volume output retains the selected slice on every color attachment after renderer state restoration', async t => {

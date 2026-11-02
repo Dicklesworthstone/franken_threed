@@ -200,6 +200,41 @@ async function capture(mode) {
           writeLayer(3, 1, 0);sampleArray(layered.texture, 3, 1);await read('array-sampled-resized');
           layered.dispose();writeLayer(3, 0, 1);sampleArray(layered.texture, 3, 0);await read('array-sampled-recreated');
         }
+        {
+          const volume = new T.WebGL3DRenderTarget(width, height, 5, {depthBuffer: false,
+            generateMipmaps: false, minFilter: T.LinearFilter, magFilter: T.LinearFilter});
+          targets.push(volume);volume.texture.wrapR = T.RepeatWrapping;
+          const volumeSampler = new T.ShaderMaterial({glslVersion: T.GLSL3, depthTest: false, depthWrite: false,
+            uniforms: {volumeData: {value: volume.texture}, sampleDepth: {value: .1}},
+            vertexShader: 'out vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+            fragmentShader: 'precision highp sampler3D;uniform sampler3D volumeData;uniform float sampleDepth;in vec2 vUv;out vec4 color;void main(){color=texture(volumeData,vec3(vUv,sampleDepth));}'});
+          materials.push(volumeSampler);const volumeConsumer = new T.Mesh(geometry, volumeSampler);
+          const sampleVolume = (depth, destination = output) => {
+            renderer.setRenderTarget(destination);volumeSampler.uniforms.sampleDepth.value = depth;
+            renderer.render(volumeConsumer, camera);
+          };
+          for (const [slice, phase] of [[0, 0], [1, 1], [2, 0], [3, 0], [4, 1]]) produce(volume, phase, slice);
+          sampleVolume(.1);sampleVolume(.9, queuedOutput);
+          await read('volume-sampled-slice-zero');await read('volume-sampled-slice-last', queuedOutput);
+          sampleVolume(.5);await read('volume-sampled-slice-middle');
+          // At Z=.15, linear 3D filtering mixes slices zero/one by 75%/25%.
+          sampleVolume(.15);await read('volume-sampled-interpolated');
+          sampleVolume(-.1);await read('volume-sampled-wrap-low');
+          sampleVolume(1.1);await read('volume-sampled-wrap-high');
+          volume.texture.wrapR = T.ClampToEdgeWrapping;
+          volume.texture.minFilter = volume.texture.magFilter = T.NearestFilter;volume.texture.needsUpdate = true;
+          sampleVolume(-.1);await read('volume-sampled-wrap-edit-ignored');
+          sampleVolume(.15);await read('volume-sampled-filter-edit-ignored');
+          produce(volume, 1, 0);sampleVolume(.1);await read('volume-sampled-rewritten-slice');
+          sampleVolume(.5);await read('volume-sampled-sibling');
+          const sourceTexture = volume.texture;volume.setSize(16, 12, 4);
+          if (volume.texture !== sourceTexture) throw new Error('Volume resize replaced the public texture');
+          produce(volume, 0, 0);produce(volume, 1, 1);produce(volume, 1, 3);
+          sampleVolume(-.25);await read('volume-sampled-resized-clamp-low');
+          sampleVolume(1.25);await read('volume-sampled-resized-clamp-high');
+          sampleVolume(.1875);await read('volume-sampled-resized-nearest');
+          volume.dispose();produce(volume, 1, 0);sampleVolume(.125);await read('volume-sampled-recreated');
+        }
         if (mode === 'source') {
           const probe = target(40, 28);probe.texture.type = T.FloatType;
           probe.texture.minFilter = probe.texture.magFilter = T.NearestFilter;
@@ -294,6 +329,11 @@ try {
     ['array-sampled-base', true], ['array-sampled-sampler-edit-ignored', false],
     ['array-sampled-nonmip-filter', false], ['array-sampled-rewritten-layer', true],
     ['array-sampled-generated-mip', false], ['array-sampled-resized', false], ['array-sampled-recreated', true],
+    ['volume-sampled-slice-zero', false], ['volume-sampled-slice-last', true], ['volume-sampled-slice-middle', false],
+    ['volume-sampled-wrap-low', true], ['volume-sampled-wrap-high', false], ['volume-sampled-wrap-edit-ignored', true],
+    ['volume-sampled-rewritten-slice', true], ['volume-sampled-sibling', false],
+    ['volume-sampled-resized-clamp-low', false], ['volume-sampled-resized-clamp-high', true],
+    ['volume-sampled-resized-nearest', false], ['volume-sampled-recreated', true],
     ['half-float-destination', false], ['initialization-retarget', true], ['draw-before-copy', false], ['draw-after-copy', true],
   ]) for (let index = 0; index < corners.length; index++) {
     const expected = colors[index].map((value, channel) => inverted && channel < 3 ? 255 - value : value);
@@ -303,6 +343,11 @@ try {
     for (const [x, y] of corners) assert.deepEqual(pixel(frames[name], x, y), [223,191,159,255], `${name}: source uniform crop`);
   for (const name of ['array-last-authored-mip', 'array-sampled-last-mip'])
     for (const [x, y] of corners) assert.deepEqual(pixel(frames[name], x, y), colors[3], 'source last array mip texel');
+  for (const name of ['volume-sampled-interpolated', 'volume-sampled-filter-edit-ignored'])
+    for (let index = 0; index < corners.length; index++) {
+      const expected = colors[index].map((value, channel) => channel < 3 ? Math.round(value * .75 + (255 - value) * .25) : value);
+      assert.deepEqual(pixel(frames[name], ...corners[index]), expected, `${name}: source interpolated quadrant ${index}`);
+    }
   for (let index = 0; index < corners.length; index++) {
     const [x, y] = corners[index], expected = pixel(frames['srgb-direct-sample'], x, y);
     assert.ok(expected[3] === 255 && expected.slice(0, 3).some(channel => channel > 0), 'source sRGB sample is nonblank');

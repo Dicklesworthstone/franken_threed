@@ -9,7 +9,18 @@ function fixture(options = {}) {
   const f = targetDevice();
   Object.assign(f.device.limits, {maxTextureDimension3D: 256, maxTextureArrayLayers: 256,
     maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
-  return {...f, owner: createThreeRenderTargets(THREE, {getDevice: () => f.device, ...options})};
+  f.device.createBindGroupLayout = descriptor => descriptor;
+  f.device.createPipelineLayout = descriptor => descriptor;
+  const draws = [], createEncoder = f.device.createCommandEncoder;
+  f.device.createCommandEncoder = () => {
+    const encoder = createEncoder(), begin = encoder.beginRenderPass;
+    encoder.beginRenderPass = descriptor => {
+      const pass = begin(descriptor);
+      return {...pass, draw(...args) { draws.push({descriptor, args}); pass.draw(...args); }};
+    };
+    return encoder;
+  };
+  return {...f, draws, owner: createThreeRenderTargets(THREE, {getDevice: () => f.device, ...options})};
 }
 const target = options => new THREE.RenderTarget3D(8, 4, 5, options);
 
@@ -63,6 +74,80 @@ test('legacy WebGL3D target resolves registered ownership without rewriting its 
   assert.equal(f.owner.getTextureTarget(source.texture), source);
   f.owner.withNativeTexture(input, texture => assert.equal(texture.dimension, '3d'));
   assert.equal(source.texture.renderTarget, null);
+});
+
+for (const type of [THREE.UnsignedByteType, THREE.FloatType])
+test(`WebGL volume sampling preserves all slices in a full-precision 3D GPU replica (type=${type})`, async t => {
+  const f = fixture(), source = new THREE.WebGL3DRenderTarget(8, 4, 5, {depthBuffer: false, type,
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose()); source.texture.wrapR = THREE.RepeatWrapping;
+  const entry = f.owner.capture(source), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, () => {}, {face: 4}); const binding = bindings.get(source.texture);
+  assert.equal(binding.viewDimension, '3d'); assert.equal(binding.view.descriptor.dimension, '3d');
+  assert.equal(binding.view.texture.dimension, '3d');
+  assert.deepEqual(binding.view.texture.size, {width: 8, height: 4, depthOrArrayLayers: 5});
+  assert.equal(binding.view.texture.format, type === THREE.FloatType ? 'rgba32float' : 'rgba8unorm');
+  assert.equal(binding.sampler.addressModeW, 'repeat'); assert.equal(binding.sampler.lodMaxClamp, 0);
+  assert.equal(f.owner.allocatedBytes, 2 * entry.shape.colorBytes);
+  const passes = f.calls.submissions.at(-1).passes;
+  assert.deepEqual(passes.map(pass => pass.descriptor.colorAttachments[0].depthSlice), [0, 1, 2, 3, 4]);
+  assert.deepEqual(f.draws.map(draw => draw.args), [0, 1, 2, 3, 4].map(slice => [3, 1, 0, slice]));
+  for (const pass of passes) {
+    const output = pass.descriptor.colorAttachments[0].view, input = pass.group.entries[0].resource;
+    assert.notEqual(output.texture, input.texture); assert.deepEqual(output.descriptor, input.descriptor);
+    assert.deepEqual(output.descriptor, {baseMipLevel: 0, mipLevelCount: 1, dimension: '3d'});
+  }
+  assert.match(f.calls.modules[0].code, /texture_3d<f32>/);
+  assert.match(f.calls.modules[0].code, /i32\(size.y\) - 1 - i32\(v.position.y\)/);
+  if (type === THREE.FloatType) {
+    assert.equal(binding.sampleType, 'unfilterable-float');
+    assert.equal(f.calls.pipelines[0].layout.bindGroupLayouts[0].entries[0].texture.viewDimension, '3d');
+  }
+  assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 1);
+  f.owner.render(entry, () => {}, {face: 1});
+  assert.equal(bindings.get(source.texture).view, binding.view); assert.equal(entry.copies, 2);
+  assert.throws(() => f.owner.bindingsFor(source).get(source.texture), {code: 'THREE_TARGET_FEEDBACK'});
+  assert.equal(source.texture.renderTarget, null); await f.owner.whenIdle();
+});
+
+test('WebGL volume setup sampler and borrowed generation survive source edits until recreation', async t => {
+  const f = fixture(), source = new THREE.WebGL3DRenderTarget(8, 4, 5, {depthBuffer: false,
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter});
+  t.after(() => f.owner.dispose()); const texture = source.texture; texture.wrapR = THREE.RepeatWrapping;
+  f.owner.capture(source); const bindings = f.owner.bindingsFor(), first = bindings.get(texture), release = first.retain();
+  const old = f.calls.textures.slice(), oldBytes = f.owner.allocatedBytes;
+  texture.minFilter = texture.magFilter = THREE.NearestFilter; texture.wrapR = THREE.ClampToEdgeWrapping; texture.needsUpdate = true;
+  assert.equal(bindings.get(texture).sampler, first.sampler);
+  source.setSize(4, 2, 3); assert.equal(source.texture, texture);
+  assert.throws(first.validate, {code: 'THREE_TARGET_STALE'}); assert.ok(old.every(value => value.destroyed === 0));
+  f.owner.capture(source); const next = bindings.get(texture);
+  assert.notEqual(next.view, first.view); assert.equal(next.sampler.addressModeW, 'clamp-to-edge');
+  assert.equal(next.sampler.minFilter, 'nearest'); assert.equal(next.sampler.magFilter, 'nearest');
+  assert.deepEqual(next.view.texture.size, {width: 4, height: 2, depthOrArrayLayers: 3});
+  assert.equal(f.owner.allocatedBytes, oldBytes + 2 * 4 * 2 * 3 * 4);
+  release(); await Promise.resolve(); await Promise.resolve(); assert.ok(old.every(value => value.destroyed === 1));
+  source.dispose(); await f.owner.whenIdle();
+  assert.equal(f.owner.allocatedBytes, 0); assert.ok(f.calls.textures.every(value => value.destroyed === 1));
+});
+
+test('WebGL volume sampling retains source mip, source-kind, precision and replica-budget boundaries', t => {
+  for (const [Type, options, mips, code] of [
+    [THREE.RenderTarget3D, {}, 0, 'THREE_TARGET_UNSUPPORTED'],
+    [THREE.WebGL3DRenderTarget, {}, 4, 'THREE_TARGET_UNSUPPORTED'],
+    [THREE.WebGL3DRenderTarget, {minFilter: THREE.NearestMipmapNearestFilter}, 0, 'THREE_TARGET_UNSUPPORTED'],
+    [THREE.WebGL3DRenderTarget, {type: THREE.FloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter}, 0, 'THREE_TARGET_SAMPLER'],
+  ]) {
+    const f = fixture(), source = new Type(8, 4, 5, {depthBuffer: false, ...options});
+    t.after(() => f.owner.dispose()); t.after(() => source.dispose());
+    source.texture.mipmaps = Array.from({length: mips}, () => ({})); const entry = f.owner.capture(source);
+    assert.throws(() => f.owner.bindingsFor().get(source.texture), {code});
+    if (mips) assert.throws(() => inspectThreeRenderTargetMip(entry.shape, 1, 0, {webgl: true}), {code: 'THREE_TARGET_MIP'});
+    assert.equal(f.calls.textures.length, 0); assert.equal(f.owner.allocatedBytes, 0);
+  }
+  const f = fixture({maxBytes: 1279}), source = new THREE.WebGL3DRenderTarget(8, 4, 5, {depthBuffer: false});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose()); f.owner.capture(source);
+  assert.throws(() => f.owner.bindingsFor().get(source.texture), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.owner.allocatedBytes, 640); assert.equal(f.calls.textures.length, 1); assert.equal(f.calls.submissions.length, 0);
 });
 
 test('authored volume mip counts, byte budgets, slice bounds and native sampler W/LOD follow XYZ storage', t => {

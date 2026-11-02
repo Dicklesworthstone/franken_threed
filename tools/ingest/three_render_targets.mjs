@@ -34,6 +34,8 @@
  * Explicit transfers/readbacks select one color or depth layer at a time.
  * RenderTarget3D and WebGL3DRenderTarget retain 3D color storage. Their selected
  * face is a mip-local depth slice; native sampling borrows the entire volume.
+ * WebGL base-level colors sample through a 3D replica, preserving interpolation
+ * between oriented slices without CPU transfers or 2D-array substitution.
  * Color mip extents shrink in XYZ while attached depth remains 2D or an
  * independently selected array. Volume mip levels are authored, not generated.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
@@ -95,6 +97,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const webglCube = target.isWebGLCubeRenderTarget === true;
   const webglArray = target.isWebGLArrayRenderTarget === true && texture?.isDataArrayTexture === true;
+  const webglVolume = target.isWebGL3DRenderTarget === true && texture?.isData3DTexture === true;
   const cube = target.isCubeRenderTarget === true || webglCube;
   const volume = target.isRenderTarget3D === true || target.isWebGL3DRenderTarget === true;
   const array = !cube && !volume && (target.depth > 1 || target.isWebGLArrayRenderTarget === true || texture?.isDataArrayTexture === true || texture?.isArrayTexture === true);
@@ -256,13 +259,14 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
-    ...(webglArray ? {webglSampler: Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
-      wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy})} : {}),
-    cube, webglCube, webglArray, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
+    ...(webglArray || webglVolume ? {webglSampler: Object.freeze({minFilter: texture.minFilter, magFilter: texture.magFilter,
+      wrapS: texture.wrapS, wrapT: texture.wrapT, anisotropy: texture.anisotropy,
+      ...(webglVolume ? {isData3DTexture: true, wrapR: texture.wrapR} : {})})} : {}),
+    cube, webglCube, webglArray, webglVolume, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     sourceVersion: texture.version,
     depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
-    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
+    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${webglVolume}/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null, colorMipProfiles = null} = {}) {
@@ -347,6 +351,21 @@ const FLIP_WGSL = flipY => `
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
   let size = textureDimensions(source);
   return textureLoad(source, vec2i(i32(p.x), ${flipY ? 'i32(size.y) - 1 - i32(p.y)' : 'i32(p.y)'}), 0);
+}`;
+
+const VOLUME_FLIP_WGSL = flipY => `
+@group(0) @binding(0) var source: texture_3d<f32>;
+struct SliceVertex {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) slice: u32,
+};
+@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) slice: u32) -> SliceVertex {
+  let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return SliceVertex(vec4f(p[i], 0, 1), slice);
+}
+@fragment fn fs(v: SliceVertex) -> @location(0) vec4f {
+  let size = textureDimensions(source);
+  return textureLoad(source, vec3i(i32(v.position.x), ${flipY ? 'i32(size.y) - 1 - i32(v.position.y)' : 'i32(v.position.y)'}, i32(v.slice)), 0);
 }`;
 
 // A scalar R32F output preserves textureLoad's f32 depth value. Sampling the
@@ -729,13 +748,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (error) { terminal ??= error; entry.error = error; retire(entry); throw error; }
     return result;
   }
-  function colorSampler(entry, texture, samplerState = texture) {
+  function colorSampler(entry, texture, samplerState = texture, {native = true} = {}) {
     const device = getDevice();
     const shape = entry.shape.colors[entry.shape.textures.indexOf(texture)];
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(samplerState, three, shape.mipLevelCount);
-    if (shape.cube && !shape.webglCube || shape.volume || !flipY && entry.shape.textures.length > 1) {
+    if (shape.cube && !shape.webglCube || native && shape.volume || !flipY && entry.shape.textures.length > 1) {
       // Native source samplers retain explicit LOD access even for ordinary
       // LinearFilter/NearestFilter; only their mip interpolation is nearest.
       // WebGL cube replicas retain the source's base-only minification clamp.
@@ -756,18 +775,20 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function sampling(entry, texture) {
     assertCurrent(entry);
-    if (entry.shape.cube && !entry.shape.webglCube || entry.shape.array && !entry.shape.webglArray || entry.shape.volume)
+    if (entry.shape.cube && !entry.shape.webglCube || entry.shape.array && !entry.shape.webglArray || entry.shape.volume && !entry.shape.webglVolume)
       fail('UNSUPPORTED', 'Native layered target color sampling requires native texture bindings');
+    if (entry.shape.webglVolume && entry.shape.mipLevelCount !== 1)
+      fail('UNSUPPORTED', 'WebGL volume sampling requires a single allocated base level');
     if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
-    // Source setTexture2DArray skips uploads for render-target textures, even
+    // Source setTexture2DArray/3D skip uploads for render-target textures, even
     // after needsUpdate. Their setup sampler survives until target recreation.
     const samplerState = entry.shape.webglSampler ?? texture;
-    const {descriptor, sampleType} = colorSampler(entry, texture, samplerState);
-    if (entry.shape.webglArray && entry.shape.mipLevelCount !== entry.shape.maximumMipLevels &&
+    const {descriptor, sampleType} = colorSampler(entry, texture, samplerState, {native: false});
+    if ((entry.shape.webglArray || entry.shape.webglVolume) && entry.shape.mipLevelCount !== entry.shape.maximumMipLevels &&
         ![three.NearestFilter, three.LinearFilter].includes(samplerState.minFilter))
-      fail('UNSUPPORTED', 'Mip-filtered WebGL arrays require a complete source mip chain');
+      fail('UNSUPPORTED', 'Mip-filtered WebGL layered targets require a complete source mip chain');
     if (entry.shape.webglCube && descriptor.lodMaxClamp > 0 && !entry.cubeMipReady)
       fail('UNSUPPORTED', 'Mip-filtered WebGL cubes require a completed source mip generation');
     const samplerKey = JSON.stringify(descriptor);
@@ -777,34 +798,37 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       if (!entry.sample) {
         budget(entry.shape.colorBytes);
         checked(entry, device => {
-          const {width, height, format, mipLevelCount, layers, cube, array} = entry.shape;
+          const {width, height, format, mipLevelCount, layers, cube, array, volume} = entry.shape;
+          const dimension = volume ? '3d' : '2d';
           entry.sample = device.createTexture({label: 'Source target UV sampling image',
-            size: {width, height, depthOrArrayLayers: layers}, format, dimension: '2d', sampleCount: 1, mipLevelCount, usage: 4 | 16});
+            size: {width, height, depthOrArrayLayers: layers}, format, dimension, sampleCount: 1, mipLevelCount, usage: 4 | 16});
           entry.charged += entry.shape.colorBytes; allocatedBytes += entry.shape.colorBytes;
-          entry.view = entry.sample.createView(cube ? {dimension: 'cube'} : array ? {dimension: '2d-array'} : {});
-          let pipeline = pipelines.get(format);
+          entry.view = entry.sample.createView(cube ? {dimension: 'cube'} : array ? {dimension: '2d-array'} : volume ? {dimension} : {});
+          const pipelineKey = `${format}/${dimension}`;
+          let pipeline = pipelines.get(pipelineKey);
           if (!pipeline) {
-            const module = device.createShaderModule({label: 'Source target UV orientation', code: FLIP_WGSL(flipY)});
+            const module = device.createShaderModule({label: 'Source target UV orientation',
+              code: (volume ? VOLUME_FLIP_WGSL : FLIP_WGSL)(flipY)});
             // textureLoad does not need filtering, but an automatic layout would
             // still infer sampleType:float and reject a feature-free float32 view.
             const layout = entry.shape.float32 ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
-              {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}},
+              {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: dimension, multisampled: false}},
             ]})]}) : 'auto';
             pipeline = device.createRenderPipeline({label: 'Source target UV orientation', layout,
               vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format}]},
               primitive: {topology: 'triangle-list'}});
-            pipelines.set(format, pipeline);
+            pipelines.set(pipelineKey, pipeline);
           }
           entry.pipeline = pipeline;
           entry.storage.withTexture(source => {
             entry.flipSteps = [];
             for (let level = 0; level < mipLevelCount; level++) for (let face = 0; face < layers; face++) {
               const settings = {baseMipLevel: level, mipLevelCount: 1,
-                ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})};
+                ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : volume ? {dimension} : {})};
               const view = entry.sample.createView(settings);
               const group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
                 entries: [{binding: 0, resource: source.createView(settings)}]});
-              entry.flipSteps.push({view, group});
+              entry.flipSteps.push({view, group, ...(volume ? {depthSlice: face} : {})});
             }
             entry.group = entry.flipSteps[0].group;
           });
@@ -818,9 +842,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         checked(entry, device => entry.storage.withTexture(() => {
           assertCurrent(entry);
           const encoder = device.createCommandEncoder({label: 'Source target UV orientation'});
-          for (const {view, group} of entry.flipSteps) {
-            const pass = encoder.beginRenderPass({colorAttachments: [{view, loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
-            pass.setPipeline(entry.pipeline); pass.setBindGroup(0, group); pass.draw(3); pass.end();
+          for (const {view, group, depthSlice} of entry.flipSteps) {
+            const pass = encoder.beginRenderPass({colorAttachments: [{view, ...(depthSlice !== undefined ? {depthSlice} : {}),
+              loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
+            pass.setPipeline(entry.pipeline); pass.setBindGroup(0, group);
+            if (depthSlice === undefined) pass.draw(3); else pass.draw(3, 1, 0, depthSlice);
+            pass.end();
           }
           assertCurrent(entry);
           device.queue.submit([encoder.finish()]);
