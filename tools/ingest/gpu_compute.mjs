@@ -64,14 +64,17 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   }
   // Never leave a device error scope installed across an await: the same device
   // is shared with rendering, uploads and other asynchronous pipeline builds.
-  function checked(run) {
+  function checked(run, validations = null) {
     live();
     device.pushErrorScope?.('validation');
     try { return run(); }
     finally {
-      if (device.popErrorScope) watch(device.popErrorScope().then(error => {
-        if (error) throw new GpuComputeError('VALIDATION', error.message);
-      }));
+      if (device.popErrorScope) {
+        const validation = watch(device.popErrorScope().then(error => {
+          if (error) throw new GpuComputeError('VALIDATION', error.message);
+        }));
+        validations?.push(validation);
+      }
     }
   }
   function budget(bytes) {
@@ -242,18 +245,27 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     const key = JSON.stringify([code, entryPoint, layouts]);
     if (pipelines.has(key)) return pipelines.get(key);
     if (pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
+    const validations = [];
     const run = (async () => {
-      const module = checked(() => device.createShaderModule({label, code}));
+      const module = checked(() => device.createShaderModule({label, code}), validations);
       if (module.getCompilationInfo) {
         const info = await interrupted(module.getCompilationInfo());
         const errors = info.messages.filter(message => message.type === 'error');
         if (errors.length) fail('SHADER', errors.map(e => `${e.lineNum}:${e.linePos} ${e.message}`).join('\n'));
       }
       live();
-      const descriptor = {label, layout: checked(() => pipelineLayout(layouts)), compute: {module, entryPoint}};
+      const descriptor = {label, layout: checked(() => pipelineLayout(layouts), validations), compute: {module, entryPoint}};
       const pipeline = await interrupted(checked(() => device.createComputePipelineAsync
-        ? device.createComputePipelineAsync(descriptor) : device.createComputePipeline(descriptor)));
-      live(); ready.add(pipeline); compiled.set(key, pipeline); return pipeline;
+        ? device.createComputePipelineAsync(descriptor) : device.createComputePipeline(descriptor), validations));
+      // Native completion is not validation, especially with the synchronous
+      // fallback. Join only this preparation's scopes, never unrelated work or
+      // a GPU queue fence, before publishing an asynchronous success.
+      await interrupted(Promise.all(validations));
+      live();
+      // A source-synchronous compute may have prepared the same key while this
+      // job yielded. Adopt its validated result rather than overwrite its cache.
+      if (pipelines.get(key) !== run) return pipelines.get(key);
+      ready.add(pipeline); compiled.set(key, pipeline); return pipeline;
     })();
     pipelines.set(key, run);
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
@@ -270,11 +282,17 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     const key = JSON.stringify([code, entryPoint, layouts]);
     if (compiled.has(key)) return compiled.get(key);
     if (!pipelines.has(key) && pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
+    const validations = [];
     const pipeline = checked(() => {
       const module = device.createShaderModule({label, code});
       return device.createComputePipeline({label, layout: pipelineLayout(layouts), compute: {module, entryPoint}});
-    });
-    ready.add(pipeline); compiled.set(key, pipeline); pipelines.set(key, Promise.resolve(pipeline));
+    }, validations);
+    // Synchronous source dispatch remains synchronous. An asynchronous caller
+    // sharing this provisional pipeline must still await its scope result.
+    ready.add(pipeline); compiled.set(key, pipeline);
+    const run = interrupted(Promise.all(validations)).then(() => { live(); return pipeline; });
+    pipelines.set(key, run);
+    run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return pipeline;
   }
   function dispatch(pipeline, groups, workgroups) {
@@ -335,7 +353,14 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     await interrupted(Promise.all([...pending, device.queue.onSubmittedWorkDone()]));
     live();
   }
-  return {upload, release, prepare, prepareSync, dispatch, read, whenIdle,
+  // Capture validation already issued by this owner. Resource preparation can
+  // join this proof without waiting for GPU work or future unrelated scopes.
+  async function validationSnapshot() {
+    live();
+    await interrupted(Promise.all([...pending]));
+    live();
+  }
+  return {upload, release, prepare, prepareSync, dispatch, read, whenIdle, validationSnapshot,
     captureUpload: (key, array, version) => { live(); return attributeOwner.capture(key, array, version); },
     releaseUpload: admission => attributeOwner.releaseCapture(admission),
     getBuffer: key => { live(); return buffers.get(key)?.buffer ?? null; },

@@ -55,6 +55,16 @@ function gpu(options = {}) {
 }
 const shader = {code: '@compute @workgroup_size(1) fn main() {}'};
 
+function delayedScopes() {
+  const device = gpu(), scopes = [];
+  device.popErrorScope = () => {
+    device.calls.push(['pop']);
+    const scope = deferred(); scopes.push(scope); return scope.promise;
+  };
+  return {device, scopes};
+}
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+
 test('dispatch owns a real compute encoder, pipeline, bind groups and submit', async () => {
   const device = gpu(), owner = createGpuCompute(device), key = {};
   const buffer = owner.upload(key, new Uint32Array([1, 2, 3]));
@@ -213,4 +223,111 @@ test('synchronous source compute preparation submits without yielding and reuses
   assert.equal(other.prepareSync(shader), prewarmed);
   assert.equal(otherDevice.calls.filter(c => c[0] === 'pipeline').length, 1);
   other.dispose();
+});
+
+for (const [index, operation] of ['shader', 'layout', 'pipeline'].entries()) {
+  test(`asynchronous preparation waits for ${operation} validation before publishing success`, async t => {
+    const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+    t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+    let settled = false;
+    const preparation = owner.prepare(shader);
+    preparation.then(() => { settled = true; }, () => { settled = true; });
+    await nextTurn();
+    assert.equal(scopes.length, 3);
+    for (const [i, scope] of scopes.entries()) if (i !== index) scope.resolve(null);
+    await nextTurn();
+    assert.equal(settled, false, 'native pipeline completion alone is not validation');
+    scopes[index].resolve({message: `${operation} is invalid`});
+    await assert.rejects(preparation, new RegExp(`GPU_COMPUTE_VALIDATION: ${operation} is invalid`));
+    assert.throws(() => owner.prepareSync(shader), /GPU_COMPUTE_VALIDATION/);
+    assert.equal(device.calls.some(c => c[0] === 'submit'), false);
+  });
+}
+
+test('synchronous fallback compilation also awaits validation in asynchronous preparation', async t => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  device.createComputePipelineAsync = undefined;
+  t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+  let settled = false;
+  const preparation = owner.prepare(shader).then(value => { settled = true; return value; });
+  await nextTurn();
+  assert.equal(settled, false);
+  for (const scope of scopes) scope.resolve(null);
+  const pipeline = await preparation;
+  assert.equal(owner.prepareSync(shader), pipeline);
+  owner.dispatch(pipeline, [], [1]);
+  assert.equal(device.calls.filter(c => c[0] === 'dispatch').length, 1);
+});
+
+test('synchronous preparation stays immediate but its async cache waits for validation', async t => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+  const pipeline = owner.prepareSync(shader);
+  owner.dispatch(pipeline, [], [1]);
+  assert.equal(device.calls.filter(c => c[0] === 'dispatch').length, 1);
+  let settled = false;
+  const preparation = owner.prepare(shader);
+  preparation.then(() => { settled = true; }, () => { settled = true; });
+  await nextTurn();
+  assert.equal(settled, false);
+  scopes[0].resolve({message: 'synchronous pipeline is invalid'});
+  await assert.rejects(preparation, /GPU_COMPUTE_VALIDATION: synchronous pipeline is invalid/);
+});
+
+test('independent preparation never waits for another shader or a GPU queue fence', async t => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  device.queue.onSubmittedWorkDone = () => assert.fail('compilation must not fence GPU submissions');
+  t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+  const first = owner.prepare(shader);
+  await nextTurn();
+  let secondSettled = false;
+  const second = owner.prepare({code: '@compute @workgroup_size(2) fn main() {}'});
+  second.then(() => { secondSettled = true; }, () => { secondSettled = true; });
+  await nextTurn();
+  assert.equal(scopes.length, 6);
+  scopes.slice(0, 3).forEach(scope => scope.resolve(null));
+  assert.ok(await first);
+  assert.equal(secondSettled, false);
+  scopes.slice(3).forEach(scope => scope.resolve(null));
+  assert.notEqual(await second, await first);
+});
+
+test('a synchronous request overtaking async preparation leaves one consistent warm cache', async t => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+  const first = owner.prepare(shader);
+  await nextTurn();
+  const synchronous = owner.prepareSync(shader), second = owner.prepare(shader);
+  assert.equal(scopes.length, 4);
+  scopes.forEach(scope => scope.resolve(null));
+  assert.equal(await first, synchronous);
+  assert.equal(await second, synchronous);
+  assert.equal(owner.prepareSync(shader), synchronous);
+  assert.equal(await owner.prepare(shader), synchronous);
+});
+
+test('disposal interrupts pipeline validation without waiting for the device callback', async () => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  const preparation = owner.prepare(shader);
+  await nextTurn();
+  owner.dispose();
+  await assert.rejects(preparation, /DISPOSED/);
+  scopes.forEach(scope => scope.resolve(null));
+  await nextTurn();
+  assert.throws(() => owner.prepare(shader), /DISPOSED/);
+});
+
+test('resource validation snapshots capture issued scopes without a queue fence', async t => {
+  const {device, scopes} = delayedScopes(), owner = createGpuCompute(device);
+  device.queue.onSubmittedWorkDone = () => assert.fail('validation must not fence GPU submissions');
+  t.after(() => { for (const scope of scopes) scope.resolve(null); owner.dispose(); });
+  owner.upload({}, new Uint32Array([1]));
+  let settled = false;
+  const validation = owner.validationSnapshot().then(() => { settled = true; });
+  owner.upload({}, new Uint32Array([2]));
+  await nextTurn();
+  assert.equal(settled, false);
+  scopes.slice(0, 2).forEach(scope => scope.resolve(null));
+  await validation;
+  assert.equal(settled, true, 'later issued scopes are not part of this snapshot');
 });
