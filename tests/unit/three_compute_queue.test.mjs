@@ -177,7 +177,7 @@ test('queued kernels preserve distinct call-time uniforms, even when prewarmed',
 });
 
 test('queued CPU versions and dirty ranges preserve intermediate simulation state', async () => {
-  const {renderer, device, buffers, block} = setup(), data = attribute(new Float32Array([0, 10])), kernel = node([storage(data)]);
+  const {renderer, device, buffers, block, events} = setup(), data = attribute(new Float32Array([0, 10])), kernel = node([storage(data)]);
   renderer.compute(kernel); // GPU now [1, 11], CPU still [0, 10].
   const gate = block();
   data.array[1] = 30; data.version++; data.updateRanges = [{start: 1, count: 1}];
@@ -192,11 +192,12 @@ test('queued CPU versions and dirty ranges preserve intermediate simulation stat
   assert.deepEqual([...new Float32Array(await middle)], [2, 31]);
   assert.deepEqual(await read(renderer, data), [101, 32]);
   assert.equal(computeAttributeSnapshot(device, data).buffer, buffers[0]);
-  assert.equal(data.uploads, 3); renderer.dispose();
+  assert.equal(events.filter(e => e[0] === 'upload').length, 3);
+  assert.equal(data.uploads, 0, 'native storage uploads leave WebGL callbacks inert'); renderer.dispose();
 });
 
 test('H8-sized structured storage preserves packed member bytes and matrix padding', async () => {
-  const {renderer, block} = setup();
+  const {renderer, block, events} = setup();
   // H8's position:vec3, velocity:vec3, C:mat3 occupy 20 32-bit words.
   // Include an integer NaN bit pattern: treating fields as JS float values
   // rather than copying storage bytes must not canonicalize it.
@@ -210,7 +211,8 @@ test('H8-sized structured storage preserves packed member bytes and matrix paddi
   gate.open(); await run;
   assert.deepEqual([...new Uint32Array(await renderer.getArrayBufferAsync(data))], expected);
   assert.equal(data.array, source); assert.equal(data.itemSize, 20); assert.equal(data.count, 2);
-  assert.equal(data.uploads, 1); renderer.dispose();
+  assert.equal(events.filter(e => e[0] === 'upload').length, 1);
+  assert.equal(data.uploads, 0, 'native storage uploads leave WebGL callbacks inert'); renderer.dispose();
 });
 
 test('queued storage replacement retains each captured shape until its own submission', async () => {
@@ -292,7 +294,8 @@ test('unchanged queued storage versions never replace GPU-produced data', async 
   data.array[0] = 999;
   gate.open(); await Promise.all([a, b, c]);
   assert.deepEqual(await read(renderer, data), [3]);
-  assert.equal(data.uploads, 1); assert.equal(events.filter(e => e[0] === 'upload').length, 1);
+  assert.equal(data.uploads, 0, 'native storage uploads leave WebGL callbacks inert');
+  assert.equal(events.filter(e => e[0] === 'upload').length, 1);
   renderer.dispose();
 });
 

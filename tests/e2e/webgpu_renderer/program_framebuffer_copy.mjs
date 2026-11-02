@@ -138,6 +138,36 @@ async function capture(mode) {
         mips.generateMipmaps = true;
         produce(sourceTarget, 1);copy('base-overwrite', mips);show(mips);await read('overwritten-base');
         show(mips, output, 1);await read('lower-mip-preserved');
+        // Source framebufferTextureLayer selects an authored array mip
+        // independently of its layer. Observe it through the same public copy.
+        {
+          const name = 'array', depth = 3;
+          const layered = new T.WebGLArrayRenderTarget(width, height, depth, {depthBuffer: false,
+            generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+          targets.push(layered);layered.texture.mipmaps = Array.from({length: 6}, () => ({}));
+          const writeLayer = (slice, level, phase) => {
+            layered.viewport.set(0, 0, Math.max(1, width >> level), Math.max(1, height >> level));
+            renderer.setRenderTarget(layered, slice, level);producerMaterial.uniforms.phase.value = phase;
+            renderer.render(producer, camera);
+          };
+          const showLayer = async (suffix, slice, level) => {
+            renderer.setRenderTarget(layered, slice, level);
+            copy(`${name}-${suffix}`, copied, new T.Vector2(((width >> level) - 8) / 2, ((height >> level) - 6) / 2));
+            show(copied);await read(`${name}-${suffix}`);
+          };
+          writeLayer(depth - 1, 0, 1);writeLayer(2, 2, 0);
+          writeLayer(1, 1, 0);writeLayer(0, 1, 0);
+          await showLayer('authored-mip-initial', 0, 1);
+          writeLayer(0, 1, 1);
+          await showLayer('authored-mip-updated', 0, 1);
+          await showLayer('authored-mip-sibling', 1, 1);
+          await showLayer('authored-other-mip', 2, 2);
+          await showLayer('authored-base-preserved', depth - 1, 0);
+          // Arrays retain all layers even at their last mip.
+          const last = framebuffer(1, 1);
+          writeLayer(2, 5, 0);
+          copy(`${name}-last-authored-mip`, last);show(last);await read(`${name}-last-authored-mip`);
+        }
         if (mode === 'source') {
           const probe = target(40, 28);probe.texture.type = T.FloatType;
           probe.texture.minFilter = probe.texture.magFilter = T.NearestFilter;
@@ -226,6 +256,8 @@ try {
     ['canvas-crop-basic', false], ['target-vector4-position', true], ['selected-cube-face', false],
     ['selected-array-layer', false], ['queued-first-consumer', false], ['queued-second-consumer', true],
     ['resized-source', false], ['explicit-destination-mip', false], ['lower-mip-preserved', false],
+    ['array-authored-mip-initial', false], ['array-authored-mip-updated', true],
+    ['array-authored-mip-sibling', false], ['array-authored-other-mip', false], ['array-authored-base-preserved', true],
     ['half-float-destination', false], ['initialization-retarget', true], ['draw-before-copy', false], ['draw-after-copy', true],
   ]) for (let index = 0; index < corners.length; index++) {
     const expected = colors[index].map((value, channel) => inverted && channel < 3 ? 255 - value : value);
@@ -233,6 +265,8 @@ try {
   }
   for (const name of ['canvas-default-position', 'overwritten-base'])
     for (const [x, y] of corners) assert.deepEqual(pixel(frames[name], x, y), [223,191,159,255], `${name}: source uniform crop`);
+  for (const [x, y] of corners)
+    assert.deepEqual(pixel(frames['array-last-authored-mip'], x, y), colors[3], 'source last array mip texel');
   for (let index = 0; index < corners.length; index++) {
     const [x, y] = corners[index], expected = pixel(frames['srgb-direct-sample'], x, y);
     assert.ok(expected[3] === 255 && expected.slice(0, 3).some(channel => channel > 0), 'source sRGB sample is nonblank');

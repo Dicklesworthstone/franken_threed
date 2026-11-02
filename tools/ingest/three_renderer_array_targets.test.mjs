@@ -1,15 +1,16 @@
-/** Native source array targets through the public renderer and owned GPU path.
+/** Source array targets through the public renderer and owned GPU path.
  * These recording-device checks observe attachments, WGSL, bindings and copy
  * regions. They do not simulate rasterized pixels or claim browser parity.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
-import {createWebGPURendererClass} from './three_renderer.mjs';
+import * as GL from '../../upstream/three.js/build/three.module.js';
+import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
-function fixture(t) {
+function fixture(t, webgl = false) {
   const device = geometryDevice();
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
   const textures = [], reads = [], copies = [], captures = [];
@@ -26,10 +27,19 @@ function fixture(t) {
   const createBuffer = device.createBuffer;
   device.createBuffer = desc => Object.assign(createBuffer(desc), {mapAsync: async () => {}});
   const createEncoder = device.createCommandEncoder;
-  device.createCommandEncoder = () => Object.assign(createEncoder(), {
-    copyTextureToBuffer(source, destination, size) { reads.push({source, destination, size}); },
-    copyTextureToTexture(source, destination, size) { copies.push({source, destination, size}); },
-  });
+  device.createCommandEncoder = () => {
+    const encoder = createEncoder(), begin = encoder.beginRenderPass;
+    return Object.assign(encoder, {
+      beginRenderPass(descriptor) {
+        const pass = begin(descriptor), record = device.passes.at(-1);
+        return {...pass,
+          setViewport(...value) { record.viewport = value; pass.setViewport(...value); },
+          setScissorRect(...value) { record.scissor = value; pass.setScissorRect(...value); }};
+      },
+      copyTextureToBuffer(source, destination, size) { reads.push({source, destination, size}); },
+      copyTextureToTexture(source, destination, size) { copies.push({source, destination, size}); },
+    });
+  };
   device.createRenderPipeline = desc => {
     const pipeline = {...desc, getBindGroupLayout: () => ({})}; device.pipelines.push(pipeline); return pipeline;
   };
@@ -39,10 +49,12 @@ function fixture(t) {
     configure(value) { configured = value; }, unconfigure() {},
     getCurrentTexture() { return device.createTexture({size: [32, 32], format: configured.format, usage: 16}); },
   })};
-  const renderer = new Renderer({canvas, device}); renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  const Type = webgl ? createWebGLRendererClass(GL) : Renderer;
+  const renderer = new Type({canvas, device}); renderer.outputColorSpace = T.LinearSRGBColorSpace;
   t.after(() => renderer.dispose());
   const scene = new T.Scene(), camera = new T.PerspectiveCamera(50, 1, .1, 20); camera.position.z = 4;
-  const material = new T.MeshBasicNodeMaterial(); material.colorNode = N.vec3(.125, .375, .625);
+  const material = webgl ? new GL.MeshBasicMaterial({color: 0x20609f}) : new T.MeshBasicNodeMaterial();
+  if (!webgl) material.colorNode = N.vec3(.125, .375, .625);
   scene.add(new T.Mesh(new T.PlaneGeometry(), material));
   const capture = renderer._captureNodeFrame;
   renderer._captureNodeFrame = function(request) {
@@ -83,6 +95,65 @@ test('array layer and authored mip level select independent attachment subresour
   assert.deepEqual([view.baseArrayLayer, view.arrayLayerCount, view.baseMipLevel, view.mipLevelCount], [2, 1, 1, 1]);
   assert.equal(f.renderer.getActiveMipmapLevel(), 1);
   assert.equal(view.texture.mipLevelCount, 2);
+});
+
+test('queued WebGL array mip draws retain every layer and captured physical viewport/scissor', async t => {
+  const f = fixture(t, true), array = new GL.WebGLArrayRenderTarget(8, 6, 3, {depthBuffer: false});
+  t.after(() => array.dispose()); array.texture.mipmaps = [{}, {}, {}, {}];
+  await f.renderer.init(); f.renderer.setPixelRatio(3); f.renderer.autoClear = false;
+  const requests = [
+    {layer: 2, mip: 1, viewport: [1, 0, 3, 2], scissor: [1, 1, 2, 1]},
+    {layer: 0, mip: 2, viewport: [0, 0, 1, 1], scissor: [0, 0, 1, 1]},
+    {layer: 2, mip: 3, viewport: [0, 0, 1, 1], scissor: [0, 0, 1, 1]},
+    {layer: 1, mip: 0, viewport: [0, 0, 8, 6]},
+  ];
+  for (const request of requests) {
+    array.viewport.fromArray(request.viewport); array.scissorTest = !!request.scissor;
+    if (request.scissor) array.scissor.fromArray(request.scissor);
+    f.renderer.setRenderTarget(array, request.layer, request.mip); f.renderer.render(f.scene, f.camera);
+  }
+  array.viewport.set(0, 0, 1, 1); array.scissor.set(0, 0, 0, 0);
+  f.renderer.setRenderTarget(null); await f.renderer.waitForGPU();
+  const passes = drawPasses(f.device), views = passes.map(pass => pass.desc.colorAttachments[0].view);
+  assert.equal(f.device.passes.length, 4, 'no mip generation or sibling-layer passes');
+  assert.deepEqual(views.map(view => [view.baseArrayLayer, view.baseMipLevel]), [[2, 1], [0, 2], [2, 3], [1, 0]]);
+  assert.ok(views.every(view => view.dimension === '2d' && view.arrayLayerCount === 1 && view.mipLevelCount === 1));
+  assert.equal(new Set(views.map(view => view.texture)).size, 1);
+  assert.deepEqual([views[0].texture.width, views[0].texture.height, views[0].texture.depthOrArrayLayers,
+    views[0].texture.mipLevelCount], [8, 6, 3, 4]);
+  assert.deepEqual(passes.map(pass => pass.viewport), [[1, 1, 3, 2, 0, 1], [0, 0, 1, 1, 0, 1], undefined, undefined]);
+  assert.deepEqual(passes.map(pass => pass.scissor), [[1, 1, 2, 1], [0, 0, 1, 1], undefined, undefined]);
+  assert.ok(passes.every(pass => pass.desc.depthStencilAttachment === undefined));
+  assert.equal(f.renderer._targets.capture(array).storage.diagnostics.mipGenerations, 0);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.info.f3d.offscreenRenders, 4);
+});
+
+test('WebGL authored array mips reject invalid layers and unsupported profiles before allocation', t => {
+  const f = fixture(t, true), array = new GL.WebGLArrayRenderTarget(8, 6, 3, {depthBuffer: false});
+  t.after(() => array.dispose()); array.texture.mipmaps = [{}, {}, {}, {}];
+  const allocations = [f.textures.length, f.device.buffers.length];
+  f.renderer.setRenderTarget(array, 2, 3);
+  for (const mip of [0, 1, 2, 3]) for (const layer of [-1, 3, .5, NaN, Infinity])
+    assert.throws(() => f.renderer.setRenderTarget(array, layer, mip), {code: 'THREE_TARGET_FACE'});
+  for (const options of [{}, {stencilBuffer: true}, {depthBuffer: false, samples: 4},
+    {depthBuffer: false, generateMipmaps: true}]) {
+    const bad = new GL.WebGLArrayRenderTarget(8, 6, 3, options); t.after(() => bad.dispose());
+    bad.texture.mipmaps = [{}, {}, {}, {}];
+    assert.throws(() => f.renderer.setRenderTarget(bad, 2, 1), {code: 'THREE_TARGET_MIP'});
+  }
+  const partial = new GL.WebGLArrayRenderTarget(8, 6, 3, {depthBuffer: false});
+  t.after(() => partial.dispose()); partial.texture.mipmaps = [{}, {}];
+  assert.throws(() => f.renderer.setRenderTarget(partial, 2, 1), {code: 'THREE_TARGET_MIP'});
+  const nativeArray = new GL.RenderTarget(8, 6, {depth: 3, depthBuffer: false});
+  t.after(() => nativeArray.dispose()); nativeArray.texture.mipmaps = [{}, {}, {}, {}];
+  assert.throws(() => f.renderer.setRenderTarget(nativeArray, 2, 2), {code: 'THREE_TARGET_MIP'});
+  const volume = new GL.WebGL3DRenderTarget(8, 6, 5, {depthBuffer: false});
+  t.after(() => volume.dispose()); volume.texture.mipmaps = [{}, {}, {}, {}];
+  for (const mip of [1, 2, 3])
+    assert.throws(() => f.renderer.setRenderTarget(volume, 0, mip), {code: 'THREE_TARGET_MIP'});
+  assert.equal(f.renderer.getRenderTarget(), array); assert.equal(f.renderer.getActiveCubeFace(), 2);
+  assert.equal(f.renderer.getActiveMipmapLevel(), 3); assert.equal(f.renderer._targets.allocatedBytes, 0);
+  assert.deepEqual([f.textures.length, f.device.buffers.length], allocations); assert.equal(f.device.passes.length, 0);
 });
 
 for (const Type of [T.RenderTarget, T.WebGLArrayRenderTarget])

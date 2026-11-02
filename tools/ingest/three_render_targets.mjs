@@ -93,6 +93,7 @@ function depthComparison(texture, three) {
 function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount = null) {
   if (!three?.RenderTarget || !(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
   const webglCube = target.isWebGLCubeRenderTarget === true;
+  const webglArray = target.isWebGLArrayRenderTarget === true && texture?.isDataArrayTexture === true;
   const cube = target.isCubeRenderTarget === true || webglCube;
   const volume = target.isRenderTarget3D === true || target.isWebGL3DRenderTarget === true;
   const array = !cube && !volume && (target.depth > 1 || target.isWebGLArrayRenderTarget === true || texture?.isDataArrayTexture === true || texture?.isArrayTexture === true);
@@ -254,11 +255,11 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
-    cube, webglCube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
+    cube, webglCube, webglArray, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     ...(cube ? {sourceVersion: texture.version} : {}),
     depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
-    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
+    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null} = {}) {
@@ -282,11 +283,15 @@ export function inspectThreeRenderTargetMip(shape, mipLevel = 0, face = 0, {webg
   if ((webgl || shape.webglCube) && mipLevel > 0) {
     // r186 WebGL uses a depthless scratch framebuffer for higher levels. The
     // current dispatcher retains one attachment profile per target, so admit
-    // ordinary 2D/cube color-only targets until it supports per-level profiles.
-    if (shape.array || shape.volume || shape.cube && !shape.webglCube ||
+    // color-only targets. Source WebGL array storage needs both the target and
+    // DataArrayTexture flags; native RenderTarget depth alone is insufficient.
+    // Array layers remain unchanged at every mip. Keep
+    // volumes excluded: source setupFrameBufferTexture does not shrink their
+    // authored Z extents, making a multi-slice volume chain incomplete in GL.
+    if (shape.volume || shape.array && !shape.webglArray || shape.cube && !shape.webglCube ||
         shape.authoredMipLevelCount !== shape.maximumMipLevels ||
         shape.depthAttachment || shape.depthTexture !== null || shape.sampleCount !== 1)
-      fail('MIP', 'WebGL mip rendering requires a complete authored 2D or cube chain, single-sample color and no depth/stencil attachment');
+      fail('MIP', 'WebGL mip rendering requires a complete authored 2D, array or cube chain, single-sample color and no depth/stencil attachment');
     // The facade supplies this flag at capture time. Owner submission must not
     // reread a later source flag: CubeCamera and subsequent base draws can
     // change it while an already accepted higher-mip request is queued.
