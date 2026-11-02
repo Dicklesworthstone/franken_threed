@@ -618,7 +618,7 @@ export function createGpuThreeTextures(device,{
     }finally{busy=false;}
   }
   function check(t){live();const d=describe(t,{initialize:records.has(t)}),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
-  function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,version:r.version,sourceVersion:r.resource.sourceVersion,
+  function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,samplerDescriptor:Object.freeze({...d.sampler}),version:r.version,sourceVersion:r.resource.sourceVersion,
     ...(d.layered?{viewDimension:d.viewDimension}:{}),sampleType:d?.sampleType??'float',filtering:(d?.sampleType??'float')==='float'});}
   function update(input){
     const list=plans(input);if(busy)fail('REENTRANT','Cannot update during a texture operation');
@@ -694,6 +694,7 @@ export function createThreeTextureBindings(device,state) {
       try{
         result=Object.freeze({texture,view:texture.createView({dimension:viewDimension}),
           sampler:device.createSampler({label:'f3d-default-texture',...(sampleType==='depth'?{compare:'less-equal'}:{})}),
+          samplerDescriptor:Object.freeze({addressModeU:'clamp-to-edge',addressModeV:'clamp-to-edge',addressModeW:'clamp-to-edge',lodMaxClamp:0}),
           viewDimension,sampleType,filtering:sampleType==='float'});
       }catch(error){texture.destroy();throw error;}
       defaults.set(key,result);
@@ -728,7 +729,7 @@ export function createThreeTextureBindings(device,state) {
       // Inspection tokens never reach addMesh: prepare() resolves them to the
       // shared owner's native view/sampler after all real sources are admitted.
       scan.add(t);
-      return checked({view:t,sampler:t,viewDimension:shape.viewDimension,sampleType:shape.sampleType});
+      return checked({view:t,sampler:t,samplerDescriptor:shape.sampler,viewDimension:shape.viewDimension,sampleType:shape.sampleType});
     }
     let result;
     try{result=owner.binding(t);}

@@ -51,6 +51,17 @@ admitted. The source rules are in the
   then need no flip; the caller swaps the pipeline's front face.
 - `gl_FragCoord` in GL window coordinates (bottom-left origin); `dFdy` keeps GL's
   upward sign; `texture()` outside fragment shaders samples level 0.
+- Signed and unsigned integer 2D, 2D-array and 3D samplers implement nearest
+  `texture`, `textureLod` and `textureGrad` through typed `textureLoad`, preserving
+  all 32 bits. Helpers apply clamp/repeat/mirror addressing, rounded array layers,
+  and explicit or derivative-based mip selection. Sampler arrays and function
+  parameters carry independent controls in 16-byte uniform slots at each
+  texture's `samplingOffset`. The admitted binding's frozen sampler descriptor
+  supplies those controls; retained direct draws keep their accepted bytes.
+  Mip minification uses the floor alternative allowed by ES 3.0 equation 3.23
+  footnote 4, matching the tested ANGLE path; the base-level half tie stays at
+  zero. This does not close the automatic texture owner's pre-existing gap for
+  public sampler-property edits made without `needsUpdate`.
 - `gl_DepthRange` is the GL default `{near: 0, far: 1, diff: 1}`: r186 never
   calls `gl.depthRange`, and pipelines record viewports with depth 0..1.
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
@@ -89,11 +100,21 @@ admitted. The source rules are in the
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
-filtered sampling of integer textures, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
+integer cube sampling and integer sampling bias, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
+Integer projected/offset sampling remains outside the admitted integer slice.
 
 ## Evidence
 
+- `three_program_integer_sampling.test.mjs`: six focused lowering, layout,
+  signature and bound-sampler metadata regressions. The existing 32 compiler
+  and 25 texture-owner tests also pass. `program_integer_sampling.mjs` compares
+  all 50 source/candidate checkpoints exactly (307,200 RGBA bytes), including
+  high-bit integer values, wraps, mip boundaries, explicit gradients, arrays,
+  volume slices and vertex sampling. Both sides use pinned r186; the candidate
+  reports `general-webgpu` with native draws. Chromium 151.0.7922.34 SwiftShader
+  reported no GPU/browser errors. This is software GPU correctness evidence,
+  not a physical-device performance result or complete ESSL closure.
 - `essl_wgsl.test.mjs`: lowering and layout regressions. Switch tests execute
   emitted scalar helper control flow through a small test-only JS syntax adapter
   and check loop targets and scope diagnostics. These checks do not validate

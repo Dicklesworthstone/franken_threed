@@ -889,7 +889,7 @@ export async function createGpuThreeScene(device,scene,{
           ownedTextures().prepare([texture]);retainedTextures.add(texture);
         }
         const binding=texture?textureBinding(texture,t,object.isBatchedMesh===true&&texture===object._indirectTexture):placeholderBinding(null,t);
-        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float'});textureKey.push(texture??null,binding.view,binding.sampler);
+        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float',samplerDescriptor:binding.samplerDescriptor});textureKey.push(texture??null,binding.view,binding.sampler);
       }
       const raster=programSupport.raster(m,{side,topology});
       const options={program:compiled.program,textures:bindings,raster,topology,
@@ -1824,7 +1824,7 @@ export async function createGpuThreeScene(device,scene,{
             refresh:()=>programSupport.refresh(m,d.refreshOptions),
             pack:(bytes,cam,size,reflection,drawId=null)=>{
               const clip=programSupport.clippingState(programClippingControls(),m,cam);
-              return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),object,cam,bytes,{targetSize:size,material:m,
+              return programSupport.pack(reflection,programSupport.refresh(m,d.refreshOptions),object,cam,bytes,{targetSize:size,material:m,textureBindings:d.options.textures,
                 values:{...(programSupport.bindsClippingPlanes(m)?{clippingPlanes:clip.planes}:{}),...(drawId!==null?{_gl_DrawID:drawId}:{})}});
             }};
         };
@@ -2012,7 +2012,7 @@ export async function createGpuThreeScene(device,scene,{
           const reflection=desc.program.program.reflection,bytes=new Uint8Array(reflection.uniformBufferSize);
           const clipState=programSupport.clippingState(programClippingControls(),material,drawCamera);
           const current=programSupport.pack(reflection,desc.retained?null:programSupport.uniformsFor(material),sourceObject,drawCamera,bytes,
-            {targetSize:programTargetSize,material,retainedUniforms:desc.retained,values:programSupport.bindsClippingPlanes(material)?{clippingPlanes:clipState.planes}:{}});
+            {targetSize:programTargetSize,material,textureBindings:desc.options.textures,retainedUniforms:desc.retained,values:programSupport.bindsClippingPlanes(material)?{clippingPlanes:clipState.planes}:{}});
           if(current.some((texture,index)=>(texture??null)!==desc.programTextures[index]))
             fail('MATERIAL','A direct program changed sampler identities while packing its uniforms');
           if(material.uniformsNeedUpdate===true)material.uniformsNeedUpdate=false;
@@ -2134,7 +2134,7 @@ export async function createGpuThreeScene(device,scene,{
               const values={...(programSupport.bindsClippingPlanes(item.material)?{clippingPlanes:clip.planes}:{}),...(sub?{_gl_DrawID:sub.id}:{})};
               const targetSize=view?.viewport&&programTargetSize?[...programTargetSize.slice(0,2),...view.viewport.slice(2,4)]:programTargetSize;
               const uniforms=programArray?programSupport.refresh(item.material,d.refreshOptions):programSupport.uniformsFor(item.material);
-              const current=programSupport.pack(reflection,uniforms,object,drawCamera,bytes,{targetSize,material:item.material,values});
+              const current=programSupport.pack(reflection,uniforms,object,drawCamera,bytes,{targetSize,material:item.material,textureBindings:d.options.textures,values});
               if(current.some((t,k)=>(t??null)!==d.programTextures[k]))fail('PREPARE','Program texture uniforms changed; call prepare()');
               for(const t of current)if(t)frameTextures?.add(t);
               // Programs evaluate fog/lighting in their own source; never core receivers.

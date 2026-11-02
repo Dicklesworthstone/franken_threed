@@ -173,7 +173,7 @@ export function threeMorphTargets(T, geometry, maxTextureSize = 8192) {
  * uniforms object (material.uniforms, or a refreshed ShaderLib clone). Values
  * the program declares but nothing sets stay zero, as GL leaves them.
  * Returns the texture (or null) for each reflected sampler binding. */
-export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, values = null, logarithmicDepthBuffer = false, retainedUniforms = null} = {}) {
+export function packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure = 1, targetSize = null, samplers = null, textureBindings = null, values = null, logarithmicDepthBuffer = false, retainedUniforms = null} = {}) {
   if (retainedUniforms) bytes.set(retainedUniforms.bytes); else bytes.fill(0);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const cameraPosition = new T.Vector3().setFromMatrixPosition(camera.matrixWorld);
@@ -222,9 +222,22 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     for (let i = 0; i < 4; i++) view.setFloat32(reflection.targetOffset + 4 * i, targetSize[i], true);
   }
   if (retainedUniforms) return retainedUniforms.desc.programTextures;
-  return reflection.textures.map(t => {
+  return reflection.textures.map((t, index) => {
     const v = samplers?.[t.name] ?? uniforms?.[t.name]?.value;
-    return t.element === null ? v ?? null : v?.[t.element] ?? null;
+    const texture = t.element === null ? v ?? null : v?.[t.element] ?? null;
+    if (t.samplingOffset !== undefined) {
+      // A borrowed binding can retain an older uploaded sampler after public
+      // property edits. Its owner is the authority for the installed controls.
+      const descriptor = textureBindings?.[index]?.samplerDescriptor;
+      if (textureBindings && reflection.integerSampling && !descriptor)
+        fail('TEXTURE', 'Normalized integer sampling needs the bound sampler descriptor');
+      const wrap = value => value === T.RepeatWrapping || value === 'repeat' ? 1 : value === T.MirroredRepeatWrapping || value === 'mirror-repeat' ? 2 : 0;
+      const controls = descriptor
+        ? [wrap(descriptor.addressModeU), wrap(descriptor.addressModeV), wrap(descriptor.addressModeW), descriptor.lodMaxClamp > 0 ? 1 : 0]
+        : [wrap(texture?.wrapS), wrap(texture?.wrapT), wrap(texture?.wrapR), texture?.minFilter === T.NearestMipmapNearestFilter ? 1 : 0];
+      for (let i = 0; i < 4; i++) view.setUint32(t.samplingOffset + i * 4, controls[i], true);
+    }
+    return texture;
   });
 }
 function components(value, n, name) {

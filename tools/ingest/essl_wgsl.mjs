@@ -36,7 +36,7 @@
  * break/continue targets; switch-local storage is shared across source labels.
  * ESSL 3.00 struct varyings flatten numeric members into inter-stage locations,
  * preserving matrix columns and smooth/flat/centroid interpolation.
- * Unsupported constructs (gl_ClipDistance, integer-texture filtering, ...)
+ * Unsupported constructs (gl_ClipDistance, integer cube sampling, ...)
  * throw EsslError; nothing is dropped.
  * No performance claim.
  */
@@ -57,6 +57,7 @@ const SAMPLERS = {
   isampler2D: {dim: '2d', s: 'int'}, isampler3D: {dim: '3d', s: 'int'}, isamplerCube: {dim: 'cube', s: 'int'}, isampler2DArray: {dim: '2d-array', s: 'int'},
   usampler2D: {dim: '2d', s: 'uint'}, usampler3D: {dim: '3d', s: 'uint'}, usamplerCube: {dim: 'cube', s: 'uint'}, usampler2DArray: {dim: '2d-array', s: 'uint'},
 };
+const integerSampler = type => type.s === 'int' || type.s === 'uint';
 function basicType(name) {
   if (name === 'void') return VOID;
   if (WGSL_SCALAR[name]) return S(name);
@@ -241,6 +242,12 @@ function reflect(shared, units, varyings) {
     fields.push({name, glslType: glslName(u.type), offset, size: lay.size, node: describe(u.type, u.repr, offset, shared)});
     offset += lay.size; align = Math.max(align, lay.align);
   }
+  const samplingOffsets = new Map();
+  for (const sampler of shared.samplers.values()) if (integerSampler(sampler.type)) {
+    for (const binding of sampler.bindings) {
+      offset = roundUp(16, offset); samplingOffsets.set(binding, offset); offset += 16;
+    }
+  }
   let targetOffset = null;
   if (shared.needsTarget) { offset = roundUp(16, offset); targetOffset = offset; offset += 16; }
   const size = Math.max(16, roundUp(16, offset));
@@ -248,9 +255,10 @@ function reflect(shared, units, varyings) {
   for (const [name, s] of shared.samplers) s.bindings.forEach((binding, element) => textures.push({
     name, element: s.count === null ? null : element, glslType: s.type.name, dimension: s.type.dim,
     sampleType: s.type.shadow ? 'depth' : s.type.s === 'float' ? 'float' : s.type.s === 'int' ? 'sint' : 'uint',
-    comparison: !!s.type.shadow, textureBinding: binding * 2, samplerBinding: binding * 2 + 1}));
+    comparison: !!s.type.shadow, textureBinding: binding * 2, samplerBinding: binding * 2 + 1,
+    ...(samplingOffsets.has(binding) ? {samplingOffset: samplingOffsets.get(binding)} : {})}));
   return {
-    uniformBufferSize: size, uniforms: fields, targetOffset,
+    uniformBufferSize: size, uniforms: fields, targetOffset, integerSampling: shared.integerSampling === true,
     blocks: [...shared.blocks].map(([name, members]) => ({name, members: members.map(m => fields.find(f => f.name === m))})),
     textures,
     attributes: units.vertex.inputs.filter(i => !i.builtin).map(i => ({name: i.name, glslType: glslName(i.type), location: i.location,
@@ -586,6 +594,8 @@ class Unit {
       }
     }
     const uniformFields = this.shared.uniformOrder.map(n => { const u = this.shared.uniforms.get(n); return `  ${u.field}: ${this.wgslUniform(u.repr)},`; });
+    for (const sampler of this.shared.samplers.values()) if (integerSampler(sampler.type))
+      for (const binding of sampler.bindings) uniformFields.push(`  f3d_sampling_${binding}: vec4<u32>,`);
     if (this.shared.needsTarget) uniformFields.push('  f3d_target: vec4<f32>,');
     if (!uniformFields.length) uniformFields.push('  f3d_pad: vec4<f32>,');
     body.push('struct F3DUniforms {', ...uniformFields, '};', '@group(0) @binding(0) var<uniform> f3d_u: F3DUniforms;');
@@ -729,6 +739,7 @@ class Unit {
       const w = safe(p.name);
       if (p.type.k === 'smp') {
         params.push(`${w}_texture: ${textureType(p.type)}`, `${w}_sampler: ${p.type.shadow ? 'sampler_comparison' : 'sampler'}`);
+        if (integerSampler(p.type)) params.push(`${w}_sampling: vec4<u32>`);
         scope.vars.set(p.name, {kind: 'samplerParam', type: p.type, w});
       } else if (p.q === 'out' || p.q === 'inout') {
         params.push(`${w}: ptr<function, ${this.wgsl(p.type)}>`);
@@ -1149,10 +1160,12 @@ class Unit {
   }
   samplerNames(r, line) {
     if (!r.smp) essError('Expected a sampler', line);
-    if (r.smp.kind === 'param') return {tex: `${r.smp.w}_texture`, smp: `${r.smp.w}_sampler`, type: r.t};
+    if (r.smp.kind === 'param') return {tex: `${r.smp.w}_texture`, smp: `${r.smp.w}_sampler`, type: r.t,
+      sampling: `${r.smp.w}_sampling`};
     const s = r.smp.sampler, base = s.count === null ? safe(r.smp.name) : `${safe(r.smp.name)}_${r.smp.element}`;
     if (s.count !== null && r.smp.element === undefined) essError('Sampler arrays must be indexed with a constant', line);
-    return {tex: `${base}_texture`, smp: `${base}_sampler`, type: s.type};
+    return {tex: `${base}_texture`, smp: `${base}_sampler`, type: s.type,
+      sampling: `f3d_u.f3d_sampling_${s.bindings[r.smp.element ?? 0]}`};
   }
   index(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
@@ -1448,7 +1461,11 @@ class Unit {
     if (!f) essError(`No matching overload for ${e.name}(${parts.map(p => glslName(p.t)).join(', ')})`, e.line);
     const callArgs = [], writeback = [];
     f.params.forEach((p, i) => {
-      if (p.type.k === 'smp') { const s = this.samplerNames(raw[i], e.line); callArgs.push(s.tex, s.smp); return; }
+      if (p.type.k === 'smp') {
+        const s = this.samplerNames(raw[i], e.line); callArgs.push(s.tex, s.smp);
+        if (integerSampler(p.type)) callArgs.push(s.sampling);
+        return;
+      }
       if (p.q === 'out' || p.q === 'inout') {
         const lv = this.lvalue(e.args[i], ctx), t = this.tmp();
         ctx.pre.push(`var ${t}: ${this.wgsl(p.type)}${p.q === 'inout' ? ` = ${lv.swizzle ? `${lv.base}.${lv.swizzle.join('')}` : lv.c}` : ''};`);
@@ -1567,6 +1584,8 @@ class Unit {
     const vec4 = st.s === 'float' ? V('float', 4) : V(st.s, 4);
     const coordNeed = {'2d': 2, '3d': 3, 'cube': 3, '2d-array': 3}[st.dim] + (st.shadow ? 1 : 0);
     const isInt = st.s !== 'float';
+    if (isInt && ['texture', 'textureLod', 'textureGrad'].includes(name))
+      return this.integerTextureCall(name, s, rest, ctx, line);
     const coords = (p, n) => {
       // Split coordinate (+ array layer / depth reference) per WGSL signatures.
       const c = this.capture(p, ctx);
@@ -1616,6 +1635,53 @@ class Unit {
       }
     }
     essError(`Unsupported texture function ${name}`, line);
+  }
+  /** Integer samplers admit only nearest texels/mips. WGSL's filtered sample
+   * builtins accept float textures, so carry the source wrap/mip controls in
+   * the draw's uniform snapshot and load the selected integer texel directly.
+   * OpenGL ES 3.0 sections 3.8.10/3.8.13 define these selection rules. */
+  integerTextureCall(name, sampler, args, ctx, line) {
+    const {type, tex, sampling} = sampler, dim = type.dim;
+    this.shared.integerSampling = true;
+    if (dim === 'cube') essError('Integer cube sampling needs a layered cube view', line);
+    const count = {texture: 1, textureLod: 2, textureGrad: 3}[name];
+    if (args.length !== count) essError(`${name} integer sampling expects ${count + 1} arguments; bias is not admitted`, line);
+    const dimensions = dim === '3d' ? 3 : 2, coordinates = dim === '2d' ? 2 : 3;
+    if (!same(args[0].t, V('float', coordinates))) essError(`${name} needs vec${coordinates} coordinates`, line);
+    if (name === 'textureLod' && !same(args[1].t, FLOAT)) essError('textureLod needs a float LOD', line);
+    if (name === 'textureGrad' && args.slice(1).some(a => !same(a.t, V('float', dimensions))))
+      essError(`textureGrad needs vec${dimensions} derivatives`, line);
+    const p = this.capture(args[0], ctx), uv = dim === '2d-array' ? `${p.c}.xy` : p.c;
+    let lod = name === 'textureLod' ? args[1].c : '0.0';
+    if (name === 'textureGrad' || name === 'texture' && this.stage === 'fragment') {
+      const size = this.tmp(), dx = this.tmp(), dy = this.tmp();
+      ctx.pre.push(`let ${size} = vec${dimensions}<f32>(textureDimensions(${tex}, 0));`,
+        `let ${dx} = ${name === 'textureGrad' ? args[1].c : `dpdx(${uv})`} * ${size};`,
+        `let ${dy} = ${name === 'textureGrad' ? args[2].c : `dpdy(${uv})`} * ${size};`);
+      lod = `(0.5 * log2(max(max(dot(${dx}, ${dx}), dot(${dy}, ${dy})), 1e-30)))`;
+    }
+    const wrap = 'f3d_integer_nearest_index';
+    if (!this.helpers.has(wrap)) this.helpers.set(wrap, `fn ${wrap}(p: f32, size: u32, mode: u32) -> i32 {
+  var uv = clamp(p, 0.0, 1.0);
+  if (mode == 1u) { uv = fract(p); }
+  else if (mode == 2u) { uv = 1.0 - abs(2.0 * fract(p * 0.5) - 1.0); }
+  return min(i32(floor(uv * f32(size))), i32(size) - 1);
+}`);
+    const helper = `f3d_integer_sample_${dim.replace('-', '_')}_${type.s}`;
+    if (!this.helpers.has(helper)) {
+      const components = 'xyz'.slice(0, dimensions).split('').map(c => `${wrap}(p.${c}, size.${c}, control.${c})`);
+      const layer = dim === '2d-array'
+        ? ', i32(clamp(floor(p.z + 0.5), 0.0, f32(textureNumLayers(image) - 1u)))' : '';
+      this.helpers.set(helper, `fn ${helper}(image: ${textureType(type)}, control: vec4<u32>, p: vec${coordinates}<f32>, lod: f32) -> vec4<${WGSL_SCALAR[type.s]}> {
+  // ES 3.0 equation 3.23, footnote 4 permits floor for minification;
+  // the pinned ANGLE path uses it. The base-level half tie stays at zero.
+  let level = select(0, i32(clamp(floor(lod + 0.5), 0.0, f32(textureNumLevels(image) - 1u))), control.w != 0u && lod > 0.5);
+  let size = textureDimensions(image, level);
+  let point = vec${dimensions}<i32>(${components.join(', ')});
+  return textureLoad(image, point${layer}, level);
+}`);
+    }
+    return {c: `${helper}(${tex}, ${sampling}, ${p.c}, ${lod})`, t: V(type.s, 4)};
   }
   inverseHelper(t, line) {
     if (t.k !== 'm' || t.c !== t.r) essError('inverse needs a square matrix', line);
