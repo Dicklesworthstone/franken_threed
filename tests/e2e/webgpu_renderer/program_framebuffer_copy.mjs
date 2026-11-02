@@ -202,7 +202,7 @@ async function capture(mode) {
         }
         {
           const volume = new T.WebGL3DRenderTarget(width, height, 5, {depthBuffer: false,
-            generateMipmaps: false, minFilter: T.LinearFilter, magFilter: T.LinearFilter});
+            generateMipmaps: false, minFilter: T.LinearFilter, magFilter: T.LinearFilter, anisotropy: 8});
           targets.push(volume);volume.texture.wrapR = T.RepeatWrapping;
           const volumeSampler = new T.ShaderMaterial({glslVersion: T.GLSL3, depthTest: false, depthWrite: false,
             uniforms: {volumeData: {value: volume.texture}, sampleDepth: {value: .1}},

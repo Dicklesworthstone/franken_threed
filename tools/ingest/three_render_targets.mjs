@@ -754,6 +754,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(samplerState, three, shape.mipLevelCount);
+    // Pinned WebGL setup only applies anisotropy with mip-linear minification.
+    // Layered targets retain that initialized sampler until recreation, even
+    // when their source texture later changes its filtering or needsUpdate.
+    if (!native && (shape.webglArray || shape.webglVolume) &&
+        ![three.NearestMipmapLinearFilter, three.LinearMipmapLinearFilter].includes(samplerState.minFilter))
+      descriptor.maxAnisotropy = 1;
     if (shape.cube && !shape.webglCube || native && shape.volume || !flipY && entry.shape.textures.length > 1) {
       // Native source samplers retain explicit LOD access even for ordinary
       // LinearFilter/NearestFilter; only their mip interpolation is nearest.

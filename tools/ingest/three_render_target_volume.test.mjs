@@ -150,6 +150,23 @@ test('WebGL volume sampling retains source mip, source-kind, precision and repli
   assert.equal(f.owner.allocatedBytes, 640); assert.equal(f.calls.textures.length, 1); assert.equal(f.calls.submissions.length, 0);
 });
 
+for (const Type of [THREE.WebGLArrayRenderTarget, THREE.WebGL3DRenderTarget])
+test(`${Type.name} base-only sampling preserves source-disabled anisotropy until recreation`, t => {
+  const f = fixture(), source = new Type(8, 4, 3, {depthBuffer: false,
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, anisotropy: 8});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose()); f.owner.capture(source);
+  const bindings = f.owner.bindingsFor(), first = bindings.get(source.texture);
+  assert.equal(first.sampler.minFilter, 'linear'); assert.equal(first.sampler.magFilter, 'linear');
+  assert.equal(first.sampler.lodMaxClamp, 0); assert.equal(first.sampler.maxAnisotropy, 1);
+  source.texture.anisotropy = 16; source.texture.needsUpdate = true;
+  assert.equal(bindings.get(source.texture).sampler, first.sampler);
+  source.dispose(); source.setSize(1, 1, 1);
+  source.texture.minFilter = THREE.LinearMipmapLinearFilter; source.texture.anisotropy = 8;
+  f.owner.capture(source); const next = bindings.get(source.texture);
+  assert.equal(next.sampler.maxAnisotropy, 8, 'a complete mip-linear image may enable anisotropy at setup');
+  assert.notEqual(next.sampler, first.sampler);
+});
+
 test('authored volume mip counts, byte budgets, slice bounds and native sampler W/LOD follow XYZ storage', t => {
   const f = fixture(), source = new THREE.RenderTarget3D(1, 1, 16, {depthBuffer: false}); t.after(() => f.owner.dispose());
   source.texture.mipmaps = Array.from({length: 5}, () => ({}));
