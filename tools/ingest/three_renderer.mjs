@@ -216,6 +216,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               texture: {maxTextureBytes: 1024 * 1024 * 1024},
               ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
               backgroundState: passOptions?.backgroundState, materialFrame: passOptions?.materialFrame,
+              sourceAttributeCallbacks: owner._shaderEncodedOutput === true,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target,
                 owner._shaderEncodedOutput ? owner._framebufferBindings(sceneLimits.textures) : sceneLimits.textures),
               renderer: {...attachments, instancing: true, renderBundles: true, maxDraws,

@@ -7,6 +7,9 @@ import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const {BufferAttribute,BufferGeometry,InterleavedBuffer,InterleavedBufferAttribute,Float16BufferAttribute} = await import(pathToFileURL(path.join(root,'build/three.core.js')));
 const {WebGLAttributes} = await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLAttributes.js')));
+const {default: Attributes} = await import(pathToFileURL(path.join(root,'src/renderers/common/Attributes.js')));
+const {default: WebGPUAttributeUtils} = await import(pathToFileURL(path.join(root,'src/renderers/webgpu/utils/WebGPUAttributeUtils.js')));
+const {AttributeType} = await import(pathToFileURL(path.join(root,'src/renderers/common/Constants.js')));
 const attribute=(values,width=3,C=Float32Array)=>new BufferAttribute(new C(values),width);
 const geometry=()=>new BufferGeometry().setAttribute('position',attribute([0,0,0, 1,0,0, 0,1,0]));
 const bytes=b=>[...new Uint8Array(b.data)];
@@ -24,6 +27,36 @@ function same(actual, expected) {
   const a=bytes(actual), b=bytes(expected); assert.deepEqual(a.slice(0,b.length),b);
   assert.ok(a.slice(b.length).every(v=>v===0),'alignment tail');
 }
+
+test('pinned native upload oracle never reads onUploadCallback for ordinary or interleaved attributes',()=>{
+  for(const interleaved of [false,true]){
+    const d=geometryDevice(),reference=geometryDevice(),g=geometry(),o=geometry();
+    if(interleaved)for(const input of [g,o]){
+      const data=new InterleavedBuffer(new Float32Array(18).fill(.25),6);
+      input.setAttribute('position',new InterleavedBufferAttribute(data,3,0));
+    }
+    const a=g.attributes.position,b=o.attributes.position,owner=value=>value.isInterleavedBufferAttribute?value.data:value;
+    const records=new WeakMap(),backend={device:reference,get(attribute){
+      let record=records.get(attribute);if(!record){record={};records.set(attribute,record);}return record;
+    }};
+    const utils=new WebGPUAttributeUtils(backend);
+    backend.createAttribute=attribute=>utils.createAttribute(attribute,32|8);
+    backend.updateAttribute=attribute=>utils.updateAttribute(attribute);
+    const source=new Attributes(backend,{createAttribute(){}});
+    for(const attribute of [a,b])Object.defineProperty(owner(attribute),'onUploadCallback',{
+      get(){assert.fail('pinned native attribute uploads leave this WebGL-only property inert');},
+    });
+    const gpu=createGpuBufferGeometry(d,g,{sourceAttributeCallbacks:false});source.update(b,AttributeType.VERTEX);
+    same(gpu.vertexBuffer,backend.get(owner(b)).buffer);
+    for(const attribute of [a,b])owner(attribute).array.fill(7);
+    gpu.update();source.update(b,AttributeType.VERTEX);same(gpu.vertexBuffer,backend.get(owner(b)).buffer);
+    for(const attribute of [a,b]){owner(attribute).addUpdateRange(3,1);owner(attribute).needsUpdate=true;}
+    gpu.update();source.update(b,AttributeType.VERTEX);same(gpu.vertexBuffer,backend.get(owner(b)).buffer);
+    assert.equal(new Float32Array(gpu.vertexBuffer.data)[3],7);
+    assert.notEqual(new Float32Array(gpu.vertexBuffer.data)[0],7,'unrequested CPU bytes remain stale');
+    assert.equal(owner(a).updateRanges.length,0);assert.equal(owner(b).updateRanges.length,0);gpu.dispose();
+  }
+});
 
 test('pinned upload oracle: stale CPU edits, source +1 coalescing, callbacks, empty-range remainder',async()=>{
   const d=geometryDevice(), source=geometry(), oracle=geometry(), gl=glReplica();

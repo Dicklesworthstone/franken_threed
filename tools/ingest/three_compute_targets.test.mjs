@@ -145,11 +145,24 @@ test('target binding scopes reject native validation and synchronous driver erro
   assert.throws(() => q.renderer.compute(kernel([sampler(other.texture)])), e => e === error);
   assert.equal(dispatches(q).length, 0); assert.ok(q.storages.every(s => !s.texture.borrowed)); q.renderer.dispose();
 });
-test('source disposal during buffer upload unwinds the borrow safely before storage release', async () => {
+test('source disposal during native buffer upload unwinds the borrow safely before storage release', async () => {
   const r = await rig(), target = new RenderTarget();
-  const attribute = {isStorageBufferAttribute: true, array: new Float32Array(1), itemSize: 1, count: 1, onUploadCallback() { target.dispose(); }};
+  const attribute = {isStorageBufferAttribute: true, array: new Float32Array(1), itemSize: 1, count: 1};
+  const upload = r.gpu.upload;
+  r.gpu.upload = (...args) => { const buffer = upload(...args); target.dispose(); return buffer; };
   assert.throws(() => r.renderer.compute(kernel([sampled(target.texture), {isStorageBuffer: true, attribute}])), {code: 'THREE_TARGET_STALE'});
   assert.equal(dispatches(r).length, 0); assert.equal(r.storages[0].disposed, true); assert.equal(r.targets.allocatedBytes, 0); r.renderer.dispose();
+});
+test('native compute uploads never read or invoke WebGL attribute callbacks', async () => {
+  const r = await rig(), attribute = {isStorageBufferAttribute: true, array: new Float32Array([1]), itemSize: 1, count: 1, version: 0};
+  Object.defineProperty(attribute, 'onUploadCallback', {get() { assert.fail('native uploads do not read onUploadCallback'); }});
+  const node = kernel([{isStorageBuffer: true, attribute}]);
+  r.renderer.compute(node);
+  assert.deepEqual([...r.gpu.getBuffer(attribute).data], [1]);
+  attribute.array[0] = 2; attribute.version++;
+  r.renderer.compute(node);
+  assert.deepEqual([...r.gpu.getBuffer(attribute).data], [2]);
+  assert.equal(dispatches(r).length, 2); await r.renderer.waitForGPU(); r.renderer.dispose();
 });
 test('writes through ordinary targets and forged/stale texture associations are refused', async () => {
   const r = await rig(), target = new RenderTarget();

@@ -1507,6 +1507,25 @@ test('generated Float32 nodes retain private history across recompiles and rejec
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_CHANGED'});
   f.material.colorNode = N.bufferAttribute(color.value, 'vec3'); assert.doesNotThrow(f.compile);
 });
+test('native generated, instance and storage bindings ignore WebGL upload callbacks without rebuilding programs', t => {
+  const inert = attribute => Object.defineProperty(attribute, 'onUploadCallback', {
+    configurable: true, get() { assert.fail('native binding must not read onUploadCallback'); },
+  });
+  const f = rig(t), color = N.bufferAttribute(new Float32Array(12).fill(.25), 'vec3');
+  f.material.colorNode = color;
+  const generated = f.compile(); inert(color.attribute.data);
+  assert.equal(f.compile(), generated); f.owner.captureDraw(generated, f.context).attributes.install();
+  for (const fixture of [cpuInstanceRig(t), cpuInstanceRig(t, {count: 5, uniformLimit: 256}), instanceRig(t)]) {
+    const descriptor = fixture.compile(); inert(fixture.object.instanceMatrix); inert(fixture.object.instanceColor);
+    assert.equal(fixture.compile(), descriptor);
+    fixture.owner.captureDraw(descriptor, fixture.context).attributes?.install();
+  }
+  const storage = new THREE.StorageBufferAttribute(4, 4); inert(storage);
+  f.material.colorNode = N.storage(storage, 'vec4', 4).element(0).xyz;
+  const descriptor = f.compile(), draw = f.owner.captureDraw(descriptor, {...f.context, renderId: 2});
+  assert.ok(draw.storage.every(binding => binding.attribute === storage));
+  assert.equal(f.compile(), descriptor);
+});
 test('generated attribute shape and range guards run before, between and after source callbacks', t => {
   for (const boundary of ['before', 'current', 'preflight']) {
     const f = rig(t), color = N.bufferAttribute(new Float32Array(12), 'vec3');
@@ -1523,7 +1542,7 @@ test('generated attribute shape and range guards run before, between and after s
   const d = f.compile(); color.attribute.data.addUpdateRange(11, 2);
   assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(updates, 0);
 });
-test('generated streams reject unsupported data and hooks before node callbacks', t => {
+test('generated streams reject unsupported data before node callbacks', t => {
   for (const source of [new Uint32Array(12), new Float32Array(new SharedArrayBuffer(48)),
     new Float32Array(new ArrayBuffer(48, {maxByteLength: 96}))]) {
     const f = rig(t); let updates = 0;
@@ -1533,9 +1552,7 @@ test('generated streams reject unsupported data and hooks before node callbacks'
   const f = rig(t), color = N.bufferAttribute(new Float32Array(12), 'vec3'); f.material.colorNode = color;
   f.compile(); color.attribute.normalized = true;
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
-  color.attribute.normalized = false; color.attribute.data.onUpload(() => {});
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'});
-  color.attribute.data.onUploadCallback = THREE.InterleavedBuffer.prototype.onUploadCallback;
+  color.attribute.normalized = false;
   f.material.fragmentNode = N.Fn(() => { color.assign(N.vec3(1)); return N.vec4(1); })();
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
 });
@@ -1582,7 +1599,6 @@ test('instance admission refuses malformed CPU/storage streams and deformation b
     [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(12), 4); }, 'OBJECT'],
     [object => { object.instanceMatrix = new THREE.InstancedBufferAttribute(new Uint32Array(64), 16); }, 'OBJECT'],
     [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3, false, 2); }, 'OBJECT'],
-    [object => { object.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(9), 3); object.instanceColor.onUpload(() => {}); }, 'HOOK'],
     [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 4); }, 'STORAGE'],
     [object => { object.instanceMatrix = new THREE.StorageInstancedBufferAttribute(4, 16, Uint32Array); }, 'STORAGE'],
     [object => { object.instanceColor = new THREE.StorageInstancedBufferAttribute(3, 2); }, 'STORAGE'],
@@ -1739,8 +1755,6 @@ test('native storage rejects writes, unsupported shapes and stage limits before 
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
   f.material.colorNode = storage.element(0).xyz;
   attribute.normalized = true; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'}); attribute.normalized = false;
-  attribute.onUploadCallback = () => {}; assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'});
-  attribute.onUploadCallback = THREE.BufferAttribute.prototype.onUploadCallback;
   f.renderer._device = {limits: {maxStorageBufferBindingSize: 32}};
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIMIT'});
   f.renderer._device.limits = {maxStorageBuffersPerShaderStage: 1};

@@ -118,7 +118,8 @@ function createThreeCompute(renderer, three) {
       // A later application update may already have new ranges. Acknowledging
       // this queued version must not erase the newer version's upload request.
       if (key.array === source && (key.version ?? 0) === version) key.clearUpdateRanges?.();
-      key.onUploadCallback?.();
+      // r186's common Attributes and native WebGPU backend do not invoke the
+      // WebGL-only onUpload callback, including for storage and indirect data.
     }
     return buffer;
   }

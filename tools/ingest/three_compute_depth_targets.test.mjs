@@ -102,10 +102,11 @@ test('depth disposal or replacement invalidates queued joint use before any nati
     await r.renderer.flush(); await rejected; assert.equal(r.storages.length, 0); assert.equal(dispatches(r).length, 0); r.renderer.dispose();
   }
 });
-test('joint native borrow unwinds before disposal requested by a storage upload callback', async () => {
+test('joint native borrow unwinds before disposal requested during native storage upload', async () => {
   const r = await rig(), target = depthTarget();
-  const attribute = {isStorageBufferAttribute: true, array: new Float32Array(1), itemSize: 1, count: 1,
-    onUploadCallback() { target.depthTexture.dispose(); }};
+  const attribute = {isStorageBufferAttribute: true, array: new Float32Array(1), itemSize: 1, count: 1};
+  const upload = r.gpu.upload;
+  r.gpu.upload = (...args) => { const buffer = upload(...args); target.depthTexture.dispose(); return buffer; };
   assert.throws(() => r.renderer.compute(kernel([sampled(target.texture), sampled(target.depthTexture), {isStorageBuffer: true, attribute}])), {code: 'THREE_TARGET_STALE'});
   assert.equal(r.targets.allocatedBytes, 0); assert.equal(r.storages[0].disposed, true); assert.equal(dispatches(r).length, 0); r.renderer.dispose();
 });

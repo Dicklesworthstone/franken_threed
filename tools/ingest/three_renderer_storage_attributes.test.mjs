@@ -78,6 +78,7 @@ test(`PBO-marked ${type} storage keeps the exact source WebGPU graph and ignores
 
 test('PBO compute, generated vertex inputs and fragment storage share one allocation across queued flag changes', async t => {
   const f = fixture(t), positions = N.instancedArray(3, 'vec3').setPBO(true), attribute = positions.value;
+  Object.defineProperty(attribute, 'onUploadCallback', {get() { assert.fail('native compute and graphics leave WebGL upload callbacks inert'); }});
   f.mesh.count = 3; f.material.positionNode = N.positionLocal.add(positions.toAttribute());
   f.material.colorNode = positions.element(0).abs();
   const compute = kernel(positions); t.after(() => compute.dispose());

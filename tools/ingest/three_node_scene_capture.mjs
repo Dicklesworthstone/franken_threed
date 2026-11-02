@@ -251,9 +251,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (object.instanceColor) owners.add(object.instanceColor);
     }
     for (const owner of owners) {
-      const prototype = owner.isInterleavedBuffer ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
-      if (owner.onUploadCallback !== prototype.onUploadCallback)
-        fail('HOOK', 'Native node attributes require the source upload callback');
+      // r186 Attributes/WebGPUAttributeUtils never reads onUploadCallback.
+      // Preserve that inert property, including accessors, on the native route.
       if (nativeHookScene) {
         if (fixedAttributeHistory.get(renderer)?.has(owner))
           fail('HOOK', 'Object callbacks require native upload history; replacement attributes already reached a fixed owner');
@@ -418,9 +417,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const source = object.geometry, owners = attributeOwners(object);
       const eligible = source instanceof three.BufferGeometry && Array.isArray(source.groups) && source.groups.length <= maxDraws &&
         !object.isInstancedMesh && !object.isSkinnedMesh && !source.isInstancedBufferGeometry &&
-        !Object.values(source.morphAttributes ?? {}).some(attributes => attributes.length) &&
-        owners.every(owner => owner.onUploadCallback === (owner.isInterleavedBuffer
-          ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype).onUploadCallback);
+        !Object.values(source.morphAttributes ?? {}).some(attributes => attributes.length);
       // Keep projection depth with this accepted geometry; later bounds edits
       // must not reorder a fixed draw while its pipeline is being prepared.
       let z = 0;

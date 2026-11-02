@@ -98,6 +98,13 @@ test('custom component readers and upload callbacks are not silently erased', ()
   assert.throws(()=>create(f),code('HOOK')); delete f.geometry.attributes.position.getX;
   f.geometry.attributes.position.onUploadCallback=()=>{}; assert.throws(()=>create(f),code('HOOK'));
 });
+test('native deformation leaves source upload callbacks unread while the default WebGL profile keeps its hook guard', () => {
+  const f=fixture({skin:true,morph:true});
+  for(const attribute of [...Object.values(f.geometry.attributes),...f.geometry.morphAttributes.position])
+    Object.defineProperty(attribute,'onUploadCallback',{get(){assert.fail('native deformation must not read onUploadCallback');}});
+  const binding=createThreeDeformationBinding(f.mesh,{three:THREE,sourceAttributeCallbacks:false});
+  binding.capture();assert.equal(binding.matches(),true);binding.dispose();
+});
 test('invalid influence count and nonaffine matrices leave the captured pose unchanged', () => {
   const f=fixture({skin:true,morph:true}),b=create(f),v=b.pose.version;
   f.mesh.morphTargetInfluences=[]; assert.throws(()=>b.capture(),code('MORPH')); assert.equal(b.pose.version,v);

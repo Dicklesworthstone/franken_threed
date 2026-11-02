@@ -61,6 +61,48 @@ function uniformBlocks(draw){
   return result;
 }
 
+for(const kind of ['fixed','authored','mixed','bundle','fixed instances','authored instances'])
+test(`native ${kind} rendering keeps WebGL upload callbacks inert through admission and uploads`,async t=>{
+  const f=fixture(t);let mesh=f.mesh;
+  if(kind.startsWith('fixed'))mesh.material=new T.MeshBasicMaterial();
+  if(kind.endsWith('instances')){
+    const instanced=new T.InstancedMesh(mesh.geometry,mesh.material,2);
+    instanced.setColorAt(0,new T.Color(.25,.5,.75));instanced.setColorAt(1,new T.Color(.5,.25,.75));
+    f.scene.remove(mesh);f.scene.add(instanced);mesh=instanced;
+  }
+  mesh.frustumCulled=false;
+  const geometries=[mesh.geometry];
+  if(kind==='mixed'){
+    const ordinary=new T.Mesh(mesh.geometry.clone(),new T.MeshBasicMaterial());ordinary.frustumCulled=false;f.scene.add(ordinary);
+    geometries.push(ordinary.geometry);t.after(()=>ordinary.geometry.dispose());
+  }
+  if(kind==='bundle'){const group=new T.BundleGroup();group.static=false;group.add(mesh);f.scene.add(group);}
+  const positions=geometries.map(geometry=>geometry.attributes.position);
+  for(const position of positions)position.array.fill(.125);
+  for(const attribute of [...positions,mesh.instanceMatrix,mesh.instanceColor].filter(Boolean))
+    Object.defineProperty(attribute,'onUploadCallback',{get(){assert.fail('native uploads never read WebGL callbacks');}});
+  for(const geometry of geometries)geometry.index.onUpload(()=>assert.fail('native index uploads never invoke WebGL callbacks'));
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  for(const position of positions){position.array[0]=.625;position.array[1]=99;position.addUpdateRange(0,1);position.needsUpdate=true;}
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=f.device.snapshots.flat().filter(draw=>draw.streams.size>0),perRender=kind==='mixed'?2:1;
+  assert.equal(draws.length,2*perRender);
+  assert.deepEqual(draws.map(draw=>{
+    const bytes=draw.contents.get(draw.streams.get(0));return [...new Float32Array(bytes.buffer,bytes.byteOffset,2)];
+  }),[...Array.from({length:perRender},()=>[.125,.125]),...Array.from({length:perRender},()=>[.625,.125])]);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+test('native inert upload callbacks do not bypass the shared fixed/authored history guard',async t=>{
+  const f=fixture(t),ordinary=new T.Mesh(f.mesh.geometry,new T.MeshBasicMaterial());
+  ordinary.frustumCulled=f.mesh.frustumCulled=false;f.scene.add(ordinary);
+  Object.defineProperty(f.mesh.geometry.attributes.position,'onUploadCallback',{
+    get(){assert.fail('ownership admission must not read a native-inert callback');},
+  });
+  await f.renderer.init();
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('native custom object dispatch captures queued prepasses and skips source items without replay',async t=>{
   const f=fixture(t),material=new T.MeshBasicMaterial(),prepass=new T.MeshBasicMaterial();
   f.mesh.material=material;f.mesh.frustumCulled=false;

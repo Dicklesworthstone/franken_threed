@@ -31,8 +31,9 @@ export function hasThreeDeformation(source) {
 
 function configuration(options) {
   if (!options || typeof options !== 'object' || Array.isArray(options)) fail('OPTIONS', 'Expected binding options');
-  for (const key of Object.keys(options)) if (key !== 'three' && !Object.hasOwn(defaults, key)) fail('OPTIONS', `Unknown binding option: ${key}`);
-  const limits = {...defaults, ...options};
+  for (const key of Object.keys(options)) if (!['three', 'sourceAttributeCallbacks'].includes(key) && !Object.hasOwn(defaults, key)) fail('OPTIONS', `Unknown binding option: ${key}`);
+  const limits = {...defaults, sourceAttributeCallbacks: true, ...options};
+  if (typeof limits.sourceAttributeCallbacks !== 'boolean') fail('OPTIONS', 'Expected a boolean source attribute callback profile');
   for (const key of Object.keys(defaults)) integer(limits[key], 1, 16777216, key);
   if (limits.maxMorphTargets > 4096) fail('LIMIT', 'At most 4096 morph targets are supported');
   if (limits.three?.REVISION !== '186') fail('SOURCE', 'Supply the pinned Three.js r186 module');
@@ -63,8 +64,10 @@ function inspect(source, limits) {
     const proto = C.prototype;
     for (let i = 0; i < width; i++) if (typeof a[getters[i]] !== 'function' || a[getters[i]] !== proto[getters[i]])
       fail('HOOK', `Custom ${label} component readers are not admitted`);
-    const upload = interleaved ? three.InterleavedBuffer.prototype.onUploadCallback : three.BufferAttribute.prototype.onUploadCallback;
-    if (owner.onUploadCallback !== upload) fail('HOOK', 'Custom attribute upload callbacks are not admitted');
+    if (limits.sourceAttributeCallbacks) {
+      const upload = interleaved ? three.InterleavedBuffer.prototype.onUploadCallback : three.BufferAttribute.prototype.onUploadCallback;
+      if (owner.onUploadCallback !== upload) fail('HOOK', 'Custom attribute upload callbacks are not admitted');
+    }
     const stride = interleaved ? integer(owner.stride, width, 16777216, 'attribute stride') : width;
     const offset = interleaved ? integer(a.offset, 0, stride - width, 'attribute offset') : 0;
     if ((a.count - 1) * stride + offset + width > owner.array.length) fail('GEOMETRY', `${label} storage is truncated`);

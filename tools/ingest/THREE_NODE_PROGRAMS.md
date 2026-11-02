@@ -818,8 +818,15 @@ other storage through `instanceIndex`.
 Source-generated `BufferAttributeNode` scalar/vector streams from raw Float32
 arrays also use private captured geometry views. Ordinary geometry attributes
 remain live and can be replaced without being trapped in a stale private view.
-Generated streams require fixed, unshared arrays, unnormalized float input and
-the default upload callback. Public BufferAttribute/InterleavedBuffer inputs and
+Generated streams require fixed, unshared arrays and unnormalized float input.
+Native WebGPU uploads leave `BufferAttribute.onUploadCallback` and the
+interleaved owner's callback unread, matching r186 `Attributes` and
+`WebGPUAttributeUtils`. Custom functions, non-callable values and accessors on
+that WebGL-only property therefore do not refuse native geometry, bundles,
+instances, generated streams or storage/compute bindings, and callback changes
+do not invalidate a native program. WebGL-authored uploads retain their source
+callbacks, including ordering, exceptions and version acknowledgement.
+Public BufferAttribute/InterleavedBuffer inputs and
 compute-backed attribute conversion need additional shared-residency profiles;
 they are refused rather than allowing ordinary and generated consumers to
 diverge after partial updates. The pinned instance nodes' private derived
@@ -1777,8 +1784,7 @@ or upload callbacks.
 The profile excludes shader context extensions and unregistered shadow lifecycles,
 skinned or morph meshes,
 including per-instance morph textures; XR/multiview and layered ArrayCamera bundles;
-object render hooks outside the source lifecycle profile above and effectful
-attribute upload callbacks.
+object render hooks outside the source lifecycle profile above.
 Ordinary transparent `DoubleSide` graphs execute consecutive back-side and
 front-side draws, matching the pinned renderer's source order. Each side owns a
 retained program and captured uniforms; object updates run for each draw while

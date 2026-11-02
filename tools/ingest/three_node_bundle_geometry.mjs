@@ -69,8 +69,8 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     if (!Number.isSafeInteger(stride) || stride < attribute.itemSize || !Number.isSafeInteger(offset) || offset < 0 ||
         offset + attribute.itemSize > stride || attribute.count && (attribute.count - 1) * stride + offset + attribute.itemSize > array.length)
       reject('ATTRIBUTE', 'Bundle attribute layout exceeds its source storage');
-    const prototype = interleaved ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
-    if (owner.onUploadCallback !== prototype.onUploadCallback) reject('HOOK', 'Bundle attributes require the source upload callback');
+    // Native source uploads do not observe BufferAttribute.onUploadCallback;
+    // the private owner must not inherit or invoke an application callback.
     if (!Array.isArray(owner.updateRanges) || owner.updateRanges.some(range => !Number.isSafeInteger(range?.start) || range.start < 0 ||
         !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length))
       reject('ATTRIBUTE', 'Bundle attribute update ranges must fit their source array');

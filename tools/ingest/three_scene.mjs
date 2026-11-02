@@ -71,10 +71,11 @@ export async function createGpuThreeScene(device,scene,{
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
   program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,backgroundState:initialBackgroundState=undefined,
-  materialFrame:initialMaterialFrame=null,
+  materialFrame:initialMaterialFrame=null,sourceAttributeCallbacks=true,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
+  if(typeof sourceAttributeCallbacks!=='boolean')fail('OPTIONS','Expected a boolean source attribute callback profile');
   // WebGLRenderer accepts Mesh/Group/Line/Points roots. Its program state uses
   // an empty Scene in that case, but traversal, matrix updates and callbacks
   // still refer to the original root. Never clone, reparent or mutate it.
@@ -286,7 +287,7 @@ export async function createGpuThreeScene(device,scene,{
     // Captured fixed views already proved rigid. A later geometry replacement
     // cannot redirect an accepted draw into the live deformation owner.
     if(!fixed&&hasThreeDeformation(object)&&!programToneMapping()&&!programLogDepth()&&!capturedNodeObject(object)){
-      try{inspectThreeDeformation(object,{...deformationOptions,three});}
+      try{inspectThreeDeformation(object,{...deformationOptions,three,sourceAttributeCallbacks});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
         // program skins/morphs itself (r186 shader path).
@@ -298,15 +299,15 @@ export async function createGpuThreeScene(device,scene,{
     const owners=new Set(Object.values(view.attributes).map(a=>a.isInterleavedBufferAttribute?a.data:a));
     if(view.index)owners.add(view.index);
     if(!Array.isArray(groups)||groups.length>maxNodes)fail('LIMIT','Geometry group capacity exceeded');
-    // Upload callbacks (e.g. onUpload(disposeArray)) run after each owner's upload,
-    // as WebGLAttributes does, at this bridge's preparation/update boundary.
-    for(const owner of owners)if(typeof owner.onUploadCallback!=='function')fail('HOOK','Expected an attribute upload callback function');
+    // WebGL callbacks (e.g. onUpload(disposeArray)) run at this bridge's upload
+    // boundary. The native WebGPU source surface never reads this property.
+    if(sourceAttributeCallbacks)for(const owner of owners)if(typeof owner.onUploadCallback!=='function')fail('HOOK','Expected an attribute upload callback function');
   }
   function instanceAdmission(object){
     if(typeof three.InstancedMesh!=='function'||!(object instanceof three.InstancedMesh))
       fail('OBJECT','Expected a source InstancedMesh from the supplied module');
     const shape=inspectInstanceAttributes(object);
-    for(const a of [object.instanceMatrix,object.instanceColor])if(a&&a.onUploadCallback!==three.BufferAttribute.prototype.onUploadCallback)
+    for(const a of [object.instanceMatrix,object.instanceColor])if(sourceAttributeCallbacks&&a&&a.onUploadCallback!==three.BufferAttribute.prototype.onUploadCallback)
       fail('HOOK','Effectful instance upload callbacks require the explicit instance API');
     return shape;
   }
@@ -1313,7 +1314,7 @@ export async function createGpuThreeScene(device,scene,{
             else{
               const available=maxDeformationBytes-deformationBytes();
               if(available<1)fail('LIMIT','Deformation replacement exceeds the old-plus-new GPU budget');
-              try{deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,
+              try{deformation=await createGpuThreeDeformation(device,item.deformationSource,{...deformationOptions,three,sourceAttributeCallbacks,
                 maxBytes:available,signal:deformationLifetime.signal,cache:deformationInputs});}
               catch(error){
                 // Data the core deformer refuses at capture (e.g. a non-affine
@@ -1331,7 +1332,7 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           gpu=geometries.get(item.geometry);
           if(!gpu){
-            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,
+            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,sourceAttributeCallbacks,
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});}
             catch(error){
               // WebGL surface: a geometry layout the core cannot stream (e.g. an
@@ -1349,7 +1350,7 @@ export async function createGpuThreeScene(device,scene,{
         if(item.instanceSource){
           instanceGpu=instances.get(item.instanceSource);
           if(!instanceGpu){
-            instanceGpu=createGpuInstanceAttributes(device,item.instanceSource,{maxBytes:maxInstanceBytes,
+            instanceGpu=createGpuInstanceAttributes(device,item.instanceSource,{maxBytes:maxInstanceBytes,sourceAttributeCallbacks,
               maxInitialBytes:Math.max(0,maxInstanceBytes-instanceBytes()),label:'f3d-source-instances'});
             instances.set(item.instanceSource,instanceGpu);addedInstances.push(item.instanceSource);
           }else instanceGpu.update({maxAdditionalBytes:Math.max(0,maxInstanceBytes-instanceBytes())});

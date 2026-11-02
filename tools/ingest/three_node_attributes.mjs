@@ -16,8 +16,6 @@ export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
       !Number.isSafeInteger(attribute.version) || attribute.version < 0 ||
       attribute.isInstancedBufferAttribute && attribute.meshPerAttribute !== 1)
     reject('ATTRIBUTE', 'Native storage vertex inputs require source 32-bit scalar/vector attributes and instance divisor one');
-  if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
-    reject('HOOK', 'Native storage vertex inputs require the source upload callback');
   // Source storage vec3 values acquire their fourth alignment word on upload.
   // This canonical signature is stable across that source-visible normalization.
   const stride = attribute.itemSize === 3 ? 4 : attribute.itemSize;
@@ -55,9 +53,6 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
         !Number.isSafeInteger(offset) || offset < 0 || offset + attribute.itemSize > stride ||
         array.length !== attribute.count * stride || (instanced && owner.meshPerAttribute !== 1))
       reject('ATTRIBUTE', 'Native generated streams require a complete source stride and instance divisor one');
-    const prototype = interleaved ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype;
-    if (owner.onUploadCallback !== prototype.onUploadCallback)
-      reject('HOOK', 'Native generated streams require the source upload callback');
     return {owner, array, interleaved, instanced, stride, offset,
       signature: JSON.stringify([array.length, attribute.count, stride, offset, attribute.itemSize, interleaved, instanced, owner.meshPerAttribute])};
   }

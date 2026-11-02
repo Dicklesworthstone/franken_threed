@@ -468,14 +468,10 @@ test('mixed built-in and authored material groups share native geometry and reta
   assert.ok(result.draws.every(draw => draw.object === object && draw.geometry === object.geometry));
   assert.equal(ordinary.isNodeMaterial, undefined, 'source material identity is not replaced by conversion');
 });
-test('active invalid graphs, unsupported material groups and effectful upload/object hooks refuse before updates', t => {
+test('active invalid graphs, unsupported material groups and object hooks refuse before updates', t => {
   const cases = [
     f => { const m = f.material(); m.colorNode = N.texture(new THREE.Texture()); f.mesh(m); },
     f => { f.mesh([f.material(), new THREE.ShaderMaterial()]); },
-    f => { f.mesh().geometry.attributes.position.onUpload(() => {}); },
-    f => { f.mesh().geometry.index.onUpload(() => {}); },
-    f => { const o = f.mesh(); const data = new THREE.InterleavedBuffer(new Float32Array(12), 3); data.onUpload(() => {});
-      o.geometry.setAttribute('position', new THREE.InterleavedBufferAttribute(data, 3, 0)); },
     f => { f.mesh().onBeforeRender = null; },
     f => { f.mesh().intersectsFrustum = () => true; },
   ];

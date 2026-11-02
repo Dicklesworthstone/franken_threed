@@ -245,7 +245,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         sourceId(node.value), sourceId(attribute), sourceId(owner), sourceId(array), array.length, array.byteLength,
         attribute.count, attribute.itemSize, attribute.normalized, attribute.gpuType, attribute.isInterleavedBufferAttribute,
         attribute.offset, attribute.isInstancedBufferAttribute, owner.stride, owner.meshPerAttribute,
-        owner.isInstancedInterleavedBuffer, owner.usage, sourceId(owner.onUploadCallback)];
+        owner.isInstancedInterleavedBuffer, owner.usage];
     }));
   }
   function inspectUniformArray(node) {
@@ -339,8 +339,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // IndirectStorageBufferAttribute is still source storage. Shader reads and
     // draw arguments borrow its compute allocation; shared write conflicts are
     // checked with the other captured uses before native submission.
-    if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
-      fail('HOOK', 'Native shader storage requires the source upload callback');
     const bytes = attribute.count * stride * 4;
     if (bytes > (renderer._device?.limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024) ||
         bytes > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))
@@ -384,8 +382,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           array.length !== attribute.count * stride || attribute.meshPerAttribute !== 1 ||
           !Number.isSafeInteger(attribute.version) || attribute.version < 0)
         fail('OBJECT', 'Native CPU instances require fixed unshared Float32 matrix/RGB attributes with divisor one');
-      if (attribute.onUploadCallback !== three.BufferAttribute.prototype.onUploadCallback)
-        fail('HOOK', 'Native CPU instance attributes require the source upload callback');
       if (instanceArrays.has(attribute) && instanceArrays.get(attribute) !== array)
         fail('CHANGED', 'Source instance nodes retain their original CPU array; replace the instance attribute to change its backing array');
       if (array.byteLength > maxAttributeBytes || array.byteLength > (renderer._device?.limits?.maxBufferSize ?? 256 * 1024 * 1024))

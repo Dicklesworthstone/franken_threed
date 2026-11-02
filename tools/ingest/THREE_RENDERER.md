@@ -490,7 +490,7 @@ color space remains sRGB. Selecting Display-P3 changes the source-authored
 output transform; it does not establish physical wide-gamut display accuracy.
 `native_color_spaces.mjs` compares actual canvas storage with unchanged r186:
 10 cases and 16 presentations match all 15,872 bytes exactly in Chromium
-141.0.7390.37 / SwiftShader, with zero GPU/browser errors. Cases include byte and
+141.0.7390.37 and 151.0.7922.34 / SwiftShader, with zero GPU/browser errors. Cases include byte and
 half-float output, ordinary and node materials, signed/HDR values, tone mapping,
 alpha, MSAA, queued changes and retained drawing. Hardware performance remains
 unmeasured.

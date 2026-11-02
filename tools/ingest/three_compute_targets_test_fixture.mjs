@@ -199,7 +199,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
   const Renderer = modules.get('./three_compute.mjs').namespace.withThreeCompute(Base, {...THREE, WGSLNodeBuilder: Builder});
   const renderer = new Renderer();
   const adapter = modules.get('./three_compute_targets.mjs').namespace.createThreeComputeTargets({targets, device, ...adapterOptions});
-  return {renderer, targets, device, adapter, storages, events, lost, scopeErrors, scopePromises,
+  return {renderer, targets, device, gpu, adapter, storages, events, lost, scopeErrors, scopePromises,
     get builds() { return builds; }, failSampler(error) { samplerFailure = error; }};
 }
 export const dispatches = r => r.events.filter(e => e[0] === 'dispatch');

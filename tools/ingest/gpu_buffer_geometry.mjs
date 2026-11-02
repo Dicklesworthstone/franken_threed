@@ -18,6 +18,9 @@
  * onUpload, and acknowledge the version AFTER the callback. Four-byte padding
  * comes from the last GPU-visible shadow. A callback may throw after writes;
  * those writes stay visible and the version stays unacknowledged, as upstream.
+ * Native WebGPU callers pass sourceAttributeCallbacks:false (program geometry
+ * selects it from attributeTypes): r186's native backend never reads that
+ * WebGL-only property. Native source capture owns its separate range history.
  *
  * Explicit API, not a WebGLRenderer replacement or arbitrary-object optimizer.
  * Geometry shape/range validation errors are recoverable. Native errors/loss are
@@ -189,8 +192,9 @@ function range(geometry, extent) {
   const first = Math.min(start, extent);
   return Object.freeze({first, count: Math.min(count, extent - first)});
 }
-function checkRanges(owner, length) {
-  if (!Array.isArray(owner.updateRanges) || typeof owner.clearUpdateRanges !== 'function' || typeof owner.onUploadCallback !== 'function') {
+function checkRanges(owner, length, sourceAttributeCallbacks) {
+  if (!Array.isArray(owner.updateRanges) || typeof owner.clearUpdateRanges !== 'function' ||
+      sourceAttributeCallbacks && typeof owner.onUploadCallback !== 'function') {
     fail('SHAPE', 'Expected BufferAttribute upload methods and ranges');
   }
   for (const r of owner.updateRanges) {
@@ -226,10 +230,12 @@ export function bufferGeometrySnapshot(handle, device) {
 
 function createResidency(device, geometry, {
   maxBytes = 64 * 1024 * 1024, maxInitialBytes = maxBytes, maxAttributes = 128, label = 'f3d-buffer-geometry',
+  sourceAttributeCallbacks = true,
 } = {}, describeSource = describe, sourceRange = range, registry = states) {
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   integer(maxInitialBytes, 0, maxBytes, 'initial allocation budget');
   integer(maxAttributes, 1, 65536, 'attribute budget');
+  if (typeof sourceAttributeCallbacks !== 'boolean') fail('OPTIONS', 'Expected a boolean source attribute callback profile');
   if (typeof label !== 'string' || !device?.limits || typeof device.createBuffer !== 'function' ||
       typeof device.queue?.writeBuffer !== 'function' || typeof device.queue.onSubmittedWorkDone !== 'function' ||
       typeof device.pushErrorScope !== 'function' || typeof device.popErrorScope !== 'function' || typeof device.lost?.then !== 'function') {
@@ -319,7 +325,7 @@ function createResidency(device, geometry, {
         const expanded = divisor > 1 ? Math.ceil(source.length / stride) * stride * divisor * 4 : logical;
         if (!Number.isSafeInteger(expanded)) fail('LIMIT', 'Expanded attribute size exceeds the safe integer range');
         const existing = records.get(owner), size = Math.max(4, align4(expanded));
-        if (typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
+        if (sourceAttributeCallbacks && typeof owner.onUploadCallback !== 'function') fail('SHAPE', 'Expected onUploadCallback');
         if (existing) {
           if (existing.version >= owner.version && requiredBytes > existing.logicalBytes) fail('SHAPE', 'Geometry counts exceed resident storage');
           if (existing.divisor !== divisor || ((divisor > 1 || existing.divisor > 1) && existing.stride !== stride))
@@ -328,7 +334,7 @@ function createResidency(device, geometry, {
             fail('FORMAT', 'Changing a resident element type or normalization requires a new attribute');
           if (existing.version < owner.version) {
             if (existing.logicalBytes !== logical) fail('RESIZE', 'Resizing a resident attribute is not supported; replace the attribute');
-            if (existing.version !== -1) checkRanges(owner, source.length);
+            if (existing.version !== -1) checkRanges(owner, source.length, sourceAttributeCallbacks);
           }
         } else {
           if (source.array === null) fail('STORAGE', 'A released attribute array cannot create a new residency');
@@ -360,7 +366,7 @@ function createResidency(device, geometry, {
         }
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
         let record = records.get(owner);
-        if (record && record.version !== -1 && record.version < owner.version) checkRanges(owner, array.length);
+        if (record && record.version !== -1 && record.version < owner.version) checkRanges(owner, array.length, sourceAttributeCallbacks);
         if (!record) {
           const divisor = entry.divisor ?? 1;
           const size = Math.max(4, align4(divisor > 1 ? Math.ceil(array.length / entry.stride) * entry.stride * divisor * 4
@@ -374,7 +380,7 @@ function createResidency(device, geometry, {
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
           write(record, array, 0, array.length);
           remember(owner, array);
-          owner.onUploadCallback();
+          if (sourceAttributeCallbacks) owner.onUploadCallback();
           record.version = owner.version;
         } else if (record.version < owner.version) {
           const ranges = owner.updateRanges;
@@ -388,7 +394,7 @@ function createResidency(device, geometry, {
             owner.clearUpdateRanges();
           }
           remember(owner, array);
-          owner.onUploadCallback();
+          if (sourceAttributeCallbacks) owner.onUploadCallback();
           record.version = owner.version;
         }
       }
@@ -566,7 +572,8 @@ const programStates = new WeakMap();
 export function createGpuProgramGeometry(device, geometry, programAttributes, options) {
   const attributeTypes = options?.attributeTypes ?? 'webgl';
   if (!['webgl', 'webgpu'].includes(attributeTypes)) fail('FORMAT', 'Program attributes require source WebGL or WebGPU type semantics');
-  const handle = createResidency(device, geometry, options, describeProgram(programAttributes, attributeTypes), range, programStates);
+  const handle = createResidency(device, geometry, {...options, sourceAttributeCallbacks: attributeTypes === 'webgl'},
+    describeProgram(programAttributes, attributeTypes), range, programStates);
   return handle;
 }
 /** Program-geometry snapshot: buffers/layouts plus GL's missing constant locations. */
