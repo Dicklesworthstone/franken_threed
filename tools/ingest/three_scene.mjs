@@ -116,7 +116,10 @@ export async function createGpuThreeScene(device,scene,{
     return passNodeFrame?.phases?.[transparent?'transparent':'opaque']!==false;
   };
   const colorMaterials=o=>sourceMaterials(o).filter(m=>colorPhaseEnabled(m)||shadowEnabled&&o.castShadow).map(colorMaterial).map(materialState);
-  const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true;
+  // Pinned AO passes restore hidden points/lines immediately after render().
+  // Their accepted exclusions follow the same admission and traversal path as
+  // native node packets, without changing the public objects during submission.
+  const excludedNodeObject=o=>passNodeFrame?.excludedObjects?.has(o)===true||passMaterialFrame?.excludedObjects?.has(o)===true;
   const bundledNodeObject=o=>passNodeFrame?.bundleObjects?.has(o)===true;
   const capturedNodeLight=o=>passNodeFrame?.nativeLights?.has(o)===true;
   const capturedNodeObject=o=>passNodeFrame&&(passNodeFrame.objects.has(o)||colorMaterials(o).some(hasThreeNodeProgram));
@@ -689,7 +692,7 @@ export async function createGpuThreeScene(device,scene,{
   let programCamera=null;
   /** WebGLRenderer light collection order: depth-first, visible, camera layers. */
   function programLightList(camera){
-    const out=[],walk=o=>{if(!o.visible)return;if(o.isLight&&(!camera||o.layers.test(camera.layers)))out.push(o);for(const c of o.children)walk(c);};
+    const out=[],walk=o=>{if(!o.visible||excludedNodeObject(o))return;if(o.isLight&&(!camera||o.layers.test(camera.layers)))out.push(o);for(const c of o.children)walk(c);};
     walk(root);return out;
   }
   function programEnvironment(m){
@@ -910,7 +913,10 @@ export async function createGpuThreeScene(device,scene,{
       // GL point sizes need the program route; elsewhere the core path renders
       // what it admits and the ShaderLib program covers what it rejects.
       // GL point sizes, dashed lines (lineDistance) and line loops need their programs.
-      if(m.isPointsMaterial||m.isLineDashedMaterial||m.isMeshMatcapMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
+      // WebGL's normal ShaderLib writes packed normals directly. The native
+      // node-material/core path converts that display color from sRGB first;
+      // using it here corrupts normal-buffer inputs to every AO pass.
+      if(m.isPointsMaterial||m.isLineDashedMaterial||m.isMeshMatcapMaterial||m.isMeshNormalMaterial||object.isLineLoop||object.isSprite)return programDescription(m,topology,object);
       // Keep GL stencil conversion on its existing ShaderLib route. The core
       // material mapper below follows WebGPU's unsigned reference contract.
       if((m.stencilWrite&&stencilAttachment)||programSupport.state?.().passState)return programDescription(m,topology,object);
@@ -1142,7 +1148,7 @@ export async function createGpuThreeScene(device,scene,{
     };
     if(programRoute())programSupport.setLights(programLightList(programCamera));
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
-      if(capturedNodeObject(object)||fixedGeometry(object)===null)continue;
+      if(excludedNodeObject(object)||capturedNodeObject(object)||fixedGeometry(object)===null)continue;
       const topology=topologyOf(object),fixed=fixedGeometry(object);
       const g=fixed?.geometry??object.geometry,instanceSource=!fixed&&object.isInstancedMesh?object:null;
       const deformationSource=!fixed&&hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;

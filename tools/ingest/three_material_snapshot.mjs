@@ -35,13 +35,19 @@ const selectorArray = (array, limit) => {
  * uniforms stay live. Hooks that could change selection during projection keep
  * their existing live-source path instead of being moved ahead of source work.
  */
-function captureSelections(three, root, {camera, overrideMaterial, maxNodes, maxMaterials, maxValues}) {
+function captureSelections(three, root, {camera, overrideMaterial, exclusions, maxNodes, maxMaterials, maxValues}) {
   const materials = new Map(), objects = new Map(), seen = new Set(), stack = [root];
   let values = 0;
   const claim = count => {
     if (count > maxValues - values) fail('LIMIT', 'Pending material snapshot value capacity exceeded');
     values += count;
   };
+  // Only the pinned pass's temporary hidden list is captured. Ordinary scene
+  // visibility and LOD updates retain their existing submission behavior.
+  const excluded = exclusions === null ? null : selectorArray(exclusions, maxNodes);
+  if (exclusions !== null && (!excluded || excluded.some(object => !(object instanceof three.Object3D)))) return null;
+  const excludedObjects = excluded ? new Set(excluded) : null;
+  if (excludedObjects) claim(excludedObjects.size);
   const ordinaryObject = object => {
     if (!(object instanceof three.Object3D) || !dataOnly(object)) return false;
     const prototype = object instanceof three.Camera ? three.Camera.prototype : three.Object3D.prototype;
@@ -109,6 +115,9 @@ function captureSelections(three, root, {camera, overrideMaterial, maxNodes, max
     const children = selectorArray(data(object, 'children'), maxNodes);
     if (!children) return null;
     if (seen.size + stack.length + children.length > maxNodes) fail('LIMIT', 'Material snapshot node capacity exceeded');
+    if (excludedObjects?.has(object)) for (const child of children) if (!excludedObjects.has(child)) {
+      claim(1); excludedObjects.add(child);
+    }
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
     if (!ordinaryGeometry(data(object, 'geometry'))) return null;
     const material = data(object, 'material');
@@ -135,14 +144,14 @@ function captureSelections(three, root, {camera, overrideMaterial, maxNodes, max
     for (const material of materials.keys()) if (!ordinaryMaterial(material)) return false;
     return true;
   };
-  return objects.size ? {materials, objects, values, cameraSafe} : null;
+  return objects.size ? {materials, objects, values, cameraSafe, excludedObjects} : null;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,
-  selectionOnly = false, camera = null, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
+  selectionOnly = false, camera = null, exclusions = null, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
   if (![maxNodes, maxMaterials, maxValues].every(n => Number.isSafeInteger(n) && n >= 0) || !maxNodes || !maxMaterials)
     fail('LIMIT', 'Invalid material snapshot capacity');
-  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, maxNodes, maxMaterials, maxValues});
+  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, maxNodes, maxMaterials, maxValues});
   const materials = new Map(), objects = new Map(), seen = new Set(), copies = new WeakMap(), stack = [root];
   const valuePrototypes = new Set(['Color', 'Vector2', 'Vector3', 'Vector4', 'Quaternion', 'Euler', 'Matrix3', 'Matrix4', 'Plane']
     .map(name => three[name]?.prototype).filter(Boolean));

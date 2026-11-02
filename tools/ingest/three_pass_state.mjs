@@ -65,22 +65,26 @@ export function getThreeStencilConstants(renderer) {
   record.active = true; return record.constants;
 }
 
-/** Source-verified supersampling passes temporarily change their camera's
- * projection for each render call. The owned renderer must capture that call
- * before the pass restores the public camera. Exact renderers execute normally;
- * no public state flag or camera replacement is installed on either renderer.
+/** Source-verified passes temporarily change camera projections or hide
+ * points/lines for a normal/depth draw. Capture the accepted call before the
+ * pass restores public state. Exact renderers execute normally; the temporary
+ * exclusions never become a public renderer field or mutate source objects.
  */
-export function renderThreePassScene(renderer, scene, camera) {
+export function renderThreePassScene(renderer, scene, camera, excludedObjects = null) {
   const record = renderers.get(renderer);
   if (!record) return renderer.render(scene, camera);
-  const previous = record.captureCamera;
-  record.captureCamera = true;
+  const previous = record.captureCamera, previousExclusions = record.excludedObjects;
+  record.captureCamera = true; record.excludedObjects = excludedObjects;
   try { return renderer.render(scene, camera); }
-  finally { record.captureCamera = previous; }
+  finally { record.captureCamera = previous; record.excludedObjects = previousExclusions; }
 }
 
 export function requiresThreePassCamera(renderer) {
   return renderers.get(renderer)?.captureCamera === true;
+}
+
+export function getThreePassExcludedObjects(renderer) {
+  return renderers.get(renderer)?.excludedObjects ?? null;
 }
 
 /** The verified composer calls its original setSize body inside this scope.

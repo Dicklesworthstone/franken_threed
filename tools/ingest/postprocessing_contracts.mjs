@@ -20,6 +20,8 @@ const pins = new Map([
   ['AfterimagePass.js', ['8cc0c8724a674a649d438c932e0b5f287e7d02f9fc35f627b669180bf4d2cc01', {AfterimagePass: 'pass'}]],
   ['SSAARenderPass.js', ['cd2b8e83b32e806091117dfbeff1f8f4e78df0175a4a3acd865b9989df1c420b', {SSAARenderPass: 'pass'}]],
   ['TAARenderPass.js', ['463dbda5d1f0f401b3575f60eddd2a84234ff5be44d29a3dc41129c34aba0f47', {TAARenderPass: 'pass'}]],
+  ['SSAOPass.js', ['2f9c02a53e09917d039c07c5bd7a110f1ce39bc5ab2affa316ea94f5198ec586', {SSAOPass: 'pass'}]],
+  ['GTAOPass.js', ['a277f848d1035c751c54d9706e579aeb74689126ced25723e53d52ac3f26f445', {GTAOPass: 'pass'}]],
   ['CopyShader.js', ['a33057d5ac91c43304c186ac0e8816e62bb2ed471d3a00ff3018dfd5c0389718', {}]],
   ['ConvolutionShader.js', ['bad71ed02351acb701e62e21a9d11f044c2c689d924d714061edb756fbea8ace', {}]],
   ['FilmShader.js', ['744c619c70f949af5d3f0f9edb27573743ab9ad12869e7c306ffb3d0caff7bb5', {}]],
@@ -28,6 +30,10 @@ const pins = new Map([
   ['LuminosityHighPassShader.js', ['5044f780b6e6cf863947f64c36fe1587132f7fbe395ada863cd1e5f0388dcf1e', {}]],
   ['BokehShader.js', ['bd8525158e3574a803f2e2ce5d5e263349a80ee41bf789e71446b9caa256aa9a', {}]],
   ['AfterimageShader.js', ['fb842ae657379a6ee3b431bd864b4e4956d36df14daf502bf6ffecdbf14de8bb', {}]],
+  ['SSAOShader.js', ['034dad98927ed8f2677a19ce56d4da1212ce5070ed2666157106025dc260bb55', {}]],
+  ['GTAOShader.js', ['cdea7be60452f61105375d2c18e4da2e8ce7b39a89246b1bb8fbf79319d58cfd', {}]],
+  ['PoissonDenoiseShader.js', ['61da074a9ad8b2139dd164c96b8b62c299f056ce06c216e1f707c5151d997602', {}]],
+  ['SimplexNoise.js', ['4b1455617135e6b477de76244de07547d95570643379b72f4758e50161b06072', {}]],
   // H6's retained model loader reads typed-array constructors. These exact
   // cold helpers do not receive the renderer or mutate pass prototypes; keep
   // their original native-access facts without the caller reflection guard.
@@ -37,7 +43,7 @@ const pins = new Map([
 ]);
 const byHash = new Map([...pins].map(([name, [hash, exports]]) => ['sha256:' + hash, {name, exports}]));
 const transformed = new Set(['MaskPass.js', 'EffectComposer.js', 'BloomPass.js', 'UnrealBloomPass.js',
-  'SSAARenderPass.js', 'TAARenderPass.js']);
+  'SSAARenderPass.js', 'TAARenderPass.js', 'SSAOPass.js', 'GTAOPass.js']);
 
 export function verifiedPostProcessingSources(modules, bases) {
   const result = new Map(), visiting = new Set();
@@ -77,6 +83,11 @@ export function transformThreePostProcessing(code, record,
   // capture; other pass work and source renderer calls retain their identities.
   if (['SSAARenderPass.js', 'TAARenderPass.js'].includes(record.name))
     code = code.replaceAll('renderer.render( this.scene, this.camera );', `${renderScene}(renderer, this.scene, this.camera);`);
+  // AO excludes points/lines only for its normal/depth draw, then restores the
+  // public objects. Retain that exact source list while preparation is queued.
+  if (['SSAOPass.js', 'GTAOPass.js'].includes(record.name))
+    code = code.replaceAll('renderer.render( this.scene, this.camera );',
+      `${renderScene}(renderer, this.scene, this.camera, this._visibilityCache);`);
   if (record.name === 'EffectComposer.js') {
     // Retain the exact size calculation and pass iteration. The private scope
     // preserves accepted target generations across the source's resize-dispose

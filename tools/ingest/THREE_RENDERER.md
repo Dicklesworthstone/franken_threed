@@ -701,6 +701,43 @@ depth-material selection, history identity, sampled dimensions and explicit
 disposal. These checks establish these source-pass paths; full application
 coverage and physical-device performance remain separate gates.
 
+## SSAO and GTAO normal buffers, occlusion and denoising
+
+The pinned `SSAOPass` and `GTAOPass` now select `general-webgpu` with their
+original sampling kernels, noise textures, blur/Poisson denoise shaders and
+output modes. Their complete pass, shader and noise dependencies are verified;
+modified sources or shaders, replaced methods and open consumers retain exact
+routing. Public quality controls and queued composer resizes use the existing
+program and target owners.
+
+WebGL `MeshNormalMaterial` now uses its source ShaderLib program. The native
+node-material path applies a color conversion that the WebGL normal buffer
+does not perform; sharing that path previously corrupted the AO inputs. The
+correction preserves native node-material behavior and fixes the WebGL normal
+display and sampled normal-buffer values together.
+
+Both source passes temporarily hide points and lines for their normal/depth
+draw, then restore the public objects. The private verified-pass scope now
+retains that exact exclusion list and its descendants through deferred
+preparation and drawing. It neither rewrites public visibility during
+submission nor freezes ordinary scene visibility or LOD selection. Exclusions
+use the existing material capture limits and release with the accepted request.
+The required capture profile remains ordinary callback-free scenes/cameras
+without shadows or custom sorting; unsupported capture fails before retaining
+additional targets.
+
+`program_ambient_occlusion.mjs` compares 27 source/candidate checkpoints and
+330,752 RGBA bytes on Chromium 151.0.7922.34 / SwiftShader, with zero GPU/browser
+errors. It covers raw AO, blur/denoise, depth, normal and diffuse outputs,
+temporary point/line exclusion, queued quality changes and two queued resizes.
+Twenty-five checkpoints differ by at most one channel value. Each 80-by-56
+resize image has 34 pixels above the 12-channel threshold (0.759%, within the
+existing 2% budget), with maximum differences of 124 for SSAO and 112 for GTAO.
+This is tolerance-based equivalence, not byte-exact parity or a hardware
+performance result. `SAOPass` remains on the exact route: its sinusoidal random
+hash amplifies fullscreen interpolation differences at some image sizes, and
+its numerical parity has not been established.
+
 ## GPUComputationRenderer texture simulations
 
 The pinned `GPUComputationRenderer` addon now runs its floating-point texture

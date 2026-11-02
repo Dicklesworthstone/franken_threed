@@ -353,6 +353,59 @@ test('advanced pass shader dependencies and unknown pass consumers retain the ex
   }
 });
 
+test('pinned ambient occlusion passes preserve quality controls and the private visibility scope', async () => {
+  for (const [name, settings] of [
+    ['SSAOPass', `pass.output = SSAOPass.OUTPUT.Blur; pass.kernelRadius = 12;
+      pass.minDistance = .005; pass.maxDistance = .2; pass.ssaoMaterial.uniforms.kernelRadius.value = 10;`],
+    ['GTAOPass', `pass.output = GTAOPass.OUTPUT.Denoise; pass.blendIntensity = .8;
+      pass.updateGtaoMaterial({radius: .4, samples: 24}); pass.updatePdMaterial({radius: 6, samples: 16, rings: 2});
+      pass.setSceneClipBox(new THREE.Box3()); const map = pass.gtaoMap;
+      pass.setGBuffer(pass.normalRenderTarget.depthTexture, pass.normalRenderTarget.texture);`],
+  ]) {
+    const entry = passFixture(`import {${name}} from 'ao';
+      const pass = new ${name}(scene, camera, 64, 32); ${settings}
+      composer.addPass(pass); composer.render(.016); composer.setSize(48, 32); pass.dispose();`,
+    {ao: new URL(`examples/jsm/postprocessing/${name}.js`, upstream).href}).entry;
+    const graph = await buildModuleGraph(entry);
+    assert.deepEqual(extractGraphRoutingFacts(graph).escapes, [], name);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu', name);
+    const mod = Object.values(graph.modules).find(mod => mod.postprocessing_transform?.name === `${name}.js`);
+    assert.ok(mod, 'the original normal/depth draw receives an explicit private visibility scope');
+    const source = fs.readFileSync(new URL(`examples/jsm/postprocessing/${name}.js`, upstream), 'utf8');
+    assert.match(transformThreePostProcessing(source, mod.postprocessing_transform),
+      /__f3dRenderPassScene\(renderer, this\.scene, this\.camera, this\._visibilityCache\)/);
+    const changed = await buildModuleGraph(entry, {
+      transformModule: (source, {url}) => url.endsWith(`/${name}.js`) ? source + '\n// changed pass\n' : null,
+    });
+    assert.equal(evaluateGraphRoutes(changed, decideRendererRoute, environment)[0].decision.route, 'exact-backend', name);
+  }
+});
+
+test('ambient occlusion shader/noise changes and opaque pass mutations remain exact', async () => {
+  const source = `import {GTAOPass} from 'ao'; const pass = new GTAOPass(scene, camera, 64, 32);
+    composer.addPass(pass); composer.render();`;
+  const map = {ao: new URL('examples/jsm/postprocessing/GTAOPass.js', upstream).href};
+  const entry = passFixture(source, map).entry;
+  for (const dependency of ['GTAOShader.js', 'PoissonDenoiseShader.js', 'SimplexNoise.js']) {
+    const graph = await buildModuleGraph(entry, {
+      transformModule: (text, {url}) => url.endsWith(`/${dependency}`) ? text + '\n// changed dependency\n' : null,
+    });
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', dependency);
+  }
+  for (const extra of ['plugin(pass);', 'pass.updateGtaoMaterial = plugin;', 'pass._visibilityCache = [];',
+    'GTAOPass.prototype.render = plugin;']) {
+    const graph = await buildModuleGraph(passFixture(source + extra, map).entry);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', extra);
+  }
+});
+
+test('SAOPass retains exact execution while its source random hash differs on the native raster path', async () => {
+  const graph = await buildModuleGraph(passFixture(`import {SAOPass} from 'sao';
+    composer.addPass(new SAOPass(scene, camera)); composer.render();`,
+  {sao: new URL('examples/jsm/postprocessing/SAOPass.js', upstream).href}).entry);
+  assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+});
+
 test('custom passes, carrier escapes and source mutations retain exact renderer ownership', () => {
   for (const body of [
     'composer.addPass(plugin);', 'composer.insertPass(new CustomPass(), 0);',

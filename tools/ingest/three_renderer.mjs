@@ -41,7 +41,7 @@ import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
-import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera} from './three_pass_state.mjs';
+import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera, getThreePassExcludedObjects} from './three_pass_state.mjs';
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
@@ -154,7 +154,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     scene.traverse(object => {
       // A queued native render owns its visibility selection. Hidden source
       // objects must not force material admission during later preparation.
-      if (nodeFrame?.excludedObjects?.has(object)) return;
+      if (nodeFrame?.excludedObjects?.has(object) || materialFrame?.excludedObjects?.has(object)) return;
       for (let ancestor = object; ancestor; ancestor = ancestor.parent)
         if (nodeFrame?.bundleObjects?.has(ancestor)) return;
       const material = materialFrame?.objects.has(object) ? materialFrame.objects.get(object) : object.material;
@@ -1077,19 +1077,20 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
       const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
       const passCameraRequired = this._shaderEncodedOutput && !clearOnly && captureCameras && requiresThreePassCamera(this);
-      // Source-verified SSAA/TAA must not collapse temporary jitter into the
-      // restored camera. Check before capturing a destination or retaining GPU
+      // Source-verified passes retain temporary jitter and AO exclusions after
+      // public state is restored. Check before capturing a destination or retaining GPU
       // generations. Hook-bearing scenes keep their existing public identities;
       // they need a broader synchronous command capture before admission here.
       let requiredMaterialFrame = null;
       if (passCameraRequired) {
         if (this.shadowMap.enabled || this.sortObjects && (this._opaqueSort || this._transparentSort))
-          fail('UNSUPPORTED', 'Supersampling camera capture requires a callback-free scene without shadows or custom sorting');
+          fail('UNSUPPORTED', 'Pinned pass capture requires a callback-free scene without shadows or custom sorting');
         requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true,
+          exclusions: getThreePassExcludedObjects(this),
           maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
           maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
         if (!requiredMaterialFrame?.cameraSafe())
-          fail('UNSUPPORTED', 'Supersampling camera capture requires ordinary callback-free scene and camera state');
+          fail('UNSUPPORTED', 'Pinned pass capture requires ordinary callback-free scene and camera state');
       }
       // Each accepted call keeps its source sort selection while pipelines are
       // prepared. Changing a sorter for the next call cannot reorder this one.
@@ -1460,7 +1461,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       webglSourceCamera = null, passCameraRequired = false,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       if (webglSourceCamera && !materialFrame?.cameraSafe()) {
-        if (passCameraRequired) fail('UNSUPPORTED', 'Supersampling scene or camera gained callbacks before its captured draw submitted');
+        if (passCameraRequired) fail('UNSUPPORTED', 'Pinned pass scene or camera gained callbacks before its captured draw submitted');
         // An application may install hooks while preparation is pending. Keep
         // those callbacks on their original camera and live mutation path.
         camera = webglSourceCamera;

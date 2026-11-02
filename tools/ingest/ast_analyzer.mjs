@@ -1053,11 +1053,14 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches"]);
   const composerMethods = new Set(["render", "addPass", "insertPass", "removePass", "swapBuffers", "reset", "setSize", "setPixelRatio", "dispose", "isLastEnabledPass"]);
   const composerViews = new Set(["renderer", "renderToScreen", "renderTarget1", "renderTarget2", "readBuffer", "writeBuffer"]);
-  const passMethods = new Set(["render", "setSize", "dispose"]);
+  const passMethods = new Set(["render", "setSize", "dispose", "setGBuffer", "setSceneClipBox", "updateGtaoMaterial", "updatePdMaterial"]);
   const passSettings = new Set(["enabled", "needsSwap", "clear", "renderToScreen", "inverse", "scene", "camera", "overrideMaterial",
     "clearColor", "clearAlpha", "clearDepth", "material", "uniforms", "textureID", "map", "opacity",
     "strength", "radius", "threshold", "resolution", "damp", "sampleLevel", "unbiased", "accumulate", "accumulateIndex",
-    "materialBokeh", "compFsMaterial", "copyFsMaterial"]);
+    "materialBokeh", "compFsMaterial", "copyFsMaterial",
+    "output", "width", "height", "kernelRadius", "minDistance", "maxDistance", "blendIntensity",
+    "normalMaterial", "ssaoMaterial", "gtaoMaterial", "pdMaterial", "blurMaterial", "depthRenderMaterial", "copyMaterial", "blendMaterial",
+    "normalRenderTarget", "ssaoRenderTarget", "blurRenderTarget", "gtaoRenderTarget", "pdRenderTarget", "gtaoMap", "depthTexture", "normalTexture"]);
   const computationMethods = new Set(["setDataType", "addVariable", "setVariableDependencies", "init", "compute",
     "getCurrentRenderTarget", "getAlternateRenderTarget", "dispose", "addResolutionDefine", "createShaderMaterial",
     "createRenderTarget", "createTexture", "renderTexture", "doRenderTarget"]);
