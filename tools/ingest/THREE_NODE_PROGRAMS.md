@@ -772,7 +772,7 @@ same-size layout changes require a new descriptor before node callbacks run.
 Splitting or merging unsized storage aliases, including nodes created inside
 `Fn`, invalidates the compiled binding layout. There is no readback, second
 graphics allocation, or CPU upload merely because a graphics draw consumes
-compute-produced values. Nested, boolean and atomic struct members are not yet
+compute-produced values. Nested and boolean struct members are not yet
 admitted; a three-word struct is also refused because the source storage uploader
 treats that stride as a padded vec3.
 
@@ -783,11 +783,27 @@ producers, compute dispatches and asynchronous readback share one GPU allocation
 in queue order. A later requested partial CPU upload changes only its selected
 components, preserving untouched GPU-produced values. A render pass cannot mix
 writable and read-only/vertex uses of the same attribute, and a draw cannot bind
-overlapping writable aliases. Float, vector, struct and vertex-stage atomics
-remain refused before native uploads. Ten focused fragment-atomic tests cover
-source WGSL, binding limits, aliases, captured uploads and FIFO ownership using
-explicit recorded producer effects; they do not execute WGSL or prove GPU pixel
-parity.
+overlapping writable aliases. A single flat `struct()` record can likewise
+contain atomic `int`/`uint` members alongside ordinary scalar/vector/matrix
+fields. Mark its storage node with `.toAtomic()` and access fields directly,
+for example `atomicAdd(counters.get('hits'), uint(1))`. Mixed Float32, Int32 and
+Uint32 backing arrays retain their raw bytes and the pinned struct padding.
+The ordinary companion fields remain read-only in graphics; compute may update
+them through the same allocation. Member atomicity participates in the cached
+shader interface, so even a same-size change invalidates accepted descriptors
+before node updates.
+
+The pinned builder emits invalid WGSL for atomic arrays of structs, and its
+singleton struct binding cannot be indexed with `.element(0)`. Both forms remain
+explicitly refused, as do floating-point/vector atomic members and vertex-stage
+atomics. The 21 focused fragment-atomic recording tests cover source shaders,
+binding limits, aliases, captured uploads and FIFO ownership. Separately,
+`node tests/e2e/webgpu_renderer/native_atomic_structs.mjs` executes fragment and
+compute producers on the real GPU and checks signed/unsigned readbacks, untouched
+CPU arrays, partial companion-field uploads and exact source/candidate pixels.
+Both backing profiles match all fourteen checkpoints (688,128 RGBA bytes) with
+zero validation errors on Chromium 151.0.7922.34/SwiftShader. This is software-GPU
+correctness evidence, not a hardware throughput measurement.
 
 Ordinary meshes and native sprites support source `count` with TSL `instanceIndex`, including
 compute-driven scalar/vector and structured particle positions. Each logical
@@ -1768,9 +1784,9 @@ for those scenes; they do not measure hardware acceleration.
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
-graphics writes, atomics outside the scalar integer fragment profile above,
-matrix storage outside the padded Float32 profile, nested/boolean/atomic
-struct members and managed uniform arrays remain refused.
+graphics writes, atomics outside the scalar integer and single-record struct
+fragment profiles above, matrix storage outside the padded Float32 profile,
+and nested/boolean struct members remain refused.
 Render-triggered compute beyond the source geometry profile and resource ordering
 boundaries described above is unsupported; generated graphics writes still
 require an explicitly admitted graphics access profile.

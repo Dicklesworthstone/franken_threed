@@ -13,7 +13,8 @@
  * sampled 2D/data-array/3D/cube textures, native cube render-target color,
  * GPU-authored 2D/array/3D storage inputs, including lossless signed/unsigned texel loads,
  * target-owned depth comparisons and read-only
- * scalar/vector/matrix or flat-struct storage buffers.
+ * scalar/vector/matrix or flat-struct storage buffers, including fragment
+ * atomic int/uint members alongside ordinary read-only struct fields.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
  * Source Fog/FogExp2 and directional/spot/point Basic/PCF/VSM shadows retain
@@ -299,8 +300,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspectStorage(node) {
     const attribute = node.value, struct = node.structTypeNode;
     const atomic = node.isAtomic === true;
-    if (atomic && (struct || !['int', 'uint'].includes(node.nodeType)))
-      fail('STORAGE', 'Native fragment atomics require scalar signed or unsigned 32-bit storage');
+    if (atomic && !struct && !['int', 'uint'].includes(node.nodeType))
+      fail('STORAGE', 'Native fragment atomics require scalar signed/unsigned 32-bit storage or flat structs with atomic integer members');
     const type = /^(?:(i|u)?vec([234])|(float|int|uint|mat[234]))$/.exec(node.nodeType ?? '');
     const matrix = /^mat([234])$/.exec(node.nodeType ?? '')?.[1];
     const components = matrix ? Number(matrix) ** 2 : type?.[2] ? Number(type[2]) : 1;
@@ -312,13 +313,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // require the authored matrix stride rather than rewriting its CPU bytes.
     let stride = matrix === '3' ? 12 : components === 3 ? 4 : components;
     if (struct) {
+      // r186 only emits a direct struct binding for a single record. Marking
+      // an array of records atomic instead emits atomic<Struct>, which WGSL
+      // rejects; do not admit that source-invalid shader as a native feature.
+      if (atomic && attribute?.count !== 1)
+        fail('STORAGE', 'Native atomic structs require a single source record accessed through its members');
       if (node.nodeType !== 'struct' || struct.isStructTypeNode !== true ||
           !Array.isArray(struct.membersLayout) || !struct.membersLayout.length || struct.membersLayout.length > maxNodes ||
-          struct.membersLayout.some(member => !member || typeof member.name !== 'string' || member.atomic ||
+          struct.membersLayout.some(member => !member || typeof member.name !== 'string' ||
+            member.atomic && (member.atomic !== true || !atomic || !['int', 'uint'].includes(member.type)) ||
             !/^(?:float|int|uint|[iu]?vec[234]|mat[234])$/.test(member.type)))
-        fail('STORAGE', 'Native storage structs require non-atomic scalar/vector/matrix 32-bit members');
+        fail('STORAGE', 'Native storage structs require 32-bit scalar/vector/matrix members; atomic int/uint members require source atomic storage');
       // Use the pinned source layout, including vec3 member alignment and mat3
-      // column padding. Mixed integer/float fields share the original bytes.
+      // column padding. Atomic scalars keep their ordinary four-byte layout.
+      // The source's toAtomic() flag selects a writable fragment binding for
+      // the whole struct; it does not wrap the struct itself in atomic<T>.
+      // Mixed integer/float fields share the original bytes.
       stride = three.StructTypeNode.prototype.getLength.call(struct);
       if (!Number.isSafeInteger(stride) || stride < 1 || stride === 3)
         fail('STORAGE', 'Native storage structs require a complete source stride without ambiguous three-word padding');
@@ -335,7 +345,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !(struct || matrix ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 0 || node.bufferCount > attribute.count)
-      fail('STORAGE', 'Native storage requires matching scalar/vector/matrix or flat-struct 32-bit attributes; mat3 columns require padding and atomics require scalar integers');
+      fail('STORAGE', 'Native storage requires matching scalar/vector/matrix or flat-struct 32-bit attributes; mat3 columns require padding and atomic values require scalar integers');
     // IndirectStorageBufferAttribute is still source storage. Shader reads and
     // draw arguments borrow its compute allocation; shared write conflicts are
     // checked with the other captured uses before native submission.
@@ -357,7 +367,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // their alias partition must remain stable. Fixed arrays bind separately.
       return [unsized ? aliases.get(attribute) : null, node.nodeType, node.bufferCount, attribute.count, bytes, node.groupNode?.name,
         node.isAtomic === true, node.access,
-        struct ? [struct.name, struct.membersLayout.map(({name, type}) => [name, type])] : null];
+        struct ? [struct.name, struct.membersLayout.map(({name, type, atomic}) => [name, type, !!atomic])] : null];
     }));
   }
   function inspectInstances(object) {
@@ -1088,6 +1098,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null, shadowGraphs = null) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
+    if (node.isStorageArrayElementNode && node.node?.structTypeNode && node.node.isAtomic === true)
+      fail('STORAGE', 'Native atomic structs use direct source member access, not array indexing');
     if (node.isComputeNode) { inspectCompute(node); return; }
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isPassTextureNode === true) {

@@ -68,6 +68,99 @@ const counter = (type = 'uint', values = [7, 11, 13, 17]) => N.storage(new T.Sto
 const graph = (storage, value = 1) => N.Fn(() => N.vec3(N.atomicAdd(storage.element(0),
   storage.nodeType === 'int' ? N.int(value) : N.uint(value)).toFloat().mul(.01)))();
 
+function structuredCounter(Type = Uint32Array) {
+  const schema = N.struct({hits: {type: 'uint', atomic: true}, balance: {type: 'int', atomic: true},
+    gain: 'float', tag: 'uint', basis: 'mat3'}, 'FragmentCounter');
+  const array = new Type(schema.getLength()), words = new Uint32Array(array.buffer);
+  words.set([7, 0xfffffff5, 0x3f000000, 19]);
+  const storage = N.storage(new T.StorageBufferAttribute(array, schema.getLength()), schema, 1).toAtomic();
+  return {schema, storage, words};
+}
+const structuredGraph = storage => N.Fn(() => {
+  const record = storage;
+  N.atomicAdd(record.get('hits'), N.uint(3));
+  N.atomicAdd(record.get('balance'), N.int(-2));
+  return N.vec3(record.get('gain'), record.get('tag').toFloat().mul(.01), record.get('basis').element(0).x);
+})();
+
+for (const Type of [Float32Array, Int32Array, Uint32Array])
+test(`${Type.name} atomic structs preserve source shaders, padded mixed fields and fragment-only writable bindings`, async t => {
+  const f = fixture(t), {schema, storage, words} = structuredCounter(Type);
+  f.material.colorNode = structuredGraph(storage);
+  await f.renderer.init();
+  const source = new T.WGSLNodeBuilder(f.mesh, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  assert.match(source.fragmentShader, /hits : atomic<\s*u32\s*>/);
+  assert.match(source.fragmentShader, /balance : atomic<\s*i32\s*>/);
+  assert.match(source.fragmentShader, /var<storage, read_write>/);
+  await f.renderer.compileAsync(f.scene, f.camera); assert.equal(storageWrites(f).length, 0);
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const descriptor = f.captures.find(frame => frame.draws.length).draws[0].binding.nodeProgram;
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(descriptor.vertex), canonical(source.vertexShader));
+  assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
+  assert.match(descriptor.fragment, /basis : mat3x3<f32>/);
+  assert.doesNotMatch(descriptor.vertex, /FragmentCounter|atomic</);
+  const bindings = descriptor.groups.flatMap(group => group.entries).filter(entry => entry.buffer?.type === 'storage');
+  assert.equal(schema.getLength(), 16);
+  assert.equal(bindings.length, 1); assert.equal(bindings[0].visibility, 2);
+  assert.equal(bindings[0].buffer.minBindingSize, 64);
+  assert.equal(storage.value.array.constructor, Type);
+  assert.deepEqual([...new Uint32Array(storageEntries(draws(f)[0])[0].resource.buffer.data)], [...words]);
+});
+
+test('atomic struct producers share compute residency and preserve partial-upload history', async t => {
+  const f = fixture(t), {storage, words} = structuredCounter(), observed = [], buffers = [];
+  f.material.colorNode = structuredGraph(storage);
+  f.device.onDraw = draw => {
+    const buffer = storageEntries(draw)[0].resource.buffer, data = new Uint32Array(buffer.data);
+    observed.push([...data.slice(0, 4)]); buffers.push(buffer); data[0] += 3;
+  };
+  f.device.onCompute = pass => {
+    const buffer = [...pass.groups.values()].flatMap(group => group.entries).find(entry => entry.resource.buffer.usage & 128).resource.buffer;
+    buffers.push(buffer); new Int32Array(buffer.data)[1] -= 2;
+  };
+  const compute = N.Fn(() => { N.atomicAdd(storage.get('balance'), N.int(-2)); })().compute(1);
+  t.after(() => compute.dispose());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  const first = f.renderer.getArrayBufferAsync(storage.value);
+  f.renderer.compute(compute);
+  words[2] = 0x3f400000; storage.value.addUpdateRange(2, 1); storage.value.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  const second = f.renderer.getArrayBufferAsync(storage.value); words.fill(0xdeadbeef);
+  assert.deepEqual([...new Uint32Array(await first).slice(0, 4)], [10, 0xfffffff5, 0x3f000000, 19]);
+  assert.deepEqual([...new Uint32Array(await second).slice(0, 4)], [13, 0xfffffff3, 0x3f400000, 19]);
+  assert.deepEqual(observed, [[7, 0xfffffff5, 0x3f000000, 19], [10, 0xfffffff3, 0x3f400000, 19]]);
+  assert.ok(buffers.every(buffer => buffer === buffers[0]));
+  assert.equal(storageWrites(f).length, 2);
+  assert.equal(storageWrites(f)[1].offset, 8); assert.equal(storageWrites(f)[1].input.byteLength, 4);
+  assert.deepEqual(storage.value.updateRanges, []); assert.ok(words.every(word => word === 0xdeadbeef));
+});
+
+for (const invalid of ['float member', 'vector member', 'unmarked storage', 'record array', 'indexed record', 'vertex stage', 'duplicate writer'])
+test(`atomic struct ${invalid} refuses before native effects`, async t => {
+  const f = fixture(t), {schema, storage} = structuredCounter();
+  if (invalid === 'float member') schema.membersLayout[0].type = 'float';
+  if (invalid === 'vector member') schema.membersLayout[0].type = 'uvec2';
+  if (invalid === 'unmarked storage') storage.setAtomic(false);
+  if (invalid === 'record array') storage.value = new T.StorageBufferAttribute(2, 16, Uint32Array);
+  if (invalid === 'vertex stage') {
+    f.material.positionNode = N.positionLocal.add(N.atomicLoad(storage.get('hits')).toFloat());
+    f.material.colorNode = N.vec3(1);
+  } else if (invalid === 'indexed record') {
+    f.material.colorNode = N.Fn(() => N.vec3(N.atomicAdd(storage.element(0).get('hits'), N.uint(1)).toFloat()))();
+  } else if (invalid === 'duplicate writer') {
+    const alias = N.storage(storage.value, schema, 1).toAtomic();
+    f.material.colorNode = N.Fn(() => {
+      N.atomicAdd(storage.get('hits'), N.uint(1));
+      N.atomicAdd(alias.get('hits'), N.uint(1)); return N.vec3(1);
+    })();
+  } else f.material.colorNode = structuredGraph(storage);
+  await f.renderer.init();
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), error => /STORAGE|CONFLICT/.test(error.code));
+  assert.equal(storageWrites(f).length, 0); assert.equal(draws(f).length, 0);
+});
+
 for (const type of ['uint', 'int']) test(`${type} fragment atomic graphs retain source WGSL, writable layout and cache transitions`, async t => {
   const f = fixture(t), storage = counter(type); f.material.colorNode = graph(storage, type === 'int' ? -3 : 3);
   await f.renderer.compileAsync(f.scene, f.camera); assert.equal(storageWrites(f).length, 0);

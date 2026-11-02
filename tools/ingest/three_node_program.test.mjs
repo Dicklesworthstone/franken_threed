@@ -1825,7 +1825,22 @@ test('same-size struct schema changes invalidate descriptors before source updat
   assert.throws(() => f.owner.captureDraw(d, f.context), {code: 'THREE_NODE_PROGRAM_STORAGE'});
   assert.equal(updates, 0);
 });
-test('structured storage rejects unsupported layouts, short strides and atomic members before updates', t => {
+test('atomic struct member changes invalidate accepted descriptors before node updates', t => {
+  const f = rig(t), schema = N.struct({hits: {type: 'uint', atomic: true}, value: 'float'}, 'AtomicRecord');
+  const storage = N.storage(new THREE.StorageBufferAttribute(1, 2, Uint32Array), schema, 1).toAtomic();
+  let updates = 0;
+  const scale = N.uniform(1).onRenderUpdate(() => { updates++; return 1; });
+  f.material.colorNode = N.Fn(() => {
+    N.atomicAdd(storage.get('hits'), N.uint(1));
+    return N.vec3(storage.get('value').mul(scale));
+  })();
+  const descriptor = f.compile();
+  schema.membersLayout[0].atomic = false;
+  assert.equal(schema.getLength(), 2, 'the buffer size does not reveal the changed shader interface');
+  assert.throws(() => f.owner.captureDraw(descriptor, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 0);
+});
+test('structured storage rejects unsupported layouts, short strides and unmarked atomic members before updates', t => {
   const cases = [
     [{position: {type: 'int', atomic: true}}, 1, Float32Array],
     [{position: 'bool'}, 1, Float32Array],
