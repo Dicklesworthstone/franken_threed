@@ -455,6 +455,17 @@ export const dispose = () => { composer.dispose(); renderer.dispose(); };
   } finally { emitted?.dispose(); globalThis.document = previous; }
 });
 
+test('the original H4 application routes with its unchanged FirstPersonControls', async () => {
+  const entry = path.resolve(upstreamBuild, '../examples/webgl_shadowmap_performance.html');
+  const out = fs.mkdtempSync(path.join(tmpdir(), 'f3d-h4-first-person-'));
+  const result = await buildApplication(entry, out, {routeWebGLRenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.deepEqual(result.rendererRoute.decisions.map(value => value.route), ['general-webgpu']);
+  const control = pathToFileURL(path.resolve(upstreamBuild, '../examples/jsm/controls/FirstPersonControls.js')).href;
+  assert.ok(result.chunks.some(chunk => chunk.modules.includes(control)), 'the actual pinned controls remain in the application');
+  assert.ok(result.entryFiles.every(file => fs.existsSync(path.join(out, file))));
+});
+
 test("a bundled closed-controls application executes retained camera controls with the new renderer", async () => {
   const controlsUrl = pathToFileURL(path.resolve(upstreamBuild, "../examples/jsm/controls/OrbitControls.js")).href;
   const a = app(`import * as THREE from 'three/webgpu';

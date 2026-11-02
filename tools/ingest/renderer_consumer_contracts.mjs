@@ -1,5 +1,5 @@
 /**
- * Source-verified ownership summaries for retained OrbitControls and standard
+ * Source-verified ownership summaries for retained camera controls and standard
  * postprocessing passes (r186, 148ef33ecb6d2502ff796d4554abd1549c95d519).
  * These objects retain their canvas or renderer. Callers must track the
  * returned instances, inherited methods and callbacks; this is not a generic
@@ -13,6 +13,7 @@
 import {verifiedPostProcessingSources} from './postprocessing_contracts.mjs';
 
 const ORBIT = 'sha256:3d79d07ecb686b4e5d93232eedab255331c1beef711e13164eaa1f68655a5f2b';
+const FIRST_PERSON = 'sha256:4f6c4bf60c8956a1201c966de1592f4f035be47b4f6fe97879a782898945992c';
 const CORE = 'sha256:9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const BUILDS = new Set([
   'sha256:9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea',
@@ -36,27 +37,31 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
     if (BUILDS.has(mod.content_hash) && mod.static_imports.length > 0 &&
         mod.static_imports.every(request => cores.has(request.resolved_id))) bases.add(id);
   }
-  const orbits = new Set();
+  const orbits = new Set(), firstPersons = new Set();
   for (const [id, mod] of modules) {
-    if (mod.content_hash === ORBIT && mod.static_imports.length === 1 &&
-        bases.has(mod.static_imports[0].resolved_id)) orbits.add(id);
+    if (mod.static_imports.length === 1 && bases.has(mod.static_imports[0].resolved_id)) {
+      if (mod.content_hash === ORBIT) orbits.add(id);
+      if (mod.content_hash === FIRST_PERSON) firstPersons.add(id);
+    }
   }
   const passes = verifiedPostProcessingSources(modules, bases);
   contracts.postprocessingSources = passes;
-  if (!orbits.size && !passes.size) return contracts;
+  if (!orbits.size && !firstPersons.size && !passes.size) return contracts;
 
   const role = (id, name) => passes.get(id)?.exports[name] ?? (orbits.has(id) && name === 'OrbitControls' ? 'orbit' :
+    firstPersons.has(id) && name === 'FirstPersonControls' ? 'first-person' :
     bases.has(id) && BASE_EXPORTS.has(name) ? 'base' :
     bases.has(id) && name === 'WebGPURenderer' ? 'webgpu' :
     bases.has(id) && name === 'WebGLRenderer' ? 'webgl' : null);
   for (const [id, mod] of modules) {
     // These exact implementations are the audited contract, not its callers.
-    if (bases.has(id) || orbits.has(id) || passes.has(id)) continue;
+    if (bases.has(id) || orbits.has(id) || firstPersons.has(id) || passes.has(id)) continue;
     const bindings = new Map(), namespaces = new Map(), reexports = new Set();
     for (const request of mod.static_imports) {
       for (const binding of request.imported_bindings ?? []) {
         if (binding.type === 'namespace') {
           if (orbits.has(request.resolved_id)) namespaces.set(binding.local, 'orbit');
+          else if (firstPersons.has(request.resolved_id)) namespaces.set(binding.local, 'first-person');
           else if (bases.has(request.resolved_id)) namespaces.set(binding.local, 'base');
         } else {
           const kind = role(request.resolved_id, binding.imported);
