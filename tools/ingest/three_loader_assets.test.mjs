@@ -23,6 +23,7 @@ const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
 const colladaUrl = rootUrl + "examples/jsm/loaders/ColladaLoader.js";
 const threeMfUrl = rootUrl + "examples/jsm/loaders/3MFLoader.js";
 const rhinoUrl = rootUrl + "examples/jsm/loaders/3DMLoader.js";
+const ldrawUrl = rootUrl + "examples/jsm/loaders/LDrawLoader.js";
 const discover = (code, options = {}) => findThreeLoaderRequests(
   parse(code, { ecmaVersion: "latest", sourceType: "module" }),
   { resolveModule: (specifier) => specifier === "three" ? coreUrl : specifier, ...options },
@@ -200,6 +201,44 @@ test("3MF discovery follows its actual source filename, aggregate exports and fi
     ['ThreeMFLoader', 'models/truck%20%23.3mf?edition=2#model'], ['ThreeMFLoader', 'models/colors.3mf'],
     ['ThreeMFLoader', 'module.3mf'], ['ThreeMFLoader', 'aggregate.3mf'], ['ThreeMFLoader', 'namespace.3mf'],
   ]);
+});
+
+test("LDraw discovery preserves packed models, finite material preloads and source configuration", () => {
+  const requests = discover(`import { LDrawLoader as Source } from ${JSON.stringify(ldrawUrl)};
+    import * as Module from ${JSON.stringify(ldrawUrl)};
+    import { LDrawLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const Loader=Source, loader=new Loader();
+    loader.setConditionalLineMaterial(ConditionalMaterial).setPartsLibraryPath('library/')
+      .setFileMap({'old.dat':'part.dat'}).setMaterials([]).addMaterials([]).clearMaterials().addDefaultMaterials();
+    loader.smoothNormals=false; const smooth=loader.smoothNormals;
+    loader.setPath('palettes/'); await loader.preloadMaterials(choice?'colors%20%23.ldr?version=2#palette':'fallback.ldr');
+    loader.setPath('models/'); loader.loadAsync(choice?'car%20%23.mpd?edition=2#model':'scene.mpd');
+    loader.smoothNormals=true; loader.parse(runtimeModel,onLoad,onError);
+    new Module.LDrawLoader().load('module.mpd');
+    new LDrawLoader().load('aggregate.mpd');
+    new Addons.LDrawLoader().preloadMaterials('namespace.ldr');`);
+  assert.deepEqual(requests.map(({loader,url}) => [loader,url]), [
+    ['LDrawLoader','palettes/colors%20%23.ldr?version=2#palette'], ['LDrawLoader','palettes/fallback.ldr'],
+    ['LDrawLoader','models/car%20%23.mpd?edition=2#model'], ['LDrawLoader','models/scene.mpd'],
+    ['LDrawLoader','module.mpd'], ['LDrawLoader','aggregate.mpd'], ['LDrawLoader','namespace.ldr'],
+  ]);
+});
+
+test("LDraw unknown mutations, foreign identities and dynamic URLs retain their host route", () => {
+  const requests = discover(`import { LDrawLoader } from ${JSON.stringify(ldrawUrl)};
+    import { LDrawLoader as Foreign } from 'file:///foreign/LDrawLoader.js';
+    import * as Wrong from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/OBJLoader.js')};
+    function shadow(LDrawLoader){new LDrawLoader().load('shadow.mpd');}
+    new Foreign().load('foreign.mpd'); new Wrong.LDrawLoader().load('wrong.mpd');
+    new LDrawLoader(manager).load('managed.mpd');
+    const custom=new LDrawLoader();custom.smoothNormals=()=>custom.setPath('other/');custom.load('custom.mpd');
+    const dynamic=new LDrawLoader();dynamic.smoothNormals=option;dynamic.load('dynamic.mpd');
+    const escaped=new LDrawLoader();customize(escaped);escaped.load('escaped.mpd');
+    new LDrawLoader().setPath(runtimePath).preloadMaterials('dynamic.ldr');
+    new LDrawLoader().preloadMaterials(runtimePalette);
+    new LDrawLoader().loadAsync('known.mpd');`);
+  assert.deepEqual(requests.map(({url}) => url), ['known.mpd']);
 });
 
 test("3MF foreign files, shadows, custom extensions and escaping loaders retain their host route", () => {

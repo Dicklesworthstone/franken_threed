@@ -35,9 +35,14 @@ const runner = new URL(data(`
 import {parentPort,workerData} from 'node:worker_threads';
 import {registerHooks} from 'node:module';
 registerHooks({resolve(specifier,context,next){return next(workerData.imports[specifier]??specifier,context);}});
-const requests=[],images=[],events=[],nativeFetch=globalThis.fetch;
+const requests=[],images=[],events=[],nativeFetch=globalThis.fetch,NativeRequest=globalThis.Request;
 globalThis.document={URL:'https://packed.example/view/index.html',baseURI:'https://packed.example/view/',
   createElementNS(_namespace,tag){if(tag!=='img')throw new Error(tag);return new ImageHost();}};
+// Native browsers resolve relative Request inputs against the document. Keep
+// unknown resource requests on that host path so real loader retries can run.
+globalThis.Request=class extends NativeRequest {
+  constructor(input,options){super(typeof input==='string'?new URL(input,document.baseURI):input,options);}
+};
 globalThis.self=globalThis;
 globalThis.ProgressEvent=class extends Event {constructor(type,details){super(type);Object.assign(this,details);}};
 globalThis.fetch=async (input,options)=>{
@@ -290,6 +295,144 @@ f 1/1/1 2/2/1 3/3/1
   assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='shared/normal.png'));
   assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
   assert.ok(result.images.every(url=>url.startsWith('data:image/png;')));
+});
+
+test("packed LDraw car retains its parts, construction steps and conditional edges without files or network", async () => {
+  const model=fs.readFileSync(new URL('../../upstream/three.js/examples/models/ldraw/officialLibrary/models/car.ldr_Packed.mpd',import.meta.url));
+  const loaderUrl=new URL('../../upstream/three.js/examples/jsm/loaders/LDrawLoader.js',import.meta.url).href;
+  const materialUrl=new URL('../../upstream/three.js/examples/jsm/materials/LDrawConditionalLineMaterial.js',import.meta.url).href;
+  const f=fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import * as THREE from ${JSON.stringify(core.href)};export {THREE};
+      import {LDrawLoader} from ${JSON.stringify(loaderUrl)};
+      import {LDrawConditionalLineMaterial} from ${JSON.stringify(materialUrl)};
+      function inspect(group){
+        const result={meshes:0,vertices:0,lines:0,conditional:0,steps:group.userData.numBuildingSteps};
+        group.traverse(object=>{
+          if(object.isMesh){result.meshes++;result.vertices+=object.geometry.attributes.position.count;}
+          if(object.isLineSegments)result.lines++;
+          if(object.isConditionalLine)result.conditional++;
+        });return result;
+      }
+      export async function run(){
+        const order=[],loader=new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial).setPath('models/');
+        let returned;
+        const first=await new Promise((resolve,reject)=>{
+          returned=loader.load('car%20%23.mpd?version=1#model',group=>{order.push('loaded');resolve(group);},undefined,reject);
+          order.push('returned');
+        });
+        const second=await new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial)
+          .setPath('models/').loadAsync('car%20%23.mpd?version=2#model');
+        let a,b;first.traverse(object=>{if(!a&&object.isMesh)a=object;});
+        second.traverse(object=>{if(!b&&object.isMesh)b=object;});
+        const before=b.geometry.attributes.position.getX(0);a.geometry.attributes.position.setX(0,before+100);
+        a.position.x=123;
+        return {order,undefinedReturn:returned===undefined,first:inspect(first),second:inspect(second),
+          files:[first.userData.fileName,second.userData.fileName],
+          independent:first!==second&&a!==b&&a.geometry!==b.geometry&&a.material!==b.material&&
+            b.geometry.attributes.position.getX(0)===before&&b.position.x===0};
+      }`, 'models/car #.mpd':model});
+  await buildApplication(f.entry,f.out,{prepareStandaloneLoaders:true});
+  assert.deepEqual(fs.readFileSync(path.join(f.out,'models/car #.mpd')),model);
+  packHtml(path.join(f.out,'index.html'),f.packed);const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  const expected={meshes:62,vertices:77031,lines:124,conditional:62,steps:8};
+  assert.deepEqual(result.result,{order:['returned','loaded'],undefinedReturn:true,first:expected,second:expected,
+    files:['car%20%23.mpd?version=1#model','car%20%23.mpd?version=2#model'],independent:true});
+  assert.equal(result.requests.length,2);
+  assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='models/car%20%23.mpd?version=2#model'));
+  assert.ok(result.events.every(([,url])=>!url.startsWith('data:')));
+});
+
+test("LDraw palettes, live smoothing, runtime parsing and unavailable library errors retain source behavior", async () => {
+  const palette='0 !COLOUR Custom_Red CODE 1000 VALUE #FF0000 EDGE #123456\n'+
+    '0 !COLOUR Custom_Blue CODE 1001 VALUE #0000FF EDGE #654321 ALPHA 128';
+  const model=`0 FILE scene.ldr
+0 !LDRAW_ORG Model
+0 !CATEGORY Vehicles
+0 !KEYWORDS miniature, two steps
+1 1000 0 0 0 1 0 0 0 1 0 0 0 1 Alias.dat
+0 STEP
+1 16 5 0 0 1 0 0 0 1 0 0 0 1 submodel.ldr
+0 FILE Part.dat
+0 !LDRAW_ORG Part
+0 BFC CERTIFY CCW
+3 16 0 0 0 1 0 0 0 1 0
+3 16 1 0 0 0 0 0 0 -1 0.5
+2 24 0 0 0 0 1 0
+5 24 0 0 0 1 0 0 0 1 0 0 -1 0.5
+0 FILE submodel.ldr
+0 !LDRAW_ORG Model
+1 1001 0 0 0 1 0 0 0 1 0 0 0 1 PART.DAT
+`;
+  const loaderUrl=new URL('../../upstream/three.js/examples/jsm/loaders/LDrawLoader.js',import.meta.url).href;
+  const materialUrl=new URL('../../upstream/three.js/examples/jsm/materials/LDrawConditionalLineMaterial.js',import.meta.url).href;
+  const resources={'palettes/colors #.ldr':palette,'models/scene.mpd':model,'models/broken.ldr':'6 invalid',
+    'models/missing-parts.ldr':'1 16 0 0 0 1 0 0 0 1 0 0 0 1 Missing.DAT'};
+  const f=fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import * as THREE from ${JSON.stringify(core.href)};export {THREE};
+      import {LDrawLoader} from ${JSON.stringify(loaderUrl)};
+      import {LDrawConditionalLineMaterial} from ${JSON.stringify(materialUrl)};
+      function objects(group){const list=[];group.traverse(object=>{if(object.isMesh||object.isLineSegments)list.push(object);});return list;}
+      const round=values=>values.map(value=>Number(value.toFixed(6)));
+      export async function run(){
+        const loader=new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial)
+          .setPartsLibraryPath('library/').setFileMap({'Alias.dat':'Part.dat'}).setPath('palettes/');
+        const preloaded=await loader.preloadMaterials('colors%20%23.ldr?version=1#palette');
+        loader.setPath('models/');const pending=loader.loadAsync('scene.mpd');loader.smoothNormals=false;
+        const flat=await pending;
+        const smoothLoader=new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial)
+          .setFileMap({'Alias.dat':'Part.dat'}).setPath('palettes/');
+        await smoothLoader.preloadMaterials('colors%20%23.ldr?version=2#palette');
+        smoothLoader.setPath('models/');const smooth=await smoothLoader.loadAsync('scene.mpd');
+        const raw=await new THREE.FileLoader().loadAsync('models/scene.mpd');
+        let parseReturn;const parseOrder=[];
+        const parsed=await new Promise((resolve,reject)=>{
+          parseReturn=loader.parse(raw,group=>{parseOrder.push('parsed');resolve(group);},reject);parseOrder.push('returned');
+        });
+        const failures=[];
+        await new Promise(resolve=>new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial)
+          .setPath('models/').load('broken.ldr',()=>{throw new Error('Invalid model accepted');},undefined,error=>{failures.push(error.message);resolve();}));
+        await new Promise(resolve=>loader.parse('6 invalid',()=>{throw new Error('Invalid model accepted');},error=>{failures.push(error.message);resolve();}));
+        try{await new LDrawLoader().setConditionalLineMaterial(LDrawConditionalLineMaterial).setPartsLibraryPath('library/')
+          .setPath('models/').loadAsync('missing-parts.ldr');}catch(error){failures.push(error.message);}
+        return {preloadUndefined:preloaded===undefined,parseUndefined:parseReturn===undefined,parseOrder,
+          parsed:{objects:objects(parsed).length,file:parsed.userData.fileName},
+          metadata:{steps:flat.userData.numBuildingSteps,category:flat.userData.category,keywords:flat.userData.keywords,
+            children:flat.children.map(child=>({name:child.name,step:child.userData.buildingStep,position:child.position.toArray()}))},
+          objects:objects(flat).map(object=>({type:object.type,conditional:!!object.isConditionalLine,name:object.material.name,
+            color:object.material.color.getHexString(),opacity:object.material.opacity,vertices:object.geometry.attributes.position.count})),
+          normals:[flat,smooth].map(group=>round([...objects(group)[0].geometry.attributes.normal.array.slice(0,3)])),failures};
+      }`,...resources});
+  await buildApplication(f.entry,f.out,{prepareStandaloneLoaders:true});
+  for(const [name,bytes] of Object.entries(resources))assert.equal(fs.readFileSync(path.join(f.out,name),'utf8'),bytes);
+  packHtml(path.join(f.out,'index.html'),f.packed);const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  const objects=[['Custom_Red','ff0000','123456',1],['Custom_Blue','0000ff','654321',128/255]].flatMap(([name,color,edge,opacity])=>[
+    {type:'Mesh',conditional:false,name:' '+name,color,opacity,vertices:6},
+    {type:'LineSegments',conditional:false,name:' '+name+' - Edge',color:edge,opacity,vertices:2},
+    {type:'LineSegments',conditional:true,name:' '+name+' - Conditional Edge',color:edge,opacity,vertices:2},
+  ]);
+  assert.deepEqual(result.result,{preloadUndefined:true,parseUndefined:true,parseOrder:['returned','parsed'],
+    parsed:{objects:6,file:''},metadata:{steps:2,category:'Vehicles',keywords:['miniature','two steps'],
+      children:[{name:'Part.dat',step:0,position:[0,0,0]},{name:'submodel.ldr',step:1,position:[5,0,0]}]},
+    objects,normals:[[0,0,1],[0,0.229753,0.973249]],failures:[
+      'THREE.LDrawLoader: Unknown line type "6" at line 1.',
+      'THREE.LDrawLoader: Unknown line type "6" at line 1.',
+      'THREE.LDrawLoader: Subobject "missing.dat" could not be loaded.',
+    ]});
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='palettes/colors%20%23.ldr?version=2#palette'));
+  // These unresolved part paths retain the real source retries and failures;
+  // packaging supplies neither substitute geometry nor synthetic responses.
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='library/parts/Missing.DAT'));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='library/parts/missing.dat'));
+  assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
 });
 
 test("packed binary and ASCII FBX retain textured geometry, skeletal clips and animation without files or network", async () => {

@@ -50,6 +50,7 @@ const BOOLEAN_OPTIONS = new Map([
   ["PCDLoader", new Set(["littleEndian"])],
   ["BVHLoader", new Set(["animateBonePositions", "animateBoneRotations"])],
   ["GCodeLoader", new Set(["splitLayer"])],
+  ["LDrawLoader", new Set(["smoothNormals"])],
 ]);
 const CUBE_URL_LOADERS = new Set(["CubeTextureLoader", "DDSLoader", "KTXLoader"]);
 const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"], ["Rhino3dmLoader", "3DMLoader.js"]]);
@@ -64,6 +65,10 @@ const ADDON_SETTINGS = new Map([
   // single-file family above. Their retained parsers also accept runtime bytes.
   ["USDLoader", new Set()],
   ["USDZLoader", new Set()],
+  // Packed MPD files contain their own parts. Unpacked library references keep
+  // the source loader's trial-and-error host route; no part paths are guessed.
+  ["LDrawLoader", new Set(["setConditionalLineMaterial", "setPartsLibraryPath", "setFileMap",
+    "setMaterials", "addMaterials", "clearMaterials", "addDefaultMaterials", "addMaterial"])],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -78,6 +83,7 @@ const ADDON_USES = new Map([
   ["ColladaLoader", new Set(["parse"])],
   ["USDLoader", new Set(["parse"])],
   ["USDZLoader", new Set(["parse"])],
+  ["LDrawLoader", new Set(["parse", "preloadMaterials"])],
   ["Rhino3dmLoader", new Set(["parse", "parseAsync", "decodeObjects"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);
@@ -434,13 +440,15 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
   const requests = [], objectLoads = new Map(), materialLoads = new Map(), rhinoLoads = new Map(), unresolvedLoads = new Set();
   for (const call of calls) {
     const method = memberName(call.callee);
-    if (!["load", "loadAsync", "parse", "parseAsync", "preload", "init", "decodeGeometry", "decodeDracoFile", "decodeObjects"].includes(method)) continue;
+    if (!["load", "loadAsync", "parse", "parseAsync", "preload", "preloadMaterials", "init", "decodeGeometry", "decodeDracoFile", "decodeObjects"].includes(method)) continue;
     const value = instance(call.callee.object, call);
     if (!value) {
       if (["load", "loadAsync"].includes(method)) unresolvedLoads.add(instanceOrigin(call.callee.object));
       continue;
     }
-    if (["load", "loadAsync"].includes(method)) {
+    // LDraw's material preload uses the same captured FileLoader path as load;
+    // its original asynchronous parsing and material identity stay untouched.
+    if (["load", "loadAsync"].includes(method) || value.loader === "LDrawLoader" && method === "preloadMaterials") {
       const argument = call.arguments[0];
       const urls = value.loader === "CubeTextureLoader" ? cubeUrls(argument) :
         finite(argument) ?? (CUBE_URL_LOADERS.has(value.loader) ? cubeUrls(argument) : null);
