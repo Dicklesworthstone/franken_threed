@@ -167,25 +167,31 @@ function createThreeCompute(renderer, three) {
       const record = readRecord(lease), value = readLeases.get(lease);
       let history = histories.get(record.key);
       if (!history) {
-        history = {first: record, multiple: false, generated: false}; histories.set(record.key, history);
+        history = {first: record, last: record, records: new Set(), shaders: new Set(), generated: false, indirect: false};
+        histories.set(record.key, history);
       }
-      history.multiple ||= history.first !== record;
-      history.generated ||= value.vertex === true || value.indirect;
+      if (!history.records.has(record)) { history.records.add(record); history.last = record; }
+      history.generated ||= value.vertex === true;
+      history.indirect ||= value.indirect === true;
+      if (!value.vertex && !value.indirect) history.shaders.add(record);
       const first = history.first;
-      if (history.multiple && (history.generated || first.byteLength !== record.byteLength ||
-          first.scalar !== record.scalar || first.itemSize !== record.itemSize || first.count !== record.count))
-        fail('READ_CONFLICT', 'Multiple host upload versions require shader-only storage with one unchanged allocation layout');
+      if (first.byteLength !== record.byteLength || first.scalar !== record.scalar ||
+          first.itemSize !== record.itemSize || first.count !== record.count)
+        fail('READ_CONFLICT', 'Multiple host upload versions require one unchanged storage allocation layout');
       if (!record.data && (uploaded.get(record.key) !== record || !gpu.getBuffer(record.key)))
         fail('STALE', 'Native graphics storage residency was released before its captured use');
       access(record.key, value.writable);
       records.add(record);
     }
+    for (const history of histories.values()) if (history.records.size > 1 &&
+        (history.indirect || history.generated && [...history.records].slice(1).some(record => !history.shaders.has(record))))
+      fail('READ_CONFLICT', 'Later generated-vertex uploads require a shader-storage binding; indirect histories require one version');
     // r186 updates shader storage during object traversal, then submits the
     // render encoder at finishRender. All draws sharing that allocation see
     // the accumulated uploads, including partial ranges, at submission time.
     // Keep every admitted upload in source order; choosing only the last CPU
     // snapshot would discard earlier ranges or overwrite GPU-authored bytes.
-    return records.values();
+    return {records, histories};
   }
   function admittedRead(previous) {
     // Retained bindings observe uploads admitted before this logical render.
@@ -208,6 +214,11 @@ function createThreeCompute(renderer, three) {
       const record = attributeRecord(attribute, true, indirect), lease = Object.freeze({});
       record.refs++; readLeases.set(lease, {record, writable, indirect, vertex: false, released: false});
       return lease;
+    },
+    retain(lease) {
+      const record = readRecord(lease), value = readLeases.get(lease), next = Object.freeze({});
+      record.refs++; readLeases.set(next, {...value, released: false});
+      return next;
     },
     refreshIndirect(lease) {
       const previous = readRecord(lease);
@@ -246,23 +257,40 @@ function createThreeCompute(renderer, three) {
         vertex: value.vertex, released: false});
       return next;
     },
-    validate: validateReads,
+    validate(leases) {
+      const {records, histories} = validateReads(leases);
+      // Geometry retains the submitted allocation's final content version,
+      // not a later mutable CPU request. Derive new immutable views; existing
+      // queued geometry proofs keep their original strict version checks.
+      return Object.freeze({refreshVertexAttribute(lease, view) {
+        const record = readRecord(lease);
+        if (!records.has(record) || !readLeases.get(lease).vertex)
+          fail('STORAGE', 'Vertex history refresh requires this render\'s captured vertex use');
+        return refreshComputeAttributeView(device, record.key, view, histories.get(record.key).last.version);
+      }});
+    },
     vertexAttribute(lease, view) {
       const record = readRecord(lease);
       readLeases.get(lease).vertex = true;
-      return captureComputeAttributeView(device, record.key, view);
+      return captureComputeAttributeView(device, record.key, view, record.version);
     },
     refreshVertexAttribute(lease, view) {
       const record = readRecord(lease);
       return refreshComputeAttributeView(device, record.key, view, record.version);
     },
     withReads(leases, run) {
-      const records = [...validateReads(leases)];
+      const {records, histories} = validateReads(leases);
       if (issuing || capturingReads) fail('REENTRY', 'Cannot submit native storage during capture or upload');
       issuing = true;
       try {
+        // Geometry preparation may already have published this complete
+        // history at the FIFO boundary. Never replay its earlier uploads over
+        // the final resident version or over GPU results produced since then.
+        const resident = new Map();
+        for (const [attribute, history] of histories)
+          if (uploaded.get(attribute) === history.last) resident.set(attribute, gpu.getBuffer(attribute));
         for (const record of records) {
-          const buffer = upload(record);
+          const buffer = resident.get(record.key) ?? upload(record);
           let resource = readResources.get(buffer);
           if (!resource) { resource = Object.freeze({buffer}); readResources.set(buffer, resource); }
           record.resource = resource;

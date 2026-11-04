@@ -220,9 +220,14 @@ order, while unchanged host versions consume GPU-produced data without a stale
 CPU refresh. Multiple host versions of one shader-storage attribute within a
 logical render upload in source order to its one allocation. All draws observe
 the accumulated contents at submission, matching pinned r186, including earlier
-partial uploads and untouched GPU results. Separate queued renders retain their
-own histories. Multiple versions also used as generated vertex/index or indirect
-inputs, and changes to allocation layout, remain explicit unsupported cases.
+partial uploads and untouched GPU results. Generated scalar/vector vertex inputs
+sharing that storage observe the final admitted version through immutable
+geometry proofs, including signed integer inputs and retained bundle draws.
+Vertex-only inputs keep the source's first upload per logical render. Preparation
+and submission share the accepted history without replaying earlier CPU uploads;
+separate queued renders retain their own histories. Multiple versions used as
+indirect inputs, generated index aliases and allocation-layout changes remain
+explicit unsupported cases.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own

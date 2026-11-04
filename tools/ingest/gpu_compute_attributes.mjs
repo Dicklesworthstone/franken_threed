@@ -145,9 +145,10 @@ export function captureComputeStorage(device, attribute) {
  * installs its proof; ordinary objects cannot supply a foreign GPUBuffer. The
  * view identity stays stable across frames so geometry caches remain bounded.
  * Its captured proof is immutable even when a later frame installs a new one. */
-export function captureComputeAttributeView(device, source, view) {
-  const lease = captureComputeStorage(device, source);
-  const shape = {array: source.array, itemSize: source.itemSize, count: source.count, version: source.version,
+export function captureComputeAttributeView(device, source, view, version = source?.version) {
+  const captured = captureComputeStorage(device, source);
+  const lease = captured.version === version ? captured : captured.atVersion(version);
+  const shape = {array: source.array, itemSize: source.itemSize, count: source.count, version,
     isStorageBufferAttribute: source.isStorageBufferAttribute === true,
     isStorageInstancedBufferAttribute: source.isStorageInstancedBufferAttribute === true,
     isInstancedBufferAttribute: source.isInstancedBufferAttribute === true,

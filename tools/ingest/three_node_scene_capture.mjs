@@ -819,9 +819,15 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   const frameContext = {...context, ...frameStamp};
   const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
+  const vertexUploads = new Map();
   const captureVertexAttribute = (attribute, view) => {
     recordBuffer(attribute);
-    const lease = storageOwner.capture(attribute);
+    // Geometries.updateAttribute admits only the first vertex upload in this
+    // source render. Later shader bindings may independently update the same
+    // allocation; their ordered history is reconciled after all draw updates.
+    const previous = vertexUploads.get(attribute);
+    const lease = previous ? storageOwner.retain(previous) : storageOwner.capture(attribute);
+    if (!previous) vertexUploads.set(attribute, lease);
     // Retain first so any subsequent proof/capture failure releases the upload.
     storageUses.push(lease); vertexStorageUses.push(lease);
     return storageOwner.vertexAttribute(lease, view);
@@ -1042,21 +1048,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         draw.nodeVertexStorage = Object.freeze((draw.nodeVertexStorage ?? []).map(lease => {
           const retained = retainStorage(lease); vertexStorageUses.push(retained); return retained;
         }));
-        if (draw.nodeVertexStorage.length && draw.bundleGeometry) {
-          const refreshed = draw.bundleGeometry.refreshStorage(attribute => {
-            for (const lease of draw.nodeVertexStorage) {
-              const view = storageOwner.refreshVertexAttribute(lease, attribute);
-              if (view !== null) return view;
-            }
-            return null;
-          });
-          if (refreshed) {
-            bundleGeometries.push(refreshed); draw.bundleGeometry = refreshed;
-            const previous = draw.binding;
-            draw.binding = Object.freeze({...previous, programGeometry: refreshed.geometry});
-            compiledBindings.delete(previous); compiledBindings.add(draw.binding);
-          }
-        }
       }
       if (draw.nodeBundle) draw.bundleStorageOwner = storageOwner;
       if (updateContext.fogRenderContext !== undefined && !captured.fogResources)
@@ -1335,7 +1326,40 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         else captureStorage();
       }
     }, destination);
-    storageOwner?.validate(storageUses);
+    const storageHistory = storageOwner?.validate(storageUses);
+    if (storageHistory) {
+      const refreshedGeometries = new Map(), refreshedBindings = new Map(), refreshedDraws = new Map();
+      const refreshDraw = draw => {
+        if (refreshedDraws.has(draw)) return refreshedDraws.get(draw);
+        if (!draw.bundleGeometry || !draw.nodeVertexStorage?.length) return draw;
+        let geometry = refreshedGeometries.get(draw.bundleGeometry);
+        if (geometry === undefined) {
+          geometry = draw.bundleGeometry.refreshStorage(attribute => {
+            for (const lease of draw.nodeVertexStorage) {
+              const view = storageHistory.refreshVertexAttribute(lease, attribute);
+              if (view !== null) return view;
+            }
+            return null;
+          });
+          refreshedGeometries.set(draw.bundleGeometry, geometry);
+          if (geometry) bundleGeometries.push(geometry);
+        }
+        if (!geometry) return draw;
+        let binding = refreshedBindings.get(draw.binding);
+        if (!binding) {
+          binding = Object.freeze({...draw.binding, programGeometry: geometry.geometry});
+          refreshedBindings.set(draw.binding, binding);
+          compiledBindings.delete(draw.binding); compiledBindings.add(binding);
+        }
+        // Replace metadata only. Every submitted vertex/shader use continues
+        // to borrow the same GPU allocation, with the source's final ordered
+        // uploads. Earlier queued renders retain their own immutable proofs.
+        const refreshed = Object.freeze({...draw, binding, bundleGeometry: geometry});
+        refreshedDraws.set(draw, refreshed); return refreshed;
+      };
+      for (let i = 0; i < capturedDraws.length; i++) capturedDraws[i] = refreshDraw(capturedDraws[i]);
+      for (const bundle of capturedBundles) bundle.draws = bundle.draws.map(refreshDraw);
+    }
     rememberFixedAttributes(phases, null, true);
     for (const {selection, draws: packets, version} of capturedBundles)
       bundles.commit(selection, packets, version);
@@ -1367,7 +1391,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     for (const attributes of preparedAttributes ?? []) attributes.install();
     // Publish at preparation's FIFO boundary. Unchanged upload versions retain
     // GPU-authored bytes, including the buffers shared by geometry compute.
-    if (vertexStorageUses.length) storageOwner.withReads(vertexStorageUses, () => {});
+    if (vertexStorageUses.length) storageOwner.withReads(uniforms ? storageUses : vertexStorageUses, () => {});
     if (preparedIndirectUses.length) storageOwner.withReads(preparedIndirectUses, () => {});
   };
   function* preparationSteps(updates) {

@@ -990,11 +990,18 @@ at `finishRender`, so all draws sharing the buffer observe the accumulated final
 contents. Each partial upload preserves earlier ranges and untouched GPU-produced
 bytes; taking only the final CPU snapshot would lose that history. Separate
 logical renders keep their FIFO boundaries. The recording-device tests compare
-this history with the actual pinned `Attributes`, `WebGPUAttributeUtils` and
-`WebGPUBackend.finishRender` implementations; they do not establish pixel parity.
-Multiple versions that also feed generated vertex/index or indirect inputs, or
-that change allocation layout, remain rejected before storage writes. Mixed
-writable and read-only aliases retain their render-pass hazard rejection.
+this history with the actual pinned `Attributes`, `Geometries.updateAttribute`,
+`WebGPUAttributeUtils` and `WebGPUBackend.finishRender` implementations; they do
+not establish pixel parity. Generated scalar/vector vertex inputs using the same
+shader-storage buffer observe those final contents through immutable geometry
+proofs for the submitted version. Vertex-only consumers retain the source's first
+upload per logical render; later object callbacks cannot independently upload
+that vertex stream. Preparation publishes the complete accepted shader/vertex
+history once, and submission reuses its final allocation without replaying old
+CPU snapshots. Float, signed and unsigned vertex layouts retain their exact
+format, stride, instance mode and ownership checks. Indirect histories, generated
+index aliases and allocation-layout changes remain rejected. Mixed writable and
+read-only aliases retain their render-pass hazard rejection.
 
 For `InstancedMesh`, replacing a matrix/color attribute, changing its capacity,
 or adding/removing instance colors selects a new graph. Data, upload-version and

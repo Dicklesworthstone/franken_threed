@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceAttributes from '../../upstream/three.js/src/renderers/common/Attributes.js';
+import SourceGeometries from '../../upstream/three.js/src/renderers/common/Geometries.js';
 import {AttributeType} from '../../upstream/three.js/src/renderers/common/Constants.js';
 import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import SourceWebGPUBackend from '../../upstream/three.js/src/renderers/webgpu/WebGPUBackend.js';
@@ -58,7 +59,7 @@ const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssig
 // Run the pinned upload implementation and its actual finishRender submission
 // boundary. The recording device establishes queue-visible buffer history;
 // it does not execute the reference shader or establish real-GPU pixel parity.
-function sourceStorage(array) {
+function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, instanced = true} = {}) {
   const device = geometryDevice(), records = new WeakMap();
   const backend = {device, _isRenderCameraDepthArray: () => false, get(key) {
     let record = records.get(key);
@@ -69,14 +70,19 @@ function sourceStorage(array) {
   backend.createStorageAttribute = attribute => utils.createAttribute(attribute, 128 | 32 | 8 | 4);
   backend.updateAttribute = attribute => utils.updateAttribute(attribute);
   const owner = new SourceAttributes(backend, {createStorageAttribute() {}});
-  const attribute = new T.StorageInstancedBufferAttribute(array.slice(), 1);
+  const attribute = new (instanced ? T.StorageInstancedBufferAttribute : T.StorageBufferAttribute)(array.slice(), itemSize);
+  const info = {render: {calls: 0}}, geometries = new SourceGeometries(owner, info);
   const update = () => owner.update(attribute, AttributeType.STORAGE);
   return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates) {
+    info.render.calls++;
     const encoder = device.createCommandEncoder(), pass = encoder.beginRenderPass({});
-    pass.setPipeline({vertex: {entryPoint: 'main', buffers: []}});
+    pass.setPipeline({vertex: {entryPoint: 'main', buffers: vertex ? [{}] : []}});
     for (const change of updates) {
-      change(attribute); update();
-      pass.setBindGroup(0, {entries: [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}]});
+      change(attribute);
+      if (vertex) geometries.updateAttribute(attribute, AttributeType.STORAGE);
+      if (shader) update();
+      if (vertex) pass.setVertexBuffer(0, backend.get(attribute).buffer);
+      pass.setBindGroup(0, {entries: shader ? [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}] : []});
       pass.draw(3);
     }
     const context = {occlusionQueryCount: 0, textures: null};
@@ -116,9 +122,98 @@ test('one render accumulates shared shader-storage versions at the pinned submis
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('shared shader-storage partial versions preserve previous uploads and untouched GPU results', async t => {
+for (const shader of [false, true])
+test(`generated vertex ${shader ? 'and shader aliases observe final' : 'uploads retain first'} source versions within each queued render`, async t => {
+  const f = fixture(t), storage = N.instancedArray(new Float32Array(3), 'float'), attribute = storage.value;
+  f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute(), 0, 0));
+  if (shader) f.material.colorNode = N.vec3(storage.element(0));
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  const source = sourceStorage(new Float32Array(3), {vertex: true, shader});
+  let frame = 0;
+  const changes = [0, 1].map(index => current => {
+    current.array.fill(frame + (index ? .75 : .25)); current.needsUpdate = true;
+  });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  for (frame = 0; frame < 2; frame++) {
+    source.render(changes); f.renderer.render(f.scene, f.camera);
+  }
+  attribute.array.fill(99); attribute.needsUpdate = true;
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = [...selected[0].streams.values()].find(value => value.usage & 128);
+  assert.deepEqual(selected.map(draw => words(draw, buffer)),
+    draws(source.device).map(draw => words(draw, source.buffer)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), shader ? [.75, .75, 1.75, 1.75] : [.25, .25, 1.25, 1.25]);
+  assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer) && (!shader || shaderStorage(draw).includes(buffer))));
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, shader ? 5 : 3,
+    'compile upload plus source-admitted vertex/shader versions, without future CPU data');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('signed per-vertex storage and shader reads share final uploads without changing integer vertex layout', async t => {
+  const f = fixture(t), storage = N.attributeArray(4, 'ivec4'), attribute = storage.value;
+  f.material.positionNode = N.positionLocal.add(storage.toAttribute().xyz.toFloat().mul(.01));
+  f.material.colorNode = storage.element(0).xyz.toFloat().abs().mul(.01);
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  const changes = [-3, -7].map(value => current => {
+    for (let i = 0; i < 4; i++) current.array.set([value, 2, 3, 4], i * 4);
+    current.needsUpdate = true;
+  });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  const source = sourceStorage(new Int32Array(16), {vertex: true, itemSize: 4, instanced: false});
+  await f.renderer.init(); source.render(changes); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99);
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = shaderStorage(selected[0])[0];
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Int32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Int32Array)));
+  for (const draw of selected) {
+    const slot = [...draw.streams].find(([, value]) => value === buffer)[0];
+    assert.equal(draw.pipeline.vertex.buffers[slot].stepMode, 'vertex');
+    assert.equal(draw.pipeline.vertex.buffers[slot].arrayStride, 16);
+    assert.equal(draw.pipeline.vertex.buffers[slot].attributes[0].format, 'sint32x4');
+    assert.deepEqual(words(draw, buffer, Int32Array).slice(0, 4), [-7, 2, 3, 4]);
+  }
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('retained bundles borrow later ordinary shader uploads through immutable generated vertex proofs', async t => {
+  const f = fixture(t), storage = N.instancedArray(new Float32Array(3), 'float'), attribute = storage.value;
+  f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute(), 0, 0));
+  f.material.colorNode = N.vec3(storage.element(0));
+  const group = new T.BundleGroup(); group.add(f.mesh); f.scene.add(group);
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false;
+  f.scene.add(other);
+  let frame = 0;
+  f.mesh.onBeforeRender = () => { attribute.array.fill(.25); attribute.needsUpdate = true; };
+  other.onBeforeRender = () => { attribute.array.fill(frame + .75); attribute.needsUpdate = true; };
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  for (frame = 0; frame < 2; frame++) f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(99);
+  await drain(f.renderer);
+  other.onBeforeRender = () => {};
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  // Authored material nodes require FULL source refresh even in a static
+  // bundle. Stabilize its captured vertex version after the final host write.
+  const encoded = f.device.bundleEncoders.length;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device), buffer = shaderStorage(selected[0])[0];
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.75, .75, 1.75, 1.75, 1.75, 1.75, 1.75, 1.75]);
+  assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer) && shaderStorage(draw).includes(buffer)));
+  assert.equal(f.device.bundleEncoders.length, encoded, 'the unchanged final version reuses recorded GPU commands');
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const vertex of [false, true])
+test(`shared ${vertex ? 'generated-vertex and ' : ''}shader-storage partial versions preserve previous uploads and untouched GPU results`, async t => {
   const f = fixture(t), storage = N.instancedArray(new Uint32Array(4), 'uint'), attribute = storage.value;
   f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01));
+  if (vertex) f.material.positionNode = N.positionLocal.add(N.vec3(N.float(storage.toAttribute()).mul(.01), 0, 0));
   const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
   f.scene.add(other);
   const compute = N.Fn(() => { storage.element(N.instanceIndex).assign(7); })().compute(4);
@@ -126,7 +221,7 @@ test('shared shader-storage partial versions preserve previous uploads and untou
   f.device.onCompute = pass => new Uint32Array(computeStorage(pass)[0].data).fill(7);
   await f.renderer.init(); await f.renderer.computeAsync(compute);
   const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
-  const source = sourceStorage(new Uint32Array(4)); source.update(); new Uint32Array(source.buffer.data).fill(7);
+  const source = sourceStorage(new Uint32Array(4), {vertex}); source.update(); new Uint32Array(source.buffer.data).fill(7);
   const changes = [[0, 11], [3, 22]].map(([index, value]) => current => {
     current.array.fill(99); current.array[index] = value;
     current.clearUpdateRanges(); current.addUpdateRange(index, 1); current.needsUpdate = true;
@@ -141,19 +236,17 @@ test('shared shader-storage partial versions preserve previous uploads and untou
   assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
     draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
   assert.ok(selected.every(draw => words(draw, buffer, Uint32Array).join() === '11,7,7,22'));
+  if (vertex) assert.ok(selected.every(draw => [...draw.streams.values()].includes(buffer)));
   assert.deepEqual(f.device.writes.filter(write => write.buffer === buffer).map(write => [write.offset, write.input.byteLength]),
     [[0, 16], [0, 4], [12, 4]]);
   assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-for (const usage of ['generated vertex', 'indirect'])
-test(`multiple storage versions with ${usage} aliases reject before storage writes`, async t => {
-  const f = fixture(t), indirect = usage === 'indirect';
-  const storage = N.instancedArray(indirect ? new Uint32Array([6, 1, 0, 0, 0]) : new Float32Array(3), indirect ? 'uint' : 'float');
+test('multiple storage versions with indirect aliases reject before storage writes', async t => {
+  const f = fixture(t), storage = N.instancedArray(new Uint32Array([6, 1, 0, 0, 0]), 'uint');
   f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01));
-  if (indirect) f.mesh.geometry.indirect = storage.value;
-  else f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute(), 0, 0));
+  f.mesh.geometry.indirect = storage.value;
   const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
   f.scene.add(other);
   await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
@@ -175,6 +268,36 @@ test('multiple storage versions cannot change allocation layout before submissio
     assert.throws(() => owner.withReads([first, second], () => assert.fail('invalid history must not issue')),
       {code: 'THREE_COMPUTE_READ_CONFLICT'});
     assert.equal(f.device.writes.length, 0);
+  } finally { owner.release(first); owner.release(second); }
+});
+
+test('submission vertex proofs remain version-strict and never replay an already published storage history', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const owner = f.renderer._getStorageInputs(), attribute = new T.StorageBufferAttribute(new Float32Array([.25]), 1);
+  const first = owner.capture(attribute), view = Object.create(attribute);
+  owner.vertexAttribute(first, view).install();
+  const original = captureComputeStorage(f.device, attribute);
+  attribute.array[0] = .75; attribute.needsUpdate = true;
+  const second = owner.capture(attribute), history = owner.validate([first, second]);
+  const submitted = history.refreshVertexAttribute(first, view);
+  attribute.array[0] = 99; attribute.needsUpdate = true;
+  let buffer;
+  try {
+    owner.withReads([first, second], () => {
+      buffer = computeAttributeSnapshot(f.device, submitted).buffer;
+      assert.equal(owner.resolve(first).buffer, buffer); assert.equal(owner.resolve(second).buffer, buffer);
+      assert.deepEqual([...new Float32Array(buffer.data)], [.75]);
+      assert.throws(() => original.resolve(), {code: 'COMPUTE_ATTRIBUTE_UNPREPARED'});
+      assert.throws(() => computeAttributeSnapshot(f.device, view), {code: 'COMPUTE_ATTRIBUTE_UNPREPARED'});
+      assert.throws(() => computeAttributeSnapshot(f.device, submitted, {index: true}), {code: 'COMPUTE_ATTRIBUTE_FORMAT'});
+      assert.throws(() => computeAttributeSnapshot(geometryDevice(), submitted), {code: 'COMPUTE_ATTRIBUTE_OWNER'});
+    });
+    // A later GPU producer can alter contents without changing the host upload
+    // version. Reentering the accepted read interval must retain that result.
+    new Float32Array(buffer.data)[0] = .875;
+    const writes = f.device.writes.length;
+    owner.withReads([first, second], () => assert.deepEqual([...new Float32Array(buffer.data)], [.875]));
+    assert.equal(f.device.writes.length, writes);
   } finally { owner.release(first); owner.release(second); }
 });
 
