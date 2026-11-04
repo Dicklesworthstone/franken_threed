@@ -47,6 +47,28 @@ as a **target or a budget**, never as a result.
 
 ---
 
+## Build and run an application
+
+The current JavaScript entry point can build an application and serve the emitted
+files on loopback HTTP:
+
+```bash
+npm ci --prefix tools
+node tools/ingest/cli.mjs ./app/index.html --build-app ./dist
+node tools/ingest/cli.mjs serve ./dist --port 8080
+```
+
+The server prints the entry URL, serves JavaScript/Wasm/model resources with their
+content types, and preserves document queries used by reload-based controls. It
+chooses `index.html` or the directory's sole HTML file; pass a specific HTML file
+when there are several pages. A standalone export can be served directly with
+`node tools/ingest/cli.mjs serve ./demo.html`.
+
+Add `--isolate` when the application requires cross-origin isolation for shared
+memory. This enables COOP `same-origin` and COEP `require-corp`; cross-origin
+resources then need compatible response headers. Ordinary serving leaves those
+headers unset. The server binds to `127.0.0.1` and stops with Ctrl-C.
+
 ## TL;DR
 
 **The problem.** A general-purpose renderer must answer the same questions on

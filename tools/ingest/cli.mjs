@@ -13,6 +13,7 @@ FrankenThreeD Module Graph Ingestion & Application Build Tool (f3d-04)
 
 Usage:
   node tools/ingest/cli.mjs --entry <path_to_html_or_js> [options]
+  node tools/ingest/cli.mjs serve <directory-or-html> [--port 8080] [--isolate]
 
 Options:
   --entry <path>        Path to HTML, ESM, or glTF/GLB entry (required)
@@ -56,6 +57,16 @@ function writeOutputFile(resolvedOutput, contentStr, displayPath) {
 
 async function main() {
   const args = process.argv.slice(2);
+  if (args[0] === "serve") {
+    try {
+      const { serveApplicationCommand } = await import("./serve_application.mjs");
+      await serveApplicationCommand(args.slice(1));
+    } catch (error) {
+      console.error(`Serve failed: ${error.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   let entry = null;
   let output = null;
   let packageRoot = null;
