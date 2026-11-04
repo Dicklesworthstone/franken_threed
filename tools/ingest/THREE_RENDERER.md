@@ -290,13 +290,37 @@ the Scene after-hook or submit graphics draws. Source native material render
 hooks remain inert, matching the pinned renderer.
 
 Hooked scenes use the complete native draw capture and its existing resource
-bounds. Install hooks before their geometry attributes have reached a fixed
-upload owner; switching existing fixed upload history into native hook ownership
-still fails explicitly. Bare non-renderable Object3D roots do not acquire Scene
+bounds. Ordinary rigid geometry shares its retained upload history with later
+hooks. Attributes already owned by the separate fixed shadow, instancing,
+deformation or mixed-list paths retain their explicit transition guard.
+Bare non-renderable Object3D roots do not acquire Scene
 callbacks. `three_renderer_scene_hooks.test.mjs` checks callback order, nested
 work, selector edits, immutable GPU bindings and exception retention using actual
 pinned source objects and a byte-accurate recording device; these are command
 and lifecycle checks, not pixel or performance results.
+
+## Queued ordinary native scene state
+
+Shadowless rigid meshes, lines, points and sprites keep accepted world matrices
+with their existing fixed geometry and material captures. Each queued render can
+therefore use a different object transform or camera without a later update
+rewriting earlier GPU inputs. This includes reflected winding, sprite centers,
+rotations and counts, and native ArrayCamera child views. Submission does not
+overwrite the objects' public matrix caches with an earlier queued transform.
+
+Complete ordinary fixed scenes also retain their hierarchy, layer masks, group
+and object render order, and standard light values. Removing a mesh after
+`render()` leaves its accepted draw intact; adding one affects later calls.
+Light colors, intensity, attenuation, world positions and target matrices survive
+edits or removal while preparation is pending. These captures share the existing
+pending-byte budget and keep the original objects as public/cache identities.
+Geometry upload generations and fixed shaders retain their existing owners.
+
+This extends the ordinary fixed capture; separate shadow, instancing,
+deformation and mixed native/fixed owners retain their existing boundaries.
+`three_renderer_fixed_snapshot.test.mjs` checks the actual queued GPU matrices,
+light buffers, draw membership and fixed shader route with the recording device.
+It does not establish additional pixel parity or a performance result.
 
 ## Public render-list sorting
 

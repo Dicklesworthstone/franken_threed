@@ -434,7 +434,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // this camera. Keep that complete pass on its existing guarded owner.
     if (!bundles || !renderer || renderer.shadowMap?.enabled === true) {
       rememberFixedAttributes(phases, null, true);
-      return {fixedGeometries, bundleGeometries, bytes};
+      return {fixedGeometries, bundleGeometries, fixedScene: null, bytes};
     }
     const projection = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = camera.isArrayCamera ? new three.FrustumArray().setFromArrayCamera(camera) :
@@ -496,6 +496,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     for (const candidate of candidates) if (!candidate.eligible) assertFixedHistory(candidate.owners);
     for (const owner of pending) unsupported.add(owner);
+    const charge = size => {
+      bytes += size;
+      if (bytes > maxUniformBytes) fail('LIMIT', 'Fixed scene exceeds the pending capture byte budget');
+    };
+    const matrix = source => {
+      charge(16 * 8);
+      const value = source.clone(); Object.freeze(value.elements); return Object.freeze(value);
+    };
     try {
       for (const {object, source, eligible, z} of candidates) {
         if (!eligible) continue;
@@ -505,19 +513,47 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           // callbacks added later therefore see the same uploaded generations,
           // including when this fixed draw is still waiting for its pipeline.
           const lease = bundles.captureGeometry(source, null, renderId);
-          bundleGeometries.push(lease); bytes += lease.bytes;
-          if (bytes > maxUniformBytes) fail('LIMIT', 'Fixed geometry exceeds the pending capture byte budget');
+          bundleGeometries.push(lease); charge(lease.bytes);
           view = Object.freeze({source, geometry: lease.geometry,
             groups: Object.freeze(source.groups.map(group => Object.freeze({...group})))});
           captured.set(source, view);
         }
-        fixedGeometries.set(object, Object.freeze({...view, z}));
+        // Geometry history and shader ownership stay fixed. The accepted world
+        // matrix must nevertheless precede any later render or application edit.
+        const state = Object.assign(Object.create(object), {matrixWorld: matrix(object.matrixWorld)});
+        if (object.isSprite) {
+          charge(3 * 8); state.center = object.center.clone(); state.count = object.count;
+          Object.freeze(state.center);
+        }
+        fixedGeometries.set(object, Object.freeze({...view, z, object: Object.freeze(state)}));
       }
+      // A complete ordinary fixed scene can also retain list membership and
+      // standard light values without taking over native, shadow or deformed
+      // owners. Source objects remain the public and cache identities.
+      let fixedScene = null;
+      if (objects.size === 0 && candidates.every(candidate => candidate.eligible)) {
+        const states = new Map(), lights = new Map();
+        for (const object of hierarchy.keys()) {
+          charge(2 * 8);
+          states.set(object, Object.freeze({layers: object.layers.mask, renderOrder: object.renderOrder}));
+          if (!candidates.length || !object.isLight || nativeLights.has(object) ||
+              !visibility.get(object) || !object.layers.test(camera.layers)) continue;
+          charge(12 * 8);
+          const light = Object.assign(Object.create(object), {matrixWorld: matrix(object.matrixWorld),
+            color: Object.freeze(object.color.clone()), intensity: object.intensity,
+            castShadow: object.castShadow, map: object.map, distance: object.distance, decay: object.decay,
+            angle: object.angle, penumbra: object.penumbra,
+            ...(object.groundColor ? {groundColor: Object.freeze(object.groundColor.clone())} : {}),
+            ...(object.target ? {target: Object.freeze({matrixWorld: matrix(object.target.matrixWorld)})} : {})});
+          lights.set(object, Object.freeze(light));
+        }
+        fixedScene = Object.freeze({hierarchy, states, lights});
+      }
+      return {fixedGeometries, bundleGeometries: Object.freeze(bundleGeometries), fixedScene, bytes};
     } catch (error) {
       for (const lease of bundleGeometries) lease.release();
       throw error;
     }
-    return {fixedGeometries, bundleGeometries: Object.freeze(bundleGeometries), bytes};
   };
   const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);

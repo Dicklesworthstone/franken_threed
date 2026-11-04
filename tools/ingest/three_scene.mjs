@@ -127,6 +127,14 @@ export async function createGpuThreeScene(device,scene,{
   // queue. Public geometry identities stay intact; only GPU inputs use the
   // captured view. A null selection was culled or excluded at source capture.
   const fixedGeometry=o=>passNodeFrame?.fixedGeometries?.get(o);
+  const fixedObject=o=>fixedGeometry(o)?.object??o;
+  const sourceChildren=o=>passNodeFrame?.sceneHierarchy?.get(o)??passNodeFrame?.fixedScene?.hierarchy.get(o)??o.children;
+  const sourceOrder=o=>passNodeFrame?.fixedScene?.states.get(o)?.renderOrder??o.renderOrder;
+  const sourceLayers=(o,camera)=>{
+    const state=passNodeFrame?.fixedScene?.states.get(o);
+    return state?(state.layers&camera.layers.mask)!==0:o.layers.test(camera.layers);
+  };
+  const spriteCount=o=>threeSpriteCount(fixedObject(o));
   const sourceGeometry=o=>fixedGeometry(o)?.source??o.geometry;
   if(!(textures instanceof Map)||typeof sortObjects!=='boolean'||typeof autoTextures!=='boolean')fail('OPTIONS','Expected a texture binding Map and boolean texture/sorting options');
   if(!textureOptions||typeof textureOptions!=='object'||Array.isArray(textureOptions))fail('OPTIONS','Expected texture ownership options');
@@ -333,7 +341,7 @@ export async function createGpuThreeScene(device,scene,{
       // Accepted bundle packets own this entire subtree, including children
       // removed or added while asynchronous pipeline preparation was pending.
       if(bundledNodeObject(object))continue;
-      const children=passNodeFrame?.sceneHierarchy?.get(object)??object.children;
+      const children=sourceChildren(object);
       if(children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
       for(let i=children.length-1;i>=0;i--)stack.push(children[i]);
       // Source projection skips hidden objects before touching render hooks,
@@ -402,7 +410,7 @@ export async function createGpuThreeScene(device,scene,{
           if(!capturedNodeObject(object)){
             if(Array.isArray(sourceMaterial(object))||!list.every(m=>m?.isSpriteMaterial||m?.isSpriteNodeMaterial))
               fail('MATERIAL','Native sprites require SpriteMaterial or SpriteNodeMaterial');
-            threeSpriteCount(object);
+            spriteCount(object);
           }
           geometryAdmission(sourceGeometry(object),object);
         }
@@ -465,6 +473,7 @@ export async function createGpuThreeScene(device,scene,{
     return lights[0]??null;
   }
   function light(source){
+    source=passNodeFrame?.fixedScene?.lights.get(source)??source;
     if(source.castShadow){
       if(!shadowEnabled)fail('SHADOW','A source shadow light cannot silently become an unshadowed light');
       shadowApi.inspectThreeShadow(source,three);
@@ -1648,7 +1657,7 @@ export async function createGpuThreeScene(device,scene,{
         const fixed=fixedGeometry(object);
         if(capturedNodeObject(object)||fixed===null)return;
         const source=fixed?.source??object.geometry,topology=topologyOf(object);
-        if(object.isSprite&&!programRoute()&&threeSpriteCount(object)===0)return;
+        if(object.isSprite&&!programRoute()&&spriteCount(object)===0)return;
         function push(original,sourceGroup){
               const originalState=materialState(original);
               if(!originalState||!originalState.visible||!shadowPass&&!colorPhaseEnabled(original))return;
@@ -1672,7 +1681,7 @@ export async function createGpuThreeScene(device,scene,{
                 updateObject(object);
                 // WebGLRenderList.push: transmission > 0 joins the transmissive list.
                 (originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass:false,program:true,
-                  sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
+                  sourceGeometry:source,sourceGroup,renderOrder:sourceOrder(object)});
                 return;
               }
               const instanceSource=!fixed&&object.isInstancedMesh?object:null;
@@ -1687,7 +1696,7 @@ export async function createGpuThreeScene(device,scene,{
               // Source list partition and sorting precede the draw-time override.
               if(shadowPass&&bindings.some(e=>!casters.has(e)||casters.get(e).disposed))fail('PREPARE','Prepare the source caster material before drawing it');
               (shadowPass?casterItems:originalState.transmission>0?transmissive:originalState.transparent?transparent:opaque).push({object,geometry:g,material,listMaterial:original,group,groupOrder,z,desc,bindings,shadowPass,
-                sourceGeometry:source,sourceGroup,renderOrder:object.renderOrder});
+                sourceGeometry:source,sourceGroup,renderOrder:sourceOrder(object)});
             }
         const selectedMaterial=sourceMaterial(object);
         if(Array.isArray(selectedMaterial))for(const group of fixed?.groups??source.groups)push(selectedMaterial[group.materialIndex],group);
@@ -1699,8 +1708,8 @@ export async function createGpuThreeScene(device,scene,{
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
         projectionOrder.set(object,visited);
         if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
-        if(fixedGeometry(object)!==null&&object.layers.test(camera.layers)){
-          if(object.isGroup)groupOrder=object.renderOrder;
+        if(fixedGeometry(object)!==null&&sourceLayers(object,camera)){
+          if(object.isGroup)groupOrder=sourceOrder(object);
           else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}
           else if(object.isLight&&!capturedNodeLight(object)){if(!programLightMode&&!nativeLightMode)lighting.lights.push(light(object));lightSources.push(object);}
           else if(object.isLineLoop&&!programRoute()){
@@ -1729,7 +1738,7 @@ export async function createGpuThreeScene(device,scene,{
             }
           }
         }
-        const children=passNodeFrame?.sceneHierarchy?.get(object)??object.children;
+        const children=sourceChildren(object);
         for(let i=children.length-1;i>=0;i--)stack.push({object:children[i],groupOrder});
       }
       if(lighting.lights.length>8)fail('LIMIT','Visible source lights exceed the renderer capacity');
@@ -1808,8 +1817,8 @@ export async function createGpuThreeScene(device,scene,{
       const copiesAtDraw = copies => {
         if(copies?.length)framebufferCopies.push({index:draws.length,copies});
       };
-      if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1)*
-          (item.nodeProgram?item.nodeViews?.length??1:programArray?arrayViews.length:arrayViews?.length?arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length:1),0)>(renderOptions.maxDraws??1024))
+      if(items.reduce((n,item)=>n+item.bindings.length*(item.object.isSprite&&!item.program&&!item.nodeProgram?spriteCount(item.object):1)*
+          (item.nodeProgram?item.nodeViews?.length??1:programArray?arrayViews.length:arrayViews?.length?arrayViews.filter(v=>sourceLayers(item.object,v.camera)).length:1),0)>(renderOptions.maxDraws??1024))
         fail('LIMIT','Expanded source draws exceed capacity');
       // Complete texture/material preflight first, then publish requested bytes
       // before this frame's immediate draw submission. Stable views keep bundles
@@ -2078,8 +2087,8 @@ export async function createGpuThreeScene(device,scene,{
           for(const item of items){
             // renderObjects checks layers immediately before each renderObject;
             // previous callbacks may change this object or this child's layers.
-            if(!item.object.layers.test(view.camera.layers))continue;
-            const instances=item.object.isSprite&&!item.program&&!item.nodeProgram?threeSpriteCount(item.object):1;
+            if(!sourceLayers(item.object,view.camera))continue;
+            const instances=item.object.isSprite&&!item.program&&!item.nodeProgram?spriteCount(item.object):1;
             if(draws.length+item.bindings.length*instances>(renderOptions.maxDraws??1024))fail('LIMIT','Expanded source draws exceed capacity');
             programSourceDraws++;yield {item:itemForView(item,view.camera),view};
           }
@@ -2193,14 +2202,14 @@ export async function createGpuThreeScene(device,scene,{
         }
         // Array-camera nodes use private arrays of model-view/normal matrices;
         // they do not overwrite the object's public single-camera caches.
-        if(item.shadowPass||programArray||!arrayViews?.length){
+        if(!fixedGeometry(item.object)?.object&&(item.shadowPass||programArray||!arrayViews?.length)){
           item.object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,item.object.matrixWorld);
           item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
         }
         for(let i=0;i<item.bindings.length;i++){
           if(programArray&&item.bindings.length===2&&!item.shadowPass){item.material.side=i===0?three.BackSide:three.FrontSide;item.material.needsUpdate=true;}
           const values=item.desc[i].values,clipped=item.desc[i].clipped,worldMatrix=item.object.isSprite?
-            threeSpriteWorldMatrix(three,item.object,materialState(item.material),drawCamera):item.object.matrixWorld.elements;
+            threeSpriteWorldMatrix(three,fixedObject(item.object),materialState(item.material),drawCamera):fixedObject(item.object).matrixWorld.elements;
           // Later view callbacks may rewrite the public transform before these
           // immutable per-view draw spans reach GPU packing.
           const common={worldMatrix:programArray?worldMatrix.slice():worldMatrix,first,count};
@@ -2210,7 +2219,7 @@ export async function createGpuThreeScene(device,scene,{
             ...(clipped?{clippingPlanes:clipped.clipShadows?clipped.clippingPlanes:[],clipIntersection:clipped.clipIntersection}:{}),
             ...(values.uvTransform?{uvTransform:values.uvTransform}:{}),
             ...(values.alphaCutoff!==undefined?{alphaCutoff:values.alphaCutoff}:{})});
-          else {for(let instance=0,instances=item.object.isSprite?threeSpriteCount(item.object):1;instance<instances;instance++){
+          else {for(let instance=0,instances=item.object.isSprite?spriteCount(item.object):1;instance<instances;instance++){
             drawObjects.push({object:item.object,material:item.material,view});draws.push({mesh:item.bindings[i].mesh,...common,...values,source:item,
             ...(clipped?{clippingPlanes:clipped.clippingPlanes,clipIntersection:clipped.clipIntersection}:{}),
             ...(fogEnabled?{receiveFog:item.desc[i].receiveFog}:{}),
@@ -2286,17 +2295,17 @@ export async function createGpuThreeScene(device,scene,{
         for(let i=0;i<draws.length;){
           copyAt(i);
           const {object,material,native,views:nativeViews}=drawObjects[i];
-          const repetitions=object.isSprite&&!native?threeSpriteCount(object):1;
+          const repetitions=object.isSprite&&!native?spriteCount(object):1;
           const views=native?(nativeViews??[{viewport:null,uniforms:draws[i].nodeUniforms}]):arrayViews;
           for(const view of views){
-          if(!native&&!object.layers.test(view.camera.layers))continue;
+          if(!native&&!sourceLayers(object,view.camera))continue;
           const viewport=native&&view.viewport?[...view.viewport.map(n=>Math.floor(n*(arrayProfile.pixelRatio??1))),
             frame.viewport?.[4]??0,frame.viewport?.[5]??1]:view.viewport;
           activeViewport=viewport??activeViewport;
           if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
           // NodeBuilder selects perspective attenuation from the ArrayCamera;
           // its per-view matrix uniform still comes from the current child.
-          const draw=native?{...draws[i],nodeUniforms:view.uniforms}:object.isSprite?{...draws[i],worldMatrix:threeSpriteWorldMatrix(three,object,material,view.camera,
+          const draw=native?{...draws[i],nodeUniforms:view.uniforms}:object.isSprite?{...draws[i],worldMatrix:threeSpriteWorldMatrix(three,fixedObject(object),materialState(material),view.camera,
             {perspective:camera.isPerspectiveCamera===true})}:draws[i];
           // Source draws every instance in this view before advancing views;
           // overlapping translucent viewports make that order observable.
@@ -2316,7 +2325,7 @@ export async function createGpuThreeScene(device,scene,{
           renderer.render({...loaded,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});passes+=renderer.colorPassCount??1;live();
         }
         logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+(item.nodeProgram?
-          item.instanceCount===0||item.nodeIndirect?.skip?0:item.nodeViews?.length??1:arrayViews.filter(v=>item.object.layers.test(v.camera.layers)).length),0);
+          item.instanceCount===0||item.nodeIndirect?.skip?0:item.nodeViews?.length??1:arrayViews.filter(v=>sourceLayers(item.object,v.camera)).length),0);
         backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;
       }else{
       if(backgroundFrame){
