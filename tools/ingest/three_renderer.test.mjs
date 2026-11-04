@@ -127,6 +127,18 @@ test('ordinary first frame: render defers to preparation without presenting an e
   assert.ok(calls.some(c => c[0] === 'unconfigure'));
 });
 
+test('disposing an unused renderer never requests a device or starts its frame clock', () => {
+  const c = canvasFixture(); let requests = 0;
+  const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter() { requests++; return Promise.resolve(null); }}});
+  const renderer = new Renderer({canvas: c.canvas});
+  renderer.dispose();
+  assert.equal(requests, 0);
+  assert.equal(renderer.initialized, false);
+  assert.equal(renderer.getAnimationLoop(), null);
+  assert.equal(renderer.info.frame, 0);
+  assert.deepEqual(c.calls, []);
+});
+
 test('initialization disposal rejects a pending adapter without requesting a late device or canvas', async () => {
   const adapter = deferred(), c = canvasFixture(), device = recordingDevice();
   let requests = 0, destroyed = 0, rejected;
@@ -134,6 +146,8 @@ test('initialization disposal rejects a pending adapter without requesting a lat
   const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: () => adapter.promise}});
   const renderer = new Renderer({canvas: c.canvas});
   const init = renderer.init();
+  const animation = renderer.setAnimationLoop(() => assert.fail('A disposed initialization cannot install a callback'));
+  animation.catch(() => {});
   init.catch(error => { rejected = error; });
   assert.equal(renderer.init(), init, 'concurrent callers share initialization');
   renderer.dispose();
@@ -141,12 +155,14 @@ test('initialization disposal rejects a pending adapter without requesting a lat
   const stopped = rejected;
   adapter.resolve({requestDevice() { requests++; return Promise.resolve(device); }});
   await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
+  await assert.rejects(animation, {code: 'F3D_RENDERER_DISPOSED'});
   await hostTurn();
   assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal settles init before the host adapter');
   assert.equal(requests, 0);
   assert.equal(destroyed, 0, 'no device was requested or owned');
   assert.deepEqual(c.calls, []);
   assert.equal(renderer.initialized, false);
+  assert.equal(renderer.getAnimationLoop(), null);
   assert.equal(renderer.info.frame, 0);
   assert.equal(renderer.init(), init, 'a disposed initialization cannot restart');
 });
@@ -159,6 +175,8 @@ test('initialization disposal retires a late owned device once without publishin
     requestDevice() { requested.resolve(); return acquisition.promise; },
   })}});
   const renderer = new Renderer({canvas: c.canvas}), init = renderer.init();
+  const animation = renderer.setAnimationLoop(() => assert.fail('A late device cannot revive a disposed loop'));
+  animation.catch(() => {});
   init.catch(error => { rejected = error; });
   await requested.promise;
   renderer.dispose();
@@ -166,6 +184,7 @@ test('initialization disposal retires a late owned device once without publishin
   const stopped = rejected;
   acquisition.resolve(device);
   await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
+  await assert.rejects(animation, {code: 'F3D_RENDERER_DISPOSED'});
   await hostTurn();
   assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal does not await requestDevice');
   assert.equal(destroyed, 1);
@@ -173,6 +192,7 @@ test('initialization disposal retires a late owned device once without publishin
   assert.equal(renderer._ownsDevice, false);
   assert.deepEqual(c.calls, []);
   assert.equal(renderer.initialized, false);
+  assert.equal(renderer.getAnimationLoop(), null);
   renderer.dispose();
   assert.equal(destroyed, 1);
 });
@@ -403,6 +423,35 @@ function animationHost(canvas) {
     scheduled.delete(id); callback(time);
   }};
 }
+
+test('native animation stopped during initialization stays stopped like the pinned source', async t => {
+  const gate = deferred(), c = canvasFixture(), device = recordingDevice(), host = animationHost(c.canvas);
+  device.destroy = () => {};
+  const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: () => gate.promise}});
+  const renderer = new Renderer({canvas: c.canvas});
+  t.after(() => { gate.resolve({requestDevice: async () => device}); renderer.dispose(); });
+  let callbackCalls = 0, sourceLoop = null, sourceStopped = false, stopped = false;
+  const callback = () => { callbackCalls++; };
+  // Run the pinned public method with only its initialization/animation owners
+  // controlled, so the comparison keeps the source's actual await ordering.
+  const source = {_initialized: false, init: () => gate.promise,
+    _animation: {setAnimationLoop(value) { sourceLoop = value; }}};
+  const sourceSetLoop = T.WebGPURenderer.prototype.setAnimationLoop;
+  const sourceStart = sourceSetLoop.call(source, callback);
+  const sourceStop = sourceSetLoop.call(source, null).then(() => { sourceStopped = true; });
+  const start = renderer.setAnimationLoop(callback);
+  const stop = renderer.setAnimationLoop(null).then(() => { stopped = true; });
+  await hostTurn();
+  const stoppedWhileInitializing = [sourceStopped, stopped];
+  gate.resolve({requestDevice: async () => device});
+  await Promise.all([sourceStart, sourceStop, start, stop]);
+  assert.equal(sourceLoop, null);
+  assert.equal(renderer.getAnimationLoop(), sourceLoop, 'a cold start cannot overwrite its later stop');
+  assert.deepEqual(stoppedWhileInitializing, [false, false], 'both source setters wait for initialization');
+  host.step(16);
+  assert.equal(callbackCalls, 0, 'the cancelled callback never executes on a later frame');
+  assert.equal(renderer.info.frame, 2, 'the source internal frame clock continues after stopping callbacks');
+});
 
 test('native animation waits for cold submission and resumes before GPU completion without losing accepted work', async t => {
   const {renderer, device, canvas, acquired} = await create(), host = animationHost(canvas);

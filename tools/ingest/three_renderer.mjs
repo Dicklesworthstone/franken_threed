@@ -1977,7 +1977,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     // ---- animation loop (source Animation semantics: callback(time, xrFrame)) ----
     async setAnimationLoop(callback) {
-      if (this._initialized === false && callback !== null) await this.init();
+      if (this._initialized === false) await this.init();
       this._setLoop(callback);
     }
     _setLoop(callback) {
@@ -2073,7 +2073,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     dispose() {
       if (this._disposed) return;
-      this.setAnimationLoop(null);
+      // Disposal must stop the current loop without starting initialization or
+      // adding an asynchronous setter behind an already pending start.
+      this._setLoop(null);
       this._disposed = true;
       this._occlusionQueries?.dispose();
       this._timestamps.dispose();
