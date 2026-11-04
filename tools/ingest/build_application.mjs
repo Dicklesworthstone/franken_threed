@@ -48,6 +48,7 @@ import { buildModuleGraph } from "./module_graph.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
+import { gltfAssetUris } from "./pack_gltf.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
@@ -1118,7 +1119,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       skipModulePreloads,
     );
 
-    // Bounded asset processing queue: handles direct HTML assets, transitive CSS url()/@import children,
+    // Bounded asset processing queue: handles direct HTML assets, transitive CSS/model children,
     // and literal dynamic imports in retained classic scripts and modules.
     const assetQueue = [];
     for (const relUrl of relativeAssetUrls) {
@@ -1169,6 +1170,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
     const visitedCssPaths = new Set();
     const visitedJsUrls = new Set();
+    const visitedModelPaths = new Set();
 
     while (assetQueue.length > 0) {
       const item = assetQueue.shift();
@@ -1281,21 +1283,45 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         );
       }
 
-      const javascript = item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
+      const javascript = !item.modelResource && item.moduleType !== "json" && path.extname(srcAssetAbs).toLowerCase() !== ".json" &&
         (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
       // Retained scripts must use the same frontend output as bundled imports.
       // URL variants can share a physical output only when their bytes agree.
       let assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
         {sourceType: item.isModuleSpecifier ? "module" : "script"}).bytes : fs.readFileSync(srcAssetAbs);
       const workerSource = classicWorkerSources.get(srcAssetAbs);
-      if (workerSource && assetData.equals(workerSource.before)) assetData = workerSource.after;
+      if (!item.modelResource && workerSource && assetData.equals(workerSource.before)) assetData = workerSource.after;
       const previous = targetFiles.get(relFromEntryDir);
       if (previous !== undefined && !Buffer.from(previous).equals(assetData))
         throw new Error(`Source transforms disagree for retained resource ${JSON.stringify(relFromEntryDir)}`);
       targetFiles.set(relFromEntryDir, assetData);
 
+      // Retained modules bypass the bundler's model emitter. Their models still
+      // need every core buffer/image URI, resolved from the model rather than
+      // the referring module. Keep model and sidecar bytes and URI strings intact.
+      const modelExtension = path.extname(srcAssetAbs).toLowerCase();
+      if (!javascript && !item.modelResource && [".gltf", ".glb"].includes(modelExtension) &&
+          !visitedModelPaths.has(srcAssetAbs)) {
+        visitedModelPaths.add(srcAssetAbs);
+        const fail = (code, message) => {
+          const error = new Error(`${code}: ${message} (model ${JSON.stringify(srcAssetAbs)})`);
+          error.code = code;
+          throw error;
+        };
+        for (const uri of gltfAssetUris(assetData, modelExtension === ".glb", fail)) {
+          if (!isRelativeUrl(uri)) continue;
+          assetQueue.push({
+            relUrl: uri,
+            referrerDir: path.dirname(srcAssetAbs),
+            referrerPath: srcAssetAbs,
+            isModuleSpecifier: false,
+            modelResource: true,
+          });
+        }
+      }
+
       // If asset is a CSS file, scan for transitive child url() and @import resources
-      if (srcAssetAbs.endsWith(".css") && !visitedCssPaths.has(srcAssetAbs)) {
+      if (!item.modelResource && srcAssetAbs.endsWith(".css") && !visitedCssPaths.has(srcAssetAbs)) {
         visitedCssPaths.add(srcAssetAbs);
         const cssContent = assetData.toString("utf-8");
         const childUrls = extractRelativeCssUrls(cssContent);
