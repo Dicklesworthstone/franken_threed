@@ -12,6 +12,7 @@ import { packHtml } from "./pack_html.mjs";
 import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
 import { vertex, vertexExpected } from "../../tests/fixtures/meshopt/vectors.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
+import { zipSync, strToU8 } from "../../upstream/three.js/examples/jsm/libs/fflate.module.js";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
 const gltf = new URL("../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js", import.meta.url);
@@ -50,10 +51,12 @@ class ImageHost extends EventTarget {
     if(!url.startsWith('data:image/png;')&&!url.startsWith('blob:'))throw new Error('Unembedded image: '+url);
     const bytes=new Uint8Array(await (await nativeFetch(url)).arrayBuffer());
     if(bytes[0]!==137||bytes[1]!==80)throw new Error('Image bytes changed');
-    this.complete=true;this.naturalWidth=1;this.naturalHeight=1;this.dispatchEvent(new Event('load'));
-  }).catch(error=>{this.dispatchEvent(new Event('error'));});}
+    this.complete=true;this.naturalWidth=1;this.naturalHeight=1;const event=new Event('load');
+    this.dispatchEvent(event);this.onload?.(event);
+  }).catch(error=>{const event=new Event('error');this.dispatchEvent(event);this.onerror?.(event);});}
 }
 globalThis.HTMLImageElement=ImageHost;
+globalThis.Image=ImageHost;
 globalThis.createImageBitmap=async blob=>({width:1,height:1,type:blob.type,byteLength:(await blob.arrayBuffer()).byteLength});
 try {
   const app=await import(workerData.url), manager=app.THREE?.DefaultLoadingManager;
@@ -580,6 +583,202 @@ test('packed ASCII and binary FBX retain textured geometry, embedded images and 
   assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='shared/paint.png'));
 });
 
+function usdArchive(texturePath = 'textures/paint.png', {image = true, missingLayer = false, directory = 'nested/'} = {}) {
+  const root = `#usda 1.0
+(
+  defaultPrim = "Triangle"
+  upAxis = "Y"
+  metersPerUnit = 1
+)
+def Xform "Triangle" (
+  prepend references = @./geometry.usda@</Geometry>
+)
+{
+  double3 xformOp:translate = (1, 2, 3)
+  uniform token[] xformOpOrder = ["xformOp:translate"]
+  rel material:binding = </Materials/Paint>
+}
+${missingLayer ? 'def Xform "Missing" (\n  prepend references = @https://outside.example/missing.usda@</Geometry>\n)\n{\n}\n' : ''}
+def Scope "Materials" {
+  def Material "Paint" {
+    token outputs:surface.connect = </Materials/Paint/Surface.outputs:surface>
+    def Shader "Surface" {
+      uniform token info:id = "UsdPreviewSurface"
+      color3f inputs:diffuseColor.connect = </Materials/Paint/Image.outputs:rgb>
+      float inputs:roughness = 0.25
+      float inputs:metallic = 0.5
+      token outputs:surface
+    }
+    def Shader "Image" {
+      uniform token info:id = "UsdUVTexture"
+      asset inputs:file = @${texturePath}@
+      token inputs:sourceColorSpace = "sRGB"
+      token inputs:wrapS = "clamp"
+      token inputs:wrapT = "mirror"
+      float2 inputs:st.connect = </Materials/Paint/Transform.outputs:result>
+      float3 outputs:rgb
+    }
+    def Shader "Transform" {
+      uniform token info:id = "UsdTransform2d"
+      float2 inputs:scale = (2, 3)
+      float2 inputs:translation = (0.25, 0.5)
+      float inputs:rotation = 30
+      float2 outputs:result
+    }
+  }
+}`;
+  const geometry = `#usda 1.0
+def "Geometry" {
+  def Mesh "Geometry" {
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+    normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+      interpolation = "vertex"
+    )
+    texCoord2f[] primvars:st = [(0, 0), (1, 0), (0, 1)] (
+      interpolation = "vertex"
+    )
+    uniform token subdivisionScheme = "none"
+  }
+}`;
+  return Buffer.from(zipSync({[directory+'root.usda']: strToU8(root), [directory+'geometry.usda']: strToU8(geometry),
+    ...(image ? {[directory+'textures/paint.png']: pixel} : {})}, {level: 0}));
+}
+
+test("packed USD archives retain layers, embedded textures, callbacks and edited USDZ export round trips offline", async () => {
+  const archive = usdArchive(), malformed = Buffer.from(zipSync({'readme.txt': strToU8('not a USD root')}));
+  const realArchive = fs.readFileSync(new URL('../../upstream/three.js/examples/models/usdz/saeukkang.usdz', import.meta.url));
+  const usd = new URL('../../upstream/three.js/examples/jsm/loaders/USDLoader.js', import.meta.url).href;
+  const legacy = new URL('../../upstream/three.js/examples/jsm/loaders/USDZLoader.js', import.meta.url).href;
+  const exporter = new URL('../../upstream/three.js/examples/jsm/exporters/USDZExporter.js', import.meta.url).href;
+  const f = fixture({'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      import {USDLoader} from ${JSON.stringify(usd)};
+      import {USDZLoader} from ${JSON.stringify(legacy)};
+      import {USDZExporter} from ${JSON.stringify(exporter)};
+      const meshes=group=>{const result=[];group.traverse(object=>{if(object.isMesh)result.push(object);});return result;};
+      export async function run(){
+        const order=[], loader=new USDLoader().setPath('models/'); let returned;
+        const first=await new Promise((resolve,reject)=>{
+          returned=loader.load('scene%20%23.usdz?edition=2#root',group=>{
+            order.push('loaded');resolve(group);
+          },undefined,reject);order.push('returned');
+        });
+        const second=await loader.loadAsync('scene%20%23.usdz?edition=2#root');
+        const legacy=await new USDZLoader().setPath('models/').loadAsync('scene%20%23.usdz?edition=2#root');
+        const real=meshes(await new USDLoader().setPath('models/').loadAsync('real.usdz'));
+        const raw=await new THREE.FileLoader().setResponseType('arraybuffer').loadAsync('models/scene%20%23.usdz?edition=2#root');
+        let immediate,callbackIdentity=false,readyAtCallback=false;
+        const parsed=await new Promise((resolve,reject)=>{
+          immediate=loader.parse(raw,'ignored/external/',group=>{
+            callbackIdentity=group===immediate;readyAtCallback=meshes(group)[0].material.map.image.complete;resolve(group);
+          },reject);
+        });
+        const a=meshes(first)[0],b=meshes(second)[0],texture=a.material.map;
+        const before={name:a.name,positions:[...a.geometry.attributes.position.array],uv:[...a.geometry.attributes.uv.array],
+          position:a.position.toArray(),material:a.material.type,roughness:a.material.roughness,metalness:a.material.metalness,
+          image:texture.image.complete,blob:texture.image.src.startsWith('blob:'),colorSpace:texture.colorSpace,
+          wrap:[texture.wrapS,texture.wrapT],repeat:texture.repeat.toArray(),offset:texture.offset.toArray(),rotation:texture.rotation};
+        const independent=first!==second&&a.geometry!==b.geometry&&a.material!==b.material&&texture!==b.material.map;
+        a.name='Edited';a.position.set(7,8,9);a.updateMatrix();
+        a.geometry.attributes.position.setXYZ(0,4,5,6);a.geometry.attributes.position.needsUpdate=true;
+        a.material.map=null;a.material.color.setRGB(0.25,0.5,0.75);a.material.roughness=0.625;
+        const exported=await new USDZExporter().parseAsync(first);
+        const restored=meshes(await new Promise((resolve,reject)=>loader.parse(exported,'',resolve,reject)))[0];
+        const failures=[];
+        try{await new USDLoader().setPath('models/').loadAsync('invalid.usdz');}catch(error){failures.push(error.message);}
+        const bad=await new THREE.FileLoader().setResponseType('arraybuffer').loadAsync('models/invalid.usdz');
+        try{loader.parse(bad);}catch(error){failures.push(error.message);}
+        return {order,undefinedReturn:returned===undefined,before,independent,callbackIdentity,readyAtCallback,
+          parsedMeshes:meshes(parsed).length,legacyMeshes:meshes(legacy).length,
+          real:real.map(mesh=>({name:mesh.name,vertices:mesh.geometry.attributes.position.count,image:mesh.material.map.image.complete})),
+          untouched:{name:b.name,x:b.position.x,first:b.geometry.attributes.position.getX(0),map:!!b.material.map},
+          restored:{name:restored.name,position:restored.position.toArray(),first:[...restored.geometry.attributes.position.array.slice(0,3)],
+            color:restored.material.color.toArray(),roughness:restored.material.roughness,map:restored.material.map},
+          zip:[...exported.slice(0,2)],failures};
+      }`,
+    'models/scene #.usdz': archive, 'models/invalid.usdz': malformed, 'models/real.usdz': realArchive,
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for(const [name,bytes] of [['scene #.usdz',archive],['invalid.usdz',malformed],['real.usdz',realArchive]])
+    assert.deepEqual(fs.readFileSync(path.join(f.out,'models',name)),bytes);
+  packHtml(path.join(f.out,'index.html'),f.packed);const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  const error='THREE.USDLoader: Invalid USDZ package. The first ZIP entry must be a USD layer (.usd/.usda/.usdc).';
+  assert.deepEqual(result.result,{order:['returned','loaded'],undefinedReturn:true,
+    before:{name:'Triangle',positions:[0,0,0,1,0,0,0,1,0],uv:[0,0,1,0,0,1],position:[1,2,3],
+      material:'MeshPhysicalMaterial',roughness:0.25,metalness:0.5,image:true,blob:true,colorSpace:'srgb',
+      wrap:[1001,1002],repeat:[2,3],offset:[0.25,0.5],rotation:Math.PI/6},
+    independent:true,callbackIdentity:true,readyAtCallback:true,parsedMeshes:1,legacyMeshes:1,
+    real:[{name:'g0',vertices:75000,image:true}],untouched:{name:'Triangle',x:1,first:0,map:true},
+    // The pinned importer reads scalar diffuse colors as sRGB, including the
+    // original exporter's values; retain that conversion rather than fixing it.
+    restored:{name:'Edited',position:[7,8,9],first:[4,5,6],
+      color:[0.050876088164650994,0.2140411404715882,0.5225215539594343],roughness:0.625,map:null},
+    zip:[80,75],failures:[error,error]});
+  assert.equal(result.images.length,5);
+  assert.ok(result.images.every(url=>url.startsWith('blob:')));
+  assert.ok(result.requests.every(({url})=>url.startsWith('data:')));
+  assert.ok(result.events.some(([kind,url])=>kind==='end'&&url==='models/scene%20%23.usdz?edition=2#root'));
+});
+
+test("USD archive texture fallbacks use only declared resources and retain source missing-reference behavior", async () => {
+  const usd = new URL('../../upstream/three.js/examples/jsm/loaders/USDLoader.js', import.meta.url).href;
+  const managedImage = 'data:image/png;base64,'+pixel.toString('base64');
+  const f = fixture({'index.html':'<script type="module" src="app.mjs"></script>',
+    'app.mjs':`import * as THREE from ${JSON.stringify(core.href)};
+      import {USDLoader} from ${JSON.stringify(usd)};
+      // An explicit finite resource also services the source composer's image
+      // fallback. Unknown companion images are not guessed from archive paths.
+      export const declaredImage=()=>new THREE.TextureLoader().load('nested/declared%20%23.png?edition=2');
+      export const declaredModel=()=>new USDLoader().load('models/managed.usdz');
+      const mesh=group=>{let result;group.traverse(object=>{if(object.isMesh)result=object;});return result;};
+      export async function run(){
+        const known=mesh(await new USDLoader().loadAsync('models/known.usdz'));
+        const sequence=[],warnings=[],oldWarn=console.warn;console.warn=(...args)=>warnings.push(args);
+        let missing,remote;
+        try{
+          missing=await new Promise((resolve,reject)=>new USDLoader().load('models/missing.usdz',group=>{
+            sequence.push('loaded');resolve(group);
+          },undefined,error=>{sequence.push('error');reject(error);}));
+          remote=await new USDLoader().loadAsync('models/remote.usdz');
+        }finally{console.warn=oldWarn;}
+        const raw=await new THREE.FileLoader().setResponseType('arraybuffer').loadAsync('models/managed.usdz');
+        const calls=[],manager=new THREE.LoadingManager();
+        manager.onStart=url=>calls.push(['start',url]);manager.onProgress=url=>calls.push(['end',url]);
+        manager.setURLModifier(url=>{calls.push(['resolve',url]);return ${JSON.stringify(managedImage)};});
+        const managed=mesh(await new Promise((resolve,reject)=>new USDLoader(manager).parse(raw,'',resolve,reject)));
+        return {known:known.material.map.image.complete,knownURL:known.material.map.image.src,sequence,
+          missingImage:mesh(missing).material.map.image,remoteImage:mesh(remote).material.map.image,
+          missingLayer:missing.getObjectByName('Missing').children.length,warnings,calls,
+          managedURL:managed.material.map.image.src,managedReady:managed.material.map.image.complete};
+      }`,
+    'models/known.usdz':usdArchive('declared%20%23.png?edition=2',{image:false}),
+    'models/missing.usdz':usdArchive('missing.png',{image:false,missingLayer:true}),
+    'models/remote.usdz':usdArchive('https://outside.example/missing.png',{image:false}),
+    'models/managed.usdz':usdArchive('managed.png',{image:false,directory:''}),
+    'nested/declared #.png':pixel,
+  });
+  await buildApplication(f.entry,f.out,{prepareStandaloneLoaders:true});
+  packHtml(path.join(f.out,'index.html'),f.packed);const html=fs.readFileSync(f.packed,'utf8');
+  fs.renameSync(path.join(f.root,'source'),path.join(f.root,'source-unavailable'));
+  fs.renameSync(f.out,path.join(f.root,'build-unavailable'));
+  const result=await execute(html);
+  assert.equal(result.ok,true,result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g,'<packed module>'));
+  assert.equal(result.result.known,true);assert.match(result.result.knownURL,/^data:image\/png;f3d-id=/);
+  assert.deepEqual({...result.result,known:undefined,knownURL:undefined},{known:undefined,knownURL:undefined,
+    sequence:['loaded'],missingImage:null,remoteImage:null,missingLayer:0,
+    warnings:[['USDLoader: Failed to load texture:','nested/missing.png'],
+      ['USDLoader: Failed to load texture:','https://outside.example/missing.png']],
+    calls:[['resolve','managed.png']],managedURL:managedImage,managedReady:true});
+  assert.deepEqual(result.images,[result.result.knownURL,'nested/missing.png','https://outside.example/missing.png',managedImage]);
+  assert.equal(result.requests.length,4,'missing USD references never produce layer requests');
+});
+
 test("resource lookup preserves unknown and manager-owned URLs and exact bytes with real MIME", async () => {
   const bytes = Buffer.from([0, 255, 123, 9]);
   const source = createThreeLoaderResourceModule(new Map([["site/a #.bin", { source: bytes }]]), {
@@ -613,6 +812,19 @@ test("host-call transformation requires both pinned module identity and exact so
   assert.deepEqual(changed, [], "a modified implementation keeps its authored host route");
   const shadowed = "const Request = globalThis.customRequest;\n" + source;
   assert.deepEqual(threeLoaderResourceEdits(shadowed, parse(shadowed, { ecmaVersion: "latest", sourceType: "module" }), core.href), []);
+});
+
+test("only the exact pinned USD image assignment gains the resource host hook", () => {
+  const url=new URL('../../upstream/three.js/examples/jsm/loaders/usd/USDComposer.js',import.meta.url);
+  const source=fs.readFileSync(url,'utf8'),ast=parse(source,{ecmaVersion:'latest',sourceType:'module'});
+  const edits=threeLoaderResourceEdits(source,ast,url.href),replacements=edits.filter(edit=>edit.type==='replace');
+  assert.equal(replacements.length,1);
+  assert.equal(source.slice(replacements[0].pos,replacements[0].end),'url');
+  assert.equal(replacements[0].text,'__f3dResolveLoaderResource(url)');
+  assert.deepEqual(threeLoaderResourceEdits(source,ast,'file:///other/USDComposer.js'),[]);
+  for(const changed of [source+'\n// modified module\n','const Image=globalThis.CustomImage;\n'+source])
+    assert.deepEqual(threeLoaderResourceEdits(changed,parse(changed,{ecmaVersion:'latest',sourceType:'module'}),url.href),[]);
+  assert.equal(fs.readFileSync(url,'utf8'),source);
 });
 
 test("only exact pinned Draco, KTX2, Rhino3DM and Meshopt source constructors gain the native worker host hook", () => {

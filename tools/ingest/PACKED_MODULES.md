@@ -371,6 +371,30 @@ loader warnings, callback and synchronous texture-return behavior stay upstream.
 These tests run the original parsers with source/build files unavailable and
 external requests rejected; they do not establish GPU format support.
 
+## Self-contained USDZ scene archives
+
+Finite pinned `USDLoader` and legacy `USDZLoader` loads now include their original
+archives in application output and the standalone resource map. Module and addon
+imports, constructor aliases, `setPath`, finite URL choices and runtime `parse()`
+retain the existing source-discovery rules. The original ZIP, USD layer parsers,
+scene composer and embedded-image Blob lifecycle execute unchanged.
+
+The exact pinned composer's final `image.src` assignment also uses the existing
+resource resolver. Archive Blob URLs and manager-provided data URLs stay intact;
+fallback images use the embedded map only when that logical resource is already
+declared. Missing USD layers retain the source's empty-reference behavior.
+Unknown or external image URLs retain their host route and source error timing.
+This supports self-contained archives; it does not automatically discover loose
+USDA/USDC companions or make an incomplete archive self-contained.
+
+Packed tests execute after source and build directories become unavailable. They
+check referenced geometry, transforms, physical materials, texture transforms,
+completion callbacks, independent reloads, the upstream 75,000-vertex model, and
+edited geometry/material/transform export through the original `USDZExporter`
+followed by reimport. Native parser errors and the source color-space conversion
+remain unchanged. The recording image host verifies original PNG bytes and
+completion; browser image decoding and rendering are separate claims.
+
 ## 3MF manufacturing models
 
 Finite `ThreeMFLoader.load()` and `loadAsync()` calls now include their complete

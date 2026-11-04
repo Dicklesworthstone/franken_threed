@@ -216,6 +216,36 @@ test("3MF foreign files, shadows, custom extensions and escaping loaders retain 
   assert.deepEqual(requests.map(({url}) => url), ['known.3mf']);
 });
 
+test("USD archive discovery retains source aliases, addon exports, finite paths and runtime parse", () => {
+  const requests = discover(`import { USDLoader as Source } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/USDLoader.js')};
+    import * as Legacy from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/USDZLoader.js')};
+    import { USDLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const Constructor=Source, loader=new Constructor(); loader.parse(runtimeBytes, '', onLoad, onError);
+    loader.setPath('models/'); loader.loadAsync(choice ? 'scene%20%23.usdz?edition=2#root' : 'other.usdz');
+    new Legacy.USDZLoader().setPath('legacy/').load('scene.usdz');
+    new USDLoader().load('aggregate.usdz'); new Addons.USDZLoader().loadAsync('namespace.usdz');`);
+  assert.deepEqual(requests.map(({loader, url}) => [loader, url]), [
+    ['USDLoader', 'models/scene%20%23.usdz?edition=2#root'], ['USDLoader', 'models/other.usdz'],
+    ['USDZLoader', 'legacy/scene.usdz'], ['USDLoader', 'aggregate.usdz'], ['USDZLoader', 'namespace.usdz'],
+  ]);
+});
+
+test("USD discovery keeps custom managers, modified receivers and unknown paths on the host route", () => {
+  const requests = discover(`import { USDLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/USDLoader.js')};
+    import { USDZLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/USDZLoader.js')};
+    import { USDLoader as Foreign } from 'file:///other/USDLoader.js';
+    import { USDLoader as Wrong } from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/USDZLoader.js')};
+    new Foreign().load('foreign.usdz'); new Wrong().load('wrong.usdz');
+    new USDLoader(manager).load('managed.usdz');
+    const escaped=new USDLoader(); customize(escaped); escaped.load('escaped.usdz');
+    const changed=new USDLoader(); changed.parse=customParse; changed.load('changed.usdz');
+    new USDZLoader().setPath(runtimePath).load('dynamic.usdz');
+    function shadow(USDLoader) { new USDLoader().load('shadow.usdz'); }
+    new USDLoader().load('known.usdz');`);
+  assert.deepEqual(requests.map(({url}) => url), ['known.usdz']);
+});
+
 test("FBX loader discovery retains animation settings, captured defaults and pending resource changes", () => {
   const requests = discover(`import { FBXLoader } from ${JSON.stringify(fbxUrl)};
     import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};

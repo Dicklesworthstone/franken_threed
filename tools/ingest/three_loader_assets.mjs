@@ -59,6 +59,11 @@ const ADDON_SETTINGS = new Map([
   ["MTLLoader", new Set(["setMaterialOptions"])],
   ["FBXLoader", new Set()],
   ["ColladaLoader", new Set()],
+  // Self-contained USDZ archives keep their layers and images inside the ZIP.
+  // Loose USD layers may still need runtime resources, so these are not in the
+  // single-file family above. Their retained parsers also accept runtime bytes.
+  ["USDLoader", new Set()],
+  ["USDZLoader", new Set()],
   ["GLTFLoader", new Set(["setDRACOLoader", "setKTX2Loader", "setMeshoptDecoder"])],
   ["DRACOLoader", new Set(["setDecoderPath", "setDecoderConfig", "setWorkerLimit", "preload"])],
   ["KTX2Loader", new Set(["setTranscoderPath", "setWorkerLimit", "detectSupport"])],
@@ -71,6 +76,8 @@ const ADDON_USES = new Map([
   ["MTLLoader", new Set(["parse"])],
   ["FBXLoader", new Set(["parse"])],
   ["ColladaLoader", new Set(["parse"])],
+  ["USDLoader", new Set(["parse"])],
+  ["USDZLoader", new Set(["parse"])],
   ["Rhino3dmLoader", new Set(["parse", "parseAsync", "decodeObjects"])],
 ]);
 const ALL_SETTINGS = new Set([...SETTINGS, ...[...ADDON_SETTINGS.values()].flatMap(value => [...value])]);

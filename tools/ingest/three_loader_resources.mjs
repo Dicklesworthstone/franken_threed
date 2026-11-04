@@ -24,12 +24,16 @@ const MODULES = new Map([
   ["src/loaders/FileLoader.js", "e3f730f2fdefdd4e9285883fb2eb7ca40e13d58ea96e969a669d3eaacd7d0c03"],
   ["src/loaders/ImageLoader.js", "0507db81b6214afd32f4c781e08acd88005ab4988f93de583f34ded571f1fbcc"],
   ["src/loaders/ImageBitmapLoader.js", "466fc2172c6d1c8d4ee40dc041785a783e09bbef79c3017a945024b8d2166c30"],
+  ["examples/jsm/loaders/usd/USDComposer.js", "ab69972fe70cdb53a6ffa935ba4dbe541cbac4dc6c1b28faa3a3ad389e15cefb"],
   ["examples/jsm/loaders/DRACOLoader.js", "fdafdf4aa11bbc65d89adb338efd844bedf94073702f9049240ff1f1ea48ad5f"],
   ["examples/jsm/loaders/KTX2Loader.js", "3a3233ce3409443076d3414b78832e1405fcfac5ecb34d367365fd0781127d6c"],
   ["examples/jsm/loaders/3DMLoader.js", "18d44a9b6e28c52f3d2fe8d9706eaffe0342961fde88f73cd497fa673dd8c40a"],
   ["examples/jsm/libs/meshopt_decoder.module.js", "d428e73a000057c6c94bfcedc3412d0c2dc14ca8800e88553aab05113ad2bf19"],
 ]);
-const CLASSES = new Set(["FileLoader", "ImageLoader", "ImageBitmapLoader"]);
+const METHODS = new Map([
+  ["FileLoader", "load"], ["ImageLoader", "load"], ["ImageBitmapLoader", "load"],
+  ["USDComposer", "_createTextureFromData"],
+]);
 const WORKER_ARGUMENTS = new Map([
   ["examples/jsm/loaders/DRACOLoader.js", "this.workerSourceURL"],
   ["examples/jsm/loaders/KTX2Loader.js", "this.workerSourceURL"],
@@ -68,8 +72,8 @@ export function threeLoaderResourceEdits(source, ast, id, packageRootUrl) {
   }
   for (const node of ast.body) {
     if (node.type !== "ClassDeclaration") continue;
-    if (!CLASSES.has(node.id?.name)) continue;
-    const load = node.body.body.find(method => method.key?.name === "load");
+    if (!METHODS.has(node.id?.name)) continue;
+    const load = node.body.body.find(method => method.key?.name === METHODS.get(node.id.name));
     const sites = [];
     const url = value => value?.type === "Identifier" && value.name === "url";
     walk.simple(load.value.body, {
@@ -78,7 +82,7 @@ export function threeLoaderResourceEdits(source, ast, id, packageRootUrl) {
             value.callee.name === "Request" && url(value.arguments[0])) sites.push(value.arguments[0]);
       },
       AssignmentExpression(value) {
-        if (node.id.name === "ImageLoader" && value.left.type === "MemberExpression" &&
+        if (["ImageLoader", "USDComposer"].includes(node.id.name) && value.left.type === "MemberExpression" &&
             !value.left.computed && value.left.object.name === "image" &&
             value.left.property.name === "src" && url(value.right)) sites.push(value.right);
       },
