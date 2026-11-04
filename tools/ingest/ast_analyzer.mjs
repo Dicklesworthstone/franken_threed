@@ -1626,7 +1626,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract
     },
 
     NewExpression(node, ancestors) {
-      // 1. Check for URL asset references: new URL(relativeLiteral, import.meta.url)
+      // 1. Check for URL assets with literal or finite lexical string choices.
       if (
         node.callee &&
         node.callee.type === "Identifier" &&
@@ -1636,21 +1636,25 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract
       ) {
         const firstArg = node.arguments[0];
         const secondArg = node.arguments[1];
-        const specifier = extractStaticString(firstArg);
+        const classified = classifyImport(firstArg);
+        const candidates = classified.classification === "literal"
+          ? [classified.specifier] : classified.candidates ?? [];
 
-        if (specifier !== null && isImportMetaUrl(secondArg)) {
-          const pathPart = specifier.split(/[?#]/)[0];
-          const isDirectory =
-            pathPart.endsWith("/") ||
-            pathPart === "." ||
-            pathPart === ".." ||
-            pathPart.endsWith("/.") ||
-            pathPart.endsWith("/..");
-
-          if (!isDirectory) {
+        if (isImportMetaUrl(secondArg)) {
+          // Directory branches keep their existing runtime route; a finite
+          // choice of filenames never grants permission to copy a directory.
+          const assets = candidates.filter(specifier => {
+            const pathPart = specifier.split(/[?#]/)[0];
+            return !pathPart.endsWith("/") && pathPart !== "." && pathPart !== ".." &&
+              !pathPart.endsWith("/.") && !pathPart.endsWith("/..");
+          });
+          if (assets.length) {
             const span = toSourceSpan(node, offsets);
             assetReferences.push({
-              specifier,
+              classification: classified.classification,
+              specifier: classified.specifier,
+              ...(classified.classification === "finite_set" ? {candidates: assets} : {}),
+              argument_span: toSourceSpan(firstArg, offsets),
               source_span: span,
               sourceSpan: span,
             });

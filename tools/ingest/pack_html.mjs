@@ -162,13 +162,20 @@ function finiteImports(node, environment = new Map(), depth = 0, classify = null
   if (
     node.type === "CallExpression" &&
     !node.optional &&
-    node.arguments.length === 1 &&
+    node.arguments.length <= 1 &&
     node.callee.type === "ArrowFunctionExpression" &&
     !node.callee.async &&
     node.callee.expression &&
     node.callee.params.length === 1 &&
     node.callee.params[0].type === "Identifier"
   ) {
+    if (!node.arguments.length) {
+      // Rollup can remove an effect-free constant selector after folding the
+      // dispatch body. Its missing parameter must still shadow outer values.
+      const nested = new Map(environment);
+      nested.delete(node.callee.params[0].name);
+      return finiteImports(node.callee.body, nested, depth + 1, classify);
+    }
     const values = finiteImports(node.arguments[0], environment, depth + 1, classify),
       result = new Set();
     for (const value of values) {
@@ -906,17 +913,29 @@ export function packHtml(
         const [ref, origin] = node.arguments;
         const isMetaUrl =
           origin?.type === "MemberExpression" &&
-          !origin.computed &&
           origin.object.type === "MetaProperty" &&
-          origin.property.name === "url";
+          origin.object.meta.name === "import" && origin.object.property.name === "meta" &&
+          (origin.computed ? literal(origin.property) === "url" : origin.property.name === "url");
         if (!isMetaUrl) return;
         const value = literal(ref);
-        if (value === null || node.arguments.length !== 2)
-          fail("DYNAMIC_ASSET", `${from}: asset URL is not a static literal`);
+        if (node.arguments.length !== 2)
+          fail("DYNAMIC_ASSET", `${from}: asset URL needs one selector and its module base`);
         if (boundAt(node, "URL")) fail("WORKER_BINDING", `${from}: shadowed asset URL constructor`);
         uses("URL");
         allowedMeta.add(origin.object);
-        add(node, `new URL(${JSON.stringify(assetFor(local(value, from)))})`);
+        if (value !== null) {
+          add(node, `new URL(${JSON.stringify(assetFor(local(value, from)))})`);
+        } else {
+          let candidates;
+          try { candidates = [...finiteImports(ref, new Map(), 0, classifyImport)]; }
+          catch { fail("DYNAMIC_ASSET", `${from}: asset URL is not a bounded string expression`); }
+          const chain = candidates.map(candidate =>
+            `s === ${JSON.stringify(candidate)} ? ${JSON.stringify(assetFor(local(candidate, from)))} : `).join("");
+          // Wrappers preserve selector side effects, TDZ and nested URL/import
+          // edits while keeping the original native URL constructor and base.
+          replacements.push({start: ref.start, end: ref.start, value: `(s => ${chain}s)((`},
+            {start: ref.end, end: ref.end, value: "))"});
+        }
       },
       CallExpression(node) {
         if (worker && hostCall(node, "importScripts")) {

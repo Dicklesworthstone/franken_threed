@@ -113,7 +113,7 @@ export function f3dRollupPlugin(options = {}) {
   const emittedJsonByUrl = new Map();
   const emittedJsonTargets = new Set();
   const dynamicChunkRefIds = new Set();
-  const gltfAssetRefIds = new Set();
+  const moduleAssetRefIds = new Set();
   const documentAssets = new Map();
   const documentResourceURLs = new Map();
   const documentRequests = [];
@@ -147,6 +147,7 @@ export function f3dRollupPlugin(options = {}) {
         type: "asset", name: path.basename(assetPath), source, originalFileName: assetPath,
       });
       emittedAssetsByPath.set(assetPath, refId);
+      moduleAssetRefIds.add(refId);
       return refId;
     }
 
@@ -204,7 +205,7 @@ export function f3dRollupPlugin(options = {}) {
       if (filename === assetPath) modelRefId = refId;
     }
     emittedAssetsByPath.set(assetPath, modelRefId);
-    gltfAssetRefIds.add(modelRefId);
+    moduleAssetRefIds.add(modelRefId);
     return modelRefId;
   }
 
@@ -252,11 +253,13 @@ export function f3dRollupPlugin(options = {}) {
     },
 
     resolveFileUrl({ referenceId, relativePath }) {
-      if (gltfAssetRefIds.has(referenceId)) {
+      if (moduleAssetRefIds.has(referenceId)) {
         // Explicit filenames preserve decoded source names, including literal
         // spaces, percent signs, '?' and '#'; encode each path segment as a URL.
         const url = relativePath.split("/").map(encodeURIComponent).join("/");
-        return `new URL(${JSON.stringify(url)}, import.meta.url).href`;
+        // Keep the original URL constructor and base. Relative string targets
+        // also let standalone packing close emitted finite selector dispatches.
+        return JSON.stringify(url);
       }
       if (dynamicChunkRefIds.has(referenceId)) {
         const rel =
@@ -351,53 +354,45 @@ export function f3dRollupPlugin(options = {}) {
       const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
 
       for (const ref of assetRefs) {
-        const rawSpecifier = ref.specifier;
-        if (!rawSpecifier || typeof rawSpecifier !== "string") continue;
+        const mapping = new Map();
+        for (const rawSpecifier of ref.candidates ?? [ref.specifier]) {
+          if (!rawSpecifier || typeof rawSpecifier !== "string") continue;
+          const suffixIndex = rawSpecifier.search(/[?#]/);
+          const cleanPath = suffixIndex < 0 ? rawSpecifier : rawSpecifier.slice(0, suffixIndex);
+          const suffix = suffixIndex < 0 ? "" : rawSpecifier.slice(suffixIndex);
+          if (!isRelativeUrl(cleanPath)) continue;
 
-        const qIdx = rawSpecifier.indexOf("?");
-        const hIdx = rawSpecifier.indexOf("#");
-        let splitIdx = -1;
-        if (qIdx !== -1 && hIdx !== -1) splitIdx = Math.min(qIdx, hIdx);
-        else if (qIdx !== -1) splitIdx = qIdx;
-        else if (hIdx !== -1) splitIdx = hIdx;
-
-        const cleanPath = splitIdx !== -1 ? rawSpecifier.slice(0, splitIdx) : rawSpecifier;
-        const suffix = splitIdx !== -1 ? rawSpecifier.slice(splitIdx) : "";
-
-        if (!isRelativeUrl(cleanPath)) continue;
-
-        let assetAbsPath;
-        try {
-          const dirSlash = moduleDir.endsWith(path.sep) ? moduleDir : moduleDir + path.sep;
-          const resolvedUrl = new URL(cleanPath, pathToFileURL(dirSlash));
-          assetAbsPath = fileURLToPath(resolvedUrl);
-        } catch {
-          assetAbsPath = path.resolve(moduleDir, cleanPath);
+          let assetAbsPath;
+          try {
+            const dirSlash = moduleDir.endsWith(path.sep) ? moduleDir : moduleDir + path.sep;
+            assetAbsPath = fileURLToPath(new URL(cleanPath, pathToFileURL(dirSlash)));
+          } catch {
+            assetAbsPath = path.resolve(moduleDir, cleanPath);
+          }
+          if (!fs.existsSync(assetAbsPath) || !fs.statSync(assetAbsPath).isFile()) {
+            throw new Error(
+              `Unresolved module asset: "${rawSpecifier}" not found at "${assetAbsPath}" referenced from "${id}"`,
+            );
+          }
+          const refId = emitModuleAsset(this, assetAbsPath);
+          mapping.set(rawSpecifier, `import.meta.ROLLUP_FILE_URL_${refId}` +
+            (suffix ? ` + ${JSON.stringify(suffix)}` : ""));
         }
+        if (!mapping.size) continue;
 
-        if (!fs.existsSync(assetAbsPath) || !fs.statSync(assetAbsPath).isFile()) {
-          throw new Error(
-            `Unresolved module asset: "${rawSpecifier}" not found at "${assetAbsPath}" referenced from "${id}"`,
-          );
-        }
-
-        const refId = emitModuleAsset(this, assetAbsPath);
-
-        const span = ref.source_span || ref.sourceSpan;
+        const span = ref.argument_span;
         const start = span.start.offset;
         const end = span.end.offset;
-
-        const replacement = suffix
-          ? `new URL(import.meta.ROLLUP_FILE_URL_${refId} + ${JSON.stringify(suffix)})`
-          : `new URL(import.meta.ROLLUP_FILE_URL_${refId})`;
-
-        edits.push({
-          type: "replace",
-          pos: start,
-          end: end,
-          priority: 2,
-          text: replacement,
-        });
+        if (ref.classification === "literal") {
+          edits.push({type: "replace", pos: start, end, priority: 2, text: mapping.get(ref.specifier)});
+        } else {
+          const chain = [...mapping].map(([candidate, target]) =>
+            `s === ${JSON.stringify(candidate)} ? ${target} : `).join("");
+          // Evaluate the original selector once, retaining its effects, TDZ
+          // failures and nested transformations. Unmapped host routes stay live.
+          edits.push({type: "insert", pos: start, priority: 1, text: `(s => ${chain}s)((`},
+            {type: "insert", pos: end, priority: 3, text: "))"});
+        }
       }
 
       // 2. Finite dynamic import replacements: import(flag ? './a.js' : './b.js')

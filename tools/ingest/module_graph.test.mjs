@@ -541,10 +541,10 @@ test("Asset references: non-matching constructor and property access forms are s
     "export const u = new URL('./t.png', import.meta.url, 'extra');",
     // 1 constructor argument
     "export const u = new URL('./t.png');",
-    // Non-literal dynamic specifier
-    "const p = './t.png'; export const u = new URL(p, import.meta.url);",
-    // Template literal with dynamic expressions
-    "const name = 't'; export const u = new URL(`./textures/${name}.png`, import.meta.url);",
+    // Mutable specifier cannot establish a finite asset graph
+    "let p = './t.png'; export const u = new URL(p, import.meta.url);",
+    // Template literal with an unknown runtime expression
+    "const name = getName(); export const u = new URL(`./textures/${name}.png`, import.meta.url);",
   ];
 
   for (const snippet of rejectedSnippets) {

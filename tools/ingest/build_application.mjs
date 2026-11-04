@@ -518,7 +518,9 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
       }
       if (Array.isArray(analysis.assetReferences)) {
         for (const assetRef of analysis.assetReferences) {
-          if (assetRef.specifier) assetSpecifiers.add(assetRef.specifier);
+          for (const specifier of assetRef.candidates ?? [assetRef.specifier]) {
+            if (specifier) assetSpecifiers.add(specifier);
+          }
         }
       }
       return {

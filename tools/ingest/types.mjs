@@ -99,7 +99,10 @@ export const SCHEMA_VERSION = "1.0.0";
 
 /**
  * @typedef {Object} AssetReference
- * @property {string} specifier - Raw asset specifier string
+ * @property {'literal' | 'finite_set'} classification - Whether a literal or finite expression supplies the asset
+ * @property {string | null} specifier - Raw literal asset specifier, or null for finite choices
+ * @property {string[]} [candidates] - Finite asset strings; directory branches retain their runtime route
+ * @property {SourceSpan} argument_span - Selector span, retained when rewriting its selected URL
  * @property {SourceSpan} source_span - Source location span of asset reference
  */
 
