@@ -85,6 +85,7 @@ export function numericLoopScopeBindings() {
 
 function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   const locals = new Set(), references = [], arrays = new Set(), assigned = new Set();
+  const varInitializers = [], varNames = new Set();
   let refusal = null, usesMath = false;
   const ownerOf = (name, scopes, position) => [...scopes].reverse()
     .find(scope => bindings(scope, position).has(name));
@@ -101,8 +102,20 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
         refusal = 'ISLAND_SHADOWED_HELPER';
     }
     if (node.type === 'VariableDeclaration') {
-      if (node.kind === 'var') refusal = 'ISLAND_ESCAPING_DECLARATION';
-      for (const d of node.declarations) pattern(d.id, locals);
+      if (node.kind === 'var') {
+        const parent = innerAncestors.at(-2);
+        // Function-scoped headers publish through the scalar-state channel.
+        // Body declarations and destructuring need separate initialization and
+        // observation proofs; do not turn them into lexical loop temporaries.
+        if (parent?.type !== 'ForStatement' || parent.init !== node ||
+            node.declarations.some(d => d.id.type !== 'Identifier'))
+          refusal = 'ISLAND_ESCAPING_DECLARATION';
+        varInitializers.push(node);
+        for (const d of node.declarations) {
+          pattern(d.id, varNames);
+          if (d.init) pattern(d.id, assigned);
+        }
+      } else for (const d of node.declarations) pattern(d.id, locals);
     }
     if (FUNCTIONS.has(node.type) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression')
       refusal = 'ISLAND_NESTED_CLOSURE';
@@ -117,12 +130,16 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
     }
     if (node.type === 'Identifier') {
       // Acorn's semantic walker omits ordinary property names and labels. Keep
-      // binding identifiers too; the closed compiler resolves their real scopes.
+      // initialized binding identifiers too; an uninitialized var declaration
+      // is only hoisting, not a read of its incoming value.
+      const declaration = innerAncestors.at(-2);
+      if (declaration?.type === 'VariableDeclarator' && declaration.id === node &&
+          !declaration.init && innerAncestors.at(-3)?.kind === 'var') return;
       references.push(node);
     }
   });
   if (refusal) return {refusal};
-  if (usesMath && locals.has('Math')) return {refusal:'ISLAND_LOCAL_MATH'};
+  if (usesMath && (locals.has('Math') || varNames.has('Math'))) return {refusal:'ISLAND_LOCAL_MATH'};
   const captures = [...new Set(references.sort((a,b) => a.start-b.start).map(n => n.name))]
     .filter(name => !locals.has(name) && !(usesMath && name === 'Math') &&
       !(helperDeclarations.has(name) && ownerOf(name, ancestors, loop) === ancestors[0]));
@@ -147,7 +164,37 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   if (captures.length > 64) return {refusal:'ISLAND_CAPTURE_BUDGET'};
   if (captures.some(name => name === 'arguments' || !ancestors.some(node => bindings(node, loop).has(name))))
     return {refusal:'ISLAND_NONLEXICAL_CAPTURE'};
-  return {captures, arrays, usesMath, scalarOutputs};
+  return {captures, arrays, usesMath, scalarOutputs, varInitializers};
+}
+
+// Each top-level for initializer executes on every successful completion of
+// this region, even when the loop takes zero trips. A direct assignment before
+// any occurrence of its binding makes the incoming value irrelevant. Scan all
+// earlier statements conservatively; nested/conditional writes never qualify.
+function outputOnlyScalars(loop, scalarOutputs) {
+  const outputs = new Set(scalarOutputs), overwritten = new Set(), seen = new Set();
+  const references = (node, names) => walk.full(node, child => {
+    if (child.type === 'Identifier') names.add(child.name);
+  });
+  function assignment(id, value) {
+    const reads = new Set(); references(value, reads);
+    if (id.type === 'Identifier' && outputs.has(id.name) &&
+        !seen.has(id.name) && !reads.has(id.name)) overwritten.add(id.name);
+    references(id, seen); for (const name of reads) seen.add(name);
+  }
+  function initializer(node) {
+    if (!node) return;
+    if (node.type === 'SequenceExpression') node.expressions.forEach(initializer);
+    else if (node.type === 'VariableDeclaration') {
+      for (const d of node.declarations) if (d.init) assignment(d.id, d.init);
+    } else if (node.type === 'AssignmentExpression' && node.operator === '=') assignment(node.left, node.right);
+    else references(node, seen);
+  }
+  for (const statement of loop.type === 'BlockStatement' ? loop.body : [loop]) {
+    if (statement.type === 'ForStatement') initializer(statement.init);
+    references(statement, seen);
+  }
+  return overwritten;
 }
 
 /**
@@ -228,14 +275,21 @@ export function planNumericLoopIslands(source, {
     }
     const closure = capturesFor(node, ancestors, bindings, helperDeclarations);
     if (closure.refusal) { item.reason=closure.refusal; continue; }
-    const {captures, arrays, usesMath, scalarOutputs} = closure;
+    const {captures, arrays, usesMath, scalarOutputs, varInitializers} = closure;
+    const outputOnly = outputOnlyScalars(node, scalarOutputs);
     const inputs = captures.filter(name => !scalarOutputs.includes(name));
     const stateName = scalarOutputs.length ? fresh('loop_state') : null;
     const parameters = stateName ? [...inputs, stateName] : inputs;
     const prologue = scalarOutputs.map((name, i) => `let ${name} = ${stateName}[${i}];`).join('\n');
     const epilogue = scalarOutputs.map((name, i) => `${stateName}[${i}] = ${name};`).join('\n');
     const functionName = fresh('loop_kernel');
-    const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${source.slice(node.start,node.end)}\n${epilogue}\n}`;
+    let body = source.slice(node.start, node.end);
+    for (const declaration of [...varInitializers].sort((a, b) => b.start - a.start)) {
+      const assignments = declaration.declarations.filter(d => d.init)
+        .map(d => `${d.id.name} = (${source.slice(d.init.start, d.init.end)})`).join(', ');
+      body = body.slice(0, declaration.start - node.start) + assignments + body.slice(declaration.end - node.start);
+    }
+    const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${body}\n${epilogue}\n}`;
     const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ? 'f64[]' : 'f64');
     const compile = types => compileNumericCandidate(kernelSource, {
       parameterTypes:types, helperSources, allowMath:usesMath || helperSources.size > 0, generalControl:true,
@@ -282,7 +336,11 @@ export function planNumericLoopIslands(source, {
         stateDispatchName=fresh('dispatch_state_loop');
         runtimeImports.push(`dispatchNumericStateLoop as ${stateDispatchName}`);
       }
-      const result=fresh('loop_result'), values=[...inputs, ...scalarOutputs].join(',');
+      // Even an overwritten lexical binding must be read: a TDZ write in the
+      // source must fall back before any native array publication. The comma
+      // expression ignores only its old value, without coercion or property access.
+      const result=fresh('loop_result'), values=[...inputs,
+        ...scalarOutputs.map(name => outputOnly.has(name) ? `(${name}, 0)` : name)].join(',');
       const publish=scalarOutputs.map((name,i) => `${name} = ${result}[${i}];`).join('\n');
       edits.push({start:node.start,end:node.end,text:
         `{ const ${result} = ${stateDispatchName}(${token}, () => [${values}], ${scalarOutputs.length}, ${mathResolver});\n` +
@@ -300,6 +358,7 @@ export function planNumericLoopIslands(source, {
     if (nestedCalls.length) item.absorbedCalls = nestedCalls.map(call => ({...call}));
     Object.assign(item, {route:'guarded-loop-wasm', captures:params.map(p => ({...p})),
       ...(stateName ? {scalarOutputs:[...scalarOutputs], scalarOutputSemantics:'mutable-lexical-f64-publication'} : {}),
+      ...(outputOnly.size ? {outputOnlyScalars:[...outputOnly]} : {}),
       storageSemantics:'same-type-alias-preserving-v1', guardFallback:'original-loop-in-place',
       controlSemantics:artifact.manifest.controlSemantics, maxIterations:artifact.manifest.maxIterations,
       loopCount:artifact.manifest.loopCount, maxLoopDepth:artifact.manifest.maxLoopDepth,

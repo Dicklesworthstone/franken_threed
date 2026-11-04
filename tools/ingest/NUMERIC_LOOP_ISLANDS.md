@@ -65,7 +65,25 @@ bindings. The compiler uses private f64 scalar storage and publishes back to the
 actual lexical bindings only after native success. Scalar values are not narrowed
 to f32 when geometry is f32. Const/import/self-name outputs and scalar type
 changes outside the numeric compiler's contract remain in JS. A nonnumeric
-initial scalar retains the original code without an extra coercion.
+initial scalar retains the original code without an extra coercion, unless a
+guaranteed initializer overwrites that value before any use.
+
+Ordinary `for (var i = 0; i < positions.length; i++)` loops can publish their
+function-scoped index, including its zero-trip value and its value after `break`.
+Multiple declarators, redeclarations and adjacent loops keep initializer order.
+The original `var` declarations remain in the fallback, preserving their hoisting
+and the binding selected by the source, including a shadowing catch parameter.
+Declarations without an initializer leave the current value alone.
+
+An unconditional `for` initializer may establish a scalar without needing its
+previous value, so a hoisted `undefined` index does not force every first call
+into JS. The same proof applies to an existing `let` or parameter binding. The
+generated capture still reads the binding to detect its temporal dead zone; it
+discards only the previous value, without coercion or property access. The native
+initializer performs the actual assignment in source order. Earlier reads in a
+fused region, nested/conditional writes and uninitialized declarations keep the
+ordinary numeric-state guards. In particular, a nested loop that may never run
+cannot replace an untouched `undefined` scalar with a numeric result.
 
 The original statements remain in place as fallback. A missing Wasm host, early
 ESM-cycle call, unavailable capture, guard miss, bounds trap or native iteration
@@ -78,7 +96,8 @@ The transformation adds no scheduler, host yield, frame loop, GPU initialization
 or runtime source compilation. Wasm is instantiated lazily and reused per emitted
 island/type variant. Async/generator suspension outside an island stays outside;
 escaping returns, suspension inside a candidate, effectful calls, unresolved
-globals and escaping `var` declarations refuse that candidate.
+globals, `var` body declarations, destructured `var` headers and
+`for (var value of ...)` bindings refuse that candidate.
 
 ## Options and inspection
 
@@ -98,7 +117,9 @@ primary and at most sixteen alternatives.
 
 `f3d-numeric-specialization.json` includes `compiledLoopIslands`, original unit
 spans, captures, scalar outputs, loop counts, retained reasons and variant sizes.
-A `LoopSequence` record identifies a fused region. For linked builds, source
+`outputOnlyScalars` identifies the bindings whose incoming values are proved
+irrelevant; their initialization is still checked. A `LoopSequence` record
+identifies a fused region. For linked builds, source
 coordinates refer to the rendered chunk before specialization/hash substitution,
 not an invented source map. Runtime assets remain content-addressed and movable
 with the emitted package; actual runtime imports appear in Rollup metadata.

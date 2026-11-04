@@ -27,6 +27,10 @@ const COUNT=`export function make(a,trace){let count=0,sum=0;return {
     trace.push([i,count,sum]);return {i,count,sum};
   },read(){return {count,sum};}
 };}`;
+const VAR_COUNT=`export function varTick(a,trace){trace.push(['before',typeof i]);
+  for(var i=0;i<a.length;i++){if(i===1)continue;a[i]+=i;if(i===3)break;}
+  trace.push(['after',i]);return i;
+}`;
 
 test('while loops publish multiple counters and reductions into their current closure',async t=>{
   const counts=observe(t),built=compile(COUNT),candidate=await load(built.code),reference=await load(COUNT);
@@ -74,6 +78,133 @@ test('parameter and function-scoped var outputs are mutable without changing the
   }`;
   const built=compile(source),candidate=await load(built.code),reference=await load(source),a=new Float64Array([1,2]);
   assert.deepEqual(candidate.tick(a,3),reference.tick(a,3));assert.deepEqual(candidate.tick(a,3),[6,2,3]);assert.equal(counts.calls,2);
+});
+
+test('var loop indices execute natively on their first call and preserve hoisting and exits',async t=>{
+  const counts=observe(t),built=compile(VAR_COUNT),candidate=await load(built.code),reference=await load(VAR_COUNT);
+  assert.equal(built.report.loopIslands.compiledKernels,1);
+  assert.deepEqual(built.report.loopIslands.candidates[0].outputOnlyScalars,['i']);
+  for(const values of [[],[2],[1,2,3,4,5],[6,7]]) {
+    const a=new Float32Array(values),b=a.slice(),trace=[],expected=[];
+    assert.equal(candidate.varTick(a,trace),reference.varTick(b,expected));
+    assert.deepEqual(a,b);assert.deepEqual(trace,expected);assert.equal(trace[0][1],'undefined');
+  }
+  assert.equal(counts.calls,4);
+});
+
+test('definite scalar initializers ignore overwritten values without coercing them',async t=>{
+  const counts=observe(t),source=`export function tick(a,i){let j;
+    for(i=0,j=i+1;i<a.length;i++,j++)a[i]+=j;
+    return [i,j,arguments[1]];
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source);
+  assert.deepEqual(built.report.loopIslands.candidates[0].outputOnlyScalars,['i','j']);
+  let conversions=0;const old={valueOf(){conversions++;return 9;}};
+  for(const values of [[],[1,2]]) {
+    const a=new Float64Array(values),b=a.slice();
+    assert.deepEqual(candidate.tick(a,old),reference.tick(b,old));assert.deepEqual(a,b);
+  }
+  assert.equal(conversions,0);assert.equal(counts.calls,2);
+});
+
+test('multiple var declarations and fused loops preserve initializer order and uninitialized bindings',async t=>{
+  const counts=observe(t),source=`export function tick(a){
+    for(var unused,i=0,i=i+1,j=i+2;i<a.length;i++,j++)a[i]+=j;
+    for(var k=0;k<a.length;k++)a[k]*=2;
+    return [unused,i,j,k];
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source),item=built.report.loopIslands.candidates[0];
+  assert.equal(item.kind,'LoopSequence');assert.deepEqual(item.outputOnlyScalars,['i','j','k']);
+  for(const values of [[],[1,2,3,4]]) {
+    const a=new Float64Array(values),b=a.slice();
+    assert.deepEqual(candidate.tick(a),reference.tick(b));assert.deepEqual(a,b);
+  }
+  assert.equal(counts.calls,2);
+});
+
+test('earlier initializer reads retain numeric guards and source coercions',async t=>{
+  const counts=observe(t),source=`export function tick(a,i){
+    for(var j=i,i=0;i<a.length;i++)a[i]+= +j;
+    return [i,j];
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source);
+  assert.deepEqual(built.report.loopIslands.candidates[0].outputOnlyScalars,['j']);
+  const a=new Float64Array([1,2]),b=a.slice();let calls=0,expectedCalls=0;
+  const old={valueOf(){calls++;return 3;}},original={valueOf(){expectedCalls++;return 3;}};
+  const result=candidate.tick(a,old),expected=reference.tick(b,original);
+  assert.equal(result[0],expected[0]);assert.equal(result[1],old);assert.equal(expected[1],original);
+  assert.deepEqual(a,b);assert.equal(calls,expectedCalls);assert.equal(calls,2);assert.equal(counts.calls,0);
+  assert.deepEqual(candidate.tick(a,2),reference.tick(b,2));assert.deepEqual(a,b);assert.equal(counts.calls,1);
+});
+
+test('reads in an earlier fused loop prevent discarding a later overwritten scalar',async t=>{
+  const counts=observe(t),source=`export function tick(a,i){
+    for(let k=0;k<a.length;k++)a[k]+= +i;
+    for(i=0;i<a.length;i++)a[i]*=2;
+    return i;
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source),item=built.report.loopIslands.candidates[0];
+  assert.equal(item.kind,'LoopSequence');assert.equal(item.outputOnlyScalars,undefined);
+  let conversions=0;const input={valueOf(){conversions++;return 3;}},a=new Float64Array([1,2]),b=a.slice();
+  assert.equal(candidate.tick(a,input),reference.tick(b,3));assert.deepEqual(a,b);
+  assert.equal(conversions,2);assert.equal(counts.calls,0);
+  assert.equal(candidate.tick(a,4),reference.tick(b,4));assert.deepEqual(a,b);assert.equal(counts.calls,1);
+});
+
+test('nested and no-init var headers preserve incoming state on zero-trip paths',async t=>{
+  const counts=observe(t),source=`export function tick(a,j){
+    for(var i=0;i<a.length;i++)for(var j=0;j<3;j++){if(j===1)continue;a[i]+=j;}
+    for(var j;j<4;j++)a[0]+=j;
+    return [i,j];
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source),item=built.report.loopIslands.candidates[0];
+  assert.deepEqual(item.outputOnlyScalars,['i']);
+  for(const values of [[],[1,2]]) {
+    const a=new Float64Array(values),b=a.slice();
+    assert.deepEqual(candidate.tick(a,7),reference.tick(b,7));assert.deepEqual(a,b);
+  }
+  assert.equal(counts.calls,2);
+  const a=new Float64Array(),b=a.slice();
+  assert.deepEqual(candidate.tick(a,undefined),reference.tick(b,undefined));assert.equal(counts.calls,2);
+});
+
+test('var initializer publication selects a catch binding without changing the hoisted outer var',async t=>{
+  const counts=observe(t),source=`export function tick(a,caught){var i=99;let inside;
+    try{throw caught;}catch(i){for(var i=0;i<a.length;i++)a[i]+=i;inside=i;}
+    return [inside,i];
+  }`;
+  const built=compile(source),candidate=await load(built.code),reference=await load(source);
+  let conversions=0;const caught={valueOf(){conversions++;return 7;}};
+  for(const values of [[],[1,2,3]]) {
+    const a=new Float64Array(values),b=a.slice();
+    assert.deepEqual(candidate.tick(a,caught),reference.tick(b,caught));assert.deepEqual(a,b);
+  }
+  assert.equal(conversions,0);assert.equal(counts.calls,2);
+});
+
+test('output-only captures probe TDZ before publishing and preserve source effects before the failing write',async t=>{
+  const counts=observe(t);
+  for(const initializer of ['i=0','a[0]=5,i=0']) {
+    const source=`export function tick(a,trace){trace.push('before');
+      for(${initializer};i<a.length;i++)a[i]+=1;
+      let i;trace.push('after');return i;
+    }`;
+    const built=compile(source),candidate=await load(built.code),reference=await load(source);
+    assert.deepEqual(built.report.loopIslands.candidates[0].outputOnlyScalars,['i']);
+    for(const values of [[],[1,2]]) {
+      const a=new Float64Array(values),b=a.slice(),trace=[],expected=[];
+      assert.throws(()=>candidate.tick(a,trace),ReferenceError);assert.throws(()=>reference.tick(b,expected),ReferenceError);
+      assert.deepEqual(a,b);assert.deepEqual(trace,expected);
+    }
+  }
+  assert.equal(counts.calls,0);assert.equal(counts.instances,0);
+});
+
+test('var outputs and array writes roll back together before budget fallback',async t=>{
+  const counts=observe(t),built=compile(VAR_COUNT,{maxIterations:1}),candidate=await load(built.code),reference=await load(VAR_COUNT);
+  const a=new Float64Array([1,2,3,4,5]),b=a.slice(),trace=[],expected=[];
+  assert.equal(candidate.varTick(a,trace),reference.varTick(b,expected));assert.deepEqual(a,b);assert.deepEqual(trace,expected);
+  assert.equal(counts.calls,1);
 });
 
 test('Math min/max reduction outputs preserve infinities signed zero and NaN',async t=>{
@@ -163,7 +294,7 @@ test('state dispatch returns no output for early module calls nonnumeric capture
 
 test('emitted builds publish scalar outputs and describe actual state-runtime imports',async t=>{
   const counts=observe(t),root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-state-app-')),entry=path.join(root,'entry.mjs');
-  fs.writeFileSync(entry,COUNT);fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
+  fs.writeFileSync(entry,COUNT+'\n'+VAR_COUNT);fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
   const plugin=numericKernelRollupPlugin(),bundle=await rollup({input:entry,plugins:[plugin]});
   try {
     const output=await bundle.generate({format:'es'}),chunk=output.output.find(item=>item.type==='chunk');
@@ -171,7 +302,10 @@ test('emitted builds publish scalar outputs and describe actual state-runtime im
     assert.ok(imports.includes('dispatchNumericStateLoop'));assert.ok(!imports.includes('dispatchNumericLoop'));
   }finally{await bundle.close();}
   const built=await buildApplication(entry,path.join(root,'dist'),{specializeNumeric:true});
-  assert.equal(built.numericSpecialization.compiledLoopIslands,1);
+  assert.equal(built.numericSpecialization.compiledLoopIslands,2);
   const module=await import(pathToFileURL(path.join(built.outDir,built.entryFiles[0]))),a=new Float64Array([1,2]);
   assert.deepEqual(module.make(a,[]).tick(),{i:2,count:2,sum:3});assert.deepEqual([...a],[1,3]);assert.equal(counts.calls,1);
+  const b=new Float64Array([1,2,3,4,5]),trace=[];
+  assert.equal(module.varTick(b,trace),3);assert.deepEqual([...b],[1,2,5,7,5]);
+  assert.deepEqual(trace,[['before','undefined'],['after',3]]);assert.equal(counts.calls,2);
 });
