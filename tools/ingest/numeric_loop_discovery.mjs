@@ -6,14 +6,15 @@
  * captured, recursive and non-scalar calls must pass the actual compiler.
  * Every discovered function still passes whole-function numeric compilation.
  */
-import {isNumericReductionCall, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
+import {isNumericForEachCall, isNumericReductionCall,
+  numericForEachCallbackBody, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
 
 // A method spelling only proposes a candidate. Actual receiver types, method
 // identities, lexical scope and effects must still pass compiler/host guards.
 export function isNumericBulkCall(node) {
   return node?.type === 'CallExpression' && !node.optional &&
     node.callee.type === 'MemberExpression' && !node.callee.optional &&
-    !node.callee.computed && ['set', 'fill', 'copyWithin', 'reduce', 'reduceRight'].includes(node.callee.property.name);
+    !node.callee.computed && ['set', 'fill', 'copyWithin', 'reduce', 'reduceRight', 'forEach'].includes(node.callee.property.name);
 }
 
 // includeBulk is explicit so legacy single-entry package selection is stable.
@@ -80,21 +81,45 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       param.type === 'Identifier' ? [[param.name, index]] : []));
     const record = {positions, arrays:new Set(), calls:[], dependencies:new Map(), required:new Set()};
     graph.set(current, record);
-    function depend(binding, value, hidden) {
-      if (binding?.type !== 'Identifier' || hidden.has(binding.name)) return;
-      if (!record.dependencies.has(binding.name)) record.dependencies.set(binding.name, new Set());
-      for (const name of references(value)) if (!hidden.has(name)) record.dependencies.get(binding.name).add(name);
+    const bindingKey = (name, scope) => scope?.get(name) ?? name;
+    const scopedReferences = (value, scope) => references(value).map(name => bindingKey(name, scope));
+    function depend(binding, value, scope) {
+      if (binding?.type !== 'Identifier') return;
+      const key = bindingKey(binding.name, scope);
+      if (!record.dependencies.has(key)) record.dependencies.set(key, new Set());
+      for (const name of scopedReferences(value, scope)) record.dependencies.get(key).add(name);
     }
-    const nodes = [{node:current.body, hidden:new Set()}];
+    // Callback declarations belong to another execution scope. Unique keys
+    // preserve aliases inside it without confusing a shadowed outer parameter
+    // with the callback's scalar value/index or lexical local of the same name.
+    function lexicalScope(scope, statements) {
+      const result = new Map(scope);
+      for (const statement of statements) if (statement?.type === 'VariableDeclaration')
+        for (const declaration of statement.declarations) if (declaration.id.type === 'Identifier')
+          result.set(declaration.id.name, Symbol(declaration.id.name));
+      return result;
+    }
+    const nodes = [{node:current.body, scope:null}];
     while (nodes.length) {
-      const {node, hidden} = nodes.pop();
+      let {node, scope} = nodes.pop();
       if (!node || ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
         'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
-      const visibleReferences = value => references(value).filter(name => !hidden.has(name));
-      if (node.type === 'VariableDeclarator') depend(node.id, node.init, hidden);
-      if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right, hidden);
-      if (node.type === 'MemberExpression' && node.object.type === 'Identifier' && !hidden.has(node.object.name))
-        record.required.add(node.object.name);
+      if (scope) {
+        if (node.type === 'BlockStatement') scope = lexicalScope(scope, node.body);
+        else if (node.type === 'ForStatement') scope = lexicalScope(scope, [node.init]);
+        else if (node.type === 'ForOfStatement') scope = lexicalScope(scope, [node.left]);
+        else if (node.type === 'SwitchStatement') {
+          nodes.push({node:node.discriminant, scope});
+          const cases = lexicalScope(scope, node.cases.flatMap(item => item.consequent));
+          for (const item of node.cases) nodes.push({node:item, scope:cases});
+          continue;
+        }
+      }
+      const visibleReferences = value => scopedReferences(value, scope);
+      if (node.type === 'VariableDeclarator') depend(node.id, node.init, scope);
+      if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right, scope);
+      if (node.type === 'MemberExpression' && node.object.type === 'Identifier')
+        record.required.add(bindingKey(node.object.name, scope));
       if (node.type === 'ForOfStatement')
         for (const name of visibleReferences(node.right)) record.required.add(name);
       // set's source may never be subscripted elsewhere, including through
@@ -104,14 +129,18 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
           !node.callee.computed && node.callee.property.name === 'subarray')
         for (const name of visibleReferences(node.callee.object)) record.required.add(name);
-      if (isNumericReductionCall(node)) {
-        const callback = node.arguments[0], body = numericReductionCallbackBody(callback);
-        // This literal callback is the only nested function whose body is
-        // proposed here. Its parameters shadow outer names; free array inputs
-        // still propagate through the same independent compiler/guard proof.
-        if (body) nodes.push({node:body, hidden:new Set([...hidden, ...callback.params.map(param => param.name)])});
+      if (isNumericReductionCall(node) || isNumericForEachCall(node)) {
+        const callback = node.arguments[0], iteration = isNumericForEachCall(node);
+        const body = iteration ? numericForEachCallbackBody(callback) : numericReductionCallbackBody(callback);
+        if (body) {
+          const callbackScope = new Map(scope);
+          callback.params.forEach(param => callbackScope.set(param.name, Symbol(param.name)));
+          const receiver = callback.params[iteration ? 2 : 3];
+          if (receiver) record.dependencies.set(callbackScope.get(receiver.name), new Set(visibleReferences(node.callee.object)));
+          nodes.push({node:body, scope:callbackScope});
+        }
       }
-      if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier' && !hidden.has(node.callee.name)) {
+      if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier' && !scope?.has(node.callee.name)) {
         const callee = immutableHelpers.get(node.callee.name);
         if (callee?.type === 'FunctionDeclaration') {
           record.calls.push({callee, arguments:node.arguments.map(visibleReferences)});
@@ -120,8 +149,8 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       }
       for (const value of Object.values(node)) {
         if (Array.isArray(value)) {
-          for (const child of value) if (child && typeof child.type === 'string') nodes.push({node:child, hidden});
-        } else if (value && typeof value.type === 'string') nodes.push({node:value, hidden});
+          for (const child of value) if (child && typeof child.type === 'string') nodes.push({node:child, scope});
+        } else if (value && typeof value.type === 'string') nodes.push({node:value, scope});
       }
     }
   }

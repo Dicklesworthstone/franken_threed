@@ -38,7 +38,7 @@ const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
-const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray', 'reduce', 'reduceRight']);
+const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray', 'reduce', 'reduceRight', 'forEach']);
 const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);

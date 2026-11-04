@@ -1,4 +1,4 @@
-# Guarded typed-array operations and reductions
+# Guarded typed-array operations and callbacks
 
 The numeric compiler now emits native Wasm for discarded-result `set`, `fill`
 and `copyWithin` calls. Bulk-only functions do not need an artificial JavaScript
@@ -6,6 +6,8 @@ loop to qualify. Immutable helper graphs, local borrowed references and ordinary
 application callbacks can use the same execution path.
 `reduce` and `reduceRight` also produce numeric results through inline callbacks
 within closed functions, helpers and admitted loop regions.
+Discarded-result `forEach` calls admit inline numeric callbacks that update
+staged arrays and captured scalars, including ordinary animation closures.
 
 ```js
 export const makeFrame = (positions, source, upload) => {
@@ -77,7 +79,7 @@ Reports retain the existing `loopIslands` aggregate, with distinct
 `TypedArrayBulkStatement` and `NumericWorkSequence` candidate kinds. Admitted
 regions declare `typedArrayMethods`. Control reports identify method work as
 `typed-array-set`, `typed-array-fill`, `typed-array-copyWithin`,
-`typed-array-reduce` or `typed-array-reduceRight`; their
+`typed-array-reduce`, `typed-array-reduceRight` or `typed-array-forEach`; their
 `loopCount` includes these work regions, not only explicit JavaScript loops.
 Native-call counts and measured timing remain separate from static reports.
 
@@ -110,6 +112,47 @@ keeps the existing statement/loop boundaries; it does not create islands around
 arbitrary expressions. External callback identities, asynchronous callbacks,
 escaping reference results and arbitrary callback bodies remain in JavaScript.
 
+## Numeric forEach callbacks
+
+Inline synchronous arrow functions and anonymous functions can update a buffer
+and accumulate captured numeric state in one transaction:
+
+```js
+positions.forEach((position, index) => {
+  positions[index] = position + velocities[index] * delta;
+  total += positions[index];
+});
+```
+
+Callbacks accept up to three plain identifier parameters: element, index and
+receiver view. Numeric assignments, updates, lexical locals, closed helpers,
+Math, admitted array operations, branches and loops reuse the existing compiler.
+An expression body can perform one of these effects. A callback `return` ends
+only the current invocation; supported effects in its argument still execute.
+The outer function and subsequent elements continue normally.
+
+The iteration counter is independent of the mutable element and index
+parameters, which are initialized anew for each invocation. The original
+receiver and its length are captured once, including when the callback rebinds
+a different local reference. Reads observe earlier staged writes and overlapping
+views in source order. Callback-local declarations shadow outer bindings only
+within their lexical scope; captured totals publish with the same transaction
+as array writes. Nested callbacks and explicit loops share the invocation's
+work budget. Empty inputs invoke no callback and consume no iteration credit.
+
+Automatic discovery follows captured array aliases into these bodies. The
+island planner prefers a closed containing operation or sequence over its
+callback's inner loops, yielding one native boundary without overlapping edits.
+If the containing callback is not closed, independently closed inner regions
+can still qualify under the existing source rules.
+
+External callback identities, named or asynchronous callbacks, default/rest or
+destructured parameters, `thisArg`, `this`, `arguments`, escaping reference
+values and rebinding the third callback parameter remain in JavaScript. The
+compiler does not introduce a generic higher-order call mechanism or allocate
+callback objects in Wasm. A changed method receives the original literal
+callback through the existing guarded source fallback.
+
 ## Live method guards and fallback
 
 The runtime validates native method descriptors without invoking getters. An
@@ -123,8 +166,8 @@ older runtimes reject the artifact rather than silently omit these checks.
 As with the existing Math/typed-array primordials, trusted runtime bootstrap is
 required; this is not a sandbox for an already-compromised host realm.
 
-Native admission requires direct, non-optional method names; `set`, `fill` and
-`copyWithin` require discarded results. Chained calls, escaping
+Native admission requires direct, non-optional method names; `set`, `fill`,
+`copyWithin` and `forEach` require discarded results. Chained calls, escaping
 `fill`/`copyWithin` results, computed names, spread arguments, unsupported method
 counts, coercive objects and
 ordinary-array `set` sources retain JavaScript. Numeric arguments and source
@@ -147,6 +190,8 @@ Rollup/CLI builds. Linked dynamic applications compare arrays and upload
 snapshots after every frame. Relocated output is tested in fresh processes both
 with and without Wasm. Reduction cases also cover both directions, seeds,
 empty/singleton inputs, callback shadowing, nested/helper effects and source
-callback identity under method overrides. These are execution/equivalence tests
-for the exercised cases, not browser/GPU validation, full Three.js compatibility
-or a speedup.
+callback identity under method overrides. The `forEach` tests additionally cover
+callback-only returns, mutable parameters, lexical captures, nested-loop
+selection, staged mutation, scalar publication and source exceptions after
+partial work. These are execution/equivalence tests for the exercised cases,
+not browser/GPU validation, full Three.js compatibility or a speedup.

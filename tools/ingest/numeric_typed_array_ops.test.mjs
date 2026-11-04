@@ -288,3 +288,111 @@ test('reduction callback admission excludes external identities, escaping values
     assert.throws(()=>compile(`function run(a){return ${expression};}`,['f64[]']));
   }
 });
+
+for(const [Type,type] of types)test(`${Type.name}: forEach preserves live elements, overlapping views and mutable callback parameters`,()=>{
+  const source=`function run(a,b,dt){let total=0;a.forEach(function(value,index,view){
+    const slot=index;index++;value+=b[slot]*dt;view[slot]=value+index;
+    if(slot+1<view.length)view[slot+1]+=value;total+=view[slot];
+  });return total;}`;
+  const reference=Function('return ('+source+')')(),{kernel,artifact}=compile(source,[type,type,'f64']);
+  assert.deepEqual(artifact.manifest.typedArrayMethods,['forEach']);
+  assert.equal(artifact.manifest.parameters[0].write,true);
+  for(const length of [0,1,5])for(const shift of [0,1])for(const dt of [-.5,1.5]) {
+    const a=new Type([1/3,2,-3,4,5,-6]),b=a.slice();
+    assert.ok(Object.is(kernel.run(a.subarray(0,length),a.subarray(shift,shift+length),dt),
+      reference(b.subarray(0,length),b.subarray(shift,shift+length),dt)));same(a,b);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,12);assert.equal(kernel.diagnostics.fallbackCalls,0);
+});
+
+test('forEach snapshots a mutable receiver and restores nested callback, loop and switch return boundaries',()=>{
+  const source=`function run(a,b){let current=a,total=0;current.forEach((value,index,view)=>{
+    current=b;view[index]=value+1;current[index]+=2;
+    b.forEach((value,index)=>{if(index===1)return total+=value;total+=index;});
+    for(let j=0;j<3;j++){switch(j){case 1:if(index===1)return total+=value;break;default:total++;}}
+    total+=10;
+  });return total+current[0];}`;
+  const reference=Function('return ('+source+')')(),{kernel,artifact}=compile(source,['f64[]','f64[]']);
+  for(const overlap of [false,true]) {
+    const a=new Float64Array([1,2,3,4]),b=a.slice(),input=overlap?a.subarray(1):new Float64Array([7,8,9]);
+    const expected=overlap?b.subarray(1):input.slice();
+    assert.equal(kernel.run(a.subarray(0,3),input),reference(b.subarray(0,3),expected));same(a,b);same(input,expected);
+  }
+  assert.equal(artifact.manifest.maxLoopDepth,2);assert.equal(kernel.diagnostics.wasmCalls,2);
+});
+
+test('forEach expression bodies, empty callbacks and per-invocation lexical bindings retain outer scope',()=>{
+  const source=`function run(a,b,Math){let total=0;
+    a.forEach(()=>{});a.forEach(value=>total+=value);
+    a.forEach((value,index)=>{const a=b,Math=value;let total=Math;total++;a[index]=total;});
+    a.forEach(()=>{let total=1;total++;});return total+Math;
+  }`;
+  const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]','f64[]','f64']);
+  const a=new Float64Array([1,2,3]),b=new Float64Array(3),expected=b.slice();
+  assert.equal(kernel.run(a,b,4),reference(a,expected,4));same(b,expected);
+  assert.equal(kernel.diagnostics.wasmCalls,1);assert.equal(kernel.diagnostics.fallbackCalls,0);
+});
+
+test('helper forEach callbacks update staged views and return only from the current callback invocation',()=>{
+  const helpers=new Map([
+    ['edit','function edit(a,b){let total=0;a.forEach((value,index,view)=>{if(index===1)return total+=value;for(let j=0;j<2;j++)view[index]+=b[index];Math.abs(value);total+=view[index];});return total;}'],
+  ]);
+  const source='function run(a,b){return edit(a,b)+a.reduce((sum,value)=>sum+value,0);}';
+  const reference=Function([...helpers.values()].join(';')+';return ('+source+')')();
+  const {kernel,artifact}=compile(source,['f64[]','f64[]'],{helperSources:helpers,allowMath:true,runtime:{resolveMath:()=>Math}});
+  const a=new Float64Array([1,2,3,4]),b=a.slice();
+  assert.equal(kernel.run(a.subarray(0,3),a.subarray(1)),reference(b.subarray(0,3),b.subarray(1)));same(a,b);
+  assert.deepEqual(artifact.manifest.typedArrayMethods,['forEach','reduce']);
+  assert.equal(kernel.diagnostics.wasmCalls,1);assert.equal(kernel.diagnostics.fallbackCalls,0);
+});
+
+test('forEach nested work and late bounds failures roll back earlier writes before one source execution',()=>{
+  const source=`function run(a,b){let total=0;a[0]+=1;b.forEach((value,index)=>{
+    for(let n=0;n<2;n++)a[index]+=value;total+=a[index];
+  });return total;}`;
+  const reference=Function('return ('+source+')')();
+  for(const [length,budget,fallbacks] of [[3,9,0],[3,8,1],[1,100,1]]) {
+    let calls=0;
+    const {kernel}=compile(source,['f64[]','f64[]'],{maxIterations:budget,
+      runtime:{fallback(...args){calls++;return reference(...args);}}});
+    const a=new Float64Array(length).fill(1),b=a.slice(),input=new Float64Array([2,3,4]);
+    assert.ok(Object.is(kernel.run(a,input),reference(b,input)));same(a,b);
+    assert.equal(calls,fallbacks);assert.equal(kernel.diagnostics.fallbackCalls,fallbacks);
+    assert.equal(kernel.diagnostics.wasmCalls,1-fallbacks);
+    assert.equal(kernel.run(a,new Float64Array()),reference(b,new Float64Array()));same(a,b);
+    assert.equal(kernel.diagnostics.wasmCalls,2-fallbacks);
+  }
+});
+
+test('forEach live descriptor guards preserve literal callbacks and exact source exception identity',()=>{
+  const source='function run(a){a[0]+=1;a.forEach((value,index)=>{a[index]+=value;});return a[0];}';
+  const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
+  const parent=Object.getPrototypeOf(Float64Array.prototype);
+  for(const where of ['own','arrayPrototype','typedPrototype']) {
+    const a=new Float64Array([1,2]),target=where==='own'?a:where==='arrayPrototype'?Float64Array.prototype:parent;
+    const descriptor=Object.getOwnPropertyDescriptor(target,'forEach');let gets=0,calls=0,callback;
+    Object.defineProperty(target,'forEach',{configurable:true,get(){gets++;return function(fn){
+      calls++;callback=fn;assert.equal(this,a);fn(5,1,this);return 99;
+    };}});
+    try {assert.equal(kernel.run(a),2);}
+    finally {if(descriptor)Object.defineProperty(target,'forEach',descriptor);else delete target.forEach;}
+    same(a,new Float64Array([2,7]));assert.equal(gets,1);assert.equal(calls,1);
+    assert.equal(callback.length,2);assert.equal(callback.toString(),'(value,index)=>{a[index]+=value;}');
+  }
+  const a=new Float64Array([1]),failure={message:'original method failure'};let gets=0;
+  Object.defineProperty(a,'forEach',{get(){gets++;throw failure;}});
+  assert.throws(()=>kernel.run(a),error=>error===failure);assert.equal(gets,1);assert.equal(a[0],2);
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,4);
+  assert.equal(kernel.run(new Float64Array([1,2])),4);assert.equal(kernel.diagnostics.wasmCalls,1);
+});
+
+test('forEach admission retains unsupported callback identities, this arguments, escaping values and receiver rebinding',()=>{
+  for(const statement of ['a.forEach(callback)','a.forEach(async(value)=>value)',
+    'a.forEach(function named(value){return value;})','a.forEach((value=1)=>value)',
+    'a.forEach((value)=>value,undefined)','a.forEach((value)=>this.value+value)',
+    'a.forEach(function(value){return arguments[0];})','a.forEach((value)=>a)',
+    'a.forEach((value,index,view)=>{view=b;view[index]=value;})','a.forEach(()=>{a=b;})',
+    'a.forEach?.((value)=>value)','a["forEach"]((value)=>value)','return a.forEach((value)=>value)']) {
+    assert.throws(()=>compile(`function run(a,b){${statement};}`,['f64[]','f64[]']));
+  }
+});

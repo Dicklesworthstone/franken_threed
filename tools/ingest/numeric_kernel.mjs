@@ -12,7 +12,7 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation, compileTypedArrayReduction } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
@@ -294,7 +294,7 @@ export function compileNumericKernel(source, {
   const loopControls = [];
   const controlLoops = [];
   let generalDepth = 0, maxGeneralDepth = 0, generalFuel = null;
-  let controlDepth = 0;
+  let controlDepth = 0, callbackReturnDepth = null;
   const mutableLocals = new Set();
   const scalarWrites = new Set();
   const reads = new Set();
@@ -425,6 +425,26 @@ export function compileNumericKernel(source, {
       },
     });
   }
+  function forEach(node, depth) {
+    return compileTypedArrayForEach(node, {resolveArray:helperArray,
+      allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
+      compileCallback(callback, body, values) {
+        const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth;
+        temporaries = new Map(parent); generalDepth++;
+        // The emitter adds a loop-exit block, loop and callback-return block.
+        controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+        callback.params.forEach((param, index) => {
+          temporaries.set(param.name, values[index]);
+          if (index < 2) mutableLocals.add(values[index]);
+        });
+        try { return compileBlock(body.type === 'BlockStatement' ? body.body
+          : [{type:'ExpressionStatement', expression:body}], true, depth + 1); }
+        finally {
+          temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+        }
+      },
+    });
+  }
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
     if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
@@ -549,7 +569,7 @@ export function compileNumericKernel(source, {
         const declaration = node.left, binding = declaration?.declarations?.[0];
         if (node.await || declaration?.type !== 'VariableDeclaration' ||
             !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 ||
-            binding.id.type !== 'Identifier' || binding.init || params.has(binding.id.name))
+            binding.id.type !== 'Identifier' || binding.init || (callbackReturnDepth === null && params.has(binding.id.name)))
           fail('Value iteration requires one fresh lexical binding and a closed typed-array view', node);
         // for-of's binding is in TDZ even while its iterable is evaluated.
         temporaries.set(binding.id.name, null);
@@ -670,7 +690,7 @@ export function compileNumericKernel(source, {
         for (const variable of statement.declarations) {
           const name = variable.id.name;
           if (variable.id.type !== 'Identifier' || !variable.init || name === indexName || nestedIndices.has(name) ||
-              params.has(name) || declared.has(name)) {
+              (callbackReturnDepth === null && params.has(name)) || declared.has(name)) {
             fail('Temporaries must be initialized scalar bindings without parameter/index shadowing', variable);
           }
           declared.add(name);
@@ -740,7 +760,7 @@ export function compileNumericKernel(source, {
           controlDepth += 2; // enclosing switch block and selected-case if
           try {
             for (const name of numericSwitchBindings(statement, fail)) {
-              if (params.has(name) || name === indexName || nestedIndices.has(name))
+              if ((callbackReturnDepth === null && params.has(name)) || name === indexName || nestedIndices.has(name))
                 fail('Switch locals must not shadow parameters or loop indices', statement);
               temporaries.set(name, null);
             }
@@ -763,11 +783,18 @@ export function compileNumericKernel(source, {
           continue;
         }
         if (structuredLoops && statement.type === 'ReturnStatement') {
+          if (callbackReturnDepth !== null) {
+            bytes.push(...compileEffects(statement.argument, depth + 1), 0x0c,
+              ...u32(controlDepth - 1 - callbackReturnDepth));
+            continue;
+          }
           if (!!statement.argument !== !!resultNode) fail('Early return must match the kernel result type', statement);
           bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
+        const iteration = forEach(assignment, depth);
+        if (iteration) { bytes.push(...iteration); continue; }
         const bulk = compileTypedArrayOperation(assignment, {resolveArray:helperArray, expression,
           allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth});
         if (bulk) { bytes.push(...bulk); continue; }
@@ -790,6 +817,10 @@ export function compileNumericKernel(source, {
             bytes.push(...get(local), ...number(1), OPS[assignment.operator[0]], ...set(local));
             scalarWrites.add(local);
           }
+          continue;
+        }
+        if (callbackReturnDepth !== null && assignment && assignment.type !== 'AssignmentExpression') {
+          bytes.push(...expression(assignment), 0x1a);
           continue;
         }
         if (assignment?.type !== 'AssignmentExpression' ||

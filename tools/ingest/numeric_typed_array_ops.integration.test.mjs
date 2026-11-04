@@ -103,11 +103,12 @@ test('nonnumeric reduction seeds preserve identity on empty inputs and coerce on
   assert.equal(app.app.run(a,3),app.reference.run(b,3));equal(a,b);assert.equal(count(app),1);
 });
 
-test('relocated dynamic application builds execute numeric reductions with native or retained source execution',async t=>{
+test('relocated dynamic application builds execute forEach and reductions with native or retained source execution',async t=>{
   const root=folder(t),src=path.join(root,'src'),out=path.join(root,'dist');fs.mkdirSync(src);
   fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
   const source=`
     function measure(a,weights,initial){const view=a.subarray(1);view.fill(initial,0,1);
+      view.forEach((value,index,view)=>{if(index===1)return;view[index]=value+weights[index];});
       return view.reduce((sum,value,index,view)=>sum+value*weights[index]+view[index],initial)
         +view.reduceRight(function(sum,value){return sum-value;});
     }
@@ -141,6 +142,90 @@ test('relocated dynamic application builds execute numeric reductions with nativ
     const result=spawnSync(process.execPath,[runner,path.join(relocated,built.entryFiles[0]),mode],{encoding:'utf8'});
     assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).calls,mode==='native'?6:0);
   }
+});
+
+test('forEach-only source functions discover captured array aliases and retain exported callback identity',async t=>{
+  const app=await application(t,`
+    export function update(a,b,delta){let total=0;a.forEach((value,index,view)=>{
+      const source=b;view[index]=value+source[index]*delta;total+=view[index];
+    });return total;}
+    export const identity=update,run=(a,b,delta)=>update(a,b,delta);
+  `);
+  const item=app.result.report.candidates.find(candidate=>candidate.functionName==='update');
+  assert.equal(item.route,'guarded-numeric-wasm');assert.deepEqual(item.parameterTypes,['f64[]','f64[]','f64']);
+  assert.deepEqual(item.typedArrayMethods,['forEach']);
+  assert.equal(app.app.update,app.app.identity);assert.equal(app.app.update.toString(),app.reference.update.toString());
+  for(const Out of [Float32Array,Float64Array])for(const In of [Float32Array,Float64Array]) {
+    const a=new Out([1,2,3]),b=a.slice(),input=new In([1/3,2/3,1]);
+    assert.equal(app.app.run(a,input,1.5),app.reference.run(b,input,1.5));equal(a,b);
+  }
+  assert.equal(count(app),4);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('forEach islands distinguish callback locals from outer captures, const inputs, scalar outputs and Math',async t=>{
+  const app=await application(t,`
+    export function make(out,input,weights,trace){let total=1;const scale=2;return()=>{
+      trace.push(['before',total]);
+      input.forEach((out,index,Math)=>{const weights=Math;let scale=out;scale++;
+        if(index===1)return total+=weights[index];
+        for(let out=0;out<2;out++)total+=scale+weights[index];
+      });
+      out.forEach((value,index)=>{out[index]=value+weights[index]*scale;total+=out[index]+Math.abs(input[index]);});
+      trace.push(['after',total,...out]);return total;
+    };}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);assert.equal(regions(app)[0].kind,'NumericWorkSequence');
+  assert.deepEqual(regions(app)[0].scalarOutputs,['total']);assert.deepEqual(regions(app)[0].mathIntrinsics,['abs']);
+  for(const Type of [Float32Array,Float64Array]) {
+    const a=new Type([1,2,3]),b=a.slice(),input=new Type([2,-3,4]),weights=new Type([1/3,2/3,1]);
+    const trace=[],expected=[],run=app.app.make(a,input,weights,trace),reference=app.reference.make(b,input,weights,expected);
+    for(let frame=0;frame<3;frame++){assert.equal(run(),reference());equal(a,b);}
+    assert.deepEqual(trace,expected);
+  }
+  assert.equal(count(app),6);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('forEach island fuel failures discard partial buffer writes and captured totals before source fallback',async t=>{
+  const app=await application(t,`
+    export function make(a,b,events){let total=0;return passes=>{
+      events.push(['before',total]);a.forEach((value,index)=>{
+        for(let pass=0;pass<passes;pass++){a[index]+=b[index];total+=a[index];}
+      });events.push(['after',total,...a]);return total;
+    };}
+  `,{loopIslands:true,maxIterations:8});
+  assert.equal(regions(app).length,1);assert.deepEqual(regions(app)[0].scalarOutputs,['total']);
+  const a=new Float32Array([1,2,3]),b=a.slice(),input=new Float32Array([1/3,2/3,1]),events=[],expected=[];
+  const run=app.app.make(a,input,events),reference=app.reference.make(b,input,expected);
+  for(const passes of [1,2,0]){assert.equal(run(passes),reference(passes));equal(a,b);}
+  assert.deepEqual(events,expected);assert.equal(count(app),2);assert.equal(count(app,'fallbackCalls'),1);
+});
+
+test('forEach source exceptions retain preceding callback writes and captured state exactly once',async t=>{
+  const app=await application(t,`
+    export function make(a,b,events){let total=0;return{read(){return total;},step(){
+      events.push('before');a.forEach((value,index,view)=>{
+        view[index]+=1;total+=view[index];view.set(b,index);
+      });events.push('after');
+    }};}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);
+  const a=new Float64Array([1,2,3]),b=a.slice(),input=new Float64Array([7,8]),events=[],expected=[];
+  const run=app.app.make(a,input,events),reference=app.reference.make(b,input,expected);
+  assert.throws(()=>run.step(),RangeError);assert.throws(()=>reference.step(),RangeError);
+  equal(a,b);assert.equal(run.read(),reference.read());assert.deepEqual(events,expected);assert.deepEqual(events,['before']);
+  assert.equal(count(app),0);assert.equal(count(app,'fallbackCalls'),1);
+});
+
+test('unsupported forEach callback identities and this arguments keep original application effects',async t=>{
+  const app=await application(t,`
+    export const events=[];
+    function callback(value,index){events.push([value,index]);}
+    export function run(a,owner){a.forEach(callback);a.forEach(function(value){this.values.push(value);},owner);}
+  `,{loopIslands:true});
+  assert.equal(app.result.report.compiledKernels,0);
+  const owner={values:[]},reference={values:[]},a=new Float64Array([1,2,3]);
+  app.app.run(a,owner);app.reference.run(a,reference);
+  assert.deepEqual(app.app.events,app.reference.events);assert.deepEqual(owner,reference);assert.equal(count(app),0);
 });
 
 for(const Type of layouts)test(`${Type.name}: inferred storage and captured bulk-only sequences need no artificial loop`,async t=>{

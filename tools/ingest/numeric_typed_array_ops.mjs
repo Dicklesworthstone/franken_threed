@@ -32,17 +32,66 @@ export function isNumericReductionCall(node) {
     !node.callee.computed && reductions.has(node.callee.property.name);
 }
 
+export function isNumericForEachCall(node) {
+  return node?.type === 'CallExpression' && !node.optional &&
+    node.callee.type === 'MemberExpression' && !node.callee.optional &&
+    !node.callee.computed && node.callee.property.name === 'forEach';
+}
+
+function inlineCallback(node, parameters) {
+  return node && ['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) &&
+    !node.id && !node.async && !node.generator && node.params.length <= parameters &&
+    node.params.every(param => param.type === 'Identifier') &&
+    new Set(node.params.map(param => param.name)).size === node.params.length;
+}
+
 // Only a literal callback consumed by the guarded native method is inlined.
 // Its identity cannot escape on that path. A changed method receives the real
 // original callback through fallback, never a synthesized callable substitute.
 export function numericReductionCallbackBody(node) {
-  if (!node || !['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) ||
-      node.id || node.async || node.generator || node.params.length > 4 ||
-      node.params.some(param => param.type !== 'Identifier') ||
-      new Set(node.params.map(param => param.name)).size !== node.params.length) return null;
+  if (!inlineCallback(node, 4)) return null;
   if (node.type === 'ArrowFunctionExpression' && node.body.type !== 'BlockStatement') return node.body;
   const statements = node.body.body;
   return statements.length === 1 && statements[0].type === 'ReturnStatement' ? statements[0].argument : null;
+}
+
+export function numericForEachCallbackBody(node) {
+  return inlineCallback(node, 3) ? node.body : null;
+}
+
+/** Ordered numeric updates with a discarded result. The iteration counter and
+ * receiver never alias the callback's mutable value/index parameters. Its body
+ * gets one private block target for returns; the caller owns lexical scope and
+ * effect tracking, just as for an explicit loop in the same transaction.
+ */
+export function compileTypedArrayForEach(node, {
+  resolveArray, compileCallback, allocateLocal, control, fail, loopDepth = 0, owner = null,
+}) {
+  if (!isNumericForEachCall(node)) return null;
+  const receiver = resolveArray(node.callee.object), callback = node.arguments[0];
+  const body = numericForEachCallbackBody(callback);
+  if (!control || !receiver || !body || node.arguments.length !== 1)
+    fail('forEach requires generalControl, a closed typed-array receiver and one inline numeric callback', node);
+  control.methods.add('forEach');
+  control.recordLoop(node, loopDepth + 1, owner?.name ?? null);
+  if (owner) owner.loopDepth = Math.max(owner.loopDepth, loopDepth + 1);
+  receiver.mark({read:true});
+  const view = {type:receiver.type, reference:true, mutable:false,
+    index:allocateLocal(), lengthIndex:allocateLocal(), sources:new Set([receiver]),
+    mark:effect => receiver.mark(effect)};
+  const counter = allocateLocal(), value = allocateLocal(), index = allocateLocal();
+  const storage = layout(receiver.type);
+  const callbackCode = compileCallback(callback, body, [value, index, view]);
+  return [...arrayPointer(receiver), 0xb8, ...set(view.index),
+    ...arrayLength(receiver), 0xb8, ...set(view.lengthIndex), ...number(0), ...set(counter),
+    ...control.charge(get(view.lengthIndex)), 0x02, 0x40, 0x03, 0x40,
+    ...get(counter), ...get(view.lengthIndex), 0x66, 0x0d, 1,
+    ...arrayPointer(view), ...get(counter), 0xab, 0x41, storage.alignment, 0x74, 0x6a,
+    storage.load, storage.alignment, 0,
+    ...(receiver.type === 'f64[]' ? [] : receiver.type === 'f32[]' ? [0xbb] : [storage.signed ? 0xb7 : 0xb8]),
+    ...set(value), ...get(counter), ...set(index),
+    0x02, 0x40, ...callbackCode, 0x0b,
+    ...get(counter), ...number(1), 0xa0, ...set(counter), 0x0c, 0, 0x0b, 0x0b];
 }
 
 /** Ordered scalar reduction over the caller's staged storage. Callback bindings

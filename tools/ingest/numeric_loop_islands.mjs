@@ -9,7 +9,8 @@ import {compileNumericCandidate} from './numeric_candidate.mjs';
 import {NumericKernelCompileError} from './numeric_kernel.mjs';
 import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
 import {discoverNumericArrayParameters, isNumericBulkCall} from './numeric_loop_discovery.mjs';
-import {isNumericReductionCall, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
+import {isNumericForEachCall, isNumericReductionCall,
+  numericForEachCallbackBody, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
 const LOOPS = new Set(['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement']);
@@ -87,20 +88,21 @@ export function numericLoopScopeBindings() {
 function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   const locals = new Set(), references = [], arrays = new Set(), assigned = new Set();
   const varInitializers = [], varNames = new Set();
-  const callbacks = new WeakSet(), callbackReturns = new WeakSet();
+  const callbacks = new WeakSet();
   walk.simple(loop, {CallExpression(node) {
     const callback = node.arguments[0];
-    if (isNumericReductionCall(node) && numericReductionCallbackBody(callback)) {
+    if ((isNumericReductionCall(node) && numericReductionCallbackBody(callback)) ||
+        (isNumericForEachCall(node) && numericForEachCallbackBody(callback))) {
       callbacks.add(callback);
-      if (callback.body.type === 'BlockStatement') callbackReturns.add(callback.body.body[0]);
     }
   }});
   let refusal = null, usesMath = false;
   const ownerOf = (name, scopes, position) => [...scopes].reverse()
     .find(scope => bindings(scope, position).has(name));
   walk.fullAncestor(loop, (node, _state, innerAncestors) => {
-    const callbackBinding = name => innerAncestors.some(scope => callbacks.has(scope) &&
-      scope.params.some(param => param.name === name));
+    const callbackIndex = innerAncestors.findIndex(scope => callbacks.has(scope));
+    const callbackBinding = name => callbackIndex !== -1 && innerAncestors.slice(callbackIndex)
+      .some(scope => bindings(scope, node).has(name));
     if (node.type === 'CallExpression' && node.callee.type === 'Identifier' &&
         helperDeclarations.has(node.callee.name)) {
       const owner = ownerOf(node.callee.name, [...ancestors, ...innerAncestors.slice(0, -1)], node);
@@ -118,7 +120,7 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
         // Function-scoped headers publish through the scalar-state channel.
         // Body declarations and destructuring need separate initialization and
         // observation proofs; do not turn them into lexical loop temporaries.
-        if (parent?.type !== 'ForStatement' || parent.init !== node ||
+        if (callbackIndex !== -1 || parent?.type !== 'ForStatement' || parent.init !== node ||
             node.declarations.some(d => d.id.type !== 'Identifier'))
           refusal = 'ISLAND_ESCAPING_DECLARATION';
         varInitializers.push(node);
@@ -126,16 +128,19 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
           pattern(d.id, varNames);
           if (d.init) pattern(d.id, assigned);
         }
-      } else for (const d of node.declarations) pattern(d.id, locals);
+      } else if (callbackIndex === -1) for (const d of node.declarations) pattern(d.id, locals);
     }
     if ((FUNCTIONS.has(node.type) && !callbacks.has(node)) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression')
       refusal = 'ISLAND_NESTED_CLOSURE';
-    if ((node.type === 'ReturnStatement' && !callbackReturns.has(node)) ||
+    if ((node.type === 'ReturnStatement' && !callbacks.has(innerAncestors.findLast(scope => FUNCTIONS.has(scope.type)))) ||
         ['AwaitExpression', 'YieldExpression', 'ThisExpression', 'Super', 'MetaProperty'].includes(node.type) ||
         (['BreakStatement', 'ContinueStatement'].includes(node.type) && node.label))
       refusal = 'ISLAND_ESCAPING_CONTROL';
-    if (node.type === 'AssignmentExpression') pattern(node.left, assigned);
-    if (node.type === 'UpdateExpression') pattern(node.argument, assigned);
+    if (node.type === 'AssignmentExpression' || node.type === 'UpdateExpression') {
+      const names = new Set();
+      pattern(node.type === 'AssignmentExpression' ? node.left : node.argument, names);
+      for (const name of names) if (!callbackBinding(name)) assigned.add(name);
+    }
     if (node.type === 'MemberExpression' && node.object.type === 'Identifier' && !callbackBinding(node.object.name)) {
       arrays.add(node.object.name);
       if (node.object.name === 'Math') usesMath = true;
@@ -227,7 +232,8 @@ export function planNumericLoopIslands(source, {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
   const edits = [], registrations = [], runtimeImports = [], accepted = [], absorbedEdits = new Set();
-  const candidates = [], bindings = numericLoopScopeBindings(), hints = discoverNumericStorageHints(ast);
+  const candidates = [], loopContainers = new WeakSet();
+  const bindings = numericLoopScopeBindings(), hints = discoverNumericStorageHints(ast);
   const helperMath = new Map();
   function usesHelperMath(name) {
     if (!helperMath.has(name)) {
@@ -240,8 +246,11 @@ export function planNumericLoopIslands(source, {
     return helperMath.get(name);
   }
   walk.fullAncestor(ast, (node, _state, ancestors) => {
+    // The walk is postorder: a containing callback operation inherits the
+    // priority of its explicit loops before either replacement is selected.
+    if (LOOPS.has(node.type)) for (const scope of ancestors) loopContainers.add(scope);
     if (numericWork(node)) candidates.push({node, ancestors:ancestors.slice(0,-1),
-      loopPriority:LOOPS.has(node.type), ...(bulkStatement(node) ? {kind:'TypedArrayBulkStatement'} : {})});
+      loopPriority:loopContainers.has(node), ...(bulkStatement(node) ? {kind:'TypedArrayBulkStatement'} : {})});
     // A sequence is closed only if ALL its statements are closed. Combining
     // adjacent numeric work removes intermediate copy/publication boundaries
     // without crossing arbitrary calls, declarations or suspension points. Bulk
@@ -255,7 +264,7 @@ export function planNumericLoopIslands(source, {
         if (end-first>1) {
           const body=node.body.slice(first,end), start=body[0], last=body.at(-1);
           candidates.push({kind:body.every(statement => LOOPS.has(statement.type)) ? 'LoopSequence' : 'NumericWorkSequence',
-            loopPriority:body.some(statement => LOOPS.has(statement.type)), ancestors:[...ancestors], node:{
+            loopPriority:body.some(statement => loopContainers.has(statement)), ancestors:[...ancestors], node:{
             type:'BlockStatement', body, start:start.start, end:last.end,
             loc:{start:start.loc.start,end:last.loc.end},
           }});
@@ -272,7 +281,10 @@ export function planNumericLoopIslands(source, {
   candidates.sort((a,b) => Number(b.loopPriority)-Number(a.loopPriority) || a.node.start-b.node.start || b.node.end-a.node.end);
   let createName, dispatchName, stateDispatchName;
   for (const {node, ancestors, kind=node.type} of candidates) {
-    if ([...excludedSpans, ...accepted].some(range => contains(range,node))) continue;
+    // Never splice a second edit across an accepted region, even if a future
+    // candidate priority rule orders an inner operation before its container.
+    if (excludedSpans.some(range => contains(range,node)) ||
+        accepted.some(range => contains(range,node) || contains(node,range))) continue;
     const item = {sourceSpan:span(node), kind, route:'retained-js', reason:null};
     report.candidates.push(item);
     if (report.compiledKernels >= maxKernels) { item.reason='KERNEL_BUDGET'; continue; }

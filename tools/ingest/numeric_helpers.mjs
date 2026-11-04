@@ -13,7 +13,7 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation, compileTypedArrayReduction } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -149,7 +149,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           mark({ read, write }) { effect.read ||= read || write; effect.write ||= write; } });
       }
     });
-    let localCount = 0, loopDepth = 0, controlDepth = 0;
+    let localCount = 0, loopDepth = 0, controlDepth = 0, callbackReturnDepth = null;
     const loopControls = [];
     function lookup(node, writing = false) {
       if (node?.type !== 'Identifier' || !environment.has(node.name)) fail('Scalar helpers cannot access captured or non-scalar bindings', node);
@@ -216,6 +216,22 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             index === 3 ? values[index] : {index:values[index], mutable:true}));
           try { return expression(body, depth + 1); }
           finally { environment = parent; loopDepth--; }
+        },
+      });
+    }
+    function forEach(node, depth) {
+      return compileTypedArrayForEach(node, {resolveArray, allocateLocal, control, fail, loopDepth, owner,
+        compileCallback(callback, body, values) {
+          const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth;
+          environment = new Map(parent); loopDepth++;
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+          callback.params.forEach((param, index) => environment.set(param.name,
+            index === 2 ? values[index] : {index:values[index], mutable:true}));
+          try { return block(body.type === 'BlockStatement' ? body.body
+            : [{type:'ExpressionStatement', expression:body}], depth + 1).bytes; }
+          finally {
+            environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+          }
         },
       });
     }
@@ -375,8 +391,12 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
               bytes.push(...value, ...set(index));
             }
           } else if (statement.type === 'ReturnStatement') {
-            if (owner.resultType === 'f64' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
-            bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
+            if (callbackReturnDepth !== null) bytes.push(...effects(statement.argument, depth + 1),
+              0x0c, ...u32(controlDepth - 1 - callbackReturnDepth));
+            else {
+              if (owner.resultType === 'f64' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
+              bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
+            }
             advance(['return']);
           } else if (statement.type === 'BlockStatement') {
             const nested = child(statement);
@@ -423,6 +443,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             // Empty bodies/for clauses still spend credit at the body boundary.
           } else {
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
+            const iteration = forEach(update, depth);
+            if (iteration) { bytes.push(...iteration); continue; }
             const bulk = compileTypedArrayOperation(update, {resolveArray, expression, allocateLocal,
               control, fail, loopDepth, owner});
             const reduced = bulk ? null : reduction(update, depth);
@@ -457,6 +479,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
               const value = expression(update.right);
               bytes.push(...(update.operator === '=' ? value
                 : binary(update.operator.slice(0, -1), get(local), value)), ...set(local));
+            } else if (callbackReturnDepth !== null && update) {
+              bytes.push(...expression(update), 0x1a);
             } else {
               fail(`Scalar helper statement ${statement.type} is not closed`, statement);
             }
