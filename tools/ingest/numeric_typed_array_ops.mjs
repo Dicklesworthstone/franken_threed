@@ -9,6 +9,7 @@ import {arrayPointer, arrayLength} from './numeric_array_references.mjs';
 import {INTEGER_ARRAY_LAYOUTS, emitToUint32, emitToUint8Clamp} from './numeric_integer.mjs';
 
 const names = new Set(['set', 'fill', 'copyWithin']);
+const reductions = new Set(['reduce', 'reduceRight']);
 const u32 = value => {
   const bytes = [];
   do { const byte = value & 127; value >>>= 7; bytes.push(byte | (value ? 128 : 0)); } while (value);
@@ -24,6 +25,75 @@ const layout = type => INTEGER_ARRAY_LAYOUTS[type] ?? {
   alignment:type === 'f64[]' ? 3 : 2, load:type === 'f64[]' ? 0x2b : 0x2a,
   store:type === 'f64[]' ? 0x39 : 0x38,
 };
+
+export function isNumericReductionCall(node) {
+  return node?.type === 'CallExpression' && !node.optional &&
+    node.callee.type === 'MemberExpression' && !node.callee.optional &&
+    !node.callee.computed && reductions.has(node.callee.property.name);
+}
+
+// Only a literal callback consumed by the guarded native method is inlined.
+// Its identity cannot escape on that path. A changed method receives the real
+// original callback through fallback, never a synthesized callable substitute.
+export function numericReductionCallbackBody(node) {
+  if (!node || !['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) ||
+      node.id || node.async || node.generator || node.params.length > 4 ||
+      node.params.some(param => param.type !== 'Identifier') ||
+      new Set(node.params.map(param => param.name)).size !== node.params.length) return null;
+  if (node.type === 'ArrowFunctionExpression' && node.body.type !== 'BlockStatement') return node.body;
+  const statements = node.body.body;
+  return statements.length === 1 && statements[0].type === 'ReturnStatement' ? statements[0].argument : null;
+}
+
+/** Ordered scalar reduction over the caller's staged storage. Callback bindings
+ * belong to a private lexical scope supplied by the root/helper compiler. No
+ * JavaScript callback, reference allocation or intermediate publication occurs.
+ */
+export function compileTypedArrayReduction(node, {
+  resolveArray, expression, compileCallback, allocateLocal, control, fail, loopDepth = 0, owner = null,
+}) {
+  if (!isNumericReductionCall(node)) return null;
+  const receiver = resolveArray(node.callee.object), callback = node.arguments[0];
+  const body = numericReductionCallbackBody(callback);
+  if (!control || !receiver || !body || node.arguments.length > 2 ||
+      node.arguments.some(arg => arg.type === 'SpreadElement'))
+    fail('Reductions require generalControl, a closed typed-array receiver and an inline numeric callback', node);
+  const method = node.callee.property.name, reverse = method === 'reduceRight';
+  control.methods.add(method);
+  control.recordLoop(node, loopDepth + 1, owner?.name ?? null);
+  if (owner) owner.loopDepth = Math.max(owner.loopDepth, loopDepth + 1);
+  receiver.mark({read:true});
+  const view = {type:receiver.type, reference:true, mutable:false,
+    index:allocateLocal(), lengthIndex:allocateLocal(), sources:new Set([receiver]),
+    mark:effect => receiver.mark(effect)};
+  const accumulator = allocateLocal(), value = allocateLocal(), index = allocateLocal();
+  const storage = layout(receiver.type);
+  const load = () => [...arrayPointer(view), ...get(index), 0xab, 0x41, storage.alignment, 0x74, 0x6a,
+    storage.load, storage.alignment, 0,
+    ...(receiver.type === 'f64[]' ? [] : receiver.type === 'f32[]' ? [0xbb] : [storage.signed ? 0xb7 : 0xb8])];
+  const advance = [...get(index), ...number(1), reverse ? 0xa1 : 0xa0, ...set(index)];
+  // The receiver and its intrinsic length are captured BEFORE the initial-value
+  // expression. The callback's array argument refers to this same snapshot even
+  // when a later local reference is rebound by the enclosing source function.
+  const code = [...arrayPointer(receiver), 0xb8, ...set(view.index),
+    ...arrayLength(receiver), 0xb8, ...set(view.lengthIndex),
+    ...(reverse ? [...get(view.lengthIndex), ...number(1), 0xa1] : number(0)), ...set(index)];
+  const initial = node.arguments.length === 2;
+  if (initial) code.push(...expression(node.arguments[1]), ...set(accumulator));
+  else code.push(...trapUnless([...get(view.lengthIndex), ...number(0), 0x64]),
+    ...load(), ...set(accumulator), ...advance);
+  const callbackCode = compileCallback(callback, body, [accumulator, value, index, view]);
+  const count = [...get(view.lengthIndex), ...(!initial ? [...number(1), 0xa1] : [])];
+  const more = reverse ? [...get(index), ...number(0), 0x66]
+    : [...get(index), ...get(view.lengthIndex), 0x63];
+  // A one-element unseeded reduction invokes no callback and keeps the loaded
+  // Number untouched. Empty unseeded reductions trap before work/publication,
+  // letting the original method produce its source TypeError in place.
+  code.push(...control.charge(count), 0x02, 0x40, 0x03, 0x40,
+    ...more, 0x45, 0x0d, 1, ...load(), ...set(value),
+    ...callbackCode, ...set(accumulator), ...advance, 0x0c, 0, 0x0b, 0x0b, ...get(accumulator));
+  return code;
+}
 
 /** Null is not an admitted bulk call. Only discarded direct member calls are
  * accepted: result escape/chaining, dynamic properties and spreads stay in JS.

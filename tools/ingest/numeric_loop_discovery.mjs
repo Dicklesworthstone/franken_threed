@@ -6,12 +6,14 @@
  * captured, recursive and non-scalar calls must pass the actual compiler.
  * Every discovered function still passes whole-function numeric compilation.
  */
+import {isNumericReductionCall, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
+
 // A method spelling only proposes a candidate. Actual receiver types, method
 // identities, lexical scope and effects must still pass compiler/host guards.
 export function isNumericBulkCall(node) {
   return node?.type === 'CallExpression' && !node.optional &&
     node.callee.type === 'MemberExpression' && !node.callee.optional &&
-    !node.callee.computed && ['set', 'fill', 'copyWithin'].includes(node.callee.property.name);
+    !node.callee.computed && ['set', 'fill', 'copyWithin', 'reduce', 'reduceRight'].includes(node.callee.property.name);
 }
 
 // includeBulk is explicit so legacy single-entry package selection is stable.
@@ -78,40 +80,48 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       param.type === 'Identifier' ? [[param.name, index]] : []));
     const record = {positions, arrays:new Set(), calls:[], dependencies:new Map(), required:new Set()};
     graph.set(current, record);
-    function depend(binding, value) {
-      if (binding?.type !== 'Identifier') return;
+    function depend(binding, value, hidden) {
+      if (binding?.type !== 'Identifier' || hidden.has(binding.name)) return;
       if (!record.dependencies.has(binding.name)) record.dependencies.set(binding.name, new Set());
-      for (const name of references(value)) record.dependencies.get(binding.name).add(name);
+      for (const name of references(value)) if (!hidden.has(name)) record.dependencies.get(binding.name).add(name);
     }
-    const nodes = [current.body];
+    const nodes = [{node:current.body, hidden:new Set()}];
     while (nodes.length) {
-      const node = nodes.pop();
+      const {node, hidden} = nodes.pop();
       if (!node || ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
         'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
-      if (node.type === 'VariableDeclarator') depend(node.id, node.init);
-      if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right);
-      if (node.type === 'MemberExpression' && node.object.type === 'Identifier')
+      const visibleReferences = value => references(value).filter(name => !hidden.has(name));
+      if (node.type === 'VariableDeclarator') depend(node.id, node.init, hidden);
+      if (node.type === 'AssignmentExpression' && node.operator === '=') depend(node.left, node.right, hidden);
+      if (node.type === 'MemberExpression' && node.object.type === 'Identifier' && !hidden.has(node.object.name))
         record.required.add(node.object.name);
       if (node.type === 'ForOfStatement')
-        for (const name of references(node.right)) record.required.add(name);
+        for (const name of visibleReferences(node.right)) record.required.add(name);
       // set's source may never be subscripted elsewhere, including through
       // aliases and reordered helper parameters. Treat it as a required view.
       if (isNumericBulkCall(node) && node.callee.property.name === 'set')
-        for (const name of references(node.arguments[0])) record.required.add(name);
+        for (const name of visibleReferences(node.arguments[0])) record.required.add(name);
       if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
           !node.callee.computed && node.callee.property.name === 'subarray')
-        for (const name of references(node.callee.object)) record.required.add(name);
-      if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier') {
+        for (const name of visibleReferences(node.callee.object)) record.required.add(name);
+      if (isNumericReductionCall(node)) {
+        const callback = node.arguments[0], body = numericReductionCallbackBody(callback);
+        // This literal callback is the only nested function whose body is
+        // proposed here. Its parameters shadow outer names; free array inputs
+        // still propagate through the same independent compiler/guard proof.
+        if (body) nodes.push({node:body, hidden:new Set([...hidden, ...callback.params.map(param => param.name)])});
+      }
+      if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier' && !hidden.has(node.callee.name)) {
         const callee = immutableHelpers.get(node.callee.name);
         if (callee?.type === 'FunctionDeclaration') {
-          record.calls.push({callee, arguments:node.arguments.map(references)});
+          record.calls.push({callee, arguments:node.arguments.map(visibleReferences)});
           if (!graph.has(callee)) pending.push(callee);
         }
       }
       for (const value of Object.values(node)) {
         if (Array.isArray(value)) {
-          for (const child of value) if (child && typeof child.type === 'string') nodes.push(child);
-        } else if (value && typeof value.type === 'string') nodes.push(value);
+          for (const child of value) if (child && typeof child.type === 'string') nodes.push({node:child, hidden});
+        } else if (value && typeof value.type === 'string') nodes.push({node:value, hidden});
       }
     }
   }

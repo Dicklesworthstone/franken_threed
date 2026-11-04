@@ -13,7 +13,7 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -206,6 +206,19 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return emitBitwiseBinary(operator, left, right, () => owner.wasmTypes.length + localCount++)
         ?? [...left, ...right, OPS[operator]];
     }
+    function reduction(node, depth) {
+      return compileTypedArrayReduction(node, {resolveArray,
+        expression:arg => expression(arg, depth + 1), allocateLocal, control, fail, loopDepth, owner,
+        compileCallback(callback, body, values) {
+          const parent = environment;
+          environment = new Map(parent); loopDepth++;
+          callback.params.forEach((param, index) => environment.set(param.name,
+            index === 3 ? values[index] : {index:values[index], mutable:true}));
+          try { return expression(body, depth + 1); }
+          finally { environment = parent; loopDepth--; }
+        },
+      });
+    }
     function expression(node, depth = 0) {
       if (!node || depth > 128) fail('Scalar helper expression exceeds the nesting limit', node);
       if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
@@ -230,6 +243,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           ...expression(node.consequent, depth + 1), 0x05, ...expression(node.alternate, depth + 1), 0x0b];
       }
       if (node.type === 'CallExpression') {
+        const reduced = reduction(node, depth);
+        if (reduced) return reduced;
         const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
           environment.has('Math') || helperSources.has('Math'), () => owner.wasmTypes.length + localCount++);
         if (intrinsic) return intrinsic;
@@ -410,7 +425,9 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
             const bulk = compileTypedArrayOperation(update, {resolveArray, expression, allocateLocal,
               control, fail, loopDepth, owner});
+            const reduced = bulk ? null : reduction(update, depth);
             if (bulk) { bytes.push(...bulk); }
+            else if (reduced) { bytes.push(...reduced, 0x1a); }
             else if (update?.type === 'CallExpression' && update.callee.type === 'Identifier') {
               bytes.push(...call(update, arg => expression(arg), environment.has(update.callee.name), owner, loopDepth, resolveArray, false));
             } else if (control && update?.type === 'SequenceExpression') {

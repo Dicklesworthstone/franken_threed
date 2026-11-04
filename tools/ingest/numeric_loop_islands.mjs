@@ -9,6 +9,7 @@ import {compileNumericCandidate} from './numeric_candidate.mjs';
 import {NumericKernelCompileError} from './numeric_kernel.mjs';
 import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
 import {discoverNumericArrayParameters, isNumericBulkCall} from './numeric_loop_discovery.mjs';
+import {isNumericReductionCall, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
 const LOOPS = new Set(['ForStatement', 'ForOfStatement', 'WhileStatement', 'DoWhileStatement']);
@@ -86,10 +87,20 @@ export function numericLoopScopeBindings() {
 function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   const locals = new Set(), references = [], arrays = new Set(), assigned = new Set();
   const varInitializers = [], varNames = new Set();
+  const callbacks = new WeakSet(), callbackReturns = new WeakSet();
+  walk.simple(loop, {CallExpression(node) {
+    const callback = node.arguments[0];
+    if (isNumericReductionCall(node) && numericReductionCallbackBody(callback)) {
+      callbacks.add(callback);
+      if (callback.body.type === 'BlockStatement') callbackReturns.add(callback.body.body[0]);
+    }
+  }});
   let refusal = null, usesMath = false;
   const ownerOf = (name, scopes, position) => [...scopes].reverse()
     .find(scope => bindings(scope, position).has(name));
   walk.fullAncestor(loop, (node, _state, innerAncestors) => {
+    const callbackBinding = name => innerAncestors.some(scope => callbacks.has(scope) &&
+      scope.params.some(param => param.name === name));
     if (node.type === 'CallExpression' && node.callee.type === 'Identifier' &&
         helperDeclarations.has(node.callee.name)) {
       const owner = ownerOf(node.callee.name, [...ancestors, ...innerAncestors.slice(0, -1)], node);
@@ -117,18 +128,20 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
         }
       } else for (const d of node.declarations) pattern(d.id, locals);
     }
-    if (FUNCTIONS.has(node.type) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression')
+    if ((FUNCTIONS.has(node.type) && !callbacks.has(node)) || node.type === 'ClassDeclaration' || node.type === 'ClassExpression')
       refusal = 'ISLAND_NESTED_CLOSURE';
-    if (['ReturnStatement', 'AwaitExpression', 'YieldExpression', 'ThisExpression', 'Super', 'MetaProperty'].includes(node.type) ||
+    if ((node.type === 'ReturnStatement' && !callbackReturns.has(node)) ||
+        ['AwaitExpression', 'YieldExpression', 'ThisExpression', 'Super', 'MetaProperty'].includes(node.type) ||
         (['BreakStatement', 'ContinueStatement'].includes(node.type) && node.label))
       refusal = 'ISLAND_ESCAPING_CONTROL';
     if (node.type === 'AssignmentExpression') pattern(node.left, assigned);
     if (node.type === 'UpdateExpression') pattern(node.argument, assigned);
-    if (node.type === 'MemberExpression' && node.object.type === 'Identifier') {
+    if (node.type === 'MemberExpression' && node.object.type === 'Identifier' && !callbackBinding(node.object.name)) {
       arrays.add(node.object.name);
       if (node.object.name === 'Math') usesMath = true;
     }
     if (node.type === 'Identifier') {
+      if (callbackBinding(node.name)) return;
       // Acorn's semantic walker omits ordinary property names and labels. Keep
       // initialized binding identifiers too; an uninitialized var declaration
       // is only hoisting, not a read of its incoming value.

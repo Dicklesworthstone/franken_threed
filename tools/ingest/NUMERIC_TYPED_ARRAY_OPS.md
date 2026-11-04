@@ -1,9 +1,11 @@
-# Guarded bulk typed-array operations
+# Guarded typed-array operations and reductions
 
 The numeric compiler now emits native Wasm for discarded-result `set`, `fill`
 and `copyWithin` calls. Bulk-only functions do not need an artificial JavaScript
 loop to qualify. Immutable helper graphs, local borrowed references and ordinary
 application callbacks can use the same execution path.
+`reduce` and `reduceRight` also produce numeric results through inline callbacks
+within closed functions, helpers and admitted loop regions.
 
 ```js
 export const makeFrame = (positions, source, upload) => {
@@ -74,9 +76,39 @@ JavaScript exceptions and preceding source-visible writes remain intact.
 Reports retain the existing `loopIslands` aggregate, with distinct
 `TypedArrayBulkStatement` and `NumericWorkSequence` candidate kinds. Admitted
 regions declare `typedArrayMethods`. Control reports identify method work as
-`typed-array-set`, `typed-array-fill` or `typed-array-copyWithin`; their
+`typed-array-set`, `typed-array-fill`, `typed-array-copyWithin`,
+`typed-array-reduce` or `typed-array-reduceRight`; their
 `loopCount` includes these work regions, not only explicit JavaScript loops.
 Native-call counts and measured timing remain separate from static reports.
+
+## Ordered numeric reductions
+
+Inline arrow expressions and anonymous callbacks with a single numeric `return`
+can compute sums, weighted totals and other ordered scalar reductions:
+
+```js
+export function weightedSum(values, weights, seed) {
+  return values.reduce((total, value, index) => total + value * weights[index], seed);
+}
+```
+
+Callbacks accept up to four plain identifier parameters: accumulator, element,
+index and the original receiver view. Numeric seeds and captured scalars/views
+use the existing invocation guards. Callback names shadow enclosing bindings
+only inside their own body, including nested reductions. The receiver and length
+are captured before the initial value is evaluated; callback reads and helper
+writes observe staged storage in exact left-to-right or right-to-left order.
+
+An omitted seed uses the first or last element. An unseeded singleton invokes no
+callback; an empty unseeded input takes the original path for its source `TypeError`.
+Each callback invocation charges the existing shared work budget. A bounds or
+budget failure rolls back the complete transaction before the original source
+runs once, preserving preceding writes and errors.
+
+Reduction results can appear in closed numeric expressions. Automatic extraction
+keeps the existing statement/loop boundaries; it does not create islands around
+arbitrary expressions. External callback identities, asynchronous callbacks,
+escaping reference results and arbitrary callback bodies remain in JavaScript.
 
 ## Live method guards and fallback
 
@@ -91,12 +123,13 @@ older runtimes reject the artifact rather than silently omit these checks.
 As with the existing Math/typed-array primordials, trusted runtime bootstrap is
 required; this is not a sandbox for an already-compromised host realm.
 
-Native admission currently requires direct, non-optional method names and
-discarded results. Chained calls, escaping `fill`/`copyWithin` results, computed
-names, spread arguments, unsupported method counts, coercive objects and
+Native admission requires direct, non-optional method names; `set`, `fill` and
+`copyWithin` require discarded results. Chained calls, escaping
+`fill`/`copyWithin` results, computed names, spread arguments, unsupported method
+counts, coercive objects and
 ordinary-array `set` sources retain JavaScript. Numeric arguments and source
 views must satisfy the actual invocation guards; discovery alone proves none
-of these properties. Array allocation, `subarray`, sorting and reductions are
+of these properties. Array allocation, `subarray` and sorting are
 not added by this change. A compilation refusal does not remove those features
 from the application's retained JavaScript.
 
@@ -112,5 +145,8 @@ overlap, bit preservation, exact range semantics, descriptor guards, helper
 arguments, rollback, automatic source discovery, imported identities and actual
 Rollup/CLI builds. Linked dynamic applications compare arrays and upload
 snapshots after every frame. Relocated output is tested in fresh processes both
-with and without Wasm. These are execution/equivalence tests for the exercised
-cases, not browser/GPU validation, full Three.js compatibility or a speedup.
+with and without Wasm. Reduction cases also cover both directions, seeds,
+empty/singleton inputs, callback shadowing, nested/helper effects and source
+callback identity under method overrides. These are execution/equivalence tests
+for the exercised cases, not browser/GPU validation, full Three.js compatibility
+or a speedup.

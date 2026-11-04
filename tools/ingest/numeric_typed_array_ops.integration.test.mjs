@@ -52,6 +52,97 @@ test('bulk-only functions discover both array slots and retain exported identity
   assert.equal(count(app),4);assert.equal(count(app,'fallbackCalls'),0);
 });
 
+test('reduction-only functions discover callback array captures and inline helper graphs automatically',async t=>{
+  const app=await application(t,`
+    export function weighted(a,weights,scale){return a.reduce((sum,value,index)=>sum+value*weights[index]*scale,0);}
+    export function measure(a,weights,scale){return weighted(a,weights,scale)+a.reduceRight((sum,value)=>sum-value,0);}
+    export const identity=measure,weightedIdentity=weighted,run=(a,weights,scale)=>measure(a,weights,scale);
+  `);
+  const item=app.result.report.candidates.find(candidate=>candidate.functionName==='measure');
+  assert.equal(item.route,'guarded-numeric-wasm');assert.deepEqual(item.parameterTypes,['f64[]','f64[]','f64']);
+  assert.deepEqual(item.typedArrayMethods,['reduce','reduceRight']);
+  assert.equal(app.app.measure,app.app.identity);assert.equal(app.app.measure.name,app.reference.measure.name);
+  assert.equal(app.app.measure.length,app.reference.measure.length);
+  assert.equal(app.app.weighted,app.app.weightedIdentity);
+  assert.equal(app.app.weighted.toString(),app.reference.weighted.toString());
+  for(const Type of [Float32Array,Float64Array]) {
+    const a=new Type([1/3,2,3]),weights=new Type([3,2,1]);
+    assert.equal(app.app.run(a,weights,1.5),app.reference.run(a,weights,1.5));
+  }
+  assert.equal(count(app),2);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('reducer-local names do not hide outer island array captures, scalar outputs or Math',async t=>{
+  const app=await application(t,`
+    export function make(out,input,weights,trace){let total=1;return()=>{trace.push('before');
+      for(let n=0;n<2;n++){
+        out[n]=input.reduce((total,value,index,out)=>total+value*weights[index]+out[index],0)+total;
+        total+=input.reduceRight(function(total,value,index,Math){return total+Math[index];},0)+Math.abs(out[n]);
+      }
+      trace.push([total,...out]);return total;
+    };}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);assert.deepEqual(regions(app)[0].scalarOutputs,['total']);
+  assert.deepEqual(regions(app)[0].mathIntrinsics,['abs']);
+  const a=new Float64Array([0,0]),b=a.slice(),input=new Float64Array([1,2,3]),weights=new Float64Array([3,2,1]);
+  const trace=[],expected=[],native=app.app.make(a,input,weights,trace),reference=app.reference.make(b,input,weights,expected);
+  for(let frame=0;frame<3;frame++){assert.equal(native(),reference());equal(a,b);}
+  assert.deepEqual(trace,expected);assert.equal(count(app),3);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('nonnumeric reduction seeds preserve identity on empty inputs and coerce only in source callbacks',async t=>{
+  const app=await application(t,`
+    function total(a,initial){a[0]+=1;return a.reduce((sum,value)=>sum+value,initial);}
+    export const run=(a,initial)=>total(a,initial);
+  `);
+  let conversions=0;const initial={valueOf(){conversions++;return 5;}};
+  assert.equal(app.app.run(new Float64Array(),initial),initial);assert.equal(conversions,0);
+  const a=new Float64Array([1,2]),b=a.slice();
+  assert.equal(app.app.run(a,initial),app.reference.run(b,5));equal(a,b);assert.equal(conversions,1);
+  assert.equal(count(app),0);assert.equal(count(app,'fallbackCalls'),2);
+  assert.equal(app.app.run(a,3),app.reference.run(b,3));equal(a,b);assert.equal(count(app),1);
+});
+
+test('relocated dynamic application builds execute numeric reductions with native or retained source execution',async t=>{
+  const root=folder(t),src=path.join(root,'src'),out=path.join(root,'dist');fs.mkdirSync(src);
+  fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
+  const source=`
+    function measure(a,weights,initial){const view=a.subarray(1);view.fill(initial,0,1);
+      return view.reduce((sum,value,index,view)=>sum+value*weights[index]+view[index],initial)
+        +view.reduceRight(function(sum,value){return sum-value;});
+    }
+    export const run=(a,weights,initial)=>measure(a,weights,initial);
+  `;
+  fs.writeFileSync(path.join(src,'measure.mjs'),source);
+  fs.writeFileSync(path.join(src,'entry.mjs'),"export const load=()=>import('./measure.mjs');");
+  const built=await buildApplication(path.join(src,'entry.mjs'),out,{specializeNumeric:true});
+  assert.ok(built.numericSpecialization.compiledKernels>0);
+  const runner=path.join(root,'run.mjs');
+  fs.writeFileSync(runner,`
+    import assert from 'node:assert/strict';import {pathToFileURL} from 'node:url';
+    let calls=0;const disabled=process.argv[3]==='no-wasm';
+    if(disabled)globalThis.WebAssembly=undefined;
+    else {const Native=WebAssembly.Instance;WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);
+      return {exports:{...instance.exports,run(...values){calls++;return instance.exports.run(...values);}}};};}
+    const app=await (await import(pathToFileURL(process.argv[2]))).load();
+    const reference=await import('data:text/javascript;base64,'+Buffer.from(${JSON.stringify(source)}).toString('base64'));
+    for(const Type of [Float32Array,Float64Array]){
+      const a=new Type([1,2,3,4]),b=a.slice();
+      for(let frame=0;frame<3;frame++){
+        assert.ok(Object.is(app.run(a,a.subarray(0,3),frame+0.5),reference.run(b,b.subarray(0,3),frame+0.5)));
+        assert.deepEqual(a,b);
+      }
+    }
+    assert.equal(calls,disabled?0:6);console.log(JSON.stringify({calls}));
+  `);
+  fs.renameSync(src,path.join(root,'source-unavailable'));
+  const relocated=path.join(root,'relocated');fs.renameSync(out,relocated);
+  for(const mode of ['native','no-wasm']) {
+    const result=spawnSync(process.execPath,[runner,path.join(relocated,built.entryFiles[0]),mode],{encoding:'utf8'});
+    assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).calls,mode==='native'?6:0);
+  }
+});
+
 for(const Type of layouts)test(`${Type.name}: inferred storage and captured bulk-only sequences need no artificial loop`,async t=>{
   const app=await application(t,`
     export const a=new ${Type.name}([1,2,3,4]),b=new ${Type.name}([7,8,9]),events=[];

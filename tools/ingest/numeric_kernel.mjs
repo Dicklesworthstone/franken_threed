@@ -12,7 +12,7 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
@@ -412,6 +412,19 @@ export function compileNumericKernel(source, {
     return emitBitwiseBinary(operator, left, right, () => temporaryBase + temporaryCount++)
       ?? [...left, ...right, OPS[operator]];
   }
+  function reduction(node, depth) {
+    return compileTypedArrayReduction(node, {resolveArray:helperArray,
+      expression:arg => expression(arg, depth + 1),
+      allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
+      compileCallback(callback, body, values) {
+        const parent = temporaries;
+        temporaries = new Map(parent); generalDepth++;
+        callback.params.forEach((param, index) => temporaries.set(param.name, values[index]));
+        try { return expression(body, depth + 1); }
+        finally { temporaries = parent; generalDepth--; }
+      },
+    });
+  }
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
     if (node.type === 'Literal' && typeof node.value === 'number') return number(node.value);
@@ -420,14 +433,14 @@ export function compileNumericKernel(source, {
         if (!inLoop) fail('Loop index is not in scope outside the loop', node);
         return [...get(indexLocal), 0xb8]; // f64.convert_i32_u
       }
-      const param = params.get(node.name);
-      if (param?.type === 'f64') return get(param.index);
       if (temporaries.has(node.name)) {
         const local = temporaries.get(node.name);
         if (local === null) fail(`Binding ${node.name} is used before initialization`, node);
         if (local.reference) fail('Array references cannot escape or be coerced to Numbers', node);
         return get(local);
       }
+      const param = params.get(node.name);
+      if (param?.type === 'f64') return get(param.index);
       fail(`Unresolved or non-scalar binding ${node.name}`, node);
     }
     // The bound view's intrinsic length is already guarded and cannot change
@@ -454,6 +467,8 @@ export function compileNumericKernel(source, {
         ...expression(node.alternate, depth + 1), 0x0b];
     }
     if (node.type === 'CallExpression') {
+      const reduced = reduction(node, depth);
+      if (reduced) return reduced;
       const intrinsic = intrinsics.call(node, arg => expression(arg, depth + 1),
         params.has('Math') || temporaries.has('Math') || indexName === 'Math' ||
         fn.id.name === 'Math' || helperSources.has('Math'), () => temporaryBase + temporaryCount++);
@@ -756,6 +771,8 @@ export function compileNumericKernel(source, {
         const bulk = compileTypedArrayOperation(assignment, {resolveArray:helperArray, expression,
           allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth});
         if (bulk) { bytes.push(...bulk); continue; }
+        const reduced = reduction(assignment, depth);
+        if (reduced) { bytes.push(...reduced, 0x1a); continue; }
         if (assignment?.type === 'CallExpression' && assignment.callee.type === 'Identifier') {
           bytes.push(...helperCall(assignment, depth, false));
           continue;
