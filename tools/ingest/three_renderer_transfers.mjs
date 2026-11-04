@@ -24,7 +24,7 @@
  * never from the active draw or the primary attachment's format.
  * This is general WebGPU execution, not shader/pixel equivalence evidence.
  */
-import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetColorFormat} from './gpu_target_transfer.mjs';
+import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetColorFormat, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 import {GpuTargetReadbackError} from './gpu_target_readback.mjs';
 import {assertThreeNativeTextureWrite} from './three_node_shadows.mjs';
@@ -223,8 +223,8 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         const {value, signal} = options(supplied);
         const from = transferEntry(source), to = transferEntry(destination);
         const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
-        if (from === to && plan.sourceColorIndex === plan.colorIndex)
-          fail('TRANSFER', 'Copies cannot read and write the same color image');
+        if (from === to && plan.sourceColorIndex === plan.colorIndex && gpuTargetCopyOverlaps(from.shape, plan))
+          fail('TRANSFER', 'Copies cannot read and write overlapping color subresources');
         assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
         const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
           sourceMipLevel: plan.sourceMipLevel, destinationMipLevel: plan.destinationMipLevel,
@@ -267,8 +267,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     const depth = source?.isDepthTexture === true || destination?.isDepthTexture === true;
     if (depth && (sourceLevel !== 0 || destinationLevel !== 0)) fail('UNSUPPORTED', 'Depth textures have only mip level zero');
     const from = textureEntry(source, depth), to = textureEntry(destination, depth);
-    if (from === to && (depth || source === destination))
-      fail('TRANSFER', 'Copies cannot read and write the same target image');
+    if (from === to && depth) fail('TRANSFER', 'In-place depth copies are not admitted');
     const value = {...(depth ? {} : {sourceMipLevel: sourceLevel, destinationMipLevel: destinationLevel,
       sourceColorIndex: (from.shape.textures ?? [source.renderTarget.texture]).indexOf(source),
       colorIndex: (to.shape.textures ?? [destination.renderTarget.texture]).indexOf(destination)}), flipY: renderer._bottomLeftOrigin === true,

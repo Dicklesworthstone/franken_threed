@@ -22,6 +22,31 @@ must be single-sample. Cube constructors may leave `texture.renderTarget` null:
 the existing target registry resolves that texture after its owning target has
 been initialized, selected or rendered. Unknown ownership remains an error.
 
+## Copies within one image
+
+A target color image can copy between allocated mip levels, or between disjoint
+cube faces and 2D-array layer ranges in one mip. This supports authored mip
+updates and GPU layer relocation without allocating a second target:
+
+```js
+// Copy two array layers into two other layers of the same native image.
+renderer.copyTextureToTexture(arrayTarget.texture, arrayTarget.texture,
+  new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(32, 32, 2)),
+  new THREE.Vector3(0, 0, 2));
+
+// The explicit transfer extension returns completion and checks the whole range.
+await renderer.copyRenderTargetPixelsAsync(arrayTarget, arrayTarget, {
+  sourceFace: 0, face: 2, width: 32, height: 32, depthOrArrayLayers: 2,
+});
+```
+
+WebGPU requires disjoint **subresources**, not just separate XY rectangles.
+Overlapping layer ranges reject before submission even if their rectangles do
+not touch. Every slice of one 3D mip is one subresource, so volume self-copies
+require different mip levels. Same-owner MRT and current/previous history
+selections retain their physical image identities; distinct images can copy the
+same mip/layer. Depth self-copies retain their separate unsupported boundary.
+
 ## Authored destination mip chains
 
 Target-to-target and storage-to-target copies accept independently selected
@@ -53,15 +78,17 @@ Every non-cube destination copies its complete XYZ range in one native copy
 command and one submission, at mip zero or an authored higher mip. Storage-to-cube
 copies and target-to-authored-cube-mip copies likewise submit one complete range.
 This avoids one source borrow, encoder and submission per layer or volume slice.
-Target-to-target cube mip-zero destinations retain the existing per-face transfer
-path. Later queued work cannot interleave within either accepted range.
+Distinct target-to-target cube mip-zero destinations retain the existing per-face
+transfer path. Shared-owner copies use one native command for their complete
+range and apply the captured destination mip-generation policy afterward.
+Later queued work cannot interleave within either accepted range.
 
 Both target generations remain retained while queued. Rejected admission,
 earlier queue failure, target disposal and renderer cancellation release them,
 including while unrelated preparation is blocked. Cancellation cannot undo an
 already submitted prefix. Combined allocation budgets and whole color/depth
 allocation limits are checked before borrowing or writing. Target-to-target
-per-slice transfer byte limits remain enforced, including nonzero destination mips.
+transfer byte limits cover the complete XYZ range, including nonzero destination mips.
 
 Source validation is captured after borrowing, including source mip generation,
 and gates destination completion without waiting inside the FIFO. A later
@@ -71,9 +98,8 @@ GPU errors and completion continue to belong to the existing owners.
 WebGL, depth and pre-initialization copies retain their existing transfer path.
 Sampled-image copies keep their captured-upload path; they are not rerouted here.
 Sampled-image-to-cube destinations and additional depth/combined-aspect copies
-remain unsupported. In-place copies within one target allocation or registered
-history group remain rejected. MRT and authored-mip allocation capabilities
-remain those of the existing target owner.
+remain unsupported. MRT and authored-mip allocation capabilities remain those
+of the existing target owner.
 
 ## Evidence
 
@@ -104,3 +130,11 @@ node --test tools/ingest/three_target_color_copy.test.mjs \
 Recorded command/submission counts are not measured GPU throughput. These tests
 are not full-renderer integration, browser GPU pixel parity or hardware benchmarks.
 No speedup is claimed.
+
+`node --test tools/ingest/three_target_subresource_copy.test.mjs` adds 17 checks
+using real pinned renderer/target classes and production ownership. Pinned
+backend copy commands and independent recorded bytes cover all four target
+dimensions; other cases cover overlapping-subresource rejection, immutable FIFO
+selection, whole-range limits, history toggles, resize, cancellation and validation
+failure. They establish the public transfer path, with GPU execution represented
+by the existing recording device rather than browser pixel evidence.

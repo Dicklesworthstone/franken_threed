@@ -108,12 +108,12 @@ test('nonzero destination mips without an authored chain remain rejected', () =>
   assert.equal(f.commands.length, 0); assert.equal(f.references, 0);
 });
 
-test('in-place allocations and shared pass-history groups reject without leaking either generation', () => {
+test('overlapping images and incompatible shared history extents reject without leaking either generation', () => {
   const f = targetCopyFixture(), source = f.target({dimension: 'cube'});
   assert.throws(() => copy(f, source, source), {code: 'THREE_STORAGE_COPY_FEEDBACK'});
   assert.equal(f.references, 0); assert.equal(f.releases, 1);
   const destination = f.target(); source.entry.historyGroup = destination.entry.historyGroup = {};
-  assert.throws(() => copy(f, source, destination), {code: 'THREE_STORAGE_COPY_FEEDBACK'});
+  assert.throws(() => copy(f, source, destination), {code: 'THREE_STORAGE_COPY_BOUNDS'});
   assert.equal(f.references, 0); assert.equal(f.commands.length, 0);
 });
 

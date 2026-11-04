@@ -100,7 +100,7 @@ attachment flags; storage budgets include the history depth. Sampling that same
 target's depth while rendering its color still encounters the existing feedback
 restriction; TRAA uses separate resolve and history targets.
 
-### Copies between colors of one MRT target
+### Copies within one target
 
 An ordinary 2D MRT target can copy between distinct, compatible color images
 through the existing public source or explicit transfer APIs:
@@ -122,18 +122,28 @@ physical images at the same color index. Allocation preflight counts shared
 history storage once, and source-shaped copies preserve the destination's
 captured mip-generation policy.
 
-Feedback checks still reject reading and writing the same physical image,
-including aliases through selected history slots. Formats must be copy-compatible
-and the destination must be single-sample; compatible linear/sRGB copies preserve
-stored bits without color conversion. Same-image subresource copies remain
-outside this profile. The source-shaped same-owner route currently requires
-ordinary 2D colors; existing explicit face APIs retain their own admission rules.
+Copies can also reuse one physical color image when the selected subresources
+are disjoint. Different mip levels are independent; at one mip, cube faces and
+2D-array layer ranges must not overlap. Different XY rectangles in one layer
+remain feedback, and every depth slice of a 3D mip belongs to one subresource.
+These checks apply to actual native images, including aliases through history
+slots. Formats must be copy-compatible and the destination must be single-sample;
+compatible linear/sRGB copies preserve stored bits without color conversion.
+
+The initialized native source API accepts `Box3`/`Vector3` ranges within the same
+cube, array or volume texture. Explicit `copyRenderTargetPixelsAsync` accepts
+`depthOrArrayLayers` (default one) in addition to `sourceFace`/`face`; the complete
+range shares one native command and its byte budget. Nonzero destinations require
+authored mip levels with `generateMipmaps: false`.
 
 The MRT transfer tests compare exact copied bytes across six formats and both
 coordinate origins. They also exercise independent mip rectangles, queued
 history swaps, resize leases, cancellation, selected mip-generation commands
-and native error propagation. These are production-owner/recording-fixture
-checks; they do not execute mip shaders or establish browser pixel parity.
+and native error propagation. The 17 subresource-copy tests also construct the
+actual pinned renderer and targets, compare copy descriptors with the pinned
+WebGPU backend, and check exact bytes across 2D, cube, array and volume copies.
+These are production-owner/recording-fixture checks; they do not execute mip
+shaders or establish browser pixel parity.
 
 ### Shared depth between 2D passes
 

@@ -4,9 +4,10 @@
  * half-floats are Uint16 bit patterns and float32 payloads are never converted.
  * Copies are raw GPU copies (including copy-compatible sRGB format pairs), not
  * color-space conversion, blending, resizing or an MSAA destination resolve.
- * Cube/array/volume endpoints require explicit face/sourceFace indices; every
- * operation addresses one layer or mip-local volume slice, independently of
- * active rendering state. Native copies may cross 2D/array/3D dimensions.
+ * Cube/array/volume endpoints require explicit face/sourceFace indices.
+ * Uploads address one layer or mip-local volume slice, independently of active
+ * rendering state. Copies may select a contiguous depthOrArrayLayers range
+ * (default one), including across 2D/array/3D dimensions.
  * colorIndex/sourceColorIndex select independent MRT attachments, defaulting to
  * zero. Their formats, not the primary attachment, determine layouts and budgets.
  * R8 uses one byte per texel; R11G11B10 uses one Uint32 packed word per texel.
@@ -143,14 +144,14 @@ export function gpuTargetWriteData(plan) {
  * those contents on the next sample. Each endpoint has mip-local bounds/rows.
  */
 export function inspectGpuTargetCopy(source, destination, value = {}) {
-  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'sourceMipLevel', 'destinationMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
+  options(value, ['sourceX', 'sourceY', 'x', 'y', 'width', 'height', 'depthOrArrayLayers', 'sourceMipLevel', 'destinationMipLevel', 'flipY', 'maxBytes', 'sourceFace', 'face', 'sourceColorIndex', 'colorIndex']);
   const {sourceColorIndex = 0, colorIndex = 0} = value;
   const [Type, components] = layout(source, sourceColorIndex); layout(destination, colorIndex);
   if (gpuTargetColorFormat(source, sourceColorIndex).replace(/-srgb$/, '') !==
       gpuTargetColorFormat(destination, colorIndex).replace(/-srgb$/, ''))
     fail('FORMAT', 'Texture copies require copy-compatible color formats');
   if (destination.sampleCount !== 1) fail('SAMPLES', 'Color copies require a single-sample destination');
-  const {sourceX = 0, sourceY = 0, x = 0, y = 0, sourceMipLevel = 0, destinationMipLevel = 0, flipY = false,
+  const {sourceX = 0, sourceY = 0, x = 0, y = 0, depthOrArrayLayers = 1, sourceMipLevel = 0, destinationMipLevel = 0, flipY = false,
     maxBytes = 64 * 1024 * 1024} = value;
   integer(sourceMipLevel, 'Source mip level');
   integer(destinationMipLevel, 'Destination mip level');
@@ -164,6 +165,13 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
     fail('MIP', 'Nonzero copy destinations require authored, non-generated mip levels');
   const sourceFace = transferFace(source, value.sourceFace, 'sourceFace', sourceMipLevel);
   const face = transferFace(destination, value.face, 'face', destinationMipLevel);
+  integer(depthOrArrayLayers, 'Copy layer count');
+  if (depthOrArrayLayers > 0) {
+    // Checking the final slice validates the complete contiguous range before
+    // either owner allocates or submits any part of the copy.
+    transferFace(source, sourceFace + depthOrArrayLayers - 1, 'sourceFace', sourceMipLevel);
+    transferFace(destination, face + depthOrArrayLayers - 1, 'face', destinationMipLevel);
+  }
   const divisor = 2 ** sourceMipLevel, destinationDivisor = 2 ** destinationMipLevel;
   const sw = source.width === 0 ? 0 : Math.max(1, Math.floor(source.width / divisor));
   const sh = source.height === 0 ? 0 : Math.max(1, Math.floor(source.height / divisor));
@@ -172,9 +180,21 @@ export function inspectGpuTargetCopy(source, destination, value = {}) {
   const {width = sw - sourceX, height = sh - sourceY} = value;
   region(sw, sh, sourceX, sourceY, width, height); region(dw, dh, x, y, width, height);
   if (typeof flipY !== 'boolean') fail('OPTIONS', 'flipY must be boolean');
-  budget(width * height * components * Type.BYTES_PER_ELEMENT, maxBytes);
-  return {empty: width === 0 || height === 0, sourceMipLevel, destinationMipLevel, sourceColorIndex, colorIndex,
+  budget(width * height * depthOrArrayLayers * components * Type.BYTES_PER_ELEMENT, maxBytes);
+  return {empty: width === 0 || height === 0 || depthOrArrayLayers === 0, sourceMipLevel, destinationMipLevel, sourceColorIndex, colorIndex,
     sourceOrigin: {x: sourceX, y: flipY ? sh - sourceY - height : sourceY, z: sourceFace},
     destinationOrigin: {x, y: flipY ? dh - y - height : y, z: face},
-    size: {width, height, depthOrArrayLayers: 1}};
+    size: {width, height, depthOrArrayLayers}};
+}
+
+/** Only call for plans whose two color selections resolve to one physical
+ * image. WebGPU copy subresources are mips and 2D array layers, not rectangles;
+ * every slice of one 3D mip belongs to the same subresource.
+ * https://www.w3.org/TR/webgpu/#dom-gpucommandencoder-copytexturetotexture
+ */
+export function gpuTargetCopyOverlaps(shape, plan) {
+  const count = plan.size.depthOrArrayLayers;
+  return !plan.empty && plan.sourceMipLevel === plan.destinationMipLevel &&
+    (shape.volume === true || (plan.sourceOrigin.z < plan.destinationOrigin.z + count &&
+      plan.destinationOrigin.z < plan.sourceOrigin.z + count));
 }

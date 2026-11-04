@@ -94,7 +94,7 @@
  * owned 2D/array storage, including private depth at nonzero color mips.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
-import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy, submitGpuDepthCopy} from './gpu_depth_transfer.mjs';
 // Authenticate target handles and device identity without exposing GPU textures.
 const transferTargets = new WeakMap();
@@ -855,15 +855,17 @@ export function createGpuRenderTarget(device, options = {}) {
       const plan = inspectGpuTargetCopy(other.shape(), transferShape(), options);
       const sameOwner = other.owner === api;
       if (sameOwner && plan.sourceColorIndex === plan.colorIndex &&
-          (other.colorSlots?.[plan.sourceColorIndex] ?? 0) === slots[plan.colorIndex])
-        fail('FEEDBACK', 'Copies cannot read and write the same color image');
+          (other.colorSlots?.[plan.sourceColorIndex] ?? 0) === slots[plan.colorIndex] &&
+          gpuTargetCopyOverlaps(other.shape(), plan))
+        fail('FEEDBACK', 'Copies cannot read and write overlapping color subresources');
       if (plan.empty) return false;
       busy = true;
       try {
         const texture = colorTexture(current, plan.colorIndex, slots);
         current.used = true;
         const copy = sourceTexture => {
-          if (sourceTexture === texture) fail('FEEDBACK', 'Copies cannot read and write the same color image');
+          if (sourceTexture === texture && gpuTargetCopyOverlaps(other.shape(), plan))
+            fail('FEEDBACK', 'Copies cannot read and write overlapping color subresources');
           current.mipsDirty.add(texture);
           checked(() => {
             const encoder = device.createCommandEncoder({label: label + ' color copy'});

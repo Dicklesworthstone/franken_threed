@@ -135,8 +135,9 @@ export function captureStorageToTargetCopy(renderer, texture, destinationTexture
 }
 
 /** Source-shaped cube/array/volume color copies through existing target owners.
- * Non-cube destinations and authored cube mips copy one complete native range.
- * Cube level-zero writes retain the face-aware path. One range has one FIFO slot.
+ * Shared owners, non-cube destinations and authored cube mips copy one native
+ * range. Distinct cube level-zero writes retain the face-aware path. Every
+ * range has one FIFO slot; self-copies require disjoint mip/layer subresources.
  */
 export function captureTargetColorCopy(renderer, texture, destinationTexture,
   region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
@@ -146,8 +147,6 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
     const source = captureTargetColor(renderer, texture, retain), destination = captureTargetColor(renderer, destinationTexture, retain);
     const sameOwner = source.entry === destination.entry ||
       !!source.entry.historyGroup && source.entry.historyGroup === destination.entry.historyGroup;
-    if (sameOwner && (texture === destinationTexture || source.shape.viewDimension !== '2d' || destination.shape.viewDimension !== '2d'))
-      fail('FEEDBACK', 'Copies within one target require distinct ordinary 2D color images');
     if (destinationLevel !== 0 && destination.shape.generateMipmaps !== false)
       fail('LEVEL', 'Nonzero target destination mips require an authored, non-generated chain');
     if (destination.entry.shape.sampleCount !== 1) fail('SAMPLES', 'Target color copies require a single-sample destination');
@@ -155,15 +154,14 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
     // target transfer planner below still validates the original formats.
     const compatible = shape => ({...shape, format: shape.format.replace(/-srgb$/, '')});
     const plan = inspectStorageTextureCopy(compatible(source.shape), compatible(destination.shape),
-      region, position, sourceLevel, destinationLevel);
+      region, position, sourceLevel, destinationLevel, sameOwner && texture === destinationTexture);
     const [sourceX, sourceY, sourceFace] = plan.sourceOrigin, [x, y, face] = plan.destinationOrigin;
     const [width, height, count] = plan.size;
     const base = Object.freeze({sourceX, sourceY, x, y, width, height, sourceMipLevel: sourceLevel,
       sourceColorIndex: source.source.colorIndex, colorIndex: destination.source.colorIndex, flipY: false});
     const step = index => ({...base, sourceFace: sourceFace + index, face: face + index});
-    // Extents are contiguous; the checked XYZ plan plus both endpoint slices
-    // validates every middle layer without building an unbounded request list.
-    // Reuse the raw transfer format/byte-budget checks in destination-mip
+    // Check the complete contiguous range without building a per-layer request
+    // list. Reuse the raw transfer format/byte-budget checks in destination-mip
     // coordinates, without changing the actual allocation or owner metadata.
     const divisor = 2 ** destinationLevel, destinationShape = destination.entry.shape;
     const mipShape = destinationLevel === 0 ? destinationShape : {...destinationShape,
@@ -171,8 +169,7 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
       height: Math.max(1, Math.floor(destinationShape.height / divisor)),
       layers: destinationShape.volume ? Math.max(1, Math.floor(destinationShape.layers / divisor)) : destinationShape.layers};
     if (!plan.empty) {
-      inspectGpuTargetCopy(source.entry.shape, mipShape, step(0));
-      inspectGpuTargetCopy(source.entry.shape, mipShape, step(count - 1));
+      inspectGpuTargetCopy(source.entry.shape, mipShape, {...step(0), depthOrArrayLayers: count});
     }
     return {empty: plan.empty, issue() {
       checkRenderer(renderer, device); source.check(); destination.check();
@@ -185,7 +182,8 @@ export function captureTargetColorCopy(renderer, texture, destinationTexture,
         // A single owner submits both selected images under one native lock.
         // Joining a deferred destination dependency back to this same source
         // would create a validation cycle; copyColor already owns both checks.
-        return targets.copyColor(source.entry, destination.entry, {...step(0), destinationMipLevel: destinationLevel},
+        return targets.copyColor(source.entry, destination.entry, {...step(0), depthOrArrayLayers: count,
+          destinationMipLevel: destinationLevel},
           {generateMipmaps: destination.shape.generateMipmaps === true});
       }
       if (!destination.entry.shape.cube || destinationLevel !== 0) {

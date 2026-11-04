@@ -54,7 +54,7 @@
  * This is general WebGPU execution, not Rust specialization or a speedup claim.
  */
 import * as gpuTargets from './gpu_render_target.mjs';
-import {inspectGpuTargetWrite, inspectGpuTargetCopy} from './gpu_target_transfer.mjs';
+import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
 
 export class ThreeRenderTargetError extends Error {
@@ -1040,8 +1040,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const plan = depth
       ? inspectGpuDepthCopy({...source.shape, sampleDepth: source.shape.depthTexture !== null}, destinationShape, options)
       : inspectGpuTargetCopy(source.shape, destinationShape, options);
-    if (!depth && sameOwner && source.shape.textures[plan.sourceColorIndex] === destination.shape.textures[plan.colorIndex])
-      fail('FEEDBACK', 'Copies cannot read and write the same color image');
+    if (!depth && sameOwner && source.shape.textures[plan.sourceColorIndex] === destination.shape.textures[plan.colorIndex] &&
+        gpuTargetCopyOverlaps(source.shape, plan))
+      fail('FEEDBACK', 'Copies cannot read and write overlapping color subresources');
     if (plan.empty) return false;
     budget(allocationBytes(source) + (sameOwner ? 0 : allocationBytes(destination)));
     ensure(source); ensure(destination);

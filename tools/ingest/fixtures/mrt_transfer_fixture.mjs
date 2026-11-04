@@ -17,11 +17,11 @@ export function mrtTransferDevice() {
   const createTexture = f.device.createTexture;
   f.device.createTexture = descriptor => {
     const texture = createTexture(descriptor), layout = layouts.get(descriptor.format);
-    Object.assign(texture, {sampleCount: descriptor.sampleCount, mipLevelCount: descriptor.mipLevelCount,
+    Object.assign(texture, {dimension: descriptor.dimension ?? '2d', sampleCount: descriptor.sampleCount, mipLevelCount: descriptor.mipLevelCount,
       depthOrArrayLayers: descriptor.size.depthOrArrayLayers});
     texture.bpp = layout ? layout[0].BYTES_PER_ELEMENT * layout[1] : 4;
     texture.planes = Array.from({length: texture.mipLevelCount}, (_, mip) =>
-      Array.from({length: texture.depthOrArrayLayers}, () => new Uint8Array(
+      Array.from({length: texture.dimension === '3d' ? Math.max(1, texture.depthOrArrayLayers >> mip) : texture.depthOrArrayLayers}, () => new Uint8Array(
         Math.max(1, texture.width >> mip) * Math.max(1, texture.height >> mip) * texture.bpp)));
     return texture;
   };
@@ -67,7 +67,12 @@ export function mrtTransferDevice() {
         assert.equal(source.texture.format.replace(/-srgb$/, ''), destination.texture.format.replace(/-srgb$/, ''));
         copies.push({source, destination, size});
         commands.push(() => {
-          for (let y = 0; y < size.height; y++) row(destination, size, y).set(row(source, size, y));
+          for (let z = 0; z < size.depthOrArrayLayers; z++) {
+            const from = {...source, origin: {...source.origin, z: source.origin.z + z}};
+            const to = {...destination, origin: {...destination.origin, z: destination.origin.z + z}};
+            const slice = {...size, depthOrArrayLayers: 1};
+            for (let y = 0; y < size.height; y++) row(to, slice, y).set(row(from, slice, y));
+          }
         });
       },
       finish() { return {commands}; },
