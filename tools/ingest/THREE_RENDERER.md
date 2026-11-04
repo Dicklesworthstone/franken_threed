@@ -260,8 +260,43 @@ Each `render()`/`renderAsync()` captures the array's child identities, matrices,
 layers and viewports at call time, so deferred preparation cannot replace an
 earlier request's views with later camera edits. Public matrix and projection
 updates follow the pinned native renderer. This does not admit nested arrays
-or multiview/XR cameras. Custom native
-scene/object/material render hooks retain their existing explicit rejection.
+or multiview/XR cameras.
+
+## Native Scene lifecycle
+
+Native `Scene.onBeforeRender` and `Scene.onAfterRender` now surround the retained
+source object lifecycle. The before-hook runs after automatic world/camera
+updates and raster selection, and before background, material and draw-list
+capture. Position changes inside it need the same explicit matrix update as
+pinned r186 to affect that render. The active render-object dispatcher is fixed
+before this hook; changing it selects the next call's dispatcher.
+
+Callbacks receive the original root, camera and selected working target. Public
+target changes survive the callbacks, with output conversion selecting its final
+target before the after-hook. A canvas change in the before-hook selects the
+backend surface while retaining the earlier raster context. Nested before-hook
+renders precede the parent; nested after-hook renders follow its output passes.
+The after-hook sees restored render context and NodeFrame render ID and can
+change or detach the accepted scene without rewriting its retained draws. An
+after-hook exception preserves that already accepted work. Preparation never
+replays either callback, including the asynchronous initialization path.
+
+Native `compileAsync(root, camera, targetScene)` initializes and advances the
+source frame before its before-hook, compiles the requested root, and uses a
+distinct target scene for additional lights and background. Its hook and material
+environment owner is the root when that root is a Scene, otherwise the target
+Scene; the hook's scene argument remains the original root. Compilation does not call
+the Scene after-hook or submit graphics draws. Source native material render
+hooks remain inert, matching the pinned renderer.
+
+Hooked scenes use the complete native draw capture and its existing resource
+bounds. Install hooks before their geometry attributes have reached a fixed
+upload owner; switching existing fixed upload history into native hook ownership
+still fails explicitly. Bare non-renderable Object3D roots do not acquire Scene
+callbacks. `three_renderer_scene_hooks.test.mjs` checks callback order, nested
+work, selector edits, immutable GPU bindings and exception retention using actual
+pinned source objects and a byte-accurate recording device; these are command
+and lifecycle checks, not pixel or performance results.
 
 ## Public render-list sorting
 

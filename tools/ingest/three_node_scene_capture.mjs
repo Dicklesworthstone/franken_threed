@@ -51,7 +51,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
   maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null,
   withFramebufferCopies = null, renderLists = null, renderId = renderer?.info?.calls,
-  bundles = null, bundleDepth = 0, sortState = null} = {}) {
+  bundles = null, bundleDepth = 0, sortState = null, matricesUpdated: sourceMatricesUpdated = false,
+  sceneHooks = false, clippingView = null, renderRoot = root, extraLights = [],
+  renderObjectFunction: selectedRenderObject = renderer?.getRenderObjectFunction?.() ?? null} = {}) {
   if (!integer(maxNodes) || maxNodes < 1 || !integer(maxDraws) || maxDraws < 1 || !integer(maxUniformBytes))
     fail('LIMIT', 'Invalid native scene capture capacity');
   const sortObjects = sortState ? sortState.sortObjects : renderer?.sortObjects === true;
@@ -102,7 +104,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     fail('BACKGROUND', 'Native backgrounds require a separate childless mesh with one authored node material');
   // Renderer fixes its current dispatcher once per render. compileAsync uses
   // the default lifecycle even when the application has installed a dispatcher.
-  const renderObjectFunction = renderer.getRenderObjectFunction?.() ?? null;
+  const renderObjectFunction = selectedRenderObject;
   const shadowPass = uniforms ? getThreeNativeShadowPass(renderer, overrideMaterial, renderObjectFunction) : null;
   const customRenderObject = !shadowPass && renderObjectFunction;
   // Match source RenderContexts identity for the ordinary-material fog
@@ -110,7 +112,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const sourceRenderContext = !shadowPass && bundles ? `${destination === null ? 'default' :
     [destination.textures.length, destination.texture.format, destination.texture.type, destination.samples,
       destination.depthBuffer, destination.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-${bundleDepth}` : undefined;
-  const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [root], hookedObjects = new Set();
+  const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [renderRoot], hookedObjects = new Set();
   let nativeOverrides = false;
   const phaseBindings = {opaque: new Set(), transparent: new Set()}, compiledBindings = new Set();
   // The source inserts a private background object into the render list. Admit
@@ -129,14 +131,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   const visibility = new Map(), excludedObjects = new Set();
   const bundleMembers = new Map(), bundleObjects = new Set(), bundleSelections = [];
-  let matricesUpdated = false, lodCaptured = false;
+  let matricesUpdated = sourceMatricesUpdated, lodCaptured = false;
   const updateMatrices = () => {
     if (matricesUpdated) return;
-    if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+    if (renderRoot.matrixWorldAutoUpdate === true) renderRoot.updateMatrixWorld();
     if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
     matricesUpdated = true;
   };
-  const pendingVisibility = [{object: root, parentVisible: true}];
+  const pendingVisibility = [{object: renderRoot, parentVisible: true}];
   if (backgroundMesh) pendingVisibility.push({object: backgroundMesh, parentVisible: true});
   while (pendingVisibility.length) {
     const {object, parentVisible, parentBundle = null, suppressed = false} = pendingVisibility.pop();
@@ -169,13 +171,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const authoredLight = object => object.isLight === true && (object.colorNode || object.isSpotLight === true && object.map);
   const projectedLights = new Set([...hierarchy.keys()].filter(object => object.isLight === true &&
     visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers)));
+  for (const object of extraLights) projectedLights.add(object);
   // Eight is the fixed shader's storage capacity, not a source-light cutoff.
   // Select one native owner for the complete material list beyond that size,
   // including unlit companions and lighting-disabled passes. The source graph
   // decides each material's contributions; no fixed frame can drop a tail or
   // reinterpret a shadow's index in a partially filtered light list.
   const nativeManyLightScene = !shadowPass && projectedLights.size > 8;
-  const nativeLights = new Set([...hierarchy.keys()].filter(object => object.isLightProbe === true || object.isLightProbeGrid === true || object.isRectAreaLight === true ||
+  const nativeLights = new Set([...hierarchy.keys(), ...extraLights].filter(object => object.isLightProbe === true || object.isLightProbeGrid === true || object.isRectAreaLight === true ||
     authoredLight(object) || nativeManyLightScene && object.isLight === true));
   const selectedLight = object => !shadowPass && renderer?.lighting?.enabled !== false &&
     projectedLights.has(object);
@@ -258,7 +261,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const hookCandidates = [...hierarchy.keys()].filter(object => visibility.get(object) && !excludedObjects.has(object) &&
       object !== backgroundMesh && object.isLineLoop !== true &&
       (object.isMesh || object.isSprite || object.isPoints || object.isLine));
-  const nativeHookScene = !!customRenderObject || hookSceneHistory.get(renderer)?.has(root) === true ||
+  const nativeHookScene = sceneHooks || !!customRenderObject || hookSceneHistory.get(renderer)?.has(root) === true ||
     hookCandidates.some(object => objectHooks(object) || attributeOwners(object).some(owner => hookAttributeHistory.get(renderer)?.has(owner)));
   if (nativeHookScene && hookCandidates.some(object => attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner))))
     fail('HOOK', 'Object callbacks require native upload history; install them before the geometry attributes reach a fixed owner');
@@ -274,6 +277,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // same renderer history even when the application removes their callbacks.
     for (const object of hookCandidates) for (const owner of attributeOwners(object)) attributes.add(owner);
   }
+  // A scene after-hook can replace geometry, detach nodes or add another tree
+  // before asynchronous preparation resumes. Retain the accepted hierarchy as
+  // well as its complete native draw packets; the bridge must not project again.
+  const sceneHierarchy = nativeHookScene && root.isScene === true ? hierarchy : null;
+  if (sceneHierarchy && renderRoot.isScene === true) objects.add(renderRoot);
   const inspectGeometry = object => {
     const geometry = object.geometry;
     if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
@@ -526,13 +534,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // The facade marks every captured pass as having updated source matrices,
     // including an empty pass. Hidden skins still participate in CPU animation.
     updateMatrices();
-    updateThreeCameraProjection(three, renderer, camera);
+    if (!sourceMatricesUpdated) updateThreeCameraProjection(three, renderer, camera);
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
     const fixed = captureFixedGeometry();
     rememberFixedAttributes(phases, fixed.fixedGeometries);
-    return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
+    return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sceneHierarchy, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
       ...fixed, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
   }
@@ -568,8 +576,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   updateMatrices();
   if (backgroundMesh?.matrixWorldAutoUpdate === true) backgroundMesh.updateMatrixWorld();
-  updateThreeCameraProjection(three, renderer, camera);
-  const clippingContexts = nativeClippingScene ? captureThreeNodeClipping(three, {root, camera, hierarchy, visibility,
+  if (!sourceMatricesUpdated) updateThreeCameraProjection(three, renderer, camera);
+  const clippingCamera = clippingView ? Object.assign(Object.create(camera), {matrixWorldInverse: clippingView}) : camera;
+  const clippingContexts = nativeClippingScene ? captureThreeNodeClipping(three, {root: renderRoot, camera: clippingCamera, hierarchy, visibility,
     shadowPass: !!shadowPass, maxPlanes: maxNodes, backgroundMesh, fail}) : null;
   for (const binding of bindings) if (binding.nodeProgram === null)
     binding.clippingContext = clippingContexts?.get(binding.object) ?? null;
@@ -580,7 +589,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     const frustum = camera.isArrayCamera ? new three.FrustumArray().setFromArrayCamera(camera) :
       new three.Frustum().setFromProjectionMatrix(projection, camera.coordinateSystem, camera.reversedDepth);
     const center = new three.Vector4();
-    const visible = [{object: root, groupOrder: 0}];
+    const visible = [{object: renderRoot, groupOrder: 0}];
     const append = (object, state, original, material, group, groupOrder, z, background = false) => {
       if (!original?.visible || !material) return;
       const variants = state.byMaterial.get(shadowPass ? original : material), binding = variants[0];
@@ -642,6 +651,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       const children = hierarchy.get(object);
       for (let i = children.length - 1; i >= 0; i--) visible.push({object: children[i], groupOrder});
     }
+    lights.push(...extraLights);
     if (sortObjects && uniforms) {
       const order = (a, b) => a.groupOrder - b.groupOrder || a.renderOrder - b.renderOrder;
       // Source WebGPU opaque sorting deliberately has no material-id key.
@@ -1368,7 +1378,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nodeCompilation = !uniforms && (deferredCompilation ||
     [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram)));
   rememberFixedAttributes(phases);
-  return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects,
+  return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sceneHierarchy,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
     sortObjects, sortCaptured: customSort && uniforms, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
     get bindings() { return preparedBindings ?? acceptedBindings; }, draws: Object.freeze(draws), bytes, background: backgroundMesh !== null,

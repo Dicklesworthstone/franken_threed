@@ -143,12 +143,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   /** Cheap, per-frame profile of scene-level features that select bridge options. */
   function sceneKey(renderer, scene, backgroundState) {
     const isScene = scene.isScene === true;
+    if (backgroundState?.nativeSceneProfile) return backgroundState.nativeSceneProfile.key;
     const selected = backgroundState ? backgroundState.background : scene.background;
     const background = isScene && selected !== null && selected !== undefined && !selected.isColor;
     return `${isScene && scene.fog ? 1 : 0}${isScene && scene.environment ? 1 : 0}${background ? 1 : 0}${renderer.shadowMap.enabled ? 1 : 0}${renderer._needsGlobalClipping?.() ? 1 : 0}`;
   }
   /** Preparation-time traversal for options that depend on materials. */
   function needsClipping(scene, overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null, nodeFrame = null, materialFrame = null) {
+    if (nodeFrame?.sceneHierarchy) return false;
     const state = material => materialFrame?.materials.get(material) ?? material;
     let clipping = false;
     scene.traverse(object => {
@@ -241,9 +243,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                   // Keep source point-material size/scale uniforms tied to the
                   // renderer's pixel ratio and logical height, even offscreen.
                   ...(destination === owner ? {} : {toneMapping: NoToneMapping, outputColorSpace: THREE.LinearSRGBColorSpace})})}) : null,
-              fog: sourceScene && scene.fog ? {} : null, environment: sourceScene && scene.environment ? {} : null,
+              fog: passOptions?.backgroundState?.nativeSceneProfile ? null : sourceScene && scene.fog ? {} : null,
+              environment: passOptions?.backgroundState?.nativeSceneProfile ? null : sourceScene && scene.environment ? {} : null,
               background: background ? {} : null,
-              shadow: owner.shadowMap.enabled ? {} : null,
+              shadow: (passOptions?.backgroundState?.nativeSceneProfile?.shadows ?? owner.shadowMap.enabled) ? {} : null,
               clipping: clipping || previous?.clipping ? owner._clippingControls ?? clippingControls : null,
             }); } catch (error) {
               // The scene gained/lost fog, environment or background while the
@@ -928,7 +931,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     // ---- frames ----
     _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel,
-      outputProfile = target ? null : this._captureOutputProfile()) {
+      outputProfile = target ? null : this._captureOutputProfile(), rasterState = null) {
       const targetShape = target ? this._targets.capture(target).shape : null;
       const mipShape = targetShape ? inspectThreeRenderTargetMip(targetShape, mipLevel, 0,
         {webgl: this._shaderEncodedOutput, generateMipmaps: target.texture.generateMipmaps}) : null;
@@ -972,9 +975,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         frame.clearStencil = clearStencil ? (this._bottomLeftOrigin ? this._clearStencil | 0
           : threeWebGPUStencilValue(this._clearStencil, fail)) & 0xff : 0;
       }
-      const pr = target ? 1 : this._pixelRatio;
-      const [bufferWidth, bufferHeight] = target ? [mipShape.width, mipShape.height] : this._bufferSize();
-      const v = target ? target.viewport : this._viewport, px = this._pixelRound ?? Math.floor;
+      const pr = rasterState?.pixelRatio ?? (target ? 1 : this._pixelRatio);
+      const [bufferWidth, bufferHeight] = rasterState?.bufferSize ?? (target ? [mipShape.width, mipShape.height] : this._bufferSize());
+      const v = rasterState?.viewport ?? (target ? target.viewport : this._viewport), px = this._pixelRound ?? Math.floor;
       // r186 WebGPU scales width/height at a selected mip. WebGL keeps the
       // authored viewport/scissor in physical pixels, including their extents.
       // Neither route mutates the source Vector4s while capturing a request.
@@ -990,12 +993,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (webglMip && (![vx, vy, vw, vh].every(Number.isFinite) || vx < 0 || vy < 0 || vw < 0 || vh < 0 ||
           vx + vw > bufferWidth || vy + vh > bufferHeight))
         fail('UNSUPPORTED', 'WebGL mip rendering requires a viewport inside the selected mip extent');
-      const [minDepth, maxDepth] = target ? [0, 1] : this._viewportDepth;
+      const [minDepth, maxDepth] = rasterState?.depth ?? (target ? [0, 1] : this._viewportDepth);
       if (vx !== 0 || vy !== 0 || vw !== bufferWidth || vh !== bufferHeight || minDepth !== 0 || maxDepth !== 1)
         frame.viewport = [vx, vy, vw, vh, minDepth, maxDepth];
-      if (target ? target.scissorTest : this._scissorTest) {
+      if (rasterState?.scissorTest ?? (target ? target.scissorTest : this._scissorTest)) {
         // Source clamping: non-negative and inside the drawing buffer.
-        const sc = target ? target.scissor : this._scissor, rawH = Math.floor(px(sc.w * pr) / divisor);
+        const sc = rasterState?.scissor ?? (target ? target.scissor : this._scissor), rawH = Math.floor(px(sc.w * pr) / divisor);
         const rawY = this._bottomLeftOrigin ? bufferHeight - px(sc.y * pr) - rawH : px(sc.y * pr);
         const sx = Math.max(0, px(sc.x * pr)), sy = Math.max(0, rawY);
         // WebGPU source: clamp each component to >= 0, then fit inside the buffer.
@@ -1073,9 +1076,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try { return this._renderFrame(scene, camera); }
       finally { this._timestampScope = previousTimestamp; this._operationScope = previousOperations; this._inspector.finishRender(); }
     }
-    _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget) {
+    _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget, sceneLifecycle = null) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
-      const overrideMaterial = scene.isScene === true ? scene.overrideMaterial : null;
+      const renderId = this.info.calls;
+      if (sceneLifecycle && this._initialized) this._beginSceneLifecycle(sceneLifecycle, {target, sourceTarget, renderId, sourceFace: face, sourceMip: mipLevel});
+      try {
+      const sceneReference = sceneLifecycle?.scene ?? scene;
+      const overrideMaterial = sceneReference.isScene === true ? sceneReference.overrideMaterial : null;
       const passCameraRequired = this._shaderEncodedOutput && !clearOnly && captureCameras && requiresThreePassCamera(this);
       // Source-verified passes retain temporary jitter and AO exclusions after
       // public state is restored. Check before capturing a destination or retaining GPU
@@ -1097,12 +1104,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const sortState = Object.freeze({sortObjects: this.sortObjects === true,
         opaqueSort: this._opaqueSort, transparentSort: this._transparentSort});
       const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement, canvasSize = this._bufferSize();
-      const renderId = this.info.calls;
       if (!this._shaderEncodedOutput) assertThreeNativeTargetWrite(this, target);
       const destination = target ? this._targets.capture(target, {initialize: !this._shaderEncodedOutput}) : this;
-      const backgroundState = !this._shaderEncodedOutput || passCameraRequired ? captureThreeBackground(THREE, scene) : undefined;
+      let backgroundState = !this._shaderEncodedOutput || passCameraRequired ? captureThreeBackground(THREE, sceneLifecycle?.backgroundScene ?? scene) : undefined;
       const outputProfile = target ? null : this._captureOutputProfile();
-      const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile), key = sceneKey(this, scene, backgroundState);
+      const frame = this._frame(scene, clearOnly, target, mipLevel, outputProfile, sceneLifecycle?.rasterState), key = sceneKey(this, scene, backgroundState);
       if (!clearOnly && this._timestampScope) frame.timestamp = this._timestampScope;
       if (!clearOnly && this._operationScope) frame.operations = this._operationScope;
       // RenderPass/normal/depth passes restore this property immediately after
@@ -1120,7 +1126,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         cameraSource = camera;
         camera = captureThreeCamera(THREE, camera);
       }
-      let matricesUpdated = false;
+      let matricesUpdated = sceneLifecycle?.begun === true;
       if (camera?.isArrayCamera === true && captureCameras) {
         if (!Array.isArray(camera.cameras) || camera.cameras.length > 256 || camera.isMultiViewCamera)
           fail('UNSUPPORTED', 'Expected an ordinary ArrayCamera with at most 256 views');
@@ -1135,8 +1141,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
       const nodeFrame = native && !nodeCaptureDeferred
-        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face, sortState}) : null;
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face, sortState, sceneLifecycle, canvasTarget}) : null;
       if (nodeFrame) matricesUpdated = true;
+      if (nodeFrame?.sceneHierarchy) backgroundState = Object.freeze({...backgroundState,
+        nativeSceneProfile: Object.freeze({key, shadows: this.shadowMap.enabled})});
       // Native callbacks retain the original camera in _captureNodeFrame.
       // Fixed draws can wait on pipeline/texture preparation; capture their
       // camera only after the source matrix and node updates finish. Array
@@ -1180,7 +1188,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame,
           overrideMaterial: request.overrideSnapshot?.material ?? overrideMaterial, mrt,
           webglSourceCamera, passCameraRequired,
-          nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState,
+          nodeCaptureDeferred, captureCameras, backgroundState, renderId, sourceTarget, canvasTarget, canvas, canvasSize, sortState, sceneLifecycle,
           canvasFrameToken: this._shaderEncodedOutput ? this._webglFrameToken ?? null : null,
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
@@ -1212,14 +1220,94 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         request.programFrame.passState = this._shaderEncodedOutput && captureCameras ? captureThreePassState(this) : null;
         return request;
       } catch (error) { this._releaseRequest(request); throw error; }
+      } finally { this._restoreSceneLifecycle(sceneLifecycle); }
     }
     _updateNativeMatrices(scene, camera) {
       if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
       updateThreeCameraProjection(THREE, this, camera);
       if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
     }
+    _sceneLifecycle(root, camera, compilation = false, targetScene = null) {
+      const scene = root.isScene === true ? root : targetScene?.isScene === true ? targetScene : null;
+      if (this._shaderEncodedOutput || !scene || !(camera instanceof THREE.Camera)) return null;
+      return {root, scene, camera, compilation, targetScene, backgroundScene: targetScene ?? scene, begun: false, finished: false,
+        entrySelection: {target: this._renderTarget, face: this._activeCubeFace, mip: this._activeMipmapLevel}};
+    }
+    _beginSceneLifecycle(lifecycle, {target, sourceTarget, renderId, sourceFace = this._activeCubeFace, sourceMip = this._activeMipmapLevel}) {
+      if (lifecycle.begun) return;
+      const {scene, camera, compilation} = lifecycle;
+      const frame = this._nodes.nodeFrame;
+      lifecycle.previousRenderId = frame.renderId;
+      lifecycle.previousDispatcher = this._currentRenderObjectFunction;
+      lifecycle.renderObjectFunction = compilation ? null : this.getRenderObjectFunction();
+      this._currentRenderObjectFunction = lifecycle.renderObjectFunction || this.renderObject;
+      lifecycle.restoreRenderId = true;
+      lifecycle.begun = true;
+      const selection = compilation ? lifecycle.entrySelection : {target: sourceTarget, face: sourceFace, mip: sourceMip};
+      this._renderTarget = selection.target; this._activeCubeFace = selection.face; this._activeMipmapLevel = selection.mip;
+      // Native render() selects its private working target before scene hooks.
+      // Compilation passes that same target as an argument, without changing
+      // the public selector. The owned canvas still submits through its session.
+      let callbackTarget = target;
+      if (target === null && this.needsFrameBufferTarget) {
+        this.getCanvasTarget(); this._frameBufferTargets ??= new Map();
+        callbackTarget = THREE.Renderer.prototype._getFrameBufferTarget.call(this);
+        if (!compilation) {
+          lifecycle.outputSelection = {target: sourceTarget, face: this._activeCubeFace, mip: this._activeMipmapLevel};
+          this._renderTarget = callbackTarget; this._activeCubeFace = 0; this._activeMipmapLevel = 0;
+        }
+      }
+      lifecycle.target = callbackTarget;
+      frame.renderId = compilation ? frame.renderId + 1 : renderId;
+      try {
+        this._updateNativeMatrices(lifecycle.root, camera);
+        // Source viewport/scissor and the global clipping view precede the
+        // scene callback. Its material, background and list edits come later.
+        lifecycle.rasterState = {
+          viewport: (callbackTarget?.viewport ?? this._viewport).clone(),
+          scissor: (callbackTarget?.scissor ?? this._scissor).clone(),
+          scissorTest: callbackTarget?.scissorTest ?? this._scissorTest,
+          pixelRatio: callbackTarget ? 1 : this._pixelRatio,
+          depth: callbackTarget ? [0, 1] : this._viewportDepth.slice(),
+          // Default render-context extents precede the callback, but target
+          // textures are updated afterward and may have been resized by it.
+          bufferSize: callbackTarget ? null : this._bufferSize(),
+        };
+        lifecycle.clippingView = camera.matrixWorldInverse.clone();
+        lifecycle.hooked = lifecycle.targetScene !== null || scene.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender ||
+          scene.onAfterRender !== THREE.Object3D.prototype.onAfterRender;
+        scene.onBeforeRender(this, lifecycle.root, camera, callbackTarget);
+        lifecycle.hooked ||= scene.onAfterRender !== THREE.Object3D.prototype.onAfterRender;
+        lifecycle.extraLights = [];
+        if (lifecycle.targetScene && lifecycle.targetScene !== lifecycle.root)
+          lifecycle.targetScene.traverseVisible(object => {
+            if (object.isLight && object.layers.test(camera.layers)) lifecycle.extraLights.push(object);
+          });
+        lifecycle.publicTarget = this._renderTarget;
+        lifecycle.publicFace = this._activeCubeFace; lifecycle.publicMip = this._activeMipmapLevel;
+      } catch (error) { this._restoreSceneLifecycle(lifecycle, false); throw error; }
+    }
+    _restoreSceneLifecycle(lifecycle, restoreOutput = true) {
+      if (!lifecycle?.restoreRenderId) return;
+      lifecycle.restoreRenderId = false;
+      this._nodes.nodeFrame.renderId = lifecycle.previousRenderId;
+      this._currentRenderObjectFunction = lifecycle.previousDispatcher;
+      if (restoreOutput && lifecycle.outputSelection) {
+        const {target, face, mip} = lifecycle.outputSelection;
+        this._renderTarget = target; this._activeCubeFace = face; this._activeMipmapLevel = mip;
+      }
+    }
+    _finishSceneLifecycle(lifecycle) {
+      if (!lifecycle?.begun || lifecycle.finished || lifecycle.compilation) return;
+      lifecycle.finished = true;
+      // Read the hook at this boundary: before/object hooks may replace it.
+      // Accepted parent requests already precede any nested after-hook work.
+      lifecycle.scene.onAfterRender(this, lifecycle.root, lifecycle.camera, lifecycle.target);
+    }
     _renderFrame(scene, camera, clearOnly = null) {
-      const requests = this._makeOutputRequests(scene, camera, clearOnly);
+      const lifecycle = clearOnly ? null : this._sceneLifecycle(scene, camera);
+      const requests = this._makeOutputRequests(scene, camera, clearOnly, true, lifecycle);
+      if (lifecycle) lifecycle.lastRequest = requests.at(-1);
       for (let i = 0; i < requests.length; i++) {
         try { this._dispatchRequest(requests[i]); }
         catch (error) {
@@ -1227,6 +1315,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           throw error;
         }
       }
+      this._finishSceneLifecycle(lifecycle);
     }
     _outputQuad(target, layer = 0) {
       let cache = this._outputQuads.get(target);
@@ -1257,9 +1346,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       return quad;
     }
-    _makeOutputRequests(scene, camera, clearOnly = null, captureCameras = true) {
+    _makeOutputRequests(scene, camera, clearOnly = null, captureCameras = true, sceneLifecycle = null) {
       if (!this._outputRenderTarget || this._shaderEncodedOutput)
-        return [this._makeRequest(scene, camera, clearOnly, captureCameras)];
+        return [this._makeRequest(scene, camera, clearOnly, captureCameras, this._renderTarget, sceneLifecycle)];
       const previousTarget = this._renderTarget, previousFace = this._activeCubeFace,
         previousMip = this._activeMipmapLevel;
       const outputTarget = previousTarget || this._outputRenderTarget;
@@ -1277,7 +1366,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           fail('UNSUPPORTED', 'Layered output conversion requires the base mip; cube conversion requires face zero');
       }
       if (!convert && (previousTarget !== null || clearOnly)) {
-        const request = this._makeRequest(scene, camera, clearOnly, captureCameras);
+        const request = this._makeRequest(scene, camera, clearOnly, captureCameras, this._renderTarget, sceneLifecycle);
         request.outputPass = previousTarget === this._outputRenderTarget;
         return [request];
       }
@@ -1297,7 +1386,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             requests.push(depth);
           }
           this._renderTarget = outputTarget;
-          requests.push(this._makeRequest(scene, camera, clearOnly, captureCameras, previousTarget));
+          requests.push(this._makeRequest(scene, camera, clearOnly, captureCameras, previousTarget, sceneLifecycle));
         } else {
           this._frameBufferTargets ??= new Map();
           const previousInternal = this._frameBufferTargets.get(this._outputRenderTarget);
@@ -1312,7 +1401,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               this._outputRenderTarget.width, this._outputRenderTarget.height, construct) : construct();
           } finally { if (previousCache) previousCache.resizing = false; }
           this._renderTarget = internal; this._activeCubeFace = 0; this._activeMipmapLevel = 0;
-          const input = this._makeRequest(scene, camera, clearOnly, captureCameras);
+          if (sceneLifecycle && captureCameras && !clearOnly) sceneLifecycle.outputSelection = {
+            target: outputTarget, face: previousFace, mip: previousMip,
+          };
+          const input = this._makeRequest(scene, camera, clearOnly, captureCameras, this._renderTarget, sceneLifecycle);
           // Source resets its public selector before callbacks, but its saved
           // render context still writes the selected private array layer.
           input.face = previousFace; input.sourceFace = 0; requests.push(input);
@@ -1344,12 +1436,19 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       } finally {
         // Source render() leaves the effective output selected after its
         // conversion pass. clear() and compileAsync() preserve the selector.
-        this._renderTarget = completed && convert && !clearOnly && captureCameras ? outputTarget : previousTarget;
-        this._activeCubeFace = previousFace; this._activeMipmapLevel = previousMip;
+        // A direct-output hook may select the next target. Only our temporary
+        // selection is restored; the source conversion path selects its output.
+        if (sceneLifecycle?.compilation && sceneLifecycle.begun) {
+          this._renderTarget = sceneLifecycle.publicTarget;
+          this._activeCubeFace = sceneLifecycle.publicFace; this._activeMipmapLevel = sceneLifecycle.publicMip;
+        } else if (convert || this._renderTarget === outputTarget && this._activeCubeFace === previousFace && this._activeMipmapLevel === previousMip) {
+          this._renderTarget = completed && convert && !clearOnly && captureCameras ? outputTarget : previousTarget;
+          this._activeCubeFace = previousFace; this._activeMipmapLevel = previousMip;
+        }
         if (outputState) { this.autoClear = outputState.autoClear; this.xr.enabled = outputState.xrEnabled; }
       }
     }
-    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId, sortState = null,
+    _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId, sortState = null, sceneLifecycle = null,
       canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target, mipLevel = 0, face = 0, sourceFace = face}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
@@ -1357,7 +1456,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!sourceRaster) { sourceRaster = createThreeSceneRaster(THREE, {stencilAttachment, fail}).program; this._nodeRaster.set(stencilAttachment, sourceRaster); }
       const reversedDepthBuffer = this.reversedDepthBuffer === true;
       const raster = (material, options) => sourceRaster(material, {...options, reversedDepthBuffer});
-      const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(scene);
+      const backgroundMesh = (this._nodeBackgrounds ??= createThreeNodeBackgrounds(THREE)).get(sceneLifecycle?.backgroundScene ?? scene);
       // Pre-init requests can be captured after a PassNode restored the public
       // renderer state. Build and update against that request's source context.
       const previousTarget = this._renderTarget, previousMRT = this._mrt, previousCanvas = this.getCanvasTarget();
@@ -1372,11 +1471,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // Direct default output and clear() output quads leave the source's
         // public selector null, although their GPU destination is a target.
         // ScreenNode therefore observes the canvas size on those source paths.
-        this._renderTarget = sourceTarget; this._mrt = mrt;
-        this._activeMipmapLevel = mipLevel; this._activeCubeFace = sourceFace;
+        this._renderTarget = sceneLifecycle?.begun ? sceneLifecycle.publicTarget : sourceTarget; this._mrt = mrt;
+        this._activeMipmapLevel = sceneLifecycle?.begun ? sceneLifecycle.publicMip : mipLevel;
+        this._activeCubeFace = sceneLifecycle?.begun ? sceneLifecycle.publicFace : sourceFace;
         if (restoreCanvas) this._canvases.select(canvasTarget);
         if (outputTransform) Object.assign(this, outputTransform);
-        if (destination === this && this.needsFrameBufferTarget) {
+        if (destination === this && !sceneLifecycle?.begun && this.needsFrameBufferTarget) {
           // Retain source target construction/identity for node observations;
           // actual color storage and submission stay in the owned canvas path.
           this.getCanvasTarget(); this._frameBufferTargets ??= new Map();
@@ -1386,7 +1486,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           maxQueries: maxDraws, maxContexts: maxBindings, fail});
         this._occlusionContext = queries.context(destination === this ? this._renderTarget : target, mrt,
           captureCameras ? bundleDepth : 0);
-        captured = captureThreeNodeScene(THREE, scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId, sortState,
+        captured = captureThreeNodeScene(THREE, sceneLifecycle?.scene ?? scene, camera, {renderer: this, overrideMaterial, raster, backgroundMesh, renderLists: this, renderId, sortState,
+          matricesUpdated: sceneLifecycle?.begun === true, sceneHooks: sceneLifecycle?.hooked === true,
+          clippingView: sceneLifecycle?.clippingView, renderRoot: scene, extraLights: sceneLifecycle?.extraLights,
+          renderObjectFunction: sceneLifecycle?.begun ? sceneLifecycle.renderObjectFunction : undefined,
           bundles: this._nodeBundles ??= createThreeNodeBundles(THREE, {maxEntries: maxDraws, fail}),
           bundleDepth,
           getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
@@ -1402,8 +1505,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       } finally {
         this._nodeCaptureDepth--;
         this._occlusionContext = previousOcclusion;
-        this._renderTarget = previousTarget; this._mrt = previousMRT;
-        this._activeMipmapLevel = previousMip; this._activeCubeFace = previousFace;
+        if (sceneLifecycle?.begun) {
+          sceneLifecycle.publicTarget = this._renderTarget;
+          sceneLifecycle.publicMip = this._activeMipmapLevel; sceneLifecycle.publicFace = this._activeCubeFace;
+        } else {
+          this._renderTarget = previousTarget;
+          this._activeMipmapLevel = previousMip; this._activeCubeFace = previousFace;
+        }
+        this._mrt = previousMRT;
         if (restoreCanvas) this._canvases.select(previousCanvas);
         if (previousOutput) Object.assign(this, previousOutput);
       }
@@ -1600,6 +1709,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       await this.init();
       pending: while (this._pending.length && !this._disposed) {
         const request = this._pending[0];
+        if (request.sceneHookFailure) throw request.sceneHookFailure;
         if (request.nodeCaptureFailure) throw request.nodeCaptureFailure.error;
         if (request.framebufferCopy) {
           try { const preparation = request.issue(); if (preparation?.then) await preparation; }
@@ -1650,11 +1760,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     async compileAsync(scene, camera, targetScene = null) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
-      const compiled = targetScene ?? scene;
+      const compiled = this._shaderEncodedOutput ? targetScene ?? scene : scene;
       if (!(compiled instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
+      if (targetScene !== null && !(targetScene instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source target scene');
+      // Source compilation initializes before its synchronous scene lifecycle.
+      // Once admitted, retries consume its capture without replaying hooks.
+      if (!this._shaderEncodedOutput && !this._initialized) await this.init();
       // Capture before initialization or another compile can yield. Preparation
       // and later draws address the same stable execution root.
-      const requests = this._makeOutputRequests(compiled, camera, null, false), compilation = {frameAdvanced: false};
+      if (!this._shaderEncodedOutput) this._nodes.nodeFrame.update();
+      const lifecycle = this._sceneLifecycle(compiled, camera, true, targetScene);
+      const requests = this._makeOutputRequests(compiled, camera, null, false, lifecycle), compilation = {frameAdvanced: !this._shaderEncodedOutput};
       for (const request of requests) request.compilation = compilation;
       try {
         await this.init();
@@ -1680,13 +1796,41 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           // The source's async-before-init path observes scene inputs at this
           // boundary. Refresh the selector before callbacks so fixed background
           // ownership and native sky packets describe that same accepted frame.
-          request.backgroundState = captureThreeBackground(THREE, request.scene);
-          request.key = sceneKey(this, request.scene, request.backgroundState);
-          destination._wanted.set(request.scene, request.key);
           const pendingBefore = this._pending.length;
+          let pendingAfterCapture = null;
           try {
+            if (request.sceneLifecycle) this._beginSceneLifecycle(request.sceneLifecycle, {
+              target: destination === this ? null : destination.target,
+              sourceTarget: request.sourceTarget, renderId: request.renderId,
+              sourceFace: request.sourceFace ?? request.face, sourceMip: request.mipLevel,
+            });
+            if (request.sceneLifecycle?.begun) {
+              // The backend selects the current canvas after Scene-before;
+              // retain that surface while its raster context stays pre-hook.
+              const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement;
+              const releaseCanvas = this._canvases.retain(canvasTarget, canvas);
+              request.releaseCanvas?.();
+              Object.assign(request, {canvasTarget, canvas, canvasSize: this._bufferSize(), releaseCanvas});
+            }
+            request.backgroundState = captureThreeBackground(THREE, request.sceneLifecycle?.backgroundScene ?? request.scene);
+            const sceneReference = request.sceneLifecycle?.scene ?? request.scene;
+            request.overrideMaterial = sceneReference.isScene === true ? sceneReference.overrideMaterial : null;
+            request.sortState = Object.freeze({sortObjects: this.sortObjects === true,
+              opaqueSort: this._opaqueSort, transparentSort: this._transparentSort});
+            if (request.sceneLifecycle?.hooked) {
+              const frame = this._frame(request.scene, request.clearOnly, destination === this ? null : destination.target,
+                request.mipLevel, request.outputProfile, request.sceneLifecycle.rasterState);
+              request.frame = {...frame, timestamp: request.frame.timestamp, operations: request.frame.operations,
+                ...(request.frame.arrayCamera ? {arrayCamera: request.frame.arrayCamera} : {})};
+              Object.assign(request.programFrame, {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+                outputColorSpace: this.outputColorSpace});
+            }
+            request.key = sceneKey(this, request.scene, request.backgroundState);
+            destination._wanted.set(request.scene, request.key);
             request.nodeFrame = this._captureNodeFrame(request);
-            request.matricesUpdated ||= !!request.nodeFrame;
+            if (request.nodeFrame?.sceneHierarchy) request.backgroundState = Object.freeze({...request.backgroundState,
+              nativeSceneProfile: Object.freeze({key: request.key, shadows: this.shadowMap.enabled})});
+            request.matricesUpdated ||= !!request.nodeFrame || request.sceneLifecycle?.begun === true;
             if (request.captureCameras) {
               if (!request.matricesUpdated) this._updateNativeMatrices(request.scene, request.camera);
               request.camera = request.camera.isArrayCamera ? captureThreeArrayCamera(THREE, request.camera) :
@@ -1694,9 +1838,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               request.matricesUpdated = true;
             }
             request.materialFrame = this._captureMaterialFrame(request);
+            this._restoreSceneLifecycle(request.sceneLifecycle);
+            pendingAfterCapture = this._pending.length;
+            try { this._finishSceneLifecycle(request.sceneLifecycle); }
+            catch (error) { this._pending.push({sceneHookFailure: error}); }
           } catch (error) {
             request.nodeCaptureFailure = {error};
           } finally {
+            this._restoreSceneLifecycle(request.sceneLifecycle);
             request.nodeCaptureDeferred = false;
             const parent = this._pending.indexOf(request);
             if (parent !== -1 && this._pending.length > pendingBefore) {
@@ -1704,8 +1853,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // recursive calls accepted by its source lifecycle. Preserve
               // their order before this parent and leave preexisting later
               // requests behind it, including on a late capture failure.
-              const prerequisites = this._pending.splice(pendingBefore);
+              const children = this._pending.splice(pendingBefore);
+              const boundary = pendingAfterCapture === null ? children.length : pendingAfterCapture - pendingBefore;
+              const prerequisites = children.slice(0, boundary), following = children.slice(boundary);
               this._pending.splice(parent, 0, ...prerequisites);
+              const last = this._pending.indexOf(request.sceneLifecycle?.lastRequest ?? request);
+              this._pending.splice((last === -1 ? this._pending.indexOf(request) : last) + 1, 0, ...following);
             }
           }
           if (request.nodeCaptureFailure) {

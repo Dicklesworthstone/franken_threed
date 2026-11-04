@@ -196,7 +196,7 @@ export async function createGpuThreeScene(device,scene,{
     const selected=backgroundScene().background;
     return passNodeFrame?.phases?.opaque!==false&&!passNodeFrame?.background&&selected!==null&&!selected?.isColor?selected:null;
   };
-  const sourceFog=()=>passNodeFrame?.sceneFogNode?null:scene.fog;
+  const sourceFog=()=>passNodeFrame?.sceneFogNode||passNodeFrame?.sceneHierarchy?null:scene.fog;
   const stencilAttachment=['depth24plus-stencil8','depth32float-stencil8'].includes(renderOptions.depthFormat);
   const sourceRaster=createThreeSceneRaster(three,{stencilAttachment,fail});
   const models=new Map([
@@ -333,12 +333,17 @@ export async function createGpuThreeScene(device,scene,{
       // Accepted bundle packets own this entire subtree, including children
       // removed or added while asynchronous pipeline preparation was pending.
       if(bundledNodeObject(object))continue;
-      if(object.children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
-      for(let i=object.children.length-1;i>=0;i--)stack.push(object.children[i]);
+      const children=passNodeFrame?.sceneHierarchy?.get(object)??object.children;
+      if(children.length+stack.length+nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
+      for(let i=children.length-1;i>=0;i--)stack.push(children[i]);
       // Source projection skips hidden objects before touching render hooks,
       // materials or geometry. Keep hierarchy/capacity validation, while the
       // accepted native capture retains inherited visibility through any await.
       if(excludedNodeObject(object)||bundledNodeObject(object)||fixedGeometry(object)===null)continue;
+      // The synchronous source lifecycle already admitted every native draw.
+      // Scene after-hooks may have replaced its public geometry or callbacks;
+      // only the retained bindings and upload leases belong to this request.
+      if(passNodeFrame?.sceneHierarchy&&capturedNodeObject(object))continue;
       // Suppressed color lists retain hierarchy traversal and shadow casters,
       // but acquire no color material, geometry or upload work for this pass.
       if(sourceMaterial(object)&&!sourceMaterials(object).some(colorPhaseEnabled)&&!(shadowEnabled&&object.castShadow))continue;
@@ -427,7 +432,7 @@ export async function createGpuThreeScene(device,scene,{
         if(shadowBlend==='reject'&&source.some(m=>materialState(m)?.transparent))fail('SHADOW','BLEND casters require the explicit shadow.blend:skip policy');
       }
     }
-    if((!fogEnabled&&sourceFog()!==null)||(!environmentEnabled&&scene.environment!==null&&!passNodeFrame?.sceneEnvironmentNode&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
+    if((!fogEnabled&&sourceFog()!==null)||(!environmentEnabled&&scene.environment!==null&&!passNodeFrame?.sceneEnvironmentNode&&!passNodeFrame?.sceneHierarchy&&!programEnvironmentOwned())||(!backgroundEnabled&&!programBackgroundOwned&&sourceBackground()!==null))
       fail('SCENE','Enable source fog:{}, environment:{} or background:{} for the corresponding source effect');
     if(backgroundEnabled&&sourceBackground()!==null){
       backgroundApi.inspectThreeBackground(sourceBackground(),three,backgroundOptions);
@@ -1702,7 +1707,7 @@ export async function createGpuThreeScene(device,scene,{
             // Source r186 WebGPU behavior: report and draw nothing for this object.
             (three.error??console.error)('Renderer: Objects of type THREE.LineLoop are not supported. Please use THREE.Line or THREE.LineSegments.');
           }
-          else if(drawable(object)||loopDrawn(object)){
+          else if((drawable(object)||loopDrawn(object))&&!capturedNodeObject(object)){
             // A caster outside the viewing frustum can still shadow a receiver.
             // Preserve source visibility/layers/LOD, but use the light frustum.
             if(shadowOwner&&object.isMesh&&object.castShadow)casterObjects.push(object);
@@ -1724,7 +1729,8 @@ export async function createGpuThreeScene(device,scene,{
             }
           }
         }
-        for(let i=object.children.length-1;i>=0;i--)stack.push({object:object.children[i],groupOrder});
+        const children=passNodeFrame?.sceneHierarchy?.get(object)??object.children;
+        for(let i=children.length-1;i>=0;i--)stack.push({object:children[i],groupOrder});
       }
       if(lighting.lights.length>8)fail('LIMIT','Visible source lights exceed the renderer capacity');
       const lightIndex=shadowOwner?lightSources.indexOf(shadowOwner.source):-1;
