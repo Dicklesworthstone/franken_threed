@@ -18,6 +18,7 @@ const CORE_LOADERS = new Set([
   "TextureLoader", "CubeTextureLoader", "ImageLoader", "ImageBitmapLoader",
   "FileLoader", "AudioLoader", "BufferGeometryLoader", "ObjectLoader",
 ]);
+const MANAGER_CALLBACKS = new Set(["onStart", "onLoad", "onProgress", "onError"]);
 const SETTINGS = new Set(["setPath", "setResourcePath", "setCrossOrigin", "setWithCredentials", "setRequestHeader"]);
 // These pinned loaders fetch one source file; their parsers do not fetch model
 // sidecars. OBJ's material creator executes upstream and has its own MTL closure.
@@ -128,30 +129,50 @@ function relativeUrl(value) {
 }
 
 /** Returns finite load requests, following lexical const bindings without guessing names. */
-export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure, moduleUrl, source } = {}) {
+export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, onDefaultManagerExposure, onManagerConstructorExposure, moduleUrl, source } = {}) {
   const root = packageRootUrl ? canonicalUrl(packageRootUrl).replace(/\/?$/, "/") : PINNED_ROOT;
+  const currentModule = moduleUrl ? canonicalUrl(moduleUrl) : null;
   // This exact retained module only reads the default manager as the fallback
   // for MaterialCreator.loadTexture(). It neither changes nor exposes it to app
   // code. A modified module or an identically named file keeps the escape rule.
   if (moduleUrl && typeof source === "string" &&
-      canonicalUrl(moduleUrl) === root + "examples/jsm/loaders/MTLLoader.js" &&
+      currentModule === root + "examples/jsm/loaders/MTLLoader.js" &&
       createHash("sha256").update(source).digest("hex") === "f1f8f0c6fcfa09671cb609954ea436521d835606853c110c5aff2dc8188f5e61") return [];
+  let managerReexported = false;
+  // A bridge can expose the constructor without creating an imported binding.
+  // The pinned build/source entry points already forward their own exports;
+  // those declarations are library structure, not an application escape.
+  const libraryModule = currentModule && (isInternalLibraryModule(currentModule, root) || currentModule.startsWith(root + "src/"));
+  if (!libraryModule) for (const node of ast.body) {
+    if (!["ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type) || !node.source) continue;
+    let resolved;
+    try { resolved = canonicalUrl(resolveModule(node.source.value)); } catch { continue; }
+    if (!(isInternalLibraryModule(resolved, root) && resolved !== root + "build/three.tsl.js") &&
+        resolved !== root + "src/loaders/LoadingManager.js") continue;
+    if (node.type === "ExportAllDeclaration" || node.specifiers.some(specifier =>
+      (specifier.local.name ?? specifier.local.value) === "LoadingManager")) managerReexported = true;
+  }
   const importedBindings = new Map();
   for (const node of ast.body) {
     if (node.type !== "ImportDeclaration") continue;
     let resolved;
     try { resolved = canonicalUrl(resolveModule(node.source.value)); } catch { continue; }
     const core = isInternalLibraryModule(resolved, root);
+    const managerModule = resolved === root + "src/loaders/LoadingManager.js";
     const addons = [...ADDON_SETTINGS.keys()].filter(name =>
       resolved === root + "examples/jsm/Addons.js" ||
       resolved === root + `examples/jsm/loaders/${ADDON_FILES.get(name) ?? name + ".js"}`);
     for (const specifier of node.specifiers) {
       let value;
-      if (specifier.type === "ImportNamespaceSpecifier" && core) value = { namespace: true };
+      if (specifier.type === "ImportNamespaceSpecifier" && core) value = {
+        namespace: true, managerNamespace: resolved !== root + "build/three.tsl.js",
+      };
+      if (specifier.type === "ImportNamespaceSpecifier" && managerModule) value = { managerNamespace: true };
       if (specifier.type === "ImportNamespaceSpecifier" && addons.length) value = { addonNamespace: new Set(addons) };
       if (specifier.type === "ImportSpecifier") {
         const imported = specifier.imported.name ?? specifier.imported.value;
         if (core && imported === "DefaultLoadingManager") value = { manager: true };
+        if ((core || managerModule) && imported === "LoadingManager") value = { loader: imported };
         if ((core && CORE_LOADERS.has(imported)) ||
             (CORE_LOADERS.has(imported) && resolved === root + `src/loaders/${imported}.js`) ||
             addons.includes(imported)) {
@@ -161,7 +182,10 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       importedBindings.set(specifier.local.name, { kind: "import", value });
     }
   }
-  if (![...importedBindings.values()].some((binding) => binding.value)) return [];
+  if (![...importedBindings.values()].some((binding) => binding.value)) {
+    if (managerReexported) onManagerConstructorExposure?.();
+    return [];
+  }
   const ancestorsByNode = new WeakMap(), scopes = new Map(), calls = [];
   const put = (scope, name, binding) => {
     if (!scopes.has(scope)) scopes.set(scope, new Map());
@@ -220,6 +244,17 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     if (!refs.has(binding)) refs.set(binding, []);
     refs.get(binding).push({ node, parent, ancestors: ancestors.slice() });
   });
+  // Acorn's ordinary walker does not visit local export specifiers. A manager
+  // or one of its loaders exported this way is just as exposed as a returned one.
+  const exported = new Set();
+  for (const node of ast.body) {
+    if (node.type !== "ExportNamedDeclaration" || node.source) continue;
+    const locals = node.specifiers.map(specifier => specifier.local.name);
+    if (node.declaration?.type === "VariableDeclaration") {
+      for (const declaration of node.declaration.declarations) names(declaration.id, locals);
+    }
+    for (const name of locals) exported.add(lookup(name, ast));
+  }
   const defaultManager = (node, active = new Set()) => {
     if (node?.type === "Identifier") {
       const binding = lookup(node.name, node);
@@ -275,6 +310,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     if (node?.type === "MemberExpression" && node.object.type === "Identifier") {
       const binding = lookup(node.object.name, node.object), name = memberName(node);
       if ((binding?.value?.namespace && CORE_LOADERS.has(name)) || binding?.value?.addonNamespace?.has(name)) return name;
+      if (name === "LoadingManager" && (binding?.value?.namespace || binding?.value?.managerNamespace)) return name;
     }
     return null;
   };
@@ -336,13 +372,118 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
     return value;
   };
+  const directEval = calls.some(call => call.callee.type === "Identifier" && call.callee.name === "eval");
+  const identityObservation = parent => parent?.type === "BinaryExpression" && ["===", "!=="].includes(parent.operator);
+  const managerCallback = (node, active = new Set()) => {
+    if (node?.type === "Identifier") {
+      const binding = lookup(node.name, node);
+      if (node.name === "undefined" && !binding) return true;
+      if (binding?.kind !== "const" || active.has(binding)) return false;
+      return managerCallback(binding.init, new Set(active).add(binding));
+    }
+    if (node?.type === "Literal" && node.value === null ||
+        node?.type === "UnaryExpression" && node.operator === "void" && node.argument.type === "Literal") return true;
+    if (!["FunctionExpression", "ArrowFunctionExpression"].includes(node?.type)) return false;
+    let safe = true;
+    // Source invokes ordinary functions with the manager as `this`. Allow
+    // identity observations, but not exposing that receiver or changing its
+    // URL mapping. Arrows keep their lexical receiver, exactly as authored.
+    if (node.type === "FunctionExpression") walk.fullAncestor(node, (value, _state, ancestors) => {
+      if (value.type === "ThisExpression" && !identityObservation(ancestors.at(-2))) safe = false;
+    });
+    return safe;
+  };
+  let managerConstructorExposed = managerReexported;
+  for (const binding of exported) {
+    if (binding?.value?.managerNamespace || binding?.value?.loader === "LoadingManager" ||
+        binding?.declaration && constructor(binding.declaration.id) === "LoadingManager") managerConstructorExposed = true;
+  }
+  for (const [binding, uses] of refs) {
+    if (!binding.value?.managerNamespace) continue;
+    for (const ref of uses) {
+      if (ref.parent?.type === "MemberExpression" && ref.parent.object === ref.node && memberName(ref.parent) !== null) continue;
+      if (!identityObservation(ref.parent)) managerConstructorExposed = true;
+    }
+  }
+  walk.fullAncestor(ast, (node, _state, ancestors) => {
+    if (constructor(node) !== "LoadingManager") return;
+    const parent = ancestors.at(-2);
+    if (parent?.type === "NewExpression" && parent.callee === node || identityObservation(parent)) return;
+    if (parent?.type === "VariableDeclarator" && (parent.id === node || parent.init === node &&
+        parent.id.type === "Identifier" && lookup(parent.id.name, parent.id)?.kind === "const")) return;
+    managerConstructorExposed = true;
+  });
+  // A prototype setter can change URL routing while a new manager is being
+  // constructed. Only the new local-manager requests depend on this proof;
+  // existing default-manager discovery retains its separate exposure rule.
+  if (managerConstructorExposed) onManagerConstructorExposure?.();
+  const checkingManagers = new Set();
+  const localManager = node => {
+    let binding, creation = node;
+    if (node?.type === "Identifier") {
+      binding = lookup(node.name, node);
+      if (binding?.kind !== "const" || exported.has(binding)) return false;
+      creation = binding.init;
+    }
+    if (directEval || managerConstructorExposed || creation?.type !== "NewExpression" || constructor(creation.callee) !== "LoadingManager" ||
+        creation.arguments.length > 3 || !creation.arguments.every(argument => managerCallback(argument))) return false;
+    // Consumer checks reuse instance() below; a shared manager can appear in
+    // several such checks. Every outer check still visits all of its references.
+    if (checkingManagers.has(creation)) return true;
+    checkingManagers.add(creation);
+    try {
+      if (!binding) {
+        const parent = ancestorsByNode.get(creation)?.at(-2);
+        return parent?.type === "NewExpression" && parent.arguments[0] === creation && confinedManagerLoader(parent);
+      }
+      for (const ref of refs.get(binding) ?? []) {
+        const member = ref.parent, operation = ref.ancestors.at(-3);
+        if (identityObservation(member)) continue;
+        if (member?.type === "NewExpression" && member.arguments.length === 1 && member.arguments[0] === ref.node &&
+            confinedManagerLoader(member)) continue;
+        if (member?.type !== "MemberExpression" || member.object !== ref.node) return false;
+        if (MANAGER_CALLBACKS.has(memberName(member)) && operation?.type === "AssignmentExpression" &&
+            operation.operator === "=" && operation.left === member && managerCallback(operation.right)) continue;
+        // abort() returns the manager; only a discarded call keeps it private.
+        if (memberName(member) === "abort" && operation?.type === "CallExpression" && operation.callee === member &&
+            operation.arguments.length === 0 && ref.ancestors.at(-4)?.type === "ExpressionStatement") continue;
+        return false;
+      }
+      return true;
+    } finally { checkingManagers.delete(creation); }
+  };
+  const confinedManagerLoader = node => {
+    const loader = constructor(node.callee);
+    // Core loader results do not expose their manager. GLTF's parser and MTL's
+    // MaterialCreator do; those and other addon consumers keep their host route.
+    if (!CORE_LOADERS.has(loader) || node.arguments.length !== 1) return false;
+    const ancestors = ancestorsByNode.get(node);
+    let value = node, index = ancestors.length - 1;
+    while (index > 0) {
+      const parent = ancestors[index - 1], next = ancestors[index - 2];
+      if (parent.type === "MemberExpression" && parent.object === value &&
+          next?.type === "CallExpression" && next.callee === parent) {
+        const method = memberName(parent);
+        if (isSetting(loader, method)) { value = next; index -= 2; continue; }
+        return isUse(loader, method) && instance(value, next) !== null;
+      }
+      if (parent.type === "VariableDeclarator" && parent.init === value && parent.id.type === "Identifier") {
+        const binding = lookup(parent.id.name, parent.id);
+        return binding?.kind === "const" && !exported.has(binding) && instance(parent.id, node) !== null;
+      }
+      return parent.type === "ExpressionStatement" && parent.expression === value;
+    }
+    return false;
+  };
   const instance = (node, use, active = new Set()) => {
     if (node?.type === "NewExpression") {
       const loader = constructor(node.callee);
       // An application-supplied manager can map a logical URL to an unrelated
-      // runtime resource. Keep that authored route without assuming disk files.
-      return loader && node.arguments.length === 0
-        ? { loader, origin: node, paths: [""], resourcePaths: [""], codecs: new Map(),
+      // runtime resource. Only confined, source-owned observation managers add
+      // discovery; constructors and callbacks still execute without rewriting.
+      return loader && loader !== "LoadingManager" && (node.arguments.length === 0 ||
+        CORE_LOADERS.has(loader) && node.arguments.length === 1 && localManager(node.arguments[0]))
+        ? { loader, origin: node, localManager: node.arguments.length === 1, paths: [""], resourcePaths: [""], codecs: new Map(),
           codecUrls: loader === "Rhino3dmLoader" ? [...RHINO_LIBRARIES] : [] } : null;
     }
     if (node?.type === "CallExpression" && ALL_SETTINGS.has(memberName(node.callee))) {
@@ -479,6 +620,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       if (urls && urls.length * value.paths.length * value.resourcePaths.length <= LIMIT) {
         for (const url of urls) for (const prefix of value.paths) for (const resourcePath of value.resourcePaths) {
           const request = { loader: value.loader, url: prefix + url, resourcePath, path: prefix, originalUrl: url };
+          if (value.localManager) request.localManager = true;
           requests.push(request);
           objectGroup?.requests.push(request);
           materialGroup?.requests.push(request);

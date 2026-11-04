@@ -119,6 +119,7 @@ export function f3dRollupPlugin(options = {}) {
   const documentRequests = [];
   const documentFetchSites = [];
   let defaultManagerExposed = false;
+  let managerConstructorExposed = false;
   let loaderResourceCalls = false;
 
   function emitJsonModule(context, url) {
@@ -214,7 +215,8 @@ export function f3dRollupPlugin(options = {}) {
 
     generateBundle(_outputOptions, bundle) {
       for (const { requests, id } of defaultManagerExposed ? [] : documentRequests) {
-        for (const [fileName, asset] of collectThreeLoaderAssets(requests, {
+        const admitted = managerConstructorExposed ? requests.filter(request => !request.localManager) : requests;
+        for (const [fileName, asset] of collectThreeLoaderAssets(admitted, {
           documentUrl: options.documentUrl,
           documentBaseUrl: mapBaseUrl,
           onResource: (filename, url) => {
@@ -415,7 +417,12 @@ export function f3dRollupPlugin(options = {}) {
           const loaderEdits = threeLoaderResourceEdits(code, ast, id, options.packageRootUrl);
           if (loaderEdits.length) { edits.push(...loaderEdits); loaderResourceCalls = true; }
         }
-        if (options.documentUrl && (code.includes("load") || code.includes("LoadingManager"))) {
+        // The compiler-owned facade forwards the pinned namespace to its known
+        // renderer factory; it contains no application loader calls or escapes.
+        if (options.documentUrl && !id.startsWith(ROUTED_RENDERER_PREFIX) && (code.includes("load") || code.includes("LoadingManager") ||
+            ast.body.some(node => node.type === "ImportDeclaration" &&
+              node.specifiers.some(specifier => specifier.type === "ImportNamespaceSpecifier") ||
+              ["ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type) && node.source))) {
           const requests = findThreeLoaderRequests(ast, {
             moduleUrl: id, source: code,
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
@@ -423,6 +430,7 @@ export function f3dRollupPlugin(options = {}) {
             }),
             packageRootUrl: options.packageRootUrl,
             onDefaultManagerExposure: () => { defaultManagerExposed = true; },
+            onManagerConstructorExposure: () => { managerConstructorExposed = true; },
           });
           if (requests.length) documentRequests.push({ requests, id });
         }
