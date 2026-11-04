@@ -9,6 +9,7 @@
     "npm": ">=10.0.0"
   },
   "dependencies": {
+    "@rollup/plugin-commonjs": "29.0.3",
     "acorn": "8.14.0",
     "acorn-walk": "8.3.4",
     "rollup": "4.63.1"

@@ -243,10 +243,14 @@ test('package frontend accepts unchanged handled sources and refuses unhandled f
       'main.mjs': "import 'unhandled';",
       'node_modules/unhandled/package.json': JSON.stringify({name: 'unhandled', exports: './input.' + extension}),
       ['node_modules/unhandled/input.' + extension]: bytes});
-    await assert.rejects(buildModuleGraph(source.entry, {transformModule(code, {url}) {
+    const graph = buildModuleGraph(source.entry, {transformModule(code, {url}) {
       assert.ok(!/\.(?:json|wasm)$/.test(new URL(url).pathname), 'resources never enter the JavaScript frontend');
       return null;
-    }}), {code: 'F3D_PACKAGE_FORMAT'});
+    }});
+    if (extension === 'cjs') {
+      const opaque = Object.values((await graph).modules).find(module => module.source_format === 'commonjs');
+      assert.equal(opaque.analysis_complete, false, 'CommonJS is recorded without executing its body or proving its closure');
+    } else await assert.rejects(graph, {code: 'F3D_PACKAGE_FORMAT'});
   }
 });
 
@@ -465,12 +469,19 @@ test('typed renderer construction keeps pinned Three identities and selects the 
   assert.equal(built.rendererRoute.routed, true);
   assert.ok(built.rendererRoute.substitutedModules.some(url => url.endsWith('/build/three.webgpu.js')));
   const oldDocument = globalThis.document;
+  const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   globalThis.document = {createElementNS: () => ({width: 32, height: 32, style: {}})};
+  Object.defineProperty(globalThis, 'navigator', {configurable: true,
+    value: {gpu: {requestAdapter: async () => null}}});
   try {
     const app = await import(pathToFileURL(path.join(f.out, built.entryFiles[0])).href);
     assert.deepEqual(app.flags, [true, 'general-webgpu', '186']);
     assert.ok(app.scene instanceof app.Scene);
-  } finally {globalThis.document = oldDocument;}
+  } finally {
+    globalThis.document = oldDocument;
+    if (oldNavigator) Object.defineProperty(globalThis, 'navigator', oldNavigator);
+    else delete globalThis.navigator;
+  }
   assert.ok([...calls.values()].every(count => count === 1));
   assert.ok(folderBytes(f.root) < 6 * 1024 * 1024, 'single native output budget');
 });

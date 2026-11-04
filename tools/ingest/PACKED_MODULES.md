@@ -65,9 +65,10 @@ maps. The selected canonical URL reaches the same cached frontend before the
 package format check. Return JavaScript explicitly to handle that source;
 returning `null`/`undefined` leaves an unsupported package format rejected.
 An explicit unchanged string is accepted, so a type-free source module does not
-need a cosmetic edit. The hook must preserve the intended module semantics;
-CommonJS is not automatically converted. JSON and binary package targets do not
-enter the JavaScript frontend, and package export selection is unchanged.
+need a cosmetic edit. The hook must preserve the intended module semantics.
+Application builds additionally compile the bounded CommonJS route below;
+an unchanged frontend result does not hide remaining CommonJS dependencies.
+JSON and binary package targets do not enter the JavaScript frontend.
 
 The CLI loads an explicitly selected local frontend module:
 
@@ -105,6 +106,43 @@ Its packed application also runs with both source and emitted directories
 unavailable. Separate checks construct the native renderer from typed source and
 execute a modified pinned core through the retained route. These establish input
 integration and execution ownership; they do not establish a rendering speedup.
+
+## Browser CommonJS builds
+
+`buildApplication` and CLI `--build-app` compile ordinary installed CommonJS
+packages and direct `.cjs` utility entries to browser ESM using the exact pinned
+`@rollup/plugin-commonjs` 29.0.3 compiler. `strictRequires: true` keeps ordinary
+nested/cyclic requires, conditional initialization, and shared `module.exports`
+instances behind lazy wrappers. Package exports and private imports select
+`browser`/`require`/`default` for requires and `browser`/`import`/`default` for ESM
+imports, in manifest order. Legacy CommonJS file/directory lookup and package
+browser replacements use the existing resolver; no package download or Node
+builtin polyfill is implied. Required source paths retain their real source
+base, including literal percent, question-mark and hash filename characters.
+
+The analysis graph labels CommonJS and mixed-source boundaries with
+`source_format` and `analysis_complete: false`. They cannot prove dynamic closure
+or authorize native renderer substitution. Source-level specialization leaves
+CommonJS intact for its compiler. Build output can subsequently be packed when
+its emitted ESM and resource graph closes.
+
+Dynamic require selection, synchronous requires of ESM/JSON/live external
+modules, and CommonJS URL query/hash variants produce explicit build errors.
+Mixed ESM/CommonJS source needs normalization by the project frontend. Retained
+ESM and module-worker sources also need frontend normalization; raw CommonJS is
+not copied into those browser module paths. Classic scripts and classic workers
+retain their existing browser execution, including UMD branches.
+
+This is a browser-bundler route, not a complete Node loader. In particular, the
+pinned compiler retains a partially initialized wrapper after an initializer
+throws, whereas Node can evict that module and retry its initialization. Programs
+depending on that retry behavior, Node module/cache introspection, or native
+host APIs need their existing frontend or native Node route. The actual pinned
+Three.js `three.cjs` is a Node-only deprecation wrapper using `process.emitWarning`
+and `require('./three.module.js')`; this browser build refuses that ESM require
+rather than changing its condition, warning, or initialization order. Native
+synchronous Three.js consumers can use the existing
+[`emitPortablePackage`](../compat-facade/portable-package.mjs) package route.
 
 ## Native document fetch resources
 

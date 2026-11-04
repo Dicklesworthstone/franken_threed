@@ -46,6 +46,7 @@ import {
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { buildModuleGraph } from "./module_graph.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { assertUnbundledModule } from "./commonjs_modules.mjs";
 import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
@@ -1287,6 +1288,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         (item.isModuleSpecifier || /\.(?:mjs|cjs|js)$/.test(srcAssetAbs));
       // Retained scripts must use the same frontend output as bundled imports.
       // URL variants can share a physical output only when their bytes agree.
+      if (javascript && item.isModuleSpecifier) assertUnbundledModule(moduleUrl, moduleSources);
       let assetData = javascript ? moduleSources.read(moduleUrl || pathToFileURL(srcAssetAbs).href,
         {sourceType: item.isModuleSpecifier ? "module" : "script"}).bytes : fs.readFileSync(srcAssetAbs);
       const workerSource = classicWorkerSources.get(srcAssetAbs);

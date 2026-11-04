@@ -18,6 +18,7 @@ import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
@@ -290,6 +291,7 @@ export function f3dRollupPlugin(options = {}) {
       const resolvedUrl = resolveModuleSpecifier(source, referrerUrl, importMap, {
         mapBaseUrl,
         _moduleSources: moduleSources,
+        allowCommonJS: options.commonJS === true,
         packageRootUrl: options.packageRootUrl,
       });
       if (importer && retainedModuleUrls.has(resolvedUrl)) {
@@ -305,12 +307,15 @@ export function f3dRollupPlugin(options = {}) {
         // cannot accidentally become a successful JavaScript module import.
         return {id: emitJsonModule(this, resolvedUrl), external: true, attributes};
       }
-      return resolvedUrl;
+      return options.commonJS ? commonjsEntry(resolvedUrl, moduleSources) : resolvedUrl;
     },
 
     load(id) {
       if (inlineModules.has(id)) {
-        return moduleSources.read(id, {source: inlineModules.get(id)}).code;
+        const source = moduleSources.read(id, {source: inlineModules.get(id)}).code;
+        if (commonjsFormat(id, moduleSources, {inline: true}) !== 'module')
+          throw commonjsError('MIXED_MODULE', 'Inline ESM with free CommonJS bindings needs a project frontend', id);
+        return source;
       }
 
       if (id.startsWith("file://")) {
@@ -454,6 +459,7 @@ export function f3dRollupPlugin(options = {}) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
                 mapBaseUrl,
                 _moduleSources: moduleSources,
+                allowCommonJS: options.commonJS === true,
                 packageRootUrl: options.packageRootUrl,
               });
               // Untyped JSON also needs an opaque native import expression:
@@ -705,6 +711,15 @@ export async function bundleWithRollup(entryPath, options = {}) {
         maxIterations: specialization === true ? undefined : specialization.maxIterations,
       })
     : null;
+  if (marchingPlugin) {
+    const transform = marchingPlugin.transform;
+    marchingPlugin.transform = function(code, id) {
+      // These source transforms add ESM imports. Keep opaque CJS intact until
+      // its compiler has established wrappers and require initialization.
+      if (id.startsWith('file:') && commonjsFormat(id, moduleSources) !== 'module') return null;
+      return transform.call(this, code, id);
+    };
+  }
   const resolvedEntryAbs = path.resolve(entryPath);
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
@@ -795,6 +810,10 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // Resolve the compiler-owned virtual modules before the import-map
         // resolver sees them; they are not application package/asset paths.
         ...(marchingPlugin ? [marchingPlugin] : []),
+        ...commonjsPlugins({moduleSources, resolveModule: (specifier, from, request) =>
+          resolveModuleSpecifier(specifier, from, importMap, {
+            mapBaseUrl, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, ...request,
+          })}),
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
@@ -808,6 +827,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
         }),
         f3dRollupPlugin({
           _moduleSources: moduleSources,
+          commonJS: true,
           importMap,
           mapBaseUrl,
           inlineModules,
@@ -890,7 +910,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
     const seenEntryChunks = new Set();
 
     for (const entryId of orderedEntryIds) {
-      const chunk = chunks.find((c) => c.facadeModuleId === entryId);
+      const chunk = chunks.find((c) => commonjsSourceUrl(c.facadeModuleId) === entryId);
 
       if (!chunk) {
         throw new Error(`Failed to find emitted chunk for entry module: ${entryId}`);
@@ -925,7 +945,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
       isDynamicEntry: Boolean(c.isDynamicEntry),
       imports: c.imports || [],
       dynamicImports: c.dynamicImports || [],
-      facadeModuleId: c.facadeModuleId || null,
+      facadeModuleId: commonjsSourceUrl(c.facadeModuleId) || null,
     }));
 
     const outputAssets = assets.map((a) => ({

@@ -15,6 +15,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 import {moduleSourcesFor} from './module_sources.mjs';
+import {assertUnbundledModule} from './commonjs_modules.mjs';
 
 export class ModuleWorkerBuildError extends Error {
   constructor(code, message, url = null) {
@@ -364,6 +365,7 @@ export function buildWorkerGraph(entryUrl, {
     const record = queue[index], bytes = read(record.url);
     const source = record.nativeResource ? null : moduleSources.read(record.url,
       {sourceType: record.sourceType, source: bytes}).code;
+    if (!record.nativeResource && record.sourceType === 'module') assertUnbundledModule(record.url, moduleSources);
     analyzedBytes += source === null ? bytes.length : Buffer.byteLength(source);
     if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
     if (record.nativeResource) {

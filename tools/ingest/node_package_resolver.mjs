@@ -1,6 +1,7 @@
-/** Local installed-ESM resolution for application ingestion.
+/** Local installed-package resolution for application ingestion.
  * Import maps and the pinned Three.js override are handled by the caller first.
- * Never downloads packages, uses global npm paths, or guesses a CommonJS route.
+ * Never downloads packages or uses global npm paths. CommonJS requires an
+ * explicit compiler admission from the caller; raw browser sources stay ESM.
  * Package exports are authoritative, including failures in the nearest package.
  */
 import fs from "node:fs";
@@ -14,6 +15,39 @@ const EMPTY_BROWSER_MODULE = new URL("./browser_empty.mjs", import.meta.url).hre
 // Only source-language files may enter the project frontend. Native JSON and
 // binary resources never become JavaScript merely because a hook is present.
 const FRONTEND_SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".cjs"]);
+
+/** CommonJS file/directory lookup only. Export-map targets never use this
+ * fallback: their selected filenames remain exact and authoritative. */
+export function resolveCommonJSFile(url) {
+  const original = new URL(url), visited = new Set();
+  const file = filename => {
+    for (const candidate of [filename, filename + '.js', filename + '.json', filename + '.node']) {
+      try { if (fs.statSync(candidate).isFile()) return fs.realpathSync(candidate); }
+      catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+    }
+    return null;
+  };
+  const directory = filename => {
+    if (visited.has(filename) || visited.size >= 32) return null;
+    visited.add(filename);
+    let value;
+    try { value = JSON.parse(fs.readFileSync(path.join(filename, 'package.json'), 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+    const main = typeof value?.browser === 'string' ? value.browser : value?.main;
+    if (typeof main === 'string' && main) {
+      const target = path.resolve(filename, main);
+      const found = file(target) ?? file(path.join(target, 'index'));
+      if (found) return found;
+    }
+    return file(path.join(filename, 'index'));
+  };
+  const filename = fileURLToPath(original);
+  const found = file(filename) ?? directory(filename);
+  if (!found) return original.href;
+  const result = pathToFileURL(found);
+  result.search = original.search; result.hash = original.hash;
+  return result.href;
+}
 
 export function resolveInstalledPackage(specifier, referrerUrl, options = {}) {
   return resolvePackageRequest(specifier, referrerUrl, options, false);
@@ -29,7 +63,9 @@ export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {
 
 function resolvePackageRequest(specifier, referrerUrl, {
   span = null, resolveExternal = null, browserSkip = null, browserTrail = [], _moduleSources = null,
+  requestKind = 'import', allowCommonJS = false,
 } = {}, browserOnly) {
+  const conditions = ['browser', requestKind, 'default'];
   const fail = (code, message) => {
     const error = new IngestionResolutionError(
       `Cannot resolve package import "${specifier}" from "${referrerUrl}": ${message}`,
@@ -100,14 +136,14 @@ function resolvePackageRequest(specifier, referrerUrl, {
     const packageJsonPath = path.join(directory, "package.json");
     let target, declaredEsmEntry = false;
     if (value?.exports !== null && value?.exports !== undefined) {
-      target = resolvePackageExports(subpath, value.exports, packageJsonPath, specifier, referrerUrl, span);
+      target = resolvePackageExports(subpath, value.exports, packageJsonPath, specifier, referrerUrl, span, conditions);
     } else {
       // Without exports, legacy browser/module entries precede main. Selection
       // is metadata-driven: a missing or unsupported selected file must fail,
       // not switch implementations. Exact subpaths bypass entrypoint fields.
       const entryField = name => typeof value?.[name] === "string" && value[name] ? value[name] : null;
       const asTarget = filename => filename.startsWith("./") ? filename : "./" + filename;
-      const moduleEntry = entryField("module");
+      const moduleEntry = requestKind === 'require' ? null : entryField("module");
       const entry = entryField("browser") || moduleEntry || entryField("main") || "index.js";
       const relative = subpath === "." ? asTarget(entry) : subpath;
       target = resolvePackageExports(".", relative, packageJsonPath, specifier, referrerUrl, span);
@@ -120,12 +156,13 @@ function resolvePackageRequest(specifier, referrerUrl, {
         new URL(target, pathToFileURL(directory + path.sep)));
       if (replacement !== null) return replacement;
     }
-    return finalize(directory, target, declaredEsmEntry);
+    return finalize(directory, target, declaredEsmEntry, value?.exports == null && value?.type !== 'module');
   }
 
-  function finalize(directory, target, declaredEsmEntry = false) {
+  function finalize(directory, target, declaredEsmEntry = false, legacy = false) {
     const packageJsonPath = path.join(directory, "package.json");
-    const url = new URL(target, pathToFileURL(directory + path.sep));
+    let url = new URL(target, pathToFileURL(directory + path.sep));
+    if (allowCommonJS && legacy && !declaredEsmEntry) url = new URL(resolveCommonJSFile(url));
     let filename;
     try { filename = fileURLToPath(url); }
     catch (error) { fail("ERR_INVALID_MODULE_SPECIFIER", `Invalid target in "${packageJsonPath}": ${error.message}`); }
@@ -144,9 +181,11 @@ function resolvePackageRequest(specifier, referrerUrl, {
     // JSON remains a native resource. Resolution does not parse it or decide
     // whether the importing site's attributes are valid; the host owns those
     // checks, including failures from a lazily selected import.
-    if (!esm && extension.toLowerCase() !== ".json" && !(FRONTEND_SOURCE_EXTENSIONS.has(extension) &&
-        _moduleSources?.read(canonical.href).frontendHandled === true))
+    const frontend = FRONTEND_SOURCE_EXTENSIONS.has(extension) && _moduleSources?.read(canonical.href).frontendHandled === true;
+    const cjs = !esm && !frontend && ['.js', '.cjs'].includes(extension);
+    if (!esm && extension.toLowerCase() !== ".json" && !frontend && !(allowCommonJS && cjs))
       fail("F3D_PACKAGE_FORMAT", `Selected target "${filename}" is not explicit ESM, a native JSON resource or JavaScript supplied by the project frontend; CommonJS and other non-JavaScript loaders need a separate route`);
+    if (esm || cjs) _moduleSources?.setFormat(canonical.href, cjs ? 'commonjs' : 'module');
     return canonical.href;
   }
 
@@ -197,7 +236,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
       const state = { browserSkip: packageJsonPath, browserTrail: [...browserTrail, visit] };
       return resolveExternal
         ? resolveExternal(target, packageUrl, state)
-        : resolveInstalledPackage(target, packageUrl, { span, _moduleSources, ...state });
+        : resolveInstalledPackage(target, packageUrl, { span, _moduleSources, requestKind, allowCommonJS, ...state });
     } catch (cause) {
       if (!(cause instanceof IngestionResolutionError)) throw cause;
       const error = new IngestionResolutionError(
@@ -222,8 +261,8 @@ function resolvePackageRequest(specifier, referrerUrl, {
     const packageUrl = pathToFileURL(packageJsonPath).href;
     const external = target => resolveExternal
       ? resolveExternal(target, packageUrl)
-      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail, _moduleSources });
-    const target = resolvePackageImports(specifier, own.value.imports, packageJsonPath, referrerUrl, span, external);
+      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail, _moduleSources, requestKind, allowCommonJS });
+    const target = resolvePackageImports(specifier, own.value.imports, packageJsonPath, referrerUrl, span, external, conditions);
     if (!target.startsWith("./")) return target;
     return browserTarget(own, target, new URL(target, pathToFileURL(own.directory + path.sep)))
       ?? finalize(own.directory, target);

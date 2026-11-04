@@ -13,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
-import { resolveInstalledPackage, resolvePackageBrowserMapping } from "./node_package_resolver.mjs";
+import { resolveInstalledPackage, resolvePackageBrowserMapping, resolveCommonJSFile } from "./node_package_resolver.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
@@ -293,6 +293,8 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   const packageOptions = {
     span, browserSkip: options.browserSkip, browserTrail: options.browserTrail,
     _moduleSources: options._moduleSources,
+    requestKind: options.requestKind,
+    allowCommonJS: options.allowCommonJS,
     // Replacement dependencies and #imports originate at the owner, but keep
     // the HTML map base, scoped host adapters and the pinned Three.js policy.
     resolveExternal: (target, from, state = {}) =>
@@ -375,11 +377,19 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       specifier,
       referrerUrl,
       span,
+      options.requestKind === 'require' ? ['browser', 'require', 'default'] : undefined,
     );
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
-    // 4b. Ordinary installed ESM dependencies; never overrides maps or the pin.
+    // 4b. Ordinary installed dependencies; never overrides maps or the pin.
     candidateUrl = resolveInstalledPackage(specifier, referrerUrl, packageOptions);
+  }
+
+  if (options.requestKind === 'require' && !mapped && browserTarget === null &&
+      candidateUrl.startsWith('file:') && /^(?:\.{1,2}\/|\/|file:)/.test(specifier)) {
+    candidateUrl = resolveCommonJSFile(candidateUrl);
+    // Browser objects commonly name './server.js' while require uses './server'.
+    candidateUrl = resolvePackageBrowserMapping(candidateUrl, referrerUrl, packageOptions) ?? candidateUrl;
   }
 
   // 5. Verify target exists if file: URL

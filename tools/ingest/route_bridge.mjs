@@ -110,7 +110,7 @@ export function extractGraphRoutingFacts(bundle, options = {}) {
   const modules = Object.values(bundle.modules || {});
   const hasUnanalyzedModules =
     (Array.isArray(bundle.external_modules) && bundle.external_modules.length > 0) ||
-    modules.some(mod => mod.dynamic_imports?.some(request => request.module_type === "unknown"));
+    modules.some(mod => mod.analysis_complete === false || mod.dynamic_imports?.some(request => request.module_type === "unknown"));
   const escapes = [];
   const constructionSites = [];
 

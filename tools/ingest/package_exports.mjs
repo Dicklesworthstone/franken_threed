@@ -110,7 +110,7 @@ function matchSubpath(specifier, entries) {
  * by the caller. External dependencies resolve INSIDE target selection, so a
  * missing/blocked dependency cannot silently activate a different array entry.
  * The callback must preserve the application's import maps and Three.js pin. */
-export function resolvePackageImports(specifier, importsField, packageJsonPath, referrerUrl, span, resolveExternal) {
+export function resolvePackageImports(specifier, importsField, packageJsonPath, referrerUrl, span, resolveExternal, conditions = ESM_CONDITIONS) {
   try {
     if (typeof specifier !== "string" || !specifier.startsWith("#") || specifier === "#" ||
         specifier.startsWith("#/") || specifier.endsWith("/"))
@@ -119,7 +119,7 @@ export function resolvePackageImports(specifier, importsField, packageJsonPath, 
       fail("ERR_INVALID_PACKAGE_CONFIG", "Package imports must be an object");
     const match = object(importsField) ? matchSubpath(specifier, importsField) : null;
     if (!match) fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is not defined`);
-    const resolved = selectTarget(match[0], ESM_CONDITIONS, match[1], 0, resolveExternal);
+    const resolved = selectTarget(match[0], conditions, match[1], 0, resolveExternal);
     if (resolved === null || resolved === undefined)
       fail("ERR_PACKAGE_IMPORT_NOT_DEFINED", `Package import "${specifier}" is blocked or has no matching condition`);
     return resolved;
@@ -144,7 +144,7 @@ export function resolveExportTargetValue(target, conditions = ESM_CONDITIONS) {
  * The caller verifies existence only after selection. No extension guessing,
  * private-subpath fallback, network access, or CommonJS execution happens here.
  */
-export function resolvePackageExports(subpath, exportsField, packageJsonPath, specifier, referrerUrl, span) {
+export function resolvePackageExports(subpath, exportsField, packageJsonPath, specifier, referrerUrl, span, conditions = ESM_CONDITIONS) {
   try {
     if (typeof subpath !== "string" || (subpath !== "." && !subpath.startsWith("./")))
       fail("ERR_INVALID_MODULE_SPECIFIER", `Invalid package subpath "${subpath}"`);
@@ -161,9 +161,9 @@ export function resolvePackageExports(subpath, exportsField, packageJsonPath, sp
       if (match) { [target, patternMatch] = match; matched = true; }
     }
     if (!matched) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Subpath "${subpath}" is not exported`);
-    const resolved = selectTarget(target, ESM_CONDITIONS, patternMatch);
+    const resolved = selectTarget(target, conditions, patternMatch);
     if (resolved === null) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Blocked package export "${specifier}": mapped to null`);
-    if (resolved === undefined) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", "Package export has no matching condition ('browser', 'import', 'default')");
+    if (resolved === undefined) fail("ERR_PACKAGE_PATH_NOT_EXPORTED", `Package export has no matching condition (${conditions.map(c => `'${c}'`).join(', ')})`);
     return resolved;
   } catch (cause) {
     if (!(cause instanceof PackageExportError)) throw cause;

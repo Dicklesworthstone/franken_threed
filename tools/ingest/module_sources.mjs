@@ -13,7 +13,10 @@ export function createModuleSources(transformModule) {
   if (transformModule !== undefined && typeof transformModule !== 'function')
     throw new TypeError('transformModule must be a synchronous function');
   const records = new Map();
+  const formats = new Map();
   return Object.freeze({
+    format(url) { return formats.get(new URL(url).href); },
+    setFormat(url, format) { formats.set(new URL(url).href, format); },
     read(url, {sourceType = 'module', source} = {}) {
       url = new URL(url).href;
       if (!['module', 'script'].includes(sourceType))

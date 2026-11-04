@@ -18,6 +18,7 @@ import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { commonjsFormat } from "./commonjs_modules.mjs";
 
 /**
  * Computes SHA-256 hash of a string.
@@ -220,8 +221,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
     // Native JSON is data, not executable JavaScript. Keep even invalid lazy
     // input unparsed: its rejection belongs to the original import() boundary.
-    const analysis = analyzeModuleAst(nativeResource ? "" : sourceCode, sourceUrl, item.offsets || {});
-    if (!nativeResource) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
+    const sourceFormat = !nativeResource ? commonjsFormat(sourceUrl, moduleSources, {inline: item.isInline}) : 'module';
+    const commonJS = sourceFormat !== 'module';
+    const analysis = analyzeModuleAst(nativeResource || commonJS ? "" : sourceCode, sourceUrl, item.offsets || {});
+    if (!nativeResource && !commonJS) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
     if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 
     // Every source-bearing export is also a static module request. Keep it in
@@ -245,6 +248,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
         mapBaseUrl,
         _moduleSources: moduleSources,
+        allowCommonJS: true,
         packageRootUrl: options.packageRootUrl,
         span: imp.sourceSpan,
       });
@@ -295,6 +299,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
             mapBaseUrl,
             _moduleSources: moduleSources,
+            allowCommonJS: true,
             packageRootUrl: options.packageRootUrl,
             span: dyn.sourceSpan,
           });
@@ -351,6 +356,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
             const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
               mapBaseUrl,
               _moduleSources: moduleSources,
+              allowCommonJS: true,
               packageRootUrl: options.packageRootUrl,
               span: dyn.sourceSpan,
             });
@@ -423,6 +429,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       id: moduleId,
       source_url: sourceUrl,
       module_type: moduleType,
+      ...(commonJS ? {source_format: sourceFormat, analysis_complete: false} : {}),
       content_hash: `sha256:${hash}`,
       is_inline: item.isInline,
       source_path: sourcePath,
@@ -433,7 +440,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       asset_references: analysis.assetReferences,
       classes: analysis.classDeclarations,
       prototype_writes: analysis.prototypeWrites,
-      has_top_level_side_effects: analysis.hasTopLevelSideEffects,
+      has_top_level_side_effects: commonJS || analysis.hasTopLevelSideEffects,
       has_live_bindings: analysis.hasLiveBindings,
       mutable_exported_bindings: analysis.mutableExportedBindings,
       renderer_construction_sites: analysis.renderer_construction_sites,
@@ -465,7 +472,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       return false;
     });
 
-    if (hasExternalStatic || hasExternalDyn) {
+    if (node.analysis_complete === false || hasExternalStatic || hasExternalDyn) {
       tainted.add(id);
       worklist.push(id);
     }
