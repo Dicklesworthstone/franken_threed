@@ -409,6 +409,132 @@ test("packed HDR/EXR environments, fonts and geometry execute retained addon par
   assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
 });
 
+test('packed PCD, XYZ and VTK retain ASCII and binary geometry, options and parse errors offline', async () => {
+  const header = (fields, sizes, types, format) => Buffer.from(`VERSION 0.7\nFIELDS ${fields}\nSIZE ${sizes}\nTYPE ${types}\nWIDTH 2\nHEIGHT 1\nPOINTS 2\nDATA ${format}\n`);
+  const pointHeader = format => header('x y z', '4 4 4', 'F F F', format);
+  const binaryPoints = Buffer.alloc(24), compressedPoints = Buffer.alloc(24);
+  [1.25, -2.5, 3, -7.5, 8.25, -9].forEach((value, i) => binaryPoints.writeFloatBE(value, i * 4));
+  // PCD's compressed encoding is planar; one LZF literal run preserves the
+  // real source decompression path without adding a test encoder dependency.
+  [1.25, -4, 2.5, 5, -3, 6].forEach((value, i) => compressedPoints.writeFloatLE(value, i * 4));
+  const compressedSizes = Buffer.alloc(8); compressedSizes.writeUInt32LE(25); compressedSizes.writeUInt32LE(24, 4);
+  const badSizes = Buffer.alloc(8); badSizes.writeUInt32LE(1); badSizes.writeUInt32LE(24, 4);
+  const triangle = [0, 0, 0, 1, 0, 0, 0, 1, 0], normals = [0, 0, 1, 0, 0, 1, 0, 0, 1];
+  const floats = values => { const bytes = Buffer.alloc(values.length * 4); values.forEach((v, i) => bytes.writeFloatBE(v, i * 4)); return bytes; };
+  const indices = Buffer.alloc(16); [3, 0, 1, 2].forEach((v, i) => indices.writeUInt32BE(v, i * 4));
+  // The source parser reads a 250-byte prefix even for small models.
+  const vtkHeader = format => `# vtk DataFile Version 3.0\n${'Retained source geometry fixture. '.repeat(4)}\n${format}\nDATASET POLYDATA\n`;
+  const resources = {
+    'points/cloud #.pcd': Buffer.concat([header('x y z rgb normal_x normal_y normal_z intensity label',
+      '4 4 4 4 4 4 4 4 4', 'F F F U F F F F I', 'ascii'),
+      Buffer.from('1 2 3 16711680 0 1 0 0.5 17\n-1 0 4 65280 1 0 0 0.25 -8\n')]),
+    'points/big-endian.pcd': Buffer.concat([pointHeader('binary'), binaryPoints]),
+    'points/compressed.pcd': Buffer.concat([pointHeader('binary_compressed'), compressedSizes, Buffer.from([23]), compressedPoints]),
+    'points/broken.pcd': Buffer.concat([pointHeader('binary_compressed'), badSizes, Buffer.from([10])]),
+    'points/cloud.xyz': Buffer.from('# colored points\n1 2 3 255 0 0\n-1 0 4 0 255 0\n'),
+    'surfaces/ascii.vtk': Buffer.from(vtkHeader('ASCII') + 'POINTS 3 float\n0 0 0 1 0 0 0 1 0\nPOLYGONS 1 4\n3 0 1 2\nPOINT_DATA 3\nNORMALS n float\n0 0 1 0 0 1 0 0 1\n'),
+    'surfaces/binary.vtk': Buffer.concat([Buffer.from(vtkHeader('BINARY') + 'POINTS 3 float\n'), floats(triangle),
+      Buffer.from('\nPOLYGONS 1 4\n'), indices, Buffer.from('\nPOINT_DATA 3\nNORMALS n float\n'), floats(normals), Buffer.from('\n')]),
+    'surfaces/broken.vtk': Buffer.from(vtkHeader('ASCII').replace('POLYDATA', 'UNSTRUCTURED_GRID') + '\n'.repeat(100)),
+  };
+  const names = ['PCDLoader', 'VTKLoader', 'XYZLoader'];
+  const f = fixture({'index.html': '<script type="module" src="modules/app.mjs"></script>',
+    'modules/app.mjs': `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      ${names.map(name => `import {${name}} from ${JSON.stringify(new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href)};`).join('\n')}
+      export async function run() {
+        const order=[], loader=new PCDLoader(); loader.setPath('points/');
+        const pending=loader.loadAsync('cloud%20%23.pcd?edition=2#points').then(value=>{order.push('loaded');return value;});
+        order.push('returned'); const ascii=await pending;
+        const binaryLoader=new PCDLoader(); binaryLoader.littleEndian=false;
+        binaryLoader.setPath('points/').setRequestHeader({'X-Fixture':'points'}).setWithCredentials(true);
+        const binary=await binaryLoader.loadAsync('big-endian.pcd');
+        const compressed=await new PCDLoader().setPath('points/').loadAsync('compressed.pcd');
+        const xyz=await new XYZLoader().setPath('points/').loadAsync('cloud.xyz');
+        const vtkAscii=await new VTKLoader().setPath('surfaces/').loadAsync('ascii.vtk');
+        const vtkBinary=await new VTKLoader().setPath('surfaces/').loadAsync('binary.vtk');
+        const failures=[];
+        try { await new PCDLoader().setPath('points/').loadAsync('broken.pcd'); } catch(error) { failures.push([error.name,error.message]); }
+        await new Promise(resolve=>new VTKLoader().setPath('surfaces/').load('broken.vtk',()=>{throw new Error('Invalid VTK accepted');},undefined,error=>{failures.push([error.name,error.message]);resolve();}));
+        const attributes=geometry=>Object.fromEntries(Object.entries(geometry.attributes).map(([name,attribute])=>[name,[...attribute.array]]));
+        return {order,ascii:attributes(ascii.geometry),binary:attributes(binary.geometry),compressed:attributes(compressed.geometry),
+          xyz:attributes(xyz),surfaces:[vtkAscii,vtkBinary].map(geometry=>({attributes:attributes(geometry),indices:[...geometry.index.array]})),failures};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  const pointColors = {position: [1, 2, 3, -1, 0, 4], color: [1, 0, 0, 0, 1, 0]};
+  assert.deepEqual(result.result, {order: ['returned', 'loaded'],
+    ascii: {...pointColors, normal: [0, 1, 0, 1, 0, 0], intensity: [.5, .25], label: [17, -8]},
+    binary: {position: [1.25, -2.5, 3, -7.5, 8.25, -9]}, compressed: {position: [1.25, 2.5, -3, -4, 5, 6]},
+    xyz: pointColors, surfaces: Array.from({length: 2}, () => ({attributes: {position: triangle, normal: normals}, indices: [0, 1, 2]})),
+    failures: [['Error', 'THREE.PCDLoader: Invalid compressed data'], ['Error', 'Unsupported DATASET type: UNSTRUCTURED_GRID']]});
+  assert.equal(result.requests.length, Object.keys(resources).length);
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+  assert.ok(result.events.some(([kind, url]) => kind === 'end' && url === 'points/cloud%20%23.pcd?edition=2#points'));
+});
+
+test('packed BVH, GCode and PDB preserve animation switches, pending options, toolpaths and bonds offline', async () => {
+  const atom = (id, element, xyz) => {
+    const line = Array(78).fill(' '), put = (offset, value) => [...value].forEach((c, i) => { line[offset + i] = c; });
+    put(0, 'HETATM'); put(6, String(id).padStart(5)); put(76, element.padStart(2));
+    xyz.forEach((value, i) => put(30 + 8 * i, value.toFixed(3).padStart(8)));
+    return line.join('');
+  };
+  const resources = {
+    'motion/walk.bvh': Buffer.from('HIERARCHY\nROOT Hips\n{\nOFFSET 0 1 0\nCHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\nEnd Site\n{\nOFFSET 0 2 0\n}\n}\nMOTION\nFrames: 2\nFrame Time: 0.5\n0 0 0 0 0 0\n1 2 3 90 0 0\n'),
+    'paths/print.gcode': Buffer.from('G90\nM82\nG0 X0 Y0 Z0\nG1 X1 Y0 Z0 E1\nG0 X1 Y1 Z1\nG1 X2 Y1 Z1 E2\n'),
+    'molecules/water.pdb': Buffer.from([atom(1, 'H', [0, 0, 0]), atom(2, 'O', [1.25, -2.5, 3.75]), 'CONECT    1    2', 'CONECT    2    1', ''].join('\n')),
+  };
+  const names = ['BVHLoader', 'GCodeLoader', 'PDBLoader'];
+  const f = fixture({'index.html': '<script type="module" src="modules/app.mjs"></script>',
+    'modules/app.mjs': `${names.map(name => `import {${name}} from ${JSON.stringify(new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href)};`).join('\n')}
+      export async function run() {
+        const motion=new BVHLoader(); motion.setPath('motion/');
+        const full=await motion.loadAsync('walk.bvh');
+        motion.animateBonePositions=false;
+        const rotations=await motion.loadAsync('walk.bvh');
+        motion.animateBonePositions=true; motion.animateBoneRotations=false;
+        const positions=await motion.loadAsync('walk.bvh');
+        const machine=new GCodeLoader(); machine.setPath('paths/');
+        const pending=machine.loadAsync('print.gcode'); machine.splitLayer=true;
+        const split=await pending;
+        machine.splitLayer=false; const merged=await machine.loadAsync('print.gcode');
+        const molecule=await new PDBLoader().setPath('molecules/').loadAsync('water.pdb');
+        const tracks=clip=>clip.tracks.map(track=>({name:track.name,times:[...track.times],values:[...track.values]}));
+        const lines=group=>group.children.map(line=>({name:line.name,material:line.material.name,positions:[...line.geometry.attributes.position.array]}));
+        return {bones:full.skeleton.bones.map(bone=>({name:bone.name,position:bone.position.toArray()})),duration:full.clip.duration,
+          full:tracks(full.clip),rotations:tracks(rotations.clip),positions:tracks(positions.clip),split:lines(split),merged:lines(merged),
+          rotation:split.rotation.x,atoms:[...molecule.geometryAtoms.attributes.position.array],
+          bonds:[...molecule.geometryBonds.attributes.position.array],json:molecule.json};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  const position = {name: 'Hips.position', times: [0, .5], values: [0, 1, 0, 1, 3, 3]};
+  const rotation = {name: 'Hips.quaternion', times: [0, .5], values: [0, 0, 0, 1, 0, 0, Math.fround(Math.SQRT1_2), Math.fround(Math.SQRT1_2)]};
+  assert.deepEqual(result.result, {bones: [{name: 'Hips', position: [0, 1, 0]}, {name: 'ENDSITE', position: [0, 2, 0]}], duration: .5,
+    full: [position, rotation], rotations: [rotation], positions: [position],
+    split: [{name: 'layer0', material: 'extruded', positions: [0, 0, 0, 1, 0, 0]},
+      {name: 'layer0', material: 'path', positions: [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1]},
+      {name: 'layer1', material: 'extruded', positions: [1, 1, 1, 2, 1, 1]}, {name: 'layer1', material: 'path', positions: []}],
+    merged: [{name: 'layer2', material: 'extruded', positions: [0, 0, 0, 1, 0, 0, 1, 1, 1, 2, 1, 1]},
+      {name: 'layer2', material: 'path', positions: [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1]}], rotation: -Math.PI / 2,
+    atoms: [0, 0, 0, 1.25, -2.5, 3.75], bonds: [0, 0, 0, 1.25, -2.5, 3.75],
+    json: {atoms: [[0, 0, 0, [255, 255, 255], 'H'], [1.25, -2.5, 3.75, [255, 13, 13], 'O']]}});
+  assert.equal(result.requests.length, 6, 'repeated loads still execute each retained parser with its current options');
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
 test('packed ASCII and binary FBX retain textured geometry, embedded images and pending resource bases offline',async()=>{
   const fbxUrl=new URL('../../upstream/three.js/examples/jsm/loaders/FBXLoader.js',import.meta.url).href;
   const models={
@@ -580,4 +706,80 @@ test("CLI build plus pack enables embedded loaders while ordinary application bu
   const sources = Object.values(JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports)
     .map(url => Buffer.from(url.split(",")[1].split("#")[0], "base64").toString());
   assert.ok(sources.some(source => source.includes(Buffer.from("from CLI").toString("base64"))));
+});
+
+test("packed DDS, KTX and TGA retain compressed mips, cube faces and decoded pixels without source files", async () => {
+  // Small authored containers exercise the retained parsers, not a replacement
+  // image codec: two DXT1 mip blocks, a six-face DDS and raw/RLE TGA pixels.
+  const dds = (seed, cube = false) => {
+    const bytes = Buffer.alloc(128 + (cube ? 6 : 1) * 16);
+    const header = {0: 0x20534444, 1: 124, 2: 0x21007, 3: 4, 4: 4,
+      7: 2, 19: 32, 20: 4, 21: 0x31545844, 27: 0x401008, 28: cube ? 0xfe00 : 0};
+    for (const [word, value] of Object.entries(header)) bytes.writeUInt32LE(value, Number(word) * 4);
+    for (let i = 128; i < bytes.length; i++) bytes[i] = (seed + i - 128) % 256;
+    return bytes;
+  };
+  const ktx = Buffer.alloc(88);
+  ktx.set([0xab, 0x4b, 0x54, 0x58, 0x20, 0x31, 0x31, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ktxHeader = [0x04030201, 0, 1, 0, 0x83f0, 0x1907, 4, 4, 0, 0, 1, 2, 0];
+  ktxHeader.forEach((value, index) => ktx.writeUInt32LE(value, 12 + index * 4));
+  ktx.writeUInt32LE(8, 64); ktx.set([40, 41, 42, 43, 44, 45, 46, 47], 68);
+  ktx.writeUInt32LE(8, 76); ktx.set([48, 49, 50, 51, 52, 53, 54, 55], 80);
+  const tga = Buffer.alloc(24); tga[2] = 2; tga.writeUInt16LE(2, 12); tga.writeUInt16LE(1, 14);
+  tga[16] = 24; tga[17] = 0x20; tga.set([0, 0, 255, 0, 255, 0], 18);
+  const rle = Buffer.from(tga.subarray(0, 18)); rle[2] = 10;
+  const bad = Buffer.from(tga); bad[2] = 0;
+  const faces = ['px', 'nx', 'py', 'ny', 'pz', 'nz'];
+  const resources = {'textures/surface #.dds': dds(10), 'textures/cube.dds': dds(60, true),
+    'textures/surface.ktx': ktx, 'textures/paint.tga': tga,
+    'textures/repeated.tga': Buffer.concat([rle, Buffer.from([0x81, 255, 0, 0])]), 'textures/bad.tga': bad,
+    ...Object.fromEntries(faces.map((face, index) => [`textures/${face}.dds`, dds(index * 16)])),
+    ...Object.fromEntries(faces.map(face => [`textures/${face}.ktx`, ktx]))};
+  const imports = ['DDSLoader', 'KTXLoader', 'TGALoader'].map(name =>
+    `import {${name}} from ${JSON.stringify(new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href)};`).join('\n');
+  const f = fixture({'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `${imports}
+      export async function run() {
+        const order=[], loader=new DDSLoader().setPath('textures/');
+        let returned;
+        const loaded=new Promise((resolve,reject)=>{
+          returned=loader.load('surface%20%23.dds?v=2#mip',texture=>{order.push('loaded');resolve(texture);},undefined,reject);
+        }); order.push('returned');
+        const surface=await loaded, second=await loader.loadAsync('surface%20%23.dds?v=2#mip');
+        const cube=await loader.loadAsync('cube.dds');
+        const faces=['px.dds','nx.dds','py.dds','ny.dds','pz.dds','nz.dds'];
+        const separate=await loader.loadAsync(faces);
+        const ktx=await new KTXLoader().setPath('textures/').loadAsync('surface.ktx');
+        const ktxCube=await new KTXLoader().setPath('textures/').loadAsync(['px.ktx','nx.ktx','py.ktx','ny.ktx','pz.ktx','nz.ktx']);
+        const image=await new TGALoader().setPath('textures/').loadAsync('paint.tga');
+        const repeated=await new TGALoader().setPath('textures/').loadAsync('repeated.tga');
+        let error;try{await new TGALoader().setPath('textures/').loadAsync('bad.tga');}catch(e){error=e.message;}
+        const mips=texture=>texture.mipmaps.map(mip=>({width:mip.width,height:mip.height,bytes:[...mip.data]}));
+        const original=second.mipmaps[0].data[0]; surface.mipmaps[0].data[0]=255;
+        return {order,returnedIdentity:surface===returned,independent:surface!==second&&second.mipmaps[0].data[0]===original,
+          surface:{width:second.image.width,height:second.image.height,format:second.format,mips:mips(second)},
+          cube:cube.image.map(mips),separate:separate.image.map(mips),
+          ktx:{width:ktx.image.width,height:ktx.image.height,format:ktx.format,mips:mips(ktx)},
+          ktxCube:ktxCube.image.map(mips),
+          image:{width:image.image.width,height:image.image.height,pixels:[...image.image.data],flipY:image.flipY},
+          repeated:[...repeated.image.data],error};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error?.split('\n')[0]);
+  const mips = seed => [4, 2].map((size, level) => ({width: size, height: size,
+    bytes: Array.from({length: 8}, (_, i) => seed + level * 8 + i)}));
+  assert.deepEqual(result.result, {order: ['returned', 'loaded'], returnedIdentity: true, independent: true,
+    surface: {width: 4, height: 4, format: 33776, mips: mips(10)},
+    cube: faces.map((_, i) => mips(60 + i * 16)), separate: faces.map((_, i) => mips(i * 16)),
+    ktx: {width: 4, height: 4, format: 33776, mips: mips(40)}, ktxCube: faces.map(() => mips(40)),
+    image: {width: 2, height: 1, pixels: [255, 0, 0, 255, 0, 255, 0, 255], flipY: true},
+    repeated: [0, 0, 255, 255, 0, 0, 255, 255], error: 'THREE.TGALoader: No data.'});
+  assert.equal(result.requests.length, 19, 'each file and the independent DDS reload use the embedded resource host');
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
 });

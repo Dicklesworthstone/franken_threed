@@ -345,8 +345,11 @@ image host checks resource bytes and ownership, not browser image-decoder parity
 ## Single-file addon assets
 
 Finite document-relative loads through the pinned `HDRLoader`, `RGBELoader`,
-`EXRLoader`, `FontLoader`, `STLLoader`, `PLYLoader` and `OBJLoader` include their
-source files in application output and the prepared standalone resource map.
+`EXRLoader`, `FontLoader`, `STLLoader`, `PLYLoader`, `OBJLoader`, `PCDLoader`,
+`VTKLoader`, `XYZLoader`, `BVHLoader`, `GCodeLoader`, `PDBLoader`, `DDSLoader`,
+`KTXLoader` and `TGALoader` include their source files in application output and
+the prepared standalone resource map. DDS and KTX also accept finite six-file
+cube arrays under the same mutation/escape guards as `CubeTextureLoader`.
 Named and namespace imports from their source modules or the addon aggregate
 retain the same discovery rules. Decoder settings, including EXR part/format
 selection and PLY property mappings, execute in the retained upstream loaders.
@@ -358,6 +361,15 @@ are unavailable, with non-data requests rejected. This is retained-loader
 packaging, not new renderer or browser GPU validation. Custom managers, escaping
 loaders and unknown paths remain on their original host route; this does not
 close material/texture sidecars for every model format.
+
+Additional packed execution cases cover ASCII/binary/compressed point clouds,
+VTK triangles and normals, BVH bones and animation tracks, GCode paths and layers,
+PDB atoms and bonds, DDS/KTX mip and cube-face bytes, and raw/RLE TGA pixels.
+PCD endianness, BVH animation switches and GCode layer splitting remain live
+source options, including writes during pending loads. Parser errors, deprecated
+loader warnings, callback and synchronous texture-return behavior stay upstream.
+These tests run the original parsers with source/build files unavailable and
+external requests rejected; they do not establish GPU format support.
 
 ## 3MF manufacturing models
 

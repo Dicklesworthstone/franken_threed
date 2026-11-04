@@ -136,6 +136,55 @@ test("addon asset discovery preserves opaque loaders and shadows while OBJ mater
   assert.deepEqual(requests.map(({url}) => url), ['materials.obj', 'sidecars.fbx', 'known.hdr']);
 });
 
+test("point, motion, toolpath and molecule loaders preserve finite files and source boolean options", () => {
+  const requests = discover(`import { PCDLoader as Points, VTKLoader, XYZLoader, BVHLoader, GCodeLoader, PDBLoader }
+      from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as PCD from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/PCDLoader.js')};
+    import * as Addons from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    const Loader = Points, cloud = new Loader();
+    cloud.littleEndian = false; const endian = cloud.littleEndian;
+    cloud.setPath('points/').setRequestHeader({Accept:'application/octet-stream'}).setWithCredentials(true);
+    cloud.loadAsync(binary ? 'cloud%20%23.pcd?version=2#points' : 'cloud-ascii.pcd');
+    cloud.littleEndian = true;
+    const motion = new BVHLoader(); motion.animateBonePositions = false;
+    motion.animateBoneRotations = true; if (motion.animateBoneRotations) motion.parse(inMemoryMotion);
+    motion.setPath('motion/').load('walking.bvh');
+    const machine = new GCodeLoader(); machine.splitLayer = true;
+    machine.load('paths/print.gcode'); machine.splitLayer = false;
+    new VTKLoader().setPath('geometry/').loadAsync('surface.vtk');
+    new XYZLoader().load('points/cloud.xyz');
+    new PDBLoader().setPath('molecules/').load('ethanol.pdb');
+    new PCD.PCDLoader().load('namespace.pcd');
+    new Addons.BVHLoader().load('namespace.bvh');`);
+  assert.deepEqual(requests.map(({loader, url}) => [loader, url]), [
+    ['PCDLoader', 'points/cloud%20%23.pcd?version=2#points'], ['PCDLoader', 'points/cloud-ascii.pcd'],
+    ['BVHLoader', 'motion/walking.bvh'], ['GCodeLoader', 'paths/print.gcode'],
+    ['VTKLoader', 'geometry/surface.vtk'], ['XYZLoader', 'points/cloud.xyz'],
+    ['PDBLoader', 'molecules/ethanol.pdb'], ['PCDLoader', 'namespace.pcd'], ['BVHLoader', 'namespace.bvh'],
+  ]);
+});
+
+test("single-file loader configuration does not admit callable, unknown or foreign state", () => {
+  const requests = discover(`import { PCDLoader, VTKLoader, XYZLoader, BVHLoader, GCodeLoader, PDBLoader }
+      from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { PCDLoader as Foreign } from 'file:///foreign/PCDLoader.js';
+    import * as Wrong from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/BVHLoader.js')};
+    new Foreign().load('foreign.pcd'); new Wrong.PCDLoader().load('wrong-export.pcd');
+    function shadow(VTKLoader) { new VTKLoader().load('shadow.vtk'); }
+    new PDBLoader(manager).load('managed.pdb');
+    const custom = new PCDLoader(); custom.littleEndian = function(){this.setPath('other/');};
+    custom.littleEndian(); custom.load('custom.pcd');
+    const motion = new BVHLoader(); motion.animateBonePositions = runtimeOption; motion.load('dynamic.bvh');
+    const called = new BVHLoader(); called.animateBoneRotations(); called.load('called.bvh');
+    const destructured = new GCodeLoader(); ({flag:destructured.splitLayer}=runtimeOptions);
+    destructured.load('destructured.gcode');
+    const wrongOption = new XYZLoader(); wrongOption.littleEndian = false; wrongOption.load('wrong-option.xyz');
+    const escaped = new PDBLoader(); customize(escaped); escaped.load('escaped.pdb');
+    new VTKLoader().setPath(runtimePath).load('dynamic.vtk');
+    new PCDLoader().load('known.pcd');`);
+  assert.deepEqual(requests.map(({url}) => url), ['known.pcd']);
+});
+
 test("3MF discovery follows its actual source filename, aggregate exports and finite archive choices", () => {
   const requests = discover(`import { ThreeMFLoader as Source } from ${JSON.stringify(threeMfUrl)};
     import * as SourceModule from ${JSON.stringify(threeMfUrl)};
@@ -889,4 +938,34 @@ test("ES module libraries retain relative loader URLs until a document host is k
   });
   const built = await buildApplication(path.join(root, "app.mjs"), path.join(root, "dist"));
   assert.equal(built.emittedFiles.some((file) => path.basename(file) === "host.txt"), false);
+});
+
+test("DDS, KTX and TGA discovery closes source texture files and immutable compressed cube faces", () => {
+  const requests = discover(`import { DDSLoader as SourceDDS, KTXLoader, TGALoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as DDS from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/DDSLoader.js')};
+    const Loader = SourceDDS, faces = ['px.dds','nx.dds','py.dds','ny.dds','pz.dds','nz.dds'];
+    const dds = new Loader().setPath('dds/'); dds.parse(runtimeBytes, false); dds.loadAsync('surface%20%23.dds?v=1#mip');
+    dds.load(faces);
+    new DDS.DDSLoader().load('single-cube.dds');
+    new KTXLoader().setPath('ktx/').loadAsync(['px.ktx','nx.ktx','py.ktx','ny.ktx','pz.ktx','nz.ktx']);
+    new KTXLoader().load(day ? 'day.ktx' : 'night.ktx');
+    const tga = new TGALoader(); tga.parse(runtimeBytes); tga.setPath('tga/').loadAsync('paint.tga');`);
+  assert.deepEqual(requests.map(({url}) => url), ['dds/surface%20%23.dds?v=1#mip',
+    ...['px', 'nx', 'py', 'ny', 'pz', 'nz'].map(face => `dds/${face}.dds`), 'single-cube.dds',
+    ...['px', 'nx', 'py', 'ny', 'pz', 'nz'].map(face => `ktx/${face}.ktx`),
+    'day.ktx', 'night.ktx', 'tga/paint.tga']);
+});
+
+test("compressed texture discovery preserves mutable faces, foreign loaders and opaque instance behavior", () => {
+  const requests = discover(`import { DDSLoader, KTXLoader, TGALoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { DDSLoader as Foreign } from 'file:///other/examples/jsm/loaders/DDSLoader.js';
+    const faces = ['a','b','c','d','e','f']; faces.reverse(); new DDSLoader().load(faces);
+    const escaped = ['a','b','c','d','e','f']; expose(escaped); new KTXLoader().loadAsync(escaped);
+    new DDSLoader().load(['a','b','c','d','e']);
+    new TGALoader().load(['a','b','c','d','e','f']);
+    new Foreign().load('foreign.dds');
+    const changed = new KTXLoader(); changed.parse = otherParser; changed.load('changed.ktx');
+    const owned = new DDSLoader(manager); owned.load('managed.dds');
+    new DDSLoader().setPath('safe/').load('known.dds');`);
+  assert.deepEqual(requests.map(({url}) => url), ['safe/known.dds']);
 });

@@ -30,10 +30,28 @@ const SINGLE_FILE_ADDONS = new Map([
   ["STLLoader", new Set()],
   ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],
   ["OBJLoader", new Set(["setMaterials"])],
+  ["PCDLoader", new Set()],
+  ["VTKLoader", new Set()],
+  ["XYZLoader", new Set()],
+  ["BVHLoader", new Set()],
+  ["GCodeLoader", new Set()],
+  ["PDBLoader", new Set()],
+  ["DDSLoader", new Set()],
+  ["KTXLoader", new Set()],
+  ["TGALoader", new Set()],
   // The archive owns its model parts and images. The retained parser creates
   // their Blob URLs; no ZIP contents are extracted or rewritten by packaging.
   ["ThreeMFLoader", new Set()],
 ]);
+// These source-defined switches affect decoding only, including changes made
+// while a load is pending. Their original reads and writes stay in the source.
+const BOOLEAN_OPTIONS = new Map([
+  ["FBXLoader", new Set(["trimAnimationClips"])],
+  ["PCDLoader", new Set(["littleEndian"])],
+  ["BVHLoader", new Set(["animateBonePositions", "animateBoneRotations"])],
+  ["GCodeLoader", new Set(["splitLayer"])],
+]);
+const CUBE_URL_LOADERS = new Set(["CubeTextureLoader", "DDSLoader", "KTXLoader"]);
 const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"], ["Rhino3dmLoader", "3DMLoader.js"]]);
 const RHINO_LIBRARIES = ["rhino3dm.js", "rhino3dm.wasm"];
 const ADDON_SETTINGS = new Map([
@@ -339,7 +357,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       const member = ref.parent, call = ref.ancestors.at(-3), method = memberName(member);
       // Only boolean configuration and simple value reads are admitted. An app
       // may replace the field with a method whose `this` can mutate loader paths.
-      if (value.loader === "FBXLoader" && member?.object === ref.node && method === "trimAnimationClips") {
+      if (member?.object === ref.node && BOOLEAN_OPTIONS.get(value.loader)?.has(method)) {
         const booleanAssignment = call?.type === "AssignmentExpression" && call.left === member && call.operator === "=" &&
           call.right.type === "Literal" && typeof call.right.value === "boolean";
         const read = call?.type === "VariableDeclarator" && call.init === member ||
@@ -387,7 +405,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       for (const ref of refs.get(binding) ?? []) {
         if (ref.parent?.type !== "CallExpression" || ref.parent.arguments[0] !== ref.node ||
             !["load", "loadAsync"].includes(memberName(ref.parent.callee)) ||
-            instance(ref.parent.callee.object, ref.parent)?.loader !== "CubeTextureLoader") return null;
+            !CUBE_URL_LOADERS.has(instance(ref.parent.callee.object, ref.parent)?.loader)) return null;
       }
       return cubeUrls(binding.init, new Set(active).add(binding));
     }
@@ -416,7 +434,9 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       continue;
     }
     if (["load", "loadAsync"].includes(method)) {
-      const urls = value.loader === "CubeTextureLoader" ? cubeUrls(call.arguments[0]) : finite(call.arguments[0]);
+      const argument = call.arguments[0];
+      const urls = value.loader === "CubeTextureLoader" ? cubeUrls(argument) :
+        finite(argument) ?? (CUBE_URL_LOADERS.has(value.loader) ? cubeUrls(argument) : null);
       let objectGroup;
       if (value.loader === "ObjectLoader") {
         // ObjectLoader keeps its first default base, but reads resourcePath
