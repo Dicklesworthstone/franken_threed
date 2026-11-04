@@ -982,11 +982,19 @@ child passes already precede their parent in the FIFO. Render-triggered geometry
 compute may also follow earlier native draws when its live resources are disjoint
 from their captured readers and the pending attachments. Unproven overlap and
 ordinary callback compute still require separate public submissions.
-Leases release their captured bytes on success and failure; the compute
-owner retains GPU lifetime. Conflicting host versions of one storage attribute
-within a single logical render are rejected before any storage writes. They
-require additional per-draw storage scheduling; separate logical renders already
-retain each version.
+Leases release their captured bytes on success and failure; the compute owner
+retains GPU lifetime. Several host versions of a shader-storage attribute within
+one logical render upload in source order to that same allocation. Pinned r186
+issues those queue writes during object traversal and submits its render encoder
+at `finishRender`, so all draws sharing the buffer observe the accumulated final
+contents. Each partial upload preserves earlier ranges and untouched GPU-produced
+bytes; taking only the final CPU snapshot would lose that history. Separate
+logical renders keep their FIFO boundaries. The recording-device tests compare
+this history with the actual pinned `Attributes`, `WebGPUAttributeUtils` and
+`WebGPUBackend.finishRender` implementations; they do not establish pixel parity.
+Multiple versions that also feed generated vertex/index or indirect inputs, or
+that change allocation layout, remain rejected before storage writes. Mixed
+writable and read-only aliases retain their render-pass hazard rejection.
 
 For `InstancedMesh`, replacing a matrix/color attribute, changing its capacity,
 or adding/removing instance colors selects a new graph. Data, upload-version and

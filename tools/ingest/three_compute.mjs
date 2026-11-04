@@ -97,7 +97,8 @@ function createThreeCompute(renderer, three) {
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
     const data = deferred ? new array.constructor(array) : array;
     const admission = !uniform && deferred ? gpu.captureUpload(key, data, version) : null;
-    const record = {key, source: array, byteLength: array.byteLength, version, uniform, data, charged, ranges, admission, refs: 0};
+    const record = {key, source: array, byteLength: array.byteLength, scalar: array.constructor,
+      itemSize: key.itemSize, count: key.count, version, uniform, data, charged, ranges, admission, refs: 0};
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
     return record;
@@ -155,7 +156,7 @@ function createThreeCompute(renderer, three) {
   }
   function validateReads(leases) {
     live();
-    const versions = new Map(), accesses = new Map();
+    const histories = new Map(), records = new Set(), accesses = new Map();
     const access = (attribute, writable) => {
       const previous = accesses.get(attribute);
       if (previous !== undefined && previous !== writable)
@@ -163,18 +164,28 @@ function createThreeCompute(renderer, three) {
       accesses.set(attribute, writable);
     };
     for (const lease of leases) {
-      const record = readRecord(lease), previous = versions.get(record.key);
-      // One graphics pass cannot bind two queue-upload histories of the same
-      // allocation. Reject before uploading either: otherwise both draws could
-      // observe the later value. Independent render calls have FIFO boundaries.
-      if (previous && previous !== record)
-        fail('READ_CONFLICT', 'One native render cannot read conflicting upload versions of a storage attribute');
+      const record = readRecord(lease), value = readLeases.get(lease);
+      let history = histories.get(record.key);
+      if (!history) {
+        history = {first: record, multiple: false, generated: false}; histories.set(record.key, history);
+      }
+      history.multiple ||= history.first !== record;
+      history.generated ||= value.vertex === true || value.indirect;
+      const first = history.first;
+      if (history.multiple && (history.generated || first.byteLength !== record.byteLength ||
+          first.scalar !== record.scalar || first.itemSize !== record.itemSize || first.count !== record.count))
+        fail('READ_CONFLICT', 'Multiple host upload versions require shader-only storage with one unchanged allocation layout');
       if (!record.data && (uploaded.get(record.key) !== record || !gpu.getBuffer(record.key)))
         fail('STALE', 'Native graphics storage residency was released before its captured use');
-      access(record.key, readLeases.get(lease).writable);
-      versions.set(record.key, record);
+      access(record.key, value.writable);
+      records.add(record);
     }
-    return versions.values();
+    // r186 updates shader storage during object traversal, then submits the
+    // render encoder at finishRender. All draws sharing that allocation see
+    // the accumulated uploads, including partial ranges, at submission time.
+    // Keep every admitted upload in source order; choosing only the last CPU
+    // snapshot would discard earlier ranges or overwrite GPU-authored bytes.
+    return records.values();
   }
   function admittedRead(previous) {
     // Retained bindings observe uploads admitted before this logical render.
@@ -195,7 +206,7 @@ function createThreeCompute(renderer, three) {
       if (typeof writable !== 'boolean' || typeof indirect !== 'boolean' || writable && indirect)
         fail('STORAGE', 'Native storage access must be a captured boolean and indirect use must be read-only');
       const record = attributeRecord(attribute, true, indirect), lease = Object.freeze({});
-      record.refs++; readLeases.set(lease, {record, writable, indirect, released: false});
+      record.refs++; readLeases.set(lease, {record, writable, indirect, vertex: false, released: false});
       return lease;
     },
     refreshIndirect(lease) {
@@ -217,7 +228,8 @@ function createThreeCompute(renderer, three) {
       if (record.byteLength !== previous.byteLength)
         fail('STORAGE', 'A retained storage binding cannot replace its captured buffer allocation size');
       const value = readLeases.get(lease), next = Object.freeze({});
-      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect, released: false});
+      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect,
+        vertex: value.vertex, released: false});
       return next;
     },
     captureIndirectAlias(lease, indirectLease) {
@@ -230,12 +242,14 @@ function createThreeCompute(renderer, three) {
       // Follow this draw's admitted indirect history, never a later CPU edit
       // or queued dispatch. Preserve access so writable aliases still fail.
       const value = readLeases.get(lease), next = Object.freeze({});
-      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect, released: false});
+      record.refs++; readLeases.set(next, {record, writable: value.writable, indirect: value.indirect,
+        vertex: value.vertex, released: false});
       return next;
     },
     validate: validateReads,
     vertexAttribute(lease, view) {
       const record = readRecord(lease);
+      readLeases.get(lease).vertex = true;
       return captureComputeAttributeView(device, record.key, view);
     },
     refreshVertexAttribute(lease, view) {

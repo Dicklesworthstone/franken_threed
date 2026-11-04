@@ -4,6 +4,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import SourceAttributes from '../../upstream/three.js/src/renderers/common/Attributes.js';
+import {AttributeType} from '../../upstream/three.js/src/renderers/common/Constants.js';
+import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
+import SourceWebGPUBackend from '../../upstream/three.js/src/renderers/webgpu/WebGPUBackend.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -50,6 +54,129 @@ const computeStorage = pass => [...pass.groups.values()].flatMap(group => group.
   .map(entry => entry.resource?.buffer).filter(buffer => buffer?.usage & 128);
 const words = (draw, buffer, Type = Float32Array) => [...new Type(draw.contents.get(buffer).buffer)];
 const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssign(N.vec3(0)); })().compute(storage.value.count);
+
+// Run the pinned upload implementation and its actual finishRender submission
+// boundary. The recording device establishes queue-visible buffer history;
+// it does not execute the reference shader or establish real-GPU pixel parity.
+function sourceStorage(array) {
+  const device = geometryDevice(), records = new WeakMap();
+  const backend = {device, _isRenderCameraDepthArray: () => false, get(key) {
+    let record = records.get(key);
+    if (!record) { record = {}; records.set(key, record); }
+    return record;
+  }};
+  const utils = new SourceWebGPUAttributeUtils(backend);
+  backend.createStorageAttribute = attribute => utils.createAttribute(attribute, 128 | 32 | 8 | 4);
+  backend.updateAttribute = attribute => utils.updateAttribute(attribute);
+  const owner = new SourceAttributes(backend, {createStorageAttribute() {}});
+  const attribute = new T.StorageInstancedBufferAttribute(array.slice(), 1);
+  const update = () => owner.update(attribute, AttributeType.STORAGE);
+  return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates) {
+    const encoder = device.createCommandEncoder(), pass = encoder.beginRenderPass({});
+    pass.setPipeline({vertex: {entryPoint: 'main', buffers: []}});
+    for (const change of updates) {
+      change(attribute); update();
+      pass.setBindGroup(0, {entries: [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}]});
+      pass.draw(3);
+    }
+    const context = {occlusionQueryCount: 0, textures: null};
+    Object.assign(backend.get(context), {renderBundles: [], currentPass: pass, encoder});
+    SourceWebGPUBackend.prototype.finishRender.call(backend, context);
+  }};
+}
+
+test('one render accumulates shared shader-storage versions at the pinned submission boundary', async t => {
+  const f = fixture(t), storage = N.instancedArray(new Float32Array(1), 'float');
+  f.material.colorNode = N.vec3(storage.element(0));
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  const callbacks = []; let frame = 0;
+  const change = (attribute, index) => {
+    attribute.array[0] = frame + (index ? .75 : .25); attribute.needsUpdate = true;
+  };
+  for (const [index, mesh] of [f.mesh, other].entries()) {
+    mesh.onBeforeRender = () => { callbacks.push(`before:${frame}:${index}`); change(storage.value, index); };
+    mesh.onAfterRender = () => { callbacks.push(`after:${frame}:${index}`); };
+  }
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera); callbacks.length = 0;
+  const source = sourceStorage(new Float32Array(1));
+  for (frame = 0; frame < 2; frame++) {
+    source.render([attribute => change(attribute, 0), attribute => change(attribute, 1)]);
+    f.renderer.render(f.scene, f.camera);
+  }
+  storage.value.array[0] = 99; storage.value.needsUpdate = true;
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = shaderStorage(selected[0])[0];
+  assert.deepEqual(selected.map(draw => words(draw, buffer)), draws(source.device).map(draw => words(draw, source.buffer)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.75, .75, 1.75, 1.75]);
+  assert.ok(selected.every(draw => shaderStorage(draw).every(value => value === buffer)));
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.deepEqual(callbacks, ['before:0:0', 'after:0:0', 'before:0:1', 'after:0:1',
+    'before:1:0', 'after:1:0', 'before:1:1', 'after:1:1']);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('shared shader-storage partial versions preserve previous uploads and untouched GPU results', async t => {
+  const f = fixture(t), storage = N.instancedArray(new Uint32Array(4), 'uint'), attribute = storage.value;
+  f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01));
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  const compute = N.Fn(() => { storage.element(N.instanceIndex).assign(7); })().compute(4);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => new Uint32Array(computeStorage(pass)[0].data).fill(7);
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  const source = sourceStorage(new Uint32Array(4)); source.update(); new Uint32Array(source.buffer.data).fill(7);
+  const changes = [[0, 11], [3, 22]].map(([index, value]) => current => {
+    current.array.fill(99); current.array[index] = value;
+    current.clearUpdateRanges(); current.addUpdateRange(index, 1); current.needsUpdate = true;
+  });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  source.render(changes); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(123);
+  await drain(f.renderer);
+  for (const mesh of [f.mesh, other]) mesh.onBeforeRender = () => {};
+  source.render([() => {}, () => {}]); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device);
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.ok(selected.every(draw => words(draw, buffer, Uint32Array).join() === '11,7,7,22'));
+  assert.deepEqual(f.device.writes.filter(write => write.buffer === buffer).map(write => [write.offset, write.input.byteLength]),
+    [[0, 16], [0, 4], [12, 4]]);
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const usage of ['generated vertex', 'indirect'])
+test(`multiple storage versions with ${usage} aliases reject before storage writes`, async t => {
+  const f = fixture(t), indirect = usage === 'indirect';
+  const storage = N.instancedArray(indirect ? new Uint32Array([6, 1, 0, 0, 0]) : new Float32Array(3), indirect ? 'uint' : 'float');
+  f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01));
+  if (indirect) f.mesh.geometry.indirect = storage.value;
+  else f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute(), 0, 0));
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  for (const mesh of [f.mesh, other]) mesh.onBeforeRender = () => { storage.value.needsUpdate = true; };
+  const writes = f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_READ_CONFLICT'});
+  assert.equal(f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length, writes);
+  assert.equal(draws(f.device).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('multiple storage versions cannot change allocation layout before submission', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const owner = f.renderer._getStorageInputs(), attribute = new T.StorageBufferAttribute(new Float32Array(4), 1);
+  const first = owner.capture(attribute);
+  attribute.array = new Float32Array(8); attribute.count = 8; attribute.needsUpdate = true;
+  const second = owner.capture(attribute);
+  try {
+    assert.throws(() => owner.withReads([first, second], () => assert.fail('invalid history must not issue')),
+      {code: 'THREE_COMPUTE_READ_CONFLICT'});
+    assert.equal(f.device.writes.length, 0);
+  } finally { owner.release(first); owner.release(second); }
+});
 
 for (const [type, Type, stride] of [['float', Float32Array, 1], ['vec3', Float32Array, 3], ['uvec2', Uint32Array, 2]])
 test(`PBO-marked ${type} storage keeps the exact source WebGPU graph and ignores fallback-only toggles`, async t => {

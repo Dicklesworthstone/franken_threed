@@ -217,8 +217,12 @@ resource bounds and remaining texture-family, writable/struct storage and advanc
 Native scalar/vector TSL storage reads now share compute's authoritative buffer
 and upload history. Queued full and partial host uploads retain their own render
 order, while unchanged host versions consume GPU-produced data without a stale
-CPU refresh. Multiple host versions of one attribute within a single logical
-render remain an explicit unsupported case; separate queued renders work.
+CPU refresh. Multiple host versions of one shader-storage attribute within a
+logical render upload in source order to its one allocation. All draws observe
+the accumulated contents at submission, matching pinned r186, including earlier
+partial uploads and untouched GPU results. Separate queued renders retain their
+own histories. Multiple versions also used as generated vertex/index or indirect
+inputs, and changes to allocation layout, remain explicit unsupported cases.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own
