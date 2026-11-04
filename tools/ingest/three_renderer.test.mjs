@@ -57,7 +57,8 @@ function recordingDevice() {
         return {...pass, setViewport(...v) { record.viewport = v; }, setScissorRect(...r) { record.scissor = r; }};
       }
       const pass = {desc, draws: []}; d.outputPasses.push(pass);
-      return {setPipeline() {}, setBindGroup() {}, draw(n) { pass.draws.push(n); }, end() {}};
+      return {setPipeline(pipeline) { pass.pipeline = pipeline; }, setBindGroup(index, group) { pass.group = group; },
+        draw(n) { pass.draws.push(n); }, end() {}};
     }};
   };
   return d;
@@ -503,6 +504,86 @@ test('WebGLRenderer surface: synchronous construction, frames before init are de
   assert.throws(() => renderer.capabilities.maxTextureSize, {code: 'F3D_RENDERER_UNSUPPORTED'});
   assert.throws(() => renderer.getContext(), {code: 'F3D_RENDERER_UNSUPPORTED'});
   renderer.dispose();
+});
+
+test('straight-alpha WebGL clears match the pinned Background and State and remain encoded until presentation', async () => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const {WebGLBackground} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLBackground.js')));
+  const {WebGLState} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLState.js')));
+  const clears = [], constants = new Map();
+  const gl = new Proxy({
+    clearColor(...value) { clears.push(value); }, createTexture: () => ({}),
+    getParameter(name) {
+      if (name === gl.VERSION) return 'WebGL 2.0';
+      if (name === gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS) return 16;
+      return [0, 0, 300, 150];
+    },
+  }, {get(object, key) {
+    if (key in object) return object[key];
+    if (/^[A-Z_0-9]+$/.test(key)) { if (!constants.has(key)) constants.set(key, constants.size + 1); return constants.get(key); }
+    return () => {};
+  }});
+  const state = WebGLState(gl, {get: () => null});
+  for (const alpha of [false, true]) for (const premultipliedAlpha of [false, true]) {
+    const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+    const renderer = new Renderer({canvas: c.canvas, device, alpha, premultipliedAlpha});
+    await renderer.init();
+    const reference = WebGLBackground({getRenderTarget: () => null, outputColorSpace: TC.SRGBColorSpace}, null, state, null, alpha, premultipliedAlpha);
+    for (const clearAlpha of [0, .25, .75, 1]) {
+      const color = new TC.Color(.1, .4, .8);
+      reference.setClearColor(color, clearAlpha); renderer.setClearColor(color, clearAlpha);
+      assert.deepEqual(renderer._frame(new TC.Scene()).clearColor, clears.at(-1));
+    }
+    assert.equal(renderer._hdr, false); assert.equal(renderer._session.rendererOptions.format, 'bgra8unorm');
+    // Like real context attributes, the construction value remains fixed.
+    renderer.premultipliedAlpha = !premultipliedAlpha;
+    assert.deepEqual(renderer._frame(new TC.Scene()).clearColor, clears.at(-1));
+    renderer.dispose(); reference.dispose();
+  }
+});
+
+for (const preserveDrawingBuffer of [false, true]) test(`straight-alpha facade renders and copies the original framebuffer, preserved=${preserveDrawingBuffer}`, async () => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC,
+    {gpu: {getPreferredCanvasFormat: () => 'rgba8unorm'}});
+  const renderer = new Renderer({canvas: c.canvas, device, alpha: true, premultipliedAlpha: false, preserveDrawingBuffer});
+  const scene = new TC.Scene(), material = new TC.MeshBasicMaterial({color: 0xff0000, transparent: true, opacity: .5});
+  const mesh = new TC.Mesh(new TC.BoxGeometry(), material), camera = new TC.PerspectiveCamera(50, 2, .1, 10);
+  camera.position.z = 3; scene.add(mesh); renderer.setClearColor(new TC.Color(.1, .4, .8), .25);
+  await renderer.renderAsync(scene, camera);
+  const source = device.textures.find(t => t.label === 'f3d-canvas-preserved');
+  assert.ok(source); assert.equal(source.format, 'rgba8unorm'); assert.equal(source.sampleCount, 1);
+  const output = device.outputPasses.at(-1);
+  assert.equal(output.desc.label, 'f3d-canvas-premultiply'); assert.deepEqual(output.draws, [3]);
+  assert.equal(output.group.entries[0].resource.attachment, source);
+  assert.deepEqual(output.pipeline.fragment.targets, [{format: 'rgba8unorm'}]);
+  const drawing = device.passes.find(p => p.desc.colorAttachments[0].view.attachment === source && p.draws.length);
+  assert.ok(drawing); assert.equal(drawing.desc.colorAttachments[0].clearValue.a, .25);
+  assert.equal(device.canvasCopies.length, 0, 'presentation does not overwrite or copy premultiplied pixels back');
+  const texture = new TC.FramebufferTexture(4, 4);
+  renderer.copyFramebufferToTexture(texture); await flush(renderer);
+  const copied = device.passes.find(pass => pass.draws.some(draw => draw.pipeline.label === 'WebGL framebuffer texel copy'));
+  assert.ok(copied);
+  const copy = copied.draws.find(draw => draw.pipeline.label === 'WebGL framebuffer texel copy');
+  assert.equal(copy.groups.get(0).group.entries[0].resource.attachment, source);
+  assert.notEqual(copied.desc.colorAttachments[0].view.attachment, source);
+  assert.equal(source.swapchain, undefined); assert.equal(device.outputPasses.at(-1).group.entries[0].resource.attachment, source);
+  renderer.dispose(); texture.dispose(); mesh.geometry.dispose(); material.dispose();
+});
+
+test('straight-alpha shader preparation errors retain the original canvas owner without whole-image HDR fallback', async () => {
+  const TC = await import(pathToFileURL(path.join(root, 'build/three.module.js')));
+  const device = recordingDevice(), c = canvasFixture(), Renderer = createWebGLRendererClass(TC);
+  const renderer = new Renderer({canvas: c.canvas, device, premultipliedAlpha: false});
+  const scene = new TC.Scene(), material = new TC.MeshBasicMaterial(), geometry = new TC.BoxGeometry(), camera = new TC.PerspectiveCamera();
+  scene.add(new TC.Mesh(geometry, material)); await renderer.renderAsync(scene, camera);
+  const session = renderer._session, error = Object.assign(new Error('source program requires unavailable output'), {code: 'THREE_SCENE_TONE_MAPPING'});
+  material.onBeforeCompile = () => { throw error; }; material.needsUpdate = true;
+  renderer.toneMapping = TC.ACESFilmicToneMapping;
+  await assert.rejects(renderer.compileAsync(scene, camera), e => e === error);
+  assert.equal(renderer._session, session); assert.equal(renderer._hdr, false);
+  assert.notEqual(renderer._hdrFallback, true); assert.equal(c.calls.some(call => call[0] === 'unconfigure'), false);
+  renderer.dispose(); geometry.dispose(); material.dispose();
 });
 
 test('WebGL material and procedural geometry changes do not acquire unused canvas images', async t => {

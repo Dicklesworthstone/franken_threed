@@ -566,6 +566,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           target: {width, height, depthFormat, sampleCount, ...presentation,
             preserveDrawingBuffer: this._shaderEncodedOutput && this.preserveDrawingBuffer === true,
             frameHistory: this._shaderEncodedOutput === true,
+            premultiplyPresentation: this._straightAlphaCanvas === true,
             alphaMode: this._compositedAlpha() ? 'premultiplied' : 'opaque'}});
       if (this._disposed) { session.dispose(); fail('DISPOSED', 'Renderer was disposed during initialization'); }
       this._session = session;
@@ -949,17 +950,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const color = this._clearColor, a = this._clearAlpha;
       // Source Background semantics: the renderer clear color is premultiplied
       // for alpha canvases; an opaque canvas ignores alpha.
-      const premultiply = this._compositedAlpha() && (!target || !this._bottomLeftOrigin);
+      const canvasAlpha = this._compositedAlpha();
+      const premultiply = canvasAlpha && (!target || !this._bottomLeftOrigin) && !this._straightAlphaCanvas;
       const frame = {
         loadOp: (clearOnly ? clearOnly.color : clear && this.autoClearColor) ? 'clear' : 'load',
         depthLoadOp: (clearOnly ? clearOnly.depth : clear && this.autoClearDepth) ? 'clear' : 'load',
-        clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, target ? a : 1],
+        clearColor: premultiply ? [color.r * a, color.g * a, color.b * a, a] : [color.r, color.g, color.b, target || canvasAlpha ? a : 1],
       };
       // Shader-encoded output stores sRGB values: clear with the encoded color
       // (source WebGL Background converts the clear color to the output space).
       if (!target && this._shaderEncodedOutput && !hdr) {
         const encoded = [color.r, color.g, color.b].map(c => c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 0.41666) - 0.055);
-        frame.clearColor = premultiply ? [...encoded.map(c => c * a), a] : [...encoded, 1];
+        frame.clearColor = premultiply ? [...encoded.map(c => c * a), a] : [...encoded, canvasAlpha ? a : 1];
       }
       Object.assign(frame, {
         clearDepth: this.getClearDepth(),
@@ -1944,7 +1946,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // Even auto-clears can be scissored or retain other attachments.
               // Logarithmic fragment depth also requires the source programs.
               if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true ||
-                  this._shaderEncodedOutput && (this.preserveDrawingBuffer === true || this.logarithmicDepthBuffer === true || this.reversedDepthBuffer === true)) throw error;
+                  this._shaderEncodedOutput && (this.preserveDrawingBuffer === true || this._straightAlphaCanvas || this.logarithmicDepthBuffer === true || this.reversedDepthBuffer === true)) throw error;
               this._hdrFallback = true;
               this._session.dispose();
               const fallbackHdr = selectOutput();
@@ -2154,6 +2156,9 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       this.isWebGLRenderer = true;
       delete this.library; // WebGLRenderer has no node library.
       this.premultipliedAlpha = premultipliedAlpha;
+      // Context creation attributes do not change after construction. Public
+      // property edits must not reinterpret an existing drawing buffer.
+      this._straightAlphaCanvas = premultipliedAlpha === false;
       this.preserveDrawingBuffer = preserveDrawingBuffer;
       this._outputBufferType = outputBufferType;
       this.clippingPlanes = [];
@@ -2177,8 +2182,6 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     }
     _parameterNames() { return WEBGL_PARAMETERS; }
     async _init() {
-      // r186 always creates an alpha context; straight alpha would need unpremultiplied compositing.
-      if (this.premultipliedAlpha === false) fail('UNSUPPORTED', 'Straight-alpha canvas compositing is not admitted');
       if (this._outputBufferType !== undefined && this._outputBufferType !== THREE.UnsignedByteType)
         fail('UNSUPPORTED', 'Non-8-bit output buffers are not admitted');
       return super._init();

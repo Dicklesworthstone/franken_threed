@@ -551,6 +551,35 @@ empty loads, changed dimensions, same-size `setSize` and same-value pixel ratio.
 There were zero GPU/browser errors. These are rendering-correctness results,
 not physical-device performance measurements.
 
+## Straight-alpha WebGL-authored canvases
+
+`premultipliedAlpha: false` now admits the WebGPU program route. Source draws,
+blending, clears and framebuffer copies use the original plain 8-bit encoded
+drawing buffer. A final fullscreen pass multiplies RGB by alpha into the
+premultiplied page image without changing the owned source image. It performs
+no color transfer, tone mapping, filtering or CPU readback. The clear-color
+path preserves alpha and follows the pinned `WebGLBackground`/`WebGLState`
+construction option, including when the renderer's `alpha` option is false.
+
+One and four samples, scissored/layered rendering, deferred animation tokens,
+`preserveDrawingBuffer`, framebuffer copies and resize share the existing
+attachment owner. Direct calls identify the current browser drawing buffer
+through weak texture-identity tokens, so calls before presentation retain their
+contents and a new browser buffer initializes transparent black/depth one.
+Swapchain handles are still reacquired for each use; none are retained across
+host turns. The extra owned color image counts against the attachment budget.
+Preparation that never borrows attachments leaves the page image untouched.
+
+This path keeps per-material shader tone mapping. Incompatible whole-image HDR
+fallback remains an explicit error before replacing the owner, as it does for
+preserved canvases. Ordinary native WebGPURenderer output is unchanged.
+
+The focused canvas/facade/session/framebuffer suites pass 119 tests. New checks
+execute the actual pinned clear-color code and inspect recorded render, copy,
+resolve and presentation commands, including both byte formats and lifetime
+boundaries. These checks do not execute WGSL or establish browser pixel parity;
+that requires a capable browser lane.
+
 ## Deferred multi-viewport WebGL animation frames
 
 The WebGL facade retains one drawing buffer for each accepted
@@ -562,7 +591,8 @@ into a freshly acquired swapchain texture. A later callback starts transparent
 black, depth one and stencil zero, so this does not turn the default canvas into
 a permanently preserved buffer. Explicit `preserveDrawingBuffer: true` retains
 its existing cross-frame behavior. Manual render calls outside these callbacks
-keep their direct presentation path.
+keep their direct presentation lifetime; straight-alpha canvases use the owned
+encoded buffer and final alpha conversion described above.
 
 The existing canvas owner allocates history color lazily on the first actual
 attachment use. Warm callbacks reuse that storage; resize, in-flight old

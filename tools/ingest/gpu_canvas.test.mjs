@@ -28,10 +28,18 @@ function fixture() {
     },
     pushErrorScope(type) { scopes.push(type); },
     popErrorScope() { assert.ok(scopes.pop()); return validation.shift() ?? Promise.resolve(null); },
+    createShaderModule(descriptor) { calls.push(['shader', descriptor]); return descriptor; },
+    createRenderPipeline(descriptor) { calls.push(['pipeline', descriptor]); return {...descriptor, getBindGroupLayout: () => ({})}; },
+    createBindGroup(descriptor) { calls.push(['group', descriptor]); return descriptor; },
     createCommandEncoder() {
       const commands = [];
       return {
-        beginRenderPass(descriptor) { commands.push(['initialize', descriptor]); return {end() {}}; },
+        beginRenderPass(descriptor) {
+          const state = {}, kind = descriptor.label === 'f3d-canvas-premultiply' ? 'present' : 'initialize';
+          commands.push([kind, descriptor, state]);
+          return {setPipeline(value) { state.pipeline = value; }, setBindGroup(index, group) { state.group = group; },
+            draw(...args) { state.draw = args; }, end() {}};
+        },
         copyTextureToTexture(source, destination, size) { commands.push(['copy', source, destination, size]); },
         finish() { return commands; },
       };
@@ -110,6 +118,100 @@ test('preserved canvas uses one owned color history and copies raw texels into e
   assert.equal(initialization[0][1].depthStencilAttachment.depthClearValue, 1);
   assert.equal(target.diagnostics.attachmentBytes, 16 * 8 * 8);
   target.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
+});
+
+for (const format of ['rgba8unorm', 'bgra8unorm']) for (const sampleCount of [1, 4])
+  test(`straight alpha presents once from unchanged encoded history (${format}, ${sampleCount}x)`, () => {
+    const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {
+      format, sampleCount, depthFormat: 'depth24plus-stencil8', srgbView: false,
+      alphaMode: 'premultiplied', premultiplyPresentation: true, frameHistory: true,
+    });
+    const frameToken = {}, sources = [];
+    for (let index = 0; index < 2; index++) target.withFrame((frame, source) => {
+      assert.equal((frame.resolveTarget ?? frame.colorView).texture, source);
+      assert.equal(source.descriptor.format, format); assert.equal(source.descriptor.sampleCount, 1);
+      source.encodedValue = [1, .5, .25, .5]; sources.push(source);
+    }, {frameToken});
+    assert.equal(sources[0], sources[1]); assert.deepEqual(sources[0].encodedValue, [1, .5, .25, .5]);
+    assert.equal(count(f, 'copy'), 0); assert.equal(count(f, 'initialize'), 1);
+    assert.equal(count(f, 'shader'), 1); assert.equal(count(f, 'pipeline'), 1); assert.equal(count(f, 'group'), 1);
+    const shader = f.calls.find(c => c[0] === 'shader')[1].code;
+    assert.match(shader, /textureLoad\(source, vec2i\(position.xy\), 0\)/);
+    assert.match(shader, /vec4f\(color.rgb \* color.a, color.a\)/);
+    for (const [, descriptor, state] of f.calls.filter(c => c[0] === 'present')) {
+      assert.equal(descriptor.colorAttachments[0].view.descriptor.format, format);
+      assert.equal(descriptor.colorAttachments[0].view.texture.descriptor.swapchain, true);
+      assert.equal(descriptor.depthStencilAttachment, undefined);
+      assert.deepEqual(state.pipeline.fragment.targets, [{format}]);
+      assert.equal(state.pipeline.multisample, undefined); assert.deepEqual(state.draw, [3]);
+      assert.equal(state.group.entries[0].resource.texture, sources[0]);
+      assert.equal(state.group.entries[0].resource.descriptor.format, format);
+    }
+    assert.equal(count(f, 'acquire'), 2); assert.equal(count(f, 'present'), 2);
+    target.withFrame(() => {}, {frameToken: {}}); assert.equal(count(f, 'initialize'), 2);
+    target.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
+  });
+
+test('straight-alpha direct calls share history until the actual browser drawing buffer expires', () => {
+  const f = fixture(), nativeAcquire = f.context.getCurrentTexture;
+  let current;
+  f.context.getCurrentTexture = () => { f.calls.push(['direct-acquire']); return current ??= nativeAcquire(); };
+  const target = createGpuCanvasTarget(f.device, f.canvas, {srgbView: false, alphaMode: 'premultiplied', premultiplyPresentation: true});
+  target.withFrame(() => {}); target.withFrame(() => {});
+  assert.equal(count(f, 'initialize'), 1); assert.equal(count(f, 'direct-acquire'), 2);
+  current = null; target.withFrame(() => {});
+  assert.equal(count(f, 'initialize'), 2, 'a new browser buffer starts with transparent black/depth one');
+  const frameToken = {}; target.withFrame(() => {}, {frameToken});
+  assert.equal(count(f, 'initialize'), 3);
+  target.withFrame(() => {}); assert.equal(count(f, 'initialize'), 3, 'direct calls retain the just-presented callback contents');
+  current = null; target.withFrame(() => {}, {frameToken});
+  assert.equal(count(f, 'initialize'), 3, 'accepted callback work survives deferred browser presentations');
+  target.dispose();
+});
+
+test('straight-alpha preserved buffers retain unmodified source pixels across tokens and resize safely', async () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {
+    srgbView: false, alphaMode: 'premultiplied', premultiplyPresentation: true, preserveDrawingBuffer: true,
+  });
+  let source;
+  for (const frameToken of [{}, {}, null]) target.withFrame((_frame, texture) => { source ??= texture; assert.equal(texture, source); }, {frameToken});
+  assert.equal(count(f, 'initialize'), 1); assert.equal(count(f, 'present'), 3);
+  const previous = f.textures.slice(); target.resize(8, 4);
+  target.withFrame((_frame, texture) => assert.notEqual(texture, source));
+  assert.equal(count(f, 'initialize'), 2); assert.equal(count(f, 'group'), 2); assert.equal(count(f, 'pipeline'), 1);
+  assert.ok(previous.every(t => t.destroyed === 0)); f.fences[0].resolve(); await tick();
+  assert.ok(previous.every(t => t.destroyed === 1)); target.dispose();
+});
+
+test('straight-alpha lazy failures, depth-only borrows and budgets never acquire unused page images', () => {
+  const options = {srgbView: false, alphaMode: 'premultiplied', premultiplyPresentation: true};
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, options), error = new Error('source callback');
+  assert.throws(() => target.withFrame(() => { throw error; }, {lazy: true}), e => e === error);
+  target.withFrame((_views, _color, depth) => assert.equal(depth(), f.textures[0]), {lazy: true});
+  assert.equal(count(f, 'acquire'), 0); assert.equal(count(f, 'present'), 0);
+  assert.throws(() => target.withFrame(frame => { void frame.colorView; throw error; }, {lazy: true}), e => e === error);
+  assert.equal(count(f, 'present'), 1); assert.equal(target.failed, false); target.dispose();
+  const limited = fixture(), overBudget = createGpuCanvasTarget(limited.device, limited.canvas, {...options, maxBytes: 1023});
+  assert.throws(() => overBudget.withFrame(() => assert.fail('over budget')), failCode('BUDGET'));
+  assert.equal(count(limited, 'acquire'), 0); assert.equal(limited.textures.length, 1); overBudget.dispose();
+});
+
+test('straight-alpha presentation validates compatible formats and native pipeline failures', async () => {
+  const options = {srgbView: false, alphaMode: 'premultiplied', premultiplyPresentation: true};
+  for (const extra of [{srgbView: true}, {format: 'rgba16float'}, {alphaMode: 'opaque'}]) {
+    const f = fixture(); assert.throws(() => createGpuCanvasTarget(f.device, f.canvas, {...options, ...extra}), failCode('ALPHA'));
+    assert.equal(count(f, 'context'), 0);
+  }
+  const invalid = fixture();
+  assert.throws(() => createGpuCanvasTarget(invalid.device, invalid.canvas, {...options, premultiplyPresentation: 1}), failCode('OPTIONS'));
+  const missing = fixture(); delete missing.device.createShaderModule;
+  assert.throws(() => createGpuCanvasTarget(missing.device, missing.canvas, options), failCode('DEVICE'));
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, options);
+  f.device.createRenderPipeline = () => { throw new Error('pipeline failed'); };
+  assert.throws(() => target.withFrame(() => {}), /pipeline failed/);
+  assert.equal(target.failed, true); assert.equal(count(f, 'present'), 0);
+  assert.ok(f.textures.every(t => t.destroyed === 1)); assert.equal(f.scopes.length, 0);
+  await assert.rejects(target.whenIdle(), /pipeline failed/); target.dispose();
 });
 
 test('preserved MSAA, depth and stencil survive frames and retire together after resize', async () => {
