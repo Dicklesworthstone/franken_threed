@@ -77,6 +77,24 @@ const deferred = () => {
 };
 const hostTurn = () => new Promise(resolve => setImmediate(resolve));
 
+function deviceEventsFixture() {
+  const device = recordingDevice(), loss = deferred(); let destroyed = 0;
+  device.features = new Set(['core-features-and-limits']); device.lost = loss.promise;
+  device.destroy = () => { destroyed++; loss.resolve({reason: 'destroyed', message: ''}); };
+  return {device, loss, destroyed: () => destroyed};
+}
+async function sourceDeviceEvents(t, fixture) {
+  const source = new T.WebGPURenderer({canvas: canvasFixture().canvas, device: fixture.device});
+  // The actual pinned backend wires its events without needing source render
+  // managers or rasterization. GPU objects are the same recording boundary.
+  await source.backend.init(source);
+  t.after(async () => {
+    fixture.device.onuncapturederror = null; fixture.loss.resolve({reason: 'destroyed'});
+    await source.backend.dispose();
+  });
+  return source;
+}
+
 test('source construction surface: render before init throws the source error', async () => {
   const {renderer, canvas} = await create();
   assert.equal(renderer.domElement, canvas); assert.equal(renderer.isWebGPURenderer, true);
@@ -260,6 +278,95 @@ test('initialization disposal aborts pending output preparation and cannot uncon
     assert.equal(replacement.initialized, true);
     replacement.dispose();
   }
+});
+
+for (const info of [{reason: 'unknown', message: 'adapter removed'}, {reason: '', message: ''}, {reason: 'destroyed'}])
+test(`native device callbacks preserve pinned payloads, receiver and live handlers (${info.reason || 'empty'})`, async t => {
+  const original = deviceEventsFixture(), native = deviceEventsFixture();
+  const source = await sourceDeviceEvents(t, original);
+  const renderer = new WebGPURenderer({canvas: canvasFixture().canvas, device: native.device});
+  t.after(() => renderer.dispose()); await renderer.init(); await renderer.init();
+  const sourceErrors = [], errors = [], sourceLosses = [], losses = [];
+  source.onError = function (value) { assert.equal(this, source); sourceErrors.push(value); };
+  renderer.onError = function (value) { assert.equal(this, renderer); errors.push(value); };
+  source.onDeviceLost = function (value) { assert.equal(this, source); sourceLosses.push(value); };
+  renderer.onDeviceLost = function (value) { assert.equal(this, renderer); losses.push(value); };
+  class GPUValidationError extends Error {}
+  for (const event of [{error: new GPUValidationError('invalid binding')}, {error: null}]) {
+    original.device.onuncapturederror(event); native.device.onuncapturederror(event);
+    assert.deepEqual(errors.at(-1), sourceErrors.at(-1));
+    assert.equal(errors.at(-1).originalEvent, event);
+  }
+  const failure = new Error('application error handler');
+  source.onError = renderer.onError = () => { throw failure; };
+  assert.throws(() => original.device.onuncapturederror({}), error => error === failure);
+  assert.throws(() => native.device.onuncapturederror({}), error => error === failure);
+  original.loss.resolve(info); native.loss.resolve(info); await hostTurn();
+  assert.deepEqual(losses, sourceLosses);
+  assert.equal(losses.length, info.reason === 'destroyed' ? 0 : 1);
+  if (losses.length) assert.equal(losses[0].originalEvent, info);
+  assert.equal(renderer._isDeviceLost, source._isDeviceLost);
+  assert.equal(renderer._isDeviceLost, false, 'custom handlers retain the source choice of loss-state policy');
+});
+
+test('default native device diagnostics and post-loss work follow the pinned source', async t => {
+  const original = deviceEventsFixture(), native = deviceEventsFixture();
+  const source = await sourceDeviceEvents(t, original);
+  const renderer = new WebGPURenderer({canvas: canvasFixture().canvas, device: native.device});
+  t.after(() => renderer.dispose()); await renderer.init();
+  const previous = T.getConsoleFunction(), logs = [];
+  T.setConsoleFunction((...args) => logs.push(args)); t.after(() => T.setConsoleFunction(previous));
+  const event = {error: new Error('uncaptured validation')};
+  original.device.onuncapturederror(event); native.device.onuncapturederror(event);
+  assert.deepEqual(logs[1], logs[0]); assert.equal(renderer._isDeviceLost, false);
+  const info = {reason: 'unknown', message: 'GPU reset'};
+  original.loss.resolve(info); native.loss.resolve(info); await hostTurn();
+  assert.equal(logs.length, 4); assert.deepEqual(logs[3], logs[2]);
+  assert.equal(source._isDeviceLost, true); assert.equal(renderer._isDeviceLost, true);
+  // Only the source backend was initialized above. Post-loss public calls must
+  // return before they need any of its other managers or validate scene inputs.
+  source._initialized = true;
+  const submissions = native.device.submissions.length;
+  for (const operation of [r => r.render(null, null), r => r.compileAsync(null, null),
+    r => r.compute(null), r => r.compileComputeAsync(null)]) {
+    assert.equal(await operation(source), undefined); assert.equal(await operation(renderer), undefined);
+  }
+  assert.equal(native.device.submissions.length, submissions);
+  assert.equal(renderer._pending.length, 0);
+});
+
+test('device loss during initialization reaches the application before failed-session cleanup', async t => {
+  const native = deviceEventsFixture(), gate = deferred(), started = deferred(), c = canvasFixture();
+  const renderer = new WebGPURenderer({canvas: c.canvas, device: native.device}), losses = [];
+  renderer.onDeviceLost = info => losses.push(info);
+  const pipeline = native.device.createRenderPipelineAsync.bind(native.device);
+  native.device.createRenderPipelineAsync = async descriptor => { started.resolve(); await gate.promise; return pipeline(descriptor); };
+  t.after(() => { gate.resolve(); renderer.dispose(); });
+  const init = renderer.init(); init.catch(() => {}); await started.promise;
+  const info = {reason: 'unknown', message: 'GPU reset during initialization'};
+  native.loss.resolve(info);
+  await assert.rejects(init, {code: 'GPU_CANVAS_DEVICE_LOST'});
+  assert.equal(losses.length, 1); assert.equal(losses[0].originalEvent, info);
+  assert.equal(native.device.onuncapturederror, null);
+  assert.equal(native.destroyed(), 0, 'a supplied device remains borrowed after initialization fails');
+});
+
+for (const borrowed of [false, true]) for (const replaceHandler of [false, true])
+test(`device callbacks retire on disposal without clobbering another handler (borrowed=${borrowed}, replaced=${replaceHandler})`, async t => {
+  const native = deviceEventsFixture(), Renderer = createWebGPURendererClass(T, {gpu: {
+    requestAdapter: async () => ({requestDevice: async () => native.device})}});
+  const renderer = new Renderer({canvas: canvasFixture().canvas, ...(borrowed ? {device: native.device} : {})});
+  t.after(() => renderer.dispose()); await renderer.init();
+  let calls = 0;
+  renderer.onDeviceLost = renderer.onError = () => { calls++; };
+  const stale = native.device.onuncapturederror, replacement = () => {};
+  if (replaceHandler) native.device.onuncapturederror = replacement;
+  renderer.dispose(); renderer.dispose();
+  assert.equal(native.device.onuncapturederror, replaceHandler ? replacement : null);
+  assert.equal(native.destroyed(), borrowed ? 0 : 1);
+  native.loss.resolve({reason: 'unknown', message: 'late device loss'});
+  stale({error: new Error('late uncaptured error')}); await hostTurn();
+  assert.equal(calls, 0, 'neither queued loss nor a retained event handler can revive the disposed owner');
 });
 
 test('clear color state, scene background and autoClear map to source clear semantics', async () => {

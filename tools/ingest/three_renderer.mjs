@@ -93,6 +93,31 @@ const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
 // replacing an already exposed renderer with another owner.
 const hasWebGPUHost = gpu => typeof (gpu ?? globalThis.navigator?.gpu)?.requestAdapter === 'function';
 
+/** One native device observer per renderer, independent of canvas sessions.
+ * Keep the source's event-handler slot and payloads. A disposed owner must not
+ * remain reachable from the device's non-removable lost Promise continuation. */
+function observeRendererDevice(renderer, device) {
+  let owner = renderer;
+  device.lost?.then?.(info => {
+    const current = owner;
+    if (!current || info.reason === 'destroyed') return;
+    current.onDeviceLost({api: 'WebGPU', message: info.message || 'Unknown reason',
+      reason: info.reason || null, originalEvent: info});
+  });
+  const onError = event => {
+    const current = owner;
+    if (!current) return;
+    const gpuError = event.error;
+    current.onError({api: 'WebGPU', type: gpuError && gpuError.constructor ? gpuError.constructor.name : 'GPUError',
+      message: (gpuError && gpuError.message) || 'Unknown uncaptured GPU error', originalEvent: event});
+  };
+  device.onuncapturederror = onError;
+  return () => {
+    owner = null;
+    if (device.onuncapturederror === onError) device.onuncapturederror = null;
+  };
+}
+
 /** Compiler-private dispatch for statically source-selected construction sites.
  * No option is read or copied, and unknown constructors keep their own behavior. */
 export function sourceThreeRendererConstructor(Constructor) {
@@ -122,6 +147,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
   if (!Number.isSafeInteger(maxDraws) || maxDraws < 1 || !Number.isSafeInteger(maxBindings) || maxBindings < 1)
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
+  const sourceError = THREE.error ?? (message => console.error('THREE.' + message));
   // A retained addon may replace the exported renderer prototype's init before
   // construction (r186 Inspector Settings does this to select WebGL). Preserve
   // that method on a genuine source renderer, before allocating any native
@@ -396,12 +422,16 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._cacheShadowNodes = new WeakMap();
       this._currentSourceMaterial = null;
       this._mrt = null;
+      this._isDeviceLost = false;
+      this.onDeviceLost = this._onDeviceLost;
+      this.onError = this._onError;
       this._initialized = false;
       this._initPromise = null;
       this._session = null;
       this._dispatcher = null;
       this._device = null;
       this._ownsDevice = false;
+      this._releaseDeviceEvents = null;
       this._rebuild = false;
       this._preparing = null;
       this._hdr = false;
@@ -442,6 +472,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._inspector.setRenderer(this);
     }
     get inspector() { return this._inspector; }
+    _onDeviceLost(info) {
+      let message = `THREE.WebGPURenderer: ${info.api} Device Lost:\n\nMessage: ${info.message}`;
+      if (info.reason) message += `\nReason: ${info.reason}`;
+      sourceError(message);
+      this._isDeviceLost = true;
+    }
+    _onError(info) {
+      let message = `WebGPURenderer: Uncaptured ${info.api} ${info.type}`;
+      if (info.message) message += `: ${info.message}`;
+      sourceError(message);
+    }
     hasFeature(name) { return !!this._device?.features?.has(name); }
     async hasFeatureAsync(name) { await this.init(); return this.hasFeature(name); }
     async resolveTimestampsAsync(type = 'render') {
@@ -512,6 +553,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         await wait(acquisition);
         live();
       }
+      if (this.isWebGPURenderer) this._releaseDeviceEvents = observeRendererDevice(this, this._device);
       this._preferredFormat = p.outputType === THREE.HalfFloatType ? 'rgba16float' :
         p.outputType === THREE.UnsignedByteType ? 'bgra8unorm' :
         (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
@@ -525,6 +567,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       } catch (error) {
         // A failed session never transfers device ownership to a usable
         // renderer. Canvas children borrow that device and cannot retire it.
+        this._releaseDeviceEvents?.(); this._releaseDeviceEvents = null;
         try { this._canvases.dispose(); }
         finally { if (this._ownsDevice) { this._ownsDevice = false; this._device.destroy(); } }
         throw signal.aborted ? signal.reason : error;
@@ -1062,6 +1105,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _renderCall(scene, camera) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (this._isDeviceLost === true && this._initialized) return;
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!(scene instanceof THREE.Object3D) || !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source scene and camera');
       this._beforeRender();
@@ -1761,6 +1805,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     async compileAsync(scene, camera, targetScene = null) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      if (this._isDeviceLost === true) return;
       if (camera !== undefined && !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source camera');
       const compiled = this._shaderEncodedOutput ? targetScene ?? scene : scene;
       if (!(compiled instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D root');
@@ -2077,6 +2122,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // adding an asynchronous setter behind an already pending start.
       this._setLoop(null);
       this._disposed = true;
+      this._releaseDeviceEvents?.(); this._releaseDeviceEvents = null;
       this._occlusionQueries?.dispose();
       this._timestamps.dispose();
       if (this._animationStarted) {

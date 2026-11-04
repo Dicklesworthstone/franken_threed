@@ -727,6 +727,7 @@ export function withThreeCompute(Base, THREE) {
       return owner(this).storageReads;
     }
     compute(nodes, dispatchSize = null) {
+      if (this._isDeviceLost === true) return;
       check(this);
       assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
@@ -751,6 +752,7 @@ export function withThreeCompute(Base, THREE) {
     }
     async computeAsync(nodes, dispatchSize = null) { await this.compute(nodes, dispatchSize); }
     async compileComputeAsync(nodes, onProgress = null) {
+      if (this._isDeviceLost === true) return;
       assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes);
       if (onProgress !== null && typeof onProgress !== 'function') fail('OPTIONS', 'onProgress must be a function');
