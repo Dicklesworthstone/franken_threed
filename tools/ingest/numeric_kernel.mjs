@@ -12,7 +12,8 @@
  * opt-in ABI is not proof of whole-application closure or a speedup claim.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach,
+  compileTypedArraySearch, isNumericBooleanSearchCall } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
@@ -286,6 +287,7 @@ export function compileNumericKernel(source, {
     },
   } : null;
   const helperCompiler = createScalarHelperCompiler(helperSources, fail, intrinsics, control, checkedIndexing);
+  const resultType = !resultNode ? 'void' : helperCompiler.booleanExpression(resultNode.argument) ? 'boolean' : 'f64';
   let temporaries = new Map();
   let temporaryCount = 0;
   let statementCount = 0;
@@ -294,7 +296,7 @@ export function compileNumericKernel(source, {
   const loopControls = [];
   const controlLoops = [];
   let generalDepth = 0, maxGeneralDepth = 0, generalFuel = null;
-  let controlDepth = 0, callbackReturnDepth = null;
+  let controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null;
   const mutableLocals = new Set();
   const scalarWrites = new Set();
   const reads = new Set();
@@ -429,10 +431,11 @@ export function compileNumericKernel(source, {
     return compileTypedArrayForEach(node, {resolveArray:helperArray,
       allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
       compileCallback(callback, body, values) {
-        const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth;
+        const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+          parentPredicate = callbackPredicate;
         temporaries = new Map(parent); generalDepth++;
         // The emitter adds a loop-exit block, loop and callback-return block.
-        controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null;
         callback.params.forEach((param, index) => {
           temporaries.set(param.name, values[index]);
           if (index < 2) mutableLocals.add(values[index]);
@@ -441,9 +444,36 @@ export function compileNumericKernel(source, {
           : [{type:'ExpressionStatement', expression:body}], true, depth + 1); }
         finally {
           temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+          callbackPredicate = parentPredicate;
         }
       },
     });
+  }
+  function search(node, depth) {
+    return compileTypedArraySearch(node, {resolveArray:helperArray,
+      allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
+      compileCallback(callback, body, values, predicate) {
+        const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+          parentPredicate = callbackPredicate;
+        temporaries = new Map(parent); generalDepth++;
+        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate;
+        callback.params.forEach((param, index) => {
+          temporaries.set(param.name, values[index]);
+          if (index < 2) mutableLocals.add(values[index]);
+        });
+        try { return compileBlock(body.type === 'BlockStatement' ? body.body
+          : [{type:'ReturnStatement', argument:body}], true, depth + 1); }
+        finally {
+          temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+          callbackPredicate = parentPredicate;
+        }
+      },
+    });
+  }
+  function resultExpression(node) {
+    if (resultType !== 'boolean') return expression(node);
+    if (!helperCompiler.booleanExpression(node)) fail('Boolean kernel returns cannot mix with Number returns', node);
+    return [...condition(node), 0xb8];
   }
   function expression(node, depth = 0) {
     if (!node || depth > 128) fail('Expression nesting exceeds the admitted bound', node);
@@ -487,6 +517,9 @@ export function compileNumericKernel(source, {
         ...expression(node.alternate, depth + 1), 0x0b];
     }
     if (node.type === 'CallExpression') {
+      if (isNumericBooleanSearchCall(node)) fail('Boolean search results cannot be used as Numbers', node);
+      const searched = search(node, depth);
+      if (searched) return searched;
       const reduced = reduction(node, depth);
       if (reduced) return reduced;
       const intrinsic = intrinsics.call(node, arg => expression(arg, depth + 1),
@@ -504,6 +537,9 @@ export function compileNumericKernel(source, {
   function condition(node, depth = 0) {
     if (!node || depth > 128) fail('Predicate nesting exceeds the admitted bound', node);
     if (node.type === 'Literal' && typeof node.value === 'boolean') return [0x41, Number(node.value)];
+    if (isNumericBooleanSearchCall(node)) return [...search(node, depth), 0xab];
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier')
+      return [...number(0), ...helperCall(node, depth, 'predicate'), 0x99, 0x63];
     if (node.type === 'BinaryExpression' && Object.hasOwn(COMPARE, node.operator)) {
       return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), COMPARE[node.operator]];
     }
@@ -784,17 +820,20 @@ export function compileNumericKernel(source, {
         }
         if (structuredLoops && statement.type === 'ReturnStatement') {
           if (callbackReturnDepth !== null) {
-            bytes.push(...compileEffects(statement.argument, depth + 1), 0x0c,
+            bytes.push(...(callbackPredicate === null ? compileEffects(statement.argument, depth + 1)
+              : [...(statement.argument ? condition(statement.argument) : [0x41, 0]), 0xb8, ...set(callbackPredicate)]), 0x0c,
               ...u32(controlDepth - 1 - callbackReturnDepth));
             continue;
           }
           if (!!statement.argument !== !!resultNode) fail('Early return must match the kernel result type', statement);
-          bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
+          bytes.push(...(statement.argument ? resultExpression(statement.argument) : []), 0x0f);
           continue;
         }
         const assignment = statement.type === 'ExpressionStatement' ? statement.expression : null;
         const iteration = forEach(assignment, depth);
         if (iteration) { bytes.push(...iteration); continue; }
+        const searched = search(assignment, depth);
+        if (searched) { bytes.push(...searched, 0x1a); continue; }
         const bulk = compileTypedArrayOperation(assignment, {resolveArray:helperArray, expression,
           allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth});
         if (bulk) { bytes.push(...bulk); continue; }
@@ -876,7 +915,7 @@ export function compileNumericKernel(source, {
     inLoop = false;
     execution = [...setup, ...emitLoop(instructions)];
   }
-  const result = resultNode ? expression(resultNode.argument) : [];
+  const result = resultNode ? resultExpression(resultNode.argument) : [];
   arrayReferences.finish();
   // Straight-line bodies use the same checked reads, ordered writes and numeric
   // output rules. Their manifest has zero loops and zero nesting depth; no
@@ -901,7 +940,7 @@ export function compileNumericKernel(source, {
     version: integerAbi ? 9 : generalControl ? 8 : checkedIndexing ? 7 : pipeline ? 6 : orderedAbi ? 5 : extentAbi ? 4 : loopStride > 1 ? 3 : parameterTypes.includes('f32[]') ? 2 : 1,
     kind: generalControl ? 'closed-numeric-control' : checkedIndexing ? 'closed-indexed-numeric' : pipeline ? 'closed-numeric-pipeline' : extentAbi || loopStride > 1 || parameterTypes.includes('f32[]') ? 'closed-numeric-loop' : 'closed-f64-loop',
     ...(!checkedIndexing && !pipeline && (extentAbi || loopStride > 1) ? { loopStride } : {}),
-    ...(orderedAbi ? { resultType: resultNode ? 'f64' : 'void', iterationSemantics: 'ordered' } : {}),
+    ...(orderedAbi ? { resultType, iterationSemantics: 'ordered' } : {}),
     functionName: fn.id.name,
     sourceName: String(sourceName),
     sourceSpan: { start: fn.start, end: fn.end },

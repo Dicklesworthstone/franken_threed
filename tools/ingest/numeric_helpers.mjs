@@ -13,7 +13,8 @@
  * helpers are admitted only where the caller discards the result.
  */
 import * as acorn from 'acorn';
-import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach } from './numeric_typed_array_ops.mjs';
+import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach,
+  compileTypedArraySearch, isNumericBooleanSearchCall, isNumericBooleanExpression } from './numeric_typed_array_ops.mjs';
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
@@ -50,6 +51,42 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
   const active = new Set();
   let sourceBytes = 0;
   let statementCount = 0;
+  const booleanHelpers = new Map();
+
+  function returnExpressions(fn) {
+    const pending = [fn.body], results = [];
+    while (pending.length) {
+      const node = pending.pop();
+      if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
+        'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
+      if (node.type === 'ReturnStatement' && node.argument) results.push(node.argument);
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) {
+          for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
+        } else if (value && typeof value.type === 'string') pending.push(value);
+      }
+    }
+    return results;
+  }
+
+  function booleanExpression(node, seen = new Set()) {
+    return !!control && isNumericBooleanExpression(node, name => {
+      if (seen.has(name) || seen.size >= 32) return false;
+      if (booleanHelpers.has(name)) return booleanHelpers.get(name);
+      const source = helperSources.get(name);
+      if (typeof source !== 'string' || source.length > 65536) return false;
+      let ast;
+      try { ast = acorn.parse(source, {ecmaVersion:'latest', sourceType:'module'}); }
+      catch { return false; }
+      const declaration = ast.body[0];
+      const fn = declaration?.type === 'ExportNamedDeclaration' ? declaration.declaration : declaration;
+      if (ast.body.length !== 1 || fn?.type !== 'FunctionDeclaration') return false;
+      const results = returnExpressions(fn), next = new Set([...seen, name]);
+      const boolean = results.length > 0 && results.every(value => booleanExpression(value, next));
+      booleanHelpers.set(name, boolean);
+      return boolean;
+    });
+  }
 
   function requireHelper(name, callNode, parameterTypes) {
     const key = JSON.stringify([name, parameterTypes]);
@@ -71,24 +108,13 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       fail(`Helper ${name} must be one named synchronous scalar function without defaults/destructuring`, callNode);
     }
     if (parameterTypes.length !== fn.params.length) fail(`Scalar helper ${name} argument count differs from its declaration`, callNode);
-    // Only Number results may enter arithmetic. Void helpers are admitted solely
-    // at discarded-value call sites; numeric/void mixed returns still refuse.
-    const pending = [fn.body];
-    let numericResult = false;
-    while (pending.length) {
-      const node = pending.pop();
-      if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression',
-        'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
-      if (node.type === 'ReturnStatement' && node.argument) numericResult = true;
-      for (const value of Object.values(node)) {
-        if (Array.isArray(value)) {
-          for (const child of value) if (child && typeof child.type === 'string') pending.push(child);
-        } else if (value && typeof value.type === 'string') pending.push(value);
-      }
-    }
+    // Number and Boolean results remain separate at every use site; no Boolean
+    // may enter numeric arithmetic or storage merely because the ABI uses f64.
+    const results = returnExpressions(fn);
+    const resultType = !results.length ? 'void' : results.every(value => booleanExpression(value)) ? 'boolean' : 'f64';
     const wasmTypes = parameterTypes.flatMap(type => type === 'f64' ? [F64] : [I32, I32]);
     const entry = { name, arity: fn.params.length, index: entries.length + 1, body: null,
-      parameterTypes, wasmTypes, resultType: numericResult ? 'f64' : 'void',
+      parameterTypes, wasmTypes, resultType,
       effects: parameterTypes.map(() => ({ read: false, write: false })) };
     entries.push(entry);
     compiled.set(key, entry);
@@ -107,7 +133,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     if (!checkedArrays && arrays.some(Boolean)) fail('Typed-array helpers require checkedIndexing', node);
     const parameterTypes = arrays.map(array => array?.type ?? 'f64');
     const entry = requireHelper(node.callee.name, node, parameterTypes);
-    if (resultUsed && entry.resultType === 'void') fail('A void helper call cannot be used as a Number', node);
+    if (resultUsed && (entry.resultType === 'void' || (entry.resultType === 'boolean' && resultUsed !== 'predicate')))
+      fail('A void or Boolean helper call cannot be used as a Number', node);
     // Count lexical loop nesting THROUGH calls, not just within each function.
     // Acyclic helpers compile once, but every call site's nesting is checked.
     if (control) control.checkDepth(loopDepth + entry.loopDepth, node);
@@ -128,7 +155,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return [...arrayPointer(array), ...arrayLength(array)];
     });
     return [...argumentsCode, 0x10, ...u32(entry.index),
-      ...(!resultUsed && entry.resultType === 'f64' ? [0x1a] : [])];
+      ...(!resultUsed && entry.resultType !== 'void' ? [0x1a] : [])];
   }
 
   function compileFunction(fn, owner) {
@@ -149,7 +176,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           mark({ read, write }) { effect.read ||= read || write; effect.write ||= write; } });
       }
     });
-    let localCount = 0, loopDepth = 0, controlDepth = 0, callbackReturnDepth = null;
+    let localCount = 0, loopDepth = 0, controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null;
     const loopControls = [];
     function lookup(node, writing = false) {
       if (node?.type !== 'Identifier' || !environment.has(node.name)) fail('Scalar helpers cannot access captured or non-scalar bindings', node);
@@ -222,15 +249,35 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     function forEach(node, depth) {
       return compileTypedArrayForEach(node, {resolveArray, allocateLocal, control, fail, loopDepth, owner,
         compileCallback(callback, body, values) {
-          const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth;
+          const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+            parentPredicate = callbackPredicate;
           environment = new Map(parent); loopDepth++;
-          controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null;
           callback.params.forEach((param, index) => environment.set(param.name,
             index === 2 ? values[index] : {index:values[index], mutable:true}));
           try { return block(body.type === 'BlockStatement' ? body.body
             : [{type:'ExpressionStatement', expression:body}], depth + 1).bytes; }
           finally {
             environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+            callbackPredicate = parentPredicate;
+          }
+        },
+      });
+    }
+    function search(node, depth) {
+      return compileTypedArraySearch(node, {resolveArray, allocateLocal, control, fail, loopDepth, owner,
+        compileCallback(callback, body, values, predicate) {
+          const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+            parentPredicate = callbackPredicate;
+          environment = new Map(parent); loopDepth++;
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate;
+          callback.params.forEach((param, index) => environment.set(param.name,
+            index === 2 ? values[index] : {index:values[index], mutable:true}));
+          try { return block(body.type === 'BlockStatement' ? body.body
+            : [{type:'ReturnStatement', argument:body}], depth + 1).bytes; }
+          finally {
+            environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+            callbackPredicate = parentPredicate;
           }
         },
       });
@@ -259,6 +306,9 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           ...expression(node.consequent, depth + 1), 0x05, ...expression(node.alternate, depth + 1), 0x0b];
       }
       if (node.type === 'CallExpression') {
+        if (isNumericBooleanSearchCall(node)) fail('Boolean search results cannot be used as Numbers', node);
+        const searched = search(node, depth);
+        if (searched) return searched;
         const reduced = reduction(node, depth);
         if (reduced) return reduced;
         const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
@@ -271,6 +321,10 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     function condition(node, depth = 0) {
       if (!node || depth > 128) fail('Scalar helper predicate exceeds the nesting limit', node);
       if (node.type === 'Literal' && typeof node.value === 'boolean') return [0x41, Number(node.value)];
+      if (isNumericBooleanSearchCall(node)) return [...search(node, depth), 0xab];
+      if (node.type === 'CallExpression' && node.callee.type === 'Identifier')
+        return [...number(0), ...call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name),
+          owner, loopDepth, resolveArray, 'predicate'), 0x99, 0x63];
       if (node.type === 'BinaryExpression' && Object.hasOwn(COMPARE, node.operator)) {
         return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), COMPARE[node.operator]];
       }
@@ -391,11 +445,16 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
               bytes.push(...value, ...set(index));
             }
           } else if (statement.type === 'ReturnStatement') {
-            if (callbackReturnDepth !== null) bytes.push(...effects(statement.argument, depth + 1),
+            if (callbackReturnDepth !== null) bytes.push(...(callbackPredicate === null
+              ? effects(statement.argument, depth + 1)
+              : [...(statement.argument ? condition(statement.argument) : [0x41, 0]), 0xb8, ...set(callbackPredicate)]),
               0x0c, ...u32(controlDepth - 1 - callbackReturnDepth));
             else {
-              if (owner.resultType === 'f64' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
-              bytes.push(...(statement.argument ? expression(statement.argument) : []), 0x0f);
+              if (owner.resultType !== 'void' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
+              if (owner.resultType === 'boolean' && !booleanExpression(statement.argument))
+                fail('Boolean helper returns cannot mix with Number returns', statement);
+              bytes.push(...(statement.argument ? owner.resultType === 'boolean'
+                ? [...condition(statement.argument), 0xb8] : expression(statement.argument) : []), 0x0f);
             }
             advance(['return']);
           } else if (statement.type === 'BlockStatement') {
@@ -445,6 +504,8 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             const update = statement.type === 'ExpressionStatement' ? statement.expression : null;
             const iteration = forEach(update, depth);
             if (iteration) { bytes.push(...iteration); continue; }
+            const searched = search(update, depth);
+            if (searched) { bytes.push(...searched, 0x1a); continue; }
             const bulk = compileTypedArrayOperation(update, {resolveArray, expression, allocateLocal,
               control, fail, loopDepth, owner});
             const reduced = bulk ? null : reduction(update, depth);
@@ -491,23 +552,24 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
     }
     const body = block(fn.body.body);
     arrayReferences.finish();
-    if (owner.resultType === 'f64' && !body.returns) fail(`Scalar helper ${fn.id.name} must return a number on every path`, fn);
+    if (owner.resultType !== 'void' && !body.returns) fail(`Scalar helper ${fn.id.name} must return a value on every path`, fn);
     // Every reachable path returns. unreachable makes the result type explicit
     // to the Wasm validator even when all returns occur in nested if branches.
-    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...referenceInitializers, ...body.bytes, ...(owner.resultType === 'f64' ? [0x00] : []), 0x0b];
+    return [...(localCount ? [1, ...u32(localCount), F64] : [0]), ...referenceInitializers, ...body.bytes, ...(owner.resultType !== 'void' ? [0x00] : []), 0x0b];
   }
 
   return {
     call,
+    booleanExpression,
     finish() {
       return {
         types: entries.map(entry => [0x60, ...u32(entry.wasmTypes.length), ...entry.wasmTypes,
-          ...(entry.resultType === 'f64' ? [1, F64] : [0])]),
+          ...(entry.resultType !== 'void' ? [1, F64] : [0])]),
         functions: entries.map(entry => u32(entry.index)),
         bodies: entries.map(entry => [...u32(entry.body.length), ...entry.body]),
         // Build-time provenance only: internal calls do not change the host ABI.
         helpers: Object.freeze(entries.map(({ name, arity, parameterTypes, resultType }) => Object.freeze({
-          name, arity, ...(parameterTypes.some(type => type !== 'f64') || resultType === 'void'
+          name, arity, ...(parameterTypes.some(type => type !== 'f64') || resultType !== 'f64'
             ? { parameterTypes: Object.freeze([...parameterTypes]), resultType } : {}),
         }))),
       };

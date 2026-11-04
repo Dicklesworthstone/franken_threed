@@ -9,7 +9,7 @@ import {compileNumericCandidate} from './numeric_candidate.mjs';
 import {NumericKernelCompileError} from './numeric_kernel.mjs';
 import {discoverNumericStorageHints} from './numeric_storage_hints.mjs';
 import {discoverNumericArrayParameters, isNumericBulkCall} from './numeric_loop_discovery.mjs';
-import {isNumericForEachCall, isNumericReductionCall,
+import {isNumericForEachCall, isNumericReductionCall, isNumericSearchCall,
   numericForEachCallbackBody, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
 
 const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
@@ -92,7 +92,7 @@ function capturesFor(loop, ancestors, bindings, helperDeclarations) {
   walk.simple(loop, {CallExpression(node) {
     const callback = node.arguments[0];
     if ((isNumericReductionCall(node) && numericReductionCallbackBody(callback)) ||
-        (isNumericForEachCall(node) && numericForEachCallbackBody(callback))) {
+        ((isNumericForEachCall(node) || isNumericSearchCall(node)) && numericForEachCallbackBody(callback))) {
       callbacks.add(callback);
     }
   }});

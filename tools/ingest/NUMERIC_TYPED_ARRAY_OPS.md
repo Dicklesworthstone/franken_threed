@@ -8,6 +8,8 @@ application callbacks can use the same execution path.
 within closed functions, helpers and admitted loop regions.
 Discarded-result `forEach` calls admit inline numeric callbacks that update
 staged arrays and captured scalars, including ordinary animation closures.
+`some`, `every`, `find`, `findIndex`, `findLast` and `findLastIndex` admit inline
+predicates with source-ordered effects and early termination.
 
 ```js
 export const makeFrame = (positions, source, upload) => {
@@ -79,7 +81,8 @@ Reports retain the existing `loopIslands` aggregate, with distinct
 `TypedArrayBulkStatement` and `NumericWorkSequence` candidate kinds. Admitted
 regions declare `typedArrayMethods`. Control reports identify method work as
 `typed-array-set`, `typed-array-fill`, `typed-array-copyWithin`,
-`typed-array-reduce`, `typed-array-reduceRight` or `typed-array-forEach`; their
+`typed-array-reduce`, `typed-array-reduceRight`, `typed-array-forEach` and the
+six `typed-array-<search-method>` names; their
 `loopCount` includes these work regions, not only explicit JavaScript loops.
 Native-call counts and measured timing remain separate from static reports.
 
@@ -153,6 +156,56 @@ compiler does not introduce a generic higher-order call mechanism or allocate
 callback objects in Wasm. A changed method receives the original literal
 callback through the existing guarded source fallback.
 
+## Short-circuit predicates and searches
+
+Closed functions, helpers and admitted loop regions can search numeric views
+without evaluating callbacks for unvisited elements:
+
+```js
+export function allInside(positions, bound) {
+  return positions.every(position => position >= -bound && position <= bound);
+}
+
+export function firstActive(weights, minimum) {
+  return weights.findIndex(weight => weight > minimum);
+}
+```
+
+The six search methods accept one inline synchronous predicate with up to three
+plain identifier parameters: element, index and receiver. A predicate may use
+numeric truthiness, Boolean comparisons, closed Boolean or numeric helpers,
+early returns, branches, nested loops and staged mutations. Falling through or
+returning without a value is falsy. Each visited element spends one credit from
+the shared invocation budget, in addition to any nested work. Early termination
+does not charge for or read remaining elements.
+
+`some` and `every` produce actual JavaScript Boolean results at the public
+boundary and work directly in admitted predicates. Their internal f64 0/1
+representation carries an explicit `resultType: "boolean"` manifest tag. The
+runtime validates this result before publishing any writes and converts it to
+a Boolean. Older readers reject the new tag; they cannot expose 0/1 as Numbers.
+Closed helpers also distinguish Boolean returns from numeric returns, including
+transitive Boolean helpers and all-Boolean logical/conditional results. Boolean
+scalar locals, Boolean arguments, mixed Boolean/Number returns and Boolean
+values used as numeric arithmetic or storage remain outside this profile.
+
+`findIndex` and `findLastIndex` return numeric indices, including native `-1`
+for a miss. `find` and `findLast` return the original loaded Number on a hit,
+including NaN and signed zero. A miss aborts the private transaction and runs
+the original source to produce exactly `undefined`. No sentinel substitutes for
+that public value. The abort discards all earlier staged array and captured
+scalar writes; original code performs its effects once in the existing source
+region. Host calls surrounding the region are not replayed.
+
+Forward and reverse searches snapshot their receiver and length once. The
+private counter and original loaded element are independent of callback
+parameter assignments and writes to the receiver. Later visits observe earlier
+staged mutations, including overlapping aliases. The third callback parameter
+keeps the original receiver even if another local reference is rebound. Nested
+search/forEach returns exit only their own callback. General callback identity,
+`thisArg`, reference-valued predicates and the other forEach exclusions above
+continue to use source execution.
+
 ## Live method guards and fallback
 
 The runtime validates native method descriptors without invoking getters. An
@@ -193,5 +246,8 @@ empty/singleton inputs, callback shadowing, nested/helper effects and source
 callback identity under method overrides. The `forEach` tests additionally cover
 callback-only returns, mutable parameters, lexical captures, nested-loop
 selection, staged mutation, scalar publication and source exceptions after
-partial work. These are execution/equivalence tests for the exercised cases,
+partial work. Search tests cover all six methods and layouts, exact Boolean and undefined
+results, both iteration directions, original-value snapshots, partial budgets,
+helper predicates, captured-state/alias rollback, method overrides and relocated
+dynamic builds with or without Wasm. These are execution/equivalence tests,
 not browser/GPU validation, full Three.js compatibility or a speedup.

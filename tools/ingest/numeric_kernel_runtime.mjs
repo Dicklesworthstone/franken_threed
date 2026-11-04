@@ -38,7 +38,8 @@ const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
-const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray', 'reduce', 'reduceRight', 'forEach']);
+const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray',
+  'reduce', 'reduceRight', 'forEach', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex']);
 const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
@@ -138,7 +139,7 @@ function indexedManifest(manifest) {
       (integerAbi ? manifest.integerSemantics !== 'ecmascript-integer-elements-v1'
         : manifest.integerSemantics !== undefined) ||
       manifest.automaticRouteAdmission !== false || manifest.iterationSemantics !== 'ordered' ||
-      !['f64', 'void'].includes(manifest.resultType) ||
+      !(generalControl ? ['f64', 'void', 'boolean'] : ['f64', 'void']).includes(manifest.resultType) ||
       !Number.isInteger(manifest.maxMemoryPages) || manifest.maxMemoryPages < 1 ||
       manifest.maxMemoryPages > 16384 ||
       !Array.isArray(manifest.parameters) || (!generalControl && !manifest.parameters.length) || manifest.parameters.length > 64 ||
@@ -173,7 +174,7 @@ function indexedManifest(manifest) {
       : !Array.isArray(manifest.loops) || !manifest.loops.length || manifest.loops.length > 16 ||
         manifest.loops.some(pass => !pass || !arrays.includes(pass.boundParameter) ||
           !Number.isInteger(pass.loopStride) || pass.loopStride < 1 || pass.loopStride > 16)) ||
-      (!writes && manifest.resultType !== 'f64')) {
+      (!writes && manifest.resultType === 'void')) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid checked-index lengths, loops or output');
   }
   Object.freeze(lengths);
@@ -600,6 +601,11 @@ export function instantiateNumericKernel(bytes, {
       if (manifest.version >= 5 && manifest.resultType === 'f64' && typeof result !== 'number') {
         refuse('KERNEL_ABI_MISMATCH', 'Numeric return was not produced before publication');
       }
+      // The Boolean result tag is mandatory: older readers reject it instead
+      // of silently exposing an internal f64 0/1 as a JavaScript Number.
+      if (manifest.resultType === 'boolean' && result !== 0 && result !== 1) {
+        refuse('KERNEL_ABI_MISMATCH', 'Boolean return was not produced before publication');
+      }
     } catch (cause) {
       const error = cause instanceof NumericKernelGuardError ? cause :
         new NumericKernelGuardError('KERNEL_EXECUTION_FAILED', 'Wasm preparation/execution failed before publication', { cause });
@@ -615,6 +621,7 @@ export function instantiateNumericKernel(bytes, {
     stats.lastGuardFailure = null;
     stats.copiedBytes += prepared.copiedBytes;
     if (manifest.version >= 5 && manifest.resultType === 'f64') return result;
+    if (manifest.resultType === 'boolean') return result === 1;
   }
 
   return Object.freeze({

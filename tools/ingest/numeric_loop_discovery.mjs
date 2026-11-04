@@ -6,7 +6,7 @@
  * captured, recursive and non-scalar calls must pass the actual compiler.
  * Every discovered function still passes whole-function numeric compilation.
  */
-import {isNumericForEachCall, isNumericReductionCall,
+import {isNumericForEachCall, isNumericReductionCall, isNumericSearchCall,
   numericForEachCallbackBody, numericReductionCallbackBody} from './numeric_typed_array_ops.mjs';
 
 // A method spelling only proposes a candidate. Actual receiver types, method
@@ -14,7 +14,8 @@ import {isNumericForEachCall, isNumericReductionCall,
 export function isNumericBulkCall(node) {
   return node?.type === 'CallExpression' && !node.optional &&
     node.callee.type === 'MemberExpression' && !node.callee.optional &&
-    !node.callee.computed && ['set', 'fill', 'copyWithin', 'reduce', 'reduceRight', 'forEach'].includes(node.callee.property.name);
+    !node.callee.computed && ['set', 'fill', 'copyWithin', 'reduce', 'reduceRight', 'forEach',
+      'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex'].includes(node.callee.property.name);
 }
 
 // includeBulk is explicit so legacy single-entry package selection is stable.
@@ -129,8 +130,8 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
           !node.callee.computed && node.callee.property.name === 'subarray')
         for (const name of visibleReferences(node.callee.object)) record.required.add(name);
-      if (isNumericReductionCall(node) || isNumericForEachCall(node)) {
-        const callback = node.arguments[0], iteration = isNumericForEachCall(node);
+      if (isNumericReductionCall(node) || isNumericForEachCall(node) || isNumericSearchCall(node)) {
+        const callback = node.arguments[0], iteration = !isNumericReductionCall(node);
         const body = iteration ? numericForEachCallbackBody(callback) : numericReductionCallbackBody(callback);
         if (body) {
           const callbackScope = new Map(scope);

@@ -10,6 +10,7 @@ import {INTEGER_ARRAY_LAYOUTS, emitToUint32, emitToUint8Clamp} from './numeric_i
 
 const names = new Set(['set', 'fill', 'copyWithin']);
 const reductions = new Set(['reduce', 'reduceRight']);
+const searches = new Set(['some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex']);
 const u32 = value => {
   const bytes = [];
   do { const byte = value & 127; value >>>= 7; bytes.push(byte | (value ? 128 : 0)); } while (value);
@@ -38,6 +39,31 @@ export function isNumericForEachCall(node) {
     !node.callee.computed && node.callee.property.name === 'forEach';
 }
 
+export function isNumericSearchCall(node) {
+  return node?.type === 'CallExpression' && !node.optional &&
+    node.callee.type === 'MemberExpression' && !node.callee.optional &&
+    !node.callee.computed && searches.has(node.callee.property.name);
+}
+
+export function isNumericBooleanSearchCall(node) {
+  return isNumericSearchCall(node) && ['some', 'every'].includes(node.callee.property.name);
+}
+
+// This is a result-type proof, not a coercion. In particular JS &&/|| may
+// return a Number, so only Boolean operands establish a Boolean result.
+export function isNumericBooleanExpression(node, booleanHelper = () => false, depth = 0) {
+  if (!node || depth > 128) return false;
+  if (node.type === 'Literal') return typeof node.value === 'boolean';
+  if (node.type === 'UnaryExpression') return node.operator === '!';
+  if (node.type === 'BinaryExpression') return ['===', '!==', '<', '>', '<=', '>='].includes(node.operator);
+  if (node.type === 'LogicalExpression' && ['&&', '||'].includes(node.operator))
+    return isNumericBooleanExpression(node.left, booleanHelper, depth + 1) && isNumericBooleanExpression(node.right, booleanHelper, depth + 1);
+  if (node.type === 'ConditionalExpression')
+    return isNumericBooleanExpression(node.consequent, booleanHelper, depth + 1) && isNumericBooleanExpression(node.alternate, booleanHelper, depth + 1);
+  return isNumericBooleanSearchCall(node) ||
+    (node.type === 'CallExpression' && node.callee.type === 'Identifier' && booleanHelper(node.callee.name));
+}
+
 function inlineCallback(node, parameters) {
   return node && ['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) &&
     !node.id && !node.async && !node.generator && node.params.length <= parameters &&
@@ -57,6 +83,56 @@ export function numericReductionCallbackBody(node) {
 
 export function numericForEachCallbackBody(node) {
   return inlineCallback(node, 3) ? node.body : null;
+}
+
+export const numericSearchCallbackBody = numericForEachCallbackBody;
+
+/** Short-circuit predicates over private staged storage. The original loaded
+ * value, iteration index and receiver are independent of mutable callback
+ * parameters. Only visited elements spend fuel. Boolean results use f64 0/1
+ * internally and carry an explicit host result type; a missing find value
+ * aborts the transaction so original JS supplies undefined and its effects.
+ */
+export function compileTypedArraySearch(node, {
+  resolveArray, compileCallback, allocateLocal, control, fail, loopDepth = 0, owner = null,
+}) {
+  if (!isNumericSearchCall(node)) return null;
+  const receiver = resolveArray(node.callee.object), callback = node.arguments[0];
+  const body = numericSearchCallbackBody(callback);
+  if (!control || !receiver || !body || node.arguments.length !== 1)
+    fail('Searches require generalControl, a closed typed-array receiver and one inline predicate callback', node);
+  const method = node.callee.property.name, reverse = method.startsWith('findLast');
+  const boolean = method === 'some' || method === 'every';
+  const valueResult = method === 'find' || method === 'findLast';
+  control.methods.add(method);
+  control.recordLoop(node, loopDepth + 1, owner?.name ?? null);
+  if (owner) owner.loopDepth = Math.max(owner.loopDepth, loopDepth + 1);
+  receiver.mark({read:true});
+  const view = {type:receiver.type, reference:true, mutable:false,
+    index:allocateLocal(), lengthIndex:allocateLocal(), sources:new Set([receiver]),
+    mark:effect => receiver.mark(effect)};
+  const counter = allocateLocal(), original = allocateLocal(), value = allocateLocal(), index = allocateLocal();
+  const predicate = allocateLocal(), result = allocateLocal(), found = valueResult ? allocateLocal() : null;
+  const storage = layout(receiver.type);
+  const callbackCode = compileCallback(callback, body, [value, index, view], predicate);
+  return [...arrayPointer(receiver), 0xb8, ...set(view.index),
+    ...arrayLength(receiver), 0xb8, ...set(view.lengthIndex),
+    ...(reverse ? [...get(view.lengthIndex), ...number(1), 0xa1] : number(0)), ...set(counter),
+    ...number(method === 'every' ? 1 : boolean ? 0 : -1), ...set(result),
+    ...(valueResult ? [...number(0), ...set(found)] : []),
+    0x02, 0x40, 0x03, 0x40,
+    ...get(counter), ...(reverse ? [...number(0), 0x63] : [...get(view.lengthIndex), 0x66]), 0x0d, 1,
+    ...control.charge(number(1)),
+    ...arrayPointer(view), ...get(counter), 0xab, 0x41, storage.alignment, 0x74, 0x6a,
+    storage.load, storage.alignment, 0,
+    ...(receiver.type === 'f64[]' ? [] : receiver.type === 'f32[]' ? [0xbb] : [storage.signed ? 0xb7 : 0xb8]),
+    ...set(original), ...get(original), ...set(value), ...get(counter), ...set(index),
+    ...number(0), ...set(predicate), 0x02, 0x40, ...callbackCode, 0x0b,
+    ...get(predicate), ...number(0), method === 'every' ? 0x61 : 0x62, 0x04, 0x40,
+    ...(boolean ? number(method === 'some' ? 1 : 0) : get(valueResult ? original : counter)), ...set(result),
+    ...(valueResult ? [...number(1), ...set(found)] : []), 0x0c, 2, 0x0b,
+    ...get(counter), ...number(1), reverse ? 0xa1 : 0xa0, ...set(counter), 0x0c, 0, 0x0b, 0x0b,
+    ...(valueResult ? trapUnless([...get(found), ...number(0), 0x62]) : []), ...get(result)];
 }
 
 /** Ordered numeric updates with a discarded result. The iteration counter and

@@ -396,3 +396,196 @@ test('forEach admission retains unsupported callback identities, this arguments,
     assert.throws(()=>compile(`function run(a,b){${statement};}`,['f64[]','f64[]']));
   }
 });
+
+const searches=['some','every','find','findIndex','findLast','findLastIndex'];
+for(const [Type,type] of types)test(`${Type.name}: six searches preserve predicate order, short circuits and exact result types`,()=>{
+  for(const method of searches) {
+    const source=`function run(a,trace,limit){return a.${method}((value,index)=>{
+      trace[0]=trace[0]*10+index+1;return value>limit;
+    });}`;
+    const reference=Function('return ('+source+')')();
+    const {kernel,artifact}=compile(source,[type,'f64[]','f64'],{runtime:{fallback:reference}});
+    assert.deepEqual(artifact.manifest.typedArrayMethods,[method]);
+    assert.equal(artifact.manifest.resultType,['some','every'].includes(method)?'boolean':'f64');
+    let misses=0,runs=0;
+    for(const values of [[2,3,0,5],[],[-0],[NaN]])for(const limit of [-1,2,9]) {
+      const a=new Type(values),trace=new Float64Array([0]),expected=trace.slice();
+      const result=reference(a,expected,limit),actual=kernel.run(a,trace,limit);
+      assert.ok(Object.is(actual,result),`${method}: ${String(actual)} != ${String(result)}`);
+      assert.equal(typeof actual,typeof result);same(trace,expected);runs++;
+      if(result===undefined)misses++;
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,runs-misses);
+    assert.equal(kernel.diagnostics.fallbackCalls,misses);
+  }
+});
+
+test('searches retain private receiver, original element and iteration snapshots while callbacks mutate parameters and aliases',()=>{
+  for(const method of searches) {
+    const source=`function run(a,b,target){let current=a;return current.${method}((value,index,view)=>{
+      const slot=index,loaded=value;current=b;value=99;index=88;
+      view[slot]+=1;current[slot]+=2;
+      if(slot+1<view.length)view[slot+1]+=loaded;
+      return slot===target;
+    });}`;
+    const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]','f64[]','f64'],{runtime:{fallback:reference}});
+    for(const overlap of [false,true])for(const target of [0,2,9]) {
+      const a=new Float64Array([1,2,3,4,5]),expected=a.slice();
+      const b=overlap?a.subarray(1):new Float64Array([6,7,8,9]);
+      const eb=overlap?expected.subarray(1):b.slice();
+      assert.ok(Object.is(kernel.run(a.subarray(0,4),b,target),reference(expected.subarray(0,4),eb,target)));
+      same(a,expected);same(b,eb);
+    }
+    assert.ok(kernel.diagnostics.wasmCalls>0);
+    assert.equal(kernel.diagnostics.fallbackCalls,['find','findLast'].includes(method)?2:0);
+  }
+});
+
+test('find values preserve NaN, infinity and both zero signs even if the callback overwrites the element and value binding',()=>{
+  for(const [Type,type] of types.slice(0,2))for(const method of ['find','findLast']) {
+    const source=`function run(a){return a.${method}((value,index,view)=>{value=7;view[index]=8;return true;});}`;
+    const {kernel}=compile(source,[type]);
+    for(const value of [NaN,-0,0,Infinity,-Infinity]) {
+      const a=new Type([value]);assert.ok(Object.is(kernel.run(a),value));assert.equal(a[0],8);
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,5);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  }
+});
+
+test('empty, falling-through and bare-return callbacks are falsy without manufacturing a Number result',()=>{
+  for(const method of searches)for(const body of ['{}','{if(value>1)return;}','{if(index===1)return true;}']) {
+    const source=`function run(a){return a.${method}((value,index)=>${body});}`;
+    const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
+    for(const values of [[],[1,2,3]]) {
+      const a=new Float64Array(values);assert.ok(Object.is(kernel.run(a),reference(a)));
+    }
+  }
+});
+
+test('numeric search predicates apply source truthiness to NaN, signed zeros, infinities and live elements',()=>{
+  for(const method of searches) {
+    const source=`function run(a){return a.${method}(value=>value);}`;
+    const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
+    for(const values of [[NaN,-0,0],[-0,NaN,Infinity,-Infinity],[0,NaN,0,-3],[NaN]]) {
+      const a=new Float64Array(values);assert.ok(Object.is(kernel.run(a),reference(a)));
+    }
+  }
+});
+
+test('Boolean ABI validation rejects malformed native results before publishing staged writes',t=>{
+  const source='function run(a){a[0]+=1;return a.some((value,index)=>{a[index]+=2;return value>0;});}';
+  const reference=Function('return ('+source+')')(),Native=WebAssembly.Instance;
+  t.after(()=>{WebAssembly.Instance=Native;});
+  let invalid;
+  WebAssembly.Instance=function(...args){
+    const instance=Reflect.construct(Native,args);
+    return {exports:{...instance.exports,run(...values){instance.exports.run(...values);return invalid;}}};
+  };
+  for(invalid of [true,false,undefined,2,NaN]) {
+    const {kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
+    const a=new Float64Array([1,2]),expected=a.slice();
+    assert.equal(kernel.run(a),reference(expected));same(a,expected);
+    assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,1);
+    assert.equal(kernel.diagnostics.lastGuardFailure,'KERNEL_ABI_MISMATCH');
+  }
+});
+
+test('search fuel counts only visited elements and shares nested helper work before transactional publication',()=>{
+  const helper='function visit(a,index,target){for(let j=0;j<2;j++)a[index]+=1;return index===target;}';
+  for(const method of searches) {
+    const source=`function run(a,b,target){a[0]+=1;return b.${method}((value,index)=>{
+      a[index]+=value;return ${method==='every'?'!':''}visit(a,index,target);
+    });}`;
+    const reference=Function(helper+';return ('+source+')')();
+    const {kernel}=compile(source,['f64[]','f64[]','f64'],{maxIterations:3,
+      helperSources:new Map([['visit',helper]]),runtime:{fallback:reference}});
+    const first=method.startsWith('findLast')?2:0;
+    for(const target of [first,1,first]) {
+      const a=new Float64Array([1,2,3]),expected=a.slice(),b=new Float64Array([4,5,6]);
+      assert.ok(Object.is(kernel.run(a,b,target),reference(expected,b,target)));same(a,expected);
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,2);assert.equal(kernel.diagnostics.fallbackCalls,1);
+  }
+});
+
+test('search early exit avoids later invalid reads while late bounds failures discard all earlier writes',()=>{
+  for(const method of searches) {
+    const source=`function run(a,b,target){a[0]+=1;return b.${method}((value,index)=>{
+      a[index]+=value;return index${method==='every'?'!==':'==='}target;
+    });}`;
+    const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]','f64[]','f64'],{runtime:{fallback:reference}});
+    // Reverse searches start at the last slot: a one-element source proves
+    // early exit; a longer source then reaches the same checked failure path.
+    const reverse=method.startsWith('findLast');
+    for(const [values,target] of [[reverse?[4]:[4,5,6],0],[[4,5,6],1]]) {
+      const a=new Float64Array([1]),expected=a.slice(),b=new Float64Array(values);
+      assert.ok(Object.is(kernel.run(a,b,target),reference(expected,b,target)));same(a,expected);
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,1);assert.equal(kernel.diagnostics.fallbackCalls,1);
+  }
+});
+
+test('Boolean helpers, nested searches, forEach returns and switch returns preserve callback boundaries',()=>{
+  const helpers=new Map([
+    ['positive','function positive(value){return value>0;}'],
+    ['scan',`function scan(a,b){return a.some((value,index,view)=>{
+      b.forEach((value,index)=>{if(index===1)return;b[index]+=1;});
+      for(let j=0;j<2;j++){switch(j){case 1:if(index===1)return b.every(x=>positive(x));break;default:view[index]+=1;}}
+      return false;
+    });}`],
+    ['forward','function forward(a,b){return scan(a,b);}'],
+  ]);
+  const source='function run(a,b){if(a.length===0)return false;return forward(a,b)&&!a.every(x=>x<0);}';
+  const reference=Function([...helpers.values()].join(';')+';return ('+source+')')();
+  const {kernel,artifact}=compile(source,['f64[]','f64[]'],{helperSources:helpers});
+  assert.equal(artifact.manifest.resultType,'boolean');
+  for(const values of [[],[1],[1,2,3]]) {
+    const a=new Float64Array(values),ea=a.slice(),b=new Float64Array([1,2,3]),eb=b.slice();
+    assert.equal(kernel.run(a,b),reference(ea,eb));same(a,ea);same(b,eb);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,3);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  assert.ok(artifact.helpers.every(helper=>helper.resultType==='boolean'));
+});
+
+for(const method of searches)test(`${method}: live method guards preserve literal callback identity and source exceptions`,()=>{
+  const source=`function run(a){a[0]+=1;return a.${method}((value,index)=>value>index);}`;
+  const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
+  const parent=Object.getPrototypeOf(Float64Array.prototype),sentinel={method};
+  for(const where of ['own','arrayPrototype','typedPrototype']) {
+    const a=new Float64Array([1,2]),target=where==='own'?a:where==='arrayPrototype'?Float64Array.prototype:parent;
+    const descriptor=Object.getOwnPropertyDescriptor(target,method);let gets=0,calls=0,callback;
+    Object.defineProperty(target,method,{configurable:true,get(){gets++;return function(fn){
+      calls++;callback=fn;assert.equal(this,a);return sentinel;
+    };}});
+    try {assert.equal(kernel.run(a),sentinel);}
+    finally {if(descriptor)Object.defineProperty(target,method,descriptor);else delete target[method];}
+    assert.equal(a[0],2);assert.equal(gets,1);assert.equal(calls,1);
+    assert.equal(callback.length,2);assert.equal(callback.toString(),'(value,index)=>value>index');
+  }
+  const a=new Float64Array([1]),failure={method};let gets=0;
+  Object.defineProperty(a,method,{get(){gets++;throw failure;}});
+  assert.throws(()=>kernel.run(a),error=>error===failure);assert.equal(gets,1);assert.equal(a[0],2);
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,4);
+  assert.ok(Object.is(kernel.run(new Float64Array([1,2])),reference(new Float64Array([1,2]))));
+  assert.equal(kernel.diagnostics.wasmCalls,1);
+});
+
+test('search admission keeps Boolean arithmetic, mixed result types and general callback values in JavaScript',()=>{
+  for(const expression of ['a.some(callback)','a.find(async value=>value)',
+    'a.every(function named(value){return value;})','a.findIndex((value=1)=>value)',
+    'a.some(value=>value,undefined)','a.some(value=>this.value)',
+    'a.find(function(value){return arguments[0];})','a.some(value=>a)',
+    'a.some((value,index,view)=>{view=b;return value;})',
+    'a.some?.(value=>value)','a["some"](value=>value)',
+    'a.some(value=>value)+1','a.some(value=>value)===1','a.some(value=>value)||2']) {
+    assert.throws(()=>compile(`function run(a,b){return ${expression};}`,['f64[]','f64[]']));
+  }
+  for(const source of ['function run(a){const found=a.some(value=>value);return found;}',
+    'function run(a){if(a.length)return 1;return a.some(value=>value);}',
+    'function run(a){if(a.length)return a.some(value=>value);return 1;}']) {
+    assert.throws(()=>compile(source,['f64[]']));
+  }
+  const helper='function positive(value){return value>0;}';
+  assert.throws(()=>compile('function run(a){return a.some(value=>positive(value)+1);}',
+    ['f64[]'],{helperSources:new Map([['positive',helper]])}));
+});

@@ -228,6 +228,127 @@ test('unsupported forEach callback identities and this arguments keep original a
   assert.deepEqual(app.app.events,app.reference.events);assert.deepEqual(owner,reference);assert.equal(count(app),0);
 });
 
+test('search-only functions discover callback captures and Boolean helper graphs while preserving public identities',async t=>{
+  const app=await application(t,`
+    function positive(value){return value>0;}
+    export function valid(a,b,limit){return a.every((value,index)=>positive(value)&&b[index]>limit);}
+    export function locate(a,b,limit){return a.findLastIndex((value,index,view)=>view[index]*b[index]>limit);}
+    export function present(a,b,limit){return valid(a,b,limit)||a.some((value,index)=>value+b[index]>limit);}
+    export const identity=present,run=(a,b,limit)=>[present(a,b,limit),locate(a,b,limit)];
+  `);
+  for(const name of ['valid','locate','present']) {
+    const item=app.result.report.candidates.find(candidate=>candidate.functionName===name);
+    assert.equal(item.route,'guarded-numeric-wasm');assert.deepEqual(item.parameterTypes,['f64[]','f64[]','f64']);
+    assert.equal(item.resultType,name==='locate'?'f64':'boolean');
+  }
+  assert.equal(app.app.present,app.app.identity);assert.equal(app.app.present.name,app.reference.present.name);
+  assert.equal(app.app.present.length,app.reference.present.length);
+  assert.equal(app.app.valid.toString(),app.reference.valid.toString());
+  for(const Type of [Float32Array,Float64Array])for(const limit of [-1,3,10]) {
+    const a=new Type([1,2,3]),b=new Type([3,2,1]);
+    assert.deepEqual(app.app.run(a,b,limit),app.reference.run(a,b,limit));
+  }
+  assert.equal(count(app),12);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+for(const method of ['find','findLast'])test(`${method}: misses discard captured mutations and overlapping aliases before source execution`,async t=>{
+  const app=await application(t,`
+    export function make(a,b,events){let total=0;return target=>{
+      events.push(['before',total,...a,...b]);
+      for(let turn=0;turn<1;turn++){let current=a;current.${method}((value,index,view)=>{
+        total+=value;current=b;view[index]+=1;current[index]+=2;
+        for(let pass=0;pass<2;pass++)total+=view[index];
+        return index===target;
+      });}
+      events.push(['after',total,...a,...b]);return total;
+    };}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);assert.deepEqual(regions(app)[0].scalarOutputs,['total']);
+  const a=new Float64Array([1,2,3,4]),expected=a.slice(),events=[],trace=[];
+  const run=app.app.make(a.subarray(0,3),a.subarray(1),events);
+  const reference=app.reference.make(expected.subarray(0,3),expected.subarray(1),trace);
+  for(const target of [1,9,0]) {assert.equal(run(target),reference(target));equal(a,expected);}
+  assert.deepEqual(events,trace);assert.equal(events.length,6);
+  assert.equal(count(app),2);assert.equal(count(app,'fallbackCalls'),1);
+});
+
+test('search islands keep callback locals separate from outer captures and accept one containing region for nested loops',async t=>{
+  const app=await application(t,`
+    export function make(out,input,weights,trace){let total=1;const scale=2;return()=>{
+      trace.push(['before',total]);
+      input.some((out,index,Math)=>{const weights=Math;let scale=out;scale++;
+        for(let out=0;out<2;out++)total+=scale+weights[index];
+        return index===1;
+      });
+      out.forEach((value,index)=>{out[index]=value+weights[index]*scale;total+=out[index]+Math.abs(input[index]);});
+      trace.push(['after',total,...out]);return total;
+    };}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);assert.deepEqual(regions(app)[0].scalarOutputs,['total']);
+  assert.deepEqual(regions(app)[0].typedArrayMethods,['forEach','some']);
+  assert.deepEqual(regions(app)[0].mathIntrinsics,['abs']);
+  const a=new Float64Array([1,2,3]),b=a.slice(),input=new Float64Array([2,-3,4]),weights=new Float64Array([1/3,2/3,1]);
+  const trace=[],expected=[],run=app.app.make(a,input,weights,trace),reference=app.reference.make(b,input,weights,expected);
+  for(let frame=0;frame<3;frame++){assert.equal(run(),reference());equal(a,b);}
+  assert.deepEqual(trace,expected);assert.equal(count(app),3);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('search callback exceptions preserve preceding array and captured writes once without duplicating surrounding host effects',async t=>{
+  const app=await application(t,`
+    export function make(a,b,events){let total=0;return{read(){return total;},step(){
+      events.push('before');a.find((value,index,view)=>{
+        view[index]+=1;total+=view[index];view.set(b,index);return false;
+      });events.push('after');
+    }};}
+  `,{loopIslands:true});
+  assert.equal(regions(app).length,1);
+  const a=new Float64Array([1,2,3]),b=a.slice(),input=new Float64Array([7,8]),events=[],expected=[];
+  const run=app.app.make(a,input,events),reference=app.reference.make(b,input,expected);
+  assert.throws(()=>run.step(),RangeError);assert.throws(()=>reference.step(),RangeError);
+  equal(a,b);assert.equal(run.read(),reference.read());assert.deepEqual(events,expected);assert.deepEqual(events,['before']);
+  assert.equal(count(app),0);assert.equal(count(app,'fallbackCalls'),1);
+});
+
+test('unsupported search callbacks and this arguments retain original host effects',async t=>{
+  const app=await application(t,`
+    export const events=[];
+    function callback(value,index){events.push([value,index]);return index===1;}
+    export function run(a,owner){return [a.some(callback),a.find(function(value){this.values.push(value);return false;},owner)];}
+  `,{loopIslands:true});
+  assert.equal(app.result.report.compiledKernels,0);assert.equal(regions(app).length,0);
+  const a=new Float64Array([1,2,3]),owner={values:[]},expected={values:[]};
+  assert.deepEqual(app.app.run(a,owner),app.reference.run(a,expected));
+  assert.deepEqual(owner,expected);assert.deepEqual(app.app.events,app.reference.events);assert.equal(count(app),0);
+});
+
+test('relocated dynamic search builds preserve Boolean and undefined results with native Wasm or unavailable Wasm',async t=>{
+  const root=folder(t),src=path.join(root,'src'),out=path.join(root,'dist');fs.mkdirSync(src);
+  fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');
+  const methods=['some','every','find','findIndex','findLast','findLastIndex'];
+  const source=methods.map(method=>`function ${method}(a,limit){return a.${method}(value=>value>limit);}`).join('\n')+
+    `\nexport const run=(a,limit)=>[${methods.map(method=>`${method}(a,limit)`).join(',')}];`;
+  fs.writeFileSync(path.join(src,'search.mjs'),source);
+  fs.writeFileSync(path.join(src,'entry.mjs'),"export const load=()=>import('./search.mjs');");
+  const build=await buildApplication(path.join(src,'entry.mjs'),out,{specializeNumeric:true});
+  assert.equal(build.numericSpecialization.compiledKernels,6);
+  const moved=path.join(root,'relocated');fs.renameSync(out,moved);
+  const entry=pathToFileURL(path.join(moved,build.entryFiles[0])).href;
+  const reference=pathToFileURL(path.join(src,'search.mjs')).href;
+  for(const wasm of [true,false]) {
+    const result=spawnSync(process.execPath,['--input-type=module','--eval',`
+      import assert from 'node:assert/strict';let calls=0;
+      if(${wasm}){const Native=WebAssembly.Instance;WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,run(...values){const result=instance.exports.run(...values);calls++;return result;}}};};}
+      else globalThis.WebAssembly=undefined;
+      const app=await (await import(${JSON.stringify(entry)})).load(),reference=await import(${JSON.stringify(reference)});
+      for(const Type of [Float32Array,Float64Array])for(const limit of [1.5,9,-1]) {
+        const a=new Type([1,2,3]);assert.deepEqual(app.run(a,limit),reference.run(a,limit));
+      }
+      assert.equal(calls,${wasm?32:0});console.log(calls);
+    `],{encoding:'utf8'});
+    assert.equal(result.status,0,result.stderr);assert.equal(Number(result.stdout.trim()),wasm?32:0);
+  }
+});
+
 for(const Type of layouts)test(`${Type.name}: inferred storage and captured bulk-only sequences need no artificial loop`,async t=>{
   const app=await application(t,`
     export const a=new ${Type.name}([1,2,3,4]),b=new ${Type.name}([7,8,9]),events=[];
