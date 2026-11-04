@@ -183,7 +183,7 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
 
 /**
  * Scans HTML content for relative asset references in attributes (e.g. stylesheets,
- * icons, images, non-module scripts, media, unbundled modulepreloads).
+ * icons, images, non-module scripts, media, unbundled modulepreloads) and inline CSS.
  *
  * Uses quote-aware tag scanners so attributes containing ">" are never truncated.
  *
@@ -268,7 +268,50 @@ export function extractRelativeAssetUrls(
     }
   }
 
+  // Inline styles share the document's effective base with markup resources.
+  // Consume complete raw-text elements and quoted tags so markup-looking source
+  // strings, comments and attribute values cannot create phantom dependencies.
+  const inlineResourceTags =
+    /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)(?:<\/\1\s*>|$)|<([a-z][a-z0-9:-]*)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>/gi;
+  for (const tag of rawHtmlContent.matchAll(inlineResourceTags)) {
+    const name = (tag[1] ?? tag[4] ?? "").toLowerCase();
+    if (!name) continue;
+    const attrs = parseTagAttributes(tag[2] ?? tag[5] ?? "");
+    if (attrs.style !== undefined) {
+      for (const url of extractRelativeCssUrls(decodeHtmlAssetAttribute(attrs.style))) {
+        assets.add(url);
+      }
+    }
+    if (name === "style" && ["", "text/css"].includes((attrs.type ?? "").trim().toLowerCase())) {
+      // Unlike attributes, a style element's raw text does not decode HTML entities.
+      for (const url of extractRelativeCssUrls(tag[3] ?? "")) assets.add(url);
+    }
+    const resource = name === "image"
+      ? attrs.href ?? attrs["xlink:href"]
+      : name === "input" && (attrs.type ?? "").toLowerCase() === "image"
+        ? attrs.src
+        : undefined;
+    if (resource !== undefined) {
+      const url = decodeHtmlAssetAttribute(resource);
+      if (isRelativeUrl(url)) assets.add(url);
+    }
+  }
+
   return Array.from(assets);
+}
+
+// Decode the XML-compatible named references and numeric character references
+// used in resource-bearing attributes. Source HTML remains byte-for-byte intact.
+function decodeHtmlAssetAttribute(value) {
+  const named = { amp: "&", AMP: "&", quot: '"', QUOT: '"', apos: "'", lt: "<", LT: "<", gt: ">", GT: ">" };
+  return value.replace(/&(?:#([xX][\da-fA-F]+|\d+);?|([a-zA-Z][\da-zA-Z]+);|(amp|AMP|quot|QUOT|lt|LT|gt|GT)(?![=\da-zA-Z]))/g,
+    (whole, number, name, legacy) => {
+      if (number === undefined) return named[name ?? legacy] ?? whole;
+      const codePoint = /^[xX]/.test(number) ? Number.parseInt(number.slice(1), 16) : Number(number);
+      return codePoint === 0 || codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? "\uFFFD"
+        : String.fromCodePoint(codePoint);
+    });
 }
 
 /**
