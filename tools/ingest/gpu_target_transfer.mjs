@@ -27,6 +27,8 @@ const FORMATS = new Map([
   ['r16float', [Uint16Array, 1, false]], ['rg16float', [Uint16Array, 2, false]],
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
   ['r32float', [Float32Array, 1, false]], ['rg32float', [Float32Array, 2, false]],
+  ['r32uint', [Uint32Array, 1, false]], ['rg32uint', [Uint32Array, 2, false]], ['rgba32uint', [Uint32Array, 4, false]],
+  ['r32sint', [Int32Array, 1, false]], ['rg32sint', [Int32Array, 2, false]], ['rgba32sint', [Int32Array, 4, false]],
 ]);
 const integer = (n, name) => {
   if (!Number.isSafeInteger(n) || n < 0) fail('REGION', `${name} must be a non-negative safe integer`);
@@ -54,7 +56,7 @@ export function gpuTargetColorFormat(shape, colorIndex = 0, reject = fail) {
 }
 function layout(shape, colorIndex = 0) {
   const value = FORMATS.get(gpuTargetColorFormat(shape, colorIndex));
-  if (!value) fail('FORMAT', 'Expected R8, RGBA/BGRA8, R11G11B10F or R/RG/RGBA16F/32F color storage');
+  if (!value) fail('FORMAT', 'Expected supported normalized, floating-point or 32-bit integer color storage');
   integer(shape.width, 'Target width'); integer(shape.height, 'Target height');
   return value;
 }

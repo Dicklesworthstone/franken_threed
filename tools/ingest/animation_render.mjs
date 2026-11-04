@@ -1150,9 +1150,9 @@ export async function createGpuAnimationRenderer(
   if (!Array.isArray(colorFormats) || (format === null ? colorFormats.length !== 0 : colorFormats[0] !== format))
     fail("ANIMATION_RENDER_OPTIONS", "Color attachment formats must retain the primary format");
   colorFormats = colorFormats.length > 1 ? inspectGpuRenderTargetColors(device, colorFormats) : Object.freeze(colorFormats.slice());
-  for (const attachmentFormat of colorFormats.slice(1))
-    createAnimationColorTargetProfile(device, {format: attachmentFormat, sampleCount},
-      message => fail("ANIMATION_RENDER_OPTIONS", message));
+  const colorTargets = colorFormats.map((attachmentFormat, index) => index === 0 ? colorTarget
+    : createAnimationColorTargetProfile(device, {format: attachmentFormat, sampleCount},
+      message => fail("ANIMATION_RENDER_OPTIONS", message)));
   if (
     ![null, "depth24plus", "depth32float", "depth16unorm", "depth24plus-stencil8", "depth32float-stencil8"].includes(depthFormat) ||
     typeof label !== "string"
@@ -1443,15 +1443,15 @@ export async function createGpuAnimationRenderer(
     let entry = clearPipelines.get(key);
     if (!entry) {
       const module = device.createShaderModule({label: `${label}/scissor-clear`, code: `
-struct ClearInfo { colors: array<vec4<f32>, ${slots}>, depth: vec4<f32> };
+struct ClearInfo { colors: array<vec4<u32>, ${slots}>, depth: vec4<f32> };
 @group(0) @binding(0) var<uniform> info: ClearInfo;
-struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${index}: vec4<f32>`),
+struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) color${index}: vec4<${target.componentType}>`),
   ...(depthFormat ? ["@builtin(frag_depth) depth: f32"] : [])].join(", ")} };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
   let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
   return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
 }
-@fragment fn fs() -> Out { return Out(${[...colorFormats.map((_, index) => `info.colors[${index}]`),
+@fragment fn fs() -> Out { return Out(${[...colorTargets.map((target, index) => `bitcast<vec4<${target.componentType}>>(info.colors[${index}])`),
   ...(depthFormat ? ["info.depth.x"] : [])].join(", ")}); }`});
       const pipeline = device.createRenderPipeline({label: `${label}/scissor-clear`, layout: "auto",
         vertex: {module, entryPoint: "vs"},
@@ -1465,8 +1465,17 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
       clearPipelines.set(key, entry);
     }
     // Written before this render's own submission (queue order per frame).
-    device.queue.writeBuffer(clearUniform, 0, new Float32Array([
-      ...(colors ? colors.flatMap(value => Array.from(value)) : Array(slots * 4).fill(0)), depth ?? 1, 0, 0, 0]));
+    // Keep integer clear words exact, including values beyond f32 precision.
+    // WebGPU converts finite integer clear components with EnforceRange:
+    // truncation toward zero, followed by a signed/unsigned range check.
+    const clearBytes = new ArrayBuffer((slots + 1) * 16);
+    if (colors) for (let index = 0; index < colors.length; index++) {
+      const Type = colorTargets[index].componentType === 'u32' ? Uint32Array
+        : colorTargets[index].componentType === 'i32' ? Int32Array : Float32Array;
+      new Type(clearBytes, index * 16, 4).set(colors[index]);
+    }
+    new Float32Array(clearBytes, slots * 16, 4)[0] = depth ?? 1;
+    device.queue.writeBuffer(clearUniform, 0, new Uint8Array(clearBytes));
     const [x, y, w, h] = rectangle;
     if (w === 0 || h === 0) return;
     // The scissor rectangle as viewport: the triangle covers exactly that area.
@@ -1902,7 +1911,9 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
           ...fogBindingEntries(),
         ],
       });
-      return compilePipelines("plain");
+      // Fixed-material WGSL has floating-point output. Integer attachments
+      // wait for the retained source program's typed fragment pipeline.
+      return colorTarget.integer ? [] : compilePipelines("plain");
     });
     await Promise.race([Promise.all([initialized.value, initialized.errors]), lost]);
     live();
@@ -1921,6 +1932,8 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
     if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot register a mesh during submission");
     if (options?.nodeProgram !== undefined) return addNodeProgramMesh(gpu, options);
     if (options?.program !== undefined) return addProgramMesh(gpu, options);
+    if (colorTarget.integer)
+      fail("ANIMATION_RENDER_OPTIONS", "Integer color targets require a typed source fragment program");
     keys(
       options,
       [
@@ -2635,11 +2648,17 @@ struct Out { ${[...colorFormats.map((_, index) => `@location(${index}) color${in
         if (!["clear", "load"].includes(stencilLoadOp)) fail("ANIMATION_RENDER_ATTACHMENT", "Invalid stencil load operation");
         integer(clearStencil, 0, 255, "clear stencil");
       }
-      color(clearColor, format?.endsWith('float') === true);
-      for (const value of clearColors) {
+      if (!colorTarget.integer) color(clearColor, format?.endsWith('float') === true);
+      for (const [index, value] of clearColors.entries()) {
         array(value, 4, "Attachment clear value");
-        if (value.some(component => !Number.isFinite(Math.fround(component))))
-          fail("ANIMATION_RENDER_VALUE", "Attachment clear values must be finite f32");
+        const target = colorTargets[index];
+        if (target.integer) {
+          const min = target.componentType === 'i32' ? -2147483648 : 0;
+          const max = target.componentType === 'i32' ? 2147483647 : 4294967295;
+          if (value.some(component => Math.trunc(component) < min || Math.trunc(component) > max))
+            fail("ANIMATION_RENDER_VALUE", "Integer attachment clear values exceed the component range");
+        } else if (value.some(component => !Number.isFinite(Math.fround(component))))
+            fail("ANIMATION_RENDER_VALUE", "Attachment clear values must be finite f32");
       }
       finite(clearDepth, "Clear depth");
       if (clearDepth < 0 || clearDepth > 1)

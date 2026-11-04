@@ -32,6 +32,8 @@ const FORMATS = new Map([
   ['r16float', [Uint16Array, 1, false]], ['rg16float', [Uint16Array, 2, false]],
   ['rgba16float', [Uint16Array, 4, false]], ['rgba32float', [Float32Array, 4, false]],
   ['r32float', [Float32Array, 1, false]], ['rg32float', [Float32Array, 2, false]],
+  ['r32uint', [Uint32Array, 1, false]], ['rg32uint', [Uint32Array, 2, false]], ['rgba32uint', [Uint32Array, 4, false]],
+  ['r32sint', [Int32Array, 1, false]], ['rg32sint', [Int32Array, 2, false]], ['rgba32sint', [Int32Array, 4, false]],
 ]);
 
 // A cube's active rendering face is not readback state. Require the caller to
@@ -113,7 +115,7 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
   if (typeof flipY !== 'boolean' || ![maxBytes, maxInFlightBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Invalid readback options');
   const layout = FORMATS.get(format);
-  if (!layout) fail('FORMAT', 'Readback requires R8, RGBA/BGRA8, R11G11B10F or R/RG/RGBA16F/32F color storage');
+  if (!layout) fail('FORMAT', 'Readback requires supported normalized, floating-point or 32-bit integer color storage');
   const [Type, components, bgra] = layout;
   const rowBytes = width * components * Type.BYTES_PER_ELEMENT, bytesPerRow = Math.ceil(rowBytes / 256) * 256;
   const size = bytesPerRow * height, elements = width * height * components;

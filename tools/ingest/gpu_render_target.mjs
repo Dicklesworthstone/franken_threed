@@ -112,7 +112,10 @@ const COLOR_BYTES = new Map([
   ['rgba8unorm', 4], ['rgba8unorm-srgb', 4],
   ['bgra8unorm', 4], ['bgra8unorm-srgb', 4], ['rgba16float', 8],
   ['r32float', 4], ['rg32float', 8], ['rgba32float', 16],
+  ['r32uint', 4], ['rg32uint', 8], ['rgba32uint', 16],
+  ['r32sint', 4], ['rg32sint', 8], ['rgba32sint', 16],
 ]);
+const integerColor = format => /^(?:r|rg|rgba)32(?:u|s)int$/.test(format);
 
 /** Render attachment limits use pixel byte cost, not texture storage bytes. */
 export function inspectGpuRenderTargetColors(device, formats) {
@@ -128,7 +131,7 @@ export function inspectGpuRenderTargetColors(device, formats) {
     // render cost despite their four-byte storage footprint. R8 costs one byte;
     // packed R11G11B10 requires four-byte component alignment.
     const bytes = formats.reduce((total, format) => {
-      const alignment = format.includes('32float') || format === 'rg11b10ufloat' ? 4 : format.endsWith('16float') ? 2 : 1;
+      const alignment = format.includes('32float') || integerColor(format) || format === 'rg11b10ufloat' ? 4 : format.endsWith('16float') ? 2 : 1;
       const cost = format === 'rg11b10ufloat' || format.includes('8unorm') && format !== 'r8unorm' ? 8 : COLOR_BYTES.get(format);
       return Math.ceil(total / alignment) * alignment + cost;
     }, 0);
@@ -240,6 +243,10 @@ export function createGpuRenderTarget(device, options = {}) {
   const float32 = ['r32float', 'rg32float', 'rgba32float'].includes(format);
   if (colorFormats.some(value => value.includes('32float')) && sampleCount !== 1)
     fail('SAMPLES', 'Float32 color targets currently require one sample');
+  if (colorFormats.some(integerColor) && sampleCount !== 1)
+    fail('SAMPLES', 'Integer color targets require one sample');
+  if (colorFormats.some((value, index) => integerColor(value) && colorGenerateMipmaps[index]))
+    fail('MIP', 'Integer targets require authored mip levels');
   if (typeof copyDestination !== 'boolean') fail('OPTIONS', 'copyDestination must be boolean');
   if (typeof sampleDepth !== 'boolean') fail('OPTIONS', 'sampleDepth must be boolean');
   if (sampleDepth && depthFormat === null) fail('DEPTH', 'Sampled depth requires a depth attachment');
@@ -306,12 +313,15 @@ export function createGpuRenderTarget(device, options = {}) {
     if (requested > maximum) fail('SIZE', 'mipLevelCount exceeds the target extent');
     return requested ?? (colorGenerateMipmaps[colorIndex] ? maximum : 1);
   };
-  function requireMipFeatures() {
+  function requireMipFeatures(colorIndices = [...colorFormats.keys()]) {
+    if (colorIndices.some(index => integerColor(colorFormats[index])))
+      fail('MIP', 'Integer targets require authored mip levels');
     if (volume) fail('MIP', 'Automatic volume mip generation is not implemented; render authored mip levels explicitly');
     if (cube && float32 && device.features?.has?.('float32-filterable') !== true)
       fail('FEATURE', 'Float32 cube mip generation requires float32-filterable on the supplied device');
   }
-  if (colorGenerateMipmaps.some((generate, index) => generate && levels(width, height, layers, index) > 1)) requireMipFeatures();
+  const generatedColors = [...colorFormats.keys()].filter(index => colorGenerateMipmaps[index] && levels(width, height, layers, index) > 1);
+  if (generatedColors.length) requireMipFeatures(generatedColors);
   const transferShape = () => ({width, height, format, colorFormats, sampleCount, generateMipmaps,
     colorGenerateMipmaps, colorMipLevelCounts: colorFormats.map((_, index) => levels(width, height, layers, index)),
     mipLevelCount: levels(width, height), cube, array, volume, depth: volume ? layers : 1, layers});
@@ -499,7 +509,7 @@ export function createGpuRenderTarget(device, options = {}) {
     const selected = colorIndices.filter(index => (colorGenerateMipmaps[index] || suppliedEncoder !== null || explicit) &&
       pair.mipsDirty.has(colorTexture(pair, index, colorSlots)) && pair.colorMipLevelCounts[index] > 1);
     if (!selected.length) return false;
-    requireMipFeatures();
+    requireMipFeatures(selected);
     checked(() => {
       if (typeof device.createCommandEncoder !== 'function') fail('DEVICE', 'Mip generation requires a command encoder');
       const encoder = suppliedEncoder ?? device.createCommandEncoder({label: label + ' mip chain'});
@@ -792,7 +802,7 @@ export function createGpuRenderTarget(device, options = {}) {
       if (!current || !selected.some(index => current.mipsDirty.has(colorTexture(current, index, slots)) && current.colorMipLevelCounts[index] > 1)) return false;
       // Missing optional filtering is a retryable admission error, not a failed
       // allocation or submission, and is checked before taking the owner lock.
-      requireMipFeatures();
+      requireMipFeatures(selected);
       busy = true;
       try {
         current.used = true;

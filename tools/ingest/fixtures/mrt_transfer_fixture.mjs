@@ -8,6 +8,8 @@ export const layouts = new Map([
   ['bgra8unorm', [Uint8Array, 4]], ['bgra8unorm-srgb', [Uint8Array, 4]],
   ['rgba16float', [Uint16Array, 4]], ['rgba32float', [Float32Array, 4]],
   ['r32float', [Float32Array, 1]], ['rg32float', [Float32Array, 2]],
+  ['r32uint', [Uint32Array, 1]], ['rg32uint', [Uint32Array, 2]], ['rgba32uint', [Uint32Array, 4]],
+  ['r32sint', [Int32Array, 1]], ['rg32sint', [Int32Array, 2]], ['rgba32sint', [Int32Array, 4]],
 ]);
 export const bytes = data => new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 export function mrtTransferDevice() {

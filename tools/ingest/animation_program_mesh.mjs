@@ -67,6 +67,7 @@ export function createProgramMeshes({device, format, colorFormats = format === n
           output.location >= Math.max(1, colorFormats.length) || outputLocations.has(output.location))
         fail('ANIMATION_RENDER_OPTIONS', 'Program output locations must select distinct allocated color attachments');
       outputLocations.add(output.location);
+      colorTargets[output.location]?.assertOutput(output.glslType ?? 'vec4');
     }
     for (const location of outputLocations) colorTargets[location].assertBlend(raster?.blend);
     if (format === null) colorTargets[0].assertBlend(raster?.blend);

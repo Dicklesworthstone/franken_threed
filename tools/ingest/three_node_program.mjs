@@ -711,9 +711,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Integer IDs and bitfields must stay integer shader values. The source
     // textureLoad/texture3DLoad factories select this sampler-free path; no
     // normalized coordinates, interpolation or implicit float conversion.
-    if (node.sampler !== false || node.compareNode != null || node.isSampleCompare?.() === true ||
+    if (texture.isCubeTexture === true || node.sampler !== false || node.compareNode != null || node.isSampleCompare?.() === true ||
         node.biasNode != null || node.gradNode != null || node.gatherNode != null)
-      fail('TEXTURE', 'Native integer graphics inputs require sampler-free texel loads without comparison, bias, gradients or gather');
+      fail('TEXTURE', 'Native integer graphics inputs require sampler-free 2D/array/3D texel loads without comparison, bias, gradients or gather');
   }
   function storageTextureLayout(node, texture = node.value, mipLevel = 0) {
     if (typeof three.StorageTextureNode !== 'function' || !(node instanceof three.StorageTextureNode) ||
@@ -798,8 +798,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const integerData = integerType && (dataVolume || texture.isDataArrayTexture === true || typeof three.DataTexture === 'function' &&
       texture instanceof three.DataTexture && texture.isDataTexture === true && !volume) &&
       !texture.isCubeTexture && !target;
-    if (integerType && ((!storage && !integerData) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
-      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, DataTexture, DataArrayTexture or Data3DTexture inputs with NoColorSpace');
+    if (integerType && ((!storage && !integerData && !target) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
+      fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, data or target-owned textures with NoColorSpace');
     const packedTarget = target && three.UnsignedInt101111Type !== undefined &&
       texture.type === three.UnsignedInt101111Type && texture.format === three.RGBFormat;
     if (!depth && !integerType && (!packedTarget && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
@@ -826,7 +826,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (primarySamples !== 1 && !(primarySamples === 4 && depth && viewDimension === '2d'))
       fail('TEXTURE', 'Native graphics require resolved color or one/four-sample 2D depth views');
     const layout = targetLayout ?? compressedLayout ?? renderer._getSampledTextureInputs?.().layoutOf({texture, isSampledTexture: true, isSampler: true, store: false});
-    if ((media || storage || dataVolume || integerData || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
+    if ((media || storage || dataVolume || integerData || integerType && target || framebuffer || target && ['cube', '2d-array', '3d'].includes(viewDimension)) && !layout?.texture)
       fail('TEXTURE', 'Missing shared GPU texture sampling layout');
     if (layout && (layout.texture?.sampleType !== sampleType || layout.texture.viewDimension !== viewDimension ||
         (layout.texture.multisampled === true) !== multisampled))
@@ -1476,6 +1476,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     builder.vertexShader = shaders.vertex; builder.fragmentShader = shaders.fragment;
     const outputStruct = builder.structs.fragment.find(struct => struct.output === true);
     const colorCount = outputStruct?.members.length ?? 1;
+    const colorTypes = Object.freeze(outputStruct ? outputStruct.members.map(member => member.type)
+      : [builder.getOutputType?.() ?? 'vec4']);
     // Default output keeps the public target null even when its physical
     // destination has multiple colors. Validate against the captured image.
     if (colorCount > (context.colorAttachmentCount ?? renderer.getRenderTarget?.()?.textures.length ?? 1))
@@ -1494,7 +1496,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     }
     const descriptor = Object.freeze({nodeProgram: true, key: `native-node-${++serial}`,
-      vertex: shaders.vertex, fragment: shaders.fragment, colorCount,
+      vertex: shaders.vertex, fragment: shaders.fragment, colorCount, colorTypes,
       cameraIndex,
       ...primitiveLayout(object, preparedMaterial),
       attributes: Object.freeze(attributes), attributesKey: JSON.stringify(attributes), groups: Object.freeze(groups),

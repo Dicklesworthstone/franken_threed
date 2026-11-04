@@ -51,7 +51,9 @@ The selected attachment determines the result's precision: RGBA8 uses
 `Uint8Array`, RGBA16F preserves raw half-float bits in `Uint16Array`, and
 R/RG/RGBA32F uses one/two/four `Float32Array` components per pixel. R8 returns
 one `Uint8Array` value per texel; packed R11G11B10 returns one original
-`Uint32Array` word per texel. Reads use base mip zero regardless of the active
+`Uint32Array` word per texel. Native R/RG/RGBA32 integer attachments return
+one/two/four `Int32Array` or `Uint32Array` components without a float conversion.
+Reads use base mip zero regardless of the active
 render mip or cube face. The native cube profile remains single-sample; source
 `WebGLCubeRenderTarget` retains its explicit admission limit. Array layers and
 3D slices use the same explicit `faceIndex` argument; they do not infer a layer
@@ -99,6 +101,37 @@ pipeline depth/stencil state and render-pass attachments all follow the enabled
 attachment flags; storage budgets include the history depth. Sampling that same
 target's depth while rendering its color still encounters the existing feedback
 restriction; TRAA uses separate resolve and history targets.
+
+### Integer render targets
+
+The native WebGPU surface supports R/RG/RGBA32 signed and unsigned targets for
+object IDs, counters and other integer outputs. Use `IntType` or
+`UnsignedIntType` with `RedIntegerFormat`, `RGIntegerFormat` or
+`RGBAIntegerFormat`; the corresponding ordinary R/RG/RGBA source-format aliases
+also retain the pinned backend's integer storage mapping. These targets require
+`NoColorSpace`, unnormalized storage and one sample (`samples: 0` or `1`).
+
+The retained r186 TSL builder emits the destination's integer fragment type.
+The pipeline owner validates scalar type and component count before creation, preserves
+typed `outputStruct()` members in mixed float/integer MRT, and rejects blending
+on integer attachments. Ordinary and scissored clears preserve all 32 bits,
+including IDs above float32's exact integer range and negative signed values.
+
+Later native graphs read the same physical image with `TSL.textureLoad()`;
+array targets select a layer with `.depth(TSL.int(layer))`, and 3D targets use
+`TSL.texture3DLoad()`. Their bindings use `uint`/`sint` without a sampler or an
+orientation replica. Authored filter properties remain unchanged. Integer cube
+targets support rendering, copies and typed readback; integer cube sampling is
+not admitted because WGSL has no cube `textureLoad` overload.
+
+Uploads, raw texture copies, authored mip levels and asynchronous readbacks use
+the existing target owner, immutable queue captures and byte budgets. Signed
+uploads retain `Int32Array` snapshots, and both result types preserve caller
+output tails and cancellation boundaries. Automatic integer mip generation is
+not admitted; selected float attachments in mixed MRT can still generate mips.
+The WebGL-compatible target path retains its explicit integer-format admission
+limit. Source-WGSL comparisons and recording-device tests cover these paths;
+they do not establish browser pixel parity, hardware validation or speedup.
 
 ### Copies within one target
 

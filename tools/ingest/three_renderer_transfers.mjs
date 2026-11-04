@@ -189,7 +189,7 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         assertThreeNativeTextureWrite(renderer, (target.textures ?? [target.texture])[plan.colorIndex]);
         // Pick built-in constructors, not a caller-controlled data.constructor.
         const Type = data instanceof Float32Array ? Float32Array : data instanceof Uint32Array ? Uint32Array
-          : data instanceof Uint16Array ? Uint16Array : Uint8Array;
+          : data instanceof Int32Array ? Int32Array : data instanceof Uint16Array ? Uint16Array : Uint8Array;
         const uploadOptions = Object.freeze({...value, colorIndex: plan.colorIndex, destinationMipLevel: plan.destinationMipLevel,
           width: plan.size.width, height: plan.size.height,
           offset: 0, bytesPerRow: plan.rowBytes});
@@ -343,9 +343,9 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
     // published only after every producer fence and the final generation check,
     // preserving it when cancellation occurs after mapping has already finished.
     const Type = depth || format.endsWith('32float') ? Float32Array : format.endsWith('16float') ? Uint16Array
-      : format === 'rg11b10ufloat' ? Uint32Array : Uint8Array;
-    const components = depth || ['r16float', 'r32float', 'r8unorm', 'rg11b10ufloat'].includes(format) ? 1
-      : ['rg16float', 'rg32float'].includes(format) ? 2 : 4;
+      : format.endsWith('32sint') ? Int32Array : format.endsWith('32uint') || format === 'rg11b10ufloat' ? Uint32Array : Uint8Array;
+    const components = depth || ['r16float', 'r32float', 'r32sint', 'r32uint', 'r8unorm', 'rg11b10ufloat'].includes(format) ? 1
+      : ['rg16float', 'rg32float', 'rg32sint', 'rg32uint'].includes(format) ? 2 : 4;
     const elements = width * height * components, bytes = elements * Type.BYTES_PER_ELEMENT, output = value.output;
     if (!Number.isSafeInteger(elements) || !Number.isSafeInteger(bytes))
       throw new GpuTargetReadbackError('BUDGET', 'Readback output exceeds safe integer precision');

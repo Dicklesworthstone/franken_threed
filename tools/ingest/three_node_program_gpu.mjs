@@ -267,6 +267,10 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
     const colorCount = nodeProgram.colorCount ?? 1;
     if (!Number.isSafeInteger(colorCount) || colorCount < 1 || colorCount > Math.max(1, colorFormats.length))
       fail('ANIMATION_RENDER_OPTIONS', 'Native fragment outputs exceed the active color attachment layout');
+    const colorTypes = nodeProgram.colorTypes ?? Array(colorCount).fill('vec4');
+    if (!Array.isArray(colorTypes) || colorTypes.length !== colorCount)
+      fail('ANIMATION_RENDER_OPTIONS', 'Native fragment output types must match their attachment locations');
+    for (let index = 0; index < colorCount; index++) colorTargets[index]?.assertOutput(colorTypes[index]);
     if (!raster || !['ccw', 'cw'].includes(raster.frontFace) || !['none', 'front', 'back'].includes(raster.cullMode) ||
         !Number.isSafeInteger(raster.writeMask) || raster.writeMask < 0 || raster.writeMask > 15 ||
         (raster.alphaToCoverageEnabled !== undefined && typeof raster.alphaToCoverageEnabled !== 'boolean') ||

@@ -54,6 +54,27 @@ test('every active MRT format validates blending before allocating a pipeline', 
   assert.equal(f.pipelines.length, 0);
 });
 
+test('typed ESSL outputs preserve signed and unsigned attachment formats', async t => {
+  const f = fixture(t, ['rgba32uint', 'rg32sint']);
+  f.program.reflection.outputs = [{location: 0, glslType: 'uvec4'}, {location: 1, glslType: 'ivec2'}];
+  await f.add();
+  assert.deepEqual(f.pipelines[0].fragment.targets, [{format: 'rgba32uint', writeMask: 15}, {format: 'rg32sint', writeMask: 15}]);
+});
+
+for (const type of ['vec4', 'ivec4', undefined]) test(`unsigned ESSL attachments reject ${type ?? 'missing'} output typing before allocation`, async t => {
+  const f = fixture(t, ['rgba32uint']);
+  f.program.reflection.outputs = [{location: 0, glslType: type}];
+  const buffers = f.device.buffers.length;
+  await assert.rejects(f.add(), /require u32 fragment outputs/);
+  assert.equal(f.pipelines.length, 0); assert.equal(f.device.buffers.length, buffers);
+});
+
+test('ESSL attachment outputs require every stored component', async t => {
+  const f = fixture(t, ['rgba32uint']); f.program.reflection.outputs = [{location: 0, glslType: 'uvec2'}];
+  await assert.rejects(f.add(), /require at least 4 fragment output components/);
+  assert.equal(f.pipelines.length, 0);
+});
+
 test('invalid or duplicate fragment locations reject before program preparation', async t => {
   const f = fixture(t);
   for (const locations of [[0, 2], [0, 0], [-1], [0.5]]) {

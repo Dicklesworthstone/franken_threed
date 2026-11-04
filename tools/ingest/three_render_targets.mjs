@@ -157,11 +157,17 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     : three.RedFormat !== undefined && texture.format === three.RedFormat ? 'r'
     : three.RGFormat !== undefined && texture.format === three.RGFormat ? 'rg' : null;
   const floatFormat = floatChannels && (float32 || halfFloat) ? `${floatChannels}${float32 ? 32 : 16}float` : null;
+  const integerType = three.IntType !== undefined && texture.type === three.IntType ? 'sint'
+    : three.UnsignedIntType !== undefined && texture.type === three.UnsignedIntType ? 'uint' : null;
+  const integerChannels = floatChannels ?? (three.RedIntegerFormat !== undefined && texture.format === three.RedIntegerFormat ? 'r'
+    : three.RGIntegerFormat !== undefined && texture.format === three.RGIntegerFormat ? 'rg'
+    : three.RGBAIntegerFormat !== undefined && texture.format === three.RGBAIntegerFormat ? 'rgba' : null);
+  const integerFormat = integerType && integerChannels ? `${integerChannels}32${integerType}` : null;
   const red8 = three.RedFormat !== undefined && texture.format === three.RedFormat && texture.type === three.UnsignedByteType;
   const packedHDR = three.UnsignedInt101111Type !== undefined && texture.type === three.UnsignedInt101111Type &&
     texture.format === three.RGBFormat;
-  if (texture.internalFormat != null || (texture.format !== three.RGBAFormat && !floatFormat && !red8 && !packedHDR))
-    fail('UNSUPPORTED', 'Targets require RGBA, R8, packed RGB11F or HalfFloatType/FloatType R/RG, with no internal format override');
+  if (texture.internalFormat != null || (texture.format !== three.RGBAFormat && !floatFormat && !integerFormat && !red8 && !packedHDR))
+    fail('UNSUPPORTED', 'Targets require supported R/RG/RGBA or packed RGB11F storage, with no internal format override');
   if (typeof texture.generateMipmaps !== 'boolean') fail('UNSUPPORTED', 'generateMipmaps must be boolean');
   const linear = texture.colorSpace === three.NoColorSpace || texture.colorSpace === three.LinearSRGBColorSpace;
   let format;
@@ -171,8 +177,11 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       (linear || texture.colorSpace === three.SRGBColorSpace))
     format = linear ? 'rgba8unorm' : 'rgba8unorm-srgb';
   else if (floatFormat && linear) format = floatFormat;
-  else fail('UNSUPPORTED', 'Target color must be RGBA8, linear R8/RGB11F or linear R/RG/RGBA16F/32F');
+  else if (integerFormat && texture.colorSpace === three.NoColorSpace && texture.normalized !== true) format = integerFormat;
+  else fail('UNSUPPORTED', 'Target color must be RGBA8, linear R8/RGB11F, linear R/RG/RGBA16F/32F or unnormalized R/RG/RGBA32 integer storage with NoColorSpace');
   if (float32 && target.samples === 4) fail('UNSUPPORTED', 'Float32 targets currently require zero or one source samples');
+  if (integerType && (target.samples === 4 || texture.generateMipmaps))
+    fail('UNSUPPORTED', 'Integer targets require one sample and authored mip levels');
   const sampleCount = target.samples === 4 ? 4 : 1, depthTexture = target.depthTexture ?? null;
   const layers = cube ? 6 : array || volume ? target.depth : 1;
   const depthArray = (array || volume) && layers > 1 && (target.useArrayDepthTexture === true || (depthTexture?.image?.depth ?? 1) > 1);
@@ -230,6 +239,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     samplerDescriptor(depthTexture, three, 1);
   }
   const generateMipmaps = mipProfile?.generateMipmaps ?? texture.generateMipmaps;
+  if (integerType && generateMipmaps) fail('UNSUPPORTED', 'Integer targets require authored mip levels');
   const maximumMipLevels = 1 + Math.floor(Math.log2(Math.max(width, height, volume ? layers : 1)));
   if (texture.mipmaps !== undefined && !Array.isArray(texture.mipmaps)) fail('UNSUPPORTED', 'Expected source mipmap descriptors');
   const authoredMipLevelCount = mipProfile?.authoredMipLevelCount ?? texture.mipmaps?.length ?? 0;
@@ -251,7 +261,8 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
       : generateMipmaps ? maximumMipLevels : 1);
   if (!positive(mipLevelCount) || mipLevelCount > maximumMipLevels)
     fail('SIZE', 'Invalid target mip count for its extent');
-  const texelBytes = format === 'r8unorm' ? 1 : format === 'r16float' ? 2 : format === 'rgba32float' ? 16 : ['rgba16float', 'rg32float'].includes(format) ? 8 : 4;
+  const texelBytes = format === 'r8unorm' ? 1 : format === 'r16float' ? 2 : format.startsWith('rgba32') ? 16
+    : format === 'rgba16float' || format.startsWith('rg32') ? 8 : 4;
   const baseColorBytes = width * height * texelBytes * layers;
   let colorBytes = baseColorBytes, w = width, h = height, d = layers;
   for (let level = 1; level < mipLevelCount; level++) {
@@ -264,7 +275,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, baseColorBytes, texture, generateMipmaps,
-    mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32,
+    mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32, integerType,
     ...(webglArray || webglVolume ? {webglSampler: captureWebGLTargetSampler(texture, webglVolume)} : {}),
     cube, webglCube, webglArray, webglVolume, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers, viewDimension: cube ? 'cube' : volume ? '3d' : array ? '2d-array' : '2d',
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
@@ -549,6 +560,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function capture(target, {initialize = false} = {}) {
     live();
     const shape = sourceShape(target);
+    if (flipY && shape.colors.some(color => color.integerType !== null))
+      fail('UNSUPPORTED', 'Integer targets currently require the native WebGPU renderer surface');
     if (flipY && shape.textures.length > 1 && shape.colors.some(color => color.mipLevelCount > 1 || color.generateMipmaps || color.texture.mipmaps.length > 0))
       fail('UNSUPPORTED', 'MRT mip pyramids currently require the native WebGPU renderer surface');
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
@@ -793,6 +806,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
     const filterable = !shape.float32 || device.features?.has?.('float32-filterable') === true;
     const descriptor = samplerDescriptor(samplerState, three, shape.mipLevelCount);
+    if (shape.integerType !== null) {
+      // Pinned integer TextureNodes use textureLoad and have no sampler binding.
+      // Preserve authored filter properties; the unused descriptor stays valid
+      // for a non-filtering binding without inventing float sampling semantics.
+      Object.assign(descriptor, {minFilter: 'nearest', magFilter: 'nearest', mipmapFilter: 'nearest',
+        maxAnisotropy: 1, lodMaxClamp: shape.mipLevelCount - 1});
+      return {descriptor, sampleType: shape.integerType};
+    }
     // Pinned WebGL setup only applies anisotropy with mip-linear minification.
     // Layered targets retain that initialized sampler until recreation, even
     // when their source texture later changes its filtering or needsUpdate.
@@ -823,6 +844,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     assertCurrent(entry);
     const colorIndex = entry.shape.textures.indexOf(texture), shape = entry.shape.colors[colorIndex];
     if (!shape) fail('STALE', 'Texture no longer belongs to its source target');
+    if (shape.integerType !== null)
+      fail('UNSUPPORTED', 'Integer target sampling requires native typed texel-load bindings');
     if (shape.cube && !shape.webglCube || shape.array && !shape.webglArray || shape.volume && !shape.webglVolume)
       fail('UNSUPPORTED', 'Native layered target color sampling requires native texture bindings');
     if (shape.webglVolume && shape.mipLevelCount !== 1)
