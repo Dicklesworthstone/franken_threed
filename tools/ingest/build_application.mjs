@@ -917,6 +917,7 @@ function pathExistsOrSymlink(targetPath) {
 
 /**
  * Builds a runnable application package from an HTML or ESM entry point.
+ * Module-only output carries its own ESM package scope for relocatable .js chunks.
  *
  * @param {string} entryPath - Path to HTML or JavaScript entry file
  * @param {string} outDir - Destination directory for emitted application (must be fresh)
@@ -964,6 +965,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
 
   const targetFiles = new Map(); // relativePath -> string | Buffer
+  if (!isHtml) {
+    // .js chunks must keep their ESM semantics even when deployed beneath a
+    // CommonJS package. Reserve the scope file before merging emitted resources
+    // so it follows the same collision and exclusive-write rules as the chunks.
+    targetFiles.set("package.json", JSON.stringify({ type: "module" }, null, 2) + "\n");
+  }
   const htmlFileName = isHtml ? path.basename(resolvedEntryAbs) : null;
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
   const classicWorkerSources = new Map(), classicScriptRewrites = new Map();

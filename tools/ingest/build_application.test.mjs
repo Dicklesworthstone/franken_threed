@@ -128,6 +128,52 @@ test("buildApplication emits runnable module-only entry point and executes with 
   assert.equal(imported.computed, 42, "Emitted chunk export must match calculation");
 });
 
+test("module-only output keeps ESM entry and lazy chunks runnable after relocation beneath CommonJS", async () => {
+  const scratch = makeScratch("f3d_app_portable_esm");
+  const sourceDir = path.join(scratch, "source");
+  const deploymentDir = path.join(scratch, "deployment");
+  fs.mkdirSync(sourceDir);
+  fs.mkdirSync(deploymentDir);
+  const sourcePackage = JSON.stringify({ type: "commonjs", name: "source-application" });
+  fs.writeFileSync(path.join(sourceDir, "package.json"), sourcePackage);
+  fs.writeFileSync(path.join(deploymentDir, "package.json"), JSON.stringify({ type: "commonjs" }));
+  fs.writeFileSync(path.join(sourceDir, "shared.mjs"), "export const value = 21;\n");
+  fs.writeFileSync(
+    path.join(sourceDir, "lazy.mjs"),
+    "import { value } from './shared.mjs';\nexport const answer = value * 3;\n",
+  );
+  fs.writeFileSync(
+    path.join(sourceDir, "main.mjs"),
+    "import { value } from './shared.mjs';\n" +
+      "import metadata from './package.json' with { type: 'json' };\n" +
+      "export const answer = value * 2;\n" +
+      "export const sourcePackageType = metadata.type;\n" +
+      "export const sourcePackageAsset = new URL('./package.json', import.meta.url);\n" +
+      "export async function loadLazy() { return (await import('./lazy.mjs')).answer; }\n",
+  );
+
+  const built = await buildApplication(path.join(sourceDir, "main.mjs"), path.join(sourceDir, "dist"));
+  assert.equal(built.isMultiChunk, true, "Exercise shared and lazy chunks as well as the entry");
+  const deployed = path.join(deploymentDir, "app");
+  fs.renameSync(built.outDir, deployed);
+  fs.renameSync(sourceDir, path.join(scratch, "source-unavailable"));
+  assert.equal(fs.existsSync(sourceDir), false, "Original source URLs must be unavailable");
+
+  const imported = await import(pathToFileURL(path.join(deployed, built.entryFiles[0])).href);
+  assert.equal(imported.answer, 42);
+  assert.equal(await imported.loadLazy(), 63);
+  assert.equal(imported.sourcePackageType, "commonjs", "JSON imports retain source metadata");
+  assert.equal(
+    fs.readFileSync(imported.sourcePackageAsset, "utf8"),
+    sourcePackage,
+    "A source package.json asset must keep its original bytes independently of output module scope",
+  );
+  assert.ok(built.emittedFiles.includes("package.json"));
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(deployed, "package.json"), "utf8")), {
+    type: "module",
+  });
+});
+
 test("buildApplication emits runnable HTML with bounded asset closure, copying CSS, images, and preloads", async () => {
   const scratch = makeScratch("f3d_app_html");
   const outDir = path.join(scratch, "dist");
@@ -187,6 +233,7 @@ test("buildApplication emits runnable HTML with bounded asset closure, copying C
   assert.equal(res.isHtml, true, "HTML entry must report isHtml: true");
   assert.equal(res.htmlFile, "index.html", "HTML file name must be index.html");
   assert.equal(res.entryFiles.length, 2, "Must have two entry chunks in document order");
+  assert.equal(res.emittedFiles.includes("package.json"), false, "HTML builds retain their original package scope");
 
   const emittedHtmlPath = path.join(outDir, "index.html");
   assert.ok(fs.existsSync(emittedHtmlPath), "Emitted index.html must exist");
@@ -568,6 +615,22 @@ test("buildApplication strictly rejects destination collisions via exclusive wri
     "PRE_EXISTING_DO_NOT_DELETE",
     "Pre-existing file must never be deleted or modified",
   );
+});
+
+test("module-only output refuses an existing package scope before writing any chunks", async () => {
+  const scratch = makeScratch("f3d_app_package_collision");
+  const outDir = path.join(scratch, "dist");
+  fs.mkdirSync(outDir);
+  fs.writeFileSync(path.join(scratch, "main.mjs"), "export const value = 42;\n");
+  const previous = JSON.stringify({ type: "commonjs", name: "existing-application" });
+  fs.writeFileSync(path.join(outDir, "package.json"), previous);
+
+  await assert.rejects(
+    buildApplication(path.join(scratch, "main.mjs"), outDir),
+    /Refusing to overwrite existing destination file: .*package\.json/,
+  );
+  assert.equal(fs.readFileSync(path.join(outDir, "package.json"), "utf8"), previous);
+  assert.deepEqual(fs.readdirSync(outDir), ["package.json"], "Collision must not leave a partial build");
 });
 
 test("CLI --build-app flag emits runnable application to fresh destination", async () => {
