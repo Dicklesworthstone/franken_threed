@@ -126,8 +126,19 @@ or authorize native renderer substitution. Source-level specialization leaves
 CommonJS intact for its compiler. Build output can subsequently be packed when
 its emitted ESM and resource graph closes.
 
-Dynamic require selection, synchronous requires of ESM/JSON/live external
+Static requires of valid local JSON, including package export targets and
+extensionless file lookup, share the host's native JSON-module instance with
+static and lazy ESM imports of the same URL. Mutation stays visible through
+every route, while different URLs keep distinct objects. Raw JSON bytes retain
+BOM handling, duplicate keys, signed zero and own `__proto__` properties through
+relocated builds and standalone packing. JSON never runs through the JavaScript
+frontend or an application-replaced `JSON.parse`.
+
+Dynamic require selection, synchronous requires of ESM/live external
 modules, and CommonJS URL query/hash variants produce explicit build errors.
+Malformed required JSON also remains a build error: eagerly linking invalid
+JSON would change a conditional or caught synchronous require failure. Ordinary
+native ESM JSON imports retain their existing host parsing/error boundaries.
 Mixed ESM/CommonJS source needs normalization by the project frontend. Retained
 ESM and module-worker sources also need frontend normalization; raw CommonJS is
 not copied into those browser module paths. Classic scripts and classic workers

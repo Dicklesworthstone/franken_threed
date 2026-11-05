@@ -18,7 +18,7 @@ import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
-import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
+import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsJsonSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
@@ -276,6 +276,12 @@ export function f3dRollupPlugin(options = {}) {
 
     resolveId(source, importer, {attributes = {}} = {}) {
       if (emittedJsonTargets.has(source)) return {id: source, external: true, attributes};
+      // The require boundary already selected and validated this exact JSON
+      // URL. Reapplying browser/import-map replacements could select a second
+      // file and break its shared identity with an ordinary ESM import.
+      const requiredJson = commonjsJsonSourceUrl(importer);
+      if (requiredJson === source)
+        return {id: emitJsonModule(this, requiredJson), external: true, attributes};
       if (source === LOADER_RESOURCES_IMPORT && options.prepareStandaloneLoaders)
         return { id: "./" + LOADER_RESOURCES_FILE, external: true, moduleSideEffects: false };
       if (inlineModules.has(source)) {

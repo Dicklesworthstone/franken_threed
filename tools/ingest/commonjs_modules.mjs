@@ -9,11 +9,13 @@ import commonjs from '@rollup/plugin-commonjs';
 import {isIdentifierShadowedAtAncestors} from './ast_analyzer.mjs';
 
 const ENTRY = '\0f3d-commonjs-entry:';
+const JSON_ENTRY = '\0f3d-commonjs-json:';
 const EMPTY = new URL('./browser_empty.mjs', import.meta.url).href;
 const classifications = new WeakMap();
 const originalEntry = id => id?.startsWith(ENTRY) ? id.slice(ENTRY.length, -4) : null;
 export const commonjsSourceUrl = id => originalEntry(id?.endsWith('?commonjs-entry')
   ? id.slice(0, -'?commonjs-entry'.length) : id) ?? id;
+export const commonjsJsonSourceUrl = id => id?.startsWith(JSON_ENTRY) ? id.slice(JSON_ENTRY.length) : null;
 
 export function commonjsError(code, message, url) {
   const error = new Error(`${message}: ${url}`);
@@ -78,7 +80,7 @@ export function assertUnbundledModule(url, sources, sourceType = 'module') {
 
 export function commonjsPlugins({moduleSources, resolveModule}) {
   const compiler = commonjs({strictRequires: true, sourceMap: true,
-    defaultIsModuleExports: true, requireReturnsDefault: id => id === EMPTY,
+    defaultIsModuleExports: true, requireReturnsDefault: id => id === EMPTY || id.startsWith(JSON_ENTRY),
     ignoreDynamicRequires: false, ignoreTryCatch: false});
   const transform = compiler.transform;
   compiler.transform = async function(code, id) {
@@ -102,7 +104,7 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
   return [compiler, {
     name: 'f3d-commonjs-boundary',
     resolveId(source, importer, options) {
-      if (originalEntry(source)) return source;
+      if (originalEntry(source) || source.startsWith(JSON_ENTRY)) return source;
       if (!options.custom?.['node-resolve']?.isRequire) return null;
       const from = originalEntry(importer) ?? importer;
       // require paths are filesystem strings: percent signs, '?' and '#' in
@@ -113,8 +115,21 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
       if (resolved === EMPTY) return resolved;
       if (!resolved.startsWith('file:'))
         throw commonjsError('EXTERNAL_REQUIRE', 'Synchronous require cannot load a live external module', resolved);
-      if (path.extname(fileURLToPath(resolved)).toLowerCase() === '.json')
-        throw commonjsError('JSON_REQUIRE', 'CommonJS JSON requires need a project frontend; native ESM JSON imports remain supported', resolved);
+      if (path.extname(fileURLToPath(resolved)).toLowerCase() === '.json') {
+        // A valid, closed JSON resource has no evaluation effects. Borrow its
+        // native JSON-module instance so require() and ESM imports share the
+        // same mutable object, including imports made later from lazy chunks.
+        // Do not lower to an object literal or a second JSON.parse(): duplicate
+        // keys, __proto__, signed zero and module identity belong to the host.
+        // Invalid input cannot take this eager path: a source require may be
+        // conditional or caught, unlike the native module's linking failure.
+        const source = fs.readFileSync(fileURLToPath(resolved), 'utf8').replace(/^\uFEFF/, '');
+        try { JSON.parse(source); }
+        catch {
+          throw commonjsError('JSON_REQUIRE', 'Malformed CommonJS JSON needs a project frontend to preserve synchronous require errors', resolved);
+        }
+        return JSON_ENTRY + resolved;
+      }
       if (!isCommonJS(resolved, moduleSources, {required: true}))
         throw commonjsError('ESM_REQUIRE', 'Requiring an ESM module may change initialization timing; use an ESM import or project frontend', resolved);
       // Even a relative child containing only side effects needs a lazy CJS
@@ -124,6 +139,8 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
       return resolved;
     },
     load(id) {
+      if (id.startsWith(JSON_ENTRY))
+        return `export {default} from ${JSON.stringify(id.slice(JSON_ENTRY.length))} with {type: 'json'};`;
       const url = originalEntry(id);
       // Requiring the real source also makes empty/side-effect-only CJS modules
       // receive a wrapper. Every facade forwards the same original instance.

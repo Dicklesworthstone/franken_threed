@@ -152,6 +152,118 @@ test('direct CommonJS entries and side-effect-only packages produce executable E
   assert.deepEqual(result.default, {answer: 42, side: {}});
 });
 
+test('CommonJS JSON dependencies share native ESM identity and exact values after relocation', async () => {
+  const json = '\uFEFF{"default":"whole object","duplicate":1,"duplicate":2,"zero":-0,"__proto__":{"safe":true}}';
+  const root = fixture({
+    'main.mjs': `import read from './library.cjs';
+      import value from './config.json' with {type:'json'};
+      import distinct from './config.json?instance' with {type:'json'};
+      export {read, value, distinct}; export const later = () => import('./later.mjs');`,
+    'later.mjs': `export {default} from './config.json' with {type:'json'};`,
+    'library.cjs': `module.exports = enabled => enabled ? {
+      config: require('./config'), again: require('./config.json'),
+      package: require('settings'), different: require('./other.json'),
+      number: require('./number.json'), nothing: require('./null.json'),
+      array: require('./array.json'), literal: require('./literal?#%.json')
+    } : null;`,
+    'config.json': json,
+    'other.json': json,
+    'number.json': '-0',
+    'null.json': 'null',
+    'array.json': '[1,false,"text"]',
+    'literal?#%.json': '{"literal":true}',
+    'node_modules/settings/package.json': '{"exports":{"browser":{"require":"./config.json"}}}',
+    'node_modules/settings/config.json': '{"version":"1.0","answer":42}',
+  });
+  const built = await buildApplication(path.join(root, 'main.mjs'), path.join(root, 'dist'));
+  const deployed = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-commonjs-json-deployed-'));
+  fs.renameSync(path.join(root, 'dist'), path.join(deployed, 'app'));
+  fs.renameSync(root, root + '-source-unavailable');
+  const result = await import(pathToFileURL(path.join(deployed, 'app', built.entryFiles[0])).href);
+  assert.equal(result.read(false), null);
+  // Native JSON loading must not call an application's replacement JSON.parse.
+  const parse = JSON.parse;
+  let loaded;
+  try {
+    JSON.parse = () => { throw new Error('Application JSON.parse must not load a module'); };
+    loaded = result.read(true);
+  } finally { JSON.parse = parse; }
+  assert.equal(loaded.config, result.value);
+  assert.equal(loaded.again, loaded.config);
+  assert.equal((await result.later()).default, loaded.config);
+  assert.notEqual(loaded.different, loaded.config, 'distinct JSON URLs keep independent objects');
+  assert.notEqual(result.distinct, loaded.config, 'query variants retain native URL identity');
+  assert.equal(loaded.config.default, 'whole object');
+  assert.equal(loaded.config.duplicate, 2);
+  assert.ok(Object.is(loaded.config.zero, -0));
+  assert.equal(Object.getPrototypeOf(loaded.config), Object.prototype);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(loaded.config, '__proto__').value, {safe: true});
+  assert.deepEqual(loaded.package, {version: '1.0', answer: 42});
+  assert.ok(Object.is(loaded.number, -0));
+  assert.equal(loaded.nothing, null);
+  assert.deepEqual(loaded.array, [1, false, 'text']);
+  assert.deepEqual(loaded.literal, {literal: true});
+  loaded.config.changed = 17;
+  assert.equal(result.read(true).config.changed, 17);
+  assert.equal((await result.later()).default.changed, 17);
+});
+
+test('standalone packing preserves shared CommonJS and lazy native JSON modules', {
+  skip: typeof nodeModule.registerHooks !== 'function',
+}, async () => {
+  const root = fixture({
+    'index.html': '<script type="module" src="./main.mjs"></script>',
+    'main.mjs': `import library from './library.cjs'; export {library};
+      export const later = () => import('./later.mjs');`,
+    'library.cjs': `module.exports = {value: require('./config.json'), read: () => require('./config.json')};`,
+    'later.mjs': `export {default} from './config.json' with {type:'json'};`,
+    'config.json': '{"answer":42,"zero":-0}',
+  });
+  const built = await buildApplication(path.join(root, 'index.html'), path.join(root, 'dist'));
+  const packed = path.join(root, 'standalone.html');
+  packHtml(path.join(built.outDir, built.htmlFile), packed);
+  const html = fs.readFileSync(packed, 'utf8');
+  const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+  const entry = /<script[^>]*type="module"[^>]*src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(root, root + '-source-unavailable');
+  const hook = nodeModule.registerHooks({resolve(specifier, context, next) {
+    return next(imports[specifier] ?? specifier, context);
+  }});
+  try {
+    const result = await import(entry);
+    assert.equal(result.library.value.answer, 42);
+    assert.ok(Object.is(result.library.value.zero, -0));
+    assert.equal(result.library.read(), result.library.value);
+    assert.equal((await result.later()).default, result.library.value);
+    result.library.value.answer = 84;
+    assert.equal((await result.later()).default.answer, 84);
+  } finally { hook.deregister(); }
+});
+
+for (const mapping of ['browser', 'import-map']) test(`CommonJS JSON applies ${mapping} replacements once and shares the selected ESM module`, async () => {
+  const root = fixture({
+    'package.json': JSON.stringify({type: 'module', ...(mapping === 'browser' ? {
+      browser: {'./source.json': './browser.json', './browser.json': './second.json'},
+    } : {})}),
+    'main.mjs': `import read from './library.cjs';
+      import value from './source.json' with {type:'json'}; export {read, value};`,
+    'library.cjs': `module.exports = () => require('./source.json');`,
+    'source.json': '{"source":"original"}',
+    'browser.json': '{"source":"browser"}',
+    'second.json': '{"source":"incorrect second replacement"}',
+  });
+  const url = name => pathToFileURL(path.join(root, name)).href;
+  const imports = mapping === 'import-map' ? {
+    [url('source.json')]: url('browser.json'), [url('browser.json')]: url('second.json'),
+  } : {};
+  fs.writeFileSync(path.join(root, 'index.html'), `<script type="importmap">${JSON.stringify({imports})}</script>` +
+    '<script type="module" src="./main.mjs"></script>');
+  const built = await buildApplication(path.join(root, 'index.html'), path.join(root, 'dist'));
+  const result = await import(pathToFileURL(path.join(root, 'dist', built.entryFiles[0])).href);
+  assert.equal(result.read(), result.value);
+  assert.equal(result.value.source, 'browser');
+});
+
 test('relative side-effect-only require children initialize lazily, including a no-op frontend', async () => {
   for (const frontend of [false, true]) {
     const key = `f3d_cjs_lazy_${frontend}`;
@@ -270,12 +382,12 @@ test('source-level specialization cannot turn CommonJS loops into unconverted mi
 
 test('unsupported CommonJS require and retained-module boundaries fail before publishing output', async () => {
   const cases = [
-    ['json', `module.exports = require('./data.json');`, 'JSON_REQUIRE'],
+    ['json', `module.exports = enabled => enabled ? require('./data.json') : null;`, 'JSON_REQUIRE'],
     ['dynamic', `module.exports = name => require(name);`, 'DYNAMIC_REQUIRE'],
     ['esm', `module.exports = flag => flag ? require('./effect.mjs') : null;`, 'ESM_REQUIRE'],
   ];
   for (const [name, source, suffix] of cases) {
-    const root = fixture({'main.cjs': source, 'data.json': '{"answer":42}', 'effect.mjs': 'export default 42;'});
+    const root = fixture({'main.cjs': source, 'data.json': '{"answer":', 'effect.mjs': 'export default 42;'});
     const out = path.join(root, 'dist');
     await assert.rejects(buildApplication(path.join(root, 'main.cjs'), out), error =>
       (error.pluginCode ?? error.code) === `F3D_COMMONJS_${suffix}`, name);
