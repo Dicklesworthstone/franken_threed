@@ -347,7 +347,7 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
     },
     async whenIdle() {
       live(); if (active) fail('REENTRY', 'Cannot await framebuffer completion inside a submitted use');
-      await Promise.all([...pending, ...[...entries].filter(entry => entry.alive && entry.storage).map(entry => entry.storage.whenIdle())]); live();
+      await Promise.race([Promise.all([...pending, ...[...entries].filter(entry => entry.alive && entry.storage).map(entry => entry.storage.whenIdle())]), stopped]); live();
     },
     get diagnostics() { return {textures: current.size, generations: entries.size, bindings: leases.size, bytes}; },
     dispose() { if (disposed) return; disposed = true; stop(new ThreeFramebufferTextureError('DISPOSED', 'Framebuffer owner disposed')); },

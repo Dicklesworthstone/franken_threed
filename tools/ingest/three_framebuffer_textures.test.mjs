@@ -150,6 +150,28 @@ test('retirement waits for submitted work and source disposal invalidates queued
   f.controls.completion.resolve(); await f.owner.whenIdle(); assert.equal(native.destroyed, 1);
 });
 
+for (const cause of ['dispose', 'abort']) test(`framebuffer ${cause} cancels completion without retiring submitted textures early`, async t => {
+  const controller = new AbortController(), f = fixture(t, {signal: controller.signal}), completion = deferred();
+  const texture = framebuffer(4, 4, false), lease = f.owner.captureFramebuffer(texture);
+  f.controls.completion = completion; t.after(() => completion.resolve());
+  f.copy([lease], lease); const native = f.timelines[0][0].destination.texture;
+  f.owner.release(lease);
+  let outcome;
+  const wait = f.owner.whenIdle().then(() => { outcome = 'resolved'; }, error => { outcome = error; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(outcome, undefined);
+  const failure = new Error('Framebuffer use cancelled by application');
+  if (cause === 'dispose') f.owner.dispose(); else controller.abort(failure);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(outcome, 'completion wait must settle before the GPU fence');
+  if (cause === 'dispose') assert.equal(outcome.code, 'THREE_FRAMEBUFFER_TEXTURE_DISPOSED');
+  else assert.equal(outcome, failure);
+  assert.equal(native.destroyed, 0); assert.equal(f.owner.diagnostics.generations, 1);
+  completion.resolve(); await wait; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(native.destroyed, 1); assert.equal(f.owner.diagnostics.generations, 0);
+  assert.equal(f.owner.diagnostics.bytes, 0);
+  f.owner.dispose(); assert.equal(native.destroyed, 1);
+});
+
 test('budgets include pending generations and reject before allocating a second texture', async t => {
   const f = fixture(t, {maxBytes: 168}), texture = framebuffer(), lease = f.owner.captureFramebuffer(texture);
   f.copy([lease], lease); assert.equal(f.owner.diagnostics.bytes, 168);
