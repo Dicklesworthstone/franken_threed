@@ -227,7 +227,7 @@ function outputOnlyScalars(loop, scalarOutputs) {
 export function planNumericLoopIslands(source, {
   ast, fresh, sourceName = '<module>', maxKernels = 64, maxMemoryPages = 1024,
   maxIterations = 1000000, excludedSpans = [], reservedEdits = [],
-  helperSources = new Map(), helperDeclarations = new Map(), replaceableCalls = [],
+  helperSources = new Map(), helperDeclarations = new Map(), replaceableCalls = [], helperCapturePlan = null,
 }) {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
@@ -300,24 +300,29 @@ export function planNumericLoopIslands(source, {
     }
     const closure = capturesFor(node, ancestors, bindings, helperDeclarations);
     if (closure.refusal) { item.reason=closure.refusal; continue; }
+    const lifted = helperCapturePlan?.(node, ancestors);
+    if (lifted?.refusal) { item.reason=lifted.refusal; continue; }
     const {captures, arrays, usesMath, scalarOutputs, varInitializers} = closure;
     const outputOnly = outputOnlyScalars(node, scalarOutputs);
     const inputs = captures.filter(name => !scalarOutputs.includes(name));
     const stateName = scalarOutputs.length ? fresh('loop_state') : null;
-    const parameters = stateName ? [...inputs, stateName] : inputs;
+    const parameters = [...inputs, ...(stateName ? [stateName] : []), ...(lifted?.parameters ?? [])];
     const prologue = scalarOutputs.map((name, i) => `let ${name} = ${stateName}[${i}];`).join('\n');
     const epilogue = scalarOutputs.map((name, i) => `${stateName}[${i}] = ${name};`).join('\n');
     const functionName = fresh('loop_kernel');
-    let body = source.slice(node.start, node.end);
-    for (const declaration of [...varInitializers].sort((a, b) => b.start - a.start)) {
+    const varEdits = [...varInitializers].sort((a, b) => b.start - a.start).map(declaration => {
       const assignments = declaration.declarations.filter(d => d.init)
-        .map(d => `${d.id.name} = (${source.slice(d.init.start, d.init.end)})`).join(', ');
-      body = body.slice(0, declaration.start - node.start) + assignments + body.slice(declaration.end - node.start);
-    }
+        .map(d => `${d.id.name} = (${lifted ? lifted.rewrite(d.init.start, d.init.end) : source.slice(d.init.start, d.init.end)})`).join(', ');
+      return {start:declaration.start, end:declaration.end, text:assignments};
+    });
+    let body = lifted ? lifted.rewrite(node.start, node.end, varEdits) : source.slice(node.start, node.end);
+    if (!lifted) for (const edit of varEdits)
+      body = body.slice(0, edit.start - node.start) + edit.text + body.slice(edit.end - node.start);
     const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${body}\n${epilogue}\n}`;
     const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ? 'f64[]' : 'f64');
     const compile = types => compileNumericCandidate(kernelSource, {
-      parameterTypes:types, helperSources, allowMath:usesMath || helperSources.size > 0, generalControl:true,
+      parameterTypes:types, helperSources:lifted?.helperSources ?? helperSources,
+      allowMath:usesMath || helperSources.size > 0, generalControl:true,
       maxMemoryPages, maxIterations, sourceName:`${sourceName}:loop@${node.start}`,
     });
     let artifact;
@@ -351,7 +356,9 @@ export function planNumericLoopIslands(source, {
     // Capture that resolver lazily at module registration, without reading its
     // value during initialization (including ESM cycles and lexical TDZ).
     const moduleMath = !!artifact.manifest.mathIntrinsics && artifact.helpers.some(helper => usesHelperMath(helper.name));
-    registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${moduleMath ? ', () => Math' : ''});`);
+    const captureOptions = lifted ? `, ${moduleMath ? '() => Math' : 'null'}, {parameterCount:${parameters.length - lifted.captures.length}, captureCount:${lifted.captures.length}, resolve:() => [${lifted.captures.join(',')}]}`
+      : moduleMath ? ', () => Math' : '';
+    registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${captureOptions});`);
     // An extra block prevents a dangling else from rebinding to our predicate.
     // The original statement (including lexical declarations and comments) is
     // unchanged in the fallback. Capture failures have no source effects.
@@ -382,6 +389,7 @@ export function planNumericLoopIslands(source, {
     for (const edit of nestedEdits) absorbedEdits.add(edit);
     if (nestedCalls.length) item.absorbedCalls = nestedCalls.map(call => ({...call}));
     Object.assign(item, {route:'guarded-loop-wasm', captures:params.map(p => ({...p})),
+      ...(lifted ? {helperCaptures:[...lifted.captures], helperCaptureSemantics:'live-readonly-module-numbers'} : {}),
       ...(stateName ? {scalarOutputs:[...scalarOutputs], scalarOutputSemantics:'mutable-lexical-f64-publication'} : {}),
       ...(outputOnly.size ? {outputOnlyScalars:[...outputOnly]} : {}),
       storageSemantics:'same-type-alias-preserving-v1', guardFallback:'original-loop-in-place',

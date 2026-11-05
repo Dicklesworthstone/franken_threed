@@ -433,17 +433,20 @@ function planNumericStorage(records, refuse) {
  * free closure `() => Math` in the original function/helper lexical environment.
  * It is not a user callback. Omission conservatively refuses native execution.
  * Global/property descriptors are checked without calling application getters.
+ * captureGuard is a compiler-produced, effect-free check of live declarative
+ * helper bindings against the invocation's snapshot. It must not call user code.
  * preserveAliasing opts into shared scratch intervals for same-type aliases.
  * Enable it only for compiler products that preserve ordered memory operations
  * without assuming disjoint parameters. Mixed-type writable overlaps still
  * retain JavaScript. The default keeps the existing independent-prefix ABI.
  */
 export function instantiateNumericKernel(bytes, {
-  fallback = null, maxMemoryBytes = null, resolveMath = null, preserveAliasing = false,
+  fallback = null, maxMemoryBytes = null, resolveMath = null, preserveAliasing = false, captureGuard = null,
 } = {}) {
   if (typeof preserveAliasing !== 'boolean') throw new TypeError('preserveAliasing must be a boolean');
   if (fallback !== null && typeof fallback !== 'function') throw new TypeError('fallback must be a function or null');
   if (resolveMath !== null && typeof resolveMath !== 'function') throw new TypeError('resolveMath must be a function or null');
+  if (captureGuard !== null && typeof captureGuard !== 'function') throw new TypeError('captureGuard must be a function or null');
   if (maxMemoryBytes !== null && (!Number.isSafeInteger(maxMemoryBytes) ||
       maxMemoryBytes < PAGE_BYTES || maxMemoryBytes > MAX_BYTES)) {
     throw new RangeError('maxMemoryBytes must be between 65536 and 1073741824');
@@ -612,6 +615,7 @@ export function instantiateNumericKernel(bytes, {
     try {
       checkArrayIteration();
       checkMath();
+      if (captureGuard && !captureGuard()) refuse('KERNEL_CAPTURE_BINDING', 'A live numeric helper capture changed');
       prepared = prepare(args);
       for (const copy of prepared.inputs) apply(typedSet, copy.target, copy.args);
       // Revalidate after preparation (including a possible host memory.grow).
@@ -619,6 +623,7 @@ export function instantiateNumericKernel(bytes, {
       // arguments require no user coercion and cannot rebind Math mid-call.
       checkMath();
       checkArrayIteration();
+      if (captureGuard && !captureGuard()) refuse('KERNEL_CAPTURE_BINDING', 'A live numeric helper capture changed');
       if (manifest.typedArrayMethods) for (let i = 0; i < manifest.parameters.length; i++) {
         const param = manifest.parameters[i];
         if (param.type !== 'f64') arrayInfo(args[i], param, boundSet.has(i), manifest.typedArrayMethods);

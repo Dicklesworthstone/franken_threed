@@ -222,9 +222,9 @@ test("mutable transitive dependencies are retained, including rebinding during a
   assert.deepEqual(app.diagnostics(), []);
 });
 
-test("captured state, helper closures and direct eval never silently become constants", async (t) => {
+test("mutable captured state, helper closures and direct eval never silently become constants", async (t) => {
   for (const helper of [
-    "function scalar(x){return x+gain;}",
+    "function scalar(x){gain+=1;return x+gain;}",
     "const scalar=(x)=>x+1;",
     "function scalar(x){return this.gain+x;}",
     "function scalar(x){return x[0];}",

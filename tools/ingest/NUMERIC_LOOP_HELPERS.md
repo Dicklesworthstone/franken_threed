@@ -83,6 +83,42 @@ Standalone helper registrations remain lazy for other call sites and exports.
 Reports distinguish `absorbedCalls` from remaining `rewrittenCalls`; an absorbed
 call is not a separate host-to-Wasm transition.
 
+## Live scalar bindings in helpers
+
+Automatic application specialization also supports helpers that read module
+Number bindings, including live imports and transitive helper calls:
+
+```js
+let amplitude = 1;
+function wave(x) { return Math.sin(x) * amplitude; }
+export function configure(value) { amplitude = value; }
+export function update(positions, time) {
+  for (let i = 0; i < positions.length; i++) positions[i] = wave(i + time);
+}
+```
+
+The compiler passes the current `amplitude` through private numeric parameters.
+It reads the binding in the helper's module environment after the original call
+arguments have been evaluated, and refreshes it for every invocation. A caller's
+same-named parameter or local variable cannot replace that binding. The original
+helper and exported function objects, declarations and source text stay intact.
+The same conversion applies to helper graphs inside extracted callback loops;
+ordinary surrounding effects remain at their original boundaries.
+
+Every captured binding must hold a primitive Number and remain read-only for
+the selected region and all reachable helpers. Changes between invocations,
+such as `configure` above, are supported. Writes inside the region, including a
+module `var` loop header, retain JavaScript. Uninitialized or non-number captures
+also retain JavaScript, preserving zero-trip behavior, partial exceptions and
+per-iteration coercions. Guarded preparation rechecks the live values before
+native execution so host reentry cannot publish a stale snapshot.
+
+This conversion reads declarative bindings only. It does not read properties,
+invoke getters, inspect proxies or bake initializer values. Array captures in
+helpers still require explicit helper arguments. Reports identify admitted
+bindings in `helperCaptures`; the raw numeric compiler and standalone kernel
+source API continue to require explicitly closed helper functions.
+
 ## Binding and fallback boundaries
 
 Every root helper call must resolve to the proven immutable module declaration,
@@ -90,9 +126,9 @@ not a same-named callback parameter, catch binding, block function or body var.
 The check includes disjoint inner declarations that could otherwise hide a
 capture. Parameter-initializer and switch-discriminant scope rules are preserved.
 The compiler separately resolves bindings inside the extracted loop and inside
-all helpers. Mutation, recursion, helper captures, reference escape, arbitrary
-object access and unsupported effects refuse the native attempt, not use of the
-application.
+all helpers. Mutable helper identities, recursion, writes to captured bindings,
+unsupported captures, reference escape, arbitrary object access and unsupported
+effects refuse the native attempt, not use of the application.
 
 A helper's `Math` binding belongs to its module; the loop's `Math` can belong to
 a different callback environment. Both used bindings must pass their own live
@@ -106,7 +142,9 @@ to attempt native execution.
 ```sh
 node --test tools/ingest/numeric_loop_helpers.test.mjs \
   tools/ingest/numeric_loop_helper_transactions.test.mjs \
-  tools/ingest/numeric_loop_helpers.integration.test.mjs
+  tools/ingest/numeric_loop_helpers.integration.test.mjs \
+  tools/ingest/numeric_helper_captures.test.mjs \
+  tools/ingest/numeric_helper_capture_runtime.test.mjs
 ```
 
 The tests execute real Wasm in Node and compare against untouched source. They

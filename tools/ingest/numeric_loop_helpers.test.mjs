@@ -188,7 +188,7 @@ test('switch discriminant loops do not borrow a case-block helper binding', asyn
 
 for(const [name,source] of [
   ['mutable helper',`function h(x){return x*2;} export function replace(value){h=value;}`],
-  ['captured helper state',`let offset=3;function h(x){return x+offset;}`],
+  ['mutable captured helper state',`let offset=3;function h(x){offset+=1;return x+offset;}`],
   ['recursive helper',`function h(x){if(x>0)return h(x-1)+1;return 0;}`],
 ]) {
   test(`${name} remains original JavaScript`, async t=>{

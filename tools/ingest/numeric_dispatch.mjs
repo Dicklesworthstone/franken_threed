@@ -7,6 +7,9 @@ import { instantiateNumericKernel, numericArrayIterationIntact } from "./numeric
 
 const apply = Reflect.apply;
 const hasOwn = Object.hasOwn;
+const define = Object.defineProperty;
+const sameValue = Object.is;
+const isArray = Array.isArray;
 const U8Array = Uint8Array;
 const ARRAY_TAGS = Object.freeze({
   "f32[]": "Float32Array", "f64[]": "Float64Array",
@@ -20,13 +23,29 @@ const typedTag = Object.getOwnPropertyDescriptor(
 ).get;
 const records = new WeakMap();
 
-function state(target, bytes, parameterTypes = null, resolveMath = null, preserveAliasing = false) {
+// A guard miss must not expose compiler-added arguments to the source function,
+// or invoke a changed Array iterator/species while reconstructing its arguments.
+function sourceArguments(values, count) {
+  const args = [];
+  for (let i = 0; i < count; i++) define(args, i, {
+    value: values[i], writable: true, enumerable: true, configurable: true,
+  });
+  return args;
+}
+
+function state(target, bytes, parameterTypes = null, resolveMath = null, preserveAliasing = false,
+  captures = null, captureGuard = null) {
   return {
     target,
+    fallback: captures === null ? target : function (...values) {
+      return apply(target, this, sourceArguments(values, captures.parameterCount));
+    },
     bytes,
     parameterTypes,
     resolveMath,
     preserveAliasing,
+    captureGuard,
+    captures,
     attempted: false,
     kernel: null,
     initializationFailure: null,
@@ -44,9 +63,12 @@ function state(target, bytes, parameterTypes = null, resolveMath = null, preserv
  * preserveAliasing is a producer assertion for ALL variants: their loads/stores
  * preserve source order without optimizations assuming disjoint parameters.
  * Storage identity and mixed-type overlap guards still run on each invocation.
+ * captureOptions describes compiler-added read-only scalar parameters. Its
+ * resolver may only read proven declarative bindings in the helper environment;
+ * it is not an application callback. Capture values never become source args.
  */
 export function createNumericDispatch(
-  target, bytes, alternatives = [], resolveMath = null, preserveAliasing = false,
+  target, bytes, alternatives = [], resolveMath = null, preserveAliasing = false, captureOptions = null,
 ) {
   if (typeof preserveAliasing !== "boolean")
     throw new TypeError("preserveAliasing must be a boolean");
@@ -56,6 +78,23 @@ export function createNumericDispatch(
     throw new TypeError("resolveMath must be a function or null");
   if (!Array.isArray(alternatives) || alternatives.length > 16)
     throw new TypeError("Expected at most 16 numeric dispatch alternatives");
+  let captures = null, root;
+  if (captureOptions !== null) {
+    const {parameterCount, captureCount, resolve} = captureOptions;
+    if (!Number.isInteger(parameterCount) || parameterCount < 0 ||
+        !Number.isInteger(captureCount) || captureCount < 1 || parameterCount + captureCount > 64 ||
+        typeof resolve !== 'function') throw new TypeError('Invalid numeric helper capture contract');
+    captures = Object.freeze({parameterCount, captureCount, resolve});
+  }
+  const captureGuard = captures === null ? null : () => {
+    try {
+      const values = captures.resolve();
+      if (!root.captureValues || !isArray(values) || values.length !== captures.captureCount) return false;
+      for (let i = 0; i < values.length; i++)
+        if (typeof values[i] !== 'number' || !sameValue(values[i], root.captureValues[i])) return false;
+      return true;
+    } catch { return false; }
+  };
   const variants = alternatives.map((variant) => {
     if (
       !variant ||
@@ -67,11 +106,16 @@ export function createNumericDispatch(
     ) {
       throw new TypeError("Invalid numeric dispatch alternative ABI");
     }
-    return state(target, variant.bytes, variant.parameterTypes.slice(), resolveMath, preserveAliasing);
+    if (captures && (variant.parameterTypes.length !== captures.parameterCount + captures.captureCount ||
+        variant.parameterTypes.slice(captures.parameterCount).some(type => type !== 'f64')))
+      throw new TypeError('Numeric helper captures require an f64 parameter tail');
+    return state(target, variant.bytes, variant.parameterTypes.slice(), resolveMath, preserveAliasing, captures, captureGuard);
   });
   const token = Object.freeze({});
-  const primary = state(target, bytes, null, resolveMath, preserveAliasing);
-  records.set(token, { primary, variants, selected: primary, identityMisses: 0 });
+  const primary = state(target, bytes, null, resolveMath, preserveAliasing, captures, captureGuard);
+  root = { primary, variants, selected: primary, identityMisses: 0,
+    captures, active: false, captureValues: null, captureMisses: 0, reentrantMisses: 0 };
+  records.set(token, root);
   return token;
 }
 
@@ -99,6 +143,34 @@ export function dispatchNumericCall(token, callee, args) {
     if (root) root.identityMisses++;
     return apply(callee, undefined, args);
   }
+  if (!root.captures) return executeNumericCall(root, callee, args);
+  if (root.active) {
+    root.reentrantMisses++;
+    root.primary.retainedCalls++;
+    return apply(callee, undefined, args);
+  }
+  root.active = true;
+  try {
+    let captures;
+    try {
+      if (args.length !== root.captures.parameterCount || !numericArrayIterationIntact()) throw null;
+      captures = root.captures.resolve();
+      if (!isArray(captures) || captures.length !== root.captures.captureCount) throw null;
+      for (let i = 0; i < captures.length; i++) if (typeof captures[i] !== 'number') throw null;
+    } catch {
+      root.captureMisses++;
+      root.primary.retainedCalls++;
+      return apply(callee, undefined, args);
+    }
+    root.captureValues = captures;
+    return executeNumericCall(root, callee, [...args, ...captures]);
+  } finally {
+    root.captureValues = null;
+    root.active = false;
+  }
+}
+
+function executeNumericCall(root, callee, args) {
   const record =
     root.variants.find((variant) => matches(variant.parameterTypes, args)) ?? root.primary;
   root.selected = record;
@@ -107,20 +179,24 @@ export function dispatchNumericCall(token, callee, args) {
     // or reading the manifest. Leave registration retryable after restoration.
     if (!numericArrayIterationIntact()) {
       record.retainedCalls++;
-      return apply(callee, undefined, args);
+      return apply(record.fallback, undefined, args);
     }
     // Set before initialization: host policy hooks may reenter the application.
     record.attempted = true;
     try {
       const kernel = instantiateNumericKernel(new U8Array(record.bytes), {
-        fallback: record.target,
+        fallback: record.fallback,
         resolveMath: record.resolveMath,
         preserveAliasing: record.preserveAliasing,
+        captureGuard: record.captureGuard,
       });
       if (
-        record.parameterTypes &&
+        (record.parameterTypes &&
         (kernel.manifest.parameters.length !== record.parameterTypes.length ||
-          kernel.manifest.parameters.some((param, i) => param.type !== record.parameterTypes[i]))
+          kernel.manifest.parameters.some((param, i) => param.type !== record.parameterTypes[i]))) ||
+        (record.captures && (kernel.manifest.parameters.length !==
+          record.captures.parameterCount + record.captures.captureCount ||
+          kernel.manifest.parameters.slice(record.captures.parameterCount).some(param => param.type !== 'f64')))
       ) {
         kernel.dispose();
         throw new TypeError("Dispatch alternative does not match its embedded Wasm ABI");
@@ -134,7 +210,7 @@ export function dispatchNumericCall(token, callee, args) {
   }
   if (record.kernel) return apply(record.kernel.run, undefined, args);
   record.retainedCalls++;
-  return apply(callee, undefined, args);
+  return apply(record.fallback, undefined, args);
 }
 
 /** Diagnostics are opt-in; generated applications do not gain new exports. */
@@ -147,6 +223,7 @@ export function numericDispatchDiagnostics(token) {
     initializationFailure: root.selected.initializationFailure,
     retainedCalls: all.reduce((count, record) => count + record.retainedCalls, 0),
     identityMisses: root.identityMisses,
+    ...(root.captures ? {captureMisses: root.captureMisses, reentrantMisses: root.reentrantMisses} : {}),
     kernel: root.selected.kernel?.diagnostics ?? null,
     variants: Object.freeze(
       all.map((record) =>
@@ -214,7 +291,7 @@ const loopRecords = new WeakMap();
  * module environment. The per-invocation resolver remains in the loop's own
  * lexical environment; neither binding is read until a guarded native attempt.
  */
-export function createNumericLoopDispatch(bytes, alternatives = [], resolveHelperMath = null) {
+export function createNumericLoopDispatch(bytes, alternatives = [], resolveHelperMath = null, captureOptions = null) {
   if (resolveHelperMath !== null && typeof resolveHelperMath !== "function")
     throw new TypeError("resolveHelperMath must be a function or null");
   const record = { active: false, resolveMath: null, captureMisses: 0, reentrantMisses: 0 };
@@ -230,7 +307,7 @@ export function createNumericLoopDispatch(bytes, alternatives = [], resolveHelpe
       if (resolveHelperMath === null) return local;
       const helper = resolveHelperMath();
       return record.resolveMath === null || local === helper ? helper : undefined;
-    }, true);
+    }, true, captureOptions);
   const token = Object.freeze({});
   loopRecords.set(token, record);
   return token;
@@ -267,8 +344,10 @@ export function dispatchNumericLoop(token, resolveCaptures, resolveMath = null) 
 export function numericLoopDispatchDiagnostics(token) {
   const record = loopRecords.get(token);
   if (!record) throw new TypeError("Unknown numeric loop dispatch token");
-  return Object.freeze({ ...numericDispatchDiagnostics(record.dispatch),
-    captureMisses: record.captureMisses, reentrantMisses: record.reentrantMisses });
+  const diagnostics = numericDispatchDiagnostics(record.dispatch);
+  return Object.freeze({ ...diagnostics,
+    captureMisses: record.captureMisses + (diagnostics.captureMisses ?? 0),
+    reentrantMisses: record.reentrantMisses + (diagnostics.reentrantMisses ?? 0) });
 }
 
 // Scalar outputs travel through an owned f64 channel. The compiler publishes

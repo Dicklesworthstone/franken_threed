@@ -28,7 +28,8 @@ import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
 import { hasNumericLoop, discoverNumericArrayParameters } from "./numeric_loop_discovery.mjs";
 import { discoverNumericStorageHints } from "./numeric_storage_hints.mjs";
-import { planNumericLoopIslands } from "./numeric_loop_islands.mjs";
+import { planNumericLoopIslands, numericLoopScopeBindings } from "./numeric_loop_islands.mjs";
+import { createNumericHelperCapturePlanner } from "./numeric_helper_captures.mjs";
 
 function span(node) {
   return {
@@ -301,6 +302,10 @@ export function specializeNumericModule(
     names.add(name);
     return name;
   }
+  const helperCapturePlan = createNumericHelperCapturePlanner({
+    source, ast, tokens, helperSources, helperDeclarations, fresh,
+    bindings: numericLoopScopeBindings(),
+  });
   const createName = fresh("create"),
     dispatchName = fresh("dispatch");
   const edits = [],
@@ -372,12 +377,17 @@ export function specializeNumericModule(
     // a subscript itself. Infer those slots across argument positions, then
     // demand the same whole-graph compiler proof and per-invocation guards.
     const arrays = discoverNumericArrayParameters(fn, helperDeclarations);
-    const parameterTypes = fn.params.map((param) => (arrays.has(param.name) ? "f64[]" : "f64"));
+    const lifted = helperCapturePlan(fn);
+    if (lifted?.refusal) { item.reason = lifted.refusal; continue; }
+    const parameterTypes = [...fn.params.map((param) => (arrays.has(param.name) ? "f64[]" : "f64")),
+      ...(lifted?.parameters.map(() => "f64") ?? [])];
+    const kernelSource = lifted ? lifted.rewrite() : source.slice(fn.start, fn.end);
+    const candidateHelpers = lifted?.helperSources ?? helperSources;
     let artifact;
     try {
-      artifact = compileNumericCandidate(source.slice(fn.start, fn.end), {
+      artifact = compileNumericCandidate(kernelSource, {
         parameterTypes,
-        helperSources,
+        helperSources: candidateHelpers,
         allowMath: true,
         sourceName: `${sourceName}:${fn.id.name}`,
         maxMemoryPages,
@@ -427,9 +437,9 @@ export function specializeNumericModule(
       if (seenLayouts.has(types.join(","))) continue;
       seenLayouts.add(types.join(","));
       try {
-        const variant = compileNumericCandidate(source.slice(fn.start, fn.end), {
+        const variant = compileNumericCandidate(kernelSource, {
           parameterTypes: types,
-          helperSources,
+          helperSources: candidateHelpers,
           allowMath: true,
           sourceName: `${sourceName}:${fn.id.name}`,
           maxMemoryPages,
@@ -454,8 +464,9 @@ export function specializeNumericModule(
     // Assert that producer contract for all AOT variants, not a guessed lack of
     // aliases. Future no-alias optimizations must not reuse this assertion.
     const mathResolver = artifact.manifest.mathIntrinsics ? "() => Math" : "null";
+    const captureOptions = lifted ? `, {parameterCount:${fn.params.length}, captureCount:${lifted.captures.length}, resolve:() => [${lifted.captures.join(",")}]}` : "";
     registrations.push(
-      `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true);`,
+      `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`,
     );
     helpers.push(
       `function ${helperName}(callee, ...args) { return ${dispatchName}(${tokenName}, callee, args); }`,
@@ -472,6 +483,10 @@ export function specializeNumericModule(
     }
     item.route = "guarded-numeric-wasm";
     item.parameterTypes = parameterTypes;
+    if (lifted) {
+      item.helperCaptures = [...lifted.captures];
+      item.helperCaptureSemantics = "live-readonly-module-numbers";
+    }
     if (artifact.manifest.typedArrayMethods)
       item.typedArrayMethods = [...artifact.manifest.typedArrayMethods];
     if (artifact.manifest.mathIntrinsics)
@@ -488,6 +503,8 @@ export function specializeNumericModule(
       // Each helper was parsed in its OWN source slice. Never attribute its
       // loops to the root's coordinates; keep helper identity in the report.
       item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan, functionName }) => {
+        if (lifted) return {kind, depth, ...(functionName ? {functionName} : {}),
+          sourceSpan: lifted.originalSpan(functionName, sourceSpan)};
         const owner = functionName ? helperSpans.get(functionName) : span(fn);
         return {
           kind, depth, ...(functionName ? { functionName } : {}),
@@ -552,7 +569,7 @@ export function specializeNumericModule(
   if (loopIslands) {
     const planned = planNumericLoopIslands(source, {
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
-      maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations,
+      maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations, helperCapturePlan,
       replaceableCalls: report.candidates.flatMap(item => item.calls),
       excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
     });
