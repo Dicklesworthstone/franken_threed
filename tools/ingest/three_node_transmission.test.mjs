@@ -1,4 +1,4 @@
-/** Physical transmission keeps the exact r186 construction and NodeFrame copy
+/** Backdrops and physical transmission keep exact r186 construction and NodeFrame copy
  * boundary. These tests establish source WGSL/capture behavior, not GPU pixels. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -6,7 +6,9 @@ import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 const N = THREE.TSL;
 
-function fixture(t, Material = THREE.MeshPhysicalNodeMaterial) {
+function fixture(t, Material = THREE.MeshPhysicalNodeMaterial, parameters = {
+  transmission: .75, thickness: .375, roughness: .25, ior: 1.5,
+  attenuationDistance: 3.5, attenuationColor: new THREE.Color(.125, .5, .875)}) {
   let target = null;
   const copies = [], canvas = {width: 32, height: 24, getDrawingBufferSize(value) { return value.set(this.width, this.height); }};
   const renderer = {library: new THREE.StandardNodeLibrary(), contextNode: N.context(),
@@ -22,8 +24,7 @@ function fixture(t, Material = THREE.MeshPhysicalNodeMaterial) {
       ? {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}} : null}),
     getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: new THREE.NodeFrame()}, info: {calls: 1}};
   const programs = createThreeNodePrograms({three: THREE, renderer}); t.after(() => programs.dispose());
-  const material = new Material({transmission: .75, thickness: .375, roughness: .25, ior: 1.5,
-    attenuationDistance: 3.5, attenuationColor: new THREE.Color(.125, .5, .875)});
+  const material = new Material(parameters);
   const object = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 6), material), scene = new THREE.Scene();
   const light = new THREE.AmbientLight(0xffffff, .5); scene.add(object, light);
   const camera = new THREE.PerspectiveCamera(50, 4 / 3, .1, 30); camera.position.z = 4;
@@ -46,6 +47,49 @@ function map() {
   const value = new THREE.DataTexture(new Uint8Array([128, 64, 192, 255]), 1, 1);
   value.minFilter = value.magFilter = THREE.LinearFilter; return value;
 }
+
+for (const Material of [THREE.MeshBasicNodeMaterial, THREE.MeshStandardNodeMaterial, THREE.MeshPhysicalNodeMaterial])
+for (const blend of [false, true]) test(`${Material.name} backdrop lighting and alpha retain exact source WGSL and viewport update frequency, blend=${blend}`, t => {
+  const f = fixture(t, Material, {transparent: true, opacity: .3125}), viewport = N.viewportSharedTexture();
+  if (Material === THREE.MeshBasicNodeMaterial) {
+    f.scene.remove(...f.context.lights); f.context.lights = [];
+  }
+  const factor = N.uniform(.625).setName('backdropMix');
+  f.material.backdropNode = viewport.rgb.oneMinus();
+  if (blend) f.material.backdropAlphaNode = factor;
+  const descriptor = f.compile(); sourceGraph(f, descriptor);
+  assert.equal(f.copies.length, 0, 'construction must not capture the framebuffer');
+  const first = f.programs.captureDraw(descriptor, f.context);
+  assert.equal(f.copies.length, 1); assert.ok(sampled(first).includes(viewport.value));
+  assert.ok(values(first).includes(.3125), 'material opacity stays independent from backdrop mixing');
+  if (blend) assert.ok(values(first).includes(.625));
+  f.programs.captureDraw(descriptor, f.context);
+  assert.equal(f.copies.length, 1, 'one shared node copies once in the same source render');
+  const saved = first.uniforms.map(bytes => bytes.slice()); factor.value = .8125;
+  assert.equal(f.compile(), descriptor, 'a live backdrop factor does not rebuild the shader');
+  const second = f.programs.captureDraw(descriptor, {...f.context, renderId: 2});
+  assert.equal(f.copies.length, 2); if (blend) assert.ok(values(second).includes(.8125));
+  assert.deepEqual(first.uniforms, saved);
+});
+
+test('backdrop graph replacement invalidates source programs and checks nested resources before callbacks', t => {
+  const f = fixture(t, THREE.MeshBasicNodeMaterial, {}); let updates = 0;
+  f.scene.remove(...f.context.lights); f.context.lights = [];
+  f.material.backdropNode = N.uniform(new THREE.Color(.25, .5, .75)).onObjectUpdate(() => { updates++; });
+  const descriptor = f.compile(); f.programs.captureDraw(descriptor, f.context);
+  f.material.backdropAlphaNode = N.float(.5);
+  assert.throws(() => f.programs.captureDraw(descriptor, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 1);
+  const next = f.compile(); assert.notEqual(next, descriptor); sourceGraph(f, next);
+  const storage = N.storage(new THREE.StorageBufferAttribute(1, 4), 'vec4', 1);
+  for (const slot of ['backdropNode', 'backdropAlphaNode']) {
+    const previous = f.material[slot];
+    f.material[slot] = N.Fn(() => { storage.element(0).assign(N.vec4(1)); return N.float(1); })();
+    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_STORAGE'});
+    assert.equal(updates, 1); f.material[slot] = previous;
+  }
+  assert.equal(f.copies.length, 0);
+});
 
 for (const Material of [THREE.MeshPhysicalMaterial, THREE.MeshPhysicalNodeMaterial]) {
   for (const side of [THREE.FrontSide, THREE.BackSide]) {

@@ -2,11 +2,20 @@
  * Copies, clears and uniform bytes are observed; WGSL is not rasterized here. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {registerHooks} from 'node:module';
 import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {RectAreaLightTexturesLib} from './fixtures/three_rect_area_light.mjs';
 const N = THREE.TSL;
+const upstream = new URL('../../upstream/three.js/', import.meta.url);
+const addonHook = registerHooks({resolve(specifier, context, next) {
+  return next(specifier === 'three/tsl' && context.parentURL?.startsWith(upstream.href)
+    ? new URL('build/three.tsl.js', upstream).href : specifier, context);
+}});
+let hashBlur;
+try { ({hashBlur} = await import(new URL('examples/jsm/tsl/display/hashBlur.js', upstream))); }
+finally { addonHook.deregister(); }
 
 async function fixture(t, options = {}) {
   const device = geometryDevice(), events = [], textures = [];
@@ -34,7 +43,8 @@ async function fixture(t, options = {}) {
       },
       copyTextureToTexture(source, destination, size) {
         assert.ok(source.texture.usage & 1); assert.ok(destination.texture.usage & 2);
-        assert.equal(source.texture.sampleCount, 1); assert.equal(source.texture.format, destination.texture.format);
+        assert.equal(source.texture.sampleCount, source.texture.format.startsWith('depth') ? destination.texture.sampleCount : 1);
+        assert.equal(source.texture.format, destination.texture.format);
         commands.push({copy: true, source, destination, size, draws: [], label: descriptor?.label});
       }, finish() { return commands; }};
   };
@@ -68,6 +78,125 @@ const copies = events => events.filter(event => event.copy);
 const sampled = draw => [...draw.groups.values()].flatMap(({group}) => group.entries ?? [])
   .map(entry => entry.resource?.texture).filter(Boolean);
 const uniformValues = draw => [...draw.contents.values()].flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
+
+for (const sharedNode of [false, true]) test(`backdrops copy the preceding draw prefix and keep source transparent ordering, sharedNode=${sharedNode}`, async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const firstViewport = N.viewportSharedTexture(), secondViewport = sharedNode ? firstViewport : N.viewportSharedTexture();
+  assert.equal(firstViewport.value, secondViewport.value, 'source nodes share their public framebuffer image');
+  const first = new THREE.MeshBasicNodeMaterial();
+  first.backdropNode = firstViewport.rgb.oneMinus().mul(N.uniform(.625).setName('portalA'));
+  first.backdropAlphaNode = N.uniform(.375).setName('portalMix');
+  f.mesh(first).renderOrder = 1;
+  const second = new THREE.MeshBasicNodeMaterial({transparent: true, side: THREE.DoubleSide, opacity: .75});
+  second.backdropNode = secondViewport.rgb.mul(N.uniform(.875).setName('portalB'));
+  f.mesh(second).renderOrder = 3;
+  const alpha = new THREE.MeshBasicNodeMaterial({transparent: true, opacity: .5});
+  alpha.colorNode = N.uniform(new THREE.Color(.25, .5, .75)).setName('middleAlpha');
+  f.mesh(alpha).renderOrder = 2;
+  f.mesh(new THREE.MeshBasicMaterial({color: 0x804020}));
+  renderer.render(scene, camera); await renderer.waitForGPU();
+  const order = [];
+  for (const event of f.events) {
+    if (event.copy) order.push('copy');
+    else for (const draw of event.draws.filter(draw => draw.indexed)) {
+      const name = ['portalA', 'portalB', 'middleAlpha'].find(name => code(draw).includes(name)) ?? 'opaque';
+      order.push(name === 'portalB' ? name + ':' + draw.pipeline.primitive.frontFace : name);
+    }
+  }
+  assert.deepEqual(order, ['opaque', 'copy', 'portalA', 'middleAlpha', ...(sharedNode ? [] : ['copy']), 'portalB:cw', 'portalB:ccw']);
+  const recorded = copies(f.events), draws = meshDraws(f.events);
+  assert.ok(sampled(draws[1]).includes(recorded[0].destination.texture));
+  for (const draw of draws.slice(3)) assert.ok(sampled(draw).includes(recorded.at(-1).destination.texture));
+  assert.equal(first.transparent, false); assert.equal(second.side, THREE.DoubleSide);
+  assert.equal(renderer._nodeCaptureBytes, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
+test('queued backdrop frames retain framebuffer extents, alpha uniforms and target ownership across destinations', async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const viewport = N.viewportSharedTexture(), alpha = N.uniform(.1875).setName('backdropAlpha');
+  const material = new THREE.MeshStandardNodeMaterial({transparent: true});
+  material.backdropNode = viewport.rgb.oneMinus(); material.backdropAlphaNode = alpha;
+  f.mesh(material); const target = new THREE.RenderTarget(16, 16, {type: THREE.HalfFloatType});
+  const second = new THREE.RenderTarget(8, 8, {type: THREE.HalfFloatType});
+  t.after(() => { target.dispose(); second.dispose(); }); renderer.setRenderTarget(target);
+  renderer.render(scene, camera);
+  alpha.value = .8125; renderer.setRenderTarget(second); renderer.render(scene, camera);
+  renderer.setRenderTarget(null); await renderer.waitForGPU();
+  const recorded = copies(f.events), draws = f.device.snapshots.flat().filter(draw => code(draw).includes('backdropAlpha'));
+  assert.deepEqual(recorded.map(copy => [copy.size.width, copy.size.height]), [[16, 16], [8, 8]]);
+  assert.equal(draws.length, 2); assert.notEqual(recorded[0].destination.texture, recorded[1].destination.texture);
+  for (const [index, draw] of draws.entries()) {
+    assert.ok(sampled(draw).includes(recorded[index].destination.texture));
+    assert.ok(uniformValues(draw).includes(index ? .8125 : .1875));
+    assert.ok(!uniformValues(draw).includes(index ? .1875 : .8125));
+  }
+  assert.equal(renderer._targets.capture(target).references, 0);
+  assert.equal(renderer._targets.capture(second).references, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
+for (const samples of [0, 4]) test(`depth-based backdrop blur retains color and depth copy boundaries across canvas resize, samples=${samples}`, async t => {
+  const f = await fixture(t, {samples}), {renderer, scene, camera} = f;
+  const distance = N.viewportLinearDepth.distance(N.linearDepth());
+  const material = new THREE.MeshBasicNodeMaterial({transparent: true});
+  material.backdropNode = hashBlur(N.viewportSharedTexture(), distance.smoothstep(0, .6).mul(.1));
+  material.backdropAlphaNode = N.checker(N.uv().mul(3)); material.opacityNode = material.backdropAlphaNode;
+  f.mesh(new THREE.MeshBasicMaterial({color: 0x804020})); f.mesh(material).renderOrder = 1;
+  await renderer.compileAsync(scene, camera); assert.equal(copies(f.events).length, 0);
+  for (const size of [16, 8]) {
+    renderer.setSize(size, size); const begin = f.events.length;
+    renderer.render(scene, camera); await renderer.waitForGPU();
+    const events = f.events.slice(begin), copied = copies(events);
+    // The pinned addon registers the original shared-color node and its sample
+    // clone separately; NodeFrame updates color, depth, then color again.
+    assert.deepEqual(copied.map(copy => copy.source.texture.format.startsWith('depth') ? 'depth' : 'color'),
+      ['color', 'depth', 'color']);
+    const [color, depth, sampledColor] = copied;
+    assert.equal(color.destination.texture, sampledColor.destination.texture);
+    assert.ok(color); assert.ok(depth); assert.equal(depth.source.texture.sampleCount, samples || 1);
+    for (const copy of copied) {
+      assert.deepEqual([copy.size.width, copy.size.height], [size, size]);
+      assert.equal(meshDraws(events.slice(0, events.indexOf(copy))).length, 1);
+    }
+    const blur = meshDraws(events).at(-1);
+    assert.ok(sampled(blur).includes(color.destination.texture));
+    assert.ok(sampled(blur).includes(depth.destination.texture));
+    assert.match(code(blur), samples ? /texture_depth_multisampled_2d/ : /texture_depth_2d/);
+    assert.ok((code(blur).match(/textureLoad\(/g) ?? []).length >= 2);
+    assert.equal(renderer._nodeCaptureBytes, 0);
+    const diagnostics = renderer._getSampledTextureInputs().diagnostics;
+    assert.equal(diagnostics.framebuffers.bindings, 0); assert.equal(diagnostics.depth.bindings, 0);
+  }
+});
+
+for (const cancelRenderer of [false, true]) test(`backdrop preparation releases copy leases on ${cancelRenderer ? 'renderer' : 'texture'} disposal without late submission`, async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const viewport = N.viewportSharedTexture(), material = new THREE.MeshBasicNodeMaterial();
+  material.backdropNode = viewport.rgb.mul(N.uniform(.625).setName('heldBackdrop')); f.mesh(material);
+  let release, issued;
+  const gate = new Promise(resolve => { release = resolve; }), ready = new Promise(resolve => { issued = resolve; });
+  const compile = f.device.createRenderPipelineAsync;
+  f.device.createRenderPipelineAsync = descriptor => {
+    if (descriptor.fragment?.module.code.includes('heldBackdrop')) { issued(); return gate.then(() => compile(descriptor)); }
+    return compile(descriptor);
+  };
+  t.after(() => release());
+  const pending = renderer.renderAsync(scene, camera); pending.catch(() => {});
+  await Promise.race([ready, pending.then(() => assert.fail('Backdrop compilation did not use its native pipeline'))]);
+  const inputs = renderer._getSampledTextureInputs();
+  assert.ok(inputs.diagnostics.framebuffers.bindings > 0); assert.equal(copies(f.events).length, 0);
+  if (cancelRenderer) {
+    await renderer.dispose();
+    await assert.rejects(pending, {code: 'GPU_CANVAS_ABORTED'});
+  } else {
+    viewport.value.dispose(); release();
+    await assert.rejects(pending, {code: 'THREE_FRAMEBUFFER_TEXTURE_STALE'});
+  }
+  assert.equal(inputs.diagnostics.framebuffers.bindings, 0); assert.equal(renderer._nodeCaptureBytes, 0);
+  release(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(copies(f.events).length, 0); assert.equal(meshDraws(f.events).length, 0);
+});
 
 test('ordinary Physical transmission submits opaque color, one copy and mips, then native glass', async t => {
   const f = await fixture(t), {renderer, scene, camera} = f;

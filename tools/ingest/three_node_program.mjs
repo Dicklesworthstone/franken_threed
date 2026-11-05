@@ -25,8 +25,9 @@
  * Named MRT outputs share native attachments and retain source graph construction.
  * ClippingGroup planes retain source union/intersection and alpha-to-coverage
  * composition. Physical transmission and dispersion retain source framebuffer
- * nodes and require the renderer's ordered scene-color copy owner. Fragment
- * integer atomics share compute storage. VSM retains the source moment and blur passes.
+ * nodes and require the renderer's ordered scene-color copy owner. Backdrop
+ * graphs retain source diffuse/alpha composition and per-node viewport copies.
+ * Fragment integer atomics share compute storage. VSM retains the source moment and blur passes.
  * capture() is a logical-draw operation, never a
  * preparation retry: it runs source before/current updates and owns the bytes.
  * after() belongs after that draw has been accepted. Callers capture before any
@@ -49,7 +50,8 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
-const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode', 'geometryNode']);
+const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode', 'geometryNode',
+  'backdropNode', 'backdropAlphaNode']);
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
 const POINT_SLOTS = new Set(['sizeNode']);
 const DASH_SLOTS = new Set(['offsetNode', 'dashScaleNode', 'dashSizeNode', 'gapSizeNode']);
@@ -924,6 +926,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const node = material.geometryNode;
     return node == null ? null : JSON.stringify([sourceId(node), node.getCacheKey()]);
   }
+  function backdropSignature(material) {
+    if (material.backdropNode == null && material.backdropAlphaNode == null) return null;
+    return JSON.stringify(['backdropNode', 'backdropAlphaNode'].map(key => {
+      const node = material[key];
+      return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
+    }));
+  }
   function inspectCompute(node) {
     const source = three.ComputeNode?.prototype;
     if (!source || Object.getPrototypeOf(node) !== source ||
@@ -1243,6 +1252,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
+    const backdropKey = backdropSignature(preparedMaterial);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
     let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
@@ -1337,6 +1347,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native subsurface scattering graphs changed during source construction');
     if (geometrySignature(prepareMaterial(material)) !== geometryKey)
       fail('CHANGED', 'Native geometry graph changed during source construction');
+    if (backdropSignature(prepareMaterial(material)) !== backdropKey)
+      fail('CHANGED', 'Native backdrop graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
     if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
@@ -1548,7 +1560,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       spriteSignature: spriteSignature(preparedMaterial, object),
       wideLineSignature: wideLineSignature(preparedMaterial),
       volumeSignature: volumeKey,
-      sssSignature: sssKey, geometrySignature: geometryKey,
+      sssSignature: sssKey, geometrySignature: geometryKey, backdropSignature: backdropKey,
       instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
@@ -1881,6 +1893,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (geometrySignature(prepareMaterial(state.material)) !== state.geometrySignature)
       fail('CHANGED', 'Native geometry graph changed; compile the source geometry constructor again');
   }
+  function checkBackdrop(state) {
+    if (backdropSignature(prepareMaterial(state.material)) !== state.backdropSignature)
+      fail('CHANGED', 'Native backdrop or alpha graph changed; compile the material graph again');
+  }
   function checkSSS(state) {
     if (sssSignature(prepareMaterial(state.material)) !== state.sssSignature)
       fail('CHANGED', 'Native subsurface thickness graphs changed; compile the SSS graph again');
@@ -1921,6 +1937,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     checkVolume(state);
     checkSSS(state);
     checkGeometry(state);
+    checkBackdrop(state);
     checkPipelineContext(state, object);
     checkFog(state, context);
     checkEnvironment(state, context);
@@ -2012,6 +2029,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkVolume(state);
       checkSSS(state);
       checkGeometry(state);
+      checkBackdrop(state);
       checkAttributes(state);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -2042,6 +2060,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkVolume(state);
       checkSSS(state);
       checkGeometry(state);
+      checkBackdrop(state);
       checkClipping(state, context);
       checkWireframe(state);
       const textures = readTextures(state);

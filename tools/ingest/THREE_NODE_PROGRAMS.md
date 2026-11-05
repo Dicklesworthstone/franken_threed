@@ -510,6 +510,38 @@ each in Chrome 151.0.7922.34 / SwiftShader, with visible nonconstant output, liv
 changes and zero GPU/browser errors. These software-GPU comparisons establish
 the tested rendering behavior; hardware performance remains unmeasured.
 
+### Native material backdrops
+
+`backdropNode` and `backdropAlphaNode` use the pinned NodeMaterial and
+WGSLNodeBuilder construction, including the graphs authored by
+`webgpu_backdrop.html` and `webgpu_backdrop_area.html`. In lit materials, the
+backdrop replaces or mixes the diffuse lighting contribution while the source
+retains specular and emissive composition. `backdropAlphaNode` controls that mix;
+ordinary opacity and `opacityNode` remain separate source inputs.
+
+Backdrop materials enter the source transparent list even when their public
+`transparent` flag is false. Shared viewport nodes copy the preceding draw span
+at their own RENDER updates: different nodes sharing one framebuffer still copy
+at their individual object boundaries, while reuse of the exact same node keeps
+source deduplication. The unchanged source `hashBlur` addon retains its original
+and cloned color updates around the depth snapshot. Existing color/depth owners
+preserve queued texture generations, uniform bytes, target leases and resized
+canvas extents, including multisampled depth. Compilation performs no copies;
+failed or cancelled preparation releases its leases without late submission.
+
+Backdrop and alpha graph identity/cache-key changes invalidate an old descriptor
+before callbacks and are checked again after source construction and updates.
+Live uniform values continue to reuse the source program. Both slots participate
+in the existing nested resource checks, including graphics storage-write
+rejection.
+
+Six Basic/Standard/Physical cases compare source WGSL byte for byte, with and
+without alpha mixing. Eight further regressions cover graph replacement, nested
+resources, transparent draw prefixes, shared-node deduplication, queued targets,
+the pinned depth-based hash blur across resize and MSAA, and disposal during
+pipeline preparation. These are source and recording-device checks; browser
+pixel parity and hardware performance remain unmeasured for this feature.
+
 ### Native transmission and viewport snapshots
 
 Ordinary and Node Physical materials execute the pinned transmission, dispersion
