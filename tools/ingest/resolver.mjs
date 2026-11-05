@@ -13,7 +13,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
-import { resolveInstalledPackage, resolvePackageBrowserMapping, resolveCommonJSFile } from "./node_package_resolver.mjs";
+import { resolveInstalledPackage, resolveInstalledPackageIfPresent, resolvePackageBrowserMapping, resolveCommonJSFile } from "./node_package_resolver.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
@@ -279,7 +279,7 @@ export function clearPackageJsonCache() {
  * @param {string} referrerUrl - Canonical URL of importing module
  * @param {{ imports?: Record<string, string | null>, scopes?: Record<string, Record<string, string | null>> }} [importMap]
  * @param {Object} [options]
- * @param {string} [options.packageRootUrl] - Base URL for Three.js package fallback
+ * @param {string} [options.packageRootUrl] - Explicit Three.js package override; otherwise use the application's installed package before the pinned fallback
  * @param {string} [options.mapBaseUrl] - Base URL for import map resolution
  * @param {{ line: number, column: number, offset: number } | null} [options.span]
  * @returns {string} - Canonical resolved file URL
@@ -303,7 +303,8 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
 
   // 1. Try import map
   const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl);
-  const browserTarget = mapped || specifier === "three" || specifier.startsWith("three/")
+  const threePackage = specifier === "three" || specifier.startsWith("three/");
+  const browserTarget = mapped || (threePackage && options.packageRootUrl)
     ? null : resolvePackageBrowserMapping(specifier, referrerUrl, packageOptions);
   if (mapped) {
     if (typeof mapped === "object" && mapped.blocked) {
@@ -339,8 +340,15 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
         span,
       );
     }
-  } else if (specifier === "three" || specifier.startsWith("three/")) {
-    // 4. Pinned Three.js package resolution via package.json exports map
+  } else if (threePackage) {
+    // Preserve the application's actual installed version and package instance.
+    // Explicit overrides remain deliberate pin choices; an absent installation
+    // can use the compiler checkout, but a selected package's errors cannot.
+    if (!options.packageRootUrl && new URL(referrerUrl).protocol === "file:") {
+      const installed = resolveInstalledPackageIfPresent(specifier, referrerUrl, packageOptions);
+      if (installed !== null) return installed;
+    }
+    // 4. Explicit or fallback Three.js package via its exports map.
     let pkgRootDir;
     let pkgRootUrl;
     if (options.packageRootUrl) {

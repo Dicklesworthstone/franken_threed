@@ -1,5 +1,5 @@
 /** Local installed-package resolution for application ingestion.
- * Import maps and the pinned Three.js override are handled by the caller first.
+ * Import maps and explicit Three.js overrides are handled by the caller first.
  * Never downloads packages or uses global npm paths. CommonJS requires an
  * explicit compiler admission from the caller; raw browser sources stay ESM.
  * Package exports are authoritative, including failures in the nearest package.
@@ -53,6 +53,13 @@ export function resolveInstalledPackage(specifier, referrerUrl, options = {}) {
   return resolvePackageRequest(specifier, referrerUrl, options, false);
 }
 
+/** A compiler fallback is legal only when no package was selected. Missing
+ * exports, files or formats in an installed package still throw their original
+ * error; they never authorize silently substituting another implementation. */
+export function resolveInstalledPackageIfPresent(specifier, referrerUrl, options = {}) {
+  return resolvePackageRequest(specifier, referrerUrl, options, false, true);
+}
+
 /** Apply only the importing package's browser object. Import maps and the
  * Three.js pin remain the caller's responsibility. Null means no replacement. */
 export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {}) {
@@ -64,7 +71,7 @@ export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {
 function resolvePackageRequest(specifier, referrerUrl, {
   span = null, resolveExternal = null, browserSkip = null, browserTrail = [], _moduleSources = null,
   requestKind = 'import', allowCommonJS = false,
-} = {}, browserOnly) {
+} = {}, browserOnly, missingPackageIsNull = false) {
   const conditions = ['browser', requestKind, 'default'];
   const fail = (code, message) => {
     const error = new IngestionResolutionError(
@@ -288,5 +295,6 @@ function resolvePackageRequest(specifier, referrerUrl, {
     if (parent === directory) break;
     directory = parent;
   }
+  if (missingPackageIsNull) return null;
   fail("ERR_MODULE_NOT_FOUND", `No import map match and no installed package "${name}" reachable from the referrer`);
 }

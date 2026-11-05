@@ -973,6 +973,72 @@ export { THREE, OrbitControls };
   );
 });
 
+test("Installed Three.js keeps import-map and explicit package overrides ahead of local browser choices", () => {
+  const scratch = makeScratchDir("f3d_installed_three_precedence");
+  const files = {
+    "entry.mjs": "",
+    "node_modules/three/package.json": JSON.stringify({name: "three", type: "module", exports: {
+      ".": {import: "./selected.mjs", require: "./selected.cjs"}, "./webgpu": "./selected.mjs",
+    }}),
+    "node_modules/three/selected.mjs": "export const selected = 'installed';",
+    "node_modules/three/selected.cjs": "module.exports = 'installed require';",
+    "override/package.json": JSON.stringify({name: "three", type: "module", exports: {".": "./selected.mjs"}}),
+    "override/selected.mjs": "export const selected = 'override';",
+    "mapped.mjs": "export const selected = 'mapped';",
+    "browser/package.json": JSON.stringify({type: "module", browser: {three: "./selected.mjs"}}),
+    "browser/entry.mjs": "",
+    "browser/selected.mjs": "export const selected = 'browser';",
+  };
+  for (const [name, source] of Object.entries(files)) {
+    const filename = path.join(scratch, name);
+    fs.mkdirSync(path.dirname(filename), {recursive: true});
+    fs.writeFileSync(filename, source);
+  }
+  const url = name => pathToFileURL(path.join(scratch, name)).href;
+  const from = url("entry.mjs"), browserFrom = url("browser/entry.mjs");
+  const options = {packageRootUrl: path.join(scratch, "override")};
+  assert.equal(resolveModuleSpecifier("three", from), url("node_modules/three/selected.mjs"));
+  assert.equal(resolveModuleSpecifier("three/webgpu", from), url("node_modules/three/selected.mjs"));
+  assert.equal(resolveModuleSpecifier("three", from, {}, {requestKind: "require", allowCommonJS: true}),
+    url("node_modules/three/selected.cjs"));
+  assert.equal(resolveModuleSpecifier("three", browserFrom), url("browser/selected.mjs"));
+  assert.equal(resolveModuleSpecifier("three", from, {}, options), url("override/selected.mjs"));
+  assert.equal(resolveModuleSpecifier("three", browserFrom, {}, options), url("override/selected.mjs"));
+  const imports = {three: url("mapped.mjs")};
+  assert.equal(resolveModuleSpecifier("three", browserFrom, {imports}, options), url("mapped.mjs"));
+  assert.throws(() => resolveModuleSpecifier("three", browserFrom, {imports: {three: null}}, options),
+    /blocked import specifier/);
+});
+
+test("Installed Three.js selected-package errors never fall back to a parent installation or compiler pin", () => {
+  const cases = [
+    ["blocked", {exports: {".": null}}, {}, "ERR_PACKAGE_PATH_NOT_EXPORTED"],
+    ["missing", {exports: "./missing.mjs"}, {}, "ERR_MODULE_NOT_FOUND"],
+    ["format", {exports: "./native.node"}, {"native.node": "binary is not a browser module"}, "F3D_PACKAGE_FORMAT"],
+    ["directory", {exports: "./directory"}, {"directory/index.mjs": "export default 42;"}, "ERR_UNSUPPORTED_DIR_IMPORT"],
+    ["invalid", "{", {}, "ERR_INVALID_PACKAGE_CONFIG"],
+  ];
+  for (const [name, fields, extra, code] of cases) {
+    const scratch = makeScratchDir("f3d_installed_three_" + name);
+    const selected = path.join(scratch, "app/node_modules/three");
+    const files = {
+      "node_modules/three/package.json": JSON.stringify({name: "three", type: "module", exports: "./index.mjs"}),
+      "node_modules/three/index.mjs": "export const parent = true;",
+      "app/entry.mjs": "import 'three';",
+      "app/node_modules/three/package.json": typeof fields === "string" ? fields
+        : JSON.stringify({name: "three", type: "module", ...fields}),
+      ...Object.fromEntries(Object.entries(extra).map(([filename, source]) => ["app/node_modules/three/" + filename, source])),
+    };
+    for (const [filename, source] of Object.entries(files)) {
+      const target = path.join(scratch, filename);
+      fs.mkdirSync(path.dirname(target), {recursive: true});
+      fs.writeFileSync(target, source);
+    }
+    assert.throws(() => resolveModuleSpecifier("three", pathToFileURL(path.join(scratch, "app/entry.mjs")).href),
+      error => error.code === code && error.message.includes(selected), name);
+  }
+});
+
 test("CLI: Execution produces valid JSON bundle file with identical graph structure", async () => {
   const scratch = makeScratchDir("f3d_cli_test");
   const outFile = path.join(scratch, "h2_graph.json");

@@ -174,6 +174,75 @@ test("module-only output keeps ESM entry and lazy chunks runnable after relocati
   });
 });
 
+test("installed Three.js application builds preserve entry-point identities and independent nested versions after relocation", async () => {
+  const scratch = makeScratch("f3d_app_installed_three");
+  const sourceDir = path.join(scratch, "source");
+  const files = {
+    "package.json": '{"type":"module"}',
+    "main.mjs": `import * as THREE from 'three';
+      import {Point as WebGPUPoint, WebGPURenderer} from 'three/webgpu';
+      import {Point as TSLPoint} from 'three/tsl';
+      import {Point as SourcePoint} from 'three/src/core.js';
+      import {point, token as addonToken} from 'three/addons/point.js';
+      import * as nested from 'plugin';
+      const renderer = new WebGPURenderer();
+      export const owner = renderer.owner;
+      export const same = [THREE.Point === WebGPUPoint, THREE.Point === TSLPoint,
+        THREE.Point === SourcePoint, point instanceof THREE.Point, addonToken === THREE.token];
+      export {THREE, nested};
+      export const lazy = () => import('three/addons/lazy.js');`,
+    "node_modules/plugin/package.json": '{"name":"plugin","type":"module","exports":"./index.mjs"}',
+    "node_modules/plugin/index.mjs": "export {Point, token, revision, count, bump} from 'three';",
+  };
+  for (const [root, revision] of [["node_modules/three", "application-version"],
+    ["node_modules/plugin/node_modules/three", "nested-version"]]) {
+    Object.assign(files, {
+      [root + "/package.json"]: JSON.stringify({name: "three", type: "module", exports: {
+        ".": "./build/three.module.js", "./webgpu": "./build/three.webgpu.js", "./tsl": "./build/three.tsl.js",
+        "./src/*": "./src/*", "./addons/*": "./examples/jsm/*",
+      }}),
+      [root + "/build/three.module.js"]: "export * from '../src/core.js'; export {revision} from '../src/revision.js';",
+      [root + "/build/three.webgpu.js"]: "export * from './three.module.js'; export class WebGPURenderer {owner = 'retained installed renderer';}",
+      [root + "/build/three.tsl.js"]: "export {Point} from '../src/core.js';",
+      // Identical bytes in different installations must not merge their classes or state.
+      [root + "/src/core.js"]: "export class Point {} export const token = {}; export let count = 0; export const bump = () => ++count;",
+      [root + "/src/revision.js"]: `export const revision = ${JSON.stringify(revision)};`,
+      [root + "/examples/jsm/point.js"]: "import {Point, token} from 'three'; export const point = new Point(); export {token};",
+      [root + "/examples/jsm/lazy.js"]: "export {Point, token, count} from 'three'; export const asset = new URL('./payload.bin', import.meta.url);",
+      [root + "/examples/jsm/payload.bin"]: Buffer.from([1, 8, 6]),
+    });
+  }
+  for (const [filename, source] of Object.entries(files)) {
+    const target = path.join(sourceDir, filename);
+    fs.mkdirSync(path.dirname(target), {recursive: true});
+    fs.writeFileSync(target, source);
+  }
+  const built = await buildApplication(path.join(sourceDir, "main.mjs"), path.join(sourceDir, "dist"), {
+    routeWebGPURenderer: true,
+  });
+  assert.equal(built.rendererRoute.routed, false, "Unverified installed renderers retain their own implementation");
+  assert.deepEqual(built.rendererRoute.substitutedModules, []);
+  const deployed = path.join(scratch, "deployed");
+  fs.renameSync(built.outDir, deployed);
+  fs.renameSync(sourceDir, path.join(scratch, "source-unavailable"));
+  const app = await import(pathToFileURL(path.join(deployed, built.entryFiles[0])).href);
+  assert.equal(app.owner, "retained installed renderer");
+  assert.deepEqual(app.same, [true, true, true, true, true]);
+  assert.equal(app.THREE.revision, "application-version");
+  assert.equal(app.nested.revision, "nested-version");
+  assert.notEqual(app.THREE.Point, app.nested.Point);
+  assert.notEqual(app.THREE.token, app.nested.token);
+  app.THREE.bump();
+  assert.equal(app.THREE.count, 1);
+  assert.equal(app.nested.count, 0);
+  const lazy = await app.lazy();
+  assert.equal(lazy, await app.lazy());
+  assert.equal(lazy.Point, app.THREE.Point);
+  assert.equal(lazy.token, app.THREE.token);
+  assert.equal(lazy.count, 1);
+  assert.deepEqual(fs.readFileSync(lazy.asset), Buffer.from([1, 8, 6]));
+});
+
 test("buildApplication emits runnable HTML with bounded asset closure, copying CSS, images, and preloads", async () => {
   const scratch = makeScratch("f3d_app_html");
   const outDir = path.join(scratch, "dist");
