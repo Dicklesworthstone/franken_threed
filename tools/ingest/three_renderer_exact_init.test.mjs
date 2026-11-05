@@ -119,6 +119,134 @@ test('runtime forceWebGL still uses the unchanged exact constructor, with and wi
   assert.equal(f.calls.length, 1);
 });
 
+test('runtime source selection preserves option getter order, receivers, custom options and all arguments', () => {
+  const calls = [], received = [], canvas = {width: 8, height: 8, style: {}};
+  class Exact extends T.WebGPURenderer {
+    constructor(...args) { received.push(args); super(...args); }
+  }
+  const Routed = createWebGPURendererClass(T, {exactBackend: Exact, gpu: capableGpu});
+  const parameters = () => ({forceWebGL: true,
+    get canvas() { calls.push(['canvas', this]); return canvas; },
+    get alpha() { calls.push(['alpha', this]); return true; },
+    get antialias() { calls.push(['antialias', this]); return false; },
+    get customSourceOption() { calls.push(['customSourceOption', this]); return 23; },
+  });
+  const extra = {}, baseline = new Exact(parameters(), extra, 7), expected = calls.splice(0).map(([name]) => name);
+  received.length = 0;
+  const options = parameters(), renderer = new Routed(options, extra, 7);
+  assert.deepEqual(calls.map(([name]) => name), expected);
+  assert.ok(calls.every(([, receiver]) => receiver === options));
+  assert.deepEqual(received, [[options, extra, 7]]);
+  assert.equal(Object.getPrototypeOf(renderer), Object.getPrototypeOf(baseline));
+  assert.equal(renderer.domElement, canvas);
+  assert.equal(renderer.backend.parameters.customSourceOption, 23);
+  assert.ok(renderer.backend instanceof T.WebGLBackend);
+  assert.equal(renderer.isF3DRenderer, undefined);
+  assert.equal(Object.hasOwn(renderer, '_session'), false);
+});
+
+test('effectful own and inherited backend selectors execute only inside the genuine source constructor', () => {
+  const f = fixture(), calls = [];
+  for (const inherited of [false, true]) for (const selected of [false, true]) {
+    const parameters = () => {
+      let reads = 0;
+      const selector = {get forceWebGL() { calls.push(['forceWebGL', this]); return reads++ === 0 ? selected : !selected; }};
+      const options = inherited ? Object.create(selector) : selector;
+      Object.defineProperties(options, {
+        canvas: {value: f.canvas, enumerable: true},
+        alpha: {enumerable: true, get() { calls.push(['alpha', this]); return true; }},
+        customSourceOption: {value: 11, enumerable: true},
+      });
+      return options;
+    };
+    const baseline = new f.ExactRenderer(parameters()), expected = calls.splice(0).map(([name]) => name);
+    const options = parameters(), renderer = new f.Routed(options);
+    assert.deepEqual(calls.map(([name]) => name), expected);
+    assert.ok(calls.every(([, receiver]) => receiver === options));
+    calls.length = 0;
+    assert.equal(renderer.backend.isWebGLBackend === true, selected);
+    assert.equal(renderer.backend.isWebGPUBackend, baseline.backend.isWebGPUBackend);
+    assert.equal(typeof options.getFallback, selected ? 'undefined' : 'function');
+    assert.equal(renderer.isF3DRenderer, undefined);
+    assert.equal(renderer.domElement, f.canvas);
+  }
+});
+
+test('source-selected option errors keep their identity and preceding getter effects', () => {
+  const f = fixture(), calls = [], marker = new Error('source option error');
+  for (const selectorThrows of [false, true]) {
+    const parameters = () => ({canvas: f.canvas,
+      get forceWebGL() { calls.push('forceWebGL'); if (selectorThrows) throw marker; return true; },
+      get alpha() { calls.push('alpha'); return true; },
+      get antialias() { calls.push('antialias'); throw marker; },
+      get laterSourceOption() { assert.fail('Source stops at the throwing option'); },
+    });
+    assert.throws(() => new f.ExactRenderer(parameters()), error => error === marker);
+    const expected = calls.splice(0);
+    assert.throws(() => new f.Routed(parameters()), error => error === marker);
+    assert.deepEqual(calls.splice(0), expected);
+  }
+  assert.throws(() => new f.Routed(null), TypeError, 'invalid options retain the source error');
+});
+
+test('ordinary native option objects stay native and later getters cannot switch their selected owner', () => {
+  const f = fixture();
+  for (const prototype of [Object.prototype, null]) {
+    const options = Object.assign(Object.create(prototype), {canvas: f.canvas, forceWebGL: false, context: null});
+    const renderer = new f.Routed(options);
+    assert.equal(renderer.isF3DRenderer, true);
+    renderer.dispose();
+  }
+  const parameters = () => ({forceWebGL: false,
+    get canvas() { this.forceWebGL = true; return f.canvas; },
+  });
+  const baseline = new f.ExactRenderer(parameters());
+  assert.equal(baseline.backend.isWebGPUBackend, true, 'source selects before copying other options');
+  const renderer = new f.Routed(parameters());
+  assert.equal(renderer.isF3DRenderer, true);
+  renderer.dispose();
+});
+
+test('opaque option receivers keep their untouched source path at the compiler constructor boundary', () => {
+  const f = fixture(), calls = [];
+  const parameters = () => new Proxy({canvas: f.canvas, forceWebGL: true, customSourceOption: 9}, {
+    get(target, key, receiver) { calls.push(['get', String(key)]); return Reflect.get(target, key, receiver); },
+    ownKeys(target) { calls.push(['ownKeys']); return Reflect.ownKeys(target); },
+    getPrototypeOf(target) { calls.push(['prototype']); return Reflect.getPrototypeOf(target); },
+    getOwnPropertyDescriptor(target, key) { calls.push(['descriptor', String(key)]); return Reflect.getOwnPropertyDescriptor(target, key); },
+  });
+  new f.ExactRenderer(parameters());
+  const expected = calls.splice(0), Source = sourceThreeRendererConstructor(f.Routed);
+  const renderer = new Source(parameters());
+  assert.deepEqual(calls, expected, 'opaque options are not inspected by the native facade');
+  assert.equal(renderer.isF3DRenderer, undefined);
+  assert.ok(renderer.backend instanceof T.WebGLBackend);
+});
+
+test('a supplied WebGL context reaches the source with unchanged options and error order on a capable host', t => {
+  t.mock.method(console, 'error', () => {});
+  const calls = [], marker = new Error('source context attributes'), canvas = {width: 8, height: 8, style: {}};
+  const context = {getContextAttributes() { calls.push('attributes'); throw marker; }};
+  const Routed = createWebGLRendererClass(GL, {exactBackend: GL.WebGLRenderer, gpu: capableGpu});
+  for (const accessor of [false, true]) {
+    const parameters = () => {
+      const options = {
+        get canvas() { calls.push('canvas'); return canvas; },
+        get alpha() { calls.push('alpha'); return true; },
+        get antialias() { calls.push('antialias'); return false; },
+        get ignoredSourceOption() { assert.fail('The source does not read unknown WebGL options'); },
+      };
+      Object.defineProperty(options, 'context', accessor ? {enumerable: true, get() { calls.push('context'); return context; }} :
+        {enumerable: true, value: context});
+      return options;
+    };
+    assert.throws(() => new GL.WebGLRenderer(parameters()), error => error === marker);
+    const expected = calls.splice(0);
+    assert.throws(() => new Routed(parameters()), error => error === marker);
+    assert.deepEqual(calls.splice(0), expected);
+  }
+});
+
 test('an own init assignment follows ordinary inherited method assignment semantics', async () => {
   const f = fixture(); f.forceWebGL(true);
   const renderer = new f.Routed({canvas: f.canvas});

@@ -93,6 +93,22 @@ const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
 // replacing an already exposed renderer with another owner.
 const hasWebGPUHost = gpu => typeof (gpu ?? globalThis.navigator?.gpu)?.requestAdapter === 'function';
 
+// The compiler keeps opaque option receivers on the source-constructor path.
+// This descriptor check covers ordinary option objects; it is not a purity
+// test for Proxies. A selector accessor or inherited/custom container goes
+// to the source before reading options, rather than reading and replaying it.
+function requiresSourceParameters(parameters, selectors) {
+  if (!parameters || typeof parameters !== 'object') return true;
+  const prototype = Object.getPrototypeOf(parameters);
+  if (prototype !== null && prototype !== Object.prototype) return true;
+  for (const name of selectors) {
+    const descriptor = Object.getOwnPropertyDescriptor(parameters, name) ??
+      (prototype && Object.getOwnPropertyDescriptor(prototype, name));
+    if (descriptor && (!Object.hasOwn(descriptor, 'value') || descriptor.value)) return true;
+  }
+  return false;
+}
+
 /** One native device observer per renderer, independent of canvas sessions.
  * Keep the source's event-handler slot and payloads. A disposed owner must not
  * remain reachable from the device's non-removable lost Promise continuation. */
@@ -321,20 +337,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         return retained;
       }
       if (exactBackend && !hasWebGPUHost(defaultGpu)) return new exactBackend(...arguments);
+      if (exactBackend && requiresSourceParameters(parameters, ['forceWebGL', 'context']))
+        return new exactBackend(...arguments);
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
+      // Choose the owner before other option getters can mutate the selectors.
+      // Source-selected constructors receive the untouched original arguments.
+      if (!exactBackend && (parameters.forceWebGL || parameters.context))
+        fail('ROUTE', 'forceWebGL or a supplied context selects the exact backend route, not this renderer');
       for (const key of Object.keys(parameters)) if (!(this._parameterNames?.() ?? PARAMETERS).has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       const {
         canvas = null, antialias = false, alpha = true, depth = true, stencil = false, samples = 0,
-        forceWebGL = false, logarithmicDepthBuffer = false, reversedDepthBuffer = false,
+        logarithmicDepthBuffer = false, reversedDepthBuffer = false,
       } = parameters;
-      // Route selection precedes construction and any canvas binding: a WebGL
-      // request (including a runtime value such as `forceWebGL: !api.webgpu`)
-      // belongs to the exact-backend route. With the pinned upstream renderer
-      // supplied, construct it unchanged; it is never this new backend.
-      if (forceWebGL || parameters.context) {
-        if (exactBackend) return new exactBackend(parameters);
-        fail('ROUTE', 'forceWebGL or a supplied context selects the exact backend route, not this renderer');
-      }
       this.isRenderer = true;
       this.isWebGPURenderer = true;
       this.isF3DRenderer = true;
@@ -2189,13 +2203,13 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
     get coordinateSystem() { return THREE.WebGLCoordinateSystem; }
     constructor(parameters = {}) {
       if (exactBackend && !hasWebGPUHost(options.gpu)) return new exactBackend(...arguments);
+      if (exactBackend && requiresSourceParameters(parameters, ['context']))
+        return new exactBackend(...arguments);
       if (!parameters || typeof parameters !== 'object') fail('OPTIONS', 'Expected renderer parameters');
-      for (const key of Object.keys(parameters)) if (!WEBGL_PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       // A supplied GL context is the exact backend by definition.
-      if (parameters.context) {
-        if (exactBackend) return new exactBackend(parameters);
+      if (!exactBackend && parameters.context)
         fail('ROUTE', 'A supplied rendering context selects the exact WebGL backend');
-      }
+      for (const key of Object.keys(parameters)) if (!WEBGL_PARAMETERS.has(key)) fail('OPTIONS', `Unknown renderer parameter: ${key}`);
       const {premultipliedAlpha = true, preserveDrawingBuffer = false, powerPreference = 'default',
         failIfMajorPerformanceCaveat, precision, outputBufferType, context, ...rest} = parameters;
       super({...rest, alpha: parameters.alpha ?? false,

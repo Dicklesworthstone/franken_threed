@@ -255,6 +255,8 @@ test("externally supplied canvas identities and opaque options cannot authorize 
     "function setup(canvas) { const renderer = new WebGPURenderer({canvas}); renderer.render(scene,camera); }",
     "let canvas = document.createElement('canvas'); canvas = host.canvas; const renderer = new WebGPURenderer({canvas});",
     "const renderer = new WebGPURenderer(options);",
+    "const renderer = new WebGPURenderer(new Proxy({forceWebGL: true}, handler));",
+    "const options = new Proxy({forceWebGL: false}, handler); const renderer = new WebGPURenderer(options);",
     "document.createElement = plugin; const canvas = document.createElement('canvas'); const renderer = new WebGPURenderer({canvas});",
     "const renderer = new WebGPURenderer(); let container = document.body; container = host; container.appendChild(renderer.domElement);",
   ]) {

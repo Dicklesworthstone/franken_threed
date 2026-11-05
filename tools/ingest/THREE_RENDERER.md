@@ -45,6 +45,10 @@ Per-site `rendererRoute.decisions` continue to identify source-selected calls as
 `exact-backend`; `exactConstructionSites` records their original source spans.
 Applications containing only explicit source selections remain unchanged.
 Runtime-valued `forceWebGL` selections retain the existing facade dispatch.
+Ordinary source selections dispatch before native option validation or getter
+evaluation and forward every original constructor argument. Accessor selectors
+and inherited/custom option containers retain the genuine source constructor;
+opaque receivers remain under the compiler's conservative construction routing.
 Opaque renderer access, unknown extensions, native-context observations and
 prototype mutation still prevent the mixed build route.
 
