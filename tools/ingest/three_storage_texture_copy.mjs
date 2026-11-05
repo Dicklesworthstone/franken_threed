@@ -88,7 +88,15 @@ export function withStorageTextureCopies(Base) {
     readStorageTexturePixelsAsync(texture, options = {}) {
       return pixels(this).read(texture, options);
     }
-    dispose() { transfers.get(this)?.dispose(); super.dispose(); }
+    _disposeResources(dispose) {
+      dispose(() => transfers.get(this)?.dispose());
+      super._disposeResources?.(dispose);
+    }
+    dispose() {
+      if (typeof super._disposeWithResources === 'function') return super.dispose();
+      transfers.get(this)?.dispose();
+      return super.dispose();
+    }
     async waitForGPU() {
       await super.waitForGPU();
       if (failures.has(this)) throw failures.get(this);

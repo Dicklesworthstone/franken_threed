@@ -8,6 +8,8 @@ import test from 'node:test';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createWebGPURendererClass, createWebGLRendererClass, F3DRendererError} from './three_renderer.mjs';
+import {withThreeCompute} from './three_compute.mjs';
+import {withStorageTextureCopies} from './three_storage_texture_copy.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const T = await import(pathToFileURL(path.join(root, 'build/three.webgpu.js')));
@@ -145,16 +147,168 @@ test('ordinary first frame: render defers to preparation without presenting an e
   assert.ok(calls.some(c => c[0] === 'unconfigure'));
 });
 
-test('disposing an unused renderer never requests a device or starts its frame clock', () => {
+test('disposing an unused renderer never requests a device or starts its frame clock', async () => {
   const c = canvasFixture(); let requests = 0;
   const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter() { requests++; return Promise.resolve(null); }}});
   const renderer = new Renderer({canvas: c.canvas});
-  renderer.dispose();
+  const disposal = renderer.dispose();
+  assert.ok(disposal instanceof Promise);
+  assert.equal(renderer.dispose(), disposal);
+  await disposal;
   assert.equal(requests, 0);
   assert.equal(renderer.initialized, false);
   assert.equal(renderer.getAnimationLoop(), null);
   assert.equal(renderer.info.frame, 0);
   assert.deepEqual(c.calls, []);
+});
+
+test('standalone compute and texture-copy mixins clean their owners and preserve the base disposal result', async () => {
+  for (const compute of [false, true]) {
+    const completion = deferred(), events = [];
+    class Base {
+      constructor() {
+        this._sampledTextureInputs = {dispose() { events.push('sampled'); }};
+        this._storageTextures = {dispose() { events.push('storage'); }};
+      }
+      dispose() { events.push('base'); return completion.promise; }
+    }
+    const Renderer = compute ? withThreeCompute(Base, T) : withStorageTextureCopies(Base);
+    const renderer = new Renderer();
+    // Creating the real transfer owner does not require a native allocation.
+    await assert.rejects(renderer.readStorageTexturePixelsAsync({}), {code: 'THREE_STORAGE_TRANSFER_ROUTE'});
+    assert.equal(renderer.dispose(), completion.promise);
+    assert.deepEqual(events, compute ? ['sampled', 'storage', 'base'] : ['base']);
+    await assert.rejects(renderer.readStorageTexturePixelsAsync({}), {code: 'THREE_STORAGE_TRANSFER_DISPOSED'});
+    completion.resolve(); await completion.promise;
+  }
+});
+
+test('native public Info reset and disposal retain the pinned counters and object identities', async () => {
+  const {renderer} = await create(), source = new T.WebGPURenderer({canvas: canvasFixture().canvas});
+  const values = info => ({autoReset: info.autoReset, frame: info.frame, calls: info.calls,
+    render: {...info.render}, compute: {...info.compute}, memory: {...info.memory}});
+  const records = [source.info, renderer.info].map(info => {
+    info.autoReset = false; info.frame = 17; info.calls = 23;
+    for (const key of Object.keys(info.render)) info.render[key] = 29;
+    for (const key of Object.keys(info.compute)) info.compute[key] = 31;
+    for (const key of Object.keys(info.memory)) info.memory[key] = 37;
+    const record = {info, render: info.render, compute: info.compute, memory: info.memory, memoryMap: info.memoryMap};
+    info.reset(); return record;
+  });
+  assert.deepEqual(values(renderer.info), values(source.info));
+  for (const {info} of records) info.dispose();
+  assert.deepEqual(values(renderer.info), values(source.info));
+  for (const {info, render, compute, memory, memoryMap} of records) {
+    assert.equal(info.render, render); assert.equal(info.compute, compute); assert.equal(info.memory, memory);
+    assert.notEqual(info.memoryMap, memoryMap);
+  }
+  assert.equal(renderer.info.f3d.route, 'general-webgpu');
+  await renderer.dispose();
+});
+
+test('native disposal matches pinned Info, Inspector and target ordering and shares cleanup completion', async t => {
+  const {renderer, canvas} = await create(), host = animationHost(canvas);
+  await renderer.setAnimationLoop(() => assert.fail('Disposal must stop the next callback'));
+  const source = new T.WebGPURenderer({canvas: canvasFixture().canvas}), gates = [deferred(), deferred()], events = [[], []];
+  // Execute the actual pinned dispose method. Its private managers and backend
+  // are controlled cleanup boundaries; no source GPU initialization is claimed.
+  source._initialized = true;
+  for (const name of ['_animation', '_objects', '_geometries', '_pipelines', '_nodes', '_bindings', '_renderLists', '_renderContexts', '_textures'])
+    source[name] = {dispose() {}};
+  source.setAnimationLoop = () => {};
+  source.backend = {dispose() { events[0].push('backend'); return gates[0].promise; }};
+  const release = renderer._release;
+  renderer._release = function (dispose) { release.call(this, dispose); events[1].push('backend'); return gates[1].promise; };
+  t.after(() => { for (const gate of gates) gate.resolve(); return renderer.dispose(); });
+  for (const [index, value] of [source, renderer].entries()) {
+    const target = new T.RenderTarget(2, 2);
+    value.setRenderTarget(target); value.info.calls = 11; value.info.memory.total = 19;
+    const clear = value.info.dispose.bind(value.info), select = value.setRenderTarget;
+    value.info.dispose = () => { events[index].push('info'); clear(); };
+    value.inspector.dispose = () => {
+      assert.equal(value.info.calls, 0); assert.equal(value.info.memory.total, 0);
+      assert.equal(value.getRenderTarget(), target); events[index].push('inspector');
+    };
+    value.setRenderTarget = function (...args) { events[index].push('target'); return select.apply(this, args); };
+  }
+  const original = source.dispose(), completion = renderer.dispose();
+  assert.ok(original instanceof Promise); assert.ok(completion instanceof Promise);
+  assert.equal(renderer.dispose(), completion);
+  assert.deepEqual(events[1], events[0]); assert.deepEqual(events[1], ['info', 'inspector', 'backend']);
+  assert.equal(host.scheduled.size, 0); assert.equal(renderer.getAnimationLoop(), null);
+  let complete = false; completion.then(() => { complete = true; });
+  await hostTurn(); assert.equal(complete, false);
+  for (const gate of gates) gate.resolve();
+  assert.equal(await original, undefined); assert.equal(await completion, undefined);
+  assert.deepEqual(events[1], events[0]); assert.deepEqual(events[1], ['info', 'inspector', 'backend', 'target']);
+  assert.equal(renderer.getRenderTarget(), null);
+  assert.equal(renderer.getActiveCubeFace(), 0); assert.equal(renderer.getActiveMipmapLevel(), 0);
+  assert.equal(renderer.dispose(), completion, 'completed disposal retains its original promise');
+});
+
+test('native disposal rejects cleanup failures without skipping independent owned resource release', async () => {
+  for (const boundary of ['info', 'inspector', 'compute', 'release']) {
+    const {renderer, device, calls} = await create(); await renderer.init();
+    const marker = new Error(`${boundary} cleanup failed`), target = new T.RenderTarget(2, 2);
+    renderer.setRenderTarget(target);
+    let inspections = 0;
+    renderer.inspector.dispose = () => { inspections++; if (boundary === 'inspector') throw marker; };
+    if (boundary === 'info') renderer.info.dispose = () => { throw marker; };
+    if (boundary === 'compute') {
+      const storage = renderer._storageTextures;
+      renderer._storageTextures = {dispose() { storage.dispose(); throw marker; }};
+    }
+    if (boundary === 'release') {
+      const release = renderer._release;
+      renderer._release = function (dispose) { release.call(this, dispose); return Promise.reject(marker); };
+    }
+    let completion;
+    assert.doesNotThrow(() => { completion = renderer.dispose(); });
+    await assert.rejects(completion, error => error === marker);
+    assert.equal(renderer.dispose(), completion);
+    assert.equal(inspections, boundary === 'info' ? 0 : 1, 'a throwing Info hook skips Inspector as in the source');
+    assert.equal(renderer.getRenderTarget(), target, 'the source skips target reset after a cleanup failure');
+    assert.ok(device.buffers.every(buffer => buffer.destroyed));
+    assert.ok(device.textures.every(texture => texture.destroyed));
+    assert.equal(calls.filter(call => call[0] === 'unconfigure').length, 1);
+  }
+});
+
+test('native disposal settles held preparation before its pipeline or GPU queue completes', async t => {
+  const {renderer, device, acquired} = await create(), f = sceneFixture(), pipeline = deferred(), started = deferred();
+  await renderer.init();
+  const compile = device.createRenderPipelineAsync.bind(device);
+  device.createRenderPipelineAsync = descriptor => { started.resolve(); return pipeline.promise.then(() => compile(descriptor)); };
+  const drawing = renderer.renderAsync(f.scene, f.camera); drawing.catch(() => {});
+  await started.promise;
+  let fenceCalls = 0;
+  device.queue.onSubmittedWorkDone = () => { fenceCalls++; return new Promise(() => {}); };
+  const disposal = renderer.dispose();
+  t.after(() => { pipeline.resolve(); return disposal; });
+  let completed = false; disposal.then(() => { completed = true; });
+  await hostTurn();
+  assert.equal(completed, true, 'owned preparation cancellation does not wait for the host pipeline');
+  await disposal; await assert.rejects(drawing);
+  assert.equal(fenceCalls, 0, 'cleanup completion is not a new GPU-idle fence');
+  assert.equal(acquired(), 0); assert.equal(renderer._pending.length, 0);
+  assert.ok(Object.values(renderer.info.memory).every(value => value === 0));
+  pipeline.resolve(); await hostTurn();
+  assert.equal(device.submissions.length, 0);
+  assert.ok(device.buffers.every(buffer => buffer.destroyed));
+  assert.ok(device.textures.every(texture => texture.destroyed));
+  assert.ok(Object.values(renderer.info.memory).every(value => value === 0));
+});
+
+test('WebGL disposal remains synchronous while native cleanup failures are awaitable', async () => {
+  const device = recordingDevice(), Renderer = createWebGLRendererClass(T), renderer = new Renderer({canvas: canvasFixture().canvas, device});
+  await renderer.init();
+  assert.equal(renderer.dispose(), undefined); assert.equal(renderer.dispose(), undefined);
+  await renderer._disposePromise;
+  const failed = new Renderer({canvas: canvasFixture().canvas, device: recordingDevice()}); await failed.init();
+  const marker = new Error('synchronous WebGL cleanup'), storage = failed._storageTextures;
+  failed._storageTextures = {dispose() { storage.dispose(); throw marker; }};
+  assert.throws(() => failed.dispose(), error => error === marker);
+  await assert.rejects(failed._disposePromise, error => error === marker);
 });
 
 test('initialization disposal rejects a pending adapter without requesting a late device or canvas', async () => {
@@ -168,7 +322,8 @@ test('initialization disposal rejects a pending adapter without requesting a lat
   animation.catch(() => {});
   init.catch(error => { rejected = error; });
   assert.equal(renderer.init(), init, 'concurrent callers share initialization');
-  renderer.dispose();
+  const disposal = renderer.dispose();
+  await disposal;
   await hostTurn();
   const stopped = rejected;
   adapter.resolve({requestDevice() { requests++; return Promise.resolve(device); }});
@@ -197,7 +352,8 @@ test('initialization disposal retires a late owned device once without publishin
   animation.catch(() => {});
   init.catch(error => { rejected = error; });
   await requested.promise;
-  renderer.dispose();
+  const disposal = renderer.dispose();
+  await disposal;
   await hostTurn();
   const stopped = rejected;
   acquisition.resolve(device);

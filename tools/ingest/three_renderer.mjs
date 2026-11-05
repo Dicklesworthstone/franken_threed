@@ -392,8 +392,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           'uniformBuffers', 'uniformBuffersSize', 'total'].map(key => [key, 0])),
         // F3D's own namespace: native submissions are not source draw counts.
         f3d: {route: 'general-webgpu', deferredRenders: 0, presentedRenders: 0, offscreenRenders: 0, nativeDrawCalls: 0, preparations: 0},
-        reset: () => { this.info.render.drawCalls = 0; this.info.render.frameCalls = 0; this.info.compute.frameCalls = 0; },
-        dispose: () => {},
+        memoryMap: new WeakMap(),
+        reset() {
+          this.render.drawCalls = this.render.frameCalls = this.compute.frameCalls = 0;
+          this.render.triangles = this.render.points = this.render.lines = 0;
+        },
+        dispose() {
+          this.reset();
+          this.calls = this.render.calls = this.compute.calls = 0;
+          this.render.timestamp = this.compute.timestamp = 0;
+          for (const key in this.memory) this.memory[key] = 0;
+          this.memoryMap = new WeakMap();
+        },
       };
       this._parameters = Object.freeze({...parameters});
       this._clearColor = new THREE.Color(0, 0, 0);
@@ -461,6 +471,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._animationStarted = false;
       this._animationHost = null;
       this._disposed = false;
+      this._disposePromise = null;
       this._transfers = createThreeRendererTransfers(this, F3DRendererError, {maxBytes: maxTransferBytes, maxRequests: maxTransfers});
       Object.defineProperties(this.info.f3d, {
         pendingTransfers: {enumerable: true, get: () => this._transfers.pendingRequests},
@@ -630,24 +641,24 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._canvases.save();
       } finally { release(); }
     }
-    _release() {
-      for (const cache of this._outputQuads.values()) cache.dispose();
+    _release(dispose) {
+      for (const cache of this._outputQuads.values()) dispose(() => cache.dispose());
       // The retained framebuffer-target listener releases its private target.
       // Source Renderer.dispose() also disposes custom output targets used as
       // framebuffer-cache keys; an unused output selector owns no such target.
       for (const target of this._frameBufferTargets?.keys() ?? [])
-        if (target !== this._canvasTarget) target.dispose();
-      this._targets.dispose();
-      this._canvases.dispose();
+        if (target !== this._canvasTarget) dispose(() => target.dispose());
+      dispose(() => this._targets.dispose());
+      dispose(() => this._canvases.dispose());
       this._wanted.clear();
-      this._passSnapshots.dispose();
-      this._nodeBackgrounds?.dispose(); this._nodeBackgrounds = null;
-      this._nodeProgramSupport?.dispose();
+      dispose(() => this._passSnapshots.dispose());
+      dispose(() => this._nodeBackgrounds?.dispose()); this._nodeBackgrounds = null;
+      dispose(() => this._nodeProgramSupport?.dispose());
       this._nodeProgramSupport = null;
-      this._nodeBundles?.dispose(); this._nodeBundles = null;
-      this._occlusionQueries?.dispose();
-      this._canvasTarget?.dispose();
-      if (this._ownsDevice) { this._ownsDevice = false; this._device?.destroy(); }
+      dispose(() => this._nodeBundles?.dispose()); this._nodeBundles = null;
+      dispose(() => this._occlusionQueries?.dispose());
+      dispose(() => this._canvasTarget?.dispose());
+      if (this._ownsDevice) { this._ownsDevice = false; dispose(() => this._device?.destroy()); }
     }
 
     /** The whole-image tone-mapping output pass. WebGLRenderer (shader-encoded
@@ -1727,7 +1738,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       if (initializeOutputDepth) this._targetDepthInitialized.add(initializeOutputDepth);
       const d = destination._dispatcher.entry(scene)?.lastDiagnostics;
-      if (d) {
+      if (d && !this._disposed) {
         this.info.render.drawCalls += d.sourceDraws;
         this.info.f3d.nativeDrawCalls = d.drawCalls;
         const memory = this.info.memory;
@@ -2130,29 +2141,69 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     getAnimationLoop() { return this._animationCallback; }
 
-    dispose() {
-      if (this._disposed) return;
+    dispose() { return this._disposeWithResources(); }
+    _disposeWithResources() {
+      const asynchronous = this.isWebGPURenderer === true;
+      if (this._disposePromise) return asynchronous ? this._disposePromise : undefined;
+      let resolve, reject, failure, failed = false;
+      const completion = this._disposePromise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      // Source callers may ignore dispose(). Keep that use safe while returning
+      // the original rejecting promise to callers that await native cleanup.
+      completion.catch(() => {});
+      const cleanup = [], record = error => { if (!failed) { failed = true; failure = error; } };
+      const dispose = operation => {
+        try {
+          const result = operation();
+          if (result?.then) {
+            const pending = Promise.resolve(result); pending.catch(() => {}); cleanup.push(pending);
+          }
+        } catch (error) { record(error); }
+      };
+      const running = [!this._initialized && this._initPromise, this._preparing, this._drain].filter(Boolean);
+      const requests = this._pending; this._pending = [];
       // Disposal must stop the current loop without starting initialization or
       // adding an asynchronous setter behind an already pending start.
-      this._setLoop(null);
       this._disposed = true;
-      this._releaseDeviceEvents?.(); this._releaseDeviceEvents = null;
-      this._occlusionQueries?.dispose();
-      this._timestamps.dispose();
-      if (this._animationStarted) {
-        this._animationStarted = false;
-        if (this._animationHandle !== null) this._animationHost?.cancelAnimationFrame?.(this._animationHandle);
-        this._animationHandle = null;
-        if (this._inspector.isRunning) this._inspector.finish();
-      }
+      this._animationCallback = null; this._animationWaiting = null;
+      dispose(() => this._setLoop(null));
+      this._animationStarted = false;
+      if (this._animationHandle !== null)
+        dispose(() => this._animationHost?.cancelAnimationFrame?.(this._animationHandle));
+      this._animationHandle = null;
+      dispose(() => this._releaseDeviceEvents?.()); this._releaseDeviceEvents = null;
+      // The pinned native renderer clears public Info before Inspector sees
+      // disposal. Neither component is disposed before initialization there.
+      dispose(() => {
+        if (asynchronous && this._initialized) this.info.dispose();
+        if (!asynchronous || this._initialized) this._inspector.dispose?.();
+      });
       const stopped = new F3DRendererError('DISPOSED', 'Renderer is disposed');
-      this._targetLifetime.abort(stopped);
-      this._targets.dispose();
-      for (const request of this._pending) { this._releaseRequest(request); request.reject?.(stopped); }
-      this._pending = [];
-      this._inspector.dispose?.();
-      if (!this._drain) this._release();
-      else this._drain.finally(() => this._release()).catch(() => {});
+      // Owners keep their established operation-specific cancellation errors.
+      // Admission has already stopped; abort the shared lifetime only after
+      // independently owned transfers, compute work and timing reads stop.
+      dispose(() => this._disposeResources?.(dispose));
+      dispose(() => this._occlusionQueries?.dispose());
+      dispose(() => this._timestamps.dispose());
+      dispose(() => this._targetLifetime.abort(stopped));
+      dispose(() => this._targets.dispose());
+      for (const request of requests) {
+        dispose(() => this._releaseRequest(request));
+        dispose(() => request.reject?.(stopped));
+      }
+      const finish = async () => {
+        // Cancellation settles these renderer-owned tasks without waiting for
+        // uncancellable host acquisition or for completion of submitted GPU work.
+        // Their operation errors remain on the original render/init promises.
+        if (running.length) await Promise.allSettled(running);
+        dispose(() => this._release(dispose));
+        for (const result of await Promise.allSettled(cleanup))
+          if (result.status === 'rejected') record(result.reason);
+        if (!failed && asynchronous) dispose(() => { this.setRenderTarget(null); });
+        if (failed) reject(failure); else resolve();
+      };
+      finish().catch(reject);
+      if (asynchronous) return completion;
+      if (failed) throw failure; // WebGLRenderer keeps its synchronous surface.
     }
   }
   const nativeInit = WebGPURenderer.prototype.init;

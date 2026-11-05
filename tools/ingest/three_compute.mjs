@@ -44,7 +44,7 @@ function createThreeCompute(renderer, three) {
   const gpu = createGpuCompute(device, {signal: renderer._targetLifetime.signal,
     onReadbackChange(count, bytes) {
       const memory = renderer.info.memory;
-      if (!memory) return;
+      if (!memory || renderer._disposed) return;
       memory.total += bytes - memory.readbackBuffersSize;
       memory.readbackBuffers = count; memory.readbackBuffersSize = bytes;
     }});
@@ -790,6 +790,20 @@ export function withThreeCompute(Base, THREE) {
       await this._sampledTextureInputs?.whenIdle();
       await this._storageTextures?.whenIdle();
     }
-    dispose() { owners.get(this)?.dispose(); this._sampledTextureInputs?.dispose(); this._storageTextures?.dispose(); super.dispose(); }
+    _disposeResources(dispose) {
+      dispose(() => owners.get(this)?.dispose());
+      dispose(() => this._sampledTextureInputs?.dispose());
+      dispose(() => this._storageTextures?.dispose());
+      super._disposeResources?.(dispose);
+    }
+    dispose() {
+      // The integrated renderer coordinates failures and its completion
+      // promise. Standalone mixin bases retain their own disposal contract.
+      if (typeof super._disposeWithResources === 'function') return super.dispose();
+      owners.get(this)?.dispose();
+      this._sampledTextureInputs?.dispose();
+      this._storageTextures?.dispose();
+      return super.dispose();
+    }
   };
 }
