@@ -21,6 +21,7 @@ import {
   urlToFilePath,
 } from "./resolver.mjs";
 import { IngestionResolutionError } from "./types.mjs";
+import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
 
 const SCRATCH_BASE = tmpdir();
 
@@ -2679,4 +2680,95 @@ test("Import-map non-special URL specifiers allow exact mappings without prefix 
     }),
     "https://cdn.example/exact.js",
   );
+});
+
+test("Explicit documentRoot maps browser paths while preserving default and remote URL behavior", () => {
+  const scratch = makeScratchDir("f3d_document_urls");
+  const root = path.join(scratch, "site");
+  fs.mkdirSync(root);
+  fs.writeFileSync(path.join(root, "asset space.bin"), "payload");
+  const base = pathToFileURL(path.join(root, "pages", "demo.html")).href;
+  const expected = pathToFileURL(path.join(root, "asset space.bin")).href + "?v=1#part";
+  assert.equal(normalizeDocumentRoot(null), null);
+  assert.equal(normalizeDocumentRoot(pathToFileURL(root)), root);
+  assert.equal(resolveDocumentUrl("/asset%20space.bin?v=1#part", base, root), expected);
+  assert.equal(resolveDocumentUrl("/a/%2e%2e/../../asset%20space.bin?v=1#part", base, root), expected);
+  assert.equal(documentRelativePath(expected, root), "asset space.bin");
+  assert.equal(documentRelativePath(path.join(root, "missing", "later.js"), root), "missing/later.js");
+  assert.equal(resolveDocumentUrl("/asset.bin", base), "file:///asset.bin");
+  assert.equal(resolveDocumentUrl("/asset.bin?v=1#part", "https://example.com/pages/demo.html", root),
+    "https://example.com/asset.bin?v=1#part");
+  for (const remote of ["//cdn.example/asset.bin", "/\\cdn.example/asset.bin"]) {
+    assert.equal(isRootRelativeDocumentUrl(remote), false);
+    assert.equal(resolveDocumentUrl(remote, base, root), new URL(remote, base).href);
+  }
+  assert.throws(() => normalizeDocumentRoot(path.join(root, "asset space.bin")), {code: "F3D_DOCUMENT_ROOT"});
+  assert.throws(() => normalizeDocumentRoot(path.join(root, "missing")), {code: "F3D_DOCUMENT_ROOT"});
+  assert.throws(() => normalizeDocumentRoot("https://example.com/"), {code: "F3D_DOCUMENT_ROOT"});
+  assert.throws(() => normalizeDocumentRoot(""), {code: "F3D_DOCUMENT_ROOT"});
+  assert.throws(() => resolveDocumentUrl("/bad%2fname", base, root), {code: "F3D_DOCUMENT_URL"});
+  assert.throws(() => documentRelativePath(scratch, root), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+
+  fs.mkdirSync(path.join(scratch, "outside"));
+  fs.symlinkSync(path.join(scratch, "outside"), path.join(root, "escape"), "dir");
+  assert.throws(() => resolveDocumentUrl("/escape/missing.js", base, root), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+  const alias = path.join(scratch, "alias");
+  fs.symlinkSync(root, alias, "dir");
+  assert.equal(normalizeDocumentRoot(alias), alias);
+  assert.equal(resolveDocumentUrl("/asset%20space.bin?v=1#part", base, alias),
+    pathToFileURL(path.join(alias, "asset space.bin")).href + "?v=1#part");
+});
+
+test("documentRoot graphs resolve rooted entries, import-map keys and scopes, and lazy module identities", async () => {
+  const root = makeScratchDir("f3d_document_graph");
+  for (const folder of ["pages", "app", "shared", "lazy"]) fs.mkdirSync(path.join(root, folder));
+  const html = `<base href="/app/"><script type="importmap">${JSON.stringify({
+    imports: {"/virtual/": "/shared/", choice: "/shared/default.js"},
+    scopes: {"/app/": {choice: "/shared/scoped.js"}},
+  })}</script><script type="module" src="/app/main.js?view=1#entry"></script>`;
+  const entry = path.join(root, "pages", "demo.html");
+  fs.writeFileSync(entry, html);
+  fs.writeFileSync(path.join(root, "app", "main.js"), `
+    import { value } from '/virtual/state.js?slot=1#one';
+    import { value as other } from '/shared/state.js?slot=1#two';
+    import choice from 'choice';
+    export { value, other, choice };
+    export const later = () => import('/lazy/later.js?slot=1#deferred');
+    export const choose = flag => import(flag ? '/lazy/one.js' : '/lazy/two.js');
+  `);
+  fs.writeFileSync(path.join(root, "shared", "state.js"), "export const value = {};");
+  fs.writeFileSync(path.join(root, "shared", "default.js"), "export default 'default';");
+  fs.writeFileSync(path.join(root, "shared", "scoped.js"), "export default 'scoped';");
+  for (const name of ["later", "one", "two"]) fs.writeFileSync(path.join(root, "lazy", name + ".js"), `export const name = '${name}';`);
+  const documentUrl = pathToFileURL(entry).href;
+  const parsed = parseHtmlEntries(html, documentUrl, {documentRoot: root});
+  assert.equal(parsed.baseUrl, pathToFileURL(path.join(root, "app") + path.sep).href);
+  assert.equal(parseHtmlEntries(html, documentUrl).baseUrl, "file:///app/");
+  const graph = await buildModuleGraph(entry, {documentRoot: root});
+  const url = name => pathToFileURL(path.join(root, name)).href;
+  assert.deepEqual(graph.root_entries, [url("app/main.js") + "?view=1#entry"]);
+  for (const id of [url("shared/state.js") + "?slot=1#one", url("shared/state.js") + "?slot=1#two",
+    url("shared/scoped.js"), url("lazy/later.js") + "?slot=1#deferred", url("lazy/one.js"), url("lazy/two.js")]) {
+    assert.ok(graph.modules[id], `Missing root-relative graph module ${id}`);
+  }
+  assert.equal(graph.modules[url("shared/default.js")], undefined);
+  assert.equal(graph.summary.unresolved_dynamic_imports, 0);
+  const rootNode = graph.modules[graph.root_entries[0]];
+  assert.ok(rootNode.dynamic_imports.every(request => request.claims_closure));
+});
+
+test("documentRoot import-map prefixes reject escaped symlinks without fencing ordinary outside dependencies", () => {
+  const scratch = makeScratchDir("f3d_document_map_containment");
+  const root = path.join(scratch, "site"), outside = path.join(scratch, "outside");
+  fs.mkdirSync(path.join(root, "mapped"), {recursive: true});
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "dependency.js"), "export const value = 42;");
+  fs.symlinkSync(path.join(outside, "dependency.js"), path.join(root, "mapped", "escape.js"));
+  const referrer = pathToFileURL(path.join(root, "main.js")).href;
+  assert.throws(() => resolveModuleSpecifier("mapped/escape.js", referrer,
+    {imports: {"mapped/": "/mapped/"}}, {documentRoot: root}), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+  assert.throws(() => resolveModuleSpecifier("/mapped/escape", referrer, {},
+    {documentRoot: root, requestKind: "require", allowCommonJS: true}), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+  assert.equal(resolveModuleSpecifier("../outside/dependency.js", referrer, {}, {documentRoot: root}),
+    pathToFileURL(path.join(outside, "dependency.js")).href);
 });

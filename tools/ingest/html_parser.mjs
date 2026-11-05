@@ -9,6 +9,7 @@
  */
 
 import { IngestionParseError } from "./types.mjs";
+import { normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 
 /**
  * Strips HTML comments while preserving characters and newlines
@@ -116,7 +117,8 @@ export function parseTagAttributes(attrString) {
  * @param {string} documentUrl - Canonical URL of the HTML document
  * @returns {{ importMap: { imports: Record<string, string | null>, scopes: Record<string, Record<string, string | null>> }, moduleScripts: ModuleScriptEntry[], preloads: string[] }}
  */
-export function parseHtmlEntries(rawHtmlContent, documentUrl) {
+export function parseHtmlEntries(rawHtmlContent, documentUrl, options = {}) {
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const importMap = {
     imports: {},
     scopes: {},
@@ -142,7 +144,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
       baseHref = attrs.href;
     }
   }
-  const effectiveBaseUrl = baseHref !== null ? new URL(baseHref, documentUrl).href : documentUrl;
+  const effectiveBaseUrl = baseHref !== null ? resolveDocumentUrl(baseHref, documentUrl, documentRoot) : documentUrl;
 
   // Match <link rel="modulepreload" ...> using quote-aware attribute scanner on DOM
   const linkRegex = /<link\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
@@ -203,7 +205,7 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl) {
       if (Object.hasOwn(attrs, "src")) {
         const externalSrc = attrs.src;
         moduleScripts.push({
-          id: new URL(externalSrc, effectiveBaseUrl).href,
+          id: resolveDocumentUrl(externalSrc, effectiveBaseUrl, documentRoot),
           src: externalSrc,
           inlineContent: null,
           startLine,

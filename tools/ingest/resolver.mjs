@@ -14,6 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
 import { resolveInstalledPackage, resolveInstalledPackageIfPresent, resolvePackageBrowserMapping, resolveCommonJSFile } from "./node_package_resolver.mjs";
+import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
 
 /**
@@ -67,7 +68,7 @@ export function isAbsoluteUrl(specifier) {
  * @param {string} mapBaseUrl
  * @returns {string | { blocked: true } | { error: string } | null}
  */
-function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
+function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl, documentRoot) {
   if (!importMap) return null;
 
   // 1. Check scopes
@@ -77,8 +78,9 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
     for (const [prefix, entries] of Object.entries(importMap.scopes)) {
       let scopeUrl;
       try {
-        scopeUrl = new URL(prefix, mapBaseUrl).href;
-      } catch {
+        scopeUrl = resolveDocumentUrl(prefix, mapBaseUrl, documentRoot);
+      } catch (error) {
+        if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
         continue; // Unparseable scope URLs are ignored by import-map normalization.
       }
       scopes.set(scopeUrl, entries);
@@ -88,7 +90,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
         referrerUrl === scopeBase ||
         (scopeBase.endsWith("/") && referrerUrl.startsWith(scopeBase))
       ) {
-        const match = matchMapEntries(specifier, referrerUrl, scopes.get(scopeBase), mapBaseUrl);
+        const match = matchMapEntries(specifier, referrerUrl, scopes.get(scopeBase), mapBaseUrl, documentRoot);
         if (match !== null) return match;
       }
     }
@@ -96,7 +98,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
 
   // 2. Check top-level imports
   if (importMap.imports && typeof importMap.imports === "object") {
-    return matchMapEntries(specifier, referrerUrl, importMap.imports, mapBaseUrl);
+    return matchMapEntries(specifier, referrerUrl, importMap.imports, mapBaseUrl, documentRoot);
   }
 
   return null;
@@ -111,12 +113,13 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl) {
  * @param {string} mapBaseUrl
  * @returns {string | null}
  */
-function normalizeSpecifierKey(key, mapBaseUrl) {
+function normalizeSpecifierKey(key, mapBaseUrl, documentRoot) {
   if (key === "") return null;
   if (key.startsWith("/") || key.startsWith("./") || key.startsWith("../")) {
     try {
-      return new URL(key, mapBaseUrl).href;
-    } catch {
+      return resolveDocumentUrl(key, mapBaseUrl, documentRoot);
+    } catch (error) {
+      if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
       return null;
     }
   }
@@ -135,11 +138,12 @@ function normalizeSpecifierKey(key, mapBaseUrl) {
  * @param {string} referrerUrl
  * @returns {string}
  */
-function normalizeRequestSpecifier(specifier, referrerUrl) {
+function normalizeRequestSpecifier(specifier, referrerUrl, documentRoot) {
   if (specifier.startsWith("/") || specifier.startsWith("./") || specifier.startsWith("../")) {
     try {
-      return new URL(specifier, referrerUrl).href;
-    } catch {
+      return resolveDocumentUrl(specifier, referrerUrl, documentRoot);
+    } catch (error) {
+      if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
       return specifier;
     }
   }
@@ -151,13 +155,14 @@ function normalizeRequestSpecifier(specifier, referrerUrl) {
 }
 
 /** Resolve a matched address before checking the import-map slash contract. */
-function resolveMapTarget(rawKey, target, mapBaseUrl) {
+function resolveMapTarget(rawKey, target, mapBaseUrl, documentRoot) {
   if (typeof target !== "string") return { blocked: true };
   let targetUrl;
   try {
     const relative = target.startsWith("/") || target.startsWith("./") || target.startsWith("../");
-    targetUrl = new URL(target, relative ? mapBaseUrl : undefined).href;
-  } catch {
+    targetUrl = resolveDocumentUrl(target, relative ? mapBaseUrl : undefined, documentRoot);
+  } catch (error) {
+    if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
     return { blocked: true };
   }
   if (rawKey.endsWith("/") && !targetUrl.endsWith("/")) {
@@ -179,12 +184,12 @@ function resolveMapTarget(rawKey, target, mapBaseUrl) {
  * @param {string} mapBaseUrl
  * @returns {string | { blocked: true } | { error: string } | null}
  */
-function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
-  const normalizedSpecifier = normalizeRequestSpecifier(specifier, referrerUrl);
+function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl, documentRoot) {
+  const normalizedSpecifier = normalizeRequestSpecifier(specifier, referrerUrl, documentRoot);
 
   const normalizedEntries = new Map();
   for (const rawKey of Object.keys(entries)) {
-    const normKey = normalizeSpecifierKey(rawKey, mapBaseUrl);
+    const normKey = normalizeSpecifierKey(rawKey, mapBaseUrl, documentRoot);
     if (normKey === null) continue;
     normalizedEntries.set(normKey, { rawKey, target: entries[rawKey] });
   }
@@ -192,7 +197,7 @@ function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
   // 1. Exact match
   if (normalizedEntries.has(normalizedSpecifier)) {
     const { rawKey, target } = normalizedEntries.get(normalizedSpecifier);
-    return resolveMapTarget(rawKey, target, mapBaseUrl);
+    return resolveMapTarget(rawKey, target, mapBaseUrl, documentRoot);
   }
 
   // URL specifiers with non-special schemes only participate in exact matches.
@@ -216,7 +221,7 @@ function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
 
   for (const [normKey, { rawKey, target }] of prefixEntries) {
     if (normalizedSpecifier.startsWith(normKey)) {
-      const targetUrl = resolveMapTarget(rawKey, target, mapBaseUrl);
+      const targetUrl = resolveMapTarget(rawKey, target, mapBaseUrl, documentRoot);
       if (typeof targetUrl !== "string") return targetUrl;
       const remainder = normalizedSpecifier.slice(normKey.length);
       let resolvedUrl;
@@ -231,6 +236,10 @@ function matchMapEntries(specifier, referrerUrl, entries, mapBaseUrl) {
         return {
           error: `Cannot resolve import specifier "${specifier}": backtracking above import map prefix "${rawKey}"`,
         };
+      }
+      if (documentRoot && isRootRelativeDocumentUrl(target)) {
+        const mapBase = new URL(mapBaseUrl);
+        if (mapBase.protocol === "file:" && !mapBase.hostname) documentRelativePath(resolvedUrl, documentRoot);
       }
       return resolvedUrl;
     }
@@ -285,6 +294,7 @@ export function clearPackageJsonCache() {
  * @returns {string} - Canonical resolved file URL
  */
 export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, options = {}) {
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const span = options.span || null;
   const referrerBase = getBaseUrl(referrerUrl);
   const mapBaseUrl = options.mapBaseUrl || referrerBase;
@@ -302,7 +312,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   };
 
   // 1. Try import map
-  const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl);
+  const mapped = matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl, documentRoot);
   const threePackage = specifier === "three" || specifier.startsWith("three/");
   const browserTarget = mapped || (threePackage && options.packageRootUrl)
     ? null : resolvePackageBrowserMapping(specifier, referrerUrl, packageOptions);
@@ -331,8 +341,9 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   ) {
     // 3. Relative or pathname specifier
     try {
-      candidateUrl = new URL(specifier, referrerBase).href;
+      candidateUrl = resolveDocumentUrl(specifier, referrerBase, documentRoot);
     } catch (err) {
+      if (err.code?.startsWith("F3D_DOCUMENT_")) throw err;
       throw new IngestionResolutionError(
         `Failed to parse URL for relative specifier "${specifier}" from "${referrerUrl}": ${err.message}`,
         specifier,
@@ -396,6 +407,10 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
   if (options.requestKind === 'require' && !mapped && browserTarget === null &&
       candidateUrl.startsWith('file:') && /^(?:\.{1,2}\/|\/|file:)/.test(specifier)) {
     candidateUrl = resolveCommonJSFile(candidateUrl);
+    if (documentRoot && isRootRelativeDocumentUrl(specifier)) {
+      const referrer = new URL(referrerBase);
+      if (referrer.protocol === "file:" && !referrer.hostname) documentRelativePath(candidateUrl, documentRoot);
+    }
     // Browser objects commonly name './server.js' while require uses './server'.
     candidateUrl = resolvePackageBrowserMapping(candidateUrl, referrerUrl, packageOptions) ?? candidateUrl;
   }

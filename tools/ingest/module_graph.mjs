@@ -19,6 +19,7 @@ import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mj
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { commonjsFormat } from "./commonjs_modules.mjs";
+import { normalizeDocumentRoot, documentRelativePath } from "./document_urls.mjs";
 
 /**
  * Computes SHA-256 hash of a string.
@@ -98,6 +99,7 @@ function findCycles(adj) {
  * @returns {Promise<Object>} The versioned module graph bundle
  */
 export async function buildModuleGraph(entryPath, options = {}) {
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
   const resolvedEntryAbs = path.resolve(entryPath);
   if (!fs.existsSync(resolvedEntryAbs)) {
@@ -105,6 +107,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
   }
 
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
+  if (documentRoot) documentRelativePath(entryUrl, documentRoot);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
 
   let importMap = { imports: {}, scopes: {} };
@@ -123,7 +126,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
   if (isHtml) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, "utf-8");
-    const parsedHtml = parseHtmlEntries(htmlContent, entryUrl);
+    const parsedHtml = parseHtmlEntries(htmlContent, entryUrl, { documentRoot });
     importMap = parsedHtml.importMap;
     mapBaseUrl = parsedHtml.baseUrl;
 
@@ -247,6 +250,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
       const targetType = imp.module_type ?? "javascript";
       const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
         mapBaseUrl,
+        documentRoot,
         _moduleSources: moduleSources,
         allowCommonJS: true,
         packageRootUrl: options.packageRootUrl,
@@ -298,6 +302,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         try {
           resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
             mapBaseUrl,
+            documentRoot,
             _moduleSources: moduleSources,
             allowCommonJS: true,
             packageRootUrl: options.packageRootUrl,
@@ -355,6 +360,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
           try {
             const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
               mapBaseUrl,
+              documentRoot,
               _moduleSources: moduleSources,
               allowCommonJS: true,
               packageRootUrl: options.packageRootUrl,
