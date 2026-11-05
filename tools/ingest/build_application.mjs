@@ -18,7 +18,8 @@
  * - Honestly recomputes Subresource Integrity (SRI) attributes for emitted chunks.
  * - Positively supports local relative <base href="..."> within application root (directories and file-shaped bases),
  *   rewriting emitted entry chunks and preloads relative to the effective base directory to preserve document.baseURI semantics.
- * - Explicitly rejects remote, root-relative, or escaping bases before output to preserve document.baseURI semantics.
+ * - Supports root-relative document resources under an explicit documentRoot;
+ *   rejects remote or escaping bases before output to preserve document.baseURI semantics.
  * - Rewrites <link rel="modulepreload"> hrefs to point to emitted chunks instead of raw
  *   source files, updating SRI integrity and skipping static asset copies for bundled modules.
  * - Enforces bounded asset closure by copying relative assets (stylesheets, images,
@@ -53,6 +54,7 @@ import { gltfAssetUris } from "./pack_gltf.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
+import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
 
 /**
  * Recomputes Subresource Integrity (SRI) string for modified or bundled content,
@@ -107,6 +109,10 @@ export function isRelativeUrl(url) {
   return true;
 }
 
+function isDocumentResourceUrl(url, documentRoot) {
+  return isRelativeUrl(url) || Boolean(documentRoot && typeof url === "string" && isRootRelativeDocumentUrl(url));
+}
+
 /**
  * Checks whether a URL string has a canonical external scheme (http:, https:, data:).
  * Does not misclassify root-relative (/...) or local file paths.
@@ -153,7 +159,7 @@ export function toCanonicalPreloadUrl(id) {
  * @param {Map<string, string>} [preloadChunkMap]
  * @returns {string | null} Emitted chunk file name if matched, else null
  */
-export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
+export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap, documentRoot = null) {
   if (!rawHref || typeof rawHref !== "string" || !preloadChunkMap) return null;
   const trimmed = rawHref.trim();
   if (!trimmed) return null;
@@ -164,7 +170,7 @@ export function findChunkForPreload(rawHref, referrerDir, preloadChunkMap) {
       const baseUrl = referrerDir.startsWith("file://")
         ? new URL(referrerDir)
         : pathToFileURL(referrerDir.endsWith(path.sep) ? referrerDir : referrerDir + path.sep);
-      const canonicalUrl = new URL(trimmed, baseUrl).href;
+      const canonicalUrl = resolveDocumentUrl(trimmed, baseUrl.href, documentRoot);
       if (preloadChunkMap.has(canonicalUrl)) {
         return preloadChunkMap.get(canonicalUrl);
       }
@@ -200,6 +206,7 @@ export function extractRelativeAssetUrls(
   preloadChunkMap = null,
   referrerDir = "",
   skipModulePreloads = false,
+  documentRoot = null,
 ) {
   const domHtml = stripScriptAndStyleBodies(rawHtmlContent);
   const assets = new Set();
@@ -209,13 +216,13 @@ export function extractRelativeAssetUrls(
   let match;
   while ((match = linkRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(match[1]);
-    if (attrs.href && isRelativeUrl(attrs.href)) {
+    if (attrs.href && isDocumentResourceUrl(attrs.href, documentRoot)) {
       // If this is a modulepreload matching an emitted chunk, it is handled by Rollup bundle emission
       if (
         attrs.rel &&
         attrs.rel.toLowerCase() === "modulepreload" &&
         (skipModulePreloads ||
-          (preloadChunkMap && findChunkForPreload(attrs.href, referrerDir, preloadChunkMap)))
+          (preloadChunkMap && findChunkForPreload(attrs.href, referrerDir, preloadChunkMap, documentRoot)))
       ) {
         continue;
       }
@@ -227,13 +234,13 @@ export function extractRelativeAssetUrls(
   const imgRegex = /<img\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
   while ((match = imgRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(match[1]);
-    if (attrs.src && isRelativeUrl(attrs.src)) {
+    if (attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
     }
     if (attrs.srcset) {
       const srcsetUrls = parseSrcsetUrls(attrs.srcset);
       for (const u of srcsetUrls) {
-        if (isRelativeUrl(u)) {
+        if (isDocumentResourceUrl(u, documentRoot)) {
           assets.add(u);
         }
       }
@@ -245,7 +252,7 @@ export function extractRelativeAssetUrls(
   while ((match = scriptRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(match[1]);
     const type = (attrs.type || "text/javascript").toLowerCase();
-    if (type !== "module" && attrs.src && isRelativeUrl(attrs.src)) {
+    if (type !== "module" && attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
     }
   }
@@ -254,16 +261,16 @@ export function extractRelativeAssetUrls(
   const mediaRegex = /<(?:video|audio|source|track)\b((?:[^"'><]+|"[^"]*"|'[^']*')*)>/gi;
   while ((match = mediaRegex.exec(domHtml)) !== null) {
     const attrs = parseTagAttributes(match[1]);
-    if (attrs.src && isRelativeUrl(attrs.src)) {
+    if (attrs.src && isDocumentResourceUrl(attrs.src, documentRoot)) {
       assets.add(attrs.src);
     }
-    if (attrs.poster && isRelativeUrl(attrs.poster)) {
+    if (attrs.poster && isDocumentResourceUrl(attrs.poster, documentRoot)) {
       assets.add(attrs.poster);
     }
     if (attrs.srcset) {
       const srcsetUrls = parseSrcsetUrls(attrs.srcset);
       for (const u of srcsetUrls) {
-        if (isRelativeUrl(u)) {
+        if (isDocumentResourceUrl(u, documentRoot)) {
           assets.add(u);
         }
       }
@@ -280,13 +287,13 @@ export function extractRelativeAssetUrls(
     if (!name) continue;
     const attrs = parseTagAttributes(tag[2] ?? tag[5] ?? "");
     if (attrs.style !== undefined) {
-      for (const url of extractRelativeCssUrls(decodeHtmlAssetAttribute(attrs.style))) {
+      for (const url of extractRelativeCssUrls(decodeHtmlAssetAttribute(attrs.style), documentRoot)) {
         assets.add(url);
       }
     }
     if (name === "style" && ["", "text/css"].includes((attrs.type ?? "").trim().toLowerCase())) {
       // Unlike attributes, a style element's raw text does not decode HTML entities.
-      for (const url of extractRelativeCssUrls(tag[3] ?? "")) assets.add(url);
+      for (const url of extractRelativeCssUrls(tag[3] ?? "", documentRoot)) assets.add(url);
     }
     const resource = name === "image"
       ? attrs.href ?? attrs["xlink:href"]
@@ -295,7 +302,7 @@ export function extractRelativeAssetUrls(
         : undefined;
     if (resource !== undefined) {
       const url = decodeHtmlAssetAttribute(resource);
-      if (isRelativeUrl(url)) assets.add(url);
+      if (isDocumentResourceUrl(url, documentRoot)) assets.add(url);
     }
   }
 
@@ -370,7 +377,7 @@ function decodeCssResourceUrl(rawUrl) {
  * @param {string} cssContent
  * @returns {string[]} Deduplicated list of relative URLs
  */
-export function extractRelativeCssUrls(cssContent) {
+export function extractRelativeCssUrls(cssContent, documentRoot = null) {
   if (!cssContent || typeof cssContent !== "string") return [];
   const urls = new Set();
   const regex = new RegExp(CSS_RESOURCE_REGEX.source, "gi");
@@ -389,7 +396,7 @@ export function extractRelativeCssUrls(cssContent) {
       const rawUrl =
         match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4] : match[5];
       const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
-      if (isRelativeUrl(url)) {
+      if (isDocumentResourceUrl(url, documentRoot)) {
         urls.add(url);
       }
       continue;
@@ -400,7 +407,7 @@ export function extractRelativeCssUrls(cssContent) {
       const rawUrl =
         match[7] !== undefined ? match[7] : match[8] !== undefined ? match[8] : match[9];
       const url = rawUrl ? decodeCssResourceUrl(rawUrl) : "";
-      if (isRelativeUrl(url)) {
+      if (isDocumentResourceUrl(url, documentRoot)) {
         urls.add(url);
       }
     }
@@ -582,45 +589,30 @@ export function extractJsModuleDependencies(code, contextUrl = "script.js") {
 
 /**
  * Resolves base href details and calculates the chunk prefix relative to the effective base directory.
- * If baseHref is empty, boolean, or absent, returns { effectiveBaseUrl: documentUrl, effectiveBaseDir: entryDir, chunkPrefix: './' }.
- * If baseHref is root-relative (/), protocol-relative (//), remote (http:, etc.), or escapes outside the root directory,
- * throws the explicit rejection error to preserve document.baseURI semantics.
- * Otherwise, computes the relative prefix from the effective base directory to the application root directory.
+ * The output root is documentRoot when declared, otherwise the HTML entry directory.
+ * Root-relative bases require that explicit root; remote or escaping bases are rejected.
+ * The prefix keeps emitted chunks reachable from the unchanged source base href.
  *
  * @param {string | null} baseHref
  * @param {string} [entryDir='']
  * @param {string} [documentUrl='']
  * @returns {{ effectiveBaseUrl: string, effectiveBaseDir: string, chunkPrefix: string }}
  */
-export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "") {
+export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "", documentRoot = null) {
   const effectiveDocUrl =
     documentUrl ||
     (entryDir ? pathToFileURL(path.join(entryDir, "index.html")).href : "file:///app/index.html");
   const effectiveEntryDir = entryDir
     ? path.resolve(entryDir)
     : fileURLToPath(new URL("./", effectiveDocUrl));
-
-  if (baseHref === null || baseHref === "" || typeof baseHref !== "string") {
-    return {
-      effectiveBaseUrl: effectiveDocUrl,
-      effectiveBaseDir: effectiveEntryDir,
-      chunkPrefix: "./",
-    };
-  }
-
-  const trimmed = baseHref.trim();
-  if (trimmed === "") {
-    return {
-      effectiveBaseUrl: effectiveDocUrl,
-      effectiveBaseDir: effectiveEntryDir,
-      chunkPrefix: "./",
-    };
-  }
+  const declaredRoot = normalizeDocumentRoot(documentRoot);
+  const applicationRoot = declaredRoot ?? effectiveEntryDir;
+  const trimmed = typeof baseHref === "string" ? baseHref.trim() : "";
 
   // Reject explicit URL schemes (e.g. file:, http:, https:), protocol-relative (//),
-  // and leading slash/backslash before resolving, to strictly support local relative bases.
+  // and filesystem-only forms. An origin-root base requires its declared local root.
   if (
-    trimmed.startsWith("/") ||
+    (!declaredRoot && trimmed.startsWith("/")) ||
     trimmed.startsWith("\\") ||
     trimmed.startsWith("//") ||
     /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
@@ -632,7 +624,7 @@ export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "") {
 
   let resolvedBaseUrl;
   try {
-    resolvedBaseUrl = new URL(trimmed, effectiveDocUrl);
+    resolvedBaseUrl = new URL(trimmed ? resolveDocumentUrl(trimmed, effectiveDocUrl, declaredRoot) : effectiveDocUrl);
   } catch {
     throw new Error(
       `Explicit rejection: <base href="${baseHref}"> is not currently supported in application build emitter to preserve document.baseURI semantics; base href support remains open.`,
@@ -645,8 +637,9 @@ export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "") {
     );
   }
 
-  const baseDir = fileURLToPath(new URL("./", resolvedBaseUrl));
-  const relFromEntry = path.relative(effectiveEntryDir, baseDir);
+  const baseDir = trimmed ? fileURLToPath(new URL("./", resolvedBaseUrl)) : effectiveEntryDir;
+  if (declaredRoot) documentRelativePath(baseDir, declaredRoot);
+  const relFromEntry = path.relative(applicationRoot, baseDir);
 
   if (
     relFromEntry === ".." ||
@@ -658,7 +651,7 @@ export function resolveBaseDetails(baseHref, entryDir = "", documentUrl = "") {
     );
   }
 
-  const relFromBase = path.relative(baseDir, effectiveEntryDir).split(path.sep).join("/");
+  const relFromBase = path.relative(baseDir, applicationRoot).split(path.sep).join("/");
   let chunkPrefix = "./";
   if (relFromBase && relFromBase !== ".") {
     chunkPrefix = relFromBase.endsWith("/") ? relFromBase : relFromBase + "/";
@@ -810,7 +803,7 @@ export function rewriteLinkTagAttributes(
  *   are never truncated.
  * - Positively supports local relative <base href="..."> within application root (directories and file-shaped bases),
  *   rewriting emitted entry chunks and modulepreloads relative to the effective base directory.
- * - Explicitly rejects remote, root-relative, or escaping bases to preserve document.baseURI semantics.
+ * - Root-relative bases require an explicit documentRoot; remote or escaping bases are rejected.
  * - Rewrites <link rel="modulepreload"> hrefs to emitted chunks and updates SRI integrity.
  * - Enforces entry count equality in both directions.
  *
@@ -832,11 +825,12 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
     (entryDir ? pathToFileURL(path.join(entryDir, "index.html")).href : "file:///app/index.html");
 
   // Discover effective first base href via parseHtmlEntries and validate base containment up front
-  const parsedHtml = parseHtmlEntries(rawHtmlContent, documentUrl);
+  const parsedHtml = parseHtmlEntries(rawHtmlContent, documentUrl, {documentRoot: options.documentRoot});
   const { effectiveBaseDir, chunkPrefix } = resolveBaseDetails(
     parsedHtml.baseHref,
     entryDir,
     documentUrl,
+    options.documentRoot,
   );
 
   // Quote-aware tag scanner:
@@ -919,6 +913,7 @@ export function rewriteHtmlForBuild(rawHtmlContent, entryFiles, chunkFilesMap = 
             parsedLink.href,
             effectiveBaseDir,
             preloadChunkMap,
+            options.documentRoot,
           );
           if (chunkFileName) {
             const chunkCode = chunkFilesMap[chunkFileName] || "";
@@ -1001,13 +996,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const resolvedOutDir = path.resolve(outDir);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
   const entryDir = path.dirname(resolvedEntryAbs);
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
+  const applicationRoot = documentRoot ?? entryDir;
+  const htmlFileName = isHtml ? documentRoot ? documentRelativePath(resolvedEntryAbs, documentRoot) : path.basename(resolvedEntryAbs) : null;
 
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf-8");
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
-    const parsedHtml = parseHtmlEntries(rawHtml, entryBaseUrl);
+    const parsedHtml = parseHtmlEntries(rawHtml, entryBaseUrl, {documentRoot});
     if (parsedHtml.baseHref !== null) {
-      resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl);
+      resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl, documentRoot);
     }
   }
 
@@ -1018,14 +1016,13 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     // so it follows the same collision and exclusive-write rules as the chunks.
     targetFiles.set("package.json", JSON.stringify({ type: "module" }, null, 2) + "\n");
   }
-  const htmlFileName = isHtml ? path.basename(resolvedEntryAbs) : null;
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
   const classicWorkerSources = new Map(), classicScriptRewrites = new Map();
   const documentWorkerGlobals = new Set();
 
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf8"), documentUrl = pathToFileURL(resolvedEntryAbs).href;
-    const parsed = parseHtmlEntries(rawHtml, documentUrl), scripts = [];
+    const parsed = parseHtmlEntries(rawHtml, documentUrl, {documentRoot}), scripts = [];
     // Skip markup-looking text in comments, styles and other raw-text elements.
     const tags = /<!--[\s\S]*?(?:-->|$)|<(script|style|textarea|title)\b((?:[^"'>]|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/\1\s*>/gi;
     for (const match of rawHtml.matchAll(tags)) {
@@ -1035,13 +1032,13 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       if ((sourceType === "script" && !isClassicJavaScriptType(attrs.type)) || attrs.src === "") continue;
       let source = match[3], file = null, original = Buffer.from(source);
       if (attrs.src !== undefined) {
-        const url = new URL(attrs.src, parsed.baseUrl);
-        if (url.protocol !== "file:" || !isRelativeUrl(attrs.src)) {
+        const url = new URL(resolveDocumentUrl(attrs.src, parsed.baseUrl, documentRoot));
+        if (url.protocol !== "file:" || !isDocumentResourceUrl(attrs.src, documentRoot)) {
           // An uninspected external script can replace the document globals.
           documentWorkerGlobals.add("Worker"); documentWorkerGlobals.add("SharedWorker"); continue;
         }
         file = fileURLToPath(url);
-        const relative = path.relative(entryDir, file);
+        const relative = documentRoot ? documentRelativePath(file, documentRoot) : path.relative(entryDir, file);
         if (relative.startsWith("..") || path.isAbsolute(relative)) continue; // Existing asset closure reports this.
         if (!fs.existsSync(file) || !fs.statSync(file).isFile()) continue;
         original = fs.readFileSync(file);
@@ -1051,9 +1048,9 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       if (sourceType === "script") scripts.push({match, attrs, source, file, original});
     }
     const plugin = moduleWorkerRollupPlugin({_moduleSources: moduleSources, sourceType: "script",
-      documentUrl, documentBaseUrl: parsed.baseUrl, unavailableGlobals: documentWorkerGlobals,
+      documentUrl, documentBaseUrl: parsed.baseUrl, documentRoot, unavailableGlobals: documentWorkerGlobals,
       resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
-        packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources})});
+        packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, documentRoot})});
     const context = {emitFile(asset) {
       const previous = targetFiles.get(asset.fileName);
       if (previous !== undefined && !Buffer.from(previous).equals(Buffer.from(asset.source)))
@@ -1093,14 +1090,14 @@ export async function buildApplication(entryPath, outDir, options = {}) {
 
     const rawHtmlContent = fs.readFileSync(resolvedEntryAbs, "utf-8");
     const entryBaseUrl = pathToFileURL(resolvedEntryAbs).href;
-    const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl);
+    const parsedHtml = parseHtmlEntries(rawHtmlContent, entryBaseUrl, {documentRoot});
     const importMap = parsedHtml.importMap;
-    const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl);
+    const { effectiveBaseDir } = resolveBaseDetails(parsedHtml.baseHref, entryDir, entryBaseUrl, documentRoot);
     const copyFetchResources = (source, sourceType) => {
       if (!source.includes("fetch")) return;
       const {sites} = analyzeDocumentFetch(source, {sourceType});
       for (const [name, asset] of collectDocumentFetchAssets(sites, {
-        documentUrl: entryBaseUrl, documentBaseUrl: parsedHtml.baseUrl,
+        documentUrl: entryBaseUrl, documentBaseUrl: parsedHtml.baseUrl, documentRoot,
       })) {
         if (emittedChunkNames.has(name))
           throw new Error(`Document fetch resource ${JSON.stringify(name)} collides with an emitted chunk or HTML entry`);
@@ -1118,6 +1115,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       preloadChunkMap,
       effectiveBaseDir,
       skipModulePreloads,
+      documentRoot,
     );
 
     // Bounded asset processing queue: handles direct HTML assets, transitive CSS/model children,
@@ -1191,6 +1189,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             mapBaseUrl: parsedHtml.baseUrl,
             _moduleSources: moduleSources,
             packageRootUrl: options.packageRootUrl,
+            documentRoot,
           });
         } catch (err) {
           let context = "";
@@ -1210,16 +1209,16 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }
 
         srcAssetAbs = urlToFilePath(resolvedUrl);
-        relFromEntryDir = path.relative(entryDir, srcAssetAbs);
+        relFromEntryDir = documentRoot ? documentRelativePath(srcAssetAbs, documentRoot) : path.relative(entryDir, srcAssetAbs);
         moduleUrl = resolvedUrl;
         // File copies share bytes, but query/fragment variants remain distinct modules.
-        const entryDirectoryUrl = new URL("./", entryBaseUrl).href;
+        const entryDirectoryUrl = pathToFileURL(applicationRoot + path.sep).href;
         retainedModuleUrls.set(resolvedUrl, "./" + resolvedUrl.slice(entryDirectoryUrl.length));
       } else {
         const { relUrl, referrerDir } = item;
         if (!relUrl || typeof relUrl !== "string") continue;
         const trimmedRelUrl = relUrl.trim();
-        if (!trimmedRelUrl) continue;
+        if (!trimmedRelUrl || documentRoot && !isDocumentResourceUrl(trimmedRelUrl, documentRoot)) continue;
 
         // Browser URI semantics: resolve against referrer directory URL using new URL,
         // then convert file: URL object directly to decoded filesystem path via fileURLToPath.
@@ -1231,17 +1230,18 @@ export async function buildApplication(entryPath, outDir, options = {}) {
             ? referrerDir
             : referrerDir + path.sep;
           const referrerBaseUrl = pathToFileURL(referrerDirSlash);
-          const resolvedUrl = new URL(trimmedRelUrl, referrerBaseUrl);
+          const resolvedUrl = resolveDocumentUrl(trimmedRelUrl, referrerBaseUrl.href, documentRoot);
           srcAssetAbs = fileURLToPath(resolvedUrl);
         } catch {
           const cleanRelPath = trimmedRelUrl.split(/[?#]/)[0];
-          srcAssetAbs = path.resolve(referrerDir, cleanRelPath);
+          srcAssetAbs = documentRoot && cleanRelPath.startsWith("/")
+            ? path.resolve(documentRoot, cleanRelPath.slice(1)) : path.resolve(referrerDir, cleanRelPath);
         }
 
-        relFromEntryDir = path.relative(entryDir, srcAssetAbs);
+        relFromEntryDir = documentRoot ? documentRelativePath(srcAssetAbs, documentRoot) : path.relative(entryDir, srcAssetAbs);
       }
 
-      // Verify that relative asset or module path does not escape entry directory
+      // Verify that a copied resource stays within the selected application root.
       if (relFromEntryDir.startsWith("..") || path.isAbsolute(relFromEntryDir)) {
         const target = item.isModuleSpecifier ? item.specifier : item.relUrl;
         let context = "";
@@ -1311,7 +1311,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
           throw error;
         };
         for (const uri of gltfAssetUris(assetData, modelExtension === ".glb", fail)) {
-          if (!isRelativeUrl(uri)) continue;
+          if (!isDocumentResourceUrl(uri, documentRoot)) continue;
           assetQueue.push({
             relUrl: uri,
             referrerDir: path.dirname(srcAssetAbs),
@@ -1326,7 +1326,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       if (!item.modelResource && srcAssetAbs.endsWith(".css") && !visitedCssPaths.has(srcAssetAbs)) {
         visitedCssPaths.add(srcAssetAbs);
         const cssContent = assetData.toString("utf-8");
-        const childUrls = extractRelativeCssUrls(cssContent);
+        const childUrls = extractRelativeCssUrls(cssContent, documentRoot);
         const cssDir = path.dirname(srcAssetAbs);
         for (const childUrl of childUrls) {
           assetQueue.push({
@@ -1383,11 +1383,12 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       ? await decideRendererRoutes(resolvedEntryAbs, options.packageRootUrl, {
           webgpu: Boolean(options.routeWebGPURenderer),
           webgl: Boolean(options.routeWebGLRenderer),
-        }, moduleSources)
+        }, moduleSources, documentRoot)
       : null;
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
     _moduleSources: moduleSources,
     packageRootUrl: options.packageRootUrl,
+    documentRoot,
     workerHostBindings: documentWorkerGlobals,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
@@ -1426,7 +1427,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         fs.readFileSync(resolvedEntryAbs, "utf-8"),
         bundleResult.entryFiles,
         bundleResult.files,
-        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, classicScriptRewrites },
+        { preloadChunkMap, entryDir, documentUrl: entryBaseUrl, documentRoot, classicScriptRewrites },
       ),
     );
   }
@@ -1506,8 +1507,8 @@ export async function buildApplication(entryPath, outDir, options = {}) {
  * this route cannot provide. Anything else keeps the retained upstream build
  * unchanged, with the reason recorded.
  */
-async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources) {
-  const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources });
+async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources, documentRoot) {
+  const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources, documentRoot });
   const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
     packageRootUrl,
     generalWebGPUAvailable: enabled.webgpu,
@@ -1552,7 +1553,7 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSou
     else if (!urls.every((id) => isInternalLibraryModule(id, packageRootUrl)))
       reason = gl ? "unpinned-three-module" : "unpinned-three-webgpu-module";
     else if (changedThree) reason = "transformed-three-module";
-    else if (gl && readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources)) reason = "gl-context-state-read";
+    else if (gl && readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources, documentRoot)) reason = "gl-context-state-read";
     if (reason) reasons.push(reason);
     else for (const url of urls) targets.push({ url, exportName });
   }
@@ -1579,7 +1580,7 @@ const GL_CONTEXT_STATE = new Set(["capabilities", "extensions", "getContextAttri
 // Fields the routed WebGLRenderer serves truthfully (three_renderer.mjs).
 const SERVED_CAPABILITIES = new Set(["getMaxAnisotropy", "logarithmicDepthBuffer", "reversedDepthBuffer", "precision", "getMaxPrecision", "isWebGL2"]);
 /** True when an application (non-pinned-library) module reads GL-context state. */
-export function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources) {
+export function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSources, documentRoot) {
   const propertyNames = node => {
     if (!node.computed) return [node.property.name];
     // Reuse finite string analysis without evaluating keys or their effects.
@@ -1590,7 +1591,7 @@ export function readsGlContextState(graph, entryAbs, packageRootUrl, moduleSourc
   const inline = new Map();
   if (/\.html?$/.test(entryAbs)) {
     const entryUrl = pathToFileURL(entryAbs).href;
-    for (const script of parseHtmlEntries(fs.readFileSync(entryAbs, "utf-8"), entryUrl).moduleScripts)
+    for (const script of parseHtmlEntries(fs.readFileSync(entryAbs, "utf-8"), entryUrl, {documentRoot}).moduleScripts)
       if (script.inlineContent !== null) inline.set(script.id, script.inlineContent);
   }
   for (const id of Object.keys(graph.modules)) {

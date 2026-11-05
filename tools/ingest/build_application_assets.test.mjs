@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import { buildApplication, extractRelativeAssetUrls } from "./build_application.mjs";
+import { parseHtmlEntries } from "./html_parser.mjs";
 import { packHtml } from "./pack_html.mjs";
 
 function fixture(files) {
@@ -157,5 +161,110 @@ test("inline CSS resources use existing missing-file and application-root checks
     await assert.rejects(buildApplication(f.entry, f.out), expected);
     assert.equal(fs.existsSync(path.join(f.out, "index.html")), false, "Do not emit a broken application");
     assert.equal(fs.readFileSync(f.entry, "utf8"), html);
+  }
+});
+
+test("declared document root keeps nested HTML, root assets and retained modules working after relocation", async t => {
+  const classic = "globalThis.loadRootShared = () => import('/scripts/shared.mjs');";
+  const integrity = "sha384-" + crypto.createHash("sha384").update(classic).digest("base64");
+  const html = `<!doctype html><title>Rooted scene</title>
+    <link rel="stylesheet" href="/styles/app.css?version=2">
+    <link rel="modulepreload" href="/scripts/main.mjs" integrity="sha384-placeholder">
+    <link rel="modulepreload" href="/scripts/preload-only.mjs">
+    <style>@import '/styles/inline.css'; body {mask:url('/images/mask.svg#paint')}</style>
+    <img src="/images/panel%20wide.svg?version=2#paint" srcset="/images/small.svg 1x, /images/large.svg 2x">
+    <img src="./page.svg"><img src="https://example.invalid/live.svg">
+    <script src="/scripts/classic.js" integrity="${integrity}"></script>
+    <script type="module" src="/scripts/main.mjs"></script>`;
+  const resources = {
+    "styles/app.css": '@import "/styles/nested.css"; .panel {background:url("../images/panel%20wide.svg#paint")} .remote {background:url(//example.invalid/remote.svg)}',
+    "styles/nested.css": '@font-face {font-family: Scene; src:url("/fonts/scene.woff2")}',
+    "styles/inline.css": '.icon {background:url("/images/icon.svg")}',
+    "fonts/scene.woff2": Buffer.from([0x77, 0x4f, 0x46, 0x32, 7, 8, 9]),
+    "images/panel wide.svg": "wide panel", "images/mask.svg": "mask", "images/icon.svg": "icon",
+    "images/small.svg": "small", "images/large.svg": "large", "pages/page.svg": "page-relative image",
+    "scripts/classic.js": classic,
+    "scripts/shared.mjs": "export const state = {count: 1};",
+    "scripts/preload-only.mjs": "export const preloaded = true;",
+  };
+  const f = fixture({"pages/demo.html": html, ...resources,
+    "scripts/main.mjs": "import {state} from '/scripts/shared.mjs'; export {state}; export const answer = 42; export const later = () => import('/scripts/lazy.mjs');",
+    "scripts/lazy.mjs": "export {state} from '/scripts/shared.mjs';",
+  });
+  const result = await buildApplication(path.join(f.source, "pages/demo.html"), f.out, {documentRoot: f.source});
+  assert.equal(result.htmlFile, "pages/demo.html");
+  assert.ok(!result.emittedFiles.includes("scripts/main.mjs"), "A bundled preload must use its emitted chunk");
+  const moved = path.join(f.root, "deployed-site");
+  fs.renameSync(f.out, moved); fs.renameSync(f.source, path.join(f.root, "source-unavailable"));
+  const server = http.createServer((request, response) => {
+    const name = decodeURIComponent(new URL(request.url, "http://localhost").pathname).slice(1);
+    const file = path.join(moved, name);
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) { response.writeHead(404); response.end(); return; }
+    const type = {".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript"}[path.extname(file)];
+    response.setHeader("Content-Type", type ?? "application/octet-stream"); response.end(fs.readFileSync(file));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(origin + "/pages/demo.html"); assert.equal(response.status, 200);
+  const emitted = await response.text(), parsed = parseHtmlEntries(emitted, origin + "/pages/demo.html");
+  assert.ok(emitted.includes(`<script src="/scripts/classic.js" integrity="${integrity}"></script>`));
+  assert.ok(emitted.includes('<img src="./page.svg"><img src="https://example.invalid/live.svg">'));
+  for (const [name, bytes] of Object.entries(resources)) {
+    assert.ok(result.emittedFiles.includes(name), name);
+    const resource = await fetch(origin + "/" + name.split("/").map(encodeURIComponent).join("/"));
+    assert.equal(resource.status, 200, name);
+    assert.deepEqual(Buffer.from(await resource.arrayBuffer()), Buffer.from(bytes), name);
+  }
+  const scriptUrl = new URL(parsed.moduleScripts[0].src, parsed.baseUrl);
+  assert.equal(scriptUrl.pathname, "/" + result.entryFiles[0], "Nested HTML must reach root-level chunks");
+  const script = await fetch(scriptUrl); assert.equal(script.status, 200);
+  const code = await script.text();
+  const preload = /<link rel="modulepreload" href="([^"]+)" integrity="([^"]+)">/.exec(emitted);
+  assert.equal(new URL(preload[1], parsed.baseUrl).href, scriptUrl.href);
+  assert.equal(preload[2], "sha384-" + crypto.createHash("sha384").update(code).digest("base64"));
+  const app = await import(pathToFileURL(path.join(moved, result.entryFiles[0])).href);
+  const shared = await import(pathToFileURL(path.join(moved, "scripts/shared.mjs")).href);
+  assert.equal(app.answer, 42); assert.equal(app.state, shared.state);
+  app.state.count = 9; assert.equal((await app.later()).state, shared.state); assert.equal(shared.state.count, 9);
+});
+
+for (const base of ["/site/", "/site/current.html?edition=2#section"])
+  test(`declared document root preserves ${base} as the effective base after relocation`, async () => {
+    const f = fixture({
+      "pages/demo.html": `<base href="${base}"><base href="/ignored/"><link rel="stylesheet" href="./theme.css"><img src="./image.svg"><script type="module" src="./main.mjs"></script>`,
+      "site/theme.css": '.image {background:url("/shared/background.svg")}',
+      "site/image.svg": "image", "shared/background.svg": "background",
+      "site/main.mjs": "export const answer = 42;",
+    });
+    const entry = path.join(f.source, "pages/demo.html");
+    await assert.rejects(buildApplication(entry, path.join(f.root, "without-root")), /Explicit rejection/);
+    const result = await buildApplication(entry, f.out, {documentRoot: pathToFileURL(f.source)});
+    const moved = path.join(f.root, "deployed-site");
+    fs.renameSync(f.out, moved); fs.renameSync(f.source, path.join(f.root, "source-unavailable"));
+    const emitted = fs.readFileSync(path.join(moved, result.htmlFile), "utf8");
+    const parsed = parseHtmlEntries(emitted, "https://example.test/pages/demo.html");
+    assert.equal(parsed.baseUrl, "https://example.test" + base);
+    assert.ok(emitted.startsWith(`<base href="${base}"><base href="/ignored/">`));
+    assert.equal(new URL(parsed.moduleScripts[0].src, parsed.baseUrl).pathname, "/" + result.entryFiles[0]);
+    for (const name of ["site/theme.css", "site/image.svg", "shared/background.svg"])
+      assert.ok(fs.existsSync(path.join(moved, name)), name);
+    assert.equal((await import(pathToFileURL(path.join(moved, result.entryFiles[0])).href)).answer, 42);
+  });
+
+test("declared document root rejects escaping CSS, symlink resources and nested HTML collisions before output", async () => {
+  for (const cause of ["css", "symlink", "collision"]) {
+    const f = fixture({"pages/demo.html": cause === "css" ? '<link rel="stylesheet" href="/styles/app.css">'
+      : `<img src="${cause === "symlink" ? "/images/outside.svg" : "/pages/demo.html"}">`,
+      "styles/app.css": 'body {background:url("../../outside.svg")}',
+    });
+    const outside = path.join(f.root, "outside.svg"); fs.writeFileSync(outside, "outside declared root");
+    if (cause === "symlink") {
+      fs.mkdirSync(path.join(f.source, "images")); fs.symlinkSync(outside, path.join(f.source, "images/outside.svg"));
+    }
+    await assert.rejects(buildApplication(path.join(f.source, "pages/demo.html"), f.out, {documentRoot: f.source}),
+      cause === "collision" ? /Collision detected/ : {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+    assert.equal(fs.existsSync(f.out), false);
+    assert.equal(fs.readFileSync(outside, "utf8"), "outside declared root");
   }
 });

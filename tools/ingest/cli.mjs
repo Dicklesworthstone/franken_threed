@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { documentRelativePath, normalizeDocumentRoot } from "./document_urls.mjs";
 
 function printHelp() {
   console.log(`
@@ -13,7 +14,7 @@ FrankenThreeD Module Graph Ingestion & Application Build Tool (f3d-04)
 
 Usage:
   node tools/ingest/cli.mjs --entry <path_to_html_or_js> [options]
-  node tools/ingest/cli.mjs serve <directory-or-html> [--port 8080] [--isolate]
+  node tools/ingest/cli.mjs serve <directory-or-html> [--document-root <dir>] [--port 8080] [--isolate]
 
 Options:
   --entry <path>        Path to HTML, ESM, or glTF/GLB entry (required)
@@ -33,6 +34,8 @@ Options:
   --max-memory-pages <n>   Kernel memory ceiling in 64 KiB pages (default: 1024)
   --output <path>       Output JSON file path (default: stdout)
   --package-root <url>  Base URL or directory for Three.js package fallback
+  --document-root <dir>  Local directory served as the browser origin root for /assets URLs
+                       Preserves HTML paths within this root in --build-app output
   --transform-module <file>  Project frontend module exporting synchronous transformModule
                        Applies to graph analysis and --build-app, including package sources
   --help, -h            Show this help message
@@ -70,6 +73,7 @@ async function main() {
   let entry = null;
   let output = null;
   let packageRoot = null;
+  let documentRoot = null;
   let transformModulePath = null;
   let buildAppDir = null;
   let packHtmlFile = null;
@@ -148,6 +152,12 @@ async function main() {
         process.exit(1);
       }
       packageRoot = args[++i];
+    } else if (arg === "--document-root") {
+      if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
+        console.error("Error: --document-root requires a directory path argument.");
+        process.exit(1);
+      }
+      documentRoot = args[++i];
     } else if (arg === "--transform-module") {
       if (i + 1 >= args.length || args[i + 1].startsWith("-")) {
         console.error("Error: --transform-module requires a frontend module path.");
@@ -188,6 +198,7 @@ async function main() {
       maxMemoryPages !== undefined ||
       output ||
       packageRoot ||
+      documentRoot ||
       transformModulePath ||
       !/\.gl(?:tf|b)$/i.test(entry))
   ) {
@@ -207,9 +218,9 @@ async function main() {
     );
     process.exit(1);
   }
-  if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot || transformModulePath)) {
+  if (buildKernelDir && (!parameterTypes || buildAppDir || output || packageRoot || documentRoot || transformModulePath)) {
     console.error(
-      "Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output, --package-root or --transform-module.",
+      "Error: --build-kernel requires --parameter-types and cannot be combined with --build-app, --output, --package-root, --document-root or --transform-module.",
     );
     process.exit(1);
   }
@@ -238,6 +249,14 @@ async function main() {
     console.error(`Error: Entry file "${entry}" does not exist.`);
     process.exit(1);
   }
+  let emittedEntryName = path.basename(resolvedEntry);
+  try {
+    documentRoot = normalizeDocumentRoot(documentRoot);
+    if (documentRoot) emittedEntryName = documentRelativePath(resolvedEntry, documentRoot);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
 
   let resolvedOutput = null;
   let resolvedBuildAppDir = null;
@@ -253,7 +272,7 @@ async function main() {
       (output && packed === path.resolve(output)) ||
       (resolvedBuildAppDir &&
         (packed === resolvedBuildAppDir ||
-          packed === path.join(resolvedBuildAppDir, path.basename(resolvedEntry))))
+          packed === path.join(resolvedBuildAppDir, emittedEntryName)))
     ) {
       console.error(
         "Error: --pack-html output collides with an input, build entry, or manifest path.",
@@ -289,10 +308,10 @@ async function main() {
         );
         process.exit(1);
       }
-      const expectedEmittedEntry = path.join(resolvedBuildAppDir, path.basename(resolvedEntry));
+      const expectedEmittedEntry = path.join(resolvedBuildAppDir, emittedEntryName);
       if (resolvedOutput === expectedEmittedEntry) {
         console.error(
-          `Error: Output path "${output}" collides with generated application file "${path.basename(resolvedEntry)}".`,
+          `Error: Output path "${output}" collides with generated application file "${emittedEntryName}".`,
         );
         process.exit(1);
       }
@@ -323,9 +342,9 @@ async function main() {
     }
   }
 
-  async function exportHtml(htmlEntry) {
+  async function exportHtml(htmlEntry, root = documentRoot) {
     const { packHtml } = await import("./pack_html.mjs");
-    const packed = packHtml(htmlEntry, packHtmlFile);
+    const packed = packHtml(htmlEntry, packHtmlFile, root ? {documentRoot: root, rootDir: root} : {});
     console.log(`Single HTML exported to: ${packed.outputFile}`);
     console.log(
       `Embedded ${packed.moduleCount} modules and ${packed.assetCount} static assets (${packed.outputBytes} bytes).`,
@@ -378,6 +397,7 @@ async function main() {
       const { buildApplication } = await import("./build_application.mjs");
       const appResult = await buildApplication(entry, buildAppDir, {
         packageRootUrl: packageRoot,
+        documentRoot,
         transformModule,
         specializeNumeric: specializeNumeric ? { maxMemoryPages } : false,
         routeWebGPURenderer,
@@ -414,7 +434,8 @@ async function main() {
       }
 
       if (packHtmlFile) {
-        appResult.singleHtml = await exportHtml(path.join(appResult.outDir, appResult.htmlFile));
+        appResult.singleHtml = await exportHtml(path.join(appResult.outDir, appResult.htmlFile),
+          documentRoot ? appResult.outDir : null);
       }
 
       if (output) {
@@ -438,6 +459,7 @@ async function main() {
     const { buildModuleGraph } = await import("./module_graph.mjs");
     const bundle = await buildModuleGraph(entry, {
       packageRootUrl: packageRoot,
+      documentRoot,
       transformModule,
     });
 

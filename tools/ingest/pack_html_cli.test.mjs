@@ -157,3 +157,47 @@ test("legacy CLI option validation remains unchanged when packing is not request
     /--parameter-types requires --build-kernel/,
   );
 });
+
+test("CLI builds and packs origin-root applications while preserving a nested HTML entry", () => {
+  const f = fixture({
+    "pages/demo.html": '<link rel="stylesheet" href="/styles/site.css"><script type="module" src="/modules/app.mjs"></script>',
+    "modules/app.mjs": "import {value} from '/modules/value.mjs';export const answer=value;",
+    "modules/value.mjs": "export const value=42;",
+    "styles/site.css": "body{background:url('/images/background.png')}",
+    "images/background.png": Buffer.from([137,80,78,71]),
+  });
+  const entry = path.join(f.root, 'pages/demo.html'), build = path.join(f.root, 'build');
+  const report = path.join(f.root, 'report.json');
+  const result = run([entry, '--document-root', f.root, '--build-app', build,
+    '--pack-html', f.out, '--output', report]);
+  assert.equal(result.status, 0, result.stderr);
+  const manifest = JSON.parse(fs.readFileSync(report, 'utf8'));
+  assert.equal(manifest.htmlFile, 'pages/demo.html');
+  assert.ok(fs.existsSync(path.join(build, manifest.htmlFile)));
+  assert.deepEqual(fs.readFileSync(path.join(build, 'images/background.png')), Buffer.from([137,80,78,71]));
+  const html = fs.readFileSync(f.out, 'utf8');
+  const css = Buffer.from(/href="data:text\/css;base64,([^"]+)"/.exec(html)[1], 'base64').toString();
+  assert.match(css, /data:image\/png/);
+  assert.ok(sourceModules(html).some(source => /42/.test(source)));
+  const direct = path.join(f.root, 'direct.html');
+  const packed = run([entry, '--document-root', f.root, '--pack-html', direct]);
+  assert.equal(packed.status, 0, packed.stderr);
+  assert.ok(fs.readFileSync(direct, 'utf8').includes('data:text/javascript;base64,'));
+});
+
+test("CLI validates document-root containment and nested output collisions before writing", () => {
+  const f = fixture({'pages/demo.html': '<script type="module" src="/entry.mjs"></script>'});
+  const entry = path.join(f.root, 'pages/demo.html'), build = path.join(f.root, 'build');
+  assert.match(run(['--help']).stdout, /--document-root/);
+  const missing = run([entry, '--document-root']);
+  assert.equal(missing.status, 1); assert.match(missing.stderr, /requires a directory/);
+  for (const flag of ['--output', '--pack-html']) {
+    const result = run([entry, '--document-root', f.root, '--build-app', build,
+      flag, path.join(build, 'pages/demo.html')]);
+    assert.equal(result.status, 1); assert.match(result.stderr, /collides/);
+    assert.equal(fs.existsSync(build), false);
+  }
+  const outside = run([f.entry, '--document-root', path.join(f.root, 'pages'), '--build-app', build]);
+  assert.equal(outside.status, 1); assert.match(outside.stderr, /escapes document root/);
+  assert.equal(fs.existsSync(build), false);
+});

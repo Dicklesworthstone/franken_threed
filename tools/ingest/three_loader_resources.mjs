@@ -114,7 +114,7 @@ const MIME = {
  * original logical URL inside GLTFLoader, never from a data URL's fake base.
  * The bound includes encoded table bytes, also charged by packHtml as source.
  */
-export function createThreeLoaderResourceModule(assets, { logicalURLs = null, maxBytes = 64 * 1024 * 1024 } = {}) {
+export function createThreeLoaderResourceModule(assets, { logicalURLs = null, documentPath = null, maxBytes = 64 * 1024 * 1024 } = {}) {
   const entries = [];
   let bytes = 0;
   for (const [filename, asset] of [...assets].sort(([a], [b]) => a.localeCompare(b))) {
@@ -129,18 +129,29 @@ export function createThreeLoaderResourceModule(assets, { logicalURLs = null, ma
       entries.push([url, data]);
     }
   }
-  return resourceModule(entries);
+  return resourceModule(entries, documentPath === null ? null : documentPath.split("/").map(encodeURIComponent).join("/"));
 }
 
-function resourceModule(entries) {
+function resourceModule(entries, documentPath = null) {
+  // Root-mounted builds keep the source page's logical path when a standalone
+  // HTML file moves. A changed document base continues to use the host's URL.
+  // Preserve the original default helper verbatim so older builds still pack.
+  const rootDeclaration = documentPath === null
+    ? "const resourceRoot = typeof document === 'undefined' ? null : new URL('./', document.URL).href;"
+    : `const sourceDocumentPath = ${JSON.stringify(documentPath)};
+const resourceRoot = typeof document === 'undefined' ? null : new URL('/', document.URL).href;
+const initialDocumentURL = typeof document === 'undefined' ? null : document.URL;
+const sourceDocumentURL = resourceRoot === null ? null : new URL(sourceDocumentPath, resourceRoot).href;`;
+  const base = documentPath === null ? "document.baseURI"
+    : "document.baseURI === initialDocumentURL ? sourceDocumentURL : document.baseURI";
   return `// Finite source-identified loader assets; unknown URLs retain their network route.
 const resources = new Map(${JSON.stringify(entries)});
-const resourceRoot = typeof document === 'undefined' ? null : new URL('./', document.URL).href;
+${rootDeclaration}
 export function resolveThreeLoaderResource(url) {
   if (typeof url !== 'string' || resourceRoot === null) return url;
   let requested, key;
   try {
-    requested = new URL(url, document.baseURI);
+    requested = new URL(url, ${base});
     if (!requested.href.startsWith(resourceRoot)) return url;
     key = requested.href.slice(resourceRoot.length);
   } catch { return url; }
@@ -168,6 +179,10 @@ export function isThreeLoaderResourceModule(source, ast) {
     const entries = JSON.parse(source.slice(entriesNode.start, entriesNode.end));
     if (!Array.isArray(entries) || entries.some(entry => !Array.isArray(entry) || entry.length !== 2 ||
         typeof entry[0] !== "string" || typeof entry[1] !== "string" || !entry[1].startsWith("data:"))) return false;
-    return source === resourceModule(entries);
+    if (source === resourceModule(entries)) return true;
+    const pathDeclaration = ast.body[1]?.declarations?.[0];
+    return pathDeclaration?.id?.name === "sourceDocumentPath" &&
+      pathDeclaration.init?.type === "Literal" && typeof pathDeclaration.init.value === "string" &&
+      source === resourceModule(entries, pathDeclaration.init.value);
   } catch { return false; }
 }

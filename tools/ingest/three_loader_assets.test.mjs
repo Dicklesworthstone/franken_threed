@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import * as nodeModule from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -892,6 +893,108 @@ test("built FileLoader and GLTFLoader fetch original document-base URLs and exte
     if (OriginalProgressEvent === undefined) delete globalThis.ProgressEvent;
     else globalThis.ProgressEvent = OriginalProgressEvent;
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("rooted glTF sidecars preserve pinned LoaderUtils path concatenation", async () => {
+  const {LoaderUtils} = await import(rootUrl + "src/loaders/LoaderUtils.js");
+  assert.equal(LoaderUtils.resolveURL("/geometry.bin", "/shared/"), "/shared//geometry.bin");
+  const geometry = Buffer.from([1, 2, 3, 4]);
+  const model = Buffer.from(JSON.stringify({asset: {version: "2.0"}, buffers: [{uri: "/geometry.bin", byteLength: geometry.length}]}));
+  const root = fixture({"pages/demo.html": "", "models/scene.gltf": model,
+    "shared/geometry.bin": geometry, "geometry.bin": "wrong origin-root resolution"});
+  const requests = discover(`import {GLTFLoader} from ${JSON.stringify(gltfUrl)};
+    new GLTFLoader().setPath('/models/').setResourcePath('/shared/').loadAsync('scene.gltf');`);
+  const logical = [], prefix = pathToFileURL(root + path.sep).href;
+  const assets = collectThreeLoaderAssets(requests, {documentRoot: root,
+    documentUrl: pathToFileURL(path.join(root, "pages/demo.html")).href,
+    onResource: (_name, url) => logical.push(url.slice(prefix.length)),
+  });
+  assert.deepEqual([...assets.keys()].sort(), ["models/scene.gltf", "shared/geometry.bin"]);
+  assert.deepEqual(logical, ["models/scene.gltf", "shared//geometry.bin"]);
+  assert.deepEqual(assets.get("models/scene.gltf").source, model);
+  assert.deepEqual(assets.get("shared/geometry.bin").source, geometry);
+});
+
+test("rooted nested-page loaders retain model sidecars and relative resources after site and standalone relocation", async t => {
+  const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  const model = JSON.stringify({
+    asset: {version: "2.0"}, scene: 0, scenes: [{nodes: [0]}], nodes: [{mesh: 0}],
+    meshes: [{primitives: [{attributes: {POSITION: 0}}]}],
+    buffers: [{uri: "geometry%20%23.bin?cache=1#positions", byteLength: positions.byteLength}],
+    bufferViews: [{buffer: 0, byteOffset: 0, byteLength: positions.byteLength}],
+    accessors: [{bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 0]}],
+  });
+  const resources = {
+    "resources/message #.txt": "origin-root bytes", "pages/resources/local.txt": "nested document bytes",
+    "models/triangle.gltf": model, "shared/geometry #.bin": Buffer.from(positions.buffer),
+  };
+  const root = fixture({"pages/demo.html": '<script type="module" src="/modules/app.mjs"></script>', ...resources,
+    "modules/app.mjs": `import {FileLoader} from ${JSON.stringify(coreUrl)};
+      import {GLTFLoader} from ${JSON.stringify(gltfUrl)};
+      export async function load() {
+        const text = await new FileLoader().setPath('/resources/').loadAsync('message%20%23.txt?edition=2#part');
+        const relative = await new FileLoader().setPath('resources/').loadAsync('local.txt?edition=4');
+        const gltf = await new GLTFLoader().setPath('/models/').setResourcePath('/shared/').loadAsync('triangle.gltf?version=3#scene');
+        return {text, relative, positions: [...gltf.scene.children[0].geometry.attributes.position.array]};
+      }`,
+  });
+  const entry = path.join(root, "pages/demo.html");
+  const built = await buildApplication(entry, path.join(root, "dist"), {documentRoot: root});
+  const prepared = await buildApplication(entry, path.join(root, "prepared"), {documentRoot: root, prepareStandaloneLoaders: true});
+  for (const output of [built, prepared]) {
+    assert.equal(output.htmlFile, "pages/demo.html");
+    for (const [name, bytes] of Object.entries(resources))
+      assert.deepEqual(fs.readFileSync(path.join(output.outDir, name)), Buffer.from(bytes), name);
+  }
+  const deployment = fixture({}), networked = path.join(deployment, "networked"), standalone = path.join(deployment, "standalone");
+  fs.renameSync(built.outDir, networked); fs.renameSync(prepared.outDir, standalone);
+  fs.renameSync(root, root + "-source-unavailable");
+  const packedFile = path.join(deployment, "scene.html");
+  packHtml(path.join(standalone, prepared.htmlFile), packedFile, {rootDir: standalone, documentRoot: standalone});
+  const seen = [], server = http.createServer((request, response) => {
+    seen.push(request.url);
+    try { response.end(fs.readFileSync(path.join(networked, decodeURIComponent(new URL(request.url, "http://localhost").pathname)))); }
+    catch { response.writeHead(404); response.end("missing resource"); }
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const OriginalRequest = globalThis.Request, OriginalProgressEvent = globalThis.ProgressEvent, originalDocument = globalThis.document;
+  globalThis.document = {URL: origin + "/pages/demo.html", baseURI: origin + "/pages/demo.html"};
+  globalThis.Request = class extends OriginalRequest {
+    constructor(input, options) { super(typeof input === "string" ? new URL(input, document.baseURI) : input, options); }
+  };
+  globalThis.ProgressEvent = class extends Event {
+    constructor(type, details) { super(type); Object.assign(this, details); }
+  };
+  try {
+    const expected = {text: "origin-root bytes", relative: "nested document bytes", positions: [...positions]};
+    const application = await import(pathToFileURL(path.join(networked, built.entryFiles[0])).href);
+    assert.deepEqual(await application.load(), expected);
+    assert.deepEqual(seen, ["/resources/message%20%23.txt?edition=2", "/pages/resources/local.txt?edition=4",
+      "/models/triangle.gltf?version=3", "/shared/geometry%20%23.bin?cache=1"]);
+    const embedded = await import(pathToFileURL(path.join(standalone, prepared.entryFiles[0])).href);
+    assert.deepEqual(await embedded.load(), expected);
+    assert.equal(seen.length, 4, "Prepared root and document-relative loader resources must be embedded");
+    await t.test("packed loaders preserve the original relative resource base at a different document depth", {
+      skip: typeof nodeModule.registerHooks !== "function",
+    }, async () => {
+      const html = fs.readFileSync(packedFile, "utf8");
+      const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+      const moduleUrl = /<script[^>]*type="module"[^>]*src="([^"]+)"/.exec(html)[1];
+      const hooks = nodeModule.registerHooks({resolve(specifier, context, next) { return next(imports[specifier] ?? specifier, context); }});
+      document.URL = document.baseURI = origin + "/relocated/to/a/different/depth/scene.html";
+      try {
+        const packed = await import(moduleUrl);
+        assert.deepEqual(await packed.load(), expected);
+        assert.equal(seen.length, 4, "Packing must not fall back to the old site or a new relative HTTP path");
+      } finally { hooks.deregister(); }
+    });
+  } finally {
+    globalThis.Request = OriginalRequest;
+    if (OriginalProgressEvent === undefined) delete globalThis.ProgressEvent; else globalThis.ProgressEvent = OriginalProgressEvent;
+    if (originalDocument === undefined) delete globalThis.document; else globalThis.document = originalDocument;
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   }
 });
 

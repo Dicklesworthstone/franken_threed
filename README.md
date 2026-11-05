@@ -64,6 +64,23 @@ chooses `index.html` or the directory's sole HTML file; pass a specific HTML fil
 when there are several pages. A standalone export can be served directly with
 `node tools/ingest/cli.mjs serve ./demo.html`.
 
+For applications that use origin-root URLs such as `/assets/main.js`, declare
+their local web root. Nested HTML keeps its path in the output, and the server
+can serve the whole root while opening that page:
+
+```bash
+node tools/ingest/cli.mjs ./site/pages/demo.html --document-root ./site \
+  --build-app ./dist --pack-html ./demo.html
+node tools/ingest/cli.mjs serve ./dist/pages/demo.html --document-root ./dist --port 8080
+```
+
+This builds `dist/pages/demo.html` with root-relative modules, styles, assets,
+closed workers and finite local fetch resources. The optional packed `demo.html`
+embeds the supported resource graph and can move independently of the build.
+The multi-file output is mounted at the origin root. See
+[`PACKED_MODULES.md`](tools/ingest/PACKED_MODULES.md#applications-with-origin-root-urls)
+for API options, loader resources and packaging limits.
+
 Add `--isolate` when the application requires cross-origin isolation for shared
 memory. This enables COOP `same-origin` and COEP `require-corp`; cross-origin
 resources then need compatible response headers. Ordinary serving leaves those

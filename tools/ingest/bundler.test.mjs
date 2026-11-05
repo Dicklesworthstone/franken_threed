@@ -873,3 +873,78 @@ test("bundleWithRollup handles HTML entries with external root module scripts (m
   assert.equal(allExtRes.chunks.length, 0, "All-external HTML entry must emit zero chunks");
   assert.equal(allExtRes.code, "", "All-external HTML entry must have empty code");
 });
+
+test("documentRoot bundles execute relocated rooted imports and assets with lazy and query identity intact", async () => {
+  const scratch = makeScratch("f3d_document_bundle");
+  const root = path.join(scratch, "public");
+  for (const name of ["pages", "app", "shared", "lazy", "media"]) fs.mkdirSync(path.join(root, name), {recursive: true});
+  const packageRoot = path.join(scratch, "node_modules", "outside-package");
+  fs.mkdirSync(packageRoot, {recursive: true});
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({name: "outside-package", type: "module", exports: "./index.js"}));
+  fs.writeFileSync(path.join(packageRoot, "index.js"), "export default 'installed outside root';");
+  fs.writeFileSync(path.join(root, "shared", "state.js"), "export default {};");
+  fs.writeFileSync(path.join(root, "shared", "scoped.js"), "export default 'scoped';");
+  fs.writeFileSync(path.join(root, "media", "pixel.bin"), Buffer.from([0, 1, 127, 255]));
+  for (const name of ["one", "two"]) fs.writeFileSync(path.join(root, "lazy", name + ".js"),
+    `globalThis.__f3d_document_lazy.push('${name}'); export const name = '${name}';`);
+  fs.writeFileSync(path.join(root, "app", "main.js"), `
+    import first from '/virtual/state.js?slot=1#one';
+    import same from '/shared/state.js?slot=1#one';
+    import other from '/shared/state.js?slot=1#two';
+    import scoped from 'choice';
+    import installed from 'outside-package';
+    export { first, same, other, scoped, installed };
+    export const image = new URL('/media/pixel.bin?version=1#sprite', import.meta.url);
+    export const load = flag => import(flag ? '/lazy/one.js' : '/lazy/two.js');
+    export const loadOne = () => import('/lazy/one.js');
+  `);
+  const entry = path.join(root, "pages", "demo.html");
+  fs.writeFileSync(entry, `<base href="/app/"><script type="importmap">${JSON.stringify({
+    imports: {"/virtual/": "/shared/"}, scopes: {"/app/": {choice: "/shared/scoped.js"}},
+  })}</script><script type="module" src="/app/main.js"></script>`);
+  const result = await bundleWithRollup(entry, {documentRoot: root});
+  const relocated = makeScratch("f3d_document_relocated");
+  emitToDisk(result.files, relocated);
+  fs.renameSync(scratch, scratch + "-source-unavailable");
+  globalThis.__f3d_document_lazy = [];
+  const main = await import(pathToFileURL(path.join(relocated, result.entryFiles[0])).href);
+  assert.equal(main.first, main.same);
+  assert.notEqual(main.first, main.other);
+  assert.equal(main.scoped, "scoped");
+  assert.equal(main.installed, "installed outside root");
+  assert.deepEqual(globalThis.__f3d_document_lazy, []);
+  assert.equal(main.image.search, "?version=1");
+  assert.equal(main.image.hash, "#sprite");
+  assert.deepEqual(fs.readFileSync(main.image), Buffer.from([0, 1, 127, 255]));
+  const one = await main.loadOne();
+  assert.equal(await main.load(true), one);
+  assert.equal((await main.load(false)).name, "two");
+  assert.deepEqual(globalThis.__f3d_document_lazy, ["one", "two"]);
+  delete globalThis.__f3d_document_lazy;
+});
+
+test("documentRoot copies rooted glTF sidecars at their authored logical paths", async () => {
+  const root = makeScratch("f3d_document_model");
+  fs.mkdirSync(path.join(root, "models"));
+  fs.mkdirSync(path.join(root, "media"));
+  const model = JSON.stringify({asset: {version: "2.0"},
+    buffers: [{uri: "/media/data.bin?version=1", byteLength: 3}, {uri: "./local.bin", byteLength: 2}],
+    images: [{uri: "/media/image.png#view"}],
+  });
+  fs.writeFileSync(path.join(root, "models", "scene.gltf"), model);
+  fs.writeFileSync(path.join(root, "models", "local.bin"), Buffer.from([1, 2]));
+  fs.writeFileSync(path.join(root, "media", "data.bin"), Buffer.from([3, 4, 5]));
+  fs.writeFileSync(path.join(root, "media", "image.png"), "image payload");
+  fs.writeFileSync(path.join(root, "main.js"), "export default new URL('/models/scene.gltf?v=1#scene', import.meta.url);");
+  const result = await bundleWithRollup(path.join(root, "main.js"), {documentRoot: root});
+  const relocated = makeScratch("f3d_document_model_relocated");
+  emitToDisk(result.files, relocated);
+  fs.renameSync(root, root + "-source-unavailable");
+  const {default: modelUrl} = await import(pathToFileURL(path.join(relocated, result.entryFiles[0])).href);
+  assert.equal(fs.readFileSync(modelUrl, "utf8"), model, "Source model bytes and URI spellings must remain unchanged");
+  assert.equal(modelUrl.search, "?v=1");
+  assert.equal(modelUrl.hash, "#scene");
+  assert.deepEqual(fs.readFileSync(new URL("./local.bin", modelUrl)), Buffer.from([1, 2]));
+  assert.deepEqual(fs.readFileSync(path.join(relocated, "media", "data.bin")), Buffer.from([3, 4, 5]));
+  assert.equal(fs.readFileSync(path.join(relocated, "media", "image.png"), "utf8"), "image payload");
+});

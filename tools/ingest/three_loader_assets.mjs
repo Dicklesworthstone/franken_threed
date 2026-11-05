@@ -12,6 +12,7 @@ import { isInternalLibraryModule } from "./route_bridge.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { fbxAssetUris } from "./pack_fbx.mjs";
 import { colladaAssetUris } from "./pack_collada.mjs";
+import { isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 
 const PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url).href;
 const CORE_LOADERS = new Set([
@@ -714,23 +715,29 @@ function mtlTextureUris(text) {
 }
 
 /** Copies the finite local closure without changing the loader's original URL strings. */
-export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl, fail, onResource }) {
-  const result = new Map(), entryDir = path.dirname(fileURLToPath(documentUrl));
+export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl = documentUrl, documentRoot, fail, onResource }) {
+  documentRoot = normalizeDocumentRoot(documentRoot);
+  const result = new Map(), entryDir = documentRoot ?? path.dirname(fileURLToPath(documentUrl));
   const add = (uri) => {
-    if (!relativeUrl(uri)) return null;
-    let filename;
-    try { filename = fileURLToPath(new URL(uri, documentBaseUrl)); }
+    if (!relativeUrl(uri) && !(documentRoot && isRootRelativeDocumentUrl(uri))) return null;
+    const resolved = documentRoot ? resolveDocumentUrl(uri, documentBaseUrl, documentRoot) : uri;
+    let filename, url;
+    try { url = new URL(resolved, documentBaseUrl); filename = fileURLToPath(url); }
     catch { return null; }
     const relative = path.relative(entryDir, filename);
-    // Root/external resources keep their original host route. An out-of-root
+    // External resources keep their original host route. An out-of-root
     // authored route cannot be reproduced inside this application's directory.
     if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) return null;
     // Loader URLs can also name responses provided by the host at runtime.
     // Unlike an explicit module file asset, absence on disk does not prove a
     // missing resource. Retain that request and its source success/error path.
     if (!fs.existsSync(filename) || !fs.statSync(filename).isFile()) return null;
+    if (documentRoot) {
+      const real = path.relative(fs.realpathSync(entryDir), fs.realpathSync(filename));
+      if (real === ".." || real.startsWith(".." + path.sep) || path.isAbsolute(real)) return null;
+    }
     const fileName = relative.split(path.sep).join("/");
-    onResource?.(fileName, new URL(uri, documentBaseUrl).href);
+    onResource?.(fileName, url.href);
     if (!result.has(fileName)) result.set(fileName, { source: fs.readFileSync(filename), originalFileName: filename });
     return result.get(fileName);
   };
@@ -801,7 +808,10 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
       ? request.path + extractUrlBase(request.originalUrl)
       : extractUrlBase(request.originalUrl));
     for (const uri of gltfAssetUris(asset.source, binary, fail)) {
-      if (relativeUrl(uri)) add(base + uri);
+      // The pinned LoaderUtils concatenates a local path even when the model's
+      // URI starts with '/'. Preserve that source URL instead of treating it
+      // like new URL(uri, model), which would discard the configured prefix.
+      if (relativeUrl(uri) || documentRoot && isRootRelativeDocumentUrl(uri)) add(base + uri);
     }
   }
   return result;

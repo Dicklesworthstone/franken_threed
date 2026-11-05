@@ -16,6 +16,7 @@ import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 import {moduleSourcesFor} from './module_sources.mjs';
 import {assertUnbundledModule} from './commonjs_modules.mjs';
+import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
 
 export class ModuleWorkerBuildError extends Error {
   constructor(code, message, url = null) {
@@ -37,6 +38,15 @@ const urlOperand = node => node?.type === 'NewExpression' && node.callee.type ==
   metaUrl(node.arguments[1]) ? node.arguments[0] : null;
 const remote = url => ['https:', 'http:', 'data:'].includes(new URL(url).protocol);
 const suffix = url => { const value = new URL(url); return value.search + value.hash; };
+const hostRootUrl = (value, documentRoot) => value.trim().startsWith('/') &&
+  !(documentRoot && isRootRelativeDocumentUrl(value));
+const localFileExists = url => {
+  try { return fs.statSync(fileURLToPath(url)).isFile(); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+    throw error;
+  }
+};
 
 // Select only result positions. Conditions and discarded sequence operands stay
 // in place and execute exactly once; a partial set of alternatives is never used.
@@ -215,6 +225,26 @@ export function findWorkerSites(source, {sourceType = 'module', relative = false
   return sitesIn(ast, node => new Set([...globals(node), ...unavailableGlobals]), {classic: true, relative});
 }
 
+/** Native worker URL operands belong to the worker transform, including host
+ * routes and conditional arms left after other arms have already been emitted. */
+export function findWorkerUrlOperands(source, {sourceType = 'module', unavailableGlobals = []} = {}) {
+  const ast = typeof source === 'string' ? parse(source, null, sourceType) : source;
+  const globals = scopedGlobals(ast), urls = [];
+  walk.simple(ast, {NewExpression(node) {
+    const kind = node.callee.type === 'Identifier' ? node.callee.name : null;
+    const unavailable = new Set([...globals(node), ...unavailableGlobals]);
+    if (!['Worker', 'SharedWorker'].includes(kind) || unavailable.has(kind) || unavailable.has('URL')) return;
+    function visit(value) {
+      if (!value) return;
+      if (urlOperand(value)) urls.push(value);
+      else if (value.type === 'SequenceExpression') visit(value.expressions.at(-1));
+      else if (value.type === 'ConditionalExpression') { visit(value.consequent); visit(value.alternate); }
+    }
+    visit(node.arguments[0]);
+  }});
+  return urls;
+}
+
 /** Direct global bindings/writes shared by document scripts. Module locals do
  * not become document globals; top-level classic bindings do. */
 export function workerGlobalBindings(source, {sourceType = 'script'} = {}) {
@@ -252,10 +282,10 @@ function importSourceType(node, url) {
 
 // Browser-native resolution is the standalone default. The application builder
 // supplies its installed-package resolver, with an EMPTY worker import map.
-function resolveLocal(specifier, referrer) {
+function resolveLocal(specifier, referrer, documentRoot) {
   if (!specifier.startsWith('./') && !specifier.startsWith('../') && !specifier.startsWith('/') && !URL.canParse(specifier))
     fail('RESOLUTION', `Bare worker import needs installed-package resolution: ${specifier}`, referrer);
-  return new URL(specifier, referrer).href;
+  return resolveDocumentUrl(specifier, referrer, documentRoot);
 }
 
 /** Plan everything before emitFile: no partial graph is emitted on rejection. */
@@ -266,10 +296,13 @@ export function buildModuleWorkerGraph(entryUrl, options = {}) {
 /** Classic scripts and ESM are separate source kinds even at the same URL. */
 export function buildWorkerGraph(entryUrl, {
   workerType = 'module',
-  resolveModule = resolveLocal, maxModules = 4096, maxAssets = 4096, maxBytes = 64 * 1024 * 1024,
+  resolveModule, maxModules = 4096, maxAssets = 4096, maxBytes = 64 * 1024 * 1024,
   requireClosedRuntimeUrls = false,
-  transformModule, _moduleSources,
+  documentRoot, transformModule, _moduleSources,
 } = {}) {
+  documentRoot = normalizeDocumentRoot(documentRoot);
+  if (resolveModule === undefined)
+    resolveModule = (specifier, referrer) => resolveLocal(specifier, referrer, documentRoot);
   const moduleSources = moduleSourcesFor({transformModule, _moduleSources});
   if (!['classic', 'module'].includes(workerType)) fail('OPTIONS', 'Expected classic or module workerType');
   if (typeof resolveModule !== 'function' || ![maxModules, maxAssets, maxBytes].every(n => Number.isSafeInteger(n) && n > 0))
@@ -386,8 +419,11 @@ export function buildWorkerGraph(entryUrl, {
     }
     function dependency(node, declaration, asUrl = false) {
       let resolved;
-      try { resolved = asUrl ? new URL(text(node), record.url).href : resolveModule(text(node), record.url); }
-      catch (cause) { fail('RESOLUTION', cause.message, record.url); }
+      try { resolved = asUrl ? resolveDocumentUrl(text(node), record.url, documentRoot) : resolveModule(text(node), record.url); }
+      catch (cause) {
+        if (cause.code?.startsWith('F3D_DOCUMENT_')) throw cause;
+        fail('RESOLUTION', cause.message, record.url);
+      }
       if (typeof resolved !== 'string') fail('RESOLUTION', 'Worker resolver must return a URL synchronously', record.url);
       resolved = normalize(resolved);
       // Remote modules keep host-owned attribute handling and require no local
@@ -434,7 +470,7 @@ export function buildWorkerGraph(entryUrl, {
         fail('DYNAMIC_RESOURCE', `The worker ${name} consumer needs the original host route`, record.url);
       });
     }
-    const imports = new Map(), scriptImports = new Map();
+    const imports = new Map(), scriptImports = new Map(), fetchUrlArguments = new Map();
     // acorn-walk visits new URL before its enclosing import/call. Claim those
     // operands first so executable dependencies cannot also become raw assets.
     walk.simple(ast, {
@@ -445,6 +481,10 @@ export function buildWorkerGraph(entryUrl, {
         for (const choice of choices) if (choice.base === 'module') workerURLs.add(choice.urlNode.start);
       },
       CallExpression(node) {
+        if (hostCall(node.callee, 'fetch')) {
+          for (const choice of urlChoices(node.arguments[0], changed, false) ?? [])
+            fetchUrlArguments.set(choice.argument, staticGet(node.arguments[1]));
+        }
         if (!hostCall(node.callee, 'importScripts')) return;
         const choices = node.arguments.map(argument => urlChoices(argument, changed));
         if (root.workerType === 'classic' && choices.some(choice => !choice))
@@ -454,9 +494,10 @@ export function buildWorkerGraph(entryUrl, {
       },
     });
     for (const site of workers) {
-      if (site.specifier.trim().startsWith('/')) continue;
-      const url = new URL(site.specifier, site.base === 'realm' ? root.url : record.url).href;
+      if (hostRootUrl(site.specifier, documentRoot)) continue;
+      const url = resolveDocumentUrl(site.specifier, site.base === 'realm' ? root.url : record.url, documentRoot);
       if (new URL(url).protocol !== 'file:') continue;
+      if (documentRoot && isRootRelativeDocumentUrl(site.specifier) && !localFileExists(url)) continue;
       replace(site.argument, worker(url, site.workerType), site.base === 'realm');
       uses(site.kind); if (site.base === 'module') uses('URL');
     }
@@ -466,7 +507,7 @@ export function buildWorkerGraph(entryUrl, {
       ExportAllDeclaration: node => dependency(node.source, node),
       ImportExpression(node) {
         for (const choice of imports.get(node)) {
-          if (choice.base === 'module' && text(choice.argument).trim().startsWith('/')) continue;
+          if (choice.base === 'module' && hostRootUrl(text(choice.argument), documentRoot)) continue;
           dependency(choice.argument, node, choice.base === 'module');
           if (choice.base === 'module') uses('URL');
         }
@@ -479,8 +520,8 @@ export function buildWorkerGraph(entryUrl, {
           for (const choices of scriptImports.get(node)) {
             for (const choice of choices) {
               const value = text(choice.argument);
-              if (value.trim().startsWith('/')) continue;
-              const url = new URL(value, choice.base === 'module' ? record.url : root.url).href;
+              if (hostRootUrl(value, documentRoot)) continue;
+              const url = resolveDocumentUrl(value, choice.base === 'module' ? record.url : root.url, documentRoot);
               if (new URL(url).protocol !== 'file:') continue;
               replace(choice.argument, module(url, record.realm, 'script'), choice.base === 'realm');
               uses('importScripts', node.callee);
@@ -501,10 +542,17 @@ export function buildWorkerGraph(entryUrl, {
         }
         for (const candidate of candidates) {
           const value = text(candidate);
-          if (value.trim().startsWith('/') || URL.canParse(value)) continue;
-          if (!staticGet(node.arguments[1])) fail('FETCH', 'Relative worker resource fetches require a statically known GET request', record.url);
+          if (hostRootUrl(value, documentRoot) || URL.canParse(value)) continue;
+          const rooted = documentRoot && isRootRelativeDocumentUrl(value);
+          if (!rooted && !staticGet(node.arguments[1]))
+            fail('FETCH', 'Relative worker resource fetches require a statically known GET request', record.url);
+          const url = resolveDocumentUrl(value, root.url, documentRoot);
+          // Root paths keep the same origin when a worker moves. A live API
+          // request or absent static file can therefore retain its native URL.
+          if (rooted &&
+              (!staticGet(node.arguments[1]) || !localFileExists(url))) continue;
           // fetch()/importScripts() use the worker entry, NOT an imported script.
-          replace(candidate, asset(new URL(value, root.url).href), true);
+          replace(candidate, asset(url), true);
           uses('fetch', node.callee);
         }
       },
@@ -519,9 +567,11 @@ export function buildWorkerGraph(entryUrl, {
         if (!candidates) return;
         for (const argument of candidates) {
           const value = text(argument);
-          if (value.trim().startsWith('/')) continue;
-          const url = new URL(value, record.url).href;
+          if (hostRootUrl(value, documentRoot)) continue;
+          const url = resolveDocumentUrl(value, record.url, documentRoot);
           if (new URL(url).protocol !== 'file:') continue;
+          if (documentRoot && isRootRelativeDocumentUrl(value) && fetchUrlArguments.has(argument) &&
+              (!fetchUrlArguments.get(argument) || !localFileExists(url))) continue;
           replace(argument, asset(url)); uses('URL');
         }
       },
@@ -602,7 +652,7 @@ export function buildWorkerGraph(entryUrl, {
 
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
 export function moduleWorkerRollupPlugin(options = {}) {
-  options = {...options, _moduleSources: moduleSourcesFor(options)};
+  options = {...options, documentRoot: normalizeDocumentRoot(options.documentRoot), _moduleSources: moduleSourcesFor(options)};
   const emitted = new Map(), references = new Map(), filesByName = new Map();
   const closedRealmEntries = new Set();
   let totalBytes = 0, totalModules = 0, totalAssets = 0;
@@ -625,14 +675,18 @@ export function moduleWorkerRollupPlugin(options = {}) {
       if (!base) fail('ENTRY', 'A module worker URL needs a local source module', id);
       const edits = [];
       for (const site of sites) {
-        // Origin-root and protocol-relative workers remain host-owned URLs.
-        if (site.specifier.trim().startsWith('/')) continue;
+        // Origin-root workers need an explicit local root. Protocol-relative
+        // workers always retain their original host route.
+        if (hostRootUrl(site.specifier, options.documentRoot)) continue;
         const sourceBase = site.base === 'realm' ? options.documentBaseUrl ?? options.documentUrl : base;
-        const url = new URL(site.specifier, sourceBase).href;
+        const url = resolveDocumentUrl(site.specifier, sourceBase, options.documentRoot);
         if (new URL(url).protocol !== 'file:') continue;
+        const rooted = options.documentRoot && isRootRelativeDocumentUrl(site.specifier);
+        if (rooted && !localFileExists(url)) continue;
+        const optionalHostRoute = site.base === 'realm' || rooted;
         const key = realmKey(url, site.workerType);
         let referenceId = emitted.get(key);
-        if (referenceId && site.base === 'realm' && !closedRealmEntries.has(key)) {
+        if (referenceId && optionalHostRoute && !closedRealmEntries.has(key)) {
           // An earlier import.meta URL site may have used the existing open
           // network profile. That is not proof for relocating a document string.
           try {
@@ -647,16 +701,16 @@ export function moduleWorkerRollupPlugin(options = {}) {
           let graph;
           try {
             graph = buildWorkerGraph(url, {...options, workerType: site.workerType,
-              requireClosedRuntimeUrls: site.base === 'realm'});
+              requireClosedRuntimeUrls: optionalHostRoute});
           } catch (error) {
-            // A document-relative string may name a server-provided worker or
+            // A document-relative or origin-root URL may name a server-provided worker or
             // an open runtime graph. Preserve its native request/error behavior
             // when local closure cannot be established, without partial output.
-            if (site.base === 'realm' && error instanceof ModuleWorkerBuildError) continue;
+            if (optionalHostRoute && error instanceof ModuleWorkerBuildError) continue;
             throw error;
           }
           if (graph.outputBytes > maxBytes - totalBytes || graph.moduleCount > maxModules - totalModules || graph.assetCount > maxAssets - totalAssets) {
-            if (site.base === 'realm') continue;
+            if (optionalHostRoute) continue;
             fail('BUDGET', 'Module worker graphs exceed the shared build budget', url);
           }
           for (const filename of graph.watchFiles) this.addWatchFile?.(filename);
@@ -667,7 +721,7 @@ export function moduleWorkerRollupPlugin(options = {}) {
           for (const entry of graph.entries) {
             const ref = filesByName.get(entry.fileName);
             emitted.set(realmKey(entry.url, entry.workerType), ref);
-            if (site.base === 'realm') closedRealmEntries.add(realmKey(entry.url, entry.workerType));
+            if (optionalHostRoute) closedRealmEntries.add(realmKey(entry.url, entry.workerType));
             references.set(ref, {suffix: suffix(entry.url), fileName: entry.fileName});
           }
           referenceId = emitted.get(key);
@@ -679,7 +733,7 @@ export function moduleWorkerRollupPlugin(options = {}) {
           // A direct Worker string uses document.baseURI, even when its call is
           // in a nested module or a lazy chunk. Keep it a string so a shadowed
           // URL constructor cannot change previously valid source behavior.
-          const documentDir = path.dirname(fileURLToPath(options.documentUrl));
+          const documentDir = options.documentRoot ?? path.dirname(fileURLToPath(options.documentUrl));
           const baseDir = fileURLToPath(new URL('.', sourceBase));
           const relative = path.relative(baseDir, path.join(documentDir, target.fileName)).split(path.sep).join('/');
           replacement = JSON.stringify((relative.startsWith('.') ? relative : './' + relative) + target.suffix);

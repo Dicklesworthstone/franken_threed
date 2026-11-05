@@ -4,6 +4,52 @@
 The ordinary multi-file build is not modified. This is retained-JavaScript
 packaging (F3D-10), not a renderer, compiler specialization or speedup claim.
 
+## Applications with origin-root URLs
+
+Declare the local directory that corresponds to the browser origin root when an
+application uses paths such as `/assets/main.js`, `/models/scene.gltf` or
+`/workers/decoder.js`:
+
+```bash
+node tools/ingest/cli.mjs site/pages/demo.html --document-root site \
+  --build-app dist --pack-html demo.html
+```
+
+The emitted HTML is `dist/pages/demo.html`. Serve `dist` at the origin root so
+that `/assets/...` continues to mean the same application resource. Moving the
+entire output directory to another origin root is supported; mounting it under
+an arbitrary URL subdirectory requires the application's own URL changes. The
+single packed `demo.html` can move independently of its source and build trees.
+
+The `documentRoot` option is shared by `buildModuleGraph`, `bundleWithRollup`,
+`buildApplication`, worker graph APIs and `packHtml`. Module entries, static and
+bounded lazy imports, import-map keys/targets/scopes, module URL assets, HTML
+resources, CSS imports/URLs, finite native GET requests and closed worker graphs
+use the declared root. Pinned Three.js loader discovery includes rooted resources
+and model sidecars; standalone preparation retains their original logical URL
+bases even when the source HTML was nested. The ordinary build also supports a
+local root-relative `<base href>`; standalone packing still rejects `<base>`
+elements because its general document-base semantics are not closed.
+
+The packer's `rootDir` remains its independent read boundary. A direct API call
+for nested source HTML should declare both mappings explicitly:
+
+```js
+packHtml('site/pages/demo.html', 'demo.html', {
+  documentRoot: 'site',
+  rootDir: 'site',
+});
+```
+
+The CLI supplies this read boundary for `--document-root`, and switches both
+roots to the emitted directory when building before packing. Mapped resources
+must remain within the declared root both lexically and after following
+symlinks. Normal installed packages and explicitly relative module dependencies
+outside that directory retain their existing resolution rules. URL queries and
+fragments keep their module identities. Protocol-relative and explicit remote
+URLs retain their host routes; this option never downloads them. Omitting the
+option preserves the existing local path and host-resource behavior.
+
 ## Classic-only HTML applications
 
 An HTML application does not need an ESM script entry. With only classic scripts,
@@ -184,8 +230,8 @@ Request creation, inner and outer options, abort/integrity overrides and native
 constructor failures retain their source ordering and host implementation.
 Shadowed or replaced constructors, existing Request values, constructor/fetch
 aliases and runtime-selected URLs keep the existing host path; their closure is
-not newly proved. Remote and document-root
-requests still need ordinary deployment, and the packer's existing `<base>`
+not newly proved. Remote requests and origin-root requests without an explicit
+`documentRoot` still need ordinary deployment, and the packer's existing `<base>`
 refusal remains. Embedded Response URLs are data URLs; server HTTP headers, cache
 behavior and live endpoints are not reproduced by this static-resource mode.
 

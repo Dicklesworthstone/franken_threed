@@ -186,6 +186,60 @@ test('native Request resources execute in source, emitted and offline packed app
   assert.equal(actual.overridden, 42); assert.equal(actual.classic, 'native Request bytes');
 });
 
+test('declared document roots preserve native rooted fetches in relocated and offline applications', async () => {
+  const f = fixture({
+    'pages/demo.html': '<script type="module" src="/modules/app.mjs"></script>',
+    'modules/app.mjs': `export async function run(){const log=[];
+      const response=await fetch(new Request((log.push('request'),'/data/value.json?copy=1#value')));
+      const raw=await fetch((log.push('fetch'),'/raw/source.js'));
+      return {value:await response.json(),raw:await raw.text(),log};}`,
+    'data/value.json': '{"answer":42}',
+    'raw/source.js': 'this is a raw response, not an executable dependency',
+  });
+  const entry = path.join(f.source, 'pages/demo.html');
+  const documentUrl = pathToFileURL(entry).href;
+  const sites = analyzeDocumentFetch(fs.readFileSync(path.join(f.source, 'modules/app.mjs'), 'utf8')).sites;
+  assert.equal(collectDocumentFetchAssets(sites, {documentUrl}).size, 0);
+  assert.deepEqual([...collectDocumentFetchAssets(sites, {documentUrl, documentRoot: f.source}).keys()],
+    ['data/value.json', 'raw/source.js']);
+  const built = await buildApplication(entry, f.out, {documentRoot: f.source});
+  assert.equal(built.htmlFile, 'pages/demo.html');
+  for (const name of ['data/value.json', 'raw/source.js'])
+    assert.deepEqual(fs.readFileSync(path.join(f.out, name)), fs.readFileSync(path.join(f.source, name)));
+  const sourceHost = await host(f.source);
+  let expected;
+  try {
+    expected = await execute({scripts: [], url: pathToFileURL(path.join(f.source, 'modules/app.mjs')).href,
+      base: sourceHost.base + 'pages/demo.html'});
+  } finally { await sourceHost.close(); }
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  const relocated = path.join(f.root, 'relocated');
+  fs.renameSync(f.out, relocated);
+  const builtHost = await host(relocated), builtEntry = path.join(relocated, built.htmlFile);
+  try {
+    assert.deepEqual(await execute({...application(fs.readFileSync(builtEntry, 'utf8'), path.dirname(builtEntry)),
+      base: builtHost.base + built.htmlFile}), expected);
+  } finally { await builtHost.close(); }
+  packHtml(builtEntry, f.packed, {documentRoot: relocated, rootDir: relocated});
+  const packed = application(fs.readFileSync(f.packed, 'utf8'), f.root);
+  fs.renameSync(relocated, path.join(f.root, 'build-unavailable'));
+  assert.deepEqual(await execute(packed), expected);
+  assert.deepEqual(expected, {value: {answer: 42}, raw: 'this is a raw response, not an executable dependency',
+    log: ['request', 'fetch']});
+});
+
+test('rooted document fetch discovery rejects symlink escapes and leaves remote requests host-owned', () => {
+  const f = fixture({'data.txt': 'inside'}), documentUrl = pathToFileURL(f.entry).href;
+  const outside = path.join(f.root, 'outside.txt');
+  fs.writeFileSync(outside, 'outside');
+  fs.symlinkSync(outside, path.join(f.source, 'escape.txt'));
+  const options = {documentUrl, documentRoot: f.source};
+  const remote = analyzeDocumentFetch(`fetch('//example.invalid/data');fetch('https://example.invalid/data');`).sites;
+  assert.equal(collectDocumentFetchAssets(remote, options).size, 0);
+  const escaping = analyzeDocumentFetch(`fetch('/escape.txt')`).sites;
+  assert.throws(() => collectDocumentFetchAssets(escaping, options), {code: 'F3D_DOCUMENT_ROOT_ESCAPE'});
+});
+
 test('native packed fetch preserves bodies, raw resources, selectors, aborts, integrity and streaming Wasm offline', async () => {
   const json = '{"value":1,"value":42,"zero":-0}';
   const integrity = 'sha256-' + createHash('sha256').update(json).digest('base64');

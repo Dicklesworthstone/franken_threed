@@ -13,10 +13,11 @@ import { rollup } from "rollup";
 
 import { analyzeModuleAst, createDynamicImportClassifier, classifyImportType } from "./ast_analyzer.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
+import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
-import { moduleWorkerRollupPlugin } from "./module_workers.mjs";
+import { moduleWorkerRollupPlugin, findWorkerUrlOperands } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsJsonSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
@@ -104,6 +105,7 @@ function isExternalUrl(url) {
  * @returns {import('rollup').Plugin}
  */
 export function f3dRollupPlugin(options = {}) {
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
   const importMap = options.importMap || { imports: {}, scopes: {} };
   const mapBaseUrl = options.mapBaseUrl;
@@ -116,6 +118,7 @@ export function f3dRollupPlugin(options = {}) {
   const dynamicChunkRefIds = new Set();
   const moduleAssetRefIds = new Set();
   const documentAssets = new Map();
+  const rootedModuleAssets = new Map();
   const documentResourceURLs = new Map();
   const documentRequests = [];
   const documentFetchSites = [];
@@ -161,13 +164,17 @@ export function f3dRollupPlugin(options = {}) {
       code, message: `${message} (model ${JSON.stringify(assetPath)})`,
     });
     for (const uri of gltfAssetUris(source, extension === ".glb", fail)) {
-      // Network, data and document-root URLs retain their authored host route.
-      // They must not be interpreted as local paths or downloaded during builds.
-      if (!isRelativeUrl(uri)) continue;
+      // Rooted sidecars retain their origin-relative URL inside the original
+      // model bytes, so they must be emitted at the declared document root.
+      const rooted = documentRoot && isRootRelativeDocumentUrl(uri);
+      if (!isRelativeUrl(uri) && !rooted) continue;
       let dependency;
-      try { dependency = fileURLToPath(new URL(uri, pathToFileURL(assetPath))); }
-      catch { fail("GLTF_RESOURCE_URL", `Invalid local glTF resource URI ${JSON.stringify(uri)}`); }
-      if (resources.has(dependency)) continue;
+      try { dependency = fileURLToPath(resolveDocumentUrl(uri, pathToFileURL(assetPath), documentRoot)); }
+      catch (error) {
+        if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
+        fail("GLTF_RESOURCE_URL", `Invalid local glTF resource URI ${JSON.stringify(uri)}`);
+      }
+      if (!rooted && resources.has(dependency)) continue;
       let content;
       try {
         if (!fs.statSync(dependency).isFile()) throw new Error("not a regular file");
@@ -175,7 +182,10 @@ export function f3dRollupPlugin(options = {}) {
       } catch (error) {
         fail("GLTF_RESOURCE_MISSING", `Cannot read glTF resource ${JSON.stringify(uri)}: ${error.message}`);
       }
-      resources.set(dependency, content);
+      if (rooted) rootedModuleAssets.set(documentRelativePath(dependency, documentRoot), {
+        source: content, originalFileName: dependency,
+      });
+      else resources.set(dependency, content);
     }
 
     let resourceRoot = path.dirname(assetPath);
@@ -190,7 +200,7 @@ export function f3dRollupPlugin(options = {}) {
     }
     const localName = (filename) => path.relative(resourceRoot, filename).split(path.sep).join("/");
     const ordered = [...resources].sort(([a], [b]) => localName(a) < localName(b) ? -1 : localName(a) > localName(b) ? 1 : 0);
-    // Include logical location and every dependency, so identically named models
+    // Include logical location and relative dependencies, so identically named models
     // do not collide and a changed image/buffer invalidates the model URL too.
     const hash = createHash("sha256");
     hash.update(path.relative(getModuleDir(mapBaseUrl ?? assetPath), assetPath).split(path.sep).join("/"));
@@ -220,8 +230,9 @@ export function f3dRollupPlugin(options = {}) {
         for (const [fileName, asset] of collectThreeLoaderAssets(admitted, {
           documentUrl: options.documentUrl,
           documentBaseUrl: mapBaseUrl,
+          documentRoot,
           onResource: (filename, url) => {
-            const root = new URL("./", options.documentUrl).href;
+            const root = documentRoot ? pathToFileURL(documentRoot + path.sep).href : new URL("./", options.documentUrl).href;
             if (!documentResourceURLs.has(filename)) documentResourceURLs.set(filename, new Set());
             documentResourceURLs.get(filename).add(url.slice(root.length));
           },
@@ -229,15 +240,21 @@ export function f3dRollupPlugin(options = {}) {
         })) documentAssets.set(fileName, asset);
       }
       const resources = new Map(documentAssets);
+      for (const [name, asset] of rootedModuleAssets) {
+        if (resources.has(name) && !Buffer.from(resources.get(name).source).equals(asset.source))
+          this.error(`Rooted model bytes disagree with document resource ${JSON.stringify(name)}`);
+        resources.set(name, asset);
+      }
       if (options.documentUrl) for (const [name, asset] of collectDocumentFetchAssets(documentFetchSites, {
-        documentUrl: options.documentUrl, documentBaseUrl: mapBaseUrl,
+        documentUrl: options.documentUrl, documentBaseUrl: mapBaseUrl, documentRoot,
       })) {
         if (resources.has(name) && !Buffer.from(resources.get(name).source).equals(asset.source))
           this.error(`Document fetch bytes disagree with loader resource ${JSON.stringify(name)}`);
         resources.set(name, asset);
       }
       for (const [fileName, asset] of resources) {
-        if (options.documentUrl && fileName === path.basename(fileURLToPath(options.documentUrl))) {
+        if (options.documentUrl && fileName === (documentRoot
+          ? documentRelativePath(options.documentUrl, documentRoot) : path.basename(fileURLToPath(options.documentUrl)))) {
           this.error(`Document resource ${JSON.stringify(fileName)} collides with the emitted HTML entry`);
         }
         const existing = bundle[fileName];
@@ -251,7 +268,8 @@ export function f3dRollupPlugin(options = {}) {
         if (bundle[LOADER_RESOURCES_FILE] || documentAssets.has(LOADER_RESOURCES_FILE))
           this.error("Embedded loader resolver collides with an emitted application resource");
         this.emitFile({ type: "asset", fileName: LOADER_RESOURCES_FILE,
-          source: createThreeLoaderResourceModule(documentAssets, { logicalURLs: documentResourceURLs }) });
+          source: createThreeLoaderResourceModule(documentAssets, { logicalURLs: documentResourceURLs,
+            documentPath: documentRoot ? documentRelativePath(options.documentUrl, documentRoot) : null }) });
       }
     },
 
@@ -296,6 +314,7 @@ export function f3dRollupPlugin(options = {}) {
 
       const resolvedUrl = resolveModuleSpecifier(source, referrerUrl, importMap, {
         mapBaseUrl,
+        documentRoot,
         _moduleSources: moduleSources,
         allowCommonJS: options.commonJS === true,
         packageRootUrl: options.packageRootUrl,
@@ -365,21 +384,28 @@ export function f3dRollupPlugin(options = {}) {
       // 1. Asset reference replacements: new URL(..., import.meta.url)
       const analysis = analyzeModuleAst(code, id);
       const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
+      const workerUrls = new Set(documentRoot && code.includes("Worker")
+        ? findWorkerUrlOperands(code, {unavailableGlobals: options.workerHostBindings}).map(node => node.start) : []);
 
       for (const ref of assetRefs) {
+        // A root worker endpoint left on its host route is executable source,
+        // never an ordinary raw URL asset for this second transform to copy.
+        if (workerUrls.has(ref.source_span.start.offset)) continue;
         const mapping = new Map();
         for (const rawSpecifier of ref.candidates ?? [ref.specifier]) {
           if (!rawSpecifier || typeof rawSpecifier !== "string") continue;
           const suffixIndex = rawSpecifier.search(/[?#]/);
           const cleanPath = suffixIndex < 0 ? rawSpecifier : rawSpecifier.slice(0, suffixIndex);
           const suffix = suffixIndex < 0 ? "" : rawSpecifier.slice(suffixIndex);
-          if (!isRelativeUrl(cleanPath)) continue;
+          const rooted = documentRoot && isRootRelativeDocumentUrl(cleanPath);
+          if (!isRelativeUrl(cleanPath) && !rooted) continue;
 
           let assetAbsPath;
           try {
             const dirSlash = moduleDir.endsWith(path.sep) ? moduleDir : moduleDir + path.sep;
-            assetAbsPath = fileURLToPath(new URL(cleanPath, pathToFileURL(dirSlash)));
-          } catch {
+            assetAbsPath = fileURLToPath(resolveDocumentUrl(cleanPath, pathToFileURL(dirSlash), documentRoot));
+          } catch (error) {
+            if (rooted || error.code?.startsWith("F3D_DOCUMENT_")) throw error;
             assetAbsPath = path.resolve(moduleDir, cleanPath);
           }
           if (!fs.existsSync(assetAbsPath) || !fs.statSync(assetAbsPath).isFile()) {
@@ -437,7 +463,7 @@ export function f3dRollupPlugin(options = {}) {
           const requests = findThreeLoaderRequests(ast, {
             moduleUrl: id, source: code,
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
-              mapBaseUrl, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
+              mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
             }),
             packageRootUrl: options.packageRootUrl,
             onDefaultManagerExposure: () => { defaultManagerExposed = true; },
@@ -464,6 +490,7 @@ export function f3dRollupPlugin(options = {}) {
             for (const cand of uniqueBranches) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
                 mapBaseUrl,
+                documentRoot,
                 _moduleSources: moduleSources,
                 allowCommonJS: options.commonJS === true,
                 packageRootUrl: options.packageRootUrl,
@@ -702,6 +729,7 @@ export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTr
 }
 
 export async function bundleWithRollup(entryPath, options = {}) {
+  const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
   const specialization = options.specializeNumeric;
   const numericPlugin =
@@ -728,6 +756,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
   }
   const resolvedEntryAbs = path.resolve(entryPath);
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
+  if (documentRoot) documentRelativePath(entryUrl, documentRoot);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
 
   let importMap = { imports: {}, scopes: {} };
@@ -738,7 +767,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
 
   if (isHtml) {
     const htmlContent = fs.readFileSync(resolvedEntryAbs, "utf-8");
-    const parsed = parseHtmlEntries(htmlContent, entryUrl);
+    const parsed = parseHtmlEntries(htmlContent, entryUrl, { documentRoot });
     importMap = parsed.importMap;
     mapBaseUrl = parsed.baseUrl;
 
@@ -818,16 +847,18 @@ export async function bundleWithRollup(entryPath, options = {}) {
         ...(marchingPlugin ? [marchingPlugin] : []),
         ...commonjsPlugins({moduleSources, resolveModule: (specifier, from, request) =>
           resolveModuleSpecifier(specifier, from, importMap, {
-            mapBaseUrl, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, ...request,
+            mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, ...request,
           })}),
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
           _moduleSources: moduleSources,
+          documentRoot,
           unavailableGlobals: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
             packageRootUrl: options.packageRootUrl,
+            documentRoot,
             _moduleSources: moduleSources,
           }),
         }),
@@ -836,10 +867,12 @@ export async function bundleWithRollup(entryPath, options = {}) {
           commonJS: true,
           importMap,
           mapBaseUrl,
+          documentRoot,
           inlineModules,
           packageRootUrl: options.packageRootUrl,
           retainedModuleUrls: options.retainedModuleUrls,
           prepareStandaloneLoaders: options.prepareStandaloneLoaders,
+          workerHostBindings: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl } : {}),
         }),
         ...(numericPlugin ? [numericPlugin] : []),

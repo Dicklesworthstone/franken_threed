@@ -10,6 +10,7 @@ import { Worker as Thread } from "node:worker_threads";
 import { buildApplication } from "./build_application.mjs";
 import { parseTagAttributes } from "./html_parser.mjs";
 import { packHtml } from "./pack_html.mjs";
+import { buildModuleWorkerGraph, moduleWorkerRollupPlugin } from "./module_workers.mjs";
 
 // Test host only: real native worker threads, ESM, classic script evaluation,
 // Wasm compilation and filesystem-backed Response bodies. Production worker
@@ -299,4 +300,137 @@ test("library hosts and user-defined Worker constructors keep source string sema
   assert.equal(built.emittedFiles.some((file) => file.startsWith("f3d-workers/")), false);
   const library = await buildApplication(path.join(root, "library.mjs"), path.join(root, "library-dist"));
   assert.equal(library.emittedFiles.some((file) => file.startsWith("f3d-workers/")), false);
+});
+
+test("rooted workers execute module, classic, lazy, JSON and fetch dependencies after a nested app relocates", async (t) => {
+  const root = fixture({
+    "pages/demo.html": '<script type="module" src="/modules/app.mjs"></script>',
+    "modules/app.mjs": `export const moduleTask=()=>new Worker('/workers/main.mjs?entry=1#worker',{type:'module'});
+      export const classicTask=()=>new Worker(new URL('/workers/classic.js',import.meta.url));`,
+    "workers/main.mjs": `import first from '/data/value.json?copy=1' with {type:'json'};
+      import same from '/data/value.json?copy=1' with {type:'json'};
+      const lazy=await import('/workers/lazy.mjs');
+      const bytes=await (await fetch('/data/body.txt')).text();
+      postMessage({value:first.value,lazy:lazy.value,same:first===same,bytes,search:location.search,hash:location.hash});`,
+    "workers/lazy.mjs": 'export const value=17;',
+    "workers/classic.js": `importScripts('/workers/globals.js');
+      fetch('/data/body.txt').then(r=>r.text()).then(bytes=>postMessage({value:globalValue,bytes}));`,
+    "workers/globals.js": 'var globalValue=21;',
+    "data/value.json": '{"value":42}',
+    "data/body.txt": 'rooted worker bytes',
+  });
+  const output = path.join(path.dirname(root), path.basename(root) + '-output');
+  const built = await buildApplication(path.join(root, 'pages/demo.html'), output, {documentRoot: root});
+  const relocated = output + '-relocated';
+  fs.renameSync(output, relocated);
+  fs.renameSync(root, root + '-source-unavailable');
+  workerHost(t, pathToFileURL(path.join(relocated, built.htmlFile)));
+  const application = await import(pathToFileURL(path.join(relocated, built.entryFiles[0])).href);
+  const moduleTask = application.moduleTask(), classicTask = application.classicTask();
+  assert.ok(moduleTask.url.pathname.startsWith(path.join(relocated, 'f3d-workers')));
+  assert.deepEqual(await moduleTask.result, {value: 42, lazy: 17, same: true, bytes: 'rooted worker bytes',
+    search: '?entry=1', hash: '#worker'});
+  assert.deepEqual(await classicTask.result, {value: 21, bytes: 'rooted worker bytes'});
+});
+
+test("documentRoot preserves server-owned worker endpoints through both worker and ordinary asset transforms", async t => {
+  const root = fixture({
+    "pages/demo.html": '<script type="module" src="/modules/app.mjs"></script>',
+    "modules/app.mjs": `export const effects=[];
+      export const direct=()=>new Worker('/api/string.js?job=1',{type:'module'});
+      export const missing=()=>new Worker(new URL('/api/generated.js?job=1#entry',import.meta.url),
+        {type:'module',name:(effects.push('options'),'generated')});
+      export const open=()=>new Worker(new URL('/workers/open.mjs',import.meta.url),{type:'module'});
+      export const shared=()=>new SharedWorker(new URL('/api/shared.js',import.meta.url),'shared');
+      export const mixed=flag=>new Worker(flag?new URL('/workers/closed.mjs',import.meta.url):
+        new URL('/api/conditional.js',import.meta.url),{type:'module'});`,
+    "workers/open.mjs": "const request='./server.json';fetch(request);",
+    "workers/closed.mjs": "postMessage('closed');",
+  });
+  const built = await buildApplication(path.join(root, "pages/demo.html"), root + "-output", {documentRoot: root});
+  const originalWorker = globalThis.Worker, originalShared = globalThis.SharedWorker;
+  const documentBase = pathToFileURL(path.join(built.outDir, built.htmlFile));
+  globalThis.Worker = globalThis.SharedWorker = class {
+    constructor(input, options) { this.url = new URL(String(input), documentBase); this.options = options; }
+  };
+  t.after(() => {
+    if (originalWorker === undefined) delete globalThis.Worker; else globalThis.Worker = originalWorker;
+    if (originalShared === undefined) delete globalThis.SharedWorker; else globalThis.SharedWorker = originalShared;
+  });
+  const application = await import(pathToFileURL(path.join(built.outDir, built.entryFiles[0])).href);
+  assert.equal(application.direct().url.pathname, "/api/string.js");
+  const missing = application.missing();
+  assert.equal(missing.url.pathname, "/api/generated.js");
+  assert.equal(missing.url.search, "?job=1");
+  assert.equal(missing.url.hash, "#entry");
+  assert.deepEqual(missing.options, {type: "module", name: "generated"});
+  assert.deepEqual(application.effects, ["options"]);
+  assert.equal(application.open().url.pathname, "/workers/open.mjs");
+  assert.equal(application.shared().url.pathname, "/api/shared.js");
+  assert.equal(application.mixed(false).url.pathname, "/api/conditional.js");
+  assert.ok(application.mixed(true).url.pathname.startsWith(path.join(built.outDir, "f3d-workers")));
+  assert.equal(built.emittedFiles.filter(name => name.startsWith("f3d-workers/")).length, 1);
+});
+
+test("documentRoot worker fetches retain live requests while relocating proved static GET resources", async t => {
+  const root = fixture({
+    "workers/main.mjs": `export async function run(){
+      const effects=[];
+      await fetch('/api',{method:'POST',body:(effects.push('body'),'payload')});
+      await fetch('/missing.json?job=1#response');
+      await fetch(new URL('/api',import.meta.url),{method:'POST'});
+      await fetch(new URL('/missing-url.json',import.meta.url));
+      const bytes=await (await fetch('/data/body.txt')).text();
+      const nested=new Worker('/api/worker.js',{type:'module',name:(effects.push('worker'),'nested')});
+      return {effects,bytes,nested};
+    }`,
+    "api": "A static file does not authorize changing a POST request",
+    "data/body.txt": "packaged GET bytes",
+  });
+  const graph = buildModuleWorkerGraph(pathToFileURL(path.join(root, "workers/main.mjs")).href,
+    {documentRoot: root, requireClosedRuntimeUrls: true});
+  assert.equal(graph.assetCount, 1);
+  const output = root + "-output";
+  for (const file of graph.files) {
+    fs.mkdirSync(path.dirname(path.join(output, file.fileName)), {recursive: true});
+    fs.writeFileSync(path.join(output, file.fileName), file.source);
+  }
+  fs.renameSync(root, root + "-source-unavailable");
+  const entry = pathToFileURL(path.join(output, graph.entryFile));
+  const originalFetch = globalThis.fetch, originalWorker = globalThis.Worker, calls = [];
+  globalThis.fetch = async (input, options) => {
+    calls.push({input, options});
+    return {text: async () => fs.readFileSync(new URL(input, entry), "utf8")};
+  };
+  globalThis.Worker = class { constructor(url, options) { this.url = url; this.options = options; } };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalWorker === undefined) delete globalThis.Worker; else globalThis.Worker = originalWorker;
+  });
+  const result = await (await import(entry.href)).run();
+  assert.equal(calls[0].input, "/api");
+  assert.deepEqual(calls[0].options, {method: "POST", body: "payload"});
+  assert.equal(calls[1].input, "/missing.json?job=1#response");
+  assert.equal(calls[2].input.pathname, "/api");
+  assert.equal(calls[2].options.method, "POST");
+  assert.equal(calls[3].input.pathname, "/missing-url.json");
+  assert.ok(new URL(calls[4].input, entry).pathname.startsWith(path.join(output, "f3d-workers/assets")));
+  assert.equal(result.bytes, "packaged GET bytes");
+  assert.equal(result.nested.url, "/api/worker.js");
+  assert.deepEqual(result.effects, ["body", "worker"]);
+});
+
+test("documentRoot worker host fallback cannot swallow inspected symlink escapes", () => {
+  const root = fixture({"worker.mjs": "", "outside.mjs": "export const value=1;"});
+  const outside = root + "-outside.mjs";
+  fs.writeFileSync(outside, "export const value=1;");
+  fs.symlinkSync(outside, path.join(root, "escape.mjs"));
+  for (const source of ["import '/escape.mjs';", "fetch('/escape.mjs');", "new Worker('/escape.mjs',{type:'module'});"]) {
+    fs.writeFileSync(path.join(root, "worker.mjs"), source);
+    const plugin = moduleWorkerRollupPlugin({documentRoot: root}), emitted = [];
+    assert.throws(() => plugin.transform.call({emitFile(file) {emitted.push(file); return 'asset';}},
+      "new Worker(new URL('/worker.mjs',import.meta.url),{type:'module'});",
+      pathToFileURL(path.join(root, "main.mjs")).href), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
+    assert.equal(emitted.length, 0);
+  }
 });
