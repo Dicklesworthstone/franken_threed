@@ -687,7 +687,7 @@ test("failed index registration is cleaned up and the renderer remains usable", 
   r.dispose();
 });
 
-test("pending registrations count against capacity and dispose safely during initialization", async () => {
+test("pending registrations count against capacity and dispose without awaiting validation", async (t) => {
   const d = deviceSpy(),
     r = await createGpuAnimationRenderer(d, { maxMeshes: 1 }),
     slow = deferred(),
@@ -701,12 +701,47 @@ test("pending registrations count against capacity and dispose safely during ini
     }
     return value;
   };
-  const pending = r.addMesh(gpu(), { indices: [0, 1, 2] });
+  t.after(() => slow.resolve(null));
+  const borrowed = gpu();
+  let outcome;
+  const pending = r.addMesh(borrowed, { indices: [0, 1, 2] }).then(
+    mesh => { outcome = mesh; }, error => { outcome = error; });
   await assert.rejects(r.addMesh(gpu()), code("ANIMATION_RENDER_LIMIT"));
   r.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcome?.code, "ANIMATION_RENDER_DISPOSED");
+  assert.equal(r.meshCount, 0);
+  assert.equal(r.allocatedBytes, 0);
+  assert.equal(borrowed.disposed, false);
   slow.resolve(null);
-  await assert.rejects(pending, code("ANIMATION_RENDER_DISPOSED"));
+  await pending;
   assert.ok(d.buffers.every((b) => b.destroyed));
+});
+
+test("dispose cancels whenIdle without completing submitted work or owning borrowed geometry", async (t) => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d), borrowed = gpu(),
+    mesh = await r.addMesh(borrowed), fence = deferred();
+  t.after(() => fence.resolve());
+  let fenceDone = false, outcome;
+  fence.promise.then(() => { fenceDone = true; });
+  d.queue.onSubmittedWorkDone = () => fence.promise;
+  d.destroy = () => assert.fail("The animation renderer does not own the device");
+  r.render(frame([mesh]));
+  const pending = r.whenIdle().then(value => { outcome = value; }, error => { outcome = error; });
+  r.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcome?.code, "ANIMATION_RENDER_DISPOSED");
+  assert.equal(fenceDone, false);
+  assert.equal(d.submissions.length, 1);
+  assert.equal(borrowed.disposed, false);
+  assert.equal(r.failed, false);
+  assert.equal(r.allocatedBytes, 0);
+  fence.resolve();
+  await pending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fenceDone, true);
+  assert.equal(r.failed, false);
+  assert.equal(borrowed.disposed, false);
 });
 
 test("capabilities and initial uniform budget fail before allocating", async () => {
@@ -905,6 +940,31 @@ test("pending surface pipelines reserve mesh/buffer capacity and unwind on failu
   r.render(frame([plain]));
   await r.whenIdle();
   r.dispose();
+});
+
+for (const rejects of [false, true])
+test(`dispose cancels pending surface compilation before its late ${rejects ? "rejection" : "success"}`, async (t) => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d, {maxDraws: 1}),
+    slow = deferred(), borrowed = gpu();
+  t.after(() => slow.resolve({}));
+  d.createRenderPipelineAsync = () => slow.promise;
+  let outcome;
+  const pending = r.addMesh(borrowed, {vertexColors: Array(9).fill(1)}).then(
+    mesh => { outcome = mesh; }, error => { outcome = error; });
+  r.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcome?.code, "ANIMATION_RENDER_DISPOSED");
+  const allocations = d.buffers.length;
+  if (rejects) slow.reject(new Error("Late driver shader rejection"));
+  else slow.resolve({});
+  await pending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(r.meshCount, 0);
+  assert.equal(r.allocatedBytes, 0);
+  assert.equal(d.buffers.length, allocations);
+  assert.ok(d.buffers.every(buffer => buffer.destroyed));
+  assert.equal(borrowed.disposed, false);
+  assert.equal(r.failed, false);
 });
 
 test("surface bind-group validation errors clean up attributes without owning the borrowed texture", async () => {

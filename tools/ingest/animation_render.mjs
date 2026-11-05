@@ -226,6 +226,8 @@
  * Host validation finishes before GPU writes. Driver errors are terminal, not
  * rollbackable. version acknowledges submission, not completion: await whenIdle()
  * for cumulative draw/deformation validation, OOM and device-loss errors.
+ * Disposal rejects pending registrations and host waits; it does not complete
+ * already submitted GPU work or dispose borrowed geometry or the device.
  */
 import { animationDfgWgsl } from "./animation_dfg.mjs";
 import {animationUvBytes, animationUvFields, snapshotAnimationMapTransforms,
@@ -1417,6 +1419,7 @@ export async function createGpuAnimationRenderer(
     instanceBindGroup = instanceUniformLayout = null;
     environmentGroups.clear();
     rasterStates.clear(); rasterIds.clear();
+    pipelines.clear(); variants.clear();
     sharedBuffers?.clear();
     sharedGroups?.clear();
   }
@@ -1429,6 +1432,11 @@ export async function createGpuAnimationRenderer(
     throw terminal;
   });
   lost.catch(() => {});
+  // Cancelling a host wait must not settle the native submission completion.
+  // Keep `lost` for fence/error tracking and use `stopped` at publication waits.
+  let rejectDisposed;
+  const stopped = Promise.race([lost, new Promise((_, reject) => { rejectDisposed = reject; })]);
+  stopped.catch(() => {});
   // Compiled source programs (ShaderMaterial) share this renderer's passes/order.
   const programs = createProgramMeshes({device, format, colorFormats, depthFormat, sampleCount, maxDraws, label, fail, scoped, lost});
   // Native Three node builders provide WGSL and bind-group layouts directly.
@@ -1747,7 +1755,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
                 : {}),
               multisample: { count: sampleCount },
             })
-            .then((pipeline) => pipelines.set(key, pipeline)),
+            .then((pipeline) => { live(); pipelines.set(key, pipeline); }),
         );
       }
     return Promise.all(created);
@@ -1856,7 +1864,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
   function ensureVariant(variant) {
     if (!variants.has(variant)) {
       const built = scoped(device, () => compilePipelines(variant));
-      const ready = Promise.race([Promise.all([built.value, built.errors]), lost]);
+      const ready = Promise.race([Promise.all([built.value, built.errors]), stopped]);
       variants.set(variant, ready);
       ready.catch(() => variants.delete(variant));
     }
@@ -2446,7 +2454,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
             }
           }
         });
-        await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), lost]);
+        await Promise.race([Promise.all([allocated.errors, ready, lightsReady]), stopped]);
       }
       live();
       const latest = deformerShape(gpu, device);
@@ -3180,7 +3188,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
     },
     async whenIdle() {
       live();
-      await Promise.race([completion, lost]);
+      await Promise.race([completion, stopped]);
       live();
       return renderer;
     },
@@ -3188,6 +3196,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
       if (busy) fail("ANIMATION_RENDER_REENTRANT", "Cannot dispose during submission");
       if (!disposed) {
         disposed = true;
+        rejectDisposed(new AnimationRenderError("ANIMATION_RENDER_DISPOSED", "Animation renderer has been disposed"));
         records.clear();
         release();
       }
