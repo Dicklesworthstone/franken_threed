@@ -19,7 +19,8 @@ import * as walk from "acorn-walk";
 import { embedGltfAssets } from "./pack_gltf.mjs";
 import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
 import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
-import { analyzeDocumentFetch, isRelativeDocumentFetchUrl } from "./document_fetch_assets.mjs";
+import { analyzeDocumentFetch, isLocalDocumentFetchUrl } from "./document_fetch_assets.mjs";
+import { documentRelativePath, isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
 
 export class HtmlPackingError extends Error {
   constructor(code, message) {
@@ -227,13 +228,14 @@ function rewriteSrcset(source, embed) {
 /**
  * @param {string} entryPath HTML entry in an already-emitted application tree.
  * @param {string} outputPath Fresh single-file destination, never overwritten.
- * @param {{rootDir?: string, maxBytes?: number, maxFiles?: number}} options
+ * @param {{rootDir?: string, documentRoot?: string | URL, maxBytes?: number, maxFiles?: number}} options
  */
 export function packHtml(
   entryPath,
   outputPath,
   {
     rootDir = path.dirname(path.resolve(entryPath)),
+    documentRoot = null,
     maxBytes = 64 * 1024 * 1024,
     maxFiles = 4096,
   } = {},
@@ -245,9 +247,12 @@ export function packHtml(
     maxFiles < 1
   )
     throw new RangeError("Positive integer packing limits are required");
+  // URL origin mapping never widens the separate file-read containment root.
+  const documentBaseRoot = normalizeDocumentRoot(documentRoot);
   const entry = path.resolve(entryPath),
     destination = path.resolve(outputPath),
     root = fs.realpathSync(rootDir);
+  if (documentBaseRoot) documentRelativePath(entry, documentBaseRoot);
   try {
     fs.lstatSync(destination);
     fail("OUTPUT_EXISTS", `Refusing to overwrite ${destination}`);
@@ -296,8 +301,9 @@ export function packHtml(
   function local(value, base) {
     let url;
     try {
-      url = new URL(value, base);
-    } catch {
+      url = new URL(resolveDocumentUrl(value, base, documentBaseRoot));
+    } catch (error) {
+      if (error.code !== "ERR_INVALID_URL") throw error;
       fail("RESOURCE_URL", `Unresolvable resource ${JSON.stringify(value)}`);
     }
     if (url.protocol !== "file:" && url.protocol !== "data:")
@@ -361,9 +367,11 @@ export function packHtml(
     for (let [key, value] of Object.entries(source)) {
       if (!key || (value !== null && typeof value !== "string"))
         fail("IMPORT_MAP", "Invalid import-map entry");
-      if (/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(key)) key = new URL(key, base).href;
-      if (value !== null) value = new URL(value, base).href;
-      if (!target.has(key)) target.set(key, value); // Earlier import maps win.
+      // Keep the original target's origin mapping after canonical URL normalization.
+      const rooted = Boolean(documentBaseRoot && value !== null && isRootRelativeDocumentUrl(value));
+      if (/^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(key)) key = resolveDocumentUrl(key, base, documentBaseRoot);
+      if (value !== null) value = resolveDocumentUrl(value, base, documentBaseRoot);
+      if (!target.has(key)) target.set(key, { value, rooted }); // Earlier import maps win.
     }
   }
   for (const map of sourceMaps) {
@@ -374,24 +382,25 @@ export function packHtml(
     )
       fail("IMPORT_MAP", "Scopes must be an object");
     for (const [scope, entries] of Object.entries(map.scopes ?? {})) {
-      const url = new URL(scope, base).href;
+      const url = resolveDocumentUrl(scope, base, documentBaseRoot);
       if (!scopes.has(url)) scopes.set(url, new Map());
       merge(scopes.get(url), entries);
     }
   }
   function resolveModule(specifier, from) {
     const urlLike = /^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(specifier);
-    const normalized = urlLike ? new URL(specifier, from).href : specifier;
+    const normalized = urlLike ? resolveDocumentUrl(specifier, from, documentBaseRoot) : specifier;
     function match(map) {
       for (const key of [...map.keys()].sort((a, b) => b.length - a.length)) {
         if (key !== normalized && !(key.endsWith("/") && normalized.startsWith(key))) continue;
-        const value = map.get(key);
+        const { value, rooted } = map.get(key);
         if (value === null) fail("BLOCKED_IMPORT", `Import map blocks ${specifier}`);
         if (key === normalized) return value;
         if (!value.endsWith("/")) fail("IMPORT_MAP", "Prefix mappings require a trailing slash");
         const mapped = new URL(normalized.slice(key.length), value).href;
         if (!mapped.startsWith(value))
           fail("IMPORT_MAP", "Mapped package import backtracks above its prefix");
+        if (rooted) documentRelativePath(mapped, documentBaseRoot);
         return mapped;
       }
       return null;
@@ -980,8 +989,9 @@ export function packHtml(
         if (request && !request.candidates.every(value => value.startsWith("data:"))) {
           if (!request.admitted)
             fail("FETCH_URL", `${from}: ${request.reason} requires the normal networked build`);
-          if (request.candidates.some(value => !value.startsWith("data:") && !isRelativeDocumentFetchUrl(value)))
-            fail("FETCH_URL", `${from}: external or document-root fetches require the normal networked build`);
+          if (request.candidates.some(value => !value.startsWith("data:") &&
+              !isLocalDocumentFetchUrl(value, {documentRoot: documentBaseRoot})))
+            fail("FETCH_URL", `${from}: external or unmapped document-root fetches require the normal networked build`);
           documentFetchUsed = true;
           documentRequestUsed ||= Boolean(request.request);
           const mapping = request.candidates.map(value =>

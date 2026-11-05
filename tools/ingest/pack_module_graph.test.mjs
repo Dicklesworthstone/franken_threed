@@ -219,6 +219,61 @@ test("document: URL aliases preserve native cyclic module identity", async (t) =
   }, { ok: true, value: true });
 });
 
+test("document roots preserve inline modules, live cycles, lazy imports and query identities without source files", async t => {
+  const main = `import {token,value,bump,cycle} from '/modules/state.mjs?one#view';
+    import {token as alias} from 'state';
+    import {token as other} from '/modules/state.mjs?two#view';
+    export async function run(){bump();
+      const lazy=await import('/modules/lazy.mjs');
+      const same=await import('/modules/state.mjs?one#view');
+      return [token===alias,token!==other,same.token===token,value,lazy.read(),cycle()];}`;
+  const f = fixture(t, 'document', {
+    'main.mjs': main,
+    'pages/demo/index.html': `<script type="importmap">{"imports":{"state":"/modules/state.mjs?one#view"}}</script>
+      <script type="module">${main}</script><script type="module" src="/modules/state.mjs?one#view"></script>`,
+    'modules/state.mjs': `import {read} from './read.mjs';export const token={};export let value=1;
+      export const bump=()=>++value;export const cycle=()=>read();`,
+    'modules/read.mjs': `import {value} from './state.mjs?one#view';export const read=()=>value;`,
+    'modules/lazy.mjs': `export {read} from './read.mjs';`,
+  });
+  const rootUrl = pathToFileURL(f.source + path.sep);
+  const imports = Object.fromEntries(['/modules/state.mjs?one#view', '/modules/state.mjs?two#view', '/modules/lazy.mjs']
+    .map(value => [value, new URL('.' + value, rootUrl).href]));
+  imports.state = imports['/modules/state.mjs?one#view'];
+  const original = await execute({...f.original, imports});
+  assert.deepEqual(original, {ok: true, value: [true, true, true, 2, 2, 2]});
+  packHtml(path.join(f.source, 'pages/demo/index.html'), f.output, {rootDir: f.source, documentRoot: f.source});
+  const emitted = await f.emitted();
+  assert.ok(Object.values(emitted.imports).every(url => url.startsWith('data:')));
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.output, path.join(f.root, 'packed-unavailable.html'));
+  assert.deepEqual(await execute(emitted), original, 'native modules execute from embedded bytes alone');
+});
+
+test("document-root finite fetch and Request use native response bodies with source and output unavailable", async t => {
+  const f = fixture(t, 'document', {
+    'pages/demo/index.html': '<script type="module" src="/app.mjs"></script>',
+    'main.mjs': `const log=[];
+      const resource=(log.push('select'),true)?'/assets/settings.json?cache=1#view':'/assets/other.json';
+      export async function run(){
+        const first=await fetch((log.push('url'),resource),(log.push('options'),{method:'GET'}));
+        const second=await fetch(new Request((log.push('request'),'/assets/raw.js?body=1'),
+          (log.push('request-options'),{method:'GET'})));
+        return [(await first.json()).value,await second.text(),log];
+      }`,
+    'assets/settings.json': '{"value":42}',
+    'assets/other.json': '{"value":7}',
+    'assets/raw.js': "import '/not-executable.mjs';\n",
+  });
+  const entry = path.join(f.source, 'pages/demo/index.html');
+  packHtml(entry, f.output, {rootDir: f.source, documentRoot: f.source});
+  const emitted = await f.emitted();
+  fs.renameSync(f.source, path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.output, path.join(f.root, 'packed-unavailable.html'));
+  assert.deepEqual(await execute(emitted), {ok: true, value: [42, "import '/not-executable.mjs';\n",
+    ['select', 'url', 'options', 'request', 'request-options']]});
+});
+
 test("worker: cycles still fail explicitly without a production linker shim", (t) => {
   const f = fixture(t, "worker", {
     "main.mjs": `export const run=()=>import(new URL('./cycle.mjs',import.meta.url));`,

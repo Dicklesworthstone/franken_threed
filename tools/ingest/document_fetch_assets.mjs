@@ -7,6 +7,7 @@ import {fileURLToPath} from 'node:url';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 import {createDynamicImportClassifier, isIdentifierShadowedAtAncestors} from './ast_analyzer.mjs';
+import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
 
 const hosts = new Set(['globalThis', 'self', 'window']);
 const tail = node => {
@@ -20,6 +21,8 @@ const literal = node => node?.type === 'Literal' && typeof node.value === 'strin
 const property = node => node.computed ? literal(node.property) : node.property.name;
 export const isRelativeDocumentFetchUrl = value => Boolean(value.trim()) &&
   !/^(?:[a-z][\w+.-]*:|[\/\\#])/i.test(value.trim());
+export const isLocalDocumentFetchUrl = (value, {documentRoot = null} = {}) =>
+  isRelativeDocumentFetchUrl(value) || Boolean(documentRoot && isRootRelativeDocumentUrl(value));
 
 export function analyzeDocumentFetch(source, {sourceType = 'module'} = {}) {
   const ast = typeof source === 'string' ? acorn.parse(source, {ecmaVersion: 'latest', sourceType}) : source;
@@ -104,17 +107,22 @@ export function analyzeDocumentFetch(source, {sourceType = 'module'} = {}) {
 }
 
 /** Copy responses at the document's original paths, never their importing
- * module's directory. Missing/live/root-relative requests stay network-owned.
+ * module's directory. Missing/live requests stay network-owned; origin-root
+ * requests can be copied when an explicit local documentRoot identifies them.
  * Raw .js/.css/model bodies are data, not executable or recursive dependencies.
  */
-export function collectDocumentFetchAssets(sites, {documentUrl, documentBaseUrl = documentUrl}) {
-  const result = new Map(), root = path.dirname(fileURLToPath(documentUrl));
+export function collectDocumentFetchAssets(sites, {documentUrl, documentBaseUrl = documentUrl, documentRoot}) {
+  documentRoot = normalizeDocumentRoot(documentRoot);
+  const result = new Map(), root = documentRoot ?? path.dirname(fileURLToPath(documentUrl));
   let bytes = 0;
   for (const site of sites) for (const value of site.admitted ? site.candidates : []) {
-    if (!isRelativeDocumentFetchUrl(value)) continue;
+    if (!isLocalDocumentFetchUrl(value, {documentRoot})) continue;
+    // Validate explicit origin-root mappings outside the optional-resource
+    // catch: an escaping symlink must not become a silently retained request.
+    const resolved = documentRoot ? resolveDocumentUrl(value, documentBaseUrl, documentRoot) : value;
     let filename;
     try {
-      const url = new URL(value, documentBaseUrl);
+      const url = new URL(resolved, documentBaseUrl);
       if (url.protocol !== 'file:') continue;
       filename = fileURLToPath(url);
     } catch { continue; }
