@@ -1,7 +1,7 @@
 # Native numeric helper loops
 
 The numeric compiler can close an acyclic graph of scalar helper functions
-containing `for`, `while`, and `do ... while` loops into the same import-free
+containing `for`, `while`, and `do ... while` loops into the same
 WebAssembly module as its selected entry point. A root can update numeric arrays,
 return a Number, or delegate all its iteration to scalar helpers.
 
@@ -110,6 +110,11 @@ Guarded Math intrinsics and exact integer/bitwise lowering remain available in
 helper bodies. Their requirements propagate to the entry's existing runtime
 checks. No arithmetic reassociation, f32 arithmetic substitution, or parallel
 independence is inferred from the presence of loops.
+
+Native transcendental Math operations use the guarded host imports described in
+[the numeric control contract](NUMERIC_GENERAL_CONTROL.md#native-math-inside-numeric-loops).
+Their operands remain numeric, and the helper bodies and loops still execute in
+Wasm. Helpers using only directly lowered operations remain import-free.
 
 Helper arrays, captured outer state, recursive functions, indirect calls,
 `for ... of`, `for ... in`, labeled control, suspension, and arbitrary effects

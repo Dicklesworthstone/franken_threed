@@ -146,7 +146,7 @@ test("final reports follow Rollup filename hash substitutions", () => {
 
 test("refused and uncalled kernels emit no runtime and keep code untouched", () => {
   const run = lifecycle();
-  const code = CODE.replace("a[i] += dt", "a[i] = Math.sin(a[i])");
+  const code = CODE.replace("a[i] += dt", "a[i] = Math.hypot(a[i])");
   assert.equal(run.chunk(code).result, null);
   const report = run.finish();
   assert.equal(report.compiledKernels, 0);

@@ -40,7 +40,10 @@ const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
 const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray',
   'reduce', 'reduceRight', 'forEach', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex']);
-const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc']);
+// Transcendentals use the host's exact Number implementation. These are the
+// only host imports admitted by the numeric ABI; generated operands are f64.
+const NATIVE_MATH_NAMES = Object.freeze(['acos', 'asin', 'atan', 'atan2', 'cos', 'exp', 'log', 'pow', 'sin', 'tan']);
+const MATH_NAMES = Object.freeze(['abs', 'ceil', 'clz32', 'floor', 'fround', 'imul', 'max', 'min', 'round', 'sign', 'sqrt', 'trunc', ...NATIVE_MATH_NAMES]);
 function dataValue(object, key) {
   const entry = descriptor(object, key);
   return entry && hasOwn(entry, 'value') ? entry.value : undefined;
@@ -218,6 +221,15 @@ function readManifest(module, wasm) {
     refuse('KERNEL_ABI_MISMATCH', 'Invalid guarded Math requirements');
   }
   if (guardedMath) Object.freeze(manifest.mathIntrinsics);
+  const nativeMath = guardedMath
+    ? manifest.mathIntrinsics.filter(name => NATIVE_MATH_NAMES.includes(name)).sort() : [];
+  if (nativeMath.length ? !Array.isArray(manifest.mathImports) ||
+      manifest.mathImports.length !== nativeMath.length ||
+      manifest.mathImports.some((name, index) => name !== nativeMath[index])
+    : manifest?.mathImports !== undefined) {
+    refuse('KERNEL_ABI_MISMATCH', 'Native Math imports must match the sorted guarded requirements');
+  }
+  if (nativeMath.length) Object.freeze(manifest.mathImports);
   if ([7, 8, 9].includes(manifest?.version)) return indexedManifest(manifest);
   const pipeline = manifest?.version === 6 && manifest.kind === 'closed-numeric-pipeline';
   const float32Abi = pipeline || ([2, 3, 4, 5].includes(manifest?.version) && manifest.kind === 'closed-numeric-loop');
@@ -411,7 +423,8 @@ function planNumericStorage(records, refuse) {
 /**
  * Instantiate a trusted compiler-produced artifact once and reuse it across
  * updates. A custom section is ABI metadata, NOT authentication of arbitrary
- * Wasm supplied by another party. The Wasm module receives no host imports.
+ * Wasm supplied by another party. The only permitted host imports are captured
+ * native Math methods declared by the compiler, with Number-only operands.
  *
  * fallback must be the original function for conservative execution. It is
  * called with the same arguments and receiver; return values and exceptions
@@ -452,15 +465,27 @@ export function instantiateNumericKernel(bytes, {
   const boundSet = new Set(boundParameters);
   const passes = generalControl ? [] : pipeline || checkedIndexing ? manifest.loops : [{ boundParameter: manifest.boundParameter, loopStride: manifest.loopStride ?? 1 }];
   const exports = wasm.Module.exports(module);
-  if (wasm.Module.imports(module).length !== 0 || exports.length !== 2 ||
+  const imports = wasm.Module.imports(module);
+  const mathImports = manifest.mathImports ?? [];
+  if (imports.length !== mathImports.length || imports.some((item, index) =>
+      item.module !== 'f3d.math' || item.kind !== 'function' || item.name !== mathImports[index]) ||
+      exports.length !== 2 ||
       !exports.some(item => item.name === 'run' && item.kind === 'function') ||
       !exports.some(item => item.name === 'memory' && item.kind === 'memory')) {
-    refuse('KERNEL_ABI_MISMATCH', 'Kernel must export only run and memory and have no imports');
+    refuse('KERNEL_ABI_MISMATCH', 'Kernel must export only run and memory and import only its declared native Math methods');
+  }
+  const nativeMath = { __proto__: null };
+  for (const name of mathImports) {
+    const method = mathMethods.get(name);
+    if (!method) refuse('KERNEL_MATH_BINDING', `The native Math.${name} implementation is unavailable`);
+    nativeMath[name] = method;
   }
   const requestedLimit = maxMemoryBytes ?? MAX_BYTES;
   const declaredLimit = manifest.maxMemoryPages * PAGE_BYTES;
   const limit = requestedLimit < declaredLimit ? requestedLimit : declaredLimit;
-  let { memory, run: execute } = new wasm.Instance(module).exports;
+  const instance = mathImports.length
+    ? new wasm.Instance(module, { 'f3d.math': nativeMath }) : new wasm.Instance(module);
+  let { memory, run: execute } = instance.exports;
   if (memory.buffer.byteLength > limit) refuse('KERNEL_MEMORY_LIMIT', 'Initial Wasm memory exceeds the configured limit');
   let disposed = false;
   const stats = { wasmCalls: 0, fallbackCalls: 0, copiedBytes: 0, lastGuardFailure: null };
@@ -590,7 +615,8 @@ export function instantiateNumericKernel(bytes, {
       prepared = prepare(args);
       for (const copy of prepared.inputs) apply(typedSet, copy.target, copy.args);
       // Revalidate after preparation (including a possible host memory.grow).
-      // The import-free Wasm call cannot rebind Math before publication.
+      // Only captured native Math functions can be called by Wasm. Their f64
+      // arguments require no user coercion and cannot rebind Math mid-call.
       checkMath();
       checkArrayIteration();
       if (manifest.typedArrayMethods) for (let i = 0; i < manifest.parameters.length; i++) {

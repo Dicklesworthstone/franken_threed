@@ -167,15 +167,15 @@ test("unsupported loops, wrong typed arrays and unavailable Wasm retain working 
   }
   globalThis.WebAssembly = native;
   const refused = fixture({
-    "entry.mjs": `function sine(a) { for (let i = 0; i < a.length; i++) a[i] = Math.sin(a[i]); }
-    export const tick = a => sine(a);`,
+    "entry.mjs": `function magnitude(a) { for (let i = 0; i < a.length; i++) a[i] = Math.hypot(a[i]); }
+    export const tick = a => magnitude(a);`,
   });
   const retained = await buildApplication(refused.entry, refused.out, { specializeNumeric: true });
   assert.equal(retained.numericSpecialization.compiledKernels, 0);
   assert.deepEqual(retained.numericSpecialization.runtimeAssets, []);
   const a = [1];
   (await importEntry(retained)).tick(a);
-  assert.equal(a[0], Math.sin(1));
+  assert.equal(a[0], Math.hypot(1));
 });
 
 test("CLI --build-app --specialize-numeric emits executable output and a build manifest", async () => {

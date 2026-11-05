@@ -37,6 +37,11 @@ helpers execute in one import-free Wasm transaction. `upload` stays at its
 original JavaScript boundary. The callback, closures and exported identities
 remain application-owned; no renderer or frame scheduler is installed.
 
+Helpers may also use [guarded native Math calls](NUMERIC_GENERAL_CONTROL.md#native-math-inside-numeric-loops),
+including `sin`, `cos`, `atan2` and `pow`. Those artifacts declare the retained
+host Math boundary in `mathImports`; the helper graph and outer loop remain one
+Wasm transaction, with the same fallback and publication contract.
+
 ```sh
 node tools/ingest/cli.mjs --entry ./src/main.mjs \
   --build-app ./dist/compiled --specialize-numeric

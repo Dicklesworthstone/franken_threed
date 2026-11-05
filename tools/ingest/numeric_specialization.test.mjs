@@ -268,7 +268,7 @@ test("conditional particle updates preserve exact arithmetic across hundreds of 
 });
 
 test("refused loops remain byte-for-byte original and carry specific source evidence", async () => {
-  const source = `export function step(a) { for (let i = 0; i < a.length; i++) a[i] = Math.sin(a[i]); }
+  const source = `export function step(a) { for (let i = 0; i < a.length; i++) a[i] = Math.hypot(a[i]); }
 export function tick(a) { step(a); }`;
   const { module, code, report } = await load(source, { sourceName: "updates.mjs" });
   assert.equal(code, source);
@@ -277,7 +277,7 @@ export function tick(a) { step(a); }`;
   assert.equal(report.candidates[0].sourceSpan.start, 7);
   const a = [1];
   module.tick(a);
-  assert.equal(a[0], Math.sin(1));
+  assert.equal(a[0], Math.hypot(1));
 });
 
 test("direct eval and parse-unsupported source units are preserved without added bindings", () => {

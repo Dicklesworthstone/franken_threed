@@ -158,9 +158,9 @@ for (const parameter of manifest.parameters) {
 }
 `
         : "";
-  const mathFreeze = artifact.manifest.mathIntrinsics
+  const mathFreeze = (artifact.manifest.mathIntrinsics
     ? "\nObject.freeze(manifest.mathIntrinsics);\n"
-    : "";
+    : "") + (artifact.manifest.mathImports ? "Object.freeze(manifest.mathImports);\n" : "");
   const mathOptions = artifact.manifest.mathIntrinsics ? ", resolveMath: () => Math" : "";
   return `/** Generated numeric-kernel package: explicit opt-in, no speedup claim. */
 import { instantiateNumericKernel, NumericKernelGuardError } from './runtime.mjs';

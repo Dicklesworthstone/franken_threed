@@ -79,6 +79,48 @@ test('dynamic callback chunks survive relocation and use fresh independent closu
   assert.deepEqual(trace,['before','after','before','after','before','after']);
 });
 
+test('relocated procedural animation keeps native transcendental results and callback effects',async t=>{
+  const counts=observe(t),app=fixture({
+    'entry.mjs':`export const load=()=>import('./lazy.mjs');`,
+    'wave.mjs':`export function wave(x){return Math.sin(x)+Math.cos(x);}`,
+    'lazy.mjs':`import {wave} from './wave.mjs';
+      export function createWave(attribute,phases,events){
+        let gain=1;
+        const frame=function frame(time){
+          events.push('before');const out=attribute.array;
+          for(let i=0;i<out.length;i++)
+            out[i]=wave(phases[i]+time)*gain+Math.atan2(phases[i],2)+Math.pow(phases[i],2);
+          attribute.needsUpdate=true;events.push('after');return attribute;
+        };
+        return {frame,alias:frame,setGain(value){gain=value;}};
+      }`,
+  });
+  const result=await buildApplication(app.entry,app.out,{specializeNumeric:true});
+  assert.equal(result.numericSpecialization.compiledLoopIslands,1);
+  assert.equal(result.numericSpecialization.accelerated,false);
+  const candidate=result.numericSpecialization.units.flatMap(unit=>unit.loopIslands?.candidates??[])
+    .find(item=>item.route==='guarded-loop-wasm');
+  assert.deepEqual(candidate.mathImports,['atan2','cos','pow','sin']);
+  const relocated=path.join(app.root,'relocated');fs.cpSync(app.out,relocated,{recursive:true});
+  const entry=await import(pathToFileURL(path.join(relocated,result.entryFiles[0])));
+  const module=await entry.load(),reference=await import(pathToFileURL(path.join(app.source,'lazy.mjs')));
+  assert.equal(counts.instances,0);
+  for(const Storage of [Float32Array,Float64Array]) {
+    const phases=new Storage([0,-0,1,-1,0.5,-0.5,1e20,-1e20,Infinity,-Infinity,NaN]);
+    const actual={array:new Storage(phases.length)},expected={array:new Storage(phases.length)};
+    const trace=[],referenceTrace=[],wave=module.createWave(actual,phases,trace);
+    const original=reference.createWave(expected,phases,referenceTrace);
+    assert.equal(wave.frame,wave.alias);assert.equal(wave.frame.name,'frame');assert.equal(wave.frame.length,1);
+    for(let frame=0;frame<8;frame++) {
+      wave.setGain(frame/3);original.setGain(frame/3);
+      assert.equal(wave.frame(frame/60),actual);original.frame(frame/60);
+      for(let i=0;i<phases.length;i++)assert.ok(Object.is(actual.array[i],expected.array[i]),`element ${i}`);
+    }
+    assert.equal(actual.needsUpdate,true);assert.deepEqual(trace,referenceTrace);
+  }
+  assert.deepEqual(counts,{instances:2,calls:16});
+});
+
 test('real Rollup metadata lists only the native loop runtime bindings it actually imports',async()=>{
   const app=fixture(),plugin=numericKernelRollupPlugin(),bundle=await rollup({input:app.entry,plugins:[plugin]});
   try {

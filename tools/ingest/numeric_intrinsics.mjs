@@ -1,8 +1,10 @@
 /**
- * Import-free Wasm lowering for a deliberately bounded set of Math operations.
+ * Wasm lowering for a deliberately bounded set of Math operations.
  * The caller proves lexical resolution; the host guards the actual Math object
  * and method identities before each execution. Never use this as a name-only
  * rewrite of arbitrary property calls. All operands must already be Numbers.
+ * Transcendentals call the captured native Math implementation through a fixed
+ * import contract, preserving browser Number results without approximations.
  *
  * Reference semantics: ECMA-262, Math object; Wasm core, floating-point numerics.
  * https://tc39.es/ecma262/multipage/numbers-and-dates.html#sec-math-object
@@ -13,6 +15,10 @@ import { emitToUint32 } from './numeric_integer.mjs';
 const UNARY = Object.freeze({
   abs: [0x99], ceil: [0x9b], floor: [0x9c], trunc: [0x9d], sqrt: [0x9f],
   fround: [0xb6, 0xbb], // round to f32 here, then promote back to a JS Number
+});
+export const MATH_IMPORT_ARITIES = Object.freeze({
+  sin: 1, cos: 1, tan: 1, asin: 1, acos: 1, atan: 1, atan2: 2,
+  exp: 1, log: 1, pow: 2,
 });
 function u32(value) {
   const bytes = [];
@@ -28,7 +34,7 @@ function number(value) {
 }
 
 export function createMathIntrinsicCompiler(enabled, fail) {
-  const used = new Set();
+  const used = new Set(), imported = new Set();
   return {
     call(node, emitArgument, shadowed, allocateLocal) {
       const callee = node.callee;
@@ -40,14 +46,21 @@ export function createMathIntrinsicCompiler(enabled, fail) {
       }
       const name = callee.property.name;
       const variadic = name === 'min' || name === 'max';
+      const nativeArity = Object.hasOwn(MATH_IMPORT_ARITIES, name) ? MATH_IMPORT_ARITIES[name] : null;
       if (!variadic && !Object.hasOwn(UNARY, name) &&
-          !['round', 'sign', 'imul', 'clz32'].includes(name)) {
+          !['round', 'sign', 'imul', 'clz32'].includes(name) && !nativeArity) {
         fail(`Math.${name} has no closed numeric lowering`, node);
       }
-      if (variadic ? node.arguments.length > 64 : node.arguments.length !== (name === 'imul' ? 2 : 1)) {
+      if (nativeArity && node.arguments.length !== nativeArity)
+        fail(`Math.${name} requires exactly ${nativeArity} numeric arguments`, node);
+      if (variadic ? node.arguments.length > 64 : node.arguments.length !== (nativeArity ?? (name === 'imul' ? 2 : 1))) {
         fail('Unary Math calls require one argument, imul two; min/max admit at most 64', node);
       }
       used.add(name);
+      if (nativeArity) {
+        imported.add(name);
+        return [...node.arguments.flatMap(emitArgument), 0x10, {mathImport: name}];
+      }
       if (variadic) {
         if (!node.arguments.length) return number(name === 'min' ? Infinity : -Infinity);
         // Every argument is pure, numeric, evaluated once in source order. The
@@ -79,5 +92,21 @@ export function createMathIntrinsicCompiler(enabled, fail) {
         ...get(x), 0xa6];
     },
     requirements() { return Object.freeze([...used].sort()); },
+    imports() { return Object.freeze([...imported].sort()); },
+    // Imports occupy the first Wasm function indices, but a later reachable
+    // helper may discover one. Link symbolic calls only after closure is known;
+    // instruction bytes and old import-free artifacts otherwise stay identical.
+    localCall(index) { return [0x10, {definedFunction: index}]; },
+    link(bytes) {
+      const names = [...imported].sort();
+      return bytes.flatMap(value => {
+        if (typeof value === 'number') return [value];
+        const index = value.mathImport === undefined ? names.length + value.definedFunction
+          : names.indexOf(value.mathImport);
+        if (!Number.isInteger(index) || index < 0)
+          fail('Unresolved numeric function call', null, 'INVALID_KERNEL_ABI');
+        return u32(index);
+      });
+    },
   };
 }

@@ -1,14 +1,15 @@
 /**
  * Close a bounded, acyclic graph of numeric JavaScript helpers into private Wasm
- * functions. No host imports, source evaluation, captures or implicit conversions
- * are admitted. Checked callers may pass typed-array views by private pointer and
+ * functions. No arbitrary host calls, source evaluation, captures or implicit
+ * conversions are admitted. Named native Math imports share the root's guarded
+ * binding. Checked callers may pass typed-array views by private pointer and
  * intrinsic length; each storage signature gets a bounded native specialization.
  * Each call evaluates arguments once, left to right;
  * a helper owns its scalar parameters and lexical locals, just as in JavaScript.
  * Number bitwise operations share the kernel's exact modulo-2^32 lowering.
  * With the caller's general-control contract, helper for/while/do-while bodies
  * spend the SAME private invocation budget as the entry point. Helpers neither
- * reset that budget nor call the host. Abrupt completion and lexical scopes
+ * reset that budget nor invoke application code. Abrupt completion and lexical scopes
  * remain source ordered. Numeric calls return a Number on every path; void
  * helpers are admitted only where the caller discards the result.
  */
@@ -42,7 +43,8 @@ function number(value) {
  * The caller is responsible for proving that these are the actual bindings at
  * the call site. The module specializer does this after linking, rejecting eval
  * and every statically mutable binding. Only reachable helpers are inspected.
- * Function/type index zero belongs to the caller's array-loop entry point.
+ * Defined function/type ordinal zero belongs to the caller's array-loop entry;
+ * the Math linker accounts for imported function indices before serialization.
  */
 export function createScalarHelperCompiler(helperSources, fail, intrinsics = null, control = null, checkedArrays = false) {
   if (!(helperSources instanceof Map)) fail('helperSources must be a Map of immutable function declarations', null, 'INVALID_KERNEL_SOURCE');
@@ -154,7 +156,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       array.mark(entry.effects[index]);
       return [...arrayPointer(array), ...arrayLength(array)];
     });
-    return [...argumentsCode, 0x10, ...u32(entry.index),
+    return [...argumentsCode, ...(intrinsics ? intrinsics.localCall(entry.index) : [0x10, ...u32(entry.index)]),
       ...(!resultUsed && entry.resultType !== 'void' ? [0x1a] : [])];
   }
 
@@ -566,7 +568,10 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         types: entries.map(entry => [0x60, ...u32(entry.wasmTypes.length), ...entry.wasmTypes,
           ...(entry.resultType !== 'void' ? [1, F64] : [0])]),
         functions: entries.map(entry => u32(entry.index)),
-        bodies: entries.map(entry => [...u32(entry.body.length), ...entry.body]),
+        bodies: entries.map(entry => {
+          const body = intrinsics ? intrinsics.link(entry.body) : entry.body;
+          return [...u32(body.length), ...body];
+        }),
         // Build-time provenance only: internal calls do not change the host ABI.
         helpers: Object.freeze(entries.map(({ name, arity, parameterTypes, resultType }) => Object.freeze({
           name, arity, ...(parameterTypes.some(type => type !== 'f64') || resultType !== 'f64'

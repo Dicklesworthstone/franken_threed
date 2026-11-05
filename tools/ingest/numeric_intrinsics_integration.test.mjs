@@ -61,6 +61,14 @@ for (const name of [
   "sign",
   "sqrt",
   "trunc",
+  "sin",
+  "cos",
+  "tan",
+  "asin",
+  "acos",
+  "atan",
+  "exp",
+  "log",
 ]) {
   test(`ordinary application calls discover Math.${name} and select f32/f64 native variants`, async (t) => {
     const declaration = `export function update(a) { for(let i=0;i<a.length;i++) a[i]=Math.${name}(a[i]); }`;
@@ -70,6 +78,8 @@ for (const name of [
     );
     assert.equal(result.report.compiledKernels, 1);
     assert.deepEqual(result.report.candidates[0].mathIntrinsics, [name]);
+    if (["sin", "cos", "tan", "asin", "acos", "atan", "exp", "log"].includes(name))
+      assert.deepEqual(result.report.candidates[0].mathImports, [name]);
     assert.equal(module.identity, module.update);
     assert.equal(module.update.toString(), declaration.slice(7));
     assert.equal(module.__stats()[0].initialized, false);
@@ -305,8 +315,6 @@ test("callee identity misses and missing ESM-cycle tokens do not evaluate Math r
 });
 
 for (const expression of [
-  "Math.sin(a[i])",
-  "Math.pow(a[i],2)",
   "Math.hypot(a[i],1)",
   'Math["sqrt"](a[i])',
   "Math.sqrt(...a)",
@@ -389,6 +397,33 @@ test("single-function standalone source enables Math without explicit compiler o
   kernel.run(a);
   same(a, [2, 3]);
   assert.equal(kernel.diagnostics.wasmCalls, 1);
+});
+
+test("standalone native Math package relocates with exact results and immutable fallback imports", async (t) => {
+  const source = `function phase(x){return Math.sin(x)+Math.cos(x);}
+    export function update(a,time){for(let i=0;i<a.length;i++)
+      a[i]=phase(a[i]+time)+Math.atan2(a[i],2)+Math.pow(a[i],3);}`;
+  const {module,result} = await packageOf(t, source, ["f64[]", "f64"]);
+  const kernel = module.createKernel(), a = new Float64Array([0,-0,0.5,-0.5,1e20,Infinity,NaN]);
+  const expected = a.slice();
+  assert.deepEqual(result.kernel.mathImports, ["atan2", "cos", "pow", "sin"]);
+  assert.ok(Object.isFrozen(kernel.manifest.mathImports));
+  module.retained(expected, 1 / 60);kernel.run(a, 1 / 60);same(a, expected);
+  assert.equal(kernel.diagnostics.wasmCalls, 1);
+  const native = globalThis.WebAssembly;
+  let fallback;
+  try {
+    globalThis.WebAssembly = undefined;
+    fallback = module.createKernel();
+  } finally {
+    globalThis.WebAssembly = native;
+  }
+  assert.deepEqual(fallback.manifest.mathImports, result.kernel.mathImports);
+  assert.ok(Object.isFrozen(fallback.manifest.mathImports));
+  assert.throws(() => fallback.manifest.mathImports.push("random"), TypeError);
+  const plain = [0,-0,0.5,-0.5], reference = plain.slice();
+  module.retained(reference, 0.1);fallback.run(plain, 0.1);same(plain, reference);
+  assert.equal(fallback.diagnostics.fallbackCalls, 1);
 });
 
 test("no-Wasm standalone fallback exposes frozen intrinsic metadata and original exceptions", async (t) => {

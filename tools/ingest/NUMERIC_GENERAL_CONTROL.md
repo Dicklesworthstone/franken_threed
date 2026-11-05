@@ -1,7 +1,7 @@
 # Budgeted general numeric control (ABI v8)
 
 The numeric compiler can now lower `for`, `while`, `do…while`, and typed-array
-`for…of` loops in closed numeric functions to import-free Wasm. This includes
+`for…of` loops in closed numeric functions to Wasm. This includes
 nonzero and reverse ranges, dynamic steps, mutable induction variables, loops
 inside branches, mixed nested loops, scalar-only functions, and zero-argument
 numeric functions.
@@ -80,6 +80,48 @@ storage contract. Explicit runtime/package callers keep their existing strict
 alias default. Mixed-type writable overlaps retain JavaScript. Shared,
 resizable, detached, proxy, and unsupported typed-array inputs remain subject
 to the existing guards; no new coercions or user getters are introduced.
+
+## Native Math inside numeric loops
+
+Closed loops and their helpers can use `Math.sin`, `cos`, `tan`, `asin`, `acos`,
+`atan`, `atan2`, `exp`, `log`, and `pow`. These operations call the host's captured
+native Math functions from Wasm, preserving that host's Number results, including
+NaN, infinities and signed zero. Unary methods take exactly one numeric argument;
+`atan2` and `pow` take exactly two. Arguments retain their source evaluation order.
+Existing directly lowered operations such as `sqrt`, `abs`, `round` and `min`
+continue to execute inside Wasm without a host call.
+
+For example, automatic numeric specialization can compile the entire loop and
+its numeric state in this ordinary application function:
+
+```javascript
+export function updateWave(out, time) {
+  for (let i = 0; i < out.length; i++) {
+    out[i] = Math.sin(i * 0.01 + time) * Math.cos(time * 0.5);
+  }
+}
+```
+
+The existing application build option `--specialize-numeric` enables discovery;
+explicit `compileNumericKernel` calls use `allowMath: true`. Direct runtime users
+provide the existing `resolveMath: () => Math` lexical-binding proof. Application
+and generated package dispatch supply that proof and retain the original source
+when guards fail.
+
+Artifacts with native calls declare a sorted `mathImports` list, also included
+in specialization reports. The runtime admits only matching `f3d.math` function
+imports and binds them to native methods captured at runtime bootstrap. It checks
+the original Math binding and method data descriptors before execution and again
+after packing or memory growth. Replaced methods, getters and shadowed bindings
+retain the original JavaScript behavior without speculative getter reads. Older
+artifacts without native calls retain their import-free format and bytes.
+
+The host Math boundary is intentional: these functions use the host's exact
+implementation rather than a new approximation. Loop control, array accesses,
+helper bodies and arithmetic run in Wasm; each listed Math operation still calls
+the native JavaScript Math function. This has no measured-speedup claim. Arbitrary
+host calls, `Math.random`, variadic `Math.hypot`, computed method access, optional
+calls, spread arguments and coercing operands remain outside this profile.
 
 ## Typed-array value iteration
 

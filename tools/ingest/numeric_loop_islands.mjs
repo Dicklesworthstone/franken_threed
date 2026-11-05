@@ -391,6 +391,7 @@ export function planNumericLoopIslands(source, {
         ({parameterTypes:v.parameterTypes,wasmBytes:v.bytes.length}))],
       ...(artifact.manifest.typedArrayMethods ? {typedArrayMethods:[...artifact.manifest.typedArrayMethods]} : {}),
       ...(artifact.manifest.mathIntrinsics ? {mathIntrinsics:[...artifact.manifest.mathIntrinsics]} : {}),
+      ...(artifact.manifest.mathImports ? {mathImports:[...artifact.manifest.mathImports]} : {}),
       ...(artifact.helpers.length ? {
         helperBindingSemantics:'immutable-module-declarations',
         helpers:artifact.helpers.map(helper => ({...helper, sourceSpan:span(helperDeclarations.get(helper.name))})),

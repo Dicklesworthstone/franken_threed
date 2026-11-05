@@ -5,7 +5,7 @@
  * and fixed-stride Float32Array/Float64Array updates, including conditionals.
  * Scalar accumulators and a final numeric return execute in source iteration order.
  * Closed numeric helpers execute as private Wasm functions. Checked helpers may
- * take typed arrays, preserving their own view bounds and shared transaction. No host calls,
+ * take typed arrays, preserving their own view bounds and shared transaction. No arbitrary host calls,
  * escapes, implicit numeric conversions or arithmetic reassociation.
  * Number bitwise operators use explicit modulo-2^32 lowering, returning f64.
  * Runtime shape/ownership guards live in numeric_kernel_runtime.mjs. This narrow
@@ -17,7 +17,7 @@ import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArr
 import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
-import { createMathIntrinsicCompiler } from './numeric_intrinsics.mjs';
+import { createMathIntrinsicCompiler, MATH_IMPORT_ARITIES } from './numeric_intrinsics.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
 
@@ -75,7 +75,8 @@ function member(node, object, property, computed) {
 }
 
 /**
- * Compile a single source function into a standalone, import-free Wasm module.
+ * Compile a single source function into a standalone Wasm module. Only admitted
+ * native Math operations may introduce fixed-signature, guarded host imports.
  * parameterTypes is positional: 'f32[]', 'f64[]' or scalar 'f64'. A matching
  * manifest is embedded in the module, so runtime ABI metadata cannot drift from
  * a separately loaded JSON sidecar. The returned bytes are deterministic.
@@ -494,7 +495,8 @@ export function compileNumericKernel(source, {
       fail(`Unresolved or non-scalar binding ${node.name}`, node);
     }
     // The bound view's intrinsic length is already guarded and cannot change
-    // during an import-free call over fixed, unshared buffers.
+    // during a closed call over fixed, unshared buffers. Retained native Math
+    // imports accept only Numbers and cannot invoke application code.
     if (pipeline || checkedIndexing) {
       const name = node.object?.name;
       const array = helperArray(node.object);
@@ -933,6 +935,7 @@ export function compileNumericKernel(source, {
   const extentAbi = orderedAbi || prelude.length > 0 || minimumLengths.size > 0;
 
   const mathIntrinsics = intrinsics.requirements();
+  const mathImports = intrinsics.imports();
   const integerAbi = checkedIndexing && [...params.values()].some(param =>
     Object.hasOwn(INTEGER_ARRAY_LAYOUTS, param.type) &&
     (writes.has(param.name) || !['u16[]', 'u32[]'].includes(param.type)));
@@ -971,6 +974,7 @@ export function compileNumericKernel(source, {
     // Older hosts reject this semantic contract, rather than skipping guards.
     numericSemantics: control?.methods.size ? 'f64-operator-order+guarded-array-methods-v1' : mathIntrinsics.length ? 'f64-operator-order+guarded-math-v1' : 'f64-operator-order',
     ...(mathIntrinsics.length ? { mathIntrinsics } : {}),
+    ...(mathImports.length ? { mathImports } : {}),
     ...(control?.methods.size ? { typedArrayMethods: [...control.methods].sort() } : {}),
     ...(integerAbi ? { integerSemantics: 'ecmascript-integer-elements-v1' } : {}),
     automaticRouteAdmission: false,
@@ -978,19 +982,23 @@ export function compileNumericKernel(source, {
   const types = [...parameterTypes.map(type => type === 'f64' ? F64 : I32), ...Array(bounds.size).fill(I32)];
   const locals = generalControl ? [] : [[...u32(loops.length), I32]];
   if (temporaryCount) locals.push([...u32(temporaryCount), F64]);
-  const body = [
+  const body = intrinsics.link([
     ...vector(locals),
     ...(sharedLoopBudget ? [...number(0), 0x24, 0] : []),
     ...referenceInitializers, ...execution, ...result, 0x0b,
-  ];
+  ]);
   const helperCode = helperCompiler.finish();
   const wasm = new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])], ...helperCode.types])),
+    ...section(1, vector([[0x60, ...vector(types.map(type => [type])), ...(resultNode ? [1, F64] : [0])],
+      ...helperCode.types, ...mathImports.map(name => [0x60, ...u32(MATH_IMPORT_ARITIES[name]),
+        ...Array(MATH_IMPORT_ARITIES[name]).fill(F64), 1, F64])])),
+    ...(mathImports.length ? section(2, vector(mathImports.map((name, index) =>
+      [...text('f3d.math'), ...text(name), 0, ...u32(1 + helperCode.types.length + index)]))) : []),
     ...section(3, vector([[0], ...helperCode.functions])),
     ...section(5, vector([[1, ...u32(1), ...u32(maxMemoryPages)]])),
     ...(sharedLoopBudget ? section(6, vector([[F64, 1, ...number(0), 0x0b]])) : []),
-    ...section(7, vector([[...text('run'), 0, 0], [...text('memory'), 2, 0]])),
+    ...section(7, vector([[...text('run'), 0, ...u32(mathImports.length)], [...text('memory'), 2, 0]])),
     ...section(10, vector([[...u32(body.length), ...body], ...helperCode.bodies])),
     ...section(0, [...text(NUMERIC_KERNEL_SECTION), ...new TextEncoder().encode(JSON.stringify(manifest))]),
   ]);

@@ -476,6 +476,8 @@ export function specializeNumericModule(
       item.typedArrayMethods = [...artifact.manifest.typedArrayMethods];
     if (artifact.manifest.mathIntrinsics)
       item.mathIntrinsics = [...artifact.manifest.mathIntrinsics];
+    if (artifact.manifest.mathImports)
+      item.mathImports = [...artifact.manifest.mathImports];
     if (artifact.manifest.version === 8) {
       item.controlSemantics = artifact.manifest.controlSemantics;
       item.maxIterations = artifact.manifest.maxIterations;

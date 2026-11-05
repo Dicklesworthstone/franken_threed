@@ -70,6 +70,66 @@ function samples() {
 }
 const inputs = samples();
 
+for (const name of ["sin", "cos", "tan", "asin", "acos", "atan", "exp", "log"])
+  for (const ArrayType of [Float32Array, Float64Array]) {
+    test(`native Math.${name}: exact host Number results and storage rounding in ${ArrayType.name}`, () => {
+      const source = `function update(out, input) { for(let i=0;i<out.length;i++) out[i]=Math.${name}(input[i]); }`;
+      const artifact = compile(source, [type(ArrayType), type(ArrayType)]), kernel = host(artifact);
+      assert.deepEqual(WebAssembly.Module.imports(new WebAssembly.Module(artifact.wasm)),
+        [{module: "f3d.math", name, kind: "function"}]);
+      assert.deepEqual(artifact.manifest.mathImports, [name]);
+      assert.ok(Object.isFrozen(artifact.manifest.mathImports));
+      const input = new ArrayType(inputs.slice(0, 2048));
+      for (const count of [0, 1, input.length]) {
+        const actual = new ArrayType(count), expected = new ArrayType(count);
+        original(source)(expected, input);
+        kernel.run(actual, input);
+        same(actual, expected);
+      }
+      assert.equal(kernel.diagnostics.wasmCalls, 3);
+      assert.equal(kernel.diagnostics.fallbackCalls, 0);
+    });
+  }
+
+for (const name of ["atan2", "pow"])
+  for (const ArrayType of [Float32Array, Float64Array]) {
+    test(`native Math.${name}: signed zero, infinities, NaN and domain edges in ${ArrayType.name}`, () => {
+      const left = new ArrayType(edges.flatMap(a => edges.map(() => a)));
+      const right = new ArrayType(edges.flatMap(() => edges));
+      const source = `function update(out,a,b){for(let i=0;i<out.length;i++)out[i]=Math.${name}(a[i],b[i]);}`;
+      const artifact = compile(source, [type(ArrayType), type(ArrayType), type(ArrayType)]);
+      const kernel = host(artifact), actual = new ArrayType(left.length), expected = new ArrayType(left.length);
+      original(source)(expected, left, right);
+      kernel.run(actual, left, right);
+      same(actual, expected);
+      assert.deepEqual(artifact.manifest.mathImports, [name]);
+      assert.equal(kernel.diagnostics.wasmCalls, 1);
+    });
+  }
+
+test("native Math calls link nested helpers discovered before imports and evaluate argument effects in order", () => {
+  const helpers = new Map([
+    ["next", "function next(state){state[0]+=1;return state[0];}"],
+    ["wave", "function wave(x){return Math.sin(x)+shift(x);}"],
+    ["shift", "function shift(x){return Math.cos(x);}"],
+  ]);
+  const source = `function update(out,state){for(let i=0;i<out.length;i++)
+    out[i]=Math.atan2(next(state),next(state))+Math.pow(next(state),next(state))+wave(i);}`;
+  const artifact = compile(source, ["f64[]", "f64[]"], {helperSources: helpers, generalControl: true});
+  assert.deepEqual(artifact.manifest.mathImports, ["atan2", "cos", "pow", "sin"]);
+  assert.deepEqual(WebAssembly.Module.imports(new WebAssembly.Module(artifact.wasm)),
+    artifact.manifest.mathImports.map(name => ({module: "f3d.math", name, kind: "function"})));
+  assert.deepEqual(compile(source, ["f64[]", "f64[]"], {helperSources: helpers, generalControl: true}).wasm, artifact.wasm);
+  const kernel = host(artifact), actual = new Float64Array(4), expected = new Float64Array(4);
+  const state = new Float64Array([0]), reference = state.slice();
+  Function([...helpers.values()].join("\n") + `\nreturn (${source});`)()(expected, reference);
+  kernel.run(actual, state);
+  same(actual, expected);
+  same(state, reference);
+  assert.equal(state[0], 16);
+  assert.equal(kernel.diagnostics.wasmCalls, 1);
+});
+
 for (const name of unary)
   for (const ArrayType of [Float32Array, Float64Array]) {
     test(`${name}: Number parity over IEEE edge cases and 25,000 bit patterns in ${ArrayType.name}`, () => {
@@ -435,9 +495,13 @@ test("disabled Math compilation remains explicit and metadata is immutable", () 
 });
 
 const rejected = [
-  "Math.sin(a[i])",
-  "Math.cos(a[i])",
-  "Math.pow(a[i],2)",
+  "Math.sin()",
+  "Math.cos(a[i],1)",
+  "Math.pow(a[i])",
+  "Math.atan2(a[i],1,2)",
+  "Math.sin(...a)",
+  'Math["sin"](a[i])',
+  'Math.sin("1")',
   "Math.random()",
   "Math.hypot(a[i],1)",
   'Math["sqrt"](a[i])',
