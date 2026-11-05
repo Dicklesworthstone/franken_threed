@@ -22,6 +22,25 @@ function fixture(files) {
   return root;
 }
 
+async function startServeCommand(t, args) {
+  const child = spawn(process.execPath, [cli, "serve", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+  t.after(async () => { if (child.exitCode === null) child.kill("SIGTERM"); await exited; });
+  let stdout = "", stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const url = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Server did not start: ${stderr}`)), 10000);
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("exit", () => { clearTimeout(timer); reject(new Error(`Server exited: ${stderr}`)); });
+    child.stdout.on("data", chunk => {
+      stdout += chunk;
+      const match = /Serving application at (http:\/\/\S+)/.exec(stdout);
+      if (match) { clearTimeout(timer); resolve(match[1]); }
+    });
+  });
+  return { url, child, exited, stderr: () => stderr };
+}
+
 test("emitted applications serve their exact HTML, chunks and streaming Wasm after source relocation", async t => {
   const root = fixture({
     "source/index.html": '<script type="module" src="./main.mjs"></script>',
@@ -65,6 +84,56 @@ test("named HTML entries retain navigation queries and encoded paths without cha
   assert.equal(fs.readFileSync(path.join(root, "scene #.html"), "utf8"), html);
 });
 
+test("explicit document roots serve nested selected entries and their origin-relative resources", async t => {
+  const html = '<script type="module" src="/assets/main.mjs?revision=2"></script><link rel="stylesheet" href="/assets/style.css">';
+  const root = fixture({
+    "dist/index.html": "different root page",
+    "dist/pages #/scene #.html": html,
+    "dist/assets/main.mjs": "export const answer = 42;",
+    "dist/assets/style.css": "body { color: green; }",
+    "dist/assets/answer.wasm": wasm,
+  });
+  const documentRoot = path.join(root, "dist"), entry = path.join(documentRoot, "pages #/scene #.html");
+  const ordinary = await startApplicationServer(entry, { port: 0 });
+  t.after(() => ordinary.close());
+  assert.equal(ordinary.root, path.dirname(entry));
+  assert.equal((await fetch(new URL("/assets/main.mjs", ordinary.url))).status, 404);
+  for (const target of [entry, path.dirname(entry)]) {
+    const running = await startApplicationServer(target, { port: 0, documentRoot });
+    t.after(() => running.close());
+    assert.equal(running.root, documentRoot);
+    assert.equal(new URL(running.url).pathname, "/pages%20%23/scene%20%23.html");
+    assert.equal(await (await fetch(running.url)).text(), html);
+    const navigation = await fetch(new URL("/?backend=webgl&count=1000", running.url));
+    assert.equal(navigation.url, running.url + "?backend=webgl&count=1000");
+    assert.equal(await navigation.text(), html);
+    assert.equal(await (await fetch(new URL("/assets/main.mjs?revision=2", running.url))).text(), "export const answer = 42;");
+    assert.equal(await (await fetch(new URL("/assets/style.css", running.url))).text(), "body { color: green; }");
+    const { instance } = await WebAssembly.instantiateStreaming(fetch(new URL("/assets/answer.wasm", running.url)));
+    assert.equal(instance.exports.answer(), 42);
+    assert.equal(await (await fetch(new URL("/index.html", running.url))).text(), "different root page");
+  }
+});
+
+test("declared document roots check selected entries and physical containment before listening", async t => {
+  const root = fixture({ "dist/pages/demo.html": "selected page", "private.html": "outside", "outside/index.html": "outside directory" });
+  const documentRoot = path.join(root, "dist"), entry = path.join(documentRoot, "pages/demo.html");
+  fs.symlinkSync(path.join(root, "private.html"), path.join(documentRoot, "pages/escape.html"));
+  fs.symlinkSync(path.join(root, "outside"), path.join(documentRoot, "escape"));
+  for (const target of [path.join(root, "private.html"), path.join(documentRoot, "pages/escape.html"), path.join(documentRoot, "escape")]) {
+    await assert.rejects(startApplicationServer(target, { port: 0, documentRoot }), { code: "F3D_DOCUMENT_ROOT_ESCAPE" });
+  }
+  await assert.rejects(startApplicationServer(entry, { port: 0, documentRoot: entry }), { code: "F3D_DOCUMENT_ROOT" });
+  fs.symlinkSync(documentRoot, path.join(root, "alias"));
+  const running = await startApplicationServer(path.join(root, "alias/pages/demo.html"), { port: 0, documentRoot: path.join(root, "alias") });
+  t.after(() => running.close());
+  assert.equal(running.root, documentRoot);
+  assert.equal(new URL(running.url).pathname, "/pages/demo.html");
+  assert.equal(await (await fetch(running.url)).text(), "selected page");
+  assert.equal((await fetch(new URL("/pages/escape.html", running.url))).status, 403);
+  assert.equal((await fetch(new URL("/escape/index.html", running.url))).status, 403);
+});
+
 test("application serving stays within its output directory and survives malformed requests", async t => {
   const root = fixture({ "dist/index.html": "application", "private.txt": "outside" });
   fs.symlinkSync(path.join(root, "private.txt"), path.join(root, "dist/escape.txt"));
@@ -88,28 +157,25 @@ test("public serve command launches a standalone file, reports its URL and close
   const root = fixture({ "source/index.html": '<script type="module" src="./main.mjs"></script>', "source/main.mjs": "export const answer = 42;" });
   const packed = path.join(root, "standalone.html");
   packHtml(path.join(root, "source/index.html"), packed);
-  const child = spawn(process.execPath, [cli, "serve", packed, "--port", "0", "--isolate"], { stdio: ["ignore", "pipe", "pipe"] });
-  const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
-  t.after(async () => { if (child.exitCode === null) child.kill("SIGTERM"); await exited; });
-  let stdout = "", stderr = "";
-  child.stderr.on("data", chunk => { stderr += chunk; });
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Server did not start: ${stderr}`)), 10000);
-    child.once("error", error => { clearTimeout(timer); reject(error); });
-    child.once("exit", () => { clearTimeout(timer); reject(new Error(`Server exited: ${stderr}`)); });
-    child.stdout.on("data", chunk => {
-      stdout += chunk;
-      const match = /Serving application at (http:\/\/\S+)/.exec(stdout);
-      if (match) { clearTimeout(timer); resolve(match[1]); }
-    });
-  });
+  const { url, child, exited, stderr } = await startServeCommand(t, [packed, "--port", "0", "--isolate"]);
   assert.equal(await (await fetch(url)).text(), fs.readFileSync(packed, "utf8"));
   child.kill("SIGTERM");
   assert.deepEqual(await exited, { code: 0, signal: null });
-  assert.equal(stderr, "");
-  for (const args of [["serve"], ["serve", root, "--port", "no"], ["serve", root, "--port", "65536"], ["serve", root, "--unknown"]]) {
+  assert.equal(stderr(), "");
+  for (const args of [["serve"], ["serve", root, "--port", "no"], ["serve", root, "--port", "65536"], ["serve", root, "--document-root"], ["serve", root, "--document-root", "--isolate"], ["serve", root, "--unknown"]]) {
     const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8" });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Serve failed:/);
   }
+});
+
+test("public serve command accepts a document root for a nested HTML route", async t => {
+  const root = fixture({ "pages/demo.html": '<script src="/assets/main.js"></script>', "assets/main.js": "globalThis.answer = 42;" });
+  const { url, child, exited, stderr } = await startServeCommand(t, [path.join(root, "pages/demo.html"), "--document-root", root, "--port", "0"]);
+  assert.equal(new URL(url).pathname, "/pages/demo.html");
+  assert.equal(await (await fetch(url)).text(), '<script src="/assets/main.js"></script>');
+  assert.equal(await (await fetch(new URL("/assets/main.js", url))).text(), "globalThis.answer = 42;");
+  child.kill("SIGTERM");
+  assert.deepEqual(await exited, { code: 0, signal: null });
+  assert.equal(stderr(), "");
 });
