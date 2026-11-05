@@ -113,6 +113,54 @@ export const dispose=()=>renderer.dispose();
   } finally { emitted?.dispose(); globalThis.document=previous; }
 });
 
+test('private renderer toolkit and state records route through an emitted application', async () => {
+  const a=app(`import * as THREE from 'three/webgpu';
+const toolkit={Renderer:THREE.WebGPURenderer};
+const alias=toolkit;
+const {Renderer}=alias;
+const state={renderer:new Renderer({antialias:false})};
+const view=state;
+const events=[];
+function width(){events.push('width');return 40;}
+view.renderer.setSize(width(),24,false);
+export const native=view.renderer.isF3DRenderer===true;
+export const flags=[view.renderer instanceof Renderer,view.renderer.isWebGPURenderer];
+export const size=view.renderer.getSize(new THREE.Vector2()).toArray();
+export const observed=events;
+export const dispose=()=>view.renderer.dispose();
+`);
+  const result=await buildApplication(a.entry,a.out,{routeWebGPURenderer:true});
+  const referenceOut=path.join(a.dir,'reference');
+  const reference=await buildApplication(a.entry,referenceOut);
+  assert.equal(result.rendererRoute.routed,true);
+  assert.deepEqual(result.rendererRoute.decisions.map(site=>site.route),['general-webgpu']);
+  assert.ok(result.chunks.some(chunk=>chunk.fileName.startsWith('f3d-renderer-runtime-')));
+  const previous=globalThis.document;
+  globalThis.document={createElementNS:()=>({width:300,height:150,style:{}})};
+  let emitted;
+  try {
+    const original=await import(pathToFileURL(path.join(referenceOut,reference.entryFiles[0])).href);
+    emitted=await import(pathToFileURL(path.join(a.out,result.entryFiles[0])).href);
+    assert.equal(original.native,false); assert.equal(emitted.native,true);
+    assert.deepEqual(emitted.flags,original.flags);
+    assert.deepEqual(emitted.flags,[true,true]);
+    assert.deepEqual(emitted.size,original.size); assert.deepEqual(emitted.size,[40,24]);
+    assert.deepEqual(emitted.observed,original.observed); assert.deepEqual(emitted.observed,['width']);
+  } finally { await emitted?.dispose(); globalThis.document=previous; }
+});
+
+test('publishing a renderer state record keeps its genuine source owner in the built application', async () => {
+  const a=app(`import * as THREE from 'three/webgpu';
+const state={renderer:new THREE.WebGPURenderer()};
+const alias=state;
+export const pluginState=alias;
+`);
+  const result=await buildApplication(a.entry,a.out,{routeWebGPURenderer:true});
+  assert.equal(result.rendererRoute.routed,false);
+  assert.ok(result.rendererRoute.decisions.some(site=>site.route==='exact-backend'));
+  assert.equal(result.chunks.some(chunk=>chunk.fileName.startsWith('f3d-renderer-runtime-')),false);
+});
+
 for (const inline of [false, true]) test(`mixed source-selected WebGL and native construction preserve option effects with inline=${inline}`, async () => {
   const body = `import * as THREE from 'three/webgpu';
 import {WebGPURenderer as Renderer} from 'three/webgpu';

@@ -190,7 +190,7 @@ test("renderer and canvas aliases retain their native owner at opaque observatio
     "const canvas = renderer.domElement; plugin(canvas);",
     "const { domElement: canvas } = renderer; plugin(canvas);",
     "const items = [renderer];",
-    "const holder = { renderer };",
+    "const holder = { renderer }; plugin(holder);",
     "const copied = { ...renderer };",
     "export const create = () => renderer;",
     "function expose() { return renderer; }",
@@ -287,6 +287,68 @@ test("closed render calls, lexical aliases and ordinary DOM attachment remain el
   }
 });
 
+test("closed local records preserve renderer, constructor and namespace ownership", () => {
+  for (const source of [
+    "const toolkit={Renderer:THREE.WebGPURenderer}; const alias=toolkit; const {Renderer}=alias; const state={renderer:new Renderer()}; state.renderer.render(scene,camera);",
+    "const toolkit={Renderer:THREE.WebGPURenderer}; const renderer=new toolkit['Renderer'](); renderer.render(scene,camera);",
+    "const imports={engine:THREE}; const {engine}=imports; const renderer=new engine.WebGPURenderer(); renderer.render(scene,camera);",
+    "const renderer=new THREE.WebGPURenderer(); const state={renderer}; const alias=state; const {renderer:draw}=alias; draw.render(scene,camera);",
+    "const renderer=new THREE.WebGPURenderer(); const view={canvas:renderer.domElement}; document.body.appendChild(view.canvas);",
+    "const host={canvas:document.createElement('canvas')}; const renderer=new THREE.WebGPURenderer({canvas:host.canvas}); renderer.render(scene,camera);",
+    "function make(){const state={renderer:new THREE.WebGPURenderer()};return state.renderer;} make().render(scene,camera);",
+    "const toolkit={Renderer:THREE.WebGPURenderer}; {const toolkit=ordinary; plugin(toolkit);} const renderer=new toolkit.Renderer(); renderer.render(scene,camera);",
+  ]) {
+    const result = analyzeModuleAst("import * as THREE from 'three/webgpu';\n" + source, moduleUrl);
+    assert.deepEqual(result.routingFacts.escapes, [], source);
+    assert.equal(result.rendererConstructionSites.length, 1, source);
+    assert.equal(result.rendererConstructionSites[0].constructorName, "WebGPURenderer", source);
+    assert.equal(decision(result).route, "general-webgpu", source);
+  }
+});
+
+test("local record ownership rejects escaped, changed, reflective and ambiguous uses", () => {
+  for (const use of [
+    "plugin(state);", "const alias=state; plugin(alias);", "export {state};", "export const alias=state;",
+    "function expose(){return state;}", "globalThis.state=state;", "const outer={state};", "const array=[state];",
+    "state[key].render(scene,camera);", "state[flag?'renderer':'other'];", "const {renderer:alias,...rest}=state;",
+    "const {renderer:alias=other}=state;", "const {[key]:alias}=state;", "const {...copy}=state;",
+    "state.renderer=other;", "const alias=state; alias.renderer=other;", "delete state.renderer;", "state.renderer++;",
+    "({value:state.renderer}=other);", "[state.renderer]=other;", "for(state.renderer of other){}",
+    "Object.defineProperty(state,'renderer',{get:plugin});", "Object.setPrototypeOf(state,plugin);",
+    "Reflect.get(state,'renderer');", "Object.keys(state);", "state.__proto__;", "state.constructor;",
+    "let alias=state;", "const alias=flag?state:other;", "const alias=state; alias=other;",
+    "plugin(state.renderer);", "state.renderer.backend.device;", "state.renderer.render=plugin;",
+    "eval('state.renderer=plugin');",
+  ]) {
+    const result = analyzeModuleAst("const renderer=new WebGPURenderer(); const state={renderer}; " + use, moduleUrl);
+    assert.equal(decision(result).route, "exact-backend", use);
+  }
+  for (const record of [
+    "{get renderer(){return renderer;}}", "{...{renderer}}", "{renderer,[key]:other}",
+    "{renderer,__proto__:null}", "{renderer,renderer:other}", "{renderer,method(){}}",
+  ]) {
+    const result = analyzeModuleAst("const renderer=new WebGPURenderer(); const state=" + record + ";", moduleUrl);
+    assert.equal(decision(result).route, "exact-backend", record);
+  }
+  const changed = analyzeModuleAst("import * as THREE from 'three/webgpu'; const toolkit={Renderer:THREE.WebGPURenderer};" +
+    "toolkit.Renderer.prototype.init=plugin; const renderer=new toolkit.Renderer();", moduleUrl);
+  assert.equal(decision(changed).route, "exact-backend");
+  for (const call of ['state.invoke();', 'state.invoke?.();', 'state.invoke`value`;']) {
+    const source = "const renderer=new WebGPURenderer(); function invoke(){plugin(this.renderer);} const state={renderer,invoke}; " + call;
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", call);
+  }
+  for (const canvas of ['host.canvas', 'canvas']) {
+    const source = "const element=document.createElement('canvas'); const host={canvas:element}; const {canvas}=host;" +
+      "plugin(element); const renderer=new WebGPURenderer({canvas:" + canvas + "});";
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", "earlier native canvas escape through " + canvas);
+  }
+  const cyclic = analyzeModuleAst("const renderer=new WebGPURenderer(); const first={renderer:second.renderer};" +
+    "const second={renderer:first.renderer}; first.renderer.render(scene,camera);", moduleUrl);
+  assert.equal(decision(cyclic).route, "exact-backend", "cyclic field provenance cannot establish ownership");
+  const unrelated = analyzeModuleAst("const renderer=new WebGPURenderer(); const config={count:1}; plugin(config); renderer.render(scene,camera);", moduleUrl);
+  assert.equal(decision(unrelated).route, "general-webgpu", "ordinary nonresource records do not become renderer escapes");
+});
+
 test("closed local factories retain renderer ownership through calls, returns and canvas parameters", () => {
   for (const source of [
     "function make() { return new WebGPURenderer(); } const renderer = make(); renderer.render(scene,camera);",
@@ -310,7 +372,7 @@ test("factory results remain resources at exports, opaque calls, containers, thr
   for (const use of [
     "plugin(make());", "const renderer=make(); plugin(renderer);", "export const renderer=make();",
     "export default make();", "const renderer=make(); renderer.getContext();", "const renderer=make(); plugin(renderer.domElement);",
-    "const renderer=make(); renderer.backend.device;", "throw make();", "const box={renderer:make()};",
+    "const renderer=make(); renderer.backend.device;", "throw make();", "const box={renderer:make()}; plugin(box);",
     "const list=[make()];", "const renderer=make(); renderer.render=plugin;",
     "function leak() { return make(); } export {leak};", "register(() => make());",
   ]) {

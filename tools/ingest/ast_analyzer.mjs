@@ -589,8 +589,9 @@ const OPAQUE_GL_METHODS = new Set([
 /**
  * A renderer's route must be chosen before an opaque consumer can observe it.
  * Track lexical aliases monotonically: reassignment cannot prove that an earlier
- * consumer lost its reference. Containers, unclosed returns and unknown calls
- * are escape boundaries, not invitations to guess what another component will do.
+ * consumer lost its reference. Private constant records may retain their own
+ * known fields; escaping containers, unclosed returns and unknown calls remain
+ * ownership boundaries, not invitations to guess another component's behavior.
  *
  * Imported consumers remain opaque unless the graph verified their source and
  * dependency contract. Even then their returned resource carriers remain in
@@ -700,11 +701,108 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
     return result;
   };
+  // A private plain record is a local alias table, not a published resource.
+  // Admit only own data fields and constant aliases whose EVERY use is a
+  // declared field read or simple destructuring. No heap/prototype simulation:
+  // mutation, reflection, dynamic keys, getters, spreads and escaping aliases
+  // keep the original container refusal. Stored values still reach the usual
+  // resource sinks after a field is selected.
+  const recordObjects = new Map(), recordSources = new Map(), recordBindings = new Map();
+  for (const node of nodes) {
+    if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" ||
+        parents.get(node)?.kind !== "const") continue;
+    recordSources.set(binding(node.id), node.init);
+    if (node.init?.type !== "ObjectExpression" || node.init.properties.length > 64 || recordObjects.size >= 64) continue;
+    const fields = new Map();
+    let plain = true;
+    for (const property of node.init.properties) {
+      const names = staticPropertyNames(property);
+      if (property.type !== "Property" || property.kind !== "init" || property.method || names?.length !== 1 ||
+          ["__proto__", "prototype", "constructor"].includes(names[0]) || fields.has(names[0])) { plain = false; break; }
+      fields.set(names[0], property.value);
+    }
+    if (plain) recordObjects.set(node.init, {fields, closed: true});
+  }
+  const resolveRecord = (cell, depth = 0) => {
+    if (recordBindings.has(cell)) return recordBindings.get(cell);
+    if (depth > 64) return null;
+    recordBindings.set(cell, null); // Break alias cycles without evaluating them.
+    const source = recordSources.get(cell);
+    const record = source?.type === "Identifier" ? resolveRecord(binding(source), depth + 1) : recordObjects.get(source);
+    recordBindings.set(cell, record ?? null);
+    return record;
+  };
+  for (const cell of recordSources.keys()) resolveRecord(cell);
+  const recordOf = (node, closed = true) => {
+    const record = node?.type === "Identifier" ? recordBindings.get(binding(node)) : recordObjects.get(node);
+    return record && (!closed || record.closed) ? record : null;
+  };
+  const recordSelections = (pattern, source, closed = true) => {
+    const record = recordOf(source, closed);
+    if (!record || pattern?.type !== "ObjectPattern") return null;
+    const selected = [];
+    for (const property of pattern.properties) {
+      const names = staticPropertyNames(property);
+      if (property.type !== "Property" || property.value.type !== "Identifier" ||
+          names?.length !== 1 || !record.fields.has(names[0])) return null;
+      selected.push([property.value, record.fields.get(names[0])]);
+    }
+    return selected;
+  };
+  const recordWrite = node => {
+    for (let owner = parents.get(node); owner; node = owner, owner = parents.get(node)) {
+      if (owner.type === "AssignmentExpression") return owner.left === node;
+      if (owner.type === "ForInStatement" || owner.type === "ForOfStatement") return owner.left === node;
+      if (owner.type === "UpdateExpression" || owner.type === "UnaryExpression" && owner.operator === "delete") return true;
+      if (owner.type === "Property" && parents.get(owner)?.type === "ObjectPattern" && owner.value === node ||
+          owner.type === "ObjectPattern" || owner.type === "ArrayPattern" || owner.type === "RestElement" ||
+          owner.type === "AssignmentPattern" && owner.left === node) continue;
+      return false;
+    }
+    return false;
+  };
+  for (const node of nodes) {
+    if (node.type === "ExportNamedDeclaration") {
+      for (const specifier of node.specifiers) {
+        const record = recordOf(specifier.local, false);
+        if (record) record.closed = false;
+      }
+      for (const declaration of node.declaration?.declarations ?? []) {
+        const record = recordOf(declaration.id, false);
+        if (record) record.closed = false;
+      }
+    }
+    if (node.type !== "Identifier") continue;
+    const record = recordOf(node, false);
+    if (!record) continue;
+    const parent = parents.get(node);
+    if (parent?.type === "VariableDeclarator" && parents.get(parent)?.kind === "const") {
+      if (parent.id === node || parent.init === node &&
+          (recordOf(parent.id, false) === record || recordSelections(parent.id, node, false))) continue;
+    }
+    if (parent?.type === "MemberExpression" && parent.object === node) {
+      const names = staticPropertyNames(parent), owner = parents.get(parent);
+      // A method/tag call publishes the record as `this`, even when the
+      // function came from another lexical binding. A constructor call does not.
+      const receiver = owner?.type === "CallExpression" && owner.callee === parent ||
+        owner?.type === "TaggedTemplateExpression" && owner.tag === parent;
+      if (!recordWrite(parent) && !receiver && names?.length === 1 && record.fields.has(names[0])) continue;
+    }
+    record.closed = false;
+  }
+  const recordField = node => {
+    if (node?.type !== "MemberExpression") return null;
+    const record = recordOf(node.object), names = staticPropertyNames(node);
+    return record && names?.length === 1 ? record.fields.get(names[0]) ?? null : null;
+  };
   let values = new WeakMap();
+  const pendingValues = new WeakSet();
   const kind = (node, depth = 0) => {
     if (!node) return 0;
     if (depth > 64) { report(node, "alias-expression-limit"); return RESOURCE; }
     if (values.has(node)) return values.get(node);
+    if (pendingValues.has(node)) { report(node, "alias-expression-cycle"); return RESOURCE; }
+    pendingValues.add(node);
     const child = value => kind(value, depth + 1);
     let value = 0;
     switch (node.type) {
@@ -720,7 +818,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           (constructor & GPGPU_CTOR ? GPGPU : 0);
         break;
       }
-      case "MemberExpression": value = propertyKind(child(node.object), staticPropertyNames(node)); break;
+      case "MemberExpression": {
+        const field = recordField(node);
+        value = field ? child(field) : propertyKind(child(node.object), staticPropertyNames(node));
+        break;
+      }
       case "ChainExpression": case "AwaitExpression": value = child(node.expression ?? node.argument); break;
       case "SequenceExpression": value = child(node.expressions.at(-1)); break;
       case "ConditionalExpression": value = child(node.consequent) | child(node.alternate); break;
@@ -743,6 +845,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         break;
       }
     }
+    pendingValues.delete(node);
     values.set(node, value);
     return value;
   };
@@ -752,9 +855,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     const cell = binding(node), next = cell.kind | value;
     if (next !== cell.kind) { cell.kind = next; changed = true; }
   };
-  const assign = (pattern, value) => {
+  const assign = (pattern, value, source) => {
     if (pattern.type === "Identifier") mark(pattern, value);
     else if (pattern.type === "ObjectPattern") {
+      const selected = recordSelections(pattern, source);
+      if (selected) { for (const [target, field] of selected) mark(target, kind(field)); return; }
       for (const property of pattern.properties) {
         if (property.type === "Property" && property.value.type === "Identifier")
           mark(property.value, propertyKind(value, staticPropertyNames(property)));
@@ -884,7 +989,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (!node) return;
     if (depth > 64) { report(node, "canvas-alias-limit"); return; }
     const visit = value => markCanvas(value, depth + 1);
-    if (node.type === "Identifier") mark(node, CANVAS);
+    const field = recordField(node);
+    if (field) visit(field);
+    else if (node.type === "Identifier") mark(node, CANVAS);
     else if (node.type === "SequenceExpression") visit(node.expressions.at(-1));
     else if (node.type === "ConditionalExpression") { visit(node.consequent); visit(node.alternate); }
     else if (node.type === "LogicalExpression") { visit(node.left); visit(node.right); }
@@ -900,22 +1007,24 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     values = new WeakMap();
     for (const node of nodes) {
       if (node.type === "VariableDeclarator") {
-        assign(node.id, kind(node.init));
+        assign(node.id, kind(node.init), node.init);
         if (kind(node.id) & CANVAS) markCanvas(node.init);
+        for (const [target, field] of recordSelections(node.id, node.init) ?? [])
+          if (kind(target) & CANVAS) markCanvas(field);
       } else if (node.type === "AssignmentExpression") {
-        assign(node.left, kind(node.right));
+        assign(node.left, kind(node.right), node.right);
         if (kind(node.left) & CANVAS) markCanvas(node.right);
       }
       else if (node.type === "NewExpression" && kind(node.callee) & CONSTRUCTOR) {
         const canvas = sourceOptionValue(node.arguments[0], "canvas");
-        if (canvas?.type === "Identifier") mark(canvas, CANVAS);
+        markCanvas(canvas);
         if (node.callee.type === "MemberExpression" && node.callee.object.type === "Identifier")
           mark(node.callee.object, NAMESPACE);
       } else if (node.type === "NewExpression" && kind(node.callee) & CONTROL_CONSTRUCTORS) {
-        mark(node.arguments[1], CANVAS);
+        markCanvas(node.arguments[1]);
       } else if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
           kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
-        mark(node.arguments[0], CANVAS);
+        markCanvas(node.arguments[0]);
       }
       const helper = localHelper(node);
       if (helper) for (let index = 0; index < helper.params.length; index++) {
@@ -944,10 +1053,13 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     const target = node.type === "VariableDeclarator" ? node.id :
       node.type === "AssignmentExpression" ? node.left : null;
     const source = node.type === "VariableDeclarator" ? node.init : node.right;
-    if (target?.type !== "Identifier" || !source) continue;
-    const cell = binding(target);
-    if (!origins.has(cell)) origins.set(cell, []);
-    origins.get(cell).push(source);
+    if (!source) continue;
+    const selected = target?.type === "Identifier" ? [[target, source]] : recordSelections(target, source) ?? [];
+    for (const [target, source] of selected) {
+      const cell = binding(target);
+      if (!origins.has(cell)) origins.set(cell, []);
+      origins.get(cell).push(source);
+    }
   }
   for (const helper of closedHelpers) for (const call of helperCalls.get(helper)) {
     for (let index = 0; index < helper.params.length; index++) {
@@ -961,6 +1073,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const closedConsumerValue = (node, expected, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = (value, role = expected) => closedConsumerValue(value, role, visiting, depth + 1);
+    const field = recordField(node);
+    if (field) return visit(field);
     if (node.type === "CallExpression" && closedHelpers.has(localHelper(node))) {
       const results = helperReturns.get(localHelper(node));
       return results.length > 0 && results.every(value => visit(value));
@@ -1001,6 +1115,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const closedDomValue = (node, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = value => closedDomValue(value, visiting, depth + 1);
+    const field = recordField(node);
+    if (field) return visit(field);
     if (node.type === "CallExpression" && closedHelpers.has(localHelper(node))) {
       const results = helperReturns.get(localHelper(node));
       return results.length > 0 && results.every(visit);
@@ -1104,6 +1220,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const closedReturn = (node, visiting = new Set(), depth = 0) => {
     if (!node || depth > 64) return false;
     const visit = value => closedReturn(value, visiting, depth + 1);
+    const field = recordField(node);
+    if (field) return visit(field);
     if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
     if (node.type === "ChainExpression") return visit(node.expression);
     if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
@@ -1277,10 +1395,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           staticPropertyNames(property)?.every(name => name === "domElement" || ctorKind(name)))))
         report(node, "destructured-resource");
     } else if (node.type === "Property" && kind(node.value) & RESOURCE && parents.get(node)?.type !== "ObjectPattern") {
-      // A local canvas in a literal constructor options object is a declared
-      // renderer input. Every other container is beyond this alias proof.
+      // Closed record fields retain the normal escape checks at each read.
+      // A literal constructor's local canvas is another declared renderer input.
       const object = parents.get(node), owner = parents.get(object);
-      if (!(node.kind === "init" && staticPropertyNames(node)?.every(name => name === "canvas") &&
+      if (!recordOf(object) && !(node.kind === "init" && staticPropertyNames(node)?.every(name => name === "canvas") &&
           kind(node.value) & CANVAS && owner?.type === "NewExpression" &&
           owner.arguments[0] === object && kind(owner.callee) & CONSTRUCTOR)) report(node, "resource-container");
     } else if (node.type === "ArrayExpression") {

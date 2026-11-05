@@ -81,6 +81,20 @@ test('closed renderer and controls factories preserve the verified canvas connec
   }
 });
 
+test('private record fields retain the verified controls constructor, receiver and canvas identities', () => {
+  for (const body of [
+    'const state={renderer,controls}; state.controls.update(); document.body.appendChild(state.renderer.domElement);',
+    'const toolkit={Navigation}; const alias=toolkit; const {Navigation:Constructor}=alias; const state={renderer}; const {renderer:owner}=state; const local=new Constructor(camera,owner.domElement); local.update();',
+    'const state={renderer}; const local=new Navigation(camera,state.renderer.domElement); const records={local}; const {local:alias}=records; alias.update();',
+  ]) assert.deepEqual(inspect(body).escapes, [], body);
+  for (const body of [
+    'const state={controls}; plugin(state);', 'const state={controls}; plugin(state.controls);',
+    'const state={controls}; state.controls.update=plugin;', 'const state={controls}; state.controls.connect(host.canvas);',
+    'const state={renderer}; state.renderer=plugin; new Navigation(camera,state.renderer.domElement);',
+    'const toolkit={Navigation}; toolkit.Navigation.prototype.update=plugin;',
+  ]) assert.equal(inspect(body).has_opaque_gl_escapes, true, body);
+});
+
 test('the original H4 graph closes its retained FirstPersonControls canvas ownership', async () => {
   const h4 = await buildModuleGraph(fileURLToPath(new URL('examples/webgl_shadowmap_performance.html', upstream)));
   assert.deepEqual(extractGraphRoutingFacts(h4).escapes, []);
@@ -155,7 +169,7 @@ for (const [name, body] of [
   ['exported instance', 'export {controls};'],
   ['returned instance', 'function expose() { return controls; }'],
   ['external store', 'globalThis.controls = controls;'],
-  ['container', 'const container = {controls};'],
+  ['escaped container', 'const container = {controls}; plugin(container);'],
   ['canvas alias escape', 'const {domElement} = controls; plugin(domElement);'],
   ['exported canvas', 'export const canvas = controls.domElement;'],
   ['event callback receiver', "controls.addEventListener('change', plugin);"],

@@ -60,6 +60,17 @@ identities also stay upstream. Closed renderer calls, local aliases, locally
 created DOM canvases and ordinary DOM attachment remain eligible. General
 imported helpers remain opaque.
 
+Private constant records can hold renderer constructors, renderer instances,
+canvases and verified controls without forcing an exact backend. Static field
+reads, constant aliases and simple destructuring retain the selected value's
+ownership, so a local `toolkit.Renderer` and `state.renderer` can use the general
+route. The original records and application statements remain intact. This proof
+is limited to shallow, freshly created records with unique own data fields whose
+uses all remain known. Exported records, unknown consumers, mutation, dynamic
+keys, getters, spreads and reflection keep the exact component. Selecting a
+native backend method from a private record also retains its existing exact-route
+requirement; the record does not hide that observation.
+
 The graph can prove a bounded retained `OrbitControls` contract by verifying the
 exact addon, resolved Three build and core bytes. The returned controls instance
 continues to carry the canvas reference through local aliases and `domElement`;
