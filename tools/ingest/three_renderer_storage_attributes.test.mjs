@@ -59,7 +59,8 @@ const kernel = storage => N.Fn(() => { storage.element(N.instanceIndex).addAssig
 // Run the pinned upload implementation and its actual finishRender submission
 // boundary. The recording device establishes queue-visible buffer history;
 // it does not execute the reference shader or establish real-GPU pixel parity.
-function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, instanced = true} = {}) {
+function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, instanced = true,
+  indirect = false, indexed = true} = {}) {
   const device = geometryDevice(), records = new WeakMap();
   const backend = {device, _isRenderCameraDepthArray: () => false, get(key) {
     let record = records.get(key);
@@ -68,22 +69,30 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
   }};
   const utils = new SourceWebGPUAttributeUtils(backend);
   backend.createStorageAttribute = attribute => utils.createAttribute(attribute, 128 | 32 | 8 | 4);
+  backend.createIndirectStorageAttribute = attribute => utils.createAttribute(attribute, 256 | 128 | 8 | 4);
   backend.updateAttribute = attribute => utils.updateAttribute(attribute);
-  const owner = new SourceAttributes(backend, {createStorageAttribute() {}});
-  const attribute = new (instanced ? T.StorageInstancedBufferAttribute : T.StorageBufferAttribute)(array.slice(), itemSize);
+  const owner = new SourceAttributes(backend, {createStorageAttribute() {}, createIndirectStorageAttribute() {}});
+  const Attribute = indirect ? T.IndirectStorageBufferAttribute : instanced ? T.StorageInstancedBufferAttribute : T.StorageBufferAttribute;
+  const attribute = new Attribute(array.slice(), itemSize);
   const info = {render: {calls: 0}}, geometries = new SourceGeometries(owner, info);
-  const update = () => owner.update(attribute, AttributeType.STORAGE);
-  return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates) {
+  const update = () => owner.update(attribute, indirect ? AttributeType.INDIRECT : AttributeType.STORAGE);
+  const index = indirect && indexed ? device.createBuffer({size: 12, usage: 16}) : null;
+  return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates,
+    {indirectDraws = null, shaderDraws = null} = {}) {
     info.render.calls++;
     const encoder = device.createCommandEncoder(), pass = encoder.beginRenderPass({});
     pass.setPipeline({vertex: {entryPoint: 'main', buffers: vertex ? [{}] : []}});
-    for (const change of updates) {
+    for (const [drawIndex, change] of updates.entries()) {
+      const usesIndirect = indirect && (indirectDraws?.[drawIndex] ?? true), usesShader = shaderDraws?.[drawIndex] ?? shader;
       change(attribute);
       if (vertex) geometries.updateAttribute(attribute, AttributeType.STORAGE);
-      if (shader) update();
+      if (usesIndirect) geometries.updateAttribute(attribute, AttributeType.INDIRECT);
+      if (usesShader) update();
       if (vertex) pass.setVertexBuffer(0, backend.get(attribute).buffer);
-      pass.setBindGroup(0, {entries: shader ? [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}] : []});
-      pass.draw(3);
+      pass.setBindGroup(0, {entries: usesShader ? [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}] : []});
+      if (usesIndirect && indexed) { pass.setIndexBuffer(index, 'uint16'); pass.drawIndexedIndirect(backend.get(attribute).buffer, 0); }
+      else if (usesIndirect) pass.drawIndirect(backend.get(attribute).buffer, 0);
+      else pass.draw(3);
     }
     const context = {occlusionQueryCount: 0, textures: null};
     Object.assign(backend.get(context), {renderBundles: [], currentPass: pass, encoder});
@@ -243,18 +252,103 @@ test(`shared ${vertex ? 'generated-vertex and ' : ''}shader-storage partial vers
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('multiple storage versions with indirect aliases reject before storage writes', async t => {
-  const f = fixture(t), storage = N.instancedArray(new Uint32Array([6, 1, 0, 0, 0]), 'uint');
-  f.material.colorNode = N.vec3(N.float(storage.element(0)).mul(.01));
-  f.mesh.geometry.indirect = storage.value;
+for (const indexed of [false, true]) for (const shader of [false, true])
+test(`${indexed ? 'indexed' : 'nonindexed'} indirect ${shader ? 'and shader aliases observe final' : 'uploads retain first'} source versions within each queued render`, async t => {
+  const f = fixture(t), data = new Uint32Array(indexed ? [3, 1, 0, 0, 0] : [3, 1, 0, 0]);
+  const attribute = new T.IndirectStorageBufferAttribute(data, 1), storage = N.storage(attribute, 'uint', attribute.count);
+  // Both variants select FULL source refresh. Only shader bindings can admit
+  // a later upload after Geometries has consumed this render's first version.
+  f.material.colorNode = shader ? N.vec3(N.float(storage.element(0)).mul(.01)) : N.vec3(1);
+  if (!indexed) f.mesh.geometry = f.mesh.geometry.toNonIndexed();
+  f.mesh.geometry.setIndirect(attribute, 0);
   const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
   f.scene.add(other);
   await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
-  for (const mesh of [f.mesh, other]) mesh.onBeforeRender = () => { storage.value.needsUpdate = true; };
-  const writes = f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length;
-  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_READ_CONFLICT'});
-  assert.equal(f.device.writes.filter(write => write.buffer.label === 'f3d-compute-buffer' && write.buffer.usage & 128).length, writes);
-  assert.equal(draws(f.device).length, 0);
+  const source = sourceStorage(data, {indirect: true, indexed, shader}); source.update();
+  const callbacks = []; let frame = 0;
+  const changes = [0, 1].map(index => current => {
+    current.array[0] = (frame ? 0 : 3) + index * 3; current.array[1] = index + 1; current.needsUpdate = true;
+  });
+  for (const [index, mesh] of [f.mesh, other].entries()) {
+    mesh.onBeforeRender = () => { callbacks.push(`before:${frame}:${index}`); changes[index](attribute); };
+    mesh.onAfterRender = () => callbacks.push(`after:${frame}:${index}`);
+  }
+  for (frame = 0; frame < 2; frame++) {
+    source.render(changes); f.renderer.render(f.scene, f.camera);
+  }
+  attribute.array.fill(99); attribute.needsUpdate = true;
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = selected[0].indirect.buffer;
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)[0]), shader ? [6, 6, 3, 3] : [3, 3, 0, 0]);
+  assert.ok(selected.every(draw => draw.indexed === indexed && draw.indirect.buffer === buffer &&
+    (!shader || shaderStorage(draw).includes(buffer))));
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, shader ? 5 : 3);
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.deepEqual(callbacks, ['before:0:0', 'after:0:0', 'before:0:1', 'after:0:1',
+    'before:1:0', 'after:1:0', 'before:1:1', 'after:1:1']);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const bundle of [false, true])
+test(`${bundle ? 'bundled' : 'ordinary'} indirect and shader partial histories preserve earlier uploads and GPU-produced words`, async t => {
+  const f = fixture(t), data = new Uint32Array([3, 1, 0, 0, 0, 0]);
+  const attribute = new T.IndirectStorageBufferAttribute(data, 1), storage = N.storage(attribute, 'uint', attribute.count);
+  f.material.colorNode = N.vec3(storage.element(5).toFloat().mul(.01));
+  f.mesh.geometry.setIndirect(attribute, 0);
+  if (bundle) { const group = new T.BundleGroup(); group.add(f.mesh); f.scene.add(group); }
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  const compute = N.Fn(() => { storage.element(5).assign(77); })().compute(1);
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => { new Uint32Array(computeStorage(pass)[0].data)[5] = 77; };
+  await f.renderer.init(); await f.renderer.computeAsync(compute);
+  const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
+  const source = sourceStorage(data, {indirect: true}); source.update(); new Uint32Array(source.buffer.data)[5] = 77;
+  const changes = [[0, 6], [1, 2]].map(([index, value]) => current => {
+    current.array.fill(99); current.array[index] = value;
+    current.clearUpdateRanges(); current.addUpdateRange(index, 1); current.needsUpdate = true;
+  });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  source.render(changes); f.renderer.render(f.scene, f.camera);
+  attribute.array.fill(123);
+  await drain(f.renderer);
+  for (const mesh of [f.mesh, other]) mesh.onBeforeRender = () => {};
+  source.render([() => {}, () => {}]); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const encoded = f.device.bundleEncoders.length;
+  source.render([() => {}, () => {}]); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const selected = draws(f.device);
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.ok(selected.every(draw => words(draw, buffer, Uint32Array).join() === '6,2,0,0,0,77' &&
+    draw.indirect.buffer === buffer && shaderStorage(draw).includes(buffer)));
+  assert.deepEqual(f.device.writes.filter(write => write.buffer === buffer).map(write => [write.offset, write.input.byteLength]),
+    [[0, 24], [0, 4], [4, 4]]);
+  if (bundle) assert.equal(f.device.bundleEncoders.length, encoded, 'unchanged allocation and offsets reuse the indirect command bundle');
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('the first indirect geometry upload can follow an earlier shader-only storage version', async t => {
+  const f = fixture(t), data = new Uint32Array([3, 1, 0, 0, 0]);
+  const attribute = new T.IndirectStorageBufferAttribute(data, 1), storage = N.storage(attribute, 'uint', attribute.count);
+  f.material.colorNode = N.vec3(storage.element(0).toFloat().mul(.01));
+  const material = new T.MeshBasicNodeMaterial(); material.colorNode = N.vec3(1);
+  const other = new T.Mesh(f.mesh.geometry.clone(), material); other.frustumCulled = false; other.renderOrder = 1;
+  other.geometry.setIndirect(attribute, 0); f.scene.add(other);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  const changes = [3, 6].map(value => current => { current.array[0] = value; current.needsUpdate = true; });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  const source = sourceStorage(data, {indirect: true}); source.update();
+  source.render(changes, {indirectDraws: [false, true], shaderDraws: [true, false]});
+  f.renderer.render(f.scene, f.camera); attribute.array.fill(99); await drain(f.renderer);
+  const selected = draws(f.device), buffer = selected[1].indirect.buffer;
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)[0]), [6, 6]);
+  assert.equal(selected[0].indirect, undefined); assert.ok(shaderStorage(selected[0]).includes(buffer));
+  assert.equal(shaderStorage(selected[1]).length, 0, 'the initial indirect upload needs no shader on that object');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 

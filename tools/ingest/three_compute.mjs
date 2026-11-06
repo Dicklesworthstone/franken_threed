@@ -183,9 +183,14 @@ function createThreeCompute(renderer, three) {
       access(record.key, value.writable);
       records.add(record);
     }
-    for (const history of histories.values()) if (history.records.size > 1 &&
-        (history.indirect || history.generated && [...history.records].slice(1).some(record => !history.shaders.has(record))))
-      fail('READ_CONFLICT', 'Later generated-vertex uploads require a shader-storage binding; indirect histories require one version');
+    // Capture enforces Geometries' first indirect upload, which can precede or
+    // follow independently admitted shader-storage updates. Indirect commands
+    // read the accumulated allocation at execution; their first lease does
+    // not freeze its bytes. Keep combined generated-vertex/indirect histories
+    // outside this profile, including their shared first-geometry-use gate.
+    for (const history of histories.values()) if (history.records.size > 1 && history.generated &&
+        (history.indirect || [...history.records].slice(1).some(record => !history.shaders.has(record))))
+      fail('READ_CONFLICT', 'Multiple generated-vertex versions require shader-storage uploads without indirect aliases');
     // r186 updates shader storage during object traversal, then submits the
     // render encoder at finishRender. All draws sharing that allocation see
     // the accumulated uploads, including partial ranges, at submission time.
