@@ -208,7 +208,7 @@ test('shadowed imports, callable proxies, argument failures and original receive
   assert.equal(applied, 1);
 });
 
-test('zero-argument, spread and string-named imports work; optional and namespace calls remain intact', async () => {
+test('zero-argument, spread, string-named and namespace imports share kernels; optional calls remain intact', async () => {
   const files = graph({
     'producer.mjs': 'function constant(){let n=0;while(n<3)n++;return n;} export {constant as "odd name",constant};',
     'consumer.mjs': "import {\"odd name\" as count} from './producer.mjs'; import * as ns from './producer.mjs'; export function run(){return count();} export function spread(...args){return count(...args);} export function optional(){return count?.();} export function namespace(){return ns.constant();}",
@@ -216,9 +216,67 @@ test('zero-argument, spread and string-named imports work; optional and namespac
   const app = await files.load('consumer.mjs'), producer = await files.load('producer.mjs');
   assert.equal(app.run(), 3); assert.equal(app.spread(), 3);
   assert.equal(app.optional(), 3); assert.equal(app.namespace(), 3);
-  assert.equal(diagnostics(producer.constant).kernel.wasmCalls, 2);
-  assert.equal(files.reports['consumer.mjs'].importedCalls.length, 2);
+  assert.equal(diagnostics(producer.constant).kernel.wasmCalls, 3);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length, 3);
   assert.equal(files.reports['consumer.mjs'].importedCalls[0].importedName, 'odd name');
+});
+
+test('namespace proof respects parameter-initializer, switch and shadowed lexical environments', async () => {
+  const source=`import * as ns from './producer.mjs';
+    export function parameter(value=ns.sum(3)){var ns;return value;}
+    export function discriminant(n){switch(ns.sum(n)){case 6:let ns;return 6;default:return 0;}}
+    export function shadow(ns,n){return ns.sum((ns=other,n));}
+    const other={sum(){throw new Error('wrong receiver');}};
+    export function hoisted(){if(false){var ns;}return ns.sum();}
+    export function caught(value){try{throw value;}catch(ns){return ns.sum();}}
+    export function loop(value){for(let ns of [value])return ns.sum();}
+    export const optional=n=>ns.sum?.(n);
+    export const chain=n=>ns?.sum(n);
+    export const dynamic=(key,n)=>ns[key](n);`;
+  const files=graph({'producer.mjs':SUM,'consumer.mjs':source});
+  const app=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,2);
+  assert.equal(app.parameter(),original.parameter());
+  assert.equal(app.discriminant(3),original.discriminant(3));
+  assert.equal(app.optional(3),original.optional(3));
+  assert.equal(app.chain(3),original.chain(3));
+  assert.equal(app.dynamic('sum',3),original.dynamic('sum',3));
+  const receiver={sum(value=7){assert.equal(this,receiver);return value;}};
+  assert.equal(app.shadow(receiver,8),8);
+  assert.equal(app.caught(receiver),7);assert.equal(app.loop(receiver),7);
+  assert.throws(()=>app.hoisted(),TypeError);assert.throws(()=>original.hoisted(),TypeError);
+  const producer=await files.load('producer.mjs');
+  assert.equal(diagnostics(producer.sum).kernel.wasmCalls,2);
+});
+
+test('namespace calls nested in arguments keep export reads, spreads and source token order', async () => {
+  const files=graph({
+    'producer.mjs':SUM,
+    'consumer.mjs':`import * as ns from './producer.mjs';
+      export function run(events){return ((ns['sum'])) /* misleading ( */
+        ((events.push('outer'),ns.sum(...(events.push('inner'),[3]))));}`,
+  });
+  const app=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  const events=[],expected=[];
+  assert.equal(app.run(events),original.run(expected));assert.deepEqual(events,expected);
+  assert.deepEqual(events,['outer','inner']);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,2);
+  assert.equal(diagnostics((await files.load('producer.mjs')).sum).kernel.wasmCalls,2);
+});
+
+for(const loopIslands of [false,true]) test(`a namespace named Math preserves admitted helper bodies (${loopIslands?'loop':'function'})`, async () => {
+  const files=graph({
+    'math.mjs':'export const sin=Math.sin;',
+    'consumer.mjs':`import * as Math from './math.mjs';
+      export function scalar(x){return Math.sin(x);}
+      ${loopIslands?'export const update=a=>':'export function update(a)'}{for(let i=0;i<a.length;i++)a[i]=scalar(a[i]);};
+      export const run=a=>update(a);`,
+  },{loopIslands});
+  const app=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  assertOriginalFunction(app.scalar,original.scalar);
+  if(!loopIslands) assertOriginalFunction(app.update,original.update);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,0);
+  compare(app.run,original.run,[new Float64Array([0,1,-1])]);
 });
 
 test('mutable original functions are never paired with stale compiled code', async () => {

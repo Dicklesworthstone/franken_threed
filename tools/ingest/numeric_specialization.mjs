@@ -222,15 +222,21 @@ export function specializeNumericModule(
   }
   // Imports identify eligible call-site spellings, NOT native targets. The
   // runtime checks the evaluated function identity, including when a nested
-  // binding shadows that spelling. Namespace/method/optional calls stay intact.
+  // binding shadows a direct-call spelling. Namespace members additionally need
+  // a lexical proof: reading the receiver twice is inert only for the immutable
+  // imported namespace binding, not for arbitrary objects or shadowed locals.
   const importedBindings = new Map();
+  const namespaceBindings = new Map();
   const exportedBindings = new Set();
   if (crossModule) {
     const aliases = new Map();
     for (const statement of ast.body) {
       if (statement.type === "ImportDeclaration") {
         for (const specifier of statement.specifiers) {
-          if (specifier.type === "ImportNamespaceSpecifier") continue;
+          if (specifier.type === "ImportNamespaceSpecifier") {
+            namespaceBindings.set(specifier.local.name, statement.source.value);
+            continue;
+          }
           importedBindings.set(specifier.local.name, {
             moduleSpecifier: statement.source.value,
             importedName: specifier.type === "ImportDefaultSpecifier"
@@ -624,6 +630,51 @@ export function specializeNumericModule(
         });
       }
       report.rewrittenCalls += sites.length;
+    }
+    if (namespaceBindings.size) {
+      const bindings = numericLoopScopeBindings(), namespaceSites = [];
+      const nativeFunctions = report.candidates.filter(item => item.route === "guarded-numeric-wasm")
+        .flatMap(item => [item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan)]);
+      for (const item of report.loopIslands?.candidates ?? [])
+        if (item.route === "guarded-loop-wasm")
+          nativeFunctions.push(...(item.helpers ?? []).map(helper => helper.sourceSpan));
+      walk.fullAncestor(ast, (call, _state, ancestors) => {
+        if (call.type !== "CallExpression" || call.optional ||
+            call.callee.type !== "MemberExpression" || call.callee.optional) return;
+        const {object, property, computed} = call.callee;
+        if (object.type !== "Identifier" || !namespaceBindings.has(object.name)) return;
+        const importedName = !computed && property.type === "Identifier" ? property.name
+          : computed && property.type === "Literal" && typeof property.value === "string" ? property.value : null;
+        if (importedName === null) return;
+        const owner = [...ancestors].reverse().find(scope => bindings(scope, object).has(object.name));
+        if (owner !== ast) return;
+        // Do not overlap an extracted loop or alter an original admitted
+        // function (notably a namespace named Math whose operations already
+        // have the numeric compiler's independent intrinsic guards).
+        if (nativeFunctions.some(region => region && region.start <= call.start && region.end >= call.end) ||
+            edits.some(edit => edit.start <= call.start && edit.end >= call.end)) return;
+        namespaceSites.push({call, importedName});
+      });
+      if (namespaceSites.length) {
+        const namespaceDispatchName = fresh("namespace_dispatch"), helperName = fresh("namespace_call");
+        runtimeImports.push(`dispatchImportedNumericCall as ${namespaceDispatchName}`);
+        helpers.push(`function ${helperName}(callee, receiver, ...args) { return ${namespaceDispatchName}(callee, args, receiver); }`);
+        for (const {call, importedName} of namespaceSites) {
+          const receiver = call.callee.object.name;
+          edits.push({start:call.callee.start, end:call.callee.end, text:helperName});
+          // The live export is selected before all source arguments. Preserve
+          // that selected function even if an argument rebinds the export, and
+          // retain the actual namespace as this on every source fallback.
+          const pos = callParen(call);
+          edits.push({start:pos, end:pos,
+            text:`${source.slice(call.callee.start, call.callee.end)},${receiver},`});
+          report.importedCalls.push({moduleSpecifier:namespaceBindings.get(receiver),
+            importedName, localName:receiver, sourceSpan:span(call),
+            receiverSemantics:"original-module-namespace",
+            route:"shared-identity-lookup-with-retained-fallback"});
+        }
+        report.rewrittenCalls += namespaceSites.length;
+      }
     }
   }
   if (!runtimeImports.length) return unchanged();

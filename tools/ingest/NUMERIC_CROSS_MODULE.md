@@ -2,8 +2,9 @@
 
 An admitted numeric function no longer needs its callers in the same output
 chunk. Exported closed functions register their **original function identity**
-with the emitted dispatcher. Direct calls through named or default imports
-look up that identity and reuse the producer's lazy Wasm instance. This is not
+with the emitted dispatcher. Direct calls through named/default imports and
+static module-namespace members look up that identity and reuse the producer's
+lazy Wasm instance. This is not
 function replacement, import rebinding, or runtime code generation.
 
 ## Application builds
@@ -56,6 +57,31 @@ retain the actual source callee and its undefined direct-call receiver. Late
 registration permits subsequent calls to use Wasm without replaying module
 initialization or changing top-level-await/dynamic-entry scheduling.
 
+Namespace calls retain their module receiver as well:
+
+```js
+import * as kernels from './particle-kernels.mjs';
+export function frame(positions, velocity, dt) {
+  kernels.integrate(positions, velocity, dt);
+}
+```
+
+The compiler proves that `kernels` resolves to the static namespace import at
+that call site. It selects the live `integrate` export before evaluating the
+original arguments, then carries that exact function and namespace through
+dispatch. Every fallback retains the namespace as `this`, including an
+uncompiled method, early module-cycle call, changed live export, unavailable
+Wasm, guard failure or exhausted work budget. Receiver state is invocation-local;
+reentry cannot overwrite it. An admitted native function cannot observe `this`,
+so no receiver is added to the Wasm ABI.
+
+The same path supports default exports and string-literal member names, such
+as `kernels.default(...)` and `kernels['update positions'](...)`. It does not
+read an export twice or invoke a callee's `.call`/`.apply` properties. Imports
+shadowed by parameters, body vars, block declarations, catch bindings or loop
+bindings stay on their original member-call path. Parameter initializers and
+switch discriminants retain their own lexical lookup rules.
+
 Native type selection and all existing ownership, bounds, Math, alias, scalar,
 and transaction guards still apply on every invocation. Same-type aliases use
 ordered shared scratch storage. Late bounds failures and exhausted native work
@@ -66,16 +92,24 @@ compiler to obtain those hints.
 
 ## Scope and costs
 
-Only direct, nonoptional calls spelled through named/default imports are newly
-rewritten. Namespace/method calls, optional calls, constructors, tagged calls,
-and indirect callback invocation remain JavaScript. A dynamically loaded chunk
-can use its static imports, but `namespace.update()` is not rewritten by this
-pass. Uninstrumented outside callers still call the original function normally.
+Only direct, nonoptional calls through named/default imports or proven static
+namespace imports are rewritten. Arbitrary object methods, dynamic member names,
+optional calls, constructors, tagged calls and indirect callback invocation
+remain JavaScript. A dynamically loaded chunk can use its static namespace
+imports; a namespace obtained from `await import(...)` is outside this proof.
+Uninstrumented outside callers still call the original function normally.
+
+The pass works on the source unit it receives. A bundler may normalize a static
+namespace call into a named-import call first; that form uses the existing
+direct-import route. Namespace execution tests therefore run actual separate
+ESM modules through `specializeNumericModule`, independently of normal builds
+that perform this normalization.
 
 The whole producer and its reachable scalar helpers must remain closed under
 the existing compiler rules. Cross-chunk dispatch does not compile imported
-helpers into a producer, infer storage allocations across chunks, or admit
-captures. Mutable original function bindings and direct-eval source units remain
+helpers into a producer or infer storage allocations across chunks. Producer-local
+live module Number/typed-array [captures](NUMERIC_LOOP_HELPERS.md#live-module-bindings-in-helpers)
+keep their existing guards. Mutable original function bindings and direct-eval source units remain
 conservative. Existing locally called kernels take priority over new export-only
 candidates under the per-unit compilation budget. AOT alternatives remain capped.
 
@@ -95,7 +129,9 @@ kept consistent for producer-only, consumer-only, and mixed chunks.
 
 ```sh
 node --test tools/ingest/numeric_cross_module.test.mjs \
-  tools/ingest/numeric_cross_chunk.test.mjs
+  tools/ingest/numeric_cross_chunk.test.mjs \
+  tools/ingest/numeric_namespace_runtime.test.mjs \
+  tools/ingest/numeric_namespace_imports.integration.test.mjs
 ```
 
 The module tests execute separate ESM graphs and native Wasm against original

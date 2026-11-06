@@ -159,21 +159,23 @@ function matches(types, args) {
 }
 
 /**
- * callee and args have already been evaluated in source order. Identity misses
+ * callee, receiver and args have already been evaluated in source order. Identity misses
  * (including shadowed bindings) and pre-initialization calls in ESM cycles must
  * invoke that actual callee, never the statically analyzed function by name.
+ * Namespace calls preserve their module receiver on every retained source path.
+ * Admitted native bodies cannot observe this, so the receiver is not a Wasm input.
  */
-export function dispatchNumericCall(token, callee, args) {
+export function dispatchNumericCall(token, callee, args, receiver = undefined) {
   const root = records.get(token);
   if (!root || root.primary.target !== callee) {
     if (root) root.identityMisses++;
-    return apply(callee, undefined, args);
+    return apply(callee, receiver, args);
   }
-  if (!root.captures) return executeNumericCall(root, callee, args);
+  if (!root.captures) return executeNumericCall(root, callee, args, receiver);
   if (root.active) {
     root.reentrantMisses++;
     root.primary.retainedCalls++;
-    return apply(callee, undefined, args);
+    return apply(callee, receiver, args);
   }
   root.active = true;
   try {
@@ -187,17 +189,17 @@ export function dispatchNumericCall(token, callee, args) {
     } catch {
       root.captureMisses++;
       root.primary.retainedCalls++;
-      return apply(callee, undefined, args);
+      return apply(callee, receiver, args);
     }
     root.captureValues = captures;
-    return executeNumericCall(root, callee, [...args, ...captures]);
+    return executeNumericCall(root, callee, [...args, ...captures], receiver);
   } finally {
     root.captureValues = null;
     root.active = false;
   }
 }
 
-function executeNumericCall(root, callee, args) {
+function executeNumericCall(root, callee, args, receiver) {
   const record =
     root.variants.find((variant) => matches(variant.parameterTypes, args)) ?? root.primary;
   root.selected = record;
@@ -206,7 +208,7 @@ function executeNumericCall(root, callee, args) {
     // or reading the manifest. Leave registration retryable after restoration.
     if (!numericArrayIterationIntact()) {
       record.retainedCalls++;
-      return apply(record.fallback, undefined, args);
+      return apply(record.fallback, receiver, args);
     }
     // Set before initialization: host policy hooks may reenter the application.
     record.attempted = true;
@@ -236,9 +238,9 @@ function executeNumericCall(root, callee, args) {
     }
     record.bytes = null;
   }
-  if (record.kernel) return apply(record.kernel.run, undefined, args);
+  if (record.kernel) return apply(record.kernel.run, receiver, args);
   record.retainedCalls++;
-  return apply(record.fallback, undefined, args);
+  return apply(record.fallback, receiver, args);
 }
 
 /** Diagnostics are opt-in; generated applications do not gain new exports. */
@@ -288,13 +290,14 @@ export function registerNumericDispatch(...args) {
 }
 
 /**
- * Direct imported calls have an undefined receiver. Evaluate their callee and
- * arguments BEFORE entering here, just as for local dispatch. Live rebindings,
+ * Direct imports use the default undefined receiver; namespace calls supply the
+ * module object. Evaluate the callee and arguments BEFORE entering here, just
+ * as for local dispatch. Live rebindings,
  * early ESM-cycle calls, uncompiled dependencies and shadowed names use the
  * actual callee. A WeakMap miss does not invoke getters or proxy traps.
  */
-export function dispatchImportedNumericCall(callee, args) {
-  return dispatchNumericCall(sharedTargets.get(callee), callee, args);
+export function dispatchImportedNumericCall(callee, args, receiver = undefined) {
+  return dispatchNumericCall(sharedTargets.get(callee), callee, args, receiver);
 }
 
 /** Opt-in diagnostics without exposing registrations or changing app exports. */
