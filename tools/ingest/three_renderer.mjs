@@ -26,7 +26,7 @@
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
- *   mapping, unsupported output color spaces,
+ *   mapping on the native output path, unsupported output color spaces,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
  */
@@ -73,7 +73,7 @@ export class F3DRendererError extends Error {
 const fail = (code, message) => { throw new F3DRendererError(code, message); };
 const NOT_INITIALIZED = 'THREE.Renderer: .render() called before the backend is initialized. Use "await renderer.init();" before rendering.';
 // r186 tone-mapping constants -> explicit output-pass names. CustomToneMapping (5)
-// is a shader hook and has no admitted equivalent.
+// runs only in the WebGL surface's source shaders, never in a fixed output pass.
 const TONE_MAPPINGS = new Map([[0, 'none'], [1, 'linear'], [2, 'reinhard'], [3, 'cineon'], [4, 'aces-filmic'], [6, 'agx'], [7, 'neutral']]);
 const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth', 'stencil', 'samples', 'forceWebGL',
   'logarithmicDepthBuffer', 'reversedDepthBuffer', 'powerPreference', 'requiredLimits', 'requiredFeatures',
@@ -629,7 +629,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           outputColorSpace: outputProfile?.transfer ?? (srgbView ? 'srgb' : 'linear'),
           ...(outputProfile?.matrix ? {outputColorMatrix: outputProfile.matrix} : {}),
           sourceOutput: extended || outputProfile?.sourceOutput === true,
-          output: {toneMapping: this._toneMapping(), exposure: this.toneMappingExposure}})
+          output: {toneMapping: this._toneMapping(this._programFrame?.toneMapping ?? this.toneMapping),
+            exposure: this._programFrame?.toneMappingExposure ?? this.toneMappingExposure}})
         : await createGpuCanvasRenderer(canvas, createDispatcher(this), {...common, lazyAttachments: true,
           target: {width, height, depthFormat, sampleCount, ...presentation,
             preserveDrawingBuffer: this._shaderEncodedOutput && this.preserveDrawingBuffer === true,
@@ -663,10 +664,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
 
     /** The whole-image tone-mapping output pass. WebGLRenderer (shader-encoded
      * output) tone-maps inside each material's program instead, unless a scene
-     * needed a draw the program route cannot take (sticky fallback). */
+     * needed a draw the program route cannot take (sticky fallback). Custom
+     * operators require their source program and cannot use that fallback. */
     _wantsHdr(tone, space = this.outputColorSpace) { return !this._shaderEncodedOutput &&
       (tone !== 'none' || space !== THREE.LinearSRGBColorSpace) ||
-      tone !== 'none' && this._hdrFallback === true; }
+      tone !== 'none' && tone !== 'custom' && this._hdrFallback === true; }
     _outputBufferFormat() {
       return this._outputBufferType === THREE.UnsignedByteType ? 'rgba8unorm' :
         this._outputBufferType === THREE.FloatType ? 'rgba32float' : 'rgba16float';
@@ -716,9 +718,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * always creates an alpha:true context; its `alpha` option only sets the
      * default clear alpha, so shader-written alpha and setClearAlpha show. */
     _compositedAlpha() { return this.alpha === true || this._contextAlpha === true; }
-    _toneMapping() {
-      const name = TONE_MAPPINGS.get(this.toneMapping);
-      if (name === undefined) fail('UNSUPPORTED', `Tone mapping ${this.toneMapping} has no admitted output pass`);
+    _toneMapping(toneMapping = this.toneMapping) {
+      if (this._shaderEncodedOutput && toneMapping === THREE.CustomToneMapping) {
+        // A linear fallback framebuffer cannot become shader-encoded history
+        // without losing or reinterpreting its retained color/depth contents.
+        if (this._hdrFallback === true) fail('UNSUPPORTED', 'Custom tone mapping cannot replace whole-image HDR fallback');
+        return 'custom';
+      }
+      const name = TONE_MAPPINGS.get(toneMapping);
+      if (name === undefined) fail('UNSUPPORTED', `Tone mapping ${toneMapping} has no admitted output pass`);
       return name;
     }
     _bufferSize() {
@@ -1289,6 +1297,15 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // after all captures succeed, preserving explicit pass calls around
         // deferred draws without imposing state work on ordinary renderers.
         request.programFrame.passState = this._shaderEncodedOutput && captureCameras ? captureThreePassState(this) : null;
+        if (this._shaderEncodedOutput && !target && !clearOnly && this.toneMapping === THREE.CustomToneMapping &&
+            (snapshot || materialFrame?.cameraSafe()) && (!sortState.sortObjects || !sortState.opaqueSort && !sortState.transparentSort)) {
+          // Keep an ordinary custom curve with its accepted deferred draw.
+          // Existing callback-free capture profiles avoid freezing a hook's
+          // reads/writes of global shader state. Inspect descriptors so an
+          // accessor-backed chunk keeps its original live evaluation boundary.
+          const chunk = Object.getOwnPropertyDescriptor(THREE.ShaderChunk, 'tonemapping_pars_fragment');
+          if (typeof chunk?.value === 'string') request.programFrame.toneMappingChunk = chunk.value;
+        }
         return request;
       } catch (error) { this._releaseRequest(request); throw error; }
       } finally { this._restoreSceneLifecycle(sceneLifecycle); }
@@ -1646,7 +1663,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideSnapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
       webglSourceCamera = null, passCameraRequired = false,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
-      if (webglSourceCamera && !materialFrame?.cameraSafe()) {
+      const cameraSafe = webglSourceCamera || programFrame?.toneMappingChunk !== undefined ? materialFrame?.cameraSafe?.() : true;
+      if (materialFrame && !cameraSafe && programFrame?.toneMappingChunk !== undefined) delete programFrame.toneMappingChunk;
+      if (webglSourceCamera && !cameraSafe) {
         if (passCameraRequired) fail('UNSUPPORTED', 'Pinned pass scene or camera gained callbacks before its captured draw submitted');
         // An application may install hooks while preparation is pending. Keep
         // those callbacks on their original camera and live mutation path.
@@ -1951,6 +1970,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         const textureReady = captured?.textureOwner?.preparation(captured.textureUses);
         if (textureReady) await textureReady;
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        // Selection captures keep live source material objects. Hooks installed
+        // after acceptance must retain their global shader reads and writes.
+        if (request?.programFrame?.toneMappingChunk !== undefined && request.materialFrame && !request.materialFrame.cameraSafe())
+          delete request.programFrame.toneMappingChunk;
         const previous = this._programFrame, previousRoot = destination._preparationRoot;
         const previousFramebufferFrame = this._programFramebufferFrame;
         this._programFramebufferFrame = request?.programTextures;
@@ -1975,7 +1998,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const canvasTarget = request?.canvasTarget ?? this.getCanvasTarget(), canvasSize = request?.canvasSize ?? this._bufferSize();
             const canvas = request?.canvas ?? canvasTarget.domElement;
             this._canvases.activate(canvasTarget, canvas);
-            const tone = request ? TONE_MAPPINGS.get(request.programFrame.toneMapping) : this._toneMapping();
+            const tone = this._toneMapping(request?.programFrame.toneMapping ?? this.toneMapping);
             const selectOutput = () => {
               const hdr = this._wantsHdr(tone, request?.programFrame.outputColorSpace ?? this.outputColorSpace);
               if (request) {
@@ -2015,7 +2038,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               // target: it would be lost or tone-mapped again on later frames.
               // Even auto-clears can be scissored or retain other attachments.
               // Logarithmic fragment depth also requires the source programs.
-              if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true ||
+              // An application-defined tone operator has no fixed-pass substitute.
+              if (error?.code !== 'THREE_SCENE_TONE_MAPPING' || tone === 'custom' || this._hdrFallback === true || globalThis.F3D_NO_FALLBACK === true ||
                   this._shaderEncodedOutput && (this.preserveDrawingBuffer === true || this._straightAlphaCanvas || this.logarithmicDepthBuffer === true || this.reversedDepthBuffer === true)) throw error;
               this._hdrFallback = true;
               this._session.dispose();

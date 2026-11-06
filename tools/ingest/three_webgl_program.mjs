@@ -146,11 +146,11 @@ function generateDefines(defines) {
 }
 const filterEmptyLine = s => s !== '';
 const includePattern = /^[ \t]*#include +<([\w\d./]+)>/gm;
-function resolveIncludes(T, string) {
+function resolveIncludes(T, string, toneMappingChunk) {
   return string.replace(includePattern, (match, include) => {
-    const s = T.ShaderChunk[include];
+    const s = include === 'tonemapping_pars_fragment' && toneMappingChunk !== undefined ? toneMappingChunk : T.ShaderChunk[include];
     if (s === undefined) fail('SOURCE', `Can not resolve #include <${include}>`);
-    return resolveIncludes(T, s);
+    return resolveIncludes(T, s, toneMappingChunk);
   });
 }
 const unrollLoopPattern = /#pragma unroll_loop_start\s+for\s*\(\s*int\s+i\s*=\s*(\d+)\s*;\s*i\s*<\s*(\d+)\s*;\s*i\s*\+\+\s*\)\s*{([\s\S]+?)}\s+#pragma unroll_loop_end/g;
@@ -194,8 +194,10 @@ function cubeUVSize(p) {
   return {texelWidth: 1.0 / (3 * Math.max(Math.pow(2, maxMip), 7 * 16)), texelHeight: 1.0 / imageHeight, maxMip};
 }
 
-/** The exact (vertex, fragment) GLSL WebGLProgram builds for these parameters. */
-export function webglProgramSources(T, p) {
+/** The exact (vertex, fragment) GLSL WebGLProgram builds for these parameters.
+ * A queued callback-free custom tone draw may retain that one chunk locally;
+ * every other source remains live, without replacing application globals. */
+export function webglProgramSources(T, p, {toneMappingChunk} = {}) {
   const shadowMapTypeDefine = {[T.PCFShadowMap]: 'SHADOWMAP_TYPE_PCF', [T.VSMShadowMap]: 'SHADOWMAP_TYPE_VSM'}[p.shadowMapType] || 'SHADOWMAP_TYPE_BASIC';
   const envMapTypeDefine = p.envMap === false ? 'ENVMAP_TYPE_CUBE' : ({[T.CubeReflectionMapping]: 'ENVMAP_TYPE_CUBE', [T.CubeRefractionMapping]: 'ENVMAP_TYPE_CUBE',
     [T.CubeUVReflectionMapping]: 'ENVMAP_TYPE_CUBE_UV'}[p.envMapMode] || 'ENVMAP_TYPE_CUBE');
@@ -280,14 +282,15 @@ export function webglProgramSources(T, p) {
       d(p.decodeVideoTexture, 'DECODE_VIDEO_TEXTURE'), d(p.decodeVideoTextureEmissive, 'DECODE_VIDEO_TEXTURE_EMISSIVE'),
       d(p.logarithmicDepthBuffer, 'USE_LOGARITHMIC_DEPTH_BUFFER'), d(p.reversedDepthBuffer, 'USE_REVERSED_DEPTH_BUFFER'),
       'uniform mat4 viewMatrix;', 'uniform vec3 cameraPosition;', 'uniform bool isOrthographic;',
-      p.toneMapping !== T.NoToneMapping ? '#define TONE_MAPPING' : '', p.toneMapping !== T.NoToneMapping ? T.ShaderChunk['tonemapping_pars_fragment'] : '',
+      p.toneMapping !== T.NoToneMapping ? '#define TONE_MAPPING' : '',
+      p.toneMapping !== T.NoToneMapping ? toneMappingChunk ?? T.ShaderChunk['tonemapping_pars_fragment'] : '',
       p.toneMapping !== T.NoToneMapping ? toneMappingFunction(T, p.toneMapping) : '',
       d(p.dithering, 'DITHERING'), d(p.opaque, 'OPAQUE'), T.ShaderChunk['colorspace_pars_fragment'],
       encodingFunction(T, 'linearToOutputTexel', p.outputColorSpace), luminanceFunction(T),
       p.useDepthPacking ? '#define DEPTH_PACKING ' + p.depthPacking : '', '\n'].filter(filterEmptyLine).join('\n');
   }
-  vertexShader = replaceClippingPlaneNums(replaceLightNums(resolveIncludes(T, vertexShader), p), p);
-  fragmentShader = replaceClippingPlaneNums(replaceLightNums(resolveIncludes(T, fragmentShader), p), p);
+  vertexShader = replaceClippingPlaneNums(replaceLightNums(resolveIncludes(T, vertexShader, toneMappingChunk), p), p);
+  fragmentShader = replaceClippingPlaneNums(replaceLightNums(resolveIncludes(T, fragmentShader, toneMappingChunk), p), p);
   vertexShader = unrollLoops(vertexShader); fragmentShader = unrollLoops(fragmentShader);
   if (p.isRawShaderMaterial !== true) {
     versionString = '#version 300 es\n';

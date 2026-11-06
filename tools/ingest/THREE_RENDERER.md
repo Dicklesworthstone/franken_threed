@@ -240,9 +240,16 @@ sharing that storage observe the final admitted version through immutable
 geometry proofs, including signed integer inputs and retained bundle draws.
 Vertex-only inputs keep the source's first upload per logical render. Preparation
 and submission share the accepted history without replaying earlier CPU uploads;
-separate queued renders retain their own histories. Multiple versions used as
-indirect inputs, generated index aliases and allocation-layout changes remain
-explicit unsupported cases.
+separate queued renders retain their own histories. Indirect arguments can share
+multiple host versions with read-only shader-storage bindings. Their first
+geometry upload retains its source boundary, including after an earlier
+shader-only object; later shader bindings can add full or partial uploads, and
+every indirect draw consumes the final accumulated allocation at submission.
+Indirect-only changes after that first use do not independently force uploads.
+Untouched GPU-produced words and retained command bundles remain intact.
+Multi-version histories combining generated vertex and indirect aliases,
+generated index aliases and allocation-layout changes remain explicitly
+unsupported; writable-versus-read-only storage hazards still apply.
 
 Standard and Physical materials, including their default node-material forms,
 accept independent `metalnessMap` and `roughnessMap` textures with their own
@@ -456,6 +463,42 @@ browser errors against source commit `148ef33ecb6d2502ff796d4554abd1549c95d519`.
 Existing shader, material and shadow-map profile limits remain in force. This is
 retained-JavaScript program preparation with owned WebGPU rendering, without a
 performance claim or a claim of complete physical-material/shadow coverage.
+
+## Custom tone mapping for WebGL-authored programs
+
+The WebGL-authored facade admits `THREE.CustomToneMapping` through the source
+material programs. The application-defined `CustomToneMapping(color)` function
+in the live `ShaderChunk.tonemapping_pars_fragment` compiles through the runtime
+GLSL-to-WGSL path, with the original `toneMappingExposure` uniform and material
+shader hooks. It executes before output encoding and blending. Materials with
+`toneMapped = false` bypass it, and ordinary render-target draws keep the
+source's no-tone-mapping, linear-output behavior.
+
+Queued requests retain their tone operator and exposure. Canvas requests in the
+existing callback-free material/pass capture profile also retain an ordinary
+string-valued `tonemapping_pars_fragment`, so queued custom curves can change
+A-to-B-to-A without overwriting earlier draws. Both source cache keys and final
+compilation use that private value; application ShaderChunk state is never
+replaced. Use `material.needsUpdate` when changing the source.
+
+Object/material shader hooks, custom sorting and accessor-backed tone chunks
+keep their existing live evaluation boundary. If a captured scene gains hooks
+before preparation or submission, its private chunk override is discarded.
+Other ShaderChunk/ShaderLib and ordinary material shader sources also remain
+live. Finish the earlier
+`renderAsync()` before editing those sources when its earlier behavior must be
+retained; this is not a snapshot of all application shader state.
+
+Custom operators cannot use the fixed whole-image HDR output pass. Invalid or
+unsupported custom GLSL fails explicitly without replacing the canvas owner.
+A renderer that has already entered the existing whole-image HDR fallback also
+rejects a switch to custom tone mapping, preserving its framebuffer history.
+Native WebGPU custom output operators remain unsupported.
+
+`three_program_custom_tone.test.mjs` compares compiled programs with the pinned
+`WebGLProgram` source and checks actual submitted shader/uniform records for
+source edits, shader hooks, bypasses and queued transitions. These are compiler
+and recording-device checks, not rasterized-pixel or performance measurements.
 
 ## Logarithmic depth for WebGL-authored programs
 
@@ -1042,7 +1085,7 @@ unmeasured.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping, non-sRGB
+  XR, custom tone mapping on the native output path, non-sRGB
   WebGL-authored canvas output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.

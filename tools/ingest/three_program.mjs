@@ -42,7 +42,8 @@ export function inspectThreeProgram(T, material, object) {
 }
 
 /** The exact GLSL r186 WebGLProgram builds for (material, object) in this context.
- * ctx: {fog, envMap, lights (webglLights().state), toneMapping, outputColorSpace, side}. */
+ * ctx: {fog, envMap, lights (webglLights().state), toneMapping, toneMappingChunk,
+ * outputColorSpace, side}. toneMappingChunk is an optional request-local source. */
 export function threeProgramSources(T, material, object, ctx = {}) {
   inspectThreeProgram(T, material, object);
   const lights = ctx.lights ?? EMPTY_LIGHTS;
@@ -50,8 +51,9 @@ export function threeProgramSources(T, material, object, ctx = {}) {
     clipping: ctx.clipping ?? {numPlanes: 0, numIntersection: 0}});
   // WebGLRenderer.getProgram: material.onBeforeCompile(parameters, renderer) may
   // rewrite the shader sources and add uniforms before the program is built.
-  if (ctx.beforeCompile && material.onBeforeCompile !== T.Material.prototype.onBeforeCompile) ctx.beforeCompile(parameters);
-  return {...webglProgramSources(T, parameters), parameters};
+  const sourceOptions = {toneMappingChunk: ctx.toneMappingChunk};
+  if (ctx.beforeCompile && material.onBeforeCompile !== T.Material.prototype.onBeforeCompile) ctx.beforeCompile(parameters, sourceOptions);
+  return {...webglProgramSources(T, parameters, sourceOptions), parameters};
 }
 const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
   pointShadowMap: [], spot: [], spotShadowMap: [], spotLightMap: [], rectArea: [], hemi: [], numSpotLightShadowsWithMaps: 0, numLightProbes: 0});
@@ -313,8 +315,8 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
    * assembled pre-hook program and customProgramCacheKey), on parameters whose
    * `uniforms` are this material's uniforms object, later refreshed and packed. */
   const hookResults = new WeakMap();
-  function beforeCompile(material, parameters) {
-    const key = webglProgramSources(T, parameters).key + '\u0000' + material.customProgramCacheKey();
+  function beforeCompile(material, parameters, sourceOptions) {
+    const key = webglProgramSources(T, parameters, sourceOptions).key + '\u0000' + material.customProgramCacheKey();
     let byKey = hookResults.get(material);
     if (!byKey) hookResults.set(material, byKey = new Map());
     let result = byKey.get(key);
@@ -328,8 +330,10 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
   }
   function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false, clipping = null} = {}) {
     const s = state();
-    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping, beforeCompile: p => beforeCompile(material, p),
+    const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping,
+      beforeCompile: (p, sourceOptions) => beforeCompile(material, p, sourceOptions),
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
+      toneMappingChunk: renderTarget ? undefined : s.toneMappingChunk,
       shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap,
       logarithmicDepthBuffer: s.logarithmicDepthBuffer === true, reversedDepthBuffer: s.reversedDepthBuffer === true});
     // GL rasterizes Points as gl_PointSize squares: compile the point-sprite form.
