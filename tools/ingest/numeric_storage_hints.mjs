@@ -16,7 +16,7 @@ const INTEGER_MASK = (1 << 7) - 1;
 const MAX_BINDINGS = 4096, MAX_EDGES = 32768, MAX_EXPRESSIONS = 32768;
 const EMPTY = Object.freeze({ mask: 0, names: [] });
 
-/** Return (callSites, parameterDescriptors) => at most 16 concrete layouts. */
+/** Return (callSites, parameterDescriptors, options?) => at most 16 concrete layouts. */
 export function discoverNumericStorageHints(ast) {
   const bindings = new Map(), cache = new WeakMap(), pending = [], queued = new Set();
   let exhausted = false, edges = 0, expressions = 0;
@@ -107,7 +107,7 @@ export function discoverNumericStorageHints(ast) {
       if (source.mask & ~target.mask) { target.mask |= source.mask; enqueue(user); }
     }
   }
-  return (sites, parameters) => {
+  return (sites, parameters, {includeFloat = false} = {}) => {
     if (exhausted) return [];
     const layouts = [], seen = new Set();
     const mask = node => {
@@ -118,8 +118,9 @@ export function discoverNumericStorageHints(ast) {
       if (site.arguments.length !== parameters.length || site.arguments.some(arg => arg.type === 'SpreadElement')) continue;
       const masks = parameters.map((param, i) => param.type === 'f64' ? 0 : mask(site.arguments[i]));
       if (exhausted) return [];
-      // Leave float-only applications' existing bytecode/layout order alone.
-      if (!masks.some(bits => bits & INTEGER_MASK)) continue;
+      // Preserve existing float-only layout order unless a new caller needs
+      // concrete mixed storage, such as hidden captured geometry buffers.
+      if (!masks.some(bits => includeFloat ? bits !== 0 : bits & INTEGER_MASK)) continue;
       for (const [read, write] of [['f64[]', 'f64[]'], ['f32[]', 'f32[]'], ['f64[]', 'f32[]'], ['f32[]', 'f64[]']]) {
         let tuples = [[]];
         for (let i = 0; i < parameters.length; i++) {
@@ -134,7 +135,7 @@ export function discoverNumericStorageHints(ast) {
         }
         for (const types of tuples) {
           const key = types.join(',');
-          if (!seen.has(key) && types.some(type => TYPES.indexOf(type) >= 0 && TYPES.indexOf(type) < 7)) {
+          if (!seen.has(key) && (includeFloat || types.some(type => TYPES.indexOf(type) >= 0 && TYPES.indexOf(type) < 7))) {
             seen.add(key); layouts.push(types);
             if (layouts.length === 16) return layouts;
           }

@@ -380,7 +380,7 @@ export function specializeNumericModule(
     const lifted = helperCapturePlan(fn);
     if (lifted?.refusal) { item.reason = lifted.refusal; continue; }
     const parameterTypes = [...fn.params.map((param) => (arrays.has(param.name) ? "f64[]" : "f64")),
-      ...(lifted?.parameters.map(() => "f64") ?? [])];
+      ...(lifted?.captureKinds.map(kind => kind === "array" ? "f64[]" : "f64") ?? [])];
     const kernelSource = lifted ? lifted.rewrite() : source.slice(fn.start, fn.end);
     const candidateHelpers = lifted?.helperSources ?? helperSources;
     let artifact;
@@ -431,7 +431,13 @@ export function specializeNumericModule(
     // never eliminate runtime guards. Prefer observed layouts over speculative
     // topology combinations, retaining the primary and the 16-alternative cap.
     // Without integer hints, existing successful output is byte-for-byte stable.
-    const hintedLayouts = storageHints(sites, artifact.manifest.parameters);
+    const captureArguments = lifted?.captures.map(name => ({type:"Identifier", name}));
+    const hintSites = captureArguments
+      ? (sites.length ? sites : [{arguments:fn.params}]).map(site =>
+        ({arguments:[...site.arguments, ...captureArguments]}))
+      : sites;
+    const hintedLayouts = storageHints(hintSites, artifact.manifest.parameters,
+      {includeFloat:!!lifted?.arrayParameters.size});
     for (const types of [...hintedLayouts, ...layouts]) {
       if (alternatives.length === 16) break;
       if (seenLayouts.has(types.join(","))) continue;
@@ -464,7 +470,8 @@ export function specializeNumericModule(
     // Assert that producer contract for all AOT variants, not a guessed lack of
     // aliases. Future no-alias optimizations must not reuse this assertion.
     const mathResolver = artifact.manifest.mathIntrinsics ? "() => Math" : "null";
-    const captureOptions = lifted ? `, {parameterCount:${fn.params.length}, captureCount:${lifted.captures.length}, resolve:() => [${lifted.captures.join(",")}]}` : "";
+    const captureKinds = lifted?.arrayParameters.size ? `, captureKinds:${JSON.stringify(lifted.captureKinds)}` : "";
+    const captureOptions = lifted ? `, {parameterCount:${fn.params.length}, captureCount:${lifted.captures.length}${captureKinds}, resolve:() => [${lifted.captures.join(",")}]}` : "";
     registrations.push(
       `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`,
     );
@@ -485,7 +492,9 @@ export function specializeNumericModule(
     item.parameterTypes = parameterTypes;
     if (lifted) {
       item.helperCaptures = [...lifted.captures];
-      item.helperCaptureSemantics = "live-readonly-module-numbers";
+      item.helperCaptureSemantics = lifted.arrayParameters.size
+        ? "live-readonly-module-bindings" : "live-readonly-module-numbers";
+      if (lifted.arrayParameters.size) item.helperCaptureKinds = [...lifted.captureKinds];
     }
     if (artifact.manifest.typedArrayMethods)
       item.typedArrayMethods = [...artifact.manifest.typedArrayMethods];

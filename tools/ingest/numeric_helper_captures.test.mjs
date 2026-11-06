@@ -196,6 +196,160 @@ test('converted helper loops report their original source positions', () => {
   }
 });
 
+test('captured geometry and velocity views execute as one source-ordered helper transaction', async () => {
+  const app = await application(`let positions=new Float32Array([1,2,3,4]), velocity=new Float32Array([2,-1,3,-2]), gain=2;
+    function integrate(i,dt){positions[i]+=velocity[i]*dt*gain;velocity[i]-=positions[i]/7;return positions[i];}
+    function forward(i,dt){return integrate(i,dt);}
+    export function update(out,dt){for(let i=0;i<out.length;i++)out[i]=forward(i,dt);}
+    export const run=(out,dt)=>update(out,dt);
+    export const state=()=>[positions,velocity];
+    export function configure(p,v,g){positions=p;velocity=v;gain=g;}`);
+  const item=app.result.report.candidates.find(item=>item.functionName==='update');
+  assert.deepEqual(item.helperCaptures,['gain','positions','velocity']);
+  assert.deepEqual(item.helperCaptureKinds,['number','array','array']);
+  assert.equal(app.module.update.toString(),app.reference.update.toString());
+  const out=new Float64Array(4),expected=out.slice();
+  for(const dt of [1/60,1/30,-0]) {
+    app.module.run(out,dt);app.reference.run(expected,dt);same(out,expected);
+    app.module.state().forEach((array,i)=>same(array,app.reference.state()[i]));
+  }
+  // A different view and layout are resolved on the next invocation; neither
+  // the binding nor the input bytes are baked into the compiled helper.
+  const p=new Float64Array([3,1,-0,7]),v=new Float64Array([1,2,3,4]);
+  app.module.configure(p,v,3);app.reference.configure(p.slice(),v.slice(),3);
+  app.module.run(out,1/3);app.reference.run(expected,1/3);same(out,expected);
+  assert.equal(app.module.state()[0],p);assert.equal(app.module.state()[1],v);
+  app.module.state().forEach((array,i)=>same(array,app.reference.state()[i]));
+  assert.equal(calls(app),4);
+});
+
+test('hidden views share staged storage with explicit arguments and each other', async () => {
+  const app=await application(`let left=new Float64Array(1),right=left;
+    function h(a,i){left[i]+=a[i];right[i]-=left[i]/3;a[i]+=right[i];}
+    function update(a){for(let i=0;i<a.length;i++)h(a,i);}
+    export const run=a=>update(a);
+    export function configure(a,b){left=a;right=b;}`);
+  for(const Type of [Float32Array,Float64Array]) for(const [a,b,c] of [[0,0,0],[0,1,2],[2,0,1]]) {
+    const storage=new Type([1,2,3,4,5,6,7]),expected=storage.slice();
+    app.module.configure(storage.subarray(b,b+4),storage.subarray(c,c+4));
+    app.reference.configure(expected.subarray(b,b+4),expected.subarray(c,c+4));
+    app.module.run(storage.subarray(a,a+4));app.reference.run(expected.subarray(a,a+4));same(storage,expected);
+  }
+  assert.equal(calls(app),6);
+});
+
+test('a frame update can keep all simulation buffers in its module environment', async () => {
+  const app=await application(`export const positions=new Float32Array([1,2,3]);
+    const velocities=new Float32Array([3,2,1]);
+    function integrate(i,dt){positions[i]+=velocities[i]*dt;}
+    function update(dt){for(let i=0;i<positions.length;i++)integrate(i,dt);}
+    export const frame=dt=>update(dt);`);
+  const positions=app.module.positions;
+  for(const dt of [1/60,1/30,-1/15]) {
+    app.module.frame(dt);app.reference.frame(dt);same(positions,app.reference.positions);
+    assert.equal(app.module.positions,positions);
+  }
+  assert.equal(calls(app),3);
+});
+
+for(const Type of [Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array])
+  test(`${Type.name} captures retain element conversions and live source storage`, async () => {
+    const app=await application(`export const field=new ${Type.name}([1,2,3,4]);
+      function sample(i,value){field[i]=value;return field[i];}
+      function update(out,scale){for(let i=0;i<out.length;i++)out[i]=sample(i,out[i]*scale);}
+      export const run=(out,scale)=>update(out,scale);`);
+    const out=new Float64Array([0.5,2.5,-3.5,65537]),expected=out.slice();
+    for(const scale of [1,1/3,1e12,Infinity]) {
+      app.module.run(out,scale);app.reference.run(expected,scale);same(out,expected);
+      same(app.module.field,app.reference.field);
+    }
+    assert.equal(calls(app),4);
+  });
+
+test('callback loop outputs and shadowed locals coexist with module array helper captures', async () => {
+  const app=await application(`let field=new Uint16Array([1,2,3,4]);
+    function read(i){const view=field;return view[i];}
+    export function make(out,events){let total=0;return {frame(field){
+      events.push('before');for(var i=0;i<out.length;i++){out[i]+=read(i)*field;total+=out[i];}
+      events.push(['after',i,total]);return total;
+    }}}`,{loopIslands:true});
+  const item=app.result.report.loopIslands.candidates.find(item=>item.route==='guarded-loop-wasm');
+  assert.deepEqual(item.helperCaptures,['field']);assert.deepEqual(item.helperCaptureKinds,['array']);
+  const out=new Float32Array(4),expected=out.slice(),events=[],referenceEvents=[];
+  const frame=app.module.make(out,events),original=app.reference.make(expected,referenceEvents);
+  for(const field of [2,1/3,-2]) {
+    assert.equal(frame.frame(field),original.frame(field));same(out,expected);
+  }
+  assert.deepEqual(events,referenceEvents);assert.equal(calls(app),3);
+});
+
+for(const loopIslands of [false,true]) for(const maxIterations of [2,1000])
+  test(`captured-array ${maxIterations===2?'work':'bounds'} failure discards the entire transaction (${loopIslands?'loop':'function'})`, async () => {
+    const prefix=`export let field=new Float64Array([1,2,3]);
+      function h(i){field[i]+=1;return field[i+1];}
+      export function configure(value){field=value;}`;
+    const body=`for(let i=0;i<out.length;i++){let repeat=0;while(repeat<1){out[i]+=h(i);repeat++;}}`;
+    const definition=loopIslands
+      ? `export const update=(out,events)=>{events.push('before');${body}events.push('after');};`
+      : `function update(out){${body}}`;
+    const source=prefix+definition+(loopIslands
+      ? `export const run=(out,events)=>update(out,events);` : `export const run=out=>update(out);`);
+    const app=await application(source,{loopIslands,maxIterations});
+    // Failure follows earlier speculative writes. The source then performs
+    // the three original updates exactly once, including its final NaN.
+    const out=new Float64Array([4,5,6]),expected=out.slice(),events=[],referenceEvents=[];
+    app.module.run(out,events);app.reference.run(expected,referenceEvents);
+    same(out,expected);same(app.module.field,app.reference.field);
+    assert.deepEqual(events,referenceEvents);assert.equal(calls(app),0);
+    app.module.configure(new Float64Array([2,3,4]));app.reference.configure(new Float64Array([2,3,4]));
+    const small=new Float64Array([5]),original=small.slice();
+    app.module.run(small,events);app.reference.run(original,referenceEvents);
+    same(small,original);same(app.module.field,app.reference.field);assert.equal(calls(app),1);
+  });
+
+test('uninitialized array captures preserve zero-trip behavior and partial source exceptions', async () => {
+  const app=await application(`function h(i){return field[i];}
+    function update(out){for(let i=0;i<out.length;i++){out[i]+=1;out[i]=h(i);}}
+    export const run=out=>update(out);
+    export const early=run(new Float64Array());export const partial=new Float64Array([2,3]);
+    export let error;try{run(partial);}catch(e){error=e;}
+    let field=new Float64Array([7,8]);`);
+  assert.equal(app.result.report.compiledKernels,1);
+  assert.equal(app.module.early,undefined);same(app.module.partial,app.reference.partial);
+  assert.ok(app.module.error instanceof ReferenceError);assert.equal(calls(app),0);
+  app.module.run(app.module.partial);app.reference.run(app.reference.partial);
+  same(app.module.partial,app.reference.partial);assert.equal(calls(app),1);
+});
+
+test('captured proxies and ordinary arrays retain source property effects without speculative reads', async () => {
+  const app=await application(`let field=new Float64Array([1,2,3]);
+    function h(i){return field[i];}
+    function update(out){for(let i=0;i<out.length;i++)out[i]=h(i);}
+    export const run=out=>update(out);export function configure(value){field=value;}`);
+  const events=[],referenceEvents=[];
+  const observed=events=>new Proxy([4,5,6],{get(target,key,receiver){events.push(key);return Reflect.get(target,key,receiver);}});
+  const out=new Float64Array(3),expected=out.slice();
+  app.module.configure(observed(events));app.reference.configure(observed(referenceEvents));
+  app.module.run(out);app.reference.run(expected);same(out,expected);
+  assert.deepEqual(events,referenceEvents);assert.equal(calls(app),0);
+  app.module.configure(new Float64Array([7,8,9]));app.reference.configure(new Float64Array([7,8,9]));
+  app.module.run(out);app.reference.run(expected);same(out,expected);assert.equal(calls(app),1);
+});
+
+test('array binding reassignment and unsupported captured helper parameters retain the original source', async () => {
+  for(const helper of [
+    'function h(i){field=other;return field[i];}',
+    'function h(...indices){return field[indices[0]];}',
+  ]) {
+    const app=await application(`let field=new Float64Array([1,2,3]),other=new Float64Array([4,5,6]);${helper}
+      function update(out){for(let i=0;i<out.length;i++)out[i]=h(i);}
+      export const run=out=>update(out);`,{loopIslands:true});
+    assert.equal(app.result.report.compiledKernels,0);
+    const out=new Float64Array(3),expected=out.slice();
+    app.module.run(out);app.reference.run(expected);same(out,expected);
+  }
+});
+
 test('real relocated lazy applications retain live imported captures in whole functions and callbacks', async t => {
   const root=directory(),src=path.join(root,'src'),out=path.join(root,'dist');fs.mkdirSync(src);
   fs.writeFileSync(path.join(root,'package.json'),'{"type":"module"}');

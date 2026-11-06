@@ -1,9 +1,11 @@
 /** Compile-only closure conversion for immutable module helper declarations.
  * Captures are live declarative bindings, never properties or baked values.
  * Original functions stay intact; the ordinary numeric compiler must close
- * every converted body, and runtime dispatch guards each hidden Number input.
+ * every converted body, and runtime dispatch guards each hidden scalar/view.
  */
+import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
+import {discoverNumericArrayParameters} from './numeric_loop_discovery.mjs';
 
 const contains = (outer, inner) => outer.start <= inner.start && inner.end <= outer.end;
 const varScope = scope => ['Program', 'FunctionDeclaration', 'FunctionExpression',
@@ -118,6 +120,25 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
     const convertedHelpers = new Map(helperSources);
     for (const [name, record] of reachable)
       convertedHelpers.set(name, rewrite(record.node.start, record.node.end, helperEdits.get(name)));
+    // Propose storage slots from the converted helper graph, including aliases,
+    // forwarding helpers and inline numeric callbacks. This is only discovery:
+    // the numeric compiler must close every body for each emitted layout, and
+    // the existing native view/alias guards still decide every invocation.
+    let declarations;
+    try {
+      declarations = new Map([...reachable.keys()].map(name => [name,
+        acorn.parse(convertedHelpers.get(name), {ecmaVersion:'latest', sourceType:'module'}).body[0]]));
+    } catch (error) {
+      // Appending to an unsupported rest/default parameter form can make the
+      // speculative helper invalid. Retain the valid original application.
+      if (!(error instanceof SyntaxError)) throw error;
+      return {refusal:'KERNEL_NOT_CLOSED'};
+    }
+    const arrayParameters = new Set();
+    for (const declaration of declarations.values())
+      for (const name of discoverNumericArrayParameters(declaration, declarations))
+        if (parameters.includes(name)) arrayParameters.add(name);
+    const captureKinds = parameters.map(name => arrayParameters.has(name) ? 'array' : 'number');
     function originalOffset(node, edits, generated) {
       let delta = 0;
       for (const edit of edits) {
@@ -130,7 +151,7 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
       return node.start + generated - delta;
     }
     return {
-      captures, parameters, helperSources:convertedHelpers,
+      captures, parameters, captureKinds, arrayParameters, helperSources:convertedHelpers,
       rewrite:(start = root.start, end = root.end, overrides = []) => rewrite(start, end, entryEdits, overrides),
       originalSpan(name, span) {
         const record = name ? reachable.get(name) : entry;

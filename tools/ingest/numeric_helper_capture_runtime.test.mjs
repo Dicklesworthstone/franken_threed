@@ -13,6 +13,12 @@ const artifact = compile();
 const options = resolve => ({parameterCount:1, captureCount:1, resolve});
 const create = (target, resolve, alternatives = []) =>
   createNumericDispatch(target, artifact.wasm, alternatives, null, true, options(resolve));
+const arrayOptions = (resolve, captureKinds = ['array'], parameterCount = 1) =>
+  ({parameterCount, captureCount:captureKinds.length, captureKinds, resolve});
+const arraySource = 'function update(out,hidden){for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];}}';
+const arrayArtifact = compileNumericKernel(arraySource, {parameterTypes:['f64[]','f64[]'],generalControl:true});
+const createArray = (target, resolve, wasm = arrayArtifact.wasm) =>
+  createNumericDispatch(target, wasm, [], null, true, arrayOptions(resolve));
 
 test('refreshes live helper captures after source arguments and preserves numeric edge values', () => {
   let gain = 0;
@@ -215,4 +221,226 @@ test('capture contracts reject invalid parameter tails and malformed runtime met
   const values=new Float64Array([1]);
   assert.deepEqual(dispatchNumericCall(token,original,[values,9]),[values,9]);
   assert.equal(numericDispatchDiagnostics(token).initializationFailure,'KERNEL_INITIALIZATION_FAILED');
+});
+
+test('live array captures read and write all nine layouts beside scalar captures', () => {
+  const types = [
+    ['f64[]',Float64Array],['f32[]',Float32Array],['i8[]',Int8Array],
+    ['u8[]',Uint8Array],['u8c[]',Uint8ClampedArray],['i16[]',Int16Array],
+    ['u16[]',Uint16Array],['i32[]',Int32Array],['u32[]',Uint32Array],
+  ];
+  const source = 'function update(out,hidden,gain){for(let i=0;i<out.length;i++){out[i]+=hidden[i]*gain;hidden[i]+=out[i];}}';
+  const variants = types.map(([type]) => {
+    const parameterTypes=['f64[]',type,'f64'];
+    return {parameterTypes,bytes:compileNumericKernel(source,{parameterTypes,generalControl:true}).wasm};
+  });
+  let hidden, gain=0;
+  function update(out) { for(let i=0;i<out.length;i++){out[i]+=hidden[i]*gain;hidden[i]+=out[i];} }
+  const token=createNumericDispatch(update,variants[0].bytes,variants.slice(1),null,true,
+    arrayOptions(() => [hidden,gain],['array','number']));
+  assert.equal(numericDispatchDiagnostics(token).initialized,false);
+  for(const [,Type] of types) for(const value of [0.5,-1.25]) {
+    hidden=new Type([2,120,255]); gain=value;
+    const expectedHidden=hidden.slice(), out=new Float64Array([3,-20,1]), expectedOut=out.slice();
+    for(let i=0;i<expectedOut.length;i++) {
+      expectedOut[i]+=expectedHidden[i]*gain; expectedHidden[i]+=expectedOut[i];
+    }
+    dispatchNumericCall(token,update,[out]);
+    assert.deepEqual(out,expectedOut); assert.deepEqual(hidden,expectedHidden);
+  }
+  const stats=numericDispatchDiagnostics(token);
+  assert.equal(stats.variants.reduce((sum,v)=>sum+(v.kernel?.wasmCalls??0),0),18);
+  assert.equal(stats.captureMisses,0);
+});
+
+test('captured views alias visible arguments and each other in one ordered transaction', () => {
+  const wasm=compileNumericKernel(`function update(out,left,right){
+    for(let i=0;i<out.length;i++){out[i]+=left[i];right[i]+=out[i];}
+  }`,{parameterTypes:['f64[]','f64[]','f64[]'],generalControl:true}).wasm;
+  for(const offsets of [[0,0,0],[0,1,2],[2,1,0]]) {
+    const actual=new Float64Array([1,2,3,4,5]), expected=actual.slice();
+    const [out,left,right]=offsets.map(offset=>actual.subarray(offset,offset+3));
+    const [referenceOut,referenceLeft,referenceRight]=offsets.map(offset=>expected.subarray(offset,offset+3));
+    for(let i=0;i<referenceOut.length;i++){referenceOut[i]+=referenceLeft[i];referenceRight[i]+=referenceOut[i];}
+    function update(out) { for(let i=0;i<out.length;i++){out[i]+=left[i];right[i]+=out[i];} }
+    const token=createNumericDispatch(update,wasm,[],null,true,arrayOptions(()=>[left,right],['array','array']));
+    dispatchNumericCall(token,update,[out]);
+    assert.deepEqual(actual,expected);
+    assert.equal(numericDispatchDiagnostics(token).kernel.wasmCalls,1);
+  }
+});
+
+test('a zero-argument helper can mutate only captured storage and keep live rebinding', () => {
+  let hidden=new Float64Array([2,3]);
+  function update() { for(let i=0;i<hidden.length;i++) hidden[i]*=2; }
+  const wasm=compileNumericKernel('function update(hidden){for(let i=0;i<hidden.length;i++)hidden[i]*=2;}',
+    {parameterTypes:['f64[]'],generalControl:true}).wasm;
+  const token=createNumericDispatch(update,wasm,[],null,true,arrayOptions(()=>[hidden],['array'],0));
+  dispatchNumericCall(token,update,[]);
+  assert.deepEqual(hidden,new Float64Array([4,6]));
+  hidden=new Float64Array([5]);
+  dispatchNumericCall(token,update,[]);
+  assert.deepEqual(hidden,new Float64Array([10]));
+  assert.equal(numericDispatchDiagnostics(token).kernel.wasmCalls,2);
+});
+
+test('array capture admission rejects proxies and spoofed tags without observable reads', () => {
+  let hooks=0;
+  const trap=()=>{hooks++;throw new Error('Speculative property access');};
+  const spoof=Object.defineProperty({},Symbol.toStringTag,{get:trap});
+  const proxy=new Proxy(new Float64Array([4]),{get:trap,getPrototypeOf:trap,getOwnPropertyDescriptor:trap});
+  const revoked=Proxy.revocable(new Float64Array([4]),{}); revoked.revoke();
+  for(const hidden of [spoof,proxy,revoked.proxy,[],new DataView(new ArrayBuffer(8)),new BigInt64Array([4n])]) {
+    let observed;
+    function original(...args) { observed={receiver:this,args}; return args[0]; }
+    const token=createArray(original,()=>[hidden]), out=new Float64Array([2]);
+    assert.equal(dispatchNumericCall(token,original,[out]),out);
+    assert.deepEqual(observed,{receiver:undefined,args:[out]});
+    assert.equal(numericDispatchDiagnostics(token).initialized,false);
+  }
+  assert.equal(hooks,0);
+});
+
+test('captured arrays use the existing ownership, prototype and mutable-length guards', () => {
+  const wasm=compileNumericKernel('function update(out,hidden){for(let i=0;i<hidden.length;i++)out[i]+=hidden[i];}',
+    {parameterTypes:['f64[]','f64[]'],generalControl:true}).wasm;
+  class Derived extends Float64Array {}
+  let hooks=0;
+  const lengthOverride=Object.defineProperty(new Float64Array([3]),'length',{get(){hooks++;return 1;}});
+  const detached=new Float64Array([3]); structuredClone(detached.buffer,{transfer:[detached.buffer]});
+  const cases=[
+    [new Derived([3]),'KERNEL_ARRAY_TYPE'],[lengthOverride,'KERNEL_MUTABLE_LENGTH'],
+    [new Float64Array(new SharedArrayBuffer(8)),'KERNEL_ARRAY_OWNERSHIP'],
+    [new Float64Array(new ArrayBuffer(8,{maxByteLength:16})),'KERNEL_ARRAY_OWNERSHIP'],
+    [detached,'KERNEL_ARRAY_OWNERSHIP'],
+  ];
+  for(const [hidden,reason] of cases) {
+    let observed;
+    function original(...args) { observed=args; }
+    const token=createArray(original,()=>[hidden],wasm),out=new Float64Array([2]);
+    dispatchNumericCall(token,original,[out]);
+    assert.deepEqual(observed,[out]); assert.equal(hooks,0);
+    const stats=numericDispatchDiagnostics(token);
+    assert.equal(stats.kernel.wasmCalls,0); assert.equal(stats.kernel.lastGuardFailure,reason);
+  }
+  const hidden=new Float64Array([3]);
+  for(const key of ['buffer','byteLength','byteOffset']) Object.defineProperty(hidden,key,{get(){hooks++;throw new Error(key);}});
+  const out=new Float64Array([2]);
+  const original=function(out) { out[0]+=hidden[0]; };
+  const actualToken=createArray(original,()=>[hidden],wasm);
+  dispatchNumericCall(actualToken,original,[out]);
+  assert.equal(out[0],5); assert.equal(hooks,0);
+  assert.equal(numericDispatchDiagnostics(actualToken).kernel.wasmCalls,1);
+});
+
+test('array capture TDZ fallback preserves zero-trip behavior and initializes lazily afterward', () => {
+  const token=createNumericLoopDispatch(arrayArtifact.wasm,[],null,arrayOptions(()=>[hidden]));
+  const empty=new Float64Array();
+  assert.equal(dispatchNumericLoop(token,()=>[empty]),false);
+  for(let i=0;i<empty.length;i++){empty[i]+=hidden[i];hidden[i]+=empty[i];}
+  assert.equal(numericLoopDispatchDiagnostics(token).initialized,false);
+  let hidden=new Float64Array([4]), out=new Float64Array([2]);
+  assert.equal(dispatchNumericLoop(token,()=>[out]),true);
+  assert.deepEqual(out,new Float64Array([6])); assert.deepEqual(hidden,new Float64Array([10]));
+  assert.equal(numericLoopDispatchDiagnostics(token).kernel.wasmCalls,1);
+});
+
+test('captured array writes roll back before bounds and fuel failures rerun source exactly once', () => {
+  for(const [hiddenValues,maxIterations] of [[[3],100],[[3,4,5],1]]) {
+    let calls=0;
+    const hidden=new Float64Array(hiddenValues), expectedHidden=hidden.slice();
+    const out=new Float64Array([2,4,6]), expectedOut=out.slice();
+    for(let i=0;i<expectedOut.length;i++){expectedOut[i]+=expectedHidden[i];expectedHidden[i]+=expectedOut[i];}
+    function update(out) { calls++;for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];} }
+    const wasm=compileNumericKernel(arraySource,{parameterTypes:['f64[]','f64[]'],generalControl:true,maxIterations}).wasm;
+    const token=createArray(update,()=>[hidden],wasm);
+    dispatchNumericCall(token,update,[out]);
+    assert.equal(calls,1); assert.deepEqual(out,expectedOut); assert.deepEqual(hidden,expectedHidden);
+    const stats=numericDispatchDiagnostics(token);
+    assert.equal(stats.kernel.wasmCalls,0); assert.equal(stats.kernel.fallbackCalls,1);
+    assert.equal(stats.kernel.lastGuardFailure,'KERNEL_EXECUTION_FAILED');
+  }
+});
+
+test('memory-growth capture rebinding retains new storage without publishing staged writes', () => {
+  const previous=new Float64Array(10000).fill(2), replacement=new Float64Array(10000).fill(7);
+  let hidden=previous;
+  function update(out) { for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];} }
+  const token=createArray(update,()=>[hidden]), out=new Float64Array(10000).fill(3);
+  const grow=WebAssembly.Memory.prototype.grow;
+  try {
+    WebAssembly.Memory.prototype.grow=function(...args) {
+      hidden=replacement; return Reflect.apply(grow,this,args);
+    };
+    dispatchNumericCall(token,update,[out]);
+  } finally { WebAssembly.Memory.prototype.grow=grow; }
+  assert.ok(previous.every(value=>value===2)); assert.ok(replacement.every(value=>value===17));
+  assert.ok(out.every(value=>value===10));
+  const stats=numericDispatchDiagnostics(token);
+  assert.equal(stats.kernel.wasmCalls,0); assert.equal(stats.kernel.fallbackCalls,1);
+  assert.equal(stats.kernel.lastGuardFailure,'KERNEL_CAPTURE_BINDING');
+});
+
+test('constructor reentry sees live array bindings and never replaces the outer capture snapshot', () => {
+  const previous=new Float64Array([2]), replacement=new Float64Array([5]);
+  let hidden=previous;
+  function update(out) { for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];} }
+  const token=createArray(update,()=>[hidden]), outer=new Float64Array([3]), inner=new Float64Array([4]);
+  const Native=WebAssembly.Module;
+  function ReentrantModule(...args) {
+    hidden=replacement; dispatchNumericCall(token,update,[inner]);
+    return Reflect.construct(Native,args);
+  }
+  Object.setPrototypeOf(ReentrantModule,Native);
+  try {
+    WebAssembly.Module=ReentrantModule;
+    dispatchNumericCall(token,update,[outer]);
+  } finally { WebAssembly.Module=Native; }
+  assert.deepEqual(previous,new Float64Array([2])); assert.deepEqual(replacement,new Float64Array([31]));
+  assert.equal(inner[0],9); assert.equal(outer[0],17);
+  let stats=numericDispatchDiagnostics(token);
+  assert.equal(stats.reentrantMisses,1); assert.equal(stats.kernel.lastGuardFailure,'KERNEL_CAPTURE_BINDING');
+  dispatchNumericCall(token,update,[outer]);
+  assert.equal(outer[0],48); assert.equal(replacement[0],79);
+  stats=numericDispatchDiagnostics(token); assert.equal(stats.kernel.wasmCalls,1);
+});
+
+test('array captures append after scalar loop state and publish both outputs together', () => {
+  let hidden=new Float64Array([2,5]), total=1;
+  const wasm=compileNumericKernel(`function update(out,state,hidden){
+    let sum=state[0];for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];sum+=out[i];}state[0]=sum;
+  }`,{parameterTypes:['f64[]','f64[]','f64[]'],generalControl:true}).wasm;
+  const token=createNumericLoopDispatch(wasm,[],null,arrayOptions(()=>[hidden],['array'],2));
+  const out=new Float64Array([3,4]);
+  const state=dispatchNumericStateLoop(token,()=>[out,total],1);
+  assert.notEqual(state,null); total=state[0];
+  assert.deepEqual(out,new Float64Array([5,9])); assert.deepEqual(hidden,new Float64Array([7,14]));
+  assert.equal(total,15); assert.equal(numericLoopDispatchDiagnostics(token).kernel.wasmCalls,1);
+});
+
+test('array capture contracts validate kinds and every embedded parameter tail', () => {
+  const resolve=()=>[new Float64Array([2])];
+  for(const captureKinds of [null,{},[],['object'],['array','number'],Array(1)]) {
+    assert.throws(()=>createNumericDispatch(()=>{},arrayArtifact.wasm,[],null,true,
+      {...arrayOptions(resolve),captureKinds}),TypeError);
+  }
+  for(const [captureKinds,parameterTypes] of [
+    [['array'],['f64[]','f64']],[['number'],['f64[]','f32[]']],
+  ]) assert.throws(()=>createNumericDispatch(()=>{},arrayArtifact.wasm,
+    [{parameterTypes,bytes:arrayArtifact.wasm}],null,true,arrayOptions(resolve,captureKinds)),TypeError);
+  const original=(...args)=>args, out=new Float64Array([1]);
+  const scalarTail=createNumericDispatch(original,artifact.wasm,[],null,true,arrayOptions(resolve));
+  assert.deepEqual(dispatchNumericCall(scalarTail,original,[out]),[out]);
+  assert.equal(numericDispatchDiagnostics(scalarTail).initializationFailure,'KERNEL_INITIALIZATION_FAILED');
+  const arrayTail=createNumericDispatch(original,arrayArtifact.wasm,[],null,true,options(()=>[2]));
+  assert.deepEqual(dispatchNumericCall(arrayTail,original,[out]),[out]);
+  assert.equal(numericDispatchDiagnostics(arrayTail).initializationFailure,'KERNEL_INITIALIZATION_FAILED');
+
+  const captureKinds=['array'], hidden=new Float64Array([2]);
+  function update(out) { for(let i=0;i<out.length;i++){out[i]+=hidden[i];hidden[i]+=out[i];} }
+  const token=createNumericDispatch(update,arrayArtifact.wasm,[],null,true,arrayOptions(()=>[hidden],captureKinds));
+  captureKinds[0]='number';
+  dispatchNumericCall(token,update,[out]);
+  assert.equal(out[0],3); assert.equal(hidden[0],5);
+  assert.equal(numericDispatchDiagnostics(token).kernel.wasmCalls,1);
 });

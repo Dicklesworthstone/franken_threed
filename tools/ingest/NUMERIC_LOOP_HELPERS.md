@@ -83,7 +83,7 @@ Standalone helper registrations remain lazy for other call sites and exports.
 Reports distinguish `absorbedCalls` from remaining `rewrittenCalls`; an absorbed
 call is not a separate host-to-Wasm transition.
 
-## Live scalar bindings in helpers
+## Live module bindings in helpers
 
 Automatic application specialization also supports helpers that read module
 Number bindings, including live imports and transitive helper calls:
@@ -105,7 +105,7 @@ helper and exported function objects, declarations and source text stay intact.
 The same conversion applies to helper graphs inside extracted callback loops;
 ordinary surrounding effects remain at their original boundaries.
 
-Every captured binding must hold a primitive Number and remain read-only for
+Captured scalar bindings must hold primitive Numbers and remain read-only for
 the selected region and all reachable helpers. Changes between invocations,
 such as `configure` above, are supported. Writes inside the region, including a
 module `var` loop header, retain JavaScript. Uninitialized or non-number captures
@@ -113,11 +113,40 @@ also retain JavaScript, preserving zero-trip behavior, partial exceptions and
 per-iteration coercions. Guarded preparation rechecks the live values before
 native execution so host reentry cannot publish a stale snapshot.
 
+Helpers can also read and write live captured numeric typed arrays:
+
+```js
+let positions = new Float32Array(12000);
+let velocities = new Float32Array(12000);
+function integrate(i, dt) {
+  positions[i] += velocities[i] * dt;
+}
+export function update(dt) {
+  for (let i = 0; i < positions.length; i++) integrate(i, dt);
+}
+```
+
+The captured views enter the same staged transaction as explicit array
+arguments. Same-type overlapping views share storage, every view keeps its own
+bounds, and stores retain their element conversions. Scalar reductions and
+writes through other helpers observe those stores in source order. A failed
+bounds or work check discards all speculative output before the original
+function or loop executes once. Captured arrays may be replaced between calls;
+rebinding a captured variable inside the admitted region remains unsupported.
+
+All nine numeric typed-array layouts use the existing ABI and native guards.
+Allocation hints from the original capture bindings select bounded variants,
+including mixed Float32 geometry, Uint32 indices and clamped byte colors.
+Unemitted layout combinations retain JavaScript. Proxies, ordinary arrays,
+shared/resizable storage and incompatible overlapping views keep their existing
+fallback behavior. Binding identity is checked again after Wasm preparation,
+so initialization or memory-growth reentry cannot publish an obsolete view.
+
 This conversion reads declarative bindings only. It does not read properties,
-invoke getters, inspect proxies or bake initializer values. Array captures in
-helpers still require explicit helper arguments. Reports identify admitted
-bindings in `helperCaptures`; the raw numeric compiler and standalone kernel
-source API continue to require explicitly closed helper functions.
+invoke getters, inspect proxies or bake initializer values. Reports identify
+admitted bindings in `helperCaptures` and distinguish array/scalar slots with
+`helperCaptureKinds` when arrays are present. The raw numeric compiler and
+standalone kernel source API still require explicitly closed helper functions.
 
 ## Binding and fallback boundaries
 
@@ -144,7 +173,8 @@ node --test tools/ingest/numeric_loop_helpers.test.mjs \
   tools/ingest/numeric_loop_helper_transactions.test.mjs \
   tools/ingest/numeric_loop_helpers.integration.test.mjs \
   tools/ingest/numeric_helper_captures.test.mjs \
-  tools/ingest/numeric_helper_capture_runtime.test.mjs
+  tools/ingest/numeric_helper_capture_runtime.test.mjs \
+  tools/ingest/numeric_helper_array_captures.integration.test.mjs
 ```
 
 The tests execute real Wasm in Node and compare against untouched source. They

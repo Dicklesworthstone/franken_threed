@@ -17,11 +17,25 @@ const ARRAY_TAGS = Object.freeze({
   "i16[]": "Int16Array", "u16[]": "Uint16Array",
   "i32[]": "Int32Array", "u32[]": "Uint32Array",
 });
+const CAPTURE_ARRAY_TAGS = Object.freeze(Object.fromEntries(
+  Object.values(ARRAY_TAGS).map(tag => [tag, true]),
+));
 const typedTag = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Float64Array.prototype),
   Symbol.toStringTag,
 ).get;
 const records = new WeakMap();
+
+// Native slot reads reject proxies and ordinary objects without consulting their
+// properties. The kernel separately enforces prototypes, ownership and lengths.
+function captureValueMatches(kind, value) {
+  return kind === 'number' ? typeof value === 'number'
+    : hasOwn(CAPTURE_ARRAY_TAGS, apply(typedTag, value, []));
+}
+
+function captureTypeMatches(kind, type) {
+  return kind === 'number' ? type === 'f64' : hasOwn(ARRAY_TAGS, type);
+}
 
 // A guard miss must not expose compiler-added arguments to the source function,
 // or invoke a changed Array iterator/species while reconstructing its arguments.
@@ -63,8 +77,10 @@ function state(target, bytes, parameterTypes = null, resolveMath = null, preserv
  * preserveAliasing is a producer assertion for ALL variants: their loads/stores
  * preserve source order without optimizations assuming disjoint parameters.
  * Storage identity and mixed-type overlap guards still run on each invocation.
- * captureOptions describes compiler-added read-only scalar parameters. Its
- * resolver may only read proven declarative bindings in the helper environment;
+ * captureOptions describes compiler-added read-only bindings. Array contents
+ * participate in the same ordered storage transaction as ordinary arguments.
+ * captureKinds defaults to scalar Numbers for existing generated applications.
+ * The resolver may only read proven declarative bindings in the helper environment;
  * it is not an application callback. Capture values never become source args.
  */
 export function createNumericDispatch(
@@ -84,14 +100,23 @@ export function createNumericDispatch(
     if (!Number.isInteger(parameterCount) || parameterCount < 0 ||
         !Number.isInteger(captureCount) || captureCount < 1 || parameterCount + captureCount > 64 ||
         typeof resolve !== 'function') throw new TypeError('Invalid numeric helper capture contract');
-    captures = Object.freeze({parameterCount, captureCount, resolve});
+    const captureKinds = captureOptions.captureKinds === undefined
+      ? Array(captureCount).fill('number') : captureOptions.captureKinds;
+    if (!isArray(captureKinds) || captureKinds.length !== captureCount)
+      throw new TypeError('Invalid numeric helper capture kinds');
+    for (let i = 0; i < captureCount; i++)
+      if (captureKinds[i] !== 'number' && captureKinds[i] !== 'array')
+        throw new TypeError('Invalid numeric helper capture kinds');
+    captures = Object.freeze({parameterCount, captureCount, resolve,
+      captureKinds: Object.freeze(captureKinds.slice())});
   }
   const captureGuard = captures === null ? null : () => {
     try {
       const values = captures.resolve();
       if (!root.captureValues || !isArray(values) || values.length !== captures.captureCount) return false;
       for (let i = 0; i < values.length; i++)
-        if (typeof values[i] !== 'number' || !sameValue(values[i], root.captureValues[i])) return false;
+        if (!captureValueMatches(captures.captureKinds[i], values[i]) ||
+            !sameValue(values[i], root.captureValues[i])) return false;
       return true;
     } catch { return false; }
   };
@@ -107,8 +132,9 @@ export function createNumericDispatch(
       throw new TypeError("Invalid numeric dispatch alternative ABI");
     }
     if (captures && (variant.parameterTypes.length !== captures.parameterCount + captures.captureCount ||
-        variant.parameterTypes.slice(captures.parameterCount).some(type => type !== 'f64')))
-      throw new TypeError('Numeric helper captures require an f64 parameter tail');
+        variant.parameterTypes.slice(captures.parameterCount).some((type, index) =>
+          !captureTypeMatches(captures.captureKinds[index], type))))
+      throw new TypeError('Numeric helper capture kinds must match the parameter tail');
     return state(target, variant.bytes, variant.parameterTypes.slice(), resolveMath, preserveAliasing, captures, captureGuard);
   });
   const token = Object.freeze({});
@@ -156,7 +182,8 @@ export function dispatchNumericCall(token, callee, args) {
       if (args.length !== root.captures.parameterCount || !numericArrayIterationIntact()) throw null;
       captures = root.captures.resolve();
       if (!isArray(captures) || captures.length !== root.captures.captureCount) throw null;
-      for (let i = 0; i < captures.length; i++) if (typeof captures[i] !== 'number') throw null;
+      for (let i = 0; i < captures.length; i++)
+        if (!captureValueMatches(root.captures.captureKinds[i], captures[i])) throw null;
     } catch {
       root.captureMisses++;
       root.primary.retainedCalls++;
@@ -196,7 +223,8 @@ function executeNumericCall(root, callee, args) {
           kernel.manifest.parameters.some((param, i) => param.type !== record.parameterTypes[i]))) ||
         (record.captures && (kernel.manifest.parameters.length !==
           record.captures.parameterCount + record.captures.captureCount ||
-          kernel.manifest.parameters.slice(record.captures.parameterCount).some(param => param.type !== 'f64')))
+          kernel.manifest.parameters.slice(record.captures.parameterCount).some((param, index) =>
+            !captureTypeMatches(record.captures.captureKinds[index], param.type))))
       ) {
         kernel.dispose();
         throw new TypeError("Dispatch alternative does not match its embedded Wasm ABI");

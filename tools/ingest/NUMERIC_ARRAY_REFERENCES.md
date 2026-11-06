@@ -85,9 +85,12 @@ References cannot escape as function results, enter scalar arithmetic or identit
 comparisons, or expose properties other than supported element access and
 intrinsic length. Array allocation, methods such as `subarray`, unsupported
 object operations, uninitialized bindings and mixed scalar/reference assignment
-retain JavaScript. Helpers with captured state, recursion or unsupported effects
-keep their existing refusal behavior. Valid application code is not rejected
-merely because this native route is unavailable.
+retain JavaScript. Automatic application specialization can lift read-only
+module bindings containing Numbers or numeric typed arrays into
+[helper parameters](NUMERIC_LOOP_HELPERS.md#live-module-bindings-in-helpers),
+including writable array contents. Rebinding those captured variables inside
+the region, recursion and unsupported effects retain JavaScript. Valid
+application code is not rejected merely because this native route is unavailable.
 
 Rebinding an array variable captured from outside an extracted loop still stays
 in JavaScript: the loop's scalar publication channel is not used to publish a

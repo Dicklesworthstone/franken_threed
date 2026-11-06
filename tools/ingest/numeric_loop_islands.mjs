@@ -319,7 +319,8 @@ export function planNumericLoopIslands(source, {
     if (!lifted) for (const edit of varEdits)
       body = body.slice(0, edit.start - node.start) + edit.text + body.slice(edit.end - node.start);
     const kernelSource = `function ${functionName}(${parameters.join(',')}) {\n${prologue}\n${body}\n${epilogue}\n}`;
-    const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ? 'f64[]' : 'f64');
+    const parameterTypes = parameters.map(name => arrays.has(name) || name === stateName ||
+      lifted?.arrayParameters.has(name) ? 'f64[]' : 'f64');
     const compile = types => compileNumericCandidate(kernelSource, {
       parameterTypes:types, helperSources:lifted?.helperSources ?? helperSources,
       allowMath:usesMath || helperSources.size > 0, generalControl:true,
@@ -334,7 +335,10 @@ export function planNumericLoopIslands(source, {
       item.reason=error.code; item.detail=error.message; continue;
     }
     const params=artifact.manifest.parameters;
-    const layouts=hints([{arguments:parameters.map(name => ({type:'Identifier',name}))}],params);
+    const captureNames = new Map(lifted?.parameters.map((name, i) => [name, lifted.captures[i]]));
+    const layouts=hints([{arguments:parameters.map(name =>
+      ({type:'Identifier',name:captureNames.get(name) ?? name}))}],params,
+      {includeFloat:!!lifted?.arrayParameters.size});
     for (const [read,write] of [['f32[]','f32[]'],['f64[]','f32[]'],['f32[]','f64[]']])
       layouts.push(params.map(p => p.type==='f64' ? 'f64' : p.write ? write : read));
     const alternatives=[], seen=new Set([parameterTypes.join(',')]);
@@ -356,7 +360,8 @@ export function planNumericLoopIslands(source, {
     // Capture that resolver lazily at module registration, without reading its
     // value during initialization (including ESM cycles and lexical TDZ).
     const moduleMath = !!artifact.manifest.mathIntrinsics && artifact.helpers.some(helper => usesHelperMath(helper.name));
-    const captureOptions = lifted ? `, ${moduleMath ? '() => Math' : 'null'}, {parameterCount:${parameters.length - lifted.captures.length}, captureCount:${lifted.captures.length}, resolve:() => [${lifted.captures.join(',')}]}`
+    const captureKinds = lifted?.arrayParameters.size ? `, captureKinds:${JSON.stringify(lifted.captureKinds)}` : '';
+    const captureOptions = lifted ? `, ${moduleMath ? '() => Math' : 'null'}, {parameterCount:${parameters.length - lifted.captures.length}, captureCount:${lifted.captures.length}${captureKinds}, resolve:() => [${lifted.captures.join(',')}]}`
       : moduleMath ? ', () => Math' : '';
     registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${captureOptions});`);
     // An extra block prevents a dangling else from rebinding to our predicate.
@@ -389,7 +394,9 @@ export function planNumericLoopIslands(source, {
     for (const edit of nestedEdits) absorbedEdits.add(edit);
     if (nestedCalls.length) item.absorbedCalls = nestedCalls.map(call => ({...call}));
     Object.assign(item, {route:'guarded-loop-wasm', captures:params.map(p => ({...p})),
-      ...(lifted ? {helperCaptures:[...lifted.captures], helperCaptureSemantics:'live-readonly-module-numbers'} : {}),
+      ...(lifted ? {helperCaptures:[...lifted.captures],
+        helperCaptureSemantics:lifted.arrayParameters.size ? 'live-readonly-module-bindings' : 'live-readonly-module-numbers',
+        ...(lifted.arrayParameters.size ? {helperCaptureKinds:[...lifted.captureKinds]} : {})} : {}),
       ...(stateName ? {scalarOutputs:[...scalarOutputs], scalarOutputSemantics:'mutable-lexical-f64-publication'} : {}),
       ...(outputOnly.size ? {outputOnlyScalars:[...outputOnly]} : {}),
       storageSemantics:'same-type-alias-preserving-v1', guardFallback:'original-loop-in-place',
