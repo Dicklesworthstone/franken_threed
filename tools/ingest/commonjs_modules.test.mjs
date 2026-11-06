@@ -92,6 +92,123 @@ test('CommonJS packages keep nested requires, cycles, lazy effects and singleton
   assert.deepEqual(fs.readFileSync((await value.module()).asset), Buffer.from([9, 2, 6, 5]));
 });
 
+const retryFiles = () => ({
+  'main.cjs': `const state = require('./state.cjs');
+    module.exports = {state, load: () => require('./parent.cjs'), observer: () => require('./observer.cjs'),
+      properties: () => require('./properties.cjs'), replace: () => require('./replace.cjs'), side: () => require('./side.cjs')};`,
+  'state.cjs': `module.exports = {attempts: 0, parents: 0, replacements: 0, sides: 0,
+    failures: [undefined, null, {reason: 'not ready'}], events: [], seen: [], properties: [], replacementObservers: []};`,
+  'parent.cjs': `const state = require('./state.cjs');
+    exports.attempt = ++state.parents; state.events.push('parent:' + exports.attempt);
+    exports.child = require('./retry.cjs');`,
+  'retry.cjs': `const state = require('./state.cjs');
+    const attempt = ++state.attempts; state.events.push('child:' + attempt);
+    exports.attempt = attempt;
+    exports.read = () => exports.attempt;
+    exports.write = value => { exports.attempt = value; };
+    exports.current = () => module.exports;
+    exports.replace = value => { module.exports = value; };
+    exports.reload = () => require('./retry.cjs');
+    state.seen.push(exports);
+    const observer = require('./observer.cjs');
+    if (attempt <= state.failures.length) { exports.failedOnly = true; throw state.failures[attempt - 1]; }
+    exports.ready = true; exports.observer = observer;`,
+  'observer.cjs': `exports.seen = require('./retry.cjs');`,
+  'properties.cjs': `const state = require('./state.cjs');
+    exports.value = state.properties.length + 1;
+    exports.read = () => exports.value;
+    exports.write = value => { exports.value = value; };
+    state.properties.push(exports);
+    if (state.properties.length < 2) throw 'retry exports';`,
+  'replace.cjs': `const state = require('./state.cjs');
+    const attempt = ++state.replacements;
+    state.replacementObservers.push(require('./replace-observer.cjs'));
+    module.exports = () => attempt;
+    if (attempt < 2) throw 17;`,
+  'replace-observer.cjs': `exports.seen = require('./replace.cjs');`,
+  'side.cjs': `const state = require('./state.cjs');
+    if (++state.sides < 2) throw 'retry side effects';`,
+});
+
+function exerciseRetries(app) {
+  const {state} = app;
+  for (let i = 0; i < state.failures.length; i++) {
+    assert.throws(app.load, error => error === state.failures[i], 'rethrow the original value');
+    assert.equal(state.attempts, i + 1);
+    assert.equal(state.parents, i + 1, 'failed ancestors are also retried');
+  }
+  const parent = app.load(), current = parent.child, old = app.observer().seen;
+  assert.equal(parent.attempt, 4);
+  assert.equal(current.attempt, 4);
+  assert.equal(current.ready, true);
+  assert.equal(Object.hasOwn(current, 'failedOnly'), false, 'retry receives fresh exports');
+  assert.equal(new Set(state.seen).size, 4);
+  assert.equal(old, state.seen[0], 'a successful cyclic dependency keeps the failed instance');
+  assert.equal(current.observer, app.observer());
+  assert.notEqual(old, current);
+  old.write(91);
+  assert.equal(old.read(), 91);
+  assert.equal(current.read(), 4, 'old exports closures cannot target the retry');
+  const replacement = {from: 'old module'};
+  old.replace(replacement);
+  assert.equal(old.current(), replacement);
+  assert.equal(current.current(), current, 'old module closures keep their own module object');
+  assert.equal(old.reload(), current, 'old self-require closures use the stable module entry');
+  assert.equal(app.load(), parent, 'successful initialization remains cached');
+  assert.deepEqual(state.events, ['parent:1', 'child:1', 'parent:2', 'child:2',
+    'parent:3', 'child:3', 'parent:4', 'child:4']);
+  assert.throws(app.properties, error => error === 'retry exports');
+  const properties = app.properties(), oldProperties = state.properties[0];
+  oldProperties.write(73);
+  assert.equal(oldProperties.read(), 73);
+  assert.equal(properties.read(), 2, 'exports-only closures keep the old attempt too');
+  assert.equal(app.properties(), properties);
+  assert.throws(app.replace, error => error === 17);
+  const exported = app.replace();
+  assert.equal(exported(), 2);
+  assert.equal(app.replace(), exported);
+  assert.equal(state.replacements, 2);
+  assert.equal(state.replacementObservers[0], state.replacementObservers[1]);
+  assert.deepEqual(state.replacementObservers[0].seen, {}, 'cycles see initial exports before replacement');
+  assert.throws(app.side, error => error === 'retry side effects');
+  const side = app.side();
+  assert.deepEqual(side, {});
+  assert.equal(app.side(), side);
+  assert.equal(state.sides, 2);
+}
+
+test('failed CommonJS initializers retry with fresh exports, old cyclic closures and cached successful children after relocation', async () => {
+  const root = fixture(retryFiles());
+  exerciseRetries(nodeModule.createRequire(import.meta.url)(path.join(root, 'main.cjs')));
+  const built = await buildApplication(path.join(root, 'main.cjs'), path.join(root, 'dist'));
+  const destination = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-commonjs-retry-deployed-'));
+  fs.renameSync(path.join(root, 'dist'), path.join(destination, 'app'));
+  fs.renameSync(root, root + '-source-unavailable');
+  const {default: app} = await import(pathToFileURL(path.join(destination, 'app', built.entryFiles[0])).href);
+  exerciseRetries(app);
+});
+
+test('packed CommonJS initializers preserve retry and cycle state with original sources unavailable', {
+  skip: typeof nodeModule.registerHooks !== 'function',
+}, async () => {
+  const root = fixture({...retryFiles(),
+    'index.html': '<script type="module" src="./entry.mjs"></script>',
+    'entry.mjs': `export {default as app} from './main.cjs';`,
+  });
+  const built = await buildApplication(path.join(root, 'index.html'), path.join(root, 'dist'));
+  const packed = path.join(root, 'standalone.html');
+  packHtml(path.join(built.outDir, built.htmlFile), packed);
+  const html = fs.readFileSync(packed, 'utf8');
+  const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+  const entry = /<script[^>]*type="module"[^>]*src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(root, root + '-source-unavailable');
+  const hook = nodeModule.registerHooks({resolve(specifier, context, next) {
+    return next(imports[specifier] ?? specifier, context);
+  }});
+  try { exerciseRetries((await import(entry)).app); }
+  finally { hook.deregister(); }
+});
+
 test('HTML CommonJS dependency builds pack with lazy ESM assets and shared identity', {
   skip: typeof nodeModule.registerHooks !== 'function',
 }, async () => {
@@ -122,7 +239,7 @@ test('HTML CommonJS dependency builds pack with lazy ESM assets and shared ident
 });
 
 test('the maintained CommonJS transform retains original source content and URL in Rollup maps', async () => {
-  const source = `const value = 42; module.exports = () => value;`;
+  const source = `const value = 42;\nmodule.exports = () => value;`;
   const root = fixture({'main.cjs': source});
   const entry = pathToFileURL(path.join(root, 'main.cjs')).href;
   const moduleSources = createModuleSources();
@@ -133,11 +250,19 @@ test('the maintained CommonJS transform retains original source content and URL 
   ]});
   try {
     const {output} = await bundle.generate({format: 'es', sourcemap: true});
-    const map = output.find(item => item.type === 'chunk').map;
+    const chunk = output.find(item => item.type === 'chunk'), map = chunk.map;
     const index = map.sourcesContent.indexOf(source);
     assert.ok(index >= 0);
     assert.ok(map.sources[index].endsWith('/main.cjs'));
     assert.ok(map.mappings.length > 0);
+    const start = chunk.code.indexOf('const value = 42;');
+    assert.ok(start >= 0);
+    const before = chunk.code.slice(0, start), line = before.split('\n').length - 1;
+    const column = start - (before.lastIndexOf('\n') + 1);
+    const entry = new nodeModule.SourceMap(map).findEntry(line, column);
+    assert.equal(entry.originalSource, map.sources[index]);
+    assert.equal(entry.originalLine, 0);
+    assert.equal(entry.originalColumn, 0);
   } finally { await bundle.close(); }
 });
 

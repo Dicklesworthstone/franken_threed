@@ -190,12 +190,18 @@ ESM and module-worker sources also need frontend normalization; raw CommonJS is
 not copied into those browser module paths. Classic scripts and classic workers
 retain their existing browser execution, including UMD branches.
 
-This is a browser-bundler route, not a complete Node loader. In particular, the
-pinned compiler retains a partially initialized wrapper after an initializer
-throws, whereas Node can evict that module and retry its initialization. Programs
-depending on that retry behavior, Node module/cache introspection, or native
-host APIs need their existing frontend or native Node route. The actual pinned
-Three.js `three.cjs` is a Node-only deprecation wrapper using `process.emitWarning`
+Failed CommonJS initializers discard their cached attempt. A later `require()`
+runs the initializer again with fresh exports and module storage, while already
+successful dependencies stay cached. Cyclic dependencies can keep the original
+partial exports and their closures; retrying does not redirect those closures to
+the new instance. Self-requires still reach the stable module entry. Exceptions
+retain their original values, including primitive throws, and failed ancestors
+also retry. This behavior is covered in relocated builds and packed output, with
+the original source and build trees unavailable.
+
+This is a browser-bundler route, not a complete Node loader. Node module/cache
+introspection and native host APIs need the existing frontend or native Node
+route. The actual pinned Three.js `three.cjs` is a Node-only deprecation wrapper using `process.emitWarning`
 and `require('./three.module.js')`; this browser build refuses that ESM require
 rather than changing its condition, warning, or initialization order. Native
 synchronous Three.js consumers can use the existing

@@ -78,6 +78,88 @@ export function assertUnbundledModule(url, sources, sourceType = 'module') {
     throw commonjsError('UNBUNDLED', 'CommonJS needs the application bundler; retained modules and worker sources must already be browser JavaScript', url);
 }
 
+/** Keep the pinned compiler's initializer, but give each failed attempt its own
+ * storage and lexical environment. A stable require entry still exposes partial
+ * exports to cycles. Reusing a failed attempt's outer export variables would
+ * redirect closures already retained by a successfully initialized dependency.
+ */
+function retryableCommonjs(result, id, ast) {
+  if (result.meta?.commonjs?.isCommonJS !== 'withRequireFunction') return result;
+  const fail = () => { throw commonjsError('WRAPPER', 'Unrecognized pinned CommonJS initializer wrapper', id); };
+  const exported = ast.body.flatMap(node => node.type === 'ExportNamedDeclaration' ? node.specifiers : [])
+    .filter(node => node.exported.name === '__require');
+  const name = exported.length === 1 && exported[0].local.name;
+  const fn = ast.body.find(node => node.type === 'FunctionDeclaration' && node.id.name === name);
+  if (!fn || fn.params.length || fn.async || fn.generator) fail();
+  const [guard, mark] = fn.body.body, final = fn.body.body.at(-1);
+  const flag = guard?.test?.name;
+  if (guard?.type !== 'IfStatement' || guard.test.type !== 'Identifier' || guard.alternate ||
+      guard.consequent.type !== 'ReturnStatement' || final?.type !== 'ReturnStatement' ||
+      mark?.type !== 'ExpressionStatement' || mark.expression.type !== 'AssignmentExpression' ||
+      mark.expression.operator !== '=' || mark.expression.left.type !== 'Identifier' ||
+      mark.expression.left.name !== flag || mark.expression.right.value !== 1 ||
+      result.code.slice(guard.consequent.argument.start, guard.consequent.argument.end) !==
+        result.code.slice(final.argument.start, final.argument.end)) fail();
+  const module = final.argument.type === 'MemberExpression' && !final.argument.computed &&
+    final.argument.object.type === 'Identifier' && final.argument.property.name === 'exports';
+  const storage = module ? final.argument.object.name : final.argument.type === 'Identifier' && final.argument.name;
+  if (!storage) fail();
+  const declarations = ast.body.filter(node => node.type === 'VariableDeclaration');
+  if (!declarations.length || !declarations.some(node => node.kind === 'var' && node.declarations.some(decl =>
+    decl.id.type === 'Identifier' && decl.id.name === flag && !decl.init)) ||
+      declarations.some(node => node.end > fn.start)) fail();
+  const imported = ast.body.find(node => node.type === 'ImportDeclaration' && node.specifiers.some(spec =>
+    spec.local.name === storage));
+  if (imported ? imported.specifiers.length !== 1 || imported.specifiers[0].type !== 'ImportSpecifier' ||
+      imported.specifiers[0].imported.name !== (module ? '__module' : '__exports') ||
+      imported.source.value !== `\0${id}?commonjs-${module ? 'module' : 'exports'}`
+    : module || !declarations.some(node => node.declarations.some(decl =>
+      decl.id.type === 'Identifier' && decl.id.name === storage && !decl.init))) fail();
+
+  const names = new Set();
+  walk.full(ast, node => { if (node.type === 'Identifier') names.add(node.name); });
+  const unique = base => { while (names.has(base)) base += '_'; names.add(base); return base; };
+  const attempt = unique('__f3dCommonjsAttempt'), error = unique('__f3dCommonjsError');
+  const code = result.code;
+  const lastImport = ast.body.filter(node => node.type === 'ImportDeclaration').at(-1);
+  // The compiler can put its module.exports alias between import declarations.
+  // Keep imports at module scope and shadow those generated aliases locally.
+  const outerDeclarations = declarations.filter(node => node.start < (lastImport?.end ?? 0));
+  const first = declarations.find(node => node.start > (lastImport?.end ?? 0)) ?? fn;
+  const lineStart = node => {
+    const start = code.lastIndexOf('\n', node.start - 1) + 1;
+    if (code.slice(start, node.start).trim()) fail();
+    return start;
+  };
+  const afterLine = node => {
+    const end = code.indexOf('\n', node.end);
+    if (end < 0 || code.slice(node.end, end).trim()) fail();
+    return end + 1;
+  };
+  const edits = [
+    [lineStart(first), `var ${attempt};\nfunction ${name} () {\n` +
+      `if (!${attempt}) ${attempt} = (function () {\nvar ${storage} = ${module ? '{exports: {}}' : '{}'};\n` +
+      outerDeclarations.map(node => code.slice(node.start, node.end) + '\n').join('')],
+    [afterLine(mark), 'try {\n'],
+    [lineStart(final), `} catch (${error}) {\n${attempt} = null;\nthrow ${error};\n}\n`],
+    [afterLine(fn), `return ${name};\n})();\nreturn ${attempt}();\n}\n`],
+  ];
+  // Insert only whole generated lines. The compiler's mapped source text keeps
+  // its columns and source-order deltas; empty map rows account for new glue.
+  const map = typeof result.map === 'string' ? JSON.parse(result.map) : result.map;
+  const mappings = map?.mappings.split(';');
+  let output = code;
+  for (const [offset, added] of edits.reverse().sort((a, b) => b[0] - a[0])) {
+    output = output.slice(0, offset) + added + output.slice(offset);
+    if (mappings) {
+      const line = code.slice(0, offset).split('\n').length - 1;
+      while (mappings.length < line) mappings.push('');
+      mappings.splice(line, 0, ...Array(added.split('\n').length - 1).fill(''));
+    }
+  }
+  return {...result, code: output, map: map ? {...map, mappings: mappings.join(';')} : map};
+}
+
 export function commonjsPlugins({moduleSources, resolveModule}) {
   const compiler = commonjs({strictRequires: true, sourceMap: true,
     defaultIsModuleExports: true, requireReturnsDefault: id => id === EMPTY || id.startsWith(JSON_ENTRY),
@@ -86,8 +168,10 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
   compiler.transform = async function(code, id) {
     if (id.startsWith('file:') && !isCommonJS(id, moduleSources)) return null;
     const result = await transform.call(this, code, id);
-    if (id.startsWith('file:') && result?.code) {
-      const ast = this.parse(result.code), helpers = new Set();
+    if (!result?.code) return result;
+    const ast = this.parse(result.code);
+    if (id.startsWith('file:')) {
+      const helpers = new Set();
       for (const node of ast.body) if (node.type === 'ImportDeclaration') {
         if (node.source.value === '\0commonjs-dynamic-modules')
           throw commonjsError('DYNAMIC_REQUIRE', 'Runtime require selection needs a project frontend with an explicit dependency closure', id);
@@ -99,7 +183,7 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
           throw commonjsError('DYNAMIC_REQUIRE', 'Runtime require selection needs a project frontend with an explicit dependency closure', id);
       }});
     }
-    return result;
+    return retryableCommonjs(result, id, ast);
   };
   return [compiler, {
     name: 'f3d-commonjs-boundary',
