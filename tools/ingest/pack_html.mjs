@@ -313,15 +313,43 @@ export function packHtml(
   const html = text(read(documentUrl));
   const tags = [...html.matchAll(TAGS)];
   let base = documentUrl,
-    executableSeen = false;
+    executableSeen = false,
+    baseSeen = false,
+    baseDependentSeen = false;
   const sourceMaps = [],
     mapRanges = [];
   for (const tag of tags) {
     const name = (tag[1] ?? tag[4] ?? "").toLowerCase(),
       attrs = attributes(tag[2] ?? tag[5] ?? "");
-    if (name === "base" && Object.hasOwn(attrs, "href")) {
-      fail("BASE_URL", "Keep the normal build for documents with a base href");
+    if (name === "base") {
+      // HTML uses the first href, independently of the first target. Keep all
+      // source base elements intact so DOM reflection and navigation keep their
+      // native meaning after the standalone document is relocated.
+      if (!baseSeen && Object.hasOwn(attrs, "href")) {
+        if (baseDependentSeen)
+          fail("BASE_URL", "A base href after scripts or URL-bearing markup requires the normal build");
+        const href = entities(attrs.href).replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "").replace(/[\t\n\r]/g, "");
+        if (/^[a-z][\w+.-]*:/i.test(href) || href.includes("\\") ||
+            href.startsWith("/") && (!documentBaseRoot || !isRootRelativeDocumentUrl(href)))
+          fail("BASE_URL", "A standalone base href must be local; origin-root bases require documentRoot");
+        const resolved = new URL(resolveDocumentUrl(href, documentUrl, documentBaseRoot));
+        if (resolved.protocol !== "file:" || resolved.hostname)
+          fail("BASE_URL", "External base URLs require the normal networked build");
+        // A base need not name an existing file, but its existing ancestors
+        // cannot escape either the declared origin or the file-read boundary.
+        documentRelativePath(resolved, root);
+        if (documentBaseRoot) documentRelativePath(resolved, documentBaseRoot);
+        base = resolved.href;
+        baseSeen = true;
+      }
+      continue;
     }
+    // Earlier script execution, import-map registration, stylesheet parsing or
+    // resource fetches can observe the old base. Do not silently move those
+    // observation boundaries by applying a later base to the complete graph.
+    if (name === "script" || name === "style" ||
+        ["src", "href", "srcset", "poster", "style", "xlink:href"].some(key => Object.hasOwn(attrs, key)))
+      baseDependentSeen = true;
     if (
       name === "meta" &&
       entities(attrs["http-equiv"] ?? "").toLowerCase() === "content-security-policy"
@@ -786,7 +814,7 @@ export function packHtml(
       if (!["classic", "module"].includes(kind))
         fail("WORKER_OPTIONS", "Explicit Worker options require a literal classic/module type");
       uses("Worker", "URL", "Blob");
-      rewriteURLs(argument, worker ? worker.entryUrl : documentUrl, (value, origin) => {
+      rewriteURLs(argument, worker ? worker.entryUrl : base, (value, origin) => {
         const childUrl = local(value, origin), record = workerFactory(childUrl, kind);
         if (sourceType === "script") {
           const name = "__f3d_worker_" + digest(kind + ":" + keyFor(childUrl));
@@ -1024,7 +1052,7 @@ export function packHtml(
     }
     return edits(source, replacements);
   }
-  function moduleFor(url, inline = null, kind = "javascript") {
+  function moduleFor(url, inline = null, kind = "javascript", referrer = url) {
     const identity = JSON.stringify([kind, url]);
     if (modules.has(identity)) return modules.get(identity);
     if (modules.size >= maxFiles) fail("PACK_LIMIT", "Module identity count exceeds packing limit");
@@ -1038,7 +1066,7 @@ export function packHtml(
     };
     modules.set(identity, record); // Register before traversal, so cycles close by identity.
     record.source = kind === "javascript" && JS_TYPES.has(record.mime)
-      ? javascript(text(record.original), url) : record.original;
+      ? javascript(text(record.original), referrer) : record.original;
     // The suffix prevents same-byte modules at different source URLs coalescing.
     record.data =
       dataUrl(record.source, record.mime) +
@@ -1170,7 +1198,11 @@ export function packHtml(
       if (type === "module") {
         if (attrs.src !== undefined) rewriteResource("src", false, true);
         else {
-          const record = moduleFor(documentUrl + `#f3d-inline-${inlineId++}`, body);
+          const inlineUrl = new URL(base);
+          inlineUrl.hash = `f3d-inline-${inlineId++}`;
+          // Identity distinguishes inline scripts; import-map scope selection
+          // and relative imports still use the real source document base.
+          const record = moduleFor(inlineUrl.href, body, "javascript", base);
           changes.src = record.data;
           body = "";
           changedBody = true;

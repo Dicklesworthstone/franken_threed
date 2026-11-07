@@ -71,6 +71,100 @@ test("resolves source import-map scopes and aliases before assigning embedded id
   assert.ok(sources.includes('export const tag="special";'));
 });
 
+for (const href of ["./assets/", "./assets/current.html?edition=2&amp;view=all#selected"])
+  test(`local base ${href} closes resources while preserving the original base elements`, () => {
+    const bases = `<base target="_self"><base href="${href}"><base href="https://ignored.invalid/">`;
+    const f = build({
+      "index.html": `${bases}<script type="importmap">{"imports":{"shared":"./shared.mjs"},"scopes":{"./nested/":{"shared":"./special.mjs"}}}</script>
+        <link rel="stylesheet" href="./main.css"><img src="./image.svg#view">
+        <script src="./classic.js"></script><script type="module" src="./nested/entry.mjs"></script>
+        <script type="module">import 'shared'; import './nested/entry.mjs'; export const bytes=new URL('./bytes.bin',import.meta.url);</script>
+        <a href="next.html">Next</a>`,
+      "assets/main.css": `@import './theme.css';body{background:url('./image.svg')}`,
+      "assets/theme.css": "body{color:rgb(12,34,56)}",
+      "assets/image.svg": '<svg xmlns="http://www.w3.org/2000/svg"/>',
+      "assets/classic.js": "globalThis.loaded=true;",
+      "assets/nested/entry.mjs": "import 'shared';",
+      "assets/shared.mjs": "export const tag='normal';",
+      "assets/special.mjs": "export const tag='scoped';",
+      "assets/bytes.bin": Buffer.from([3, 1, 4]),
+    });
+    assert.ok(f.html.startsWith(bases), 'target-only and ignored duplicate bases retain their exact markup');
+    assert.equal(f.result.moduleCount, 4);
+    const sources = Object.values(mapOf(f.html)).map(dataText);
+    assert.ok(sources.includes("export const tag='normal';"));
+    assert.ok(sources.includes("export const tag='scoped';"));
+    assert.match(sources.join('\n'), /data:application\/octet-stream;base64,AwEE/);
+    assert.match(f.html, /<a href="next.html">Next<\/a>/, 'navigation remains browser-owned');
+    assert.match(dataText(/rel="stylesheet" href="([^"]+)"/.exec(f.html)[1]), /data:text\/css;base64,/);
+    assert.match(dataText(/<script src="([^"]+)"/.exec(f.html)[1]), /globalThis.loaded=true/);
+    assert.ok(!f.html.includes(f.root));
+  });
+
+test("root-relative bases require the declared origin and retain relative worker and fetch resolution", () => {
+  const f = fixture({
+    "pages/index.html": '<base href="/assets/"><script type="module" src="/scripts/entry.mjs"></script>',
+    "scripts/entry.mjs": `export const worker=new Worker('./worker.mjs',{type:'module'}); export const settings=fetch('./settings.json');`,
+    "assets/worker.mjs": "self.postMessage('from-base');",
+    "assets/settings.json": '{"base":true}',
+  });
+  const entry = path.join(f.root, 'pages/index.html');
+  assert.throws(() => packHtml(entry, f.out, {rootDir: f.root}), {code: 'BASE_URL'});
+  const result = packHtml(entry, f.out, {rootDir: f.root, documentRoot: f.root});
+  const html = fs.readFileSync(f.out, 'utf8'), sources = Object.values(mapOf(html)).map(dataText);
+  assert.ok(html.startsWith('<base href="/assets/">'));
+  assert.equal(result.workerCount, 1);
+  assert.match(sources.join('\n'), /data:application\/json;base64,eyJiYXNlIjp0cnVlfQ==/);
+});
+
+test("empty and query-only first bases still take precedence over later hrefs", () => {
+  for (const href of ['', '?edition=2#view', '#view']) {
+    const f = build({
+      'index.html': `<base href="${href}"><base href="./ignored/"><script type="module">import './entry.mjs';</script>`,
+      'entry.mjs': 'export const value=42;',
+    });
+    assert.equal(f.result.moduleCount, 2);
+    assert.ok(Object.values(mapOf(f.html)).map(dataText).includes('export const value=42;'));
+    assert.ok(f.html.startsWith(`<base href="${href}"><base href="./ignored/">`));
+  }
+});
+
+test("inline modules keep exact query/fragment import-map scopes separate from their identities", () => {
+  const f = build({
+    'index.html': `<base href="./assets/current.html?edition=2#selected">
+      <script type="importmap">{"imports":{"shared":"./default.mjs"},"scopes":{
+        "./current.html?edition=2#selected":{"shared":"./scoped.mjs"}}}</script>
+      <script type="module">import 'shared'; export const instance={};</script>
+      <script type="module">import 'shared'; export const instance={};</script>`,
+    'assets/default.mjs': "export const scope='default';",
+    'assets/scoped.mjs': "export const scope='document';",
+  });
+  const sources = Object.values(mapOf(f.html)).map(dataText);
+  assert.equal(f.result.moduleCount, 3, 'inline modules remain distinct while sharing the scoped module');
+  assert.ok(sources.includes("export const scope='document';"));
+  assert.ok(!sources.includes("export const scope='default';"));
+  assert.equal(new Set(Object.values(mapOf(f.html))).size, 3);
+});
+
+test("late or escaping effective bases fail before producing a standalone artifact", () => {
+  for (const prefix of ['<script>globalThis.base=document.baseURI;</script>', '<script type="importmap">{}</script>',
+    '<link rel="stylesheet" href="before.css">', '<style>body{background:url(before.png)}</style>', '<img src="before.png">']) {
+    const f = fixture({"index.html": `${prefix}<base href="./assets/">`});
+    assert.throws(() => packHtml(f.entry, f.out), {code: 'BASE_URL'});
+    assert.equal(fs.existsSync(f.out), false);
+  }
+  for (const href of ['../outside/', 'https://example.invalid/', '//example.invalid/', 'file:///tmp/', '/\\example.invalid/']) {
+    const f = fixture({"index.html": `<base href="${href}"><title>unclosed</title>`});
+    assert.throws(() => packHtml(f.entry, f.out), error => ['BASE_URL', 'F3D_DOCUMENT_ROOT_ESCAPE'].includes(error.code));
+    assert.equal(fs.existsSync(f.out), false);
+  }
+  const f = fixture({"document/index.html": '<base href="./linked/">', "outside/value.txt": 'outside'});
+  const root = path.join(f.root, 'document');
+  fs.symlinkSync(path.join(f.root, 'outside'), path.join(root, 'linked'));
+  assert.throws(() => packHtml(path.join(root, 'index.html'), f.out, {rootDir: root}), {code: 'F3D_DOCUMENT_ROOT_ESCAPE'});
+  assert.equal(fs.existsSync(f.out), false);
+});
+
 test("explicit document roots close nested HTML, rooted import maps, stylesheets and resource URLs", () => {
   const f = fixture({
     "pages/demo/index.html": `<script type="importmap">${JSON.stringify({
@@ -241,9 +335,9 @@ for (const [label, files, code] of [
   ["worker realm", { "app.mjs": `new Worker('./worker.mjs');` }, "HOST_RESOURCE"],
   ["runtime fetch", { "app.mjs": `fetch('./bytes.bin');` }, "FETCH_URL"],
   [
-    "base URL",
+    "external base URL",
     {
-      "index.html": '<base href="./"><script type="module" src="app.mjs"></script>',
+      "index.html": '<base href="https://example.invalid/"><script type="module" src="app.mjs"></script>',
       "app.mjs": "",
     },
     "BASE_URL",

@@ -27,9 +27,20 @@ bounded lazy imports, import-map keys/targets/scopes, module URL assets, HTML
 resources, CSS imports/URLs, finite native GET requests and closed worker graphs
 use the declared root. Pinned Three.js loader discovery includes rooted resources
 and model sidecars; standalone preparation retains their original logical URL
-bases even when the source HTML was nested. The ordinary build also supports a
-local root-relative `<base href>`; standalone packing still rejects `<base>`
-elements because its general document-base semantics are not closed.
+bases even when the source HTML was nested. Both the ordinary build and standalone
+packing support local `<base href>` paths, including root-relative paths when
+`documentRoot` is declared.
+
+Standalone packing preserves the original base elements, their target attributes,
+and browser-owned navigation. The first `href` supplies the base for inline module
+imports, import maps, markup, inline CSS, finite document fetches and string worker
+URLs. Imported modules and external stylesheets retain their own resource bases.
+Directory and file-shaped bases, queries, fragments and ignored later base elements
+are supported. The effective base must precede scripts, styles and URL-bearing
+markup: earlier execution or resource loading could observe a different base.
+Remote bases, escaping paths and runtime base mutation still require ordinary
+deployment. Packing does not create navigation destinations or reproduce live
+HTTP behavior.
 
 The packer's `rootDir` remains its independent read boundary. A direct API call
 for nested source HTML should declare both mappings explicitly:
@@ -213,7 +224,7 @@ HTML application builds include finite local GET resources requested by document
 modules and retained classic scripts. Plain strings, immutable module `const`
 aliases, conditional choices, string concatenation and template selectors use
 the existing bounded expression analysis. Resources resolve from the document's
-effective base, including supported local `<base>` paths in the ordinary build,
+effective base, including supported local `<base>` paths,
 regardless of which imported module contains the call. Normalized project source
 participates before bundling. Missing files, remote URLs and unproved requests
 keep their original networked routes.
@@ -237,8 +248,7 @@ constructor failures retain their source ordering and host implementation.
 Shadowed or replaced constructors, existing Request values, constructor/fetch
 aliases and runtime-selected URLs keep the existing host path; their closure is
 not newly proved. Remote requests and origin-root requests without an explicit
-`documentRoot` still need ordinary deployment, and the packer's existing `<base>`
-refusal remains. Embedded Response URLs are data URLs; server HTTP headers, cache
+`documentRoot` still need ordinary deployment. Embedded Response URLs are data URLs; server HTTP headers, cache
 behavior and live endpoints are not reproduced by this static-resource mode.
 
 The focused execution compares source and emitted applications served over HTTP,

@@ -149,6 +149,13 @@ test("inline document assets resolve against the first local base while source C
     assert.ok(result.emittedFiles.includes(name));
     assert.deepEqual(fs.readFileSync(path.join(f.out, name)), Buffer.from(bytes), name);
   }
+  const packed = path.join(f.root, "standalone.html");
+  packHtml(path.join(f.out, "index.html"), packed);
+  const standalone = fs.readFileSync(packed, "utf8");
+  assert.ok(standalone.startsWith('<!doctype html><base href="./assets/"><base href="./ignored/">'));
+  assert.ok(embeddedResources(standalone).some(bytes => bytes.equals(resources['assets/font.woff2'])),
+    'the imported stylesheet retains the original font bytes');
+  assert.match(standalone, /data:image\/svg\+xml;f3d-resource=/);
 });
 
 test("inline CSS resources use existing missing-file and application-root checks before emission", async () => {
@@ -250,6 +257,12 @@ for (const base of ["/site/", "/site/current.html?edition=2#section"])
     for (const name of ["site/theme.css", "site/image.svg", "shared/background.svg"])
       assert.ok(fs.existsSync(path.join(moved, name)), name);
     assert.equal((await import(pathToFileURL(path.join(moved, result.entryFiles[0])).href)).answer, 42);
+    const packed = path.join(f.root, "standalone.html");
+    packHtml(path.join(moved, result.htmlFile), packed, {rootDir: moved, documentRoot: moved});
+    const standalone = fs.readFileSync(packed, 'utf8');
+    assert.ok(standalone.startsWith(`<base href="${base}"><base href="/ignored/">`));
+    assert.match(standalone, /data:text\/javascript;base64,/);
+    assert.ok(!standalone.includes(moved));
   });
 
 test("declared document root rejects escaping CSS, symlink resources and nested HTML collisions before output", async () => {
