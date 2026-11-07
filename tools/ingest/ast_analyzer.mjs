@@ -603,11 +603,15 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const COMPOSER_CTOR = 2048, PASS_CTOR = 4096, COMPOSER = 8192, PASS = 16384;
   const FIRST_PERSON_CTOR = 32768, FIRST_PERSON_NAMESPACE = 65536;
   const GPGPU_CTOR = 131072, GPGPU = 262144, GPGPU_NAMESPACE = 524288;
-  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR;
+  const MAP_CTOR = 1048576, MAP_NAMESPACE = 2097152;
+  const TRACKBALL_CTOR = 4194304, TRACKBALL_NAMESPACE = 8388608;
+  const FLY_CTOR = 16777216, FLY_NAMESPACE = 33554432;
+  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR | MAP_CTOR | TRACKBALL_CTOR | FLY_CTOR;
   const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | CONTROL_CONSTRUCTORS | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR | GPGPU_CTOR;
   const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS | GPGPU;
   const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
     role === "first-person" ? FIRST_PERSON_CTOR : role === "gpu-computation" ? GPGPU_CTOR :
+    role === "map" ? MAP_CTOR : role === "trackball" ? TRACKBALL_CTOR : role === "fly" ? FLY_CTOR :
     role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : role === "composer" ? COMPOSER_CTOR : role === "pass" ? PASS_CTOR : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
@@ -657,6 +661,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           const role = consumerContract?.namespaces.get(spec.local.name);
           const cell = scopes.get(ast).get(spec.local.name);
           cell.consumerSource = role === "orbit" ? ORBIT_NAMESPACE : role === "first-person" ? FIRST_PERSON_NAMESPACE :
+            role === "map" ? MAP_NAMESPACE : role === "trackball" ? TRACKBALL_NAMESPACE : role === "fly" ? FLY_NAMESPACE :
             role === "gpu-computation" ? GPGPU_NAMESPACE : role === "base" ? BASE_NAMESPACE : 0;
           cell.kind |= NAMESPACE | cell.consumerSource;
         }
@@ -694,6 +699,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     let result = names.reduce((kind, name) => kind | ctorKind(name), 0);
     if (object & ORBIT_NAMESPACE && names.includes("OrbitControls")) result |= ORBIT_CTOR;
     if (object & FIRST_PERSON_NAMESPACE && names.includes("FirstPersonControls")) result |= FIRST_PERSON_CTOR;
+    if (object & MAP_NAMESPACE && names.includes("MapControls")) result |= MAP_CTOR;
+    if (object & TRACKBALL_NAMESPACE && names.includes("TrackballControls")) result |= TRACKBALL_CTOR;
+    if (object & FLY_NAMESPACE && names.includes("FlyControls")) result |= FLY_CTOR;
     if (object & GPGPU_NAMESPACE && names.includes("GPUComputationRenderer")) result |= GPGPU_CTOR;
     if (object & BASE_NAMESPACE && names.some(name => name === "Controls" || name === "EventDispatcher")) result |= BASE_CTOR;
     if (object & (RENDERER | CONTROLS) && names.some(name => name === "domElement")) result |= CANVAS;
@@ -1100,7 +1108,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       const names = staticPropertyNames(node);
       if (!names) return false;
       if (expected === CONTROL_CONSTRUCTORS) return names.every(name => name === "OrbitControls") && visit(node.object, ORBIT_NAMESPACE) ||
-        names.every(name => name === "FirstPersonControls") && visit(node.object, FIRST_PERSON_NAMESPACE);
+        names.every(name => name === "FirstPersonControls") && visit(node.object, FIRST_PERSON_NAMESPACE) ||
+        names.every(name => name === "MapControls") && visit(node.object, MAP_NAMESPACE) ||
+        names.every(name => name === "TrackballControls") && visit(node.object, TRACKBALL_NAMESPACE) ||
+        names.every(name => name === "FlyControls") && visit(node.object, FLY_NAMESPACE);
       if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
       if (expected === GPGPU_CTOR) return names.every(name => name === "GPUComputationRenderer") && visit(node.object, GPGPU_NAMESPACE);
       if (expected === WEBGL) return names.every(name => name === "WebGLRenderer") && visit(node.object, BASE_NAMESPACE) ||
@@ -1165,8 +1176,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "minTargetRadius", "maxTargetRadius", "enableZoom", "zoomSpeed", "zoomToCursor", "enableRotate", "rotateSpeed",
     "enablePan", "panSpeed", "keyPanSpeed", "keyRotateSpeed", "screenSpacePanning",
     "movementSpeed", "lookSpeed", "lookVertical", "autoForward", "heightSpeed", "heightCoef", "heightMin", "heightMax",
-    "constrainVertical", "verticalMin", "verticalMax", "mouseDragOn"]);
-  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches"]);
+    "constrainVertical", "verticalMin", "verticalMax", "mouseDragOn", "rollSpeed", "dragToLook",
+    "noRotate", "noZoom", "noPan", "multiTouchRoll", "staticMoving", "dynamicDampingFactor", "keys", "mouseButtons", "touches"]);
+  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches", "screen"]);
   const composerMethods = new Set(["render", "addPass", "insertPass", "removePass", "swapBuffers", "reset", "setSize", "setPixelRatio", "dispose", "isLastEnabledPass"]);
   const composerViews = new Set(["renderer", "renderToScreen", "renderTarget1", "renderTarget2", "readBuffer", "writeBuffer"]);
   const passMethods = new Set(["render", "setSize", "dispose", "setGBuffer", "setSceneClipBox", "updateGtaoMaterial", "updatePdMaterial"]);

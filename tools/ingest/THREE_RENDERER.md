@@ -71,9 +71,11 @@ keys, getters, spreads and reflection keep the exact component. Selecting a
 native backend method from a private record also retains its existing exact-route
 requirement; the record does not hide that observation.
 
-The graph can prove a bounded retained `OrbitControls` contract by verifying the
-exact addon, resolved Three build and core bytes. The returned controls instance
-continues to carry the canvas reference through local aliases and `domElement`;
+The graph can prove bounded retained `OrbitControls`, `FirstPersonControls`,
+`MapControls`, `TrackballControls` and `FlyControls` contracts by verifying the
+exact addon, resolved Three build and core bytes. `MapControls` also requires its
+actual resolved `OrbitControls` superclass to pass that proof. The returned
+controls instance continues to carry the canvas reference through local aliases and `domElement`;
 it is not an exemption for arbitrary consumers. Closed updates, camera-control
 methods, configuration and disposal remain eligible. Exports, unknown consumers,
 event callbacks, private hooks, method replacement, reflection and unproved
@@ -81,6 +83,19 @@ constructor/receiver origins retain the upstream owner. Changed source bytes,
 redirected base classes and unresolved code invalidate the proof. The original
 H2 application is consequently eligible with `--route-webgl-renderer`, retaining
 its actual OrbitControls and camera identities while using the new GPU backend.
+
+Map panning, trackball rotation/zoom/damping/multitouch and flight speed/roll/drag
+settings keep their original source implementation. Named and namespace imports,
+local factories and private records preserve the controls/camera/canvas identities.
+Resize, reset, disconnect/reconnect and disposal remain source-owned operations;
+callback or native-context exposure still selects the exact renderer. The bounded
+source-proof regression command is
+`node --max-old-space-size=256 --test tools/ingest/renderer_camera_controls_source.test.mjs`;
+it verifies actual pinned source/import identities and analyzes the calling code.
+The native DOM comparison is `node tools/ingest/renderer_camera_controls.browser.mjs`: it
+builds source and routed applications, applies real pointer/keyboard/wheel input,
+and compares camera state at each lifecycle boundary. This is compatibility and
+new-backend routing validation, not a controls rewrite or a speedup measurement.
 
 H1 still retains the exact renderer: its Inspector Settings component replaces
 `WebGPURenderer.prototype.init` to select a real WebGL backend from persisted

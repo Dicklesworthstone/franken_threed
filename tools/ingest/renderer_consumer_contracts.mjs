@@ -15,6 +15,13 @@ import {verifiedGpuComputationSources} from './gpu_computation_contracts.mjs';
 
 const ORBIT = 'sha256:3d79d07ecb686b4e5d93232eedab255331c1beef711e13164eaa1f68655a5f2b';
 const FIRST_PERSON = 'sha256:4f6c4bf60c8956a1201c966de1592f4f035be47b4f6fe97879a782898945992c';
+const MAP = 'sha256:5a686152c498914389d1503b60121f484d06f15cb4f7405c15fb6b8ddcc1bdb6';
+const CONTROL_SOURCES = new Map([
+  [ORBIT, {name: 'OrbitControls', role: 'orbit'}],
+  [FIRST_PERSON, {name: 'FirstPersonControls', role: 'first-person'}],
+  ['sha256:cce95baddf589c16fea901b70f2038eca4557357937e1b03f8c76fe7ffe7457f', {name: 'TrackballControls', role: 'trackball'}],
+  ['sha256:8063858389f2ccd5cd6f0968562752dbab4b21a03c7a6e1dcbb5cc746fc06373', {name: 'FlyControls', role: 'fly'}],
+]);
 const CORE = 'sha256:9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const BUILDS = new Set([
   'sha256:9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea',
@@ -38,34 +45,39 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
     if (BUILDS.has(mod.content_hash) && mod.static_imports.length > 0 &&
         mod.static_imports.every(request => cores.has(request.resolved_id))) bases.add(id);
   }
-  const orbits = new Set(), firstPersons = new Set();
+  const controls = new Map();
   for (const [id, mod] of modules) {
-    if (mod.static_imports.length === 1 && bases.has(mod.static_imports[0].resolved_id)) {
-      if (mod.content_hash === ORBIT) orbits.add(id);
-      if (mod.content_hash === FIRST_PERSON) firstPersons.add(id);
-    }
+    const source = CONTROL_SOURCES.get(mod.content_hash);
+    if (source && mod.static_imports.length === 1 && bases.has(mod.static_imports[0].resolved_id))
+      controls.set(id, source);
+  }
+  // MapControls inherits the whole Orbit implementation. Its own fingerprint
+  // cannot establish a contract when either resolved dependency was replaced.
+  for (const [id, mod] of modules) {
+    if (mod.content_hash === MAP && mod.static_imports.length === 2 &&
+        mod.static_imports.every(request => request.specifier === 'three' ? bases.has(request.resolved_id) :
+          request.specifier === './OrbitControls.js' && controls.get(request.resolved_id)?.role === 'orbit'))
+      controls.set(id, {name: 'MapControls', role: 'map'});
   }
   const passes = verifiedPostProcessingSources(modules, bases);
   contracts.postprocessingSources = passes;
   const computations = verifiedGpuComputationSources(modules, bases, passes);
   contracts.gpuComputationSources = computations;
-  if (!orbits.size && !firstPersons.size && !passes.size && !computations.size) return contracts;
+  if (!controls.size && !passes.size && !computations.size) return contracts;
 
   const role = (id, name) => computations.has(id) && name === 'GPUComputationRenderer' ? 'gpu-computation' :
-    passes.get(id)?.exports[name] ?? (orbits.has(id) && name === 'OrbitControls' ? 'orbit' :
-    firstPersons.has(id) && name === 'FirstPersonControls' ? 'first-person' :
+    passes.get(id)?.exports[name] ?? (controls.get(id)?.name === name ? controls.get(id).role :
     bases.has(id) && BASE_EXPORTS.has(name) ? 'base' :
     bases.has(id) && name === 'WebGPURenderer' ? 'webgpu' :
     bases.has(id) && name === 'WebGLRenderer' ? 'webgl' : null);
   for (const [id, mod] of modules) {
     // These exact implementations are the audited contract, not its callers.
-    if (bases.has(id) || orbits.has(id) || firstPersons.has(id) || passes.has(id) || computations.has(id)) continue;
+    if (bases.has(id) || controls.has(id) || passes.has(id) || computations.has(id)) continue;
     const bindings = new Map(), namespaces = new Map(), reexports = new Set();
     for (const request of mod.static_imports) {
       for (const binding of request.imported_bindings ?? []) {
         if (binding.type === 'namespace') {
-          if (orbits.has(request.resolved_id)) namespaces.set(binding.local, 'orbit');
-          else if (firstPersons.has(request.resolved_id)) namespaces.set(binding.local, 'first-person');
+          if (controls.has(request.resolved_id)) namespaces.set(binding.local, controls.get(request.resolved_id).role);
           else if (computations.has(request.resolved_id)) namespaces.set(binding.local, 'gpu-computation');
           else if (bases.has(request.resolved_id)) namespaces.set(binding.local, 'base');
         } else {

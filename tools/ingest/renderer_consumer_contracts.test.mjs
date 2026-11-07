@@ -163,6 +163,97 @@ test('FirstPersonControls requires unchanged addon bytes and the resolved pinned
   assert.equal(evaluateGraphRoutes(await buildModuleGraph(f.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
 });
 
+for (const [control, configure] of [
+  ['MapControls', 'controls.screenSpacePanning=false; controls.zoomToCursor=true; controls.target.set(0,1,0); controls.saveState(); controls.reset();'],
+  ['TrackballControls', 'controls.noRotate=false; controls.noZoom=false; controls.noPan=false; controls.multiTouchRoll=true; controls.staticMoving=true; controls.dynamicDampingFactor=.3; controls.handleResize(); controls.reset(); const width=controls.screen.width;'],
+  ['FlyControls', 'controls.movementSpeed=10; controls.rollSpeed=.1; controls.dragToLook=true; controls.autoForward=false;'],
+]) {
+  const controlUrl = new URL(`examples/jsm/controls/${control}.js`, upstream).href;
+  test(`${control} preserves source controls and closed canvas ownership through aliases and factories`, async () => {
+    const f = fixture('', {control, map: {imports: {controls: controlUrl}}});
+    const graph = await buildModuleGraph(f.entry);
+    const contract = verifiedRendererConsumerContracts(new Map(Object.entries(graph.modules))).get(graph.root_entries[0]);
+    assert.ok(contract);
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+    const source = imports.replace('OrbitControls', control) + setup;
+    const inspect = body => analyzeModuleAst(source + body, 'file:///controls.js', {}, contract).routing_facts;
+    for (const body of [configure,
+      'const local=controls; local.update(.016); local.disconnect(); local.connect(renderer.domElement); local.dispose();',
+      'function create(camera,canvas) { return new Navigation(camera,canvas); } const local=create(camera,renderer.domElement); local.update(.02);',
+      'const kit={Navigation}; const state={controls}; const {controls:local}=state; local.update(.02); const other=new kit.Navigation(camera,renderer.domElement); other.dispose();',
+      'const same=controls instanceof Navigation; const cameraIdentity=controls.object===camera; document.body.appendChild(controls.domElement);',
+      "controls.keys=['KeyA','KeyS','KeyD']; controls.mouseButtons={LEFT:THREE.MOUSE.PAN}; controls.touches={ONE:THREE.TOUCH.PAN};",
+    ]) assert.deepEqual(inspect(body).escapes, [], body);
+    for (const body of [
+      'plugin(controls);', 'globalThis.controls=controls;', 'export {controls};', 'plugin(controls.domElement);',
+      'controls.update=plugin;', 'controls._onPointerDown=plugin;', 'plugin(controls._onKeyDown);',
+      'controls.connect(host.canvas);', 'controls.domElement=host.canvas;', 'const update=controls.update; plugin(update);',
+      "controls.addEventListener('change',plugin);", 'controls.dispatchEvent(event);',
+      'Navigation.prototype.update=plugin;', 'THREE.Controls.prototype.connect=plugin;',
+      'window.addEventListener=plugin;', 'document.getBoundingClientRect=plugin;',
+      'class Custom extends Navigation {}', 'let local=controls; local=plugin; local.update(.1);',
+    ]) assert.equal(inspect(body).has_opaque_gl_escapes, true, body);
+  });
+
+  test(`${control} namespaces do not authorize other exports or replaced constructors`, async () => {
+    for (const [body, route] of [
+      [`const controls=new Navigation.${control}(camera,renderer.domElement); controls.update(.1);`, 'general-webgpu'],
+      ['const controls=new Navigation.FirstPersonControls(camera,renderer.domElement);', 'exact-backend'],
+      [`Navigation.${control}.prototype.update=plugin;`, 'exact-backend'],
+      [`let namespace=Navigation; namespace=plugin; new namespace.${control}(camera,renderer.domElement);`, 'exact-backend'],
+    ]) {
+      const f = fixture();
+      fs.writeFileSync(f.entry, '<script type="importmap">' + JSON.stringify({imports: {three, controls: controlUrl}}) + '</script>' +
+        '<script type="module">import * as THREE from "three"; import * as Navigation from "controls";' +
+        'const renderer=new THREE.WebGPURenderer(); const camera=new THREE.PerspectiveCamera();' + body + '</script>');
+      assert.equal(evaluateGraphRoutes(await buildModuleGraph(f.entry), decideRendererRoute, environment)[0].decision.route, route);
+    }
+  });
+
+  test(`${control} requires original source bytes and every resolved superclass`, async () => {
+    const source = fs.readFileSync(new URL(controlUrl), 'utf8');
+    const f = fixture('', {control, modules: {'controls.js': source + '\n// changed source\n',
+      'OrbitControls.js': fs.readFileSync(new URL(orbit), 'utf8')}, map: {imports: {controls: './controls.js'}}});
+    assert.equal(evaluateGraphRoutes(await buildModuleGraph(f.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+    fs.writeFileSync(path.join(f.dir, 'controls.js'), source);
+    const verified = await buildModuleGraph(f.entry);
+    assert.equal(evaluateGraphRoutes(verified, decideRendererRoute, environment)[0].decision.route, 'general-webgpu',
+      'source hashes and resolved dependencies establish identity, never the addon filename');
+    const base = `export * from ${JSON.stringify(three)}; import {Controls as Base} from ${JSON.stringify(three)};
+      export class Controls extends Base { constructor(...args) { super(...args); globalThis.plugin(this.domElement); } }`;
+    fs.writeFileSync(path.join(f.dir, 'base.js'), base);
+    const map = {imports: {three, controls: './controls.js'}, scopes: {[pathToFileURL(f.dir + path.sep).href]: {three: './base.js'}}};
+    fs.writeFileSync(f.entry, '<script type="importmap">' + JSON.stringify(map) + '</script><script type="module">' +
+      imports.replace('OrbitControls', control) + setup + '</script>');
+    assert.equal(evaluateGraphRoutes(await buildModuleGraph(f.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  });
+}
+
+test('MapControls verifies the actual OrbitControls superclass and rejects mutations from other modules', async () => {
+  const mapSource = fs.readFileSync(new URL('examples/jsm/controls/MapControls.js', upstream), 'utf8');
+  const f = fixture('', {control: 'MapControls', modules: {'controls.js': mapSource,
+    'OrbitControls.js': fs.readFileSync(new URL(orbit), 'utf8') + '\n// changed base\n'},
+    map: {imports: {controls: './controls.js'}}});
+  assert.equal(evaluateGraphRoutes(await buildModuleGraph(f.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  fs.writeFileSync(path.join(f.dir, 'OrbitControls.js'), fs.readFileSync(new URL(orbit), 'utf8'));
+  fs.writeFileSync(path.join(f.dir, 'mutation.js'), "import {OrbitControls} from './OrbitControls.js'; OrbitControls.prototype.update=globalThis.plugin;");
+  fs.writeFileSync(f.entry, fs.readFileSync(f.entry, 'utf8')
+    .replace('const renderer =', "import './mutation.js'; const renderer ="));
+  const graph = await buildModuleGraph(f.entry);
+  assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  assert.ok(extractGraphRoutingFacts(graph).escapes.some(escape => escape.module_id.endsWith('/mutation.js')));
+});
+
+test('the unchanged LOD and trackball examples become eligible through their retained camera controls', async () => {
+  for (const example of ['webgl_lod.html', 'misc_controls_trackball.html']) {
+    const graph = await buildModuleGraph(fileURLToPath(new URL(`examples/${example}`, upstream)));
+    assert.deepEqual(extractGraphRoutingFacts(graph).escapes, [], example);
+    const routes = evaluateGraphRoutes(graph, decideRendererRoute, {...environment, allowLegacyWebGLRoute: true});
+    assert.equal(routes.length, 1, example);
+    assert.equal(routes[0].decision.route, 'general-webgpu', example);
+  }
+});
+
 for (const [name, body] of [
   ['opaque consumer', 'plugin(controls);'],
   ['opaque alias consumer', 'const other = controls; plugin(other);'],
