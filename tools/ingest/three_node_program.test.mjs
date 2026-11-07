@@ -2083,7 +2083,76 @@ test('source material references switch correctly between alternating objects an
     assert.ok(floats(draw.uniforms).includes(value));
   }
 });
-test('source material conversion refuses unregistered classes, shader hooks and incompatible map inputs', t => {
+for (const Material of [THREE.MeshBasicMaterial, THREE.MeshBasicNodeMaterial,
+  THREE.MeshStandardMaterial, THREE.MeshStandardNodeMaterial]) {
+  test(`${Material.name} preserves inert legacy compile hooks on the native source route`, t => {
+    const f = rig(t), material = new Material(), calls = [];
+    const beforeCompile = function () { calls.push(this); throw new Error('WebGL-only hook must not execute'); };
+    material.onBeforeCompile = beforeCompile;
+    material.positionNode = N.positionLocal;
+    f.object.material = material;
+    const context = {...f.context, material};
+    const source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    source.scene = f.scene; source.camera = f.camera;
+    if (material.isMeshStandardMaterial) source.lightsNode = N.lights([]);
+    source.build();
+    const descriptor = f.owner.compile(material, f.object, context);
+    const canonical = shader => shader.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+    assert.equal(canonical(descriptor.vertex), canonical(source.vertexShader));
+    assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
+    f.owner.captureDraw(descriptor, context);
+    assert.equal(material.onBeforeCompile, beforeCompile, 'the public hook keeps its source identity');
+    assert.deepEqual(calls, [], 'neither pinned source nor candidate executes the legacy hook');
+
+    const replacement = function () { calls.push(this); throw new Error('Replacement hook must remain inert'); };
+    const initialSourceKey = material.customProgramCacheKey();
+    material.onBeforeCompile = replacement;
+    assert.equal(f.owner.compile(material, f.object, context), descriptor,
+      'assigning the inert hook alone does not invalidate source rendering');
+    if (!material.isNodeMaterial) {
+      assert.notEqual(material.customProgramCacheKey(), initialSourceKey);
+      assert.equal(material.customProgramCacheKey(), replacement.toString(), 'the default source key keeps the public hook text');
+    }
+    material.needsUpdate = true;
+    const rebuilt = f.owner.compile(material, f.object, {...context, renderId: 2});
+    assert.notEqual(rebuilt, descriptor, 'normal source material invalidation still rebuilds the program');
+    f.owner.captureDraw(rebuilt, {...context, renderId: 2});
+    assert.equal(canonical(rebuilt.vertex), canonical(source.vertexShader));
+    assert.equal(canonical(rebuilt.fragment), canonical(source.fragmentShader));
+    assert.equal(material.onBeforeCompile, replacement);
+    assert.deepEqual(calls, []);
+
+    material.customProgramCacheKey = () => { assert.fail('Unsupported cache-key effects must not execute'); };
+    assert.throws(() => f.owner.compile(material, f.object, context), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  });
+}
+
+test('native legacy hooks with custom cache-key coercion refuse before executing it', t => {
+  for (const Material of [THREE.MeshBasicMaterial, THREE.MeshBasicNodeMaterial]) {
+    for (const [key, accessor] of [['toString', false], ['toString', true], [Symbol.toPrimitive, false], [Symbol.toPrimitive, true]]) {
+      const f = rig(t), material = new Material();
+      const hook = () => { assert.fail('Legacy compile body is inert'); };
+      const effect = () => { assert.fail('Custom coercion must not run during admission'); };
+      Object.defineProperty(hook, key, accessor ? {get: effect} : {value: effect});
+      material.onBeforeCompile = hook; material.positionNode = N.positionLocal; f.object.material = material;
+      assert.throws(() => f.owner.compile(material, f.object, {...f.context, material}), {code: 'THREE_NODE_PROGRAM_HOOK'});
+      assert.equal(material.onBeforeCompile, hook);
+      assert.equal(f.owner.diagnostics.programs, 0);
+    }
+  }
+});
+
+test('opaque callable legacy hooks refuse without probing Proxy traps', t => {
+  const f = rig(t); let traps = 0;
+  const effect = () => { traps++; throw new Error('Opaque hook was probed'); };
+  const hook = new Proxy(() => {}, {get: effect, getOwnPropertyDescriptor: effect, getPrototypeOf: effect});
+  f.material.onBeforeCompile = hook;
+  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(traps, 0); assert.equal(f.material.onBeforeCompile, hook);
+  assert.equal(f.owner.diagnostics.programs, 0);
+});
+
+test('source material conversion refuses unregistered classes, custom program keys and incompatible map inputs', t => {
   const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
   const Custom = class extends THREE.MeshStandardMaterial {};
   const custom = new Custom(); custom.positionNode = N.positionLocal;
@@ -2091,8 +2160,6 @@ test('source material conversion refuses unregistered classes, shader hooks and 
   const originalConversion = f.renderer.library.fromMaterial;
   f.renderer.library.fromMaterial = () => new THREE.MeshStandardNodeMaterial();
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_MATERIAL'}); f.renderer.library.fromMaterial = originalConversion;
-  material.onBeforeCompile = () => {};
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.onBeforeCompile;
   material.customProgramCacheKey = () => 'custom';
   assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_HOOK'}); delete material.customProgramCacheKey;
   material.envMap = dataTexture();

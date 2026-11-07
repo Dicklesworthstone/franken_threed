@@ -50,6 +50,30 @@ export class ThreeNodeProgramError extends Error {
   }
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
+const functionToString = Function.prototype.toString;
+function inspectLegacyCompileHook(material) {
+  const descriptor = (value, key) => {
+    for (let owner = value; owner; owner = Object.getPrototypeOf(owner)) {
+      const property = Object.getOwnPropertyDescriptor(owner, key);
+      if (property) return property;
+    }
+    return null;
+  };
+  const hook = descriptor(material, 'onBeforeCompile');
+  if (!hook || !Object.hasOwn(hook, 'value') || typeof hook.value !== 'function')
+    fail('HOOK', 'Native legacy compile hooks require ordinary function properties');
+  // This intrinsic does not run callable Proxy traps. Refuse opaque functions
+  // before inspecting properties that such a wrapper could intercept.
+  if (/\{\s*\[native code\]\s*\}$/.test(functionToString.call(hook.value)))
+    fail('HOOK', 'Opaque native legacy compile hooks require the source program cache-key lifecycle');
+  // Material's default key calls .toString(); RenderObject also stringifies
+  // enumerable hooks. Their bodies are inert, but custom primitive conversion
+  // is an observable cache-key effect and cannot be silently skipped or replayed.
+  const text = descriptor(hook.value, 'toString'), primitive = descriptor(hook.value, Symbol.toPrimitive);
+  if (!text || !Object.hasOwn(text, 'value') || text.value !== functionToString ||
+      primitive && (!Object.hasOwn(primitive, 'value') || primitive.value != null))
+    fail('HOOK', 'Custom material hook stringification requires the source program cache-key lifecycle');
+}
 const SLOTS = new Set(['colorNode', 'positionNode', 'vertexNode', 'fragmentNode', 'opacityNode', 'alphaTestNode', 'outputNode', 'mrtNode', 'aoNode', 'depthNode', 'lightsNode', 'geometryNode',
   'backdropNode', 'backdropAlphaNode']);
 const SPRITE_SLOTS = new Set(['rotationNode', 'scaleNode']);
@@ -1004,6 +1028,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspect(material, object, context = {}) {
     live();
     const sourceMaterial = material;
+    if (material instanceof three.Material) inspectLegacyCompileHook(material);
     material = prepareMaterial(material);
     const {scene, camera} = context;
     if (!(material instanceof three.NodeMaterial) ||
@@ -1044,12 +1069,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
     inspectThreeLightingContext(three, renderer.contextNode);
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
-    // The pinned WebGPU renderer invokes object hooks only. Material's legacy
-    // onBeforeRender callback is inert on this source route, including when set.
-    if (sourceMaterial.onBeforeCompile !== three.Material.prototype.onBeforeCompile ||
-        sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
+    // The pinned WebGPU renderer does not invoke Material's legacy
+    // onBeforeCompile or onBeforeRender hooks. Preserve those source properties
+    // without treating them as shader effects. RenderObject does invoke custom
+    // program cache keys, so their existing admission boundary remains separate.
+    if (sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
           ? three.NodeMaterial.prototype.customProgramCacheKey : three.Material.prototype.customProgramCacheKey))
-      fail('HOOK', 'Custom material shader/render hooks are not admitted');
+      fail('HOOK', 'Custom material program cache keys are not admitted');
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
