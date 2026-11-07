@@ -92,13 +92,19 @@ function createThreeCompute(renderer, three) {
   function snapshot(key, array, version, uniform, deferred, ranges = []) {
     if (!ArrayBuffer.isView(array) || array instanceof DataView) fail('BUFFER', 'Expected a typed uniform or storage buffer');
     const previous = !uniform && captured.get(key);
-    if (previous?.source === array && previous.version === version && (previous.data || uploaded.get(key) === previous)) return previous;
-    const charged = deferred ? array.byteLength : 0;
+    // Native Attributes.update observes DynamicDrawUsage at each admitted
+    // geometry/binding update, even when needsUpdate never advanced version.
+    // Give that use its own payload identity, including synchronous compute:
+    // the GPU owner must not deduplicate an edited array at the same version.
+    const dynamic = !uniform && key.usage === three.DynamicDrawUsage;
+    if (!dynamic && previous?.source === array && previous.version === version &&
+        (previous.data || uploaded.get(key) === previous)) return previous;
+    const copy = deferred || dynamic, charged = copy ? array.byteLength : 0;
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
-    const data = deferred ? new array.constructor(array) : array;
-    const admission = !uniform && deferred ? gpu.captureUpload(key, data, version) : null;
+    const data = copy ? new array.constructor(array) : array;
+    const admission = !uniform && copy ? gpu.captureUpload(key, data, version) : null;
     const record = {key, source: array, byteLength: array.byteLength, scalar: array.constructor,
-      itemSize: key.itemSize, count: key.count, version, uniform, data, charged, ranges, admission, refs: 0};
+      itemSize: key.itemSize, count: key.count, version, uniform, dynamic, data, charged, ranges, admission, refs: 0};
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
     return record;
@@ -124,7 +130,7 @@ function createThreeCompute(renderer, three) {
     if (!uniform) {
       // A later application update may already have new ranges. Acknowledging
       // this queued version must not erase the newer version's upload request.
-      if (key.array === source && (key.version ?? 0) === version) key.clearUpdateRanges?.();
+      if (!record.dynamic && key.array === source && (key.version ?? 0) === version) key.clearUpdateRanges?.();
       // r186's common Attributes and native WebGPU backend do not invoke the
       // WebGL-only onUpload callback, including for storage and indirect data.
     }
@@ -146,7 +152,14 @@ function createThreeCompute(renderer, three) {
     if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
       !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
       fail('STORAGE', 'Expected a nonnegative storage version and in-bounds update ranges');
-    return snapshot(attribute, array, version, false, deferred, ranges);
+    const previous = captured.get(attribute), initialized = !!(previous?.data || gpu.getBuffer(attribute));
+    const record = snapshot(attribute, array, version, false, deferred, ranges);
+    // The first source allocation uploads everything without consuming ranges.
+    // Later dynamic updates consume them now, before another binding/current
+    // callback can observe this attribute. Clearing at deferred submission would
+    // both repeat old ranges and erase newer requests at the unchanged version.
+    if (record.dynamic && initialized && ranges.length) attribute.clearUpdateRanges?.();
+    return record;
   }
   function readRecord(lease) {
     live();
@@ -725,7 +738,8 @@ export function withThreeCompute(Base, THREE) {
           getSamples: () => this.currentSamples, signal: this._targetLifetime.signal})});
     }
     /** Graphics leases share compute's authoritative allocation and upload
-     * history. An unchanged host version never overwrites GPU-produced bytes. */
+     * history. Static unchanged versions retain GPU-produced bytes; source
+     * DynamicDrawUsage requests an upload at each admitted update boundary. */
     _getStorageInputs() {
       check(this);
       if (!this._device) fail('DEVICE', 'Initialize the renderer before capturing storage inputs');

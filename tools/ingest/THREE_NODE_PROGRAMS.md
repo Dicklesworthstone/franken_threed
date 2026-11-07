@@ -37,8 +37,8 @@ renders in that frame. `onInit()` dispatches precede the first update kernel;
 subsequent draws use that same GPU buffer. Named storage attributes, ordinary
 attributes promoted by `TSL.storage()`, source vec3 padding and generated program
 cache keys retain one source constructor/kernel identity. Queued renders keep
-their accepted compute uniforms and source upload versions, and unmarked CPU
-arrays do not overwrite GPU-authored results. Compute before/after callbacks see
+their accepted compute uniforms and source upload versions, and unmarked static
+CPU arrays do not overwrite GPU-authored results. Compute before/after callbacks see
 the kernel and null scene/object/camera/material; current compute callbacks also
 see a null `compute`, as in `NodeManager.updateForCompute`. Nested work restores
 the enclosing graphics callback context.
@@ -168,6 +168,15 @@ zero GPU errors. These comparisons use the native F3D backend. Hardware
 performance remains unmeasured.
 
 ### Materials and node graphs
+
+Native programs preserve ordinary `onBeforeCompile` functions carried by
+materials that also support a WebGL route. Their bodies remain inert on WebGPU,
+as in the pinned source, and the public function identity remains unchanged.
+Replacing the hook alone retains the prepared program; `needsUpdate` keeps its
+normal invalidation behavior. Custom program cache keys, effectful hook
+stringification and opaque callable proxies retain their explicit admission
+boundary. Source-WGSL comparisons cover ordinary and node Basic/Standard
+materials; this does not add new WebGL shader-hook translation.
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
 `MeshPhongMaterial`, `MeshStandardMaterial`, `MeshPhysicalMaterial`,
@@ -1031,9 +1040,29 @@ upload per logical render; later object callbacks cannot independently upload
 that vertex stream. Preparation publishes the complete accepted shader/vertex
 history once, and submission reuses its final allocation without replaying old
 CPU snapshots. Float, signed and unsigned vertex layouts retain their exact
-format, stride, instance mode and ownership checks. Indirect histories, generated
-index aliases and allocation-layout changes remain rejected. Mixed writable and
-read-only aliases retain their render-pass hazard rejection.
+format, stride, instance mode and ownership checks. Combined generated-vertex and
+indirect histories, generated index aliases and allocation-layout changes remain
+rejected. Mixed writable and read-only aliases retain their render-pass hazard
+rejection.
+
+Native storage attributes using `DynamicDrawUsage` now capture the current CPU
+bytes at each source-admitted update without requiring `needsUpdate`. This covers
+synchronous and queued compute, shader-storage bindings, generated vertex inputs,
+indirect arguments and their separate shader-storage aliases. Generated vertex
+and indirect inputs keep the source's first geometry upload per logical render;
+later shader bindings can independently upload the same allocation. Public
+attribute versions are unchanged, and later CPU edits cannot replace an accepted
+payload. Switching back to static usage preserves GPU-produced contents until
+the source requests another upload.
+
+Dynamic partial updates consume their ranges at that source update boundary.
+The first allocation retains the ranges, as upstream does; a subsequent shader
+binding can therefore require a full upload after geometry consumed a partial
+range. Deferred submission does not clear newer requests at the same public
+version. Copied payloads use the existing snapshot budget and retirement path,
+including disposal and pipeline preparation failures. Source-backed recording
+tests compare these byte histories and range observations with pinned r186;
+they do not establish browser image parity or a performance result.
 
 For `InstancedMesh`, replacing a matrix/color attribute, changing its capacity,
 or adding/removing instance colors selects a new graph. Data, upload-version and

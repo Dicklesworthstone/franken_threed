@@ -78,7 +78,7 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
   const update = () => owner.update(attribute, indirect ? AttributeType.INDIRECT : AttributeType.STORAGE);
   const index = indirect && indexed ? device.createBuffer({size: 12, usage: 16}) : null;
   return {device, attribute, update, get buffer() { return backend.get(attribute).buffer; }, render(updates,
-    {indirectDraws = null, shaderDraws = null} = {}) {
+    {indirectDraws = null, shaderDraws = null, afterGeometry = null} = {}) {
     info.render.calls++;
     const encoder = device.createCommandEncoder(), pass = encoder.beginRenderPass({});
     pass.setPipeline({vertex: {entryPoint: 'main', buffers: vertex ? [{}] : []}});
@@ -87,6 +87,7 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
       change(attribute);
       if (vertex) geometries.updateAttribute(attribute, AttributeType.STORAGE);
       if (usesIndirect) geometries.updateAttribute(attribute, AttributeType.INDIRECT);
+      afterGeometry?.[drawIndex]?.(attribute);
       if (usesShader) update();
       if (vertex) pass.setVertexBuffer(0, backend.get(attribute).buffer);
       pass.setBindGroup(0, {entries: usesShader ? [{binding: 0, resource: {buffer: backend.get(attribute).buffer}}] : []});
@@ -349,6 +350,115 @@ test('the first indirect geometry upload can follow an earlier shader-only stora
   assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)[0]), [6, 6]);
   assert.equal(selected[0].indirect, undefined); assert.ok(shaderStorage(selected[0]).includes(buffer));
   assert.equal(shaderStorage(selected[1]).length, 0, 'the initial indirect upload needs no shader on that object');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const mode of ['shader', 'vertex', 'vertex-shader', 'indirect', 'indirect-shader'])
+test(`dynamic ${mode} storage observes each source upload boundary without needsUpdate`, async t => {
+  const f = fixture(t), data = new Uint32Array([3, 1, 0, 0, 0, 0, 0, 0]);
+  const vertex = mode.startsWith('vertex'), indirect = mode.startsWith('indirect'), shader = mode.includes('shader');
+  const attribute = new (indirect ? T.IndirectStorageBufferAttribute : T.StorageBufferAttribute)(data, 1);
+  attribute.setUsage(T.DynamicDrawUsage);
+  const storage = N.storage(attribute, 'uint', attribute.count);
+  f.material.colorNode = shader ? N.vec3(storage.element(0).toFloat().mul(.01)) : N.vec3(1);
+  if (vertex) f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute().setUsage(T.DynamicDrawUsage).toFloat().mul(.01), 0, 0));
+  if (indirect) f.mesh.geometry.setIndirect(attribute, 0);
+  const other = new T.Mesh(f.mesh.geometry, f.material); other.frustumCulled = false; other.renderOrder = 1;
+  f.scene.add(other);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  const source = sourceStorage(data, {vertex, indirect, shader, instanced: false});
+  source.attribute.setUsage(T.DynamicDrawUsage); source.update();
+  let frame = 0;
+  const changes = [0, 1].map(index => current => { current.array[0] = (frame ? 0 : 3) + index * 3; });
+  f.mesh.onBeforeRender = () => changes[0](attribute); other.onBeforeRender = () => changes[1](attribute);
+  for (frame = 0; frame < 2; frame++) {
+    source.render(changes); f.renderer.render(f.scene, f.camera);
+  }
+  attribute.array.fill(99);
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = indirect ? selected[0].indirect.buffer
+    : vertex ? [...selected[0].streams.values()].find(value => value.usage & 128) : shaderStorage(selected[0])[0];
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)),
+    draws(source.device).map(draw => words(draw, source.buffer, Uint32Array)));
+  assert.deepEqual(selected.map(draw => words(draw, buffer, Uint32Array)[0]), shader ? [6, 6, 3, 3] : [3, 3, 0, 0]);
+  assert.equal(attribute.version, 0, 'dynamic uploads must not manufacture public needsUpdate versions');
+  assert.ok(selected.every(draw => (!vertex || [...draw.streams.values()].includes(buffer)) &&
+    (!indirect || draw.indirect.buffer === buffer) && (!shader || shaderStorage(draw).includes(buffer))));
+  assert.equal(f.device.buffers.filter(value => value.label === 'f3d-compute-buffer' && value.usage & 128).length, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('dynamic geometry consumes ranges before shader updates without clearing later queued requests', async t => {
+  const f = fixture(t), data = new Uint32Array([1, 2, 3, 4]);
+  const attribute = new T.StorageBufferAttribute(data, 1).setUsage(T.DynamicDrawUsage);
+  const storage = N.storage(attribute, 'uint', attribute.count), observedRanges = [];
+  const marker = N.uniform(0).onObjectUpdate(() => {
+    observedRanges.push(attribute.updateRanges.map(range => ({...range})));
+    attribute.array[2] = 22;
+    return 0;
+  });
+  f.material.positionNode = N.positionLocal.add(N.vec3(storage.toAttribute().setUsage(T.DynamicDrawUsage).toFloat().mul(.01), 0, 0));
+  f.material.colorNode = N.vec3(storage.element(0).toFloat().mul(.01), marker, storage.element(2).toFloat().mul(.01));
+  attribute.addUpdateRange(1, 1);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(attribute.updateRanges, [{start: 1, count: 1}], 'first allocation leaves pending ranges intact');
+  observedRanges.length = 0;
+  const source = sourceStorage(data, {vertex: true, instanced: false});
+  source.attribute.setUsage(T.DynamicDrawUsage); source.attribute.addUpdateRange(1, 1); source.update();
+  assert.deepEqual(source.attribute.updateRanges, attribute.updateRanges);
+  const change = current => {
+    current.array.fill(99); current.array[0] = 11;
+    current.clearUpdateRanges(); current.addUpdateRange(0, 1);
+  };
+  const sourceRanges = [];
+  source.render([change], {afterGeometry: [current => {
+    sourceRanges.push(current.updateRanges.map(range => ({...range}))); current.array[2] = 22;
+  }]});
+  f.mesh.onBeforeRender = () => change(attribute);
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(observedRanges, sourceRanges);
+  assert.deepEqual(attribute.updateRanges, [], 'dynamic binding update consumed its accepted ranges synchronously');
+  attribute.array.fill(123); attribute.addUpdateRange(3, 1);
+  await drain(f.renderer);
+  const selected = draws(f.device), buffer = shaderStorage(selected[0])[0];
+  assert.deepEqual(words(selected[0], buffer, Uint32Array), words(draws(source.device)[0], source.buffer, Uint32Array));
+  assert.deepEqual(words(selected[0], buffer, Uint32Array), [11, 99, 22, 99],
+    'the shader binding performs a full dynamic update after geometry consumed the partial range');
+  assert.deepEqual(attribute.updateRanges, [{start: 3, count: 1}], 'older queued uploads leave later requests intact');
+  assert.equal(attribute.version, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const queued of [false, true])
+test(`${queued ? 'queued' : 'synchronous'} dynamic compute uploads source bytes without needsUpdate and preserves static GPU results`, async t => {
+  const f = fixture(t), storage = N.instancedArray(new Float32Array([.125]), 'float'), attribute = storage.value;
+  attribute.setUsage(T.DynamicDrawUsage);
+  const compute = N.Fn(() => { storage.element(0).addAssign(1); })().compute(1), seen = [];
+  t.after(() => compute.dispose());
+  f.device.onCompute = pass => {
+    const buffer = computeStorage(pass)[0], view = new Float32Array(buffer.data);
+    seen.push(view[0]); view[0] += 1;
+  };
+  await f.renderer.init(); await f.renderer.compileComputeAsync(compute);
+  const source = sourceStorage(new Float32Array([.125])); source.attribute.setUsage(T.DynamicDrawUsage); source.update();
+  const expected = [], sourceCompute = () => {
+    source.update(); const view = new Float32Array(source.buffer.data); expected.push(view[0]); view[0] += 1;
+  };
+  if (queued) {
+    f.renderer.render(f.scene, f.camera);
+    assert.ok(f.renderer._drain, 'cold draw preparation holds the following compute requests in the FIFO');
+  }
+  const pending = [];
+  for (const value of [.25, .75]) {
+    source.attribute.array[0] = value; sourceCompute();
+    attribute.array[0] = value; pending.push(f.renderer.compute(compute));
+  }
+  attribute.array[0] = 99;
+  await Promise.all(pending); await drain(f.renderer);
+  source.attribute.setUsage(T.StaticDrawUsage); source.attribute.array[0] = 99; sourceCompute();
+  attribute.setUsage(T.StaticDrawUsage); await f.renderer.computeAsync(compute);
+  assert.deepEqual(seen, expected); assert.deepEqual(seen, [.25, .75, 1.75]);
+  assert.equal(attribute.version, 0);
+  assert.deepEqual([...new Float32Array(captureComputeStorage(f.device, attribute).resolve().buffer.data)], [2.75]);
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
@@ -697,20 +807,28 @@ test('accepted storage vertex reads survive source disposal and refuse a foreign
   assert.throws(() => computeAttributeSnapshot(f.device, view), /DISPOSED/);
 });
 
-test('renderer disposal cancels accepted storage vertex draws and preparation failure releases captured versions', async t => {
+for (const dynamic of [false, true])
+test(`${dynamic ? 'dynamic' : 'static'} storage captures retire after renderer disposal and preparation failure`, async t => {
+  const usage = dynamic ? T.DynamicDrawUsage : T.StaticDrawUsage;
   const f = fixture(t), positions = N.instancedArray(2, 'vec3');
-  f.material.positionNode = N.positionLocal.add(positions.toAttribute());
+  f.material.positionNode = N.positionLocal.add(positions.toAttribute().setUsage(usage));
   await f.renderer.init(); f.renderer.render(f.scene, f.camera); f.renderer.dispose();
   await drain(f.renderer);
   assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(draws(f.device).length, 0);
   assert.ok(f.device.buffers.filter(buffer => buffer.label === 'f3d-compute-buffer').every(buffer => buffer.destroyed));
   const g = fixture(t), other = N.instancedArray(2, 'vec3');
-  g.material.positionNode = N.positionLocal.add(other.toAttribute());
+  g.material.positionNode = N.positionLocal.add(other.toAttribute().setUsage(usage));
+  const capture = g.renderer._captureNodeFrame.bind(g.renderer); let accepted;
+  g.renderer._captureNodeFrame = request => { const packet = capture(request); if (packet) accepted = packet; return packet; };
   await g.renderer.init();
   g.device.createRenderPipelineAsync = () => Promise.reject(new Error('storage vertex pipeline rejected'));
   g.renderer.render(g.scene, g.camera);
   await assert.rejects(drain(g.renderer), /storage vertex pipeline rejected/);
   assert.equal(g.renderer._nodeCaptureBytes, 0); assert.equal(g.device.submissions.length, 0);
+  assert.ok(accepted.storageUses.length > 0);
+  for (const lease of accepted.storageUses)
+    assert.throws(() => accepted.storageOwner.validate([lease]), {code: 'THREE_COMPUTE_STALE'},
+      'failed preparation releases its captured storage payloads');
 });
 
 
