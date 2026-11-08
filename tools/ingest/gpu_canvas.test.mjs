@@ -78,6 +78,16 @@ test('every use reacquires the swapchain, including repeated calls in one host t
   target.dispose();
 });
 
+test('display-p3 configures the native canvas without adding a shader transfer', () => {
+  const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {colorSpace: 'display-p3', srgbView: false});
+  const configuration = f.calls.find(c => c[0] === 'configure')[1];
+  assert.equal(configuration.colorSpace, 'display-p3'); assert.deepEqual(configuration.viewFormats, []);
+  assert.equal(target.rendererOptions.format, 'bgra8unorm'); target.dispose();
+  const invalid = fixture();
+  assert.throws(() => createGpuCanvasTarget(invalid.device, invalid.canvas, {colorSpace: 'unregistered'}), failCode('FORMAT'));
+  assert.equal(count(invalid, 'context'), 0);
+});
+
 test('four-sample color and depth match and resolve into a fresh single-sample canvas view', () => {
   const f = fixture(), target = createGpuCanvasTarget(f.device, f.canvas, {format: 'rgba8unorm', sampleCount: 4, depthFormat: 'depth32float'});
   target.withFrame(frame => {

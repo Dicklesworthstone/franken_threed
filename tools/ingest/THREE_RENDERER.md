@@ -658,6 +658,38 @@ resolve and presentation commands, including both byte formats and lifetime
 boundaries. These checks do not execute WGSL or establish browser pixel parity;
 that requires a capable browser lane.
 
+## WebGL-authored output color spaces
+
+The WebGL-authored route accepts linear sRGB and registered Display-P3 /
+linear Display-P3 output in addition to sRGB. Register the pinned addon color
+definitions with `ColorManagement.define` and set `renderer.outputColorSpace` as
+in the source application. Non-sRGB canvas draws use their actual ShaderLib or
+authored shader programs, including source primary conversion and transfer,
+before blending into a plain UNORM attachment. Clear colors and solid backgrounds
+use the source `Color.getRGB` output conversion before premultiplication. Public
+render targets retain their independent working-linear shader output.
+
+Each accepted draw retains its output selection during deferred preparation.
+The native canvas uses the source definition's `drawingBufferColorSpace`.
+Changing that gamut resets drawing-buffer color/depth/stencil history, including
+an A-to-B-to-A change with no draw in B, as required by the
+[WebGL drawing-buffer contract](https://registry.khronos.org/webgl/specs/latest/1.0/#DOM-WebGLRenderingContext-drawingBufferColorSpace).
+Changing only the transfer within one gamut preserves existing attachments and
+`preserveDrawingBuffer` history. These operations share the existing render FIFO.
+
+Synchronous output-space mutation inside draw, shadow, sorting, shader-compile or
+program-cache-key callbacks explicitly requires exact execution; it cannot queue
+a delayed reset behind the draw whose attachment it changes. Unregistered color
+spaces preserve the source lookup error. Non-sRGB output also requires the source
+program path rather than a previously selected whole-image HDR fallback.
+
+`node --test tools/ingest/three_renderer_webgl_color_spaces.test.mjs` compares
+generated programs and clears with the unchanged pinned `WebGLProgram` and
+`WebGLBackground`, and records queued output, display configuration, history
+reset, offscreen behavior and callback boundaries. Canvas-owner regressions cover
+the actual configuration descriptors. These are source/recording checks;
+rasterized browser parity and hardware performance remain separate gates.
+
 ## Deferred multi-viewport WebGL animation frames
 
 The WebGL facade retains one drawing buffer for each accepted
@@ -1100,8 +1132,8 @@ unmeasured.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping on the native output path, non-sRGB
-  WebGL-authored canvas output, node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
+  XR, custom tone mapping on the native output path,
+  node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.
 - Upstream passes non-one factors with Min/Max blend equations, which WebGPU

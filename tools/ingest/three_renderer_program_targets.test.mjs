@@ -16,7 +16,7 @@ for (const options of [{}, {colorSpace: T.SRGBColorSpace}, {type: T.HalfFloatTyp
     const f = await make(), r = f.renderer, t = new T.RenderTarget(64, 32, options), s = scene('program');
     r.setPixelRatio(3); r.setSize(200, 100); r.toneMapping = T.ACESFilmicToneMapping; r.toneMappingExposure = 2;
     t.viewport.set(4, 6, 48, 24); r.setRenderTarget(t); r.render(s, new T.Camera());
-    r.toneMapping = T.AgXToneMapping; r.outputColorSpace = 'other-canvas-space';
+    r.toneMapping = T.AgXToneMapping; r.outputColorSpace = T.LinearSRGBColorSpace;
     await flush(r);
     const d = f.draws[0];
     assert.ok(d.program, 'the facade injects source program support offscreen');

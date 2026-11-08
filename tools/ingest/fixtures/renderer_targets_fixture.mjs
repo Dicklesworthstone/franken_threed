@@ -2,6 +2,8 @@
  * target owner, GPU descriptors and queue sequencing, not rasterized pixels. */
 import {targetDevice, targetThree} from './target_residency_fixture.mjs';
 import {EventDispatcher} from '../../../upstream/three.js/src/core/EventDispatcher.js';
+import {Color as SourceColor} from '../../../upstream/three.js/src/math/Color.js';
+import {ColorManagement} from '../../../upstream/three.js/src/math/ColorManagement.js';
 class Object3D {
   name = '';
   children = [];
@@ -16,9 +18,10 @@ class Color {
   constructor(r = 0, g = 0, b = 0) { Object.assign(this, {r, g, b}); }
   set(c) { return this.copy(c?.isColor ? c : new Color((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255)); }
   copy(c) { Object.assign(this, {r: c.r, g: c.g, b: c.b}); return this; }
+  getRGB(target, colorSpace) { return new SourceColor(this.r, this.g, this.b).getRGB(target, colorSpace); }
 }
 class Vector2 { set(x, y) { Object.assign(this, {x, y}); return this; } }
-export const T = {...targetThree, EventDispatcher, Scene, Object3D, Camera, PerspectiveCamera: Camera, Color, Vector2,
+export const T = {...targetThree, EventDispatcher, Scene, Object3D, Camera, PerspectiveCamera: Camera, Color, ColorManagement, Vector2,
   WebGPUCoordinateSystem: 2001, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
 export const createThreeProgramSupport = options => ({...options, disposeCount: 0, dispose() { this.disposeCount++; }});
 export const createThreeProgramPMREM = () => {};

@@ -683,6 +683,10 @@ export async function createGpuThreeScene(device,scene,{
   // every draw is its ShaderLib program; anything else is a TONE_MAPPING error
   // (the facade then keeps its whole-image output pass instead).
   const programToneMapping=()=>programRoute()&&(programSupport.state?.().toneMapping??three.NoToneMapping)!==three.NoToneMapping;
+  // Non-sRGB WebGL canvas outputs need the source primary/transfer functions
+  // in each material. Offscreen programs keep their existing linear contract.
+  const programColorOutput=()=>programRoute()&&programSupport.state?.().canvasOutput===true&&
+    programSupport.state().outputColorSpace!==three.SRGBColorSpace;
   // Source logarithmic/reversed depth changes shader and raster conventions,
   // including shadow/deformation variants; every material uses its program.
   const programReversedDepth=()=>programRoute()&&programSupport.state?.().reversedDepthBuffer===true;
@@ -694,7 +698,7 @@ export async function createGpuThreeScene(device,scene,{
     const env=scene.environment;
     if(!programRoute()||!env)return false;
     // Renderer-route PMREMGenerator.fromScene captures: r186 PMREM through programs.
-    if(programToneMapping()||programDepthMode()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
+    if(programToneMapping()||programColorOutput()||programDepthMode()||!environmentEnabled||env.isF3DSceneEnvironment===true)return true;
     try{environmentApi.inspectThreeEnvironment(env,three,environmentOptions);return false;}
     catch(error){if(String(error?.code).startsWith('THREE_ENVIRONMENT_'))return true;throw error;}
   }
@@ -935,6 +939,7 @@ export async function createGpuThreeScene(device,scene,{
       // material mapper below follows WebGPU's unsigned reference contract.
       if((m.stencilWrite&&stencilAttachment)||programSupport.state?.().passState)return programDescription(m,topology,object);
       if(programToneMapping())return toneMappedProgram(()=>programDescription(m,topology,object));
+      if(programColorOutput())return programDescription(m,topology,object);
       if(programDepthMode())return programDescription(m,topology,object);
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
@@ -956,6 +961,7 @@ export async function createGpuThreeScene(device,scene,{
   function coreDescription(m,clippingFrame,topology='triangles'){
     const source=m;m=materialState(m);
     if(programToneMapping())fail('TONE_MAPPING',`In-shader tone mapping needs every draw on the program route: ${m?.type}`);
+    if(programColorOutput())fail('MATERIAL',`The selected output color space needs the source material program: ${m?.type}`);
     if(programDepthMode())fail('DEPTH_MODE',`The selected depth mode needs the source material program: ${m?.type}`);
     const shading=models.get(Object.getPrototypeOf(m));
     if(!shading)fail('MATERIAL',`Unsupported source material: ${m?.type}`);
@@ -1921,7 +1927,10 @@ export async function createGpuThreeScene(device,scene,{
       let clearRequested=passProgram?.passClear;
       if(backgroundScene().background?.isColor&&!passNodeFrame?.background){
         clearPolicy.clearColor=rgba(backgroundScene().background);clearPolicy.loadOp='clear';
-        if(renderOptions.outputTransfer==='srgb')clearPolicy.clearColor=[...srgbEncode(clearPolicy.clearColor.slice(0,3)),1];
+        if(passProgram?.canvasOutput){
+          const color=backgroundScene().background.getRGB({},passProgram.outputColorSpace);
+          clearPolicy.clearColor=[color.r,color.g,color.b,1].map(c=>Math.max(0,Math.min(1,c)));
+        }else if(renderOptions.outputTransfer==='srgb')clearPolicy.clearColor=[...srgbEncode(clearPolicy.clearColor.slice(0,3)),1];
         if(passState&&passProgram.passBackgroundClear){
           clearRequested=passProgram.passBackgroundClear;
           clearPolicy.loadOp=clearRequested.color?'clear':'load';

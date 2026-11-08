@@ -37,14 +37,14 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options))
     fail('OPTIONS', 'Expected canvas options');
   for (const key of Object.keys(options))
-    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView', 'toneMappingMode', 'preserveDrawingBuffer', 'frameHistory', 'premultiplyPresentation'].includes(key))
+    if (!['format', 'depthFormat', 'sampleCount', 'alphaMode', 'maxBytes', 'width', 'height', 'srgbView', 'toneMappingMode', 'colorSpace', 'preserveDrawingBuffer', 'frameHistory', 'premultiplyPresentation'].includes(key))
       fail('OPTIONS', `Unknown canvas option: ${key}`);
   const {
     format: canvasFormat = 'bgra8unorm', depthFormat = 'depth24plus', sampleCount = 1,
     alphaMode = 'opaque', maxBytes = 128 * 1024 * 1024,
     width: initialWidth = canvas?.width, height: initialHeight = canvas?.height,
     srgbView = canvasFormat !== 'rgba16float', toneMappingMode = 'standard', preserveDrawingBuffer = false, frameHistory = false,
-    premultiplyPresentation = false,
+    premultiplyPresentation = false, colorSpace = 'srgb',
   } = options;
   if (typeof srgbView !== 'boolean') fail('OPTIONS', 'srgbView must be boolean');
   if (typeof preserveDrawingBuffer !== 'boolean') fail('OPTIONS', 'preserveDrawingBuffer must be boolean');
@@ -54,6 +54,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     fail('FORMAT', 'Canvas format must be rgba8unorm, bgra8unorm or rgba16float without an sRGB view');
   if (!['standard', 'extended'].includes(toneMappingMode))
     fail('FORMAT', 'Canvas tone mapping must be standard or extended');
+  if (!['srgb', 'display-p3'].includes(colorSpace))
+    fail('FORMAT', 'Canvas display color space must be srgb or display-p3');
   if (![null, 'depth24plus', 'depth32float', 'depth24plus-stencil8'].includes(depthFormat) || ![1, 4].includes(sampleCount))
     fail('FORMAT', 'Expected optional depth24plus/depth32float/depth24plus-stencil8 and one or four samples');
   // 'premultiplied' composites the canvas over the page. The explicit renderer
@@ -350,7 +352,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
       checked(() => {
         configured = true;
         context.configure({device, format: canvasFormat, usage: RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING | (preserveDrawingBuffer || frameHistory ? COPY_DST : 0),
-          alphaMode, colorSpace: 'srgb', viewFormats: srgbView ? [format] : [], toneMapping: {mode: toneMappingMode}});
+          alphaMode, colorSpace, viewFormats: srgbView ? [format] : [], toneMapping: {mode: toneMappingMode}});
       });
       resize(initialWidth, initialHeight);
     });

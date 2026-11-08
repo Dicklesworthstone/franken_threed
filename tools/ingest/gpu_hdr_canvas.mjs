@@ -39,7 +39,7 @@ export async function createGpuHdrCanvasRenderer(canvas, createRenderer, options
   if (!Number.isSafeInteger(hdr.maxBytes) || hdr.maxBytes < 1 || (hdr.label !== undefined && typeof hdr.label !== 'string'))
     fail('OPTIONS', 'Invalid HDR target budget or label');
   const target = capture(session.target ?? {}, ['format', 'depthFormat', 'sampleCount', 'alphaMode', 'srgbView',
-    'maxBytes', 'width', 'height', 'toneMappingMode'], 'presentation target');
+    'maxBytes', 'width', 'height', 'toneMappingMode', 'colorSpace'], 'presentation target');
   if (outputColorSpace !== undefined && !['linear', 'srgb'].includes(outputColorSpace) || typeof sourceOutput !== 'boolean')
     fail('OPTIONS', 'Expected a linear/sRGB output transfer and boolean source-output selection');
   // A premultiplied canvas composites over the page. The linear scene target is

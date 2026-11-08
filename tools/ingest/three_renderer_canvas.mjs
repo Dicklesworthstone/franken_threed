@@ -29,7 +29,7 @@ export function createThreeRendererCanvases(THREE, renderer, canvas, fail) {
   // split target on resize). Its native context still has exactly one owner.
   const entries = new Map();
   let active = null;
-  const fields = ['_session', '_dispatcher', '_hdr', '_srgbView', '_outputProfileKey'];
+  const fields = ['_session', '_dispatcher', '_hdr', '_srgbView', '_outputProfileKey', '_canvasOutputKey'];
   const validate = (target, canvas = target?.domElement) => {
     if ((target !== initial && !(typeof THREE.CanvasTarget === 'function' && target instanceof THREE.CanvasTarget)) ||
         typeof canvas?.getContext !== 'function')
@@ -62,7 +62,7 @@ export function createThreeRendererCanvases(THREE, renderer, canvas, fail) {
     let entry = entries.get(canvas);
     if (!entry) {
       entry = {canvas, targets: new Map(), references: 0, retired: false,
-        _session: null, _dispatcher: null, _hdr: false, _srgbView: true, _outputProfileKey: null};
+        _session: null, _dispatcher: null, _hdr: false, _srgbView: true, _outputProfileKey: null, _canvasOutputKey: null};
       entries.set(entry.canvas, entry);
     }
     if (!entry.targets.has(target)) {
