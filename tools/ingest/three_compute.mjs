@@ -50,6 +50,7 @@ function createThreeCompute(renderer, three) {
     }});
   const programs = new Map(), initialized = new Set(), listeners = new Map(), building = new Set();
   const captured = new WeakMap(), uploaded = new WeakMap(), payloads = new Set(), compiling = new Set();
+  const uploadLayouts = new WeakMap();
   const readLeases = new WeakMap(), readResources = new WeakMap();
   const transfers = new Set();
   let transferFailure = null;
@@ -67,19 +68,27 @@ function createThreeCompute(renderer, three) {
     if (![Float32Array, Int32Array, Uint32Array, Int16Array, Uint16Array, Int8Array, Uint8Array].includes(attribute.array.constructor))
       fail('STORAGE', 'Storage attributes require f32 or integer components');
   }
-  function normalize(attribute) {
+  function normalize(attribute, update) {
     live(); validateAttribute(attribute);
     // r186 StructTypeNode supplies its padded stride in 32-bit words. Preserve
     // those bytes, including mixed integer fields and matrix-column padding;
     // a storage item need not be a vertex-sized scalar/vector (H8 uses 20 words).
-    let array = attribute.array;
-    if (array instanceof Int8Array || array instanceof Int16Array) array = new Int32Array(array);
-    else if (array instanceof Uint8Array || array instanceof Uint16Array) array = new Uint32Array(array);
-    if (attribute.itemSize === 3) {
-      const padded = new array.constructor(attribute.count * 4);
-      for (let i = 0; i < attribute.count; i++) padded.set(array.subarray(i * 3, i * 3 + 3), i * 4);
-      array = padded; attribute.itemSize = 4;
-      attribute.clearUpdateRanges?.();
+    let array = attribute.array, layout = uploadLayouts.get(attribute);
+    if (!layout) {
+      if (array instanceof Int8Array || array instanceof Int16Array) array = new Int32Array(array);
+      else if (array instanceof Uint8Array || array instanceof Uint16Array) array = new Uint32Array(array);
+      layout = {itemSize: attribute.itemSize, paddedItemSize: attribute.itemSize === 3 ? 4 : null};
+      uploadLayouts.set(attribute, layout);
+    }
+    if (update && layout.paddedItemSize !== null) {
+      // The pinned uploader retains its original input stride even after the
+      // first public array replacement. Reapply that same layout on accepted
+      // updates; interpreting the now-four-word array as an already-packed
+      // input would change both public and GPU-visible source histories.
+      const {itemSize, paddedItemSize} = layout;
+      const padded = new array.constructor(attribute.count * paddedItemSize);
+      for (let i = 0; i < attribute.count; i++) padded.set(array.subarray(i * itemSize, i * itemSize + itemSize), i * paddedItemSize);
+      array = padded; attribute.itemSize = paddedItemSize;
     }
     attribute.array = array;
     return array;
@@ -97,7 +106,7 @@ function createThreeCompute(renderer, three) {
     // Give that use its own payload identity, including synchronous compute:
     // the GPU owner must not deduplicate an edited array at the same version.
     const dynamic = !uniform && key.usage === three.DynamicDrawUsage;
-    if (!dynamic && previous?.source === array && previous.version === version &&
+    if (!uniform && !dynamic && previous?.version === version &&
         (previous.data || uploaded.get(key) === previous)) return previous;
     const copy = deferred || dynamic, charged = copy ? array.byteLength : 0;
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
@@ -119,7 +128,7 @@ function createThreeCompute(renderer, three) {
     snapshotBytes += charged;
   }
   function upload(record) {
-    const {key, version, uniform, source, ranges} = record;
+    const {key, version, uniform, ranges} = record;
     if (uploaded.get(key) === record) {
       const buffer = gpu.getBuffer(key);
       if (buffer) return buffer;
@@ -127,13 +136,9 @@ function createThreeCompute(renderer, three) {
     if (!record.data) fail('STALE', 'A consumed upload snapshot cannot recreate released storage');
     const buffer = gpu.upload(key, record.data, version, {uniform, ranges, admission: record.admission});
     uploaded.set(key, record);
-    if (!uniform) {
-      // A later application update may already have new ranges. Acknowledging
-      // this queued version must not erase the newer version's upload request.
-      if (!record.dynamic && key.array === source && (key.version ?? 0) === version) key.clearUpdateRanges?.();
-      // r186's common Attributes and native WebGPU backend do not invoke the
-      // WebGL-only onUpload callback, including for storage and indirect data.
-    }
+    // Ranges are consumed at capture, where the source admits the update.
+    // Deferred submission must not erase newer requests at the same version.
+    // r186's native uploader leaves the WebGL-only onUpload callback inert.
     return buffer;
   }
   function attributeRecord(attribute, deferred, indirect = false) {
@@ -147,18 +152,30 @@ function createThreeCompute(renderer, three) {
         attribute.array.length !== attribute.itemSize * attribute.count))
       fail('INDIRECT', 'Indirect drawing requires a complete unnormalized source 32-bit integer buffer attribute');
     const plainIndirect = indirect && !attribute.isStorageBufferAttribute && !attribute.isStorageInstancedBufferAttribute;
-    const array = plainIndirect ? attribute.array : normalize(attribute), version = attribute.version ?? 0;
-    const ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
+    const version = attribute.version ?? 0, previous = captured.get(attribute);
+    const initialized = !!(previous?.data || gpu.getBuffer(attribute));
+    const update = !previous || previous.version !== version || attribute.usage === three.DynamicDrawUsage;
+    const array = plainIndirect ? attribute.array : normalize(attribute, update);
+    let ranges = (attribute.updateRanges ?? []).map(({start, count}) => ({start, count}));
     if (!Number.isSafeInteger(version) || version < 0 || ranges.some(({start, count}) =>
       !Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 || start + count > array.length))
       fail('STORAGE', 'Expected a nonnegative storage version and in-bounds update ranges');
-    const previous = captured.get(attribute), initialized = !!(previous?.data || gpu.getBuffer(attribute));
+    const layout = !plainIndirect && uploadLayouts.get(attribute);
+    if (initialized && layout?.paddedItemSize != null) {
+      const {itemSize, paddedItemSize} = layout;
+      ranges = ranges.map(({start, count}) => {
+        const first = Math.floor(start / itemSize), last = Math.ceil((start + count) / itemSize);
+        return {start: first * paddedItemSize, count: (last - first) * paddedItemSize};
+      });
+      if (ranges.some(({start, count}) => start + count > array.length))
+        fail('STORAGE', 'Padded storage update ranges exceed the source allocation');
+    }
     const record = snapshot(attribute, array, version, false, deferred, ranges);
     // The first source allocation uploads everything without consuming ranges.
-    // Later dynamic updates consume them now, before another binding/current
+    // Later admitted updates consume them now, before another binding/current
     // callback can observe this attribute. Clearing at deferred submission would
-    // both repeat old ranges and erase newer requests at the unchanged version.
-    if (record.dynamic && initialized && ranges.length) attribute.clearUpdateRanges?.();
+    // both repeat old ranges and erase newer requests at an unchanged version.
+    if (record !== previous && initialized && ranges.length) attribute.clearUpdateRanges?.();
     return record;
   }
   function readRecord(lease) {
@@ -518,15 +535,17 @@ function createThreeCompute(renderer, three) {
         issue(dispatch = true) { return preparation ? preparation.then(() => issue(dispatch)) : issue(dispatch); }};
     } catch (error) { release(); throw error; }
   }
-  function compute(list, override, schedule, deferred) {
+  function compute(group, list, override, schedule, deferred) {
     live();
     assertThreeNativeComputeOutsideCapture(renderer);
     if (issuing || capturingReads) fail('REENTRY', 'Cannot compute from an upload callback or native storage capture');
     renderer.info.calls++; renderer.info.compute.calls++; renderer.info.compute.frameCalls++;
     const uid = `compute:${renderer.info.compute.frameCalls}:f${renderer.info.frame}`;
-    const timestamp = renderer._timestamps?.begin('compute', uid, list.length === 1 ? list[0] : list);
-    renderer.inspector?.beginCompute?.(uid, list);
-    const operations = renderer.backend?._capture?.(list);
+    // Execution owns the captured list, while Inspector/Timeline and timestamp
+    // lookups retain the caller's node or array identity, including named groups.
+    const timestamp = renderer._timestamps?.begin('compute', uid, group);
+    renderer.inspector?.beginCompute?.(uid, group);
+    const operations = renderer.backend?._capture?.(group);
     const pending = [];
     try {
       for (const node of list) {
@@ -549,7 +568,7 @@ function createThreeCompute(renderer, three) {
           update(entry, 'after');
         });
       }
-    } finally { renderer.inspector?.finishCompute?.(); }
+    } finally { renderer.inspector?.finishCompute?.(uid); }
     return pending.length ? Promise.all(pending).then(() => {}) : undefined;
   }
   async function compile(list, onProgress) {
@@ -750,7 +769,7 @@ export function withThreeCompute(Base, THREE) {
       check(this);
       assertThreeNativeComputeOutsideCapture(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
-      const run = () => owner(this).compute(list, size, (issue, asynchronous) => submit(this, issue, asynchronous, true),
+      const run = () => owner(this).compute(nodes, list, size, (issue, asynchronous) => submit(this, issue, asynchronous, true),
         () => this._computeTurn ? !!this._computeTurn.pending : !!(this._drain || this._preparing));
       const result = this._initialized ? run() : submit(this, () => {
         // Nested onInit/before/after compute calls belong to this submit slot,

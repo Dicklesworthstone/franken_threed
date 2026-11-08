@@ -5,23 +5,27 @@
  * queued render can install its bytes without rewriting application attributes.
  */
 export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
+  const arrayType = attribute?.array?.constructor;
+  const scalar = arrayType === Int8Array || arrayType === Int16Array ? Int32Array
+    : arrayType === Uint8Array || arrayType === Uint16Array ? Uint32Array : arrayType;
   if (!(attribute instanceof three.BufferAttribute) ||
       !(attribute.isStorageBufferAttribute === true || attribute.isStorageInstancedBufferAttribute === true) ||
       attribute.isInterleavedBufferAttribute || attribute.normalized ||
-      ![Float32Array, Int32Array, Uint32Array].includes(attribute.array?.constructor) ||
+      ![Float32Array, Int32Array, Uint32Array].includes(scalar) ||
       !(attribute.array.buffer instanceof ArrayBuffer) || attribute.array.buffer.resizable ||
       !Number.isSafeInteger(attribute.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
       !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
       attribute.array.length !== attribute.itemSize * attribute.count ||
       !Number.isSafeInteger(attribute.version) || attribute.version < 0 ||
       attribute.isInstancedBufferAttribute && attribute.meshPerAttribute !== 1)
-    reject('ATTRIBUTE', 'Native storage vertex inputs require source 32-bit scalar/vector attributes and instance divisor one');
-  // Source storage vec3 values acquire their fourth alignment word on upload.
-  // This canonical signature is stable across that source-visible normalization.
+    reject('ATTRIBUTE', 'Native storage vertex inputs require source f32/integer scalar/vector attributes and instance divisor one');
+  // The source uploader promotes narrow integers to 32 bits and gives vec3
+  // values a fourth alignment word. Keep one signature across those public
+  // layout changes so generated vertices borrow the same shader/compute owner.
   const stride = attribute.itemSize === 3 ? 4 : attribute.itemSize;
   return {gpu: true, owner: attribute, array: attribute.array, interleaved: false,
     instanced: attribute.isInstancedBufferAttribute === true, stride, offset: 0,
-    signature: JSON.stringify([attribute.array.constructor.name, attribute.count, stride,
+    signature: JSON.stringify([scalar.name, attribute.count, stride,
       attribute.isInstancedBufferAttribute === true, attribute.meshPerAttribute])};
 }
 

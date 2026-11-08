@@ -13,6 +13,8 @@ import {createWebGPURendererClass} from './three_renderer.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage, captureComputeAttributeView, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
+// The retained uploader reads this browser enum when promoting unsigned data.
+globalThis.GPUBufferUsage ??= Object.freeze({INDEX: 16});
 const Renderer = createWebGPURendererClass(T), N = T.TSL;
 function fixture(t) {
   const device = geometryDevice();
@@ -100,6 +102,86 @@ function sourceStorage(array, {vertex = false, shader = true, itemSize = 1, inst
     SourceWebGPUBackend.prototype.finishRender.call(backend, context);
   }};
 }
+
+for (const Type of [Int8Array, Uint8Array, Int16Array, Uint16Array]) for (const vertex of [false, true])
+test(`${Type.name} storage enters native ${vertex ? 'vertex and shader' : 'shader'} reads through source integer promotion`, async t => {
+  const f = fixture(t), signed = Type === Int8Array || Type === Int16Array;
+  const data = new Type(Array.from({length: 16}, (_, index) => signed ? index - 8 : index + 240));
+  const attribute = new T.StorageBufferAttribute(data.slice(), 4), storage = N.storage(attribute, signed ? 'ivec4' : 'uvec4', 4);
+  f.material.colorNode = storage.element(0).xyz.toFloat().abs().mul(.01);
+  if (vertex) f.material.positionNode = N.positionLocal.add(storage.toAttribute().xyz.toFloat().mul(.001));
+  const source = sourceStorage(data, {itemSize: 4, vertex, instanced: false});
+  source.render([() => {}]);
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const draw = draws(f.device)[0], buffer = shaderStorage(draw)[0], Scalar = signed ? Int32Array : Uint32Array;
+  assert.equal(attribute.array.constructor, Scalar);
+  assert.deepEqual([...attribute.array], [...source.attribute.array]);
+  assert.deepEqual(words(draw, buffer, Scalar), words(draws(source.device)[0], source.buffer, Scalar));
+  if (vertex) {
+    const slot = [...draw.streams].find(([, value]) => value === buffer)[0];
+    assert.equal(draw.pipeline.vertex.buffers[slot].attributes[0].format, signed ? 'sint32x4' : 'uint32x4');
+  }
+  const count = f.device.writes.filter(write => write.buffer === buffer).length;
+  attribute.array.fill(9); attribute.addUpdateRange(4, 4); attribute.needsUpdate = true;
+  source.render([current => { current.array.fill(9); current.addUpdateRange(4, 4); current.needsUpdate = true; }]);
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(shaderStorage(draws(f.device)[1])[0], buffer);
+  assert.deepEqual(words(draws(f.device)[1], buffer, Scalar), words(draws(source.device)[1], source.buffer, Scalar));
+  assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, count + 1);
+});
+
+for (const dynamic of [false, true])
+test(`${dynamic ? 'dynamic' : 'versioned'} vec3 storage retains source padding and range histories across queued renders`, async t => {
+  const f = fixture(t), data = new Float32Array([1, 2, 3, 4, 5, 6]);
+  const attribute = new T.StorageBufferAttribute(data.slice(), 3), storage = N.storage(attribute, 'vec3', 2);
+  f.material.colorNode = storage.element(0).mul(.01);
+  const source = sourceStorage(data, {itemSize: 3, instanced: false});
+  for (const current of [attribute, source.attribute]) {
+    current.setUsage(dynamic ? T.DynamicDrawUsage : T.StaticDrawUsage); current.addUpdateRange(4, 1);
+  }
+  await f.renderer.init();
+  const changes = [() => {}, current => {
+    current.array.set([11, 12, 13, 14, 15, 16, 17, 18]);
+    if (!dynamic) current.needsUpdate = true;
+  }, current => {
+    current.array.set([21, 22, 23, 24, 25, 26, 27, 28]); current.clearUpdateRanges();
+    if (!dynamic) current.needsUpdate = true;
+  }];
+  for (const change of changes) {
+    source.render([change]); change(attribute); f.renderer.render(f.scene, f.camera);
+    assert.deepEqual([...attribute.array], [...source.attribute.array], 'public arrays follow the source upload layout');
+    assert.deepEqual(attribute.updateRanges, source.attribute.updateRanges,
+      'ranges are consumed at the source update boundary, after the initial allocation');
+  }
+  attribute.array.fill(99); await drain(f.renderer);
+  const selected = draws(f.device), buffer = shaderStorage(selected[0])[0];
+  assert.deepEqual(selected.map(draw => words(draw, buffer)), draws(source.device).map(draw => words(draw, source.buffer)));
+  assert.ok(selected.every(draw => shaderStorage(draw)[0] === buffer));
+  assert.equal(attribute.version, dynamic ? 0 : 2); assert.equal(attribute.itemSize, 4);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const dynamic of [false, true])
+test(`${dynamic ? 'dynamic' : 'versioned'} vec3 compute uses the pinned repeated padding and range mapping`, async t => {
+  const f = fixture(t), data = new Float32Array([1, 2, 3, 4, 5, 6]);
+  const attribute = new T.StorageBufferAttribute(data.slice(), 3), storage = N.storage(attribute, 'vec3', 2);
+  const compute = kernel(storage), source = sourceStorage(data, {itemSize: 3, instanced: false});
+  t.after(() => compute.dispose()); await f.renderer.init();
+  for (const current of [attribute, source.attribute]) {
+    current.setUsage(dynamic ? T.DynamicDrawUsage : T.StaticDrawUsage); current.addUpdateRange(4, 1);
+  }
+  for (let turn = 0; turn < 3; turn++) {
+    if (turn) for (const current of [attribute, source.attribute]) {
+      current.array.set([11, 12, 13, 14, 15, 16, 17, 18].map(value => value + turn * 10));
+      if (!dynamic) current.needsUpdate = true;
+    }
+    source.update(); f.renderer.compute(compute);
+    const buffer = computeStorage(f.device.computePasses.at(-1))[0];
+    assert.deepEqual([...attribute.array], [...source.attribute.array]);
+    assert.deepEqual([...new Float32Array(buffer.data)], [...new Float32Array(source.buffer.data)]);
+    assert.deepEqual(attribute.updateRanges, source.attribute.updateRanges);
+  }
+});
 
 test('one render accumulates shared shader-storage versions at the pinned submission boundary', async t => {
   const f = fixture(t), storage = N.instancedArray(new Float32Array(1), 'float');
@@ -907,25 +989,34 @@ for (const bundled of [false, true]) for (const vertex of [false, true])
 test(`${bundled ? 'bundled' : 'ordinary SHARED'} ${vertex ? 'generated' : 'shader-only'} storage retains each preceding compute upload`, async t => {
   const f = fixture(t), colors = N.attributeArray(4, 'vec3'), attribute = colors.value;
   attribute.array.fill(.125);
+  const source = sourceStorage(attribute.array, {itemSize: 3, vertex, instanced: false});
   f.scene.fogNode = N.fog(vertex ? colors.toAttribute().add(colors.element(0)) : colors.element(0), N.float(.5));
   if (bundled) {
     const group = new T.BundleGroup(); group.add(f.mesh); f.scene.add(group);
   }
   await f.renderer.init();
+  source.render([() => {}]);
   f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   const buffer = captureComputeStorage(f.device, attribute).resolve().buffer;
   const encoded = f.device.bundleEncoders.length;
   attribute.array.fill(.25); attribute.needsUpdate = true;
+  source.attribute.array.fill(.25); source.attribute.needsUpdate = true; source.update(); source.render([() => {}]);
   f.renderer.compute(kernel(colors)); f.renderer.render(f.scene, f.camera);
   attribute.array.fill(99); attribute.array[0] = .75; attribute.addUpdateRange(0, 1); attribute.needsUpdate = true;
+  source.attribute.array.fill(99); source.attribute.array[0] = .75;
+  source.attribute.addUpdateRange(0, 1); source.attribute.needsUpdate = true; source.update(); source.render([() => {}]);
   f.renderer.compute(kernel(colors)); f.renderer.render(f.scene, f.camera);
   attribute.array.fill(99);
   await drain(f.renderer);
+  source.attribute.array.fill(99); source.render([() => {}]);
   f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   const selected = draws(f.device);
   assert.equal(selected.length, 4);
   assert.deepEqual(selected.map(draw => words(draw, buffer)[0]), [.125, .25, .75, .75]);
-  assert.deepEqual(selected.map(draw => words(draw, buffer)[1]), [.125, .25, .25, .25], 'partial uploads leave unrequested words GPU-stale');
+  assert.deepEqual(selected.map(draw => words(draw, buffer)), draws(source.device).map(draw => words(draw, source.buffer)));
+  // The pinned padded uploader expands a component range to its whole source
+  // vector. Only vectors outside that expanded range must stay GPU-stale.
+  assert.deepEqual(selected.map(draw => words(draw, buffer)[4]), [.125, .25, .25, .25]);
   assert.ok(selected.every(draw => (!vertex || [...draw.streams.values()].includes(buffer)) && shaderStorage(draw).includes(buffer)));
   if (bundled) assert.equal(f.device.bundleEncoders.length, encoded + (vertex ? 2 : 0), 'unchanged captured versions reuse their native command bundle');
   assert.equal(f.device.writes.filter(write => write.buffer === buffer).length, 3,

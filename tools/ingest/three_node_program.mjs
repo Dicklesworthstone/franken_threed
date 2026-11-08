@@ -339,6 +339,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const components = matrix ? Number(matrix) ** 2 : type?.[2] ? Number(type[2]) : 1;
     const scalar = type?.[1] === 'i' || type?.[3] === 'int' ? Int32Array
       : type?.[1] === 'u' || type?.[3] === 'uint' ? Uint32Array : Float32Array;
+    // Native WebGPU promotes unnormalized 8-/16-bit integer attributes at
+    // their first upload. Admit that source entrance before compute owns the
+    // allocation; shader construction itself must not mutate the public array.
+    const promoted = attribute?.array instanceof Int8Array || attribute?.array instanceof Int16Array ? Int32Array
+      : attribute?.array instanceof Uint8Array || attribute?.array instanceof Uint16Array ? Uint32Array : attribute?.array?.constructor;
     // Storage matrices use aligned column vectors: mat2 is four words, mat3
     // is twelve (three padded vec3 columns), and mat4 is sixteen. The source
     // attribute uploader only pads itemSize=3, not a packed nine-word mat3;
@@ -372,7 +377,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !['readOnly', 'readWrite'].includes(node.access) ||
         !(attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute) ||
         attribute.isInterleavedBufferAttribute || attribute.normalized ||
-        !(struct ? [Float32Array, Int32Array, Uint32Array].some(Type => attribute.array instanceof Type) : attribute.array instanceof scalar) ||
+        !(struct ? [Float32Array, Int32Array, Uint32Array].includes(promoted) : promoted === scalar) ||
         !Number.isSafeInteger(attribute.count) || attribute.count < 1 ||
         !(struct || matrix ? attribute.itemSize === stride : [components, stride].includes(attribute.itemSize)) ||
         attribute.array.length !== attribute.count * attribute.itemSize ||

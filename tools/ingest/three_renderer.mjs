@@ -1153,7 +1153,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._timestampScope = timestamp;
       this._operationScope = this._backend._capture({camera, renderTarget: this._renderTarget});
       try { return this._renderFrame(scene, camera); }
-      finally { this._timestampScope = previousTimestamp; this._operationScope = previousOperations; this._inspector.finishRender(); }
+      finally { this._timestampScope = previousTimestamp; this._operationScope = previousOperations; this._inspector.finishRender(uid); }
     }
     _makeRequest(scene, camera, clearOnly = null, captureCameras = true, sourceTarget = this._renderTarget, sceneLifecycle = null) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;

@@ -777,6 +777,22 @@ remain unchanged. The H8 fluid particle record (`position: vec3`,
 `velocity: vec3`, `C: mat3`) occupies 80 bytes and can be written by compute and
 read directly in both vertex and fragment graphs.
 
+Unnormalized Int8, Uint8, Int16 and Uint16 storage attributes can enter native
+shader reads and generated `.toAttribute()` vertex inputs directly. Their first
+upload performs the pinned signed/unsigned 32-bit promotion, with stable program
+signatures and one shared compute/graphics allocation. Shader construction alone
+does not replace the source array. Later partial uploads retain that allocation.
+
+Storage `vec3` uploads preserve the pinned original-stride padding history,
+including its public array replacements on later accepted updates. Component
+ranges expand to complete padded vectors using the original three-word stride;
+vectors outside those ranges keep their GPU contents. Initial allocation leaves
+ranges pending, and later accepted static or dynamic updates consume them during
+capture so delayed submission cannot erase newer requests. The 63 storage
+regressions pass, including twelve new integer-promotion and queued-padding cases
+against the actual pinned attribute owners. These are recording-device byte and
+ownership checks; browser pixels and hardware performance are unverified.
+
 `IndirectStorageBufferAttribute` also participates in these native storage
 bindings. Vertex/fragment shader reads, compute kernels and indirect draw arguments
 share one allocation and the captured upload history. Later unrequested CPU edits
@@ -1055,7 +1071,7 @@ attribute versions are unchanged, and later CPU edits cannot replace an accepted
 payload. Switching back to static usage preserves GPU-produced contents until
 the source requests another upload.
 
-Dynamic partial updates consume their ranges at that source update boundary.
+Admitted partial updates consume their ranges at that source update boundary.
 The first allocation retains the ranges, as upstream does; a subsequent shader
 binding can therefore require a full upload after geometry consumed a partial
 range. Deferred submission does not clear newer requests at the same public

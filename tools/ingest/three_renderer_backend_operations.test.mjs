@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import {RendererInspector} from '../../upstream/three.js/examples/jsm/inspector/RendererInspector.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -73,6 +74,46 @@ function observe(f) {
 }
 const flush = async renderer => {while (renderer._drain) await renderer._drain;};
 const deferred = () => {let resolve; const promise = new Promise(yes => {resolve = yes;}); return {promise, resolve};};
+
+test('Inspector compute records and timestamp lookups retain the exact node or named group owner', async t => {
+  const f = fixture(t), N = T.TSL;
+  const values = new T.StorageBufferAttribute(new Uint32Array(8), 1), storage = N.storage(values, 'uint', 8);
+  const kernel = N.Fn(() => {storage.element(N.instanceIndex).assign(N.instanceIndex);})().compute(8, [4]);
+  kernel.name = 'Update particles'; t.after(() => kernel.dispose());
+  const inspector = new RendererInspector(); inspector.resolveTimestamp = () => {};
+  f.renderer.inspector = inspector;
+  const calls = [], begin = inspector.beginCompute, finish = inspector.finishCompute;
+  inspector.beginCompute = function (uid, owner) { calls.push({kind: 'begin', uid, owner}); return begin.call(this, uid, owner); };
+  inspector.finishCompute = function (uid) { calls.push({kind: 'finish', uid}); return finish.call(this, uid); };
+  await f.renderer.init(); await f.renderer.compileComputeAsync(kernel);
+  f.renderer.info.frame = 3; inspector.begin();
+  const single = [kernel], group = [kernel, kernel];
+  single.name = 'One step'; group.name = 'Two steps';
+  for (const owner of [kernel, single, group]) {
+    f.renderer.compute(owner);
+    const record = inspector.currentFrame.computes.at(-1);
+    assert.equal(record.computeNode, owner, 'the unchanged Inspector must see the original source owner');
+    assert.equal(record.name, owner.name);
+    const [start, end] = calls.slice(-2);
+    assert.equal(start.owner, owner); assert.equal(end.uid, start.uid);
+    assert.equal(f.renderer.backend.getTimestampUID(owner), start.uid);
+  }
+  inspector.finish();
+  await flush(f.renderer);
+  assert.equal(f.device.computePasses.length, 4);
+});
+
+test('Inspector render completion receives the UID of the accepted render', async t => {
+  const f = fixture(t), calls = [];
+  const begin = f.inspector.beginRender, finish = f.inspector.finishRender;
+  f.inspector.beginRender = function (uid, ...args) { calls.push(['begin', uid]); return begin.call(this, uid, ...args); };
+  f.inspector.finishRender = function (uid) { calls.push(['finish', uid]); return finish.call(this, uid); };
+  await f.renderer.init(); f.renderer.info.frame = 4;
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(calls.map(([kind]) => kind), ['begin', 'finish']);
+  assert.equal(calls[1][1], calls[0][1]); assert.ok(calls[1][1].endsWith(':f4'));
+  await flush(f.renderer);
+});
 
 for (const [kind, material] of [
   ['ordinary MeshToon', () => new T.MeshToonNodeMaterial()],
@@ -152,13 +193,18 @@ test('queued compute reports the captured source dispatch and restores the surro
   f.device.createRenderPipelineAsync = async descriptor => {started.resolve(); await gate.promise; return pipeline(descriptor);};
   t.after(() => {gate.resolve(); kernel.dispose();});
   f.renderer.info.frame = 6; f.renderer.render(f.scene, f.camera); await started.promise;
-  f.renderer.info.frame = 7; const dispatch = [2, 1, 1]; f.renderer.compute(kernel, dispatch);
-  dispatch[0] = 1; f.renderer.info.frame = 12;
+  f.renderer.info.frame = 7; const dispatch = [2, 1, 1], group = [kernel]; group.name = 'Queued step';
+  f.renderer.compute(group, dispatch);
+  const acceptedUid = f.renderer.backend.getTimestampUID(group);
+  group.length = 0; dispatch[0] = 1; f.renderer.info.frame = 12;
   assert.equal(f.device.computePasses.length, 0); assert.equal(f.inspector.currentCompute, null);
   gate.resolve(); await flush(f.renderer);
   const events = watched.events.filter(event => event.name.includes('Compute') || event.name === 'compute');
   assert.deepEqual(events.map(event => event.name), ['beginCompute', 'compute', 'finishCompute']);
   assert.deepEqual(events.map(event => event.frame), [7, 7, 7]);
+  assert.ok(events.every(event => event.target === group), 'queued operations keep the original group identity');
+  assert.ok(events.every(event => event.compute.group === group));
+  assert.ok(events.every(event => event.compute.uid === acceptedUid));
   assert.equal(events[1].node, kernel); assert.deepEqual(events[1].dispatch, [2, 1, 1]);
   assert.ok(events[1].compute.uid.endsWith(':f7'));
   assert.deepEqual(f.device.computePasses[0].dispatches, [[2, 1, 1]]); assert.equal(f.device.computePasses[0].ended, true);
