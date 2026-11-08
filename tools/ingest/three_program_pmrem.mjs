@@ -570,6 +570,7 @@ struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
       for (const byKey of residencies.values()) for (const gpu of byKey.values()) gpu.dispose();
       residencies.clear(); dfg?.texture.destroy(); dfg = null;
       targets.clear(); done.clear(); outputs.clear(); constant?.destroy(); constant = null; generator.dispose();
+      capture?.dispose(); capture = null;
     },
   });
 }

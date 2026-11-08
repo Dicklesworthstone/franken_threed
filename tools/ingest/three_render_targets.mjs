@@ -416,7 +416,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function release(entry) {
     if (entry.busy || entry.programReferences || entry.depthReferences || entry.historyGroup?.busy || entry.historyGroup?.frame || entry.released) return;
     entry.released = true;
-    try { entry._dispatcher?.dispose(); }
+    try {
+      try { entry._dispatcher?.dispose(); }
+      finally { const program = entry._programSupport; entry._programSupport = null; program?.dispose(); }
+    }
     finally {
       const group = entry.historyGroup;
       if (group) {

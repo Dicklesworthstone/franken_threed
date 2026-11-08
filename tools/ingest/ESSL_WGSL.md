@@ -365,8 +365,20 @@ material on the program route, as program shadow maps do. Scenario
 Shader hooks: `material.onBeforeCompile(parameters, renderer)` runs as in
 WebGLRenderer.getProgram, once per program (keyed by the assembled pre-hook
 program and `customProgramCacheKey()`), on parameters whose `uniforms` are the
-material's uniforms object that is later refreshed and packed; added uniforms
-and rewritten chunks reach the program. `material.onBeforeRender` runs at the
+source `ShaderMaterial.uniforms` or a fresh ShaderLib clone. A replacement
+`parameters.uniforms` dictionary becomes the renderer's active uniform owner
+without replacing the public `material.uniforms`; added numeric values and
+samplers reach the program. Selecting an older cached variant retains the latest
+dictionary, matching the source's assignment boundary. Material disposal clears
+the hook result and dictionary so later reuse recompiles the hook; renderer,
+target and PMREM teardown release those caches and their listeners without
+disposing application textures. Callback, source-assembly and translation errors
+do not publish a replacement or cache a failed hook result.
+`three_program.test.mjs` checks these ownership transitions against the unchanged
+pinned `WebGLRenderer.getProgram` and disposal functions, with GL program
+allocation recorded, and checks actual packed values and sampler identities.
+Those checks do not execute a GPU or establish pixel parity.
+`material.onBeforeRender` runs at the
 draw. Materials with either hook always draw their program. Scenario
 `shaderlib_before_compile` matches upstream WebGLRenderer;
 `webgl_materials_modified`, `webgl_shadowmap_csm` (CSM chunk rewrites) and

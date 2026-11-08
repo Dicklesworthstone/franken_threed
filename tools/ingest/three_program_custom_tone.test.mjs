@@ -58,12 +58,13 @@ function fixture(t, native = false) {
 }
 const fragment = draw => draw.pipeline.fragment.module.code;
 const customCall = /fn toneMapping\([\s\S]*?return CustomToneMapping\(color\);/;
-function exposure(draw, reflection) {
+function uniformScalar(draw, reflection, name) {
   const {group, offsets} = draw.groups.get(0), {resource} = group.entries.find(entry => entry.binding === 0);
-  const bytes = draw.contents.get(resource.buffer), uniform = reflection.uniforms.find(u => u.name === 'toneMappingExposure');
+  const bytes = draw.contents.get(resource.buffer), uniform = reflection.uniforms.find(u => u.name === name);
   return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     .getFloat32((resource.offset ?? 0) + (offsets[0] ?? 0) + uniform.offset, true);
 }
+const exposure = (draw, reflection) => uniformScalar(draw, reflection, 'toneMappingExposure');
 
 test('custom tone operators compile from the pinned WebGLProgram source for built-in and authored materials', t => {
   customChunk(t);
@@ -85,7 +86,7 @@ test('custom tone operators compile from the pinned WebGLProgram source for buil
 test('custom tone recompilation preserves live ShaderChunk replacement and material shader hooks', async t => {
   const replace = customChunk(t), f = fixture(t);
   f.material.onBeforeCompile = shader => {
-    shader.uniforms.customOffset = {value: .125};
+    shader.uniforms = {...shader.uniforms, customOffset: {value: .125}};
     shader.fragmentShader = 'uniform float customOffset;\n' + shader.fragmentShader.replace('#include <tonemapping_fragment>',
       '#include <tonemapping_fragment>\ngl_FragColor.rgb += vec3(customOffset);');
   };
@@ -94,12 +95,15 @@ test('custom tone recompilation preserves live ShaderChunk replacement and mater
   const first = f.device.snapshots.flat().at(-1);
   assert.match(fragment(first), /f3d_u.customOffset/);
   assert.match(fragment(first), customCall);
+  assert.equal(uniformScalar(first, f.renderer._programSupport.compile(f.material, f.mesh).program.reflection, 'customOffset'), .125,
+    'the submitted draw reads the hook replacement dictionary');
   replace('sqrt(color * toneMappingExposure)'); f.material.needsUpdate = true;
   await f.renderer.renderAsync(f.scene, f.camera);
   const second = f.device.snapshots.flat().at(-1);
   assert.notEqual(second.pipeline, first.pipeline, 'changed runtime source produces a new program');
   assert.match(fragment(second), /sqrt\(\(color \* f3d_u.toneMappingExposure\)\)/);
   assert.match(fragment(second), /f3d_u.customOffset/);
+  assert.equal(uniformScalar(second, f.renderer._programSupport.compile(f.material, f.mesh).program.reflection, 'customOffset'), .125);
   assert.equal(f.renderer._hdr, false);
 });
 

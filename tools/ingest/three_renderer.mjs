@@ -656,6 +656,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       dispose(() => this._nodeBackgrounds?.dispose()); this._nodeBackgrounds = null;
       dispose(() => this._nodeProgramSupport?.dispose());
       this._nodeProgramSupport = null;
+      dispose(() => this._programSupport?.dispose()); this._programSupport = null;
       dispose(() => this._nodeBundles?.dispose()); this._nodeBundles = null;
       dispose(() => this._occlusionQueries?.dispose());
       dispose(() => this._canvasTarget?.dispose());

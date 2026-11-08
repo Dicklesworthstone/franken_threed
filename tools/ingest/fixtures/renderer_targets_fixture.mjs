@@ -20,7 +20,7 @@ class Color {
 class Vector2 { set(x, y) { Object.assign(this, {x, y}); return this; } }
 export const T = {...targetThree, EventDispatcher, Scene, Object3D, Camera, PerspectiveCamera: Camera, Color, Vector2,
   WebGPUCoordinateSystem: 2001, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
-export const createThreeProgramSupport = options => options;
+export const createThreeProgramSupport = options => ({...options, disposeCount: 0, dispose() { this.disposeCount++; }});
 export const createThreeProgramPMREM = () => {};
 export const createThreeProgramShadows = () => {};
 export async function createGpuThreeScene(device, scene, options) {

@@ -52,7 +52,7 @@ export function threeProgramSources(T, material, object, ctx = {}) {
   // WebGLRenderer.getProgram: material.onBeforeCompile(parameters, renderer) may
   // rewrite the shader sources and add uniforms before the program is built.
   const sourceOptions = {toneMappingChunk: ctx.toneMappingChunk};
-  if (ctx.beforeCompile && material.onBeforeCompile !== T.Material.prototype.onBeforeCompile) ctx.beforeCompile(parameters, sourceOptions);
+  if (ctx.beforeCompile) ctx.beforeCompile(parameters, sourceOptions);
   return {...webglProgramSources(T, parameters, sourceOptions), parameters};
 }
 const EMPTY_LIGHTS = Object.freeze({ambient: [0, 0, 0], probe: [], sun: [], sunShadowMap: [], directional: [], directionalShadowMap: [], point: [],
@@ -295,7 +295,8 @@ function write(view, node, value, name, base = 0) {
  * WebGLRenderer.render does) and per-material ShaderLib uniform clones.
  * Compiled programs are cached by their exact assembled source text (bounded). */
 export function createThreeProgramSupport({three: T, state, maxPrograms = 256, maxPointSize = 1024, pmrem = null, shadows = null, transmission = null}) {
-  const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true}), clones = new WeakMap();
+  const compiled = new Map(), lights = webglLights(T, {floatLinear: () => state().floatLinear === true});
+  let clones = new WeakMap();
   const uniformBlocks = createUniformBlocks();
   let dfgLUT = null;
   /** r186 getDFGLUT(): the 16x16 RG half-float DFG table, linear, clamped. */
@@ -312,26 +313,49 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
    * lights (WebGLPrograms shadowMapEnabled). renderTarget: an offscreen pass
    * (shadow depth): no tone mapping, linear output, GL row order. */
   /** onBeforeCompile runs once per program (keyed, like WebGLPrograms, by the
-   * assembled pre-hook program and customProgramCacheKey), on parameters whose
-   * `uniforms` are this material's uniforms object, later refreshed and packed. */
-  const hookResults = new WeakMap();
+   * assembled pre-hook program and customProgramCacheKey). Each new program
+   * starts with getUniforms(material), and a replacement dictionary becomes
+   * the material's active uniform owner, as WebGLRenderer.getProgram does. */
+  const hookResults = new Map();
+  function onMaterialDispose({target: material}) {
+    material.removeEventListener('dispose', onMaterialDispose);
+    hookResults.delete(material); clones.delete(material);
+  }
+  function shaderCallback(callback) {
+    const renderer = state().renderer ?? null;
+    if (renderer?._shaderEncodedOutput !== true) return callback(renderer);
+    const depth = renderer._programCompileCallbackDepth ?? 0;
+    renderer._programCompileCallbackDepth = depth + 1;
+    try { return callback(renderer); }
+    finally { renderer._programCompileCallbackDepth = depth; }
+  }
   function beforeCompile(material, parameters, sourceOptions) {
-    const key = webglProgramSources(T, parameters, sourceOptions).key + '\u0000' + material.customProgramCacheKey();
+    const key = webglProgramSources(T, parameters, sourceOptions).key + shaderCallback(() => '\u0000' + material.customProgramCacheKey());
     let byKey = hookResults.get(material);
-    if (!byKey) hookResults.set(material, byKey = new Map());
-    let result = byKey.get(key);
-    if (!result) {
-      parameters.uniforms = uniformsFor(material);
-      material.onBeforeCompile(parameters, state().renderer ?? null);
-      result = {vertexShader: parameters.vertexShader, fragmentShader: parameters.fragmentShader};
-      byKey.set(key, result);
+    if (!byKey) {
+      hookResults.set(material, byKey = new Map());
+      material.addEventListener('dispose', onMaterialDispose);
     }
+    let result = byKey.get(key), publish = null;
+    if (!result) {
+      parameters.uniforms = webglMaterialUniforms(T, material);
+      shaderCallback(renderer => material.onBeforeCompile(parameters, renderer));
+      result = {vertexShader: parameters.vertexShader, fragmentShader: parameters.fragmentShader};
+      // Source getProgram publishes only after acquireProgram has assembled
+      // the shader. A failed include, translation or callback must not replace
+      // the last usable dictionary or prevent a later retry of this variant.
+      publish = () => { byKey.set(key, result); clones.set(material, parameters.uniforms); };
+    }
+    // Selecting a cached variant leaves the latest dictionary installed. The
+    // source assigns materialProperties.uniforms only for a new program.
     parameters.vertexShader = result.vertexShader; parameters.fragmentShader = result.fragmentShader;
+    return publish;
   }
   function compile(material, object, {fog = null, side = material.side, envMap = null, shadows = false, renderTarget = false, clipping = null} = {}) {
     const s = state();
+    let publishHook;
     const sources = threeProgramSources(T, material, object, {fog, side, envMap, lights: lights.state, clipping,
-      beforeCompile: (p, sourceOptions) => beforeCompile(material, p, sourceOptions),
+      beforeCompile: (p, sourceOptions) => { publishHook = beforeCompile(material, p, sourceOptions); },
       toneMapping: renderTarget ? T.NoToneMapping : s.toneMapping, outputColorSpace: renderTarget ? T.LinearSRGBColorSpace : s.outputColorSpace,
       toneMappingChunk: renderTarget ? undefined : s.toneMappingChunk,
       shadowMapEnabled: shadows, shadowMapType: s.shadowMapType ?? T.PCFShadowMap,
@@ -346,13 +370,14 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
       if (compiled.size >= maxPrograms) compiled.delete(compiled.keys().next().value);
       compiled.set(key, entry);
     }
+    publishHook?.();
     return entry;
   }
-  /** WebGLRenderer.getUniforms: material.uniforms, or this material's ShaderLib clone. */
+  /** materialProperties.uniforms, or the source getUniforms before first use. */
   function uniformsFor(material) {
+    if (clones.has(material)) return clones.get(material);
     if (material.isShaderMaterial) return material.uniforms;
-    let u = clones.get(material);
-    if (!u) clones.set(material, u = webglMaterialUniforms(T, material));
+    const u = webglMaterialUniforms(T, material); clones.set(material, u);
     return u;
   }
   /** WebGLRenderer.setProgram binds shadow maps from the light state by uniform
@@ -427,6 +452,11 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     state,
     clippingState: (controls, material, camera, options) => threeClippingState(T, controls, material, camera, options),
     bindsClippingPlanes,
+    dispose() {
+      for (const material of hookResults.keys()) onMaterialDispose({target: material});
+      clones = new WeakMap(); compiled.clear();
+      dfgLUT?.dispose(); dfgLUT = null;
+    },
     createGeometry: (device, source, attributes, options) => createGpuProgramGeometry(device, source, attributes, options),
     geometrySnapshot: (gpu, device) => programGeometrySnapshot(gpu, device),
   });

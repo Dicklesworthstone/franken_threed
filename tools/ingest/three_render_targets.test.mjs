@@ -17,6 +17,21 @@ test('selecting source targets is GPU-free; one persistent storage per target', 
   assert.equal(calls.destroyed, 0); assert.ok(calls.textures.every(t => t.destroyed === 1));
 });
 
+for (const throws of [false, true]) test(`target release disposes shader program ownership after dispatcher teardown: throws=${throws}`, () => {
+  const {owner, target, calls} = fixture(), entry = owner.capture(target), events = [];
+  const marker = new Error('dispatcher disposal failed');
+  owner.ensure(entry);
+  entry._dispatcher = {dispose() { events.push('dispatcher'); if (throws) throw marker; }};
+  entry._programSupport = {dispose() { events.push('program'); }};
+  if (throws) assert.throws(() => target.dispose(), error => error === marker);
+  else target.dispose();
+  assert.deepEqual(events, ['dispatcher', 'program']);
+  assert.equal(entry._programSupport, null);
+  assert.ok(calls.textures.every(texture => texture.destroyed === 1));
+  owner.dispose();
+  assert.deepEqual(events, ['dispatcher', 'program'], 'retired support is not disposed twice');
+});
+
 for (const samples of [0, 4]) for (const type of [T.UnsignedByteType, T.HalfFloatType])
   test(`resolved texture sampling: samples=${samples}, type=${type}`, async () => {
     const {owner, target, calls} = fixture(); target.samples = samples; target.texture.type = type;

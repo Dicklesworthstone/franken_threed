@@ -4,11 +4,15 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
+import {parse} from 'acorn';
+import {simple} from 'acorn-walk';
 import {threeProgramSources, threeProgramRaster, packThreeProgramUniforms, createThreeProgramSupport} from './three_program.mjs';
 import {compileEsslProgram} from './essl_wgsl.mjs';
-const T = await import(pathToFileURL(path.join(process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js'), 'build/three.module.js')));
+const upstream = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
+const T = await import(pathToFileURL(path.join(upstream, 'build/three.module.js')));
 
 const state = {toneMapping: T.NoToneMapping, outputColorSpace: T.SRGBColorSpace};
 const shader = (extra = {}) => new T.ShaderMaterial({
@@ -99,6 +103,183 @@ test('program support caches compiled programs by exact source text', () => {
   assert.equal(support.compile(m, a), support.compile(m, b));
   assert.notEqual(support.compile(m, a), support.compile(m, new T.Mesh(new T.BufferGeometry().setAttribute('position', new T.BufferAttribute(new Float32Array(9), 3)), m)),
     'HAS_NORMAL differs, so the program differs');
+});
+
+// Execute unchanged r186 program/uniform ownership, source assembly and disposal
+// against recording GL allocation calls. Source keys/clones/acquisition are the
+// real WebGLPrograms; this is an ownership oracle, not a GPU shader oracle.
+async function sourceProgramOwner() {
+  const {WebGLPrograms} = await import(pathToFileURL(path.join(upstream, 'src/renderers/webgl/WebGLPrograms.js')));
+  const {WebGLProperties} = await import(pathToFileURL(path.join(upstream, 'src/renderers/webgl/WebGLProperties.js')));
+  const {WebGLLights} = await import(pathToFileURL(path.join(upstream, 'src/renderers/webgl/WebGLLights.js')));
+  const source = fs.readFileSync(path.join(upstream, 'src/renderers/WebGLRenderer.js'), 'utf8');
+  const names = new Set(['getProgram', 'updateCommonMaterialProperties', 'materialNeedsLights',
+    'onMaterialDispose', 'deallocateMaterial', 'releaseMaterialProgramReferences']), bodies = [];
+  simple(parse(source, {ecmaVersion: 'latest', sourceType: 'module'}), {FunctionDeclaration(node) {
+    if (names.has(node.id?.name)) bodies.push(source.slice(node.start, node.end));
+  }});
+  assert.equal(bodies.length, names.size);
+  const gl = {VERTEX_SHADER: 'vertex', FRAGMENT_SHADER: 'fragment', createProgram: () => ({}), createShader: type => ({type}),
+    shaderSource(shader, text) { shader.source = text; }, compileShader() {}, attachShader() {}, bindAttribLocation() {}, linkProgram() {}, deleteProgram() {}};
+  const renderer = {...state, getContext: () => gl, getRenderTarget: () => null, state: {buffers: {depth: {getReversed: () => false}}},
+    shadowMap: {enabled: false, type: T.PCFShadowMap}}, environments = {get: texture => texture ?? null};
+  const extensions = {has: () => false}, capabilities = {precision: 'highp', getMaxPrecision: value => value};
+  const clipping = {numPlanes: 0, numIntersection: 0, uniform: {value: null}}, properties = WebGLProperties();
+  const programCache = WebGLPrograms(renderer, environments, extensions, capabilities, {releaseStatesOfProgram() {}}, clipping);
+  const currentRenderState = {state: {lights: WebGLLights(extensions), shadowsArray: [], lightProbeGridArray: []}};
+  return Function('properties', 'currentRenderState', 'programCache', 'environments', 'clipping', '_this', '_emptyScene',
+    'const _nodesHandler = null;\n' + bodies.join('\n') + '\nreturn {compile(material, object) { return getProgram(material, _emptyScene, object); },' +
+    'uniformsFor(material) { return properties.get(material).uniforms; }};')(
+    properties, currentRenderState, programCache, environments, clipping, renderer, new T.Scene());
+}
+
+test('shader hooks retain replaced uniform dictionaries and fresh variant inputs like r186', async t => {
+  for (const owner of [await sourceProgramOwner(), createThreeProgramSupport({three: T, state: () => state})]) {
+    t.after(() => owner.dispose?.());
+    for (const material of [shader(), new T.MeshBasicMaterial()]) {
+      const mesh = new T.Mesh(new T.BoxGeometry(), material), inputs = [], outputs = [];
+      t.after(() => { material.dispose(); mesh.geometry.dispose(); });
+      material.onBeforeCompile = parameters => {
+        inputs.push(parameters.uniforms);
+        parameters.uniforms = {...parameters.uniforms, injected: {value: outputs.length + 1}};
+        outputs.push(parameters.uniforms);
+      };
+      owner.compile(material, mesh);
+      assert.equal(owner.uniformsFor(material), outputs[0], 'the callback-selected dictionary owns the program uniforms');
+      owner.compile(material, mesh);
+      assert.equal(outputs.length, 1, 'a cached program does not replay the callback');
+      material.defines = {SECOND: 1}; material.needsUpdate = true;
+      owner.compile(material, mesh);
+      assert.equal(owner.uniformsFor(material), outputs[1]);
+      assert.equal(inputs[1].injected, undefined, 'a new variant does not inherit the preceding hook dictionary');
+      if (material.isShaderMaterial) assert.equal(inputs[1], material.uniforms);
+      else assert.notEqual(inputs[1], inputs[0], 'ShaderLib supplies a fresh clone for a new variant');
+      material.defines = {}; material.needsUpdate = true;
+      owner.compile(material, mesh);
+      assert.equal(outputs.length, 2);
+      assert.equal(owner.uniformsFor(material), outputs[1], 'r186 keeps the latest dictionary when selecting an older program');
+      material.dispose();
+      owner.compile(material, mesh);
+      assert.equal(outputs.length, 3, 'a new residency reruns the hook after material disposal');
+      assert.equal(owner.uniformsFor(material), outputs[2]);
+    }
+  }
+});
+
+test('shader hooks pack replaced numeric and sampler uniforms without changing material.uniforms', t => {
+  const support = createThreeProgramSupport({three: T, state: () => state}), material = shader();
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  const texture = new T.DataTexture(new Uint8Array([31, 63, 127, 255]), 1, 1), original = material.uniforms;
+  const selected = {tint: {value: new T.Color(0.25, 0.5, 0.75)}, map: {value: texture}};
+  t.after(() => { material.dispose(); mesh.geometry.dispose(); texture.dispose(); support.dispose?.(); });
+  material.onBeforeCompile = parameters => {
+    parameters.uniforms = selected;
+    parameters.fragmentShader = 'uniform vec3 tint; uniform sampler2D map; void main() { gl_FragColor = vec4(tint, 1.0) * texture2D(map, vec2(0.5)); }';
+  };
+  const {program: {reflection}} = support.compile(material, mesh), bytes = new Uint8Array(reflection.uniformBufferSize);
+  const pack = () => support.pack(reflection, support.refresh(material), mesh, camera, bytes);
+  assert.deepEqual(pack(), [texture]);
+  const offset = reflection.uniforms.find(u => u.name === 'tint').offset;
+  assert.deepEqual(Array.from(new Float32Array(bytes.buffer, offset, 3)), [0.25, 0.5, 0.75]);
+  selected.tint.value.setRGB(0.75, 0.25, 0.5); pack();
+  assert.deepEqual(Array.from(new Float32Array(bytes.buffer, offset, 3)), [0.75, 0.25, 0.5]);
+  assert.equal(material.uniforms, original);
+  assert.equal(original.map, undefined, 'the renderer must not publish the replacement onto the material');
+});
+
+test('shader hooks preserve the prior owner on callback failure and restore default uniform ownership', async t => {
+  for (const owner of [await sourceProgramOwner(), createThreeProgramSupport({three: T, state: () => state})]) {
+    const material = shader(), mesh = new T.Mesh(new T.BoxGeometry(), material), original = material.uniforms;
+    t.after(() => { material.dispose(); mesh.geometry.dispose(); owner.dispose?.(); });
+    const marker = new Error('shader hook failed');
+    let reject = false, calls = 0, selected;
+    material.onBeforeCompile = parameters => {
+      calls++;
+      parameters.uniforms = {...parameters.uniforms, injected: {value: calls}};
+      if (reject) throw marker;
+      selected = parameters.uniforms;
+    };
+    owner.compile(material, mesh);
+    material.defines = {SECOND: 1}; material.needsUpdate = true; reject = true;
+    assert.throws(() => owner.compile(material, mesh), error => error === marker);
+    assert.equal(owner.uniformsFor(material), selected, 'a failed callback does not publish its dictionary');
+    reject = false; owner.compile(material, mesh);
+    assert.equal(calls, 3, 'a failed variant remains retryable');
+    assert.equal(owner.uniformsFor(material), selected);
+    material.onBeforeCompile = T.Material.prototype.onBeforeCompile; material.needsUpdate = true;
+    owner.compile(material, mesh);
+    assert.equal(owner.uniformsFor(material), original, 'restoring the default hook installs its source dictionary');
+  }
+});
+
+test('shader hooks release their disposal listeners and keep application textures alive on owner teardown', () => {
+  const support = createThreeProgramSupport({three: T, state: () => state}), material = shader();
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), texture = new T.Texture(), foreign = () => {};
+  let textureDisposals = 0;
+  texture.addEventListener('dispose', () => { textureDisposals++; });
+  material.addEventListener('dispose', foreign);
+  material.onBeforeCompile = parameters => { parameters.uniforms = {map: {value: texture}}; };
+  support.compile(material, mesh);
+  assert.equal(material._listeners.dispose.length, 2);
+  support.dispose(); support.dispose();
+  assert.deepEqual(material._listeners.dispose, [foreign]);
+  assert.equal(textureDisposals, 0, 'the shader owner does not own the application sampler texture');
+  material.dispose(); mesh.geometry.dispose(); texture.dispose();
+});
+
+test('shader hooks publish uniforms only after source assembly succeeds and retry failed variants', async t => {
+  for (const owner of [await sourceProgramOwner(), createThreeProgramSupport({three: T, state: () => state})]) {
+    const material = shader(), mesh = new T.Mesh(new T.BoxGeometry(), material);
+    t.after(() => { material.dispose(); mesh.geometry.dispose(); owner.dispose?.(); });
+    let failAssembly = false, calls = 0;
+    material.onBeforeCompile = parameters => {
+      parameters.uniforms = {...parameters.uniforms, injected: {value: ++calls}};
+      if (failAssembly) parameters.fragmentShader += '\n#include <f3d_missing_hook_chunk>';
+    };
+    owner.compile(material, mesh);
+    const prior = owner.uniformsFor(material);
+    material.defines = {SECOND: 1}; material.needsUpdate = true; failAssembly = true;
+    assert.throws(() => owner.compile(material, mesh), /Can not resolve #include <f3d_missing_hook_chunk>/);
+    assert.equal(owner.uniformsFor(material), prior);
+    material.defines = {}; material.needsUpdate = true;
+    owner.compile(material, mesh);
+    assert.equal(owner.uniformsFor(material), prior, 'returning to the healthy variant must not bind failed values');
+    assert.equal(calls, 2);
+    material.defines = {SECOND: 1}; material.needsUpdate = true; failAssembly = false;
+    owner.compile(material, mesh);
+    assert.equal(calls, 3, 'failed source assembly did not cache a hook result');
+    assert.equal(owner.uniformsFor(material).injected.value, 3);
+  }
+});
+
+test('shader hooks bracket synchronous application callbacks and restore nesting after exceptions', () => {
+  const renderer = {_shaderEncodedOutput: true, _programCompileCallbackDepth: 2};
+  const support = createThreeProgramSupport({three: T, state: () => ({...state, renderer})}), material = shader();
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), marker = new Error('application shader callback');
+  let variant = 'a', rejectKey = false, rejectBody = false;
+  material.customProgramCacheKey = () => {
+    assert.equal(renderer._programCompileCallbackDepth, 3);
+    if (rejectKey) throw marker;
+    return variant;
+  };
+  material.onBeforeCompile = (parameters, value) => {
+    assert.equal(value, renderer); assert.equal(renderer._programCompileCallbackDepth, 3);
+    if (rejectBody) throw marker;
+  };
+  support.compile(material, mesh); assert.equal(renderer._programCompileCallbackDepth, 2);
+  rejectKey = true;
+  assert.throws(() => support.compile(material, mesh), error => error === marker);
+  assert.equal(renderer._programCompileCallbackDepth, 2);
+  rejectKey = false; variant = 'b'; rejectBody = true;
+  assert.throws(() => support.compile(material, mesh), error => error === marker);
+  assert.equal(renderer._programCompileCallbackDepth, 2);
+  rejectBody = false;
+  material.customProgramCacheKey = () => ({toString() {
+    assert.equal(renderer._programCompileCallbackDepth, 3, 'cache-key coercion is still application callback work');
+    return 'coerced';
+  }});
+  support.compile(material, mesh); assert.equal(renderer._programCompileCallbackDepth, 2);
+  support.dispose(); material.dispose(); mesh.geometry.dispose();
 });
 
 test('aggregate equality: live ShaderMaterial uniforms and unseen runtime variants use the compiler path', t => {
