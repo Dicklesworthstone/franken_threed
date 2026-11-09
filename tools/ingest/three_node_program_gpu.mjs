@@ -17,6 +17,7 @@ import {createProgramUniformArena} from './animation_program_uniforms.mjs';
 import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {hasAnimationStencil, snapshotAnimationRaster, snapshotAnimationBlendConstant} from './animation_raster.mjs';
 import {inspectGpuRenderTargetColors} from './gpu_render_target.mjs';
+import {gpuProgramModule} from './gpu_program_modules.mjs';
 
 export function createThreeNodeProgramMeshes({device, format, colorFormats = format === null ? [] : [format], depthFormat, sampleCount, maxDraws,
   label, fail, scoped, lost = device.lost, maxUniformBytes = 64 * 1024 * 1024, maxBindGroups = 4}) {
@@ -334,15 +335,20 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
             bindGroupLayouts = groups.map((group, index) => group.arenaLayout ? uniformBindings[index].layout
               : device.createBindGroupLayout({label: `${label}/node-group-${index}`, entries: group.entries}));
             const layout = device.createPipelineLayout({label, bindGroupLayouts});
-            const vertexModule = device.createShaderModule({label: `${label}/node-vertex`, code: vertex});
-            const fragmentModule = device.createShaderModule({label: `${label}/node-fragment`, code: fragment});
+            // Conversion warmup and independent target owners share only exact
+            // validated WGSL modules. Pipeline layouts and draw histories stay local.
+            const vertexModule = gpuProgramModule(device, {label: `${label}/node-vertex`, code: vertex});
+            const fragmentModule = gpuProgramModule(device, {label: `${label}/node-fragment`, code: fragment});
             const pipeline = frontFace => device.createRenderPipelineAsync({label, layout,
-              vertex: {module: vertexModule, entryPoint: 'main', buffers: layouts},
-              fragment: {module: fragmentModule, entryPoint: 'main', targets: pipelineState.targets},
+              vertex: {module: vertexModule.module, entryPoint: 'main', buffers: layouts},
+              fragment: {module: fragmentModule.module, entryPoint: 'main', targets: pipelineState.targets},
               primitive: {...pipelineState.primitive, frontFace},
               ...(pipelineState.depthStencil ? {depthStencil: pipelineState.depthStencil} : {}),
               multisample: pipelineState.multisample});
-            const ready = Promise.all([pipeline(state.frontFace), pipeline(state.frontFace === 'ccw' ? 'cw' : 'ccw')]);
+            const ready = Promise.all([
+              Promise.all([pipeline(state.frontFace), pipeline(state.frontFace === 'ccw' ? 'cw' : 'ccw')]),
+              vertexModule.ready, fragmentModule.ready,
+            ]).then(([pipelines]) => pipelines);
             ready.catch(() => {}); return ready;
           });
           const [pipelines] = await Promise.race([Promise.all([issued.value, issued.errors]), stopped]);

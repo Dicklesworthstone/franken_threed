@@ -10,6 +10,22 @@ uniform buffers, command encoding and submission. The path does not construct an
 upstream renderer, translate through ESSL reflection, or claim measured
 acceleration or a Rust implementation of node evaluation.
 
+Native graphics pipeline owners now share the existing per-device WGSL module
+cache by exact shader source. Independent render targets, raster variants and
+fresh pipeline records can reuse compatible modules while keeping their own
+pipeline layouts, bind groups, uniform histories and geometry. A changed stage
+compiles independently; identical source never shares GPU handles across devices.
+The bounded LRU retains at most 256 modules and 16 MiB of source strings.
+
+Module validation and compilation diagnostics must succeed before a native draw
+record is published, alongside pipeline validation. Failed modules are evicted
+for retry, device loss clears the module cache, and owner disposal still cancels
+its pending pipelines without discarding compatible modules owned by the device.
+All error scopes close before asynchronous waits. The focused native pipeline
+and shared-module suites pass **67 tests**, including reuse across distinct
+target formats/sample counts, changed stages, failed compilation and retry, and
+the existing 4,000-record sharing and queued-disposal cases.
+
 ## Implemented graph surface
 
 ### Render-triggered geometry compute

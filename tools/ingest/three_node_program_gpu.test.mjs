@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createThreeNodeProgramMeshes} from './three_node_program_gpu.mjs';
 import {createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
+import {gpuProgramModule} from './gpu_program_modules.mjs';
 const fail = (code, message) => { throw Object.assign(Error(message), {code}); };
 function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups = 4, maxBufferSize = 1 << 22, sampleCount = 1,
   depthFormat = 'depth24plus', configureGeometry = () => {}} = {}) {
@@ -56,7 +57,7 @@ function rig(t, {maxDraws = 8, maxUniformBytes = 4 * 1024 * 1024, maxBindGroups 
     const command = {}; owner.stage(record, {nodeUniforms, ...input}, command); return command;
   };
   t.after(() => { releasePipelines?.(); owner.dispose(); gpu.dispose(); assert.ok(buffers.every(b => b.dead)); });
-  return {device, source, gpu, owner, raster, program, add, stage, buffers, bindGroups, pipelines, writes, shaderModules, pipelineLayouts,
+  return {device, source, gpu, owner, raster, program, add, stage, buffers, bindGroups, pipelines, writes, shaderModules, pipelineLayouts, scoped,
     lose: resolveLost,
     holdPipelines() { pipelineGate = new Promise(resolve => { releasePipelines = resolve; }); return releasePipelines; },
     errors({pipeline = null, scope = null} = {}) { pipelineError = pipeline; scopeError = scope; }};
@@ -818,4 +819,60 @@ test('removing one shared record preserves peers while the final removal release
   f.owner.remove(c); f.owner.remove(d);
   const before = f.pipelines.length, replacement = await f.add([32]);
   assert.notEqual(replacement.pipelines.normal, c.pipelines.normal); assert.equal(f.pipelines.length, before + 2);
+});
+
+test('native pipelines reuse prewarmed modules across independent target owners', async t => {
+  const f = rig(t), program = f.program([16]);
+  const vertex = gpuProgramModule(f.device, {code: program.vertex, label: 'conversion-warmup'});
+  const fragment = gpuProgramModule(f.device, {code: program.fragment, label: 'conversion-warmup'});
+  await Promise.all([vertex.ready, fragment.ready]);
+  const first = await f.add([16]);
+  assert.equal(first.pipelines.normal.vertex.module, vertex.module);
+  assert.equal(first.pipelines.normal.fragment.module, fragment.module);
+  const other = createThreeNodeProgramMeshes({device: f.device, format: 'rgba16float', depthFormat: 'depth24plus',
+    sampleCount: 4, maxDraws: 8, label: 'other-target', fail, scoped: f.scoped});
+  try {
+    const second = await other.add(f.gpu, {nodeProgram: program, raster: f.raster});
+    assert.notEqual(second.pipelines.normal, first.pipelines.normal);
+    assert.notEqual(second.bindGroupLayouts, first.bindGroupLayouts);
+    assert.equal(second.pipelines.normal.fragment.targets[0].format, 'rgba16float');
+    assert.equal(second.pipelines.normal.multisample.count, 4);
+    assert.equal(second.pipelines.normal.vertex.module, vertex.module);
+    assert.equal(second.pipelines.normal.fragment.module, fragment.module);
+    f.owner.remove(first);
+    const replacement = await f.add([16]);
+    assert.notEqual(replacement.pipelines.normal, first.pipelines.normal);
+    assert.equal(replacement.pipelines.normal.vertex.module, vertex.module);
+    assert.equal(f.shaderModules.length, 2);
+  } finally { other.dispose(); }
+});
+
+test('native shader compilation failure cannot publish a successful pipeline and retries the failed module', async t => {
+  const f = rig(t), create = f.device.createShaderModule;
+  let invalid = true;
+  f.device.createShaderModule = descriptor => {
+    const module = create(descriptor), errors = invalid && descriptor.code === f.program().vertex;
+    module.getCompilationInfo = async () => ({messages: errors ? [{type: 'error', message: 'invalid native WGSL'}] : []});
+    return module;
+  };
+  await assert.rejects(f.add([]), {code: 'GPU_PROGRAM_MODULE_DEVICE', message: 'GPU_PROGRAM_MODULE_DEVICE: invalid native WGSL'});
+  assert.equal(f.shaderModules.length, 2);
+  invalid = false;
+  const record = await f.add([]);
+  assert.equal(f.shaderModules.length, 3, 'only the failed vertex module needs recompilation');
+  assert.equal(f.pipelines.length, 4, 'a rejected module does not publish a cached native pipeline');
+  f.stage(record, []);
+});
+
+test('native source changes recompile only the changed stage while raster and binding variants reuse modules', async t => {
+  const f = rig(t), first = await f.add([16]);
+  const state = await f.add([32], {raster: {...f.raster, cullMode: 'none'}});
+  assert.notEqual(state.pipelines.normal, first.pipelines.normal);
+  assert.equal(state.pipelines.normal.vertex.module, first.pipelines.normal.vertex.module);
+  assert.equal(state.pipelines.normal.fragment.module, first.pipelines.normal.fragment.module);
+  const program = f.program([16]); program.fragment += '\n// changed native source';
+  const changed = await f.add([], {nodeProgram: program});
+  assert.equal(changed.pipelines.normal.vertex.module, first.pipelines.normal.vertex.module);
+  assert.notEqual(changed.pipelines.normal.fragment.module, first.pipelines.normal.fragment.module);
+  assert.equal(f.shaderModules.length, 3);
 });
