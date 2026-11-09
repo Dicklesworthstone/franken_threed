@@ -532,10 +532,30 @@ automatic WebGL scene texture pool refuses instead of reconstructing its prior
 GPU bytes. Custom input upload callbacks and ordinary GPU-written copy
 destinations are outside this detached-input profile; render-target inputs use
 the existing GPU target owner and its lifetime guards. Pre-initialization texture
-calls and `fromScene()` retain their previous delayed behavior; `fromScene()`
-sigma capture and explicit targets are not completed by this change.
-`compileCubemapShader()` and `compileEquirectangularShader()` remain no-ops on
-this facade.
+calls and `fromScene()` retain their previous delayed behavior; scene snapshot
+capture and sigma pre-blur remain incomplete. The pinned WebGL helper does not
+use an `options.renderTarget` destination for `fromScene()`.
+
+`compileCubemapShader()` and `compileEquirectangularShader()` now retain r186's
+conversion-material construction and capture translated shaders before
+asynchronous initialization. They return `undefined`, as the source methods do,
+and validate modules on the owned device without allocating input textures,
+draw geometry or render pipelines, or submitting a render. Later conversion
+draws reuse the exact warmed GPU modules through `gpu_program_modules.mjs`.
+Its per-device LRU retains at most 256 entries and 16 MiB of source strings;
+failed modules are evicted and device loss clears residency. Generator disposal
+preserves accepted warmup; renderer disposal cancels pending work. Validation
+failures remain observable through the existing renderer error boundary.
+
+The native renderer also exposes the source `compile` accessor, which returns
+`compileAsync`. Native PMREM warmup retains a separate empty-placeholder
+texture admission gap; the alias does not close that path.
+
+The new module-cache and public-warmup suites pass all ten tests, covering
+device isolation, eviction, retry, cancellation, pre-initialization capture,
+actual conversion-module reuse and the native compile alias. The public PMREM
+browser comparison below now also verifies that all four warmed modules are
+consumed by subsequent cube and panorama pipelines.
 
 Ten recording-device regressions cover source filter uniforms, destination
 reuse, queued versions, Source aliases, accepted disposal, callback isolation and

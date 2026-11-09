@@ -32,6 +32,7 @@ import {hasAnimationStencil, snapshotAnimationRaster} from './animation_raster.m
 import {createProgramIndexLowering} from './animation_program_indices.mjs';
 import {snapshotProgramPointRuns} from './animation_program_points.mjs';
 import {createProgramUniformArena} from './animation_program_uniforms.mjs';
+import {gpuProgramModule} from './gpu_program_modules.mjs';
 
 const VERTEX = 1, FRAGMENT = 2;
 
@@ -107,13 +108,15 @@ export function createProgramMeshes({device, format, colorFormats = format === n
       const layout = device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]});
       const textureGroup = textureLayout ? device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, i) => [
         {binding: t.textureBinding, resource: textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
-      const vertexModule = device.createShaderModule({label: `${label}/vertex`, code: vertex});
-      const fragmentModule = device.createShaderModule({label: `${label}/fragment`, code: fragment});
+      const vertexModule = gpuProgramModule(device, {label: `${label}/vertex`, code: vertex});
+      const fragmentModule = gpuProgramModule(device, {label: `${label}/fragment`, code: fragment});
+      const modulesReady = Promise.all([vertexModule.ready, fragmentModule.ready]);
+      modulesReady.catch(() => {});
       const primitiveTopology = points ? 'triangle-list' : provoking === 'line-strip' ? 'line-list' : {triangles: 'triangle-list', lines: 'line-list', 'line-strip': 'line-strip', points: 'point-list'}[topology];
       if (!primitiveTopology) fail('ANIMATION_RENDER_OPTIONS', 'Invalid program topology');
       const pipeline = frontFace => device[immediate ? 'createRenderPipeline' : 'createRenderPipelineAsync']({label, layout,
-        vertex: {module: vertexModule, entryPoint: 'f3d_vertex', buffers: layouts},
-        fragment: {module: fragmentModule, entryPoint: 'f3d_fragment', targets: colorFormats.map((format, location) =>
+        vertex: {module: vertexModule.module, entryPoint: 'f3d_vertex', buffers: layouts},
+        fragment: {module: fragmentModule.module, entryPoint: 'f3d_fragment', targets: colorFormats.map((format, location) =>
           outputLocations.has(location) ? {format, ...(raster.blend ? {blend: raster.blend} : {}), writeMask: raster.writeMask}
             : {format, writeMask: 0})},
         primitive: {topology: primitiveTopology, cullMode: raster.cullMode, frontFace,
@@ -124,7 +127,7 @@ export function createProgramMeshes({device, format, colorFormats = format === n
       const pair = [pipeline(raster.frontFace), pipeline(raster.frontFace === 'ccw' ? 'cw' : 'ccw')];
       const ready = immediate ? pair : Promise.all(pair);
       if (!immediate) ready.catch(() => {});
-      return {textureGroup, ready};
+      return {textureGroup, ready, modulesReady};
     });
     const publish = pipelines => {
       if (allocated.error) throw allocated.error;
@@ -139,11 +142,11 @@ export function createProgramMeshes({device, format, colorFormats = format === n
       };
     };
     if (immediate) {
-      validation = Promise.all([validation, allocated.errors]).then(() => uniforms.whenIdle());
+      validation = Promise.all([validation, allocated.errors, allocated.value?.modulesReady]).then(() => uniforms.whenIdle());
       validation.catch(error => { validationError ??= error; });
       return publish(allocated.value?.ready);
     }
-    return Promise.race([Promise.all([allocated.value?.ready, allocated.errors]), uniforms.stopped]).then(([pipelines]) => publish(pipelines));
+    return Promise.race([Promise.all([allocated.value?.ready, allocated.errors, allocated.value?.modulesReady]), uniforms.stopped]).then(([pipelines]) => publish(pipelines));
     };
     return immediate ? build(uniforms.registerImmediate(reflection.uniformBufferSize))
       : uniforms.register(reflection.uniformBufferSize).then(build);

@@ -73,6 +73,22 @@ async function capture(mode) {
       const gen=new Generator(renderer);
       try{
         if(mode==='candidate'){await renderer.init();renderer._device.addEventListener('uncapturederror',e=>errors.push(e.error.message));}
+        const warmModules=new Set(),usedWarmModules=new Set();
+        if(mode==='candidate'){
+          const device=renderer._device,createModule=device.createShaderModule.bind(device);
+          device.createShaderModule=descriptor=>{const module=createModule(descriptor);
+            if(descriptor.label?.startsWith('PMREM/warmup/'))warmModules.add(module);return module;};
+          for(const method of ['createRenderPipeline','createRenderPipelineAsync']){
+            const create=device[method].bind(device);device[method]=descriptor=>{
+              for(const module of [descriptor.vertex?.module,descriptor.fragment?.module])if(warmModules.has(module))usedWarmModules.add(module);
+              return create(descriptor);};
+          }
+        }
+        if(gen.compileCubemapShader()!==undefined||gen.compileEquirectangularShader()!==undefined)throw Error('WebGL PMREM warmup must remain synchronous');
+        if(mode==='candidate'){
+          await renderer.waitForGPU();
+          if(warmModules.size!==4||usedWarmModules.size!==0)throw Error('Warmup must compile conversion modules without drawing');
+        }
         renderer.setSize(96,64,false);renderer.outputColorSpace=T.LinearSRGBColorSpace;renderer.toneMapping=T.NoToneMapping;
         const a=image(), coldAlias=a.clone();inputs.push(coldAlias);
         let atlas=gen.fromEquirectangular(a);targets.push(atlas);use(atlas);scene.background=a;
@@ -93,7 +109,8 @@ async function capture(mode) {
         atlas=gen.fromEquirectangular(gpu.texture);targets.push(atlas);use(atlas);await checkpoint();
         const larger=image(128,2);atlas=gen.fromEquirectangular(larger);targets.push(atlas);use(atlas);
         larger.dispose();gen.dispose();await checkpoint();
-        return {frames,errors,route:renderer.info.f3d?.route,draws:renderer.info.f3d?.nativeDrawCalls};
+        return {frames,errors,route:renderer.info.f3d?.route,draws:renderer.info.f3d?.nativeDrawCalls,
+          warmedModules:warmModules.size,reusedWarmModules:usedWarmModules.size};
       }finally{gen.dispose();for(const t of inputs)t.dispose();for(const t of targets)t.dispose();output.dispose();renderer.dispose();canvas.remove();}
 
     }, mode);
@@ -104,6 +121,7 @@ async function capture(mode) {
 try {
   const source = await capture('source'), candidate = await capture('candidate');
   assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
+  assert.equal(candidate.warmedModules, 4); assert.equal(candidate.reusedWarmModules, 4);
   assert.deepEqual(source.frames[1], source.frames[2], 'cold and unchanged warm source aliases retain uploaded pixels');
   assert.notDeepEqual(source.frames[2], source.frames[3], 'marked source upload changes pixels');
   const results = source.frames.map((reference, frame) => {
@@ -118,5 +136,6 @@ try {
     return {checkpoint: frame, maxError, differingBytes, pixelsOverTolerance: over};
   });
   console.log(JSON.stringify({case: 'program_pmrem_public_targets', status: 'pass', results, rgbaBytes: source.frames.length * 96 * 64 * 4,
-    route: candidate.route, nativeDrawCalls: candidate.draws, gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
+    route: candidate.route, nativeDrawCalls: candidate.draws, warmedModules: candidate.warmedModules, reusedWarmModules: candidate.reusedWarmModules,
+    gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
 } finally { await new Promise(resolve => server.close(resolve)); }

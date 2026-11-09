@@ -44,6 +44,7 @@ import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera, getThreePassExcludedObjects} from './three_pass_state.mjs';
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
+import {gpuProgramModule} from './gpu_program_modules.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {hasThreeWebGLTextureResidency} from './three_textures.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
@@ -1901,6 +1902,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._renderCall(scene, camera);
       while (this._drain) await this._drain;
     }
+    get compile() { return this.compileAsync; }
     async compileAsync(scene, camera, targetScene = null) {
       if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
       if (this._isDeviceLost === true) return;
@@ -2457,6 +2459,37 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
       this.compileAsync(scene, camera, targetScene).catch(error => { this._deferredError ??= error; });
       return materials;
     }
+    /** PMREM's retained helper compiles an empty geometry before its texture
+     * exists. Capture its actual shader now, without admitting a draw/upload;
+     * the same device modules are reused when its conversion planes render. */
+    _compilePMREM(object) {
+      if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+      const profile = {toneMapping: THREE.NoToneMapping, outputColorSpace: THREE.LinearSRGBColorSpace,
+        logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
+        reversedDepthBuffer: this.reversedDepthBuffer === true, renderer: this};
+      const support = createThreeProgramSupport({three: THREE, state: () => profile, maxPrograms: 1});
+      let program;
+      try { program = support.compile(object.material, object).program; }
+      finally { support.dispose(); }
+      const signal = this._targetLifetime.signal;
+      let rejectStopped;
+      const stopped = new Promise((_, reject) => { rejectStopped = reject; });
+      const abort = () => rejectStopped(signal.reason);
+      signal.addEventListener('abort', abort, {once: true});
+      const work = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
+        await this.init();
+        if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        const vertex = gpuProgramModule(this._device, {code: program.vertex, label: 'PMREM/warmup/vertex'});
+        const fragment = gpuProgramModule(this._device, {code: program.fragment, label: 'PMREM/warmup/fragment'});
+        await Promise.all([vertex.ready, fragment.ready]);
+      });
+      const run = this._preparing = Promise.race([work, stopped]);
+      run.catch(error => { this._deferredError ??= error; });
+      run.finally(() => {
+        signal.removeEventListener('abort', abort);
+        if (this._preparing === run) this._preparing = null;
+      }).catch(() => {});
+    }
     getCurrentViewport(target) {
       return this._renderTarget ? target.copy(this._renderTarget.viewport).round() : target.copy(this._viewport).multiplyScalar(this._pixelRatio).round();
     }
@@ -2522,8 +2555,10 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
  *
  * Pre-initialization calls retain their earlier delayed source descriptors.
  * fromScene also retains delayed scene capture: later edits before preparation
- * are observed, sigma pre-blur is not reproduced, and explicit targets refuse.
- * Shader warmup methods remain no-ops on this facade. These legacy paths do not
+ * are observed and sigma pre-blur is not reproduced.
+ * Shader warmup retains source material construction and validates WGSL modules
+ * shared with later conversion draws; it needs neither geometry nor an input
+ * texture and does not submit a render. The legacy delayed bake paths do not
  * claim source PMREM pixel equivalence. Other renderers get the upstream class.
  */
 export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
@@ -2576,6 +2611,13 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
         return source._sceneToCubeUV.apply(generator, args);
       }},
     });
+    if (renderer._shaderEncodedOutput) {
+      // Keep r186's material/empty-mesh construction. Only the GPU compilation
+      // boundary changes; no source renderer, draw or texture owner is created.
+      generator._compileMaterial = material => source._compileMaterial.call({
+        _renderer: {compile: object => renderer._compilePMREM(object)},
+      }, material);
+    }
     return generator;
   };
   class PMREMGenerator {
@@ -2631,8 +2673,8 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
       return this._fromTexture('fromCubemap', cubemap, renderTarget);
     }
     async fromCubemapAsync(...args) { return this.fromCubemap(...args); }
-    compileCubemapShader() {}
-    compileEquirectangularShader() {}
+    compileCubemapShader() { return this._generator.compileCubemapShader(); }
+    compileEquirectangularShader() { return this._generator.compileEquirectangularShader(); }
     _fromTexture(method, texture, target) {
       const renderer = this._renderer, previous = PMREM_CAPTURES.get(renderer);
       let input = null;
