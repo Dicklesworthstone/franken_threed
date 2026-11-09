@@ -20,8 +20,8 @@
  * or precision conversion is inferred. Consumers choose their shader sample index.
  * colorFormats adds ordered MRT attachments under the same owner. Optional
  * colorMipLevelCounts/colorGenerateMipmaps retain each color's pyramid policy.
- * MRT pyramids support 2D and ordinary 2D-array color; each rendered mip must
- * exist in every color, while sampling and transfers select one color's levels.
+ * MRT pyramids support 2D, ordinary 2D-array and authored 3D color; each rendered
+ * mip must exist in every color, while sampling and transfers select one color's levels.
  * Array generation keeps each color and layer independent. MSAA resolves
  * into level zero before generation, and cannot render higher mip levels.
  * Frames expose colorViews/resolveTargets, retaining their primary aliases.
@@ -264,13 +264,12 @@ export function createGpuRenderTarget(device, options = {}) {
     fail('OPTIONS', 'Layered targets require positive arrayLayers or volumeDepth and an optional depthArray flag');
   if (Number(cube) + Number(array) + Number(volume) > 1)
     fail('OPTIONS', 'Cube, 2D array and 3D volume dimensions are mutually exclusive');
-  if (volume && (sampleCount !== 1 || generateMipmaps))
+  if (volume && (sampleCount !== 1 || generateMipmaps || colorGenerateMipmaps.some(Boolean)))
     fail('UNSUPPORTED', 'Volume targets require one sample and authored mip levels');
   if (array && depthArray && sampleDepth && sampleCount !== 1)
     fail('UNSUPPORTED', 'Sampled array depth requires one sample');
-  const hasMipPyramids = colorGenerateMipmaps.some(Boolean) || colorMipLevelCounts.some(count => count > 1);
-  if (multiple && (cube || hasMipPyramids && volume))
-    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D or 2D-array targets');
+  if (multiple && cube)
+    fail('UNSUPPORTED', 'Cube targets require one color attachment');
   if (cube && sampleCount !== 1)
     fail('UNSUPPORTED', 'Cube targets require one sample');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))

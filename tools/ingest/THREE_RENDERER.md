@@ -1035,8 +1035,18 @@ depth readback retains its separate single-level contract.
 with pinned r186, including authored overwrites, independent queued generation,
 clear history, explicit LOD sampling and unequal color mip counts. Chromium
 151.0.7922.34 / SwiftShader matches the stored and sampled texels exactly with
-zero GPU/browser errors. Layered, volume and WebGL-authored MRT mip pyramids
-remain outside this profile.
+zero GPU/browser errors. That browser comparison covers ordinary 2D MRT.
+
+Native 2D-array MRT now admits independent authored/generated color mip chains,
+including per-layer generation, one/four-sample resolves and separate history
+images. Native volume MRT admits independent authored chains: render levels must
+exist in every attachment, while sampling, uploads, copies and readback can
+select a longer chain on one color. Volume mip extents shrink in XYZ; depth
+attachments retain their independent 2D/array allocation. The added production
+owner/compute recording tests cover these paths, budgets and resize lifetimes;
+they do not extend the browser pixel evidence above. Automatic volume generation,
+volume history, cube MRT and WebGL-authored MRT mip pyramids remain excluded.
+See [THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for the current profiles.
 
 ## Native mipmapped pass histories
 
@@ -1087,8 +1097,9 @@ against pinned r186, with mixed half-float/byte MRT, four samples, generated mip
 late auxiliary-history activation and queued renders/readbacks across resize.
 All 15 checkpoints, 261 images, 67,320 components and 114,672 stored bytes match
 exactly on Chromium 151.0.7922.34 / SwiftShader, with zero GPU/browser errors.
-Layered MRT mip pyramids, sampled multisampled array depth, cube histories and
-volume histories remain outside this profile.
+The added layered MRT mip coverage described above is verified by owner
+recording tests and is not part of this browser comparison. Sampled multisampled
+array depth, cube histories and volume histories remain outside this profile.
 
 ## Registered native output color spaces
 

@@ -39,7 +39,9 @@
  * WebGL base-level colors sample through a 3D replica, preserving interpolation
  * between oriented slices without CPU transfers or 2D-array substitution.
  * Color mip extents shrink in XYZ while attached depth remains 2D or an
- * independently selected array. Volume mip levels are authored, not generated.
+ * independently selected array. Every volume MRT color retains its own authored
+ * mip chain and precision; rendering selects a mip shared by all attachments.
+ * Volume mip levels are authored, not generated.
  * Private stencil buffers and UnsignedInt248 DepthStencilFormat attachments
  * retain both aspects for rendering; depth sampling selects only the depth aspect.
  * Source FloatType R/RG/RGBA attachments retain full precision through storage,
@@ -293,9 +295,8 @@ export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = nul
     fail('SOURCE', 'Expected one to eight distinct target-owned color attachments');
   const colors = target.textures.map((texture, index) => inspectThreeRenderTargetColor(target, three, texture,
     cubeMipLevelCount, colorMipProfiles?.[index])), primary = colors[0];
-  if (colors.length > 1 && (primary.cube || primary.volume &&
-      colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1)))
-    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D or 2D-array targets');
+  if (colors.length > 1 && primary.cube)
+    fail('UNSUPPORTED', 'Cube targets require a single color attachment');
   const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes +
     (color.sampleCount === 4 ? color.baseColorBytes * 4 : 0), 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');

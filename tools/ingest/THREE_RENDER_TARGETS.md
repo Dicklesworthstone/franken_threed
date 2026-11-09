@@ -487,8 +487,8 @@ and resize retirement continue to charge every live image to the shared budget.
 The focused array-MRT owner tests check descriptors, command order, sampling
 leases, exact allocation charges, independent history images and retirement.
 They use the existing recording-device fixtures and do not execute mip shaders
-or establish pinned-source pixel equivalence. Cube MRT and volume MRT mip chains
-retain their existing admission limits.
+or establish pinned-source pixel equivalence. Cube MRT retains its existing
+admission limit; authored volume MRT levels follow the profile below.
 
 ## Native volume targets and layered transfers
 
@@ -532,15 +532,31 @@ base mip zero, slice zero, even when a different render slice/mip is active.
 The facade regression compares its encoded command to the pinned renderer and
 backend. Use an explicit texture copy when a different source slice is needed.
 
+Native volume MRT also retains independent authored mip chains and formats for
+every color. Rendering requires a mip present in all attachments and selects a
+slice within that mip's reduced Z extent. Sampling, typed uploads, copies and
+readback select one color's allocated levels independently, including levels
+beyond a sibling's shorter chain. Graphics and compute borrow the original 3D
+images; no sampling replica or mip-generation pass is introduced. Private
+nonzero-mip depth retains its independent 2D or array allocation and byte charge.
+Accepted sampling leases and submitted work retain every old color chain across
+resize until their consumers and queue fences finish.
+
 Volume color is single-sample. Automatic 3D mip generation, volume history
-rotation, nonzero MRT render mips and storage-to-target writes above mip zero
-remain explicit boundaries. Authored single-color volume mips can be rendered,
-sampled, copied as sources and read back. These additions do not close the full
+rotation and storage-to-target writes above mip zero remain explicit boundaries.
+Automatic generation is rejected for every volume attachment, including a
+secondary color with only one allocated level. Copies between distinct MRT
+images or distinct mips remain valid when their formats and regions match;
+different Z slices of the same image and mip still share one subresource and
+cannot be copied onto themselves. These additions do not close the full
 render-target compatibility bead.
 
 The focused volume owner, source target, facade, storage-copy and framebuffer
 tests record native commands and independently compare transferred bytes.
 They do not execute GPU shaders or establish browser pixel parity or speedups.
+The added volume-MRT tests exercise the production GPU/source owners and compute
+sampling bridge with recording fixtures, including secondary-color readback,
+mip-local slice ranges, typed transfers, allocation limits and resize retirement.
 
 ## Remaining gaps and verification
 
