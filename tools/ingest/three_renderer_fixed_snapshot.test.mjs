@@ -350,18 +350,86 @@ test('application material fields on non-renderable groups do not become mixed s
   assert.equal(group.material, f.material); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('a refused legacy fixed instance transition preserves its prior route and GPU-stale bytes', async t => {
-  const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, 1);
+for (const capacity of [3, 1025]) test(`ordinary instances retain upload history through queued mixed transitions (${capacity} matrices)`, async t => {
+  const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, capacity);
+  f.device.limits.maxUniformBufferBindingSize = 65536; f.renderer.sortObjects = false; instance.count = 2;
   instance.frustumCulled = false; f.scene.remove(f.mesh); f.scene.add(instance);
+  instance.setMatrixAt(1, new T.Matrix4().makeTranslation(.5, 0, 0));
+  instance.setColorAt(0, new T.Color(.125, .375, .625)); instance.setColorAt(1, new T.Color(.25, .5, .75));
+  const position = f.geometry.attributes.position, matrices = instance.instanceMatrix, colors = instance.instanceColor;
+  position.array.fill(.125); let before = 0, after = 0, updates = 0;
+  for (const attribute of [position, matrices, colors]) Object.defineProperty(attribute, 'onUploadCallback', {
+    get() { assert.fail('native instance capture must not observe WebGL upload callbacks'); },
+  });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  position.array[0] = 99; colors.array[0] = 99; matrices.array[12] = 1.5;
+  instance.onBeforeRender = () => { before++; }; instance.onAfterRender = () => { after++; };
+  const native = addNativeMesh(t, f, T.TSL.vec3(T.TSL.uniform(.5).onObjectUpdate(() => { updates++; return .5; })));
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  position.array[0] = .625; position.array[1] = 99; position.addUpdateRange(0, 1); position.needsUpdate = true;
+  colors.array[0] = .875; colors.array[1] = 99; colors.addUpdateRange(0, 1); colors.needsUpdate = true;
+  matrices.array[12] = 2; matrices.array[28] = 99; matrices.addUpdateRange(12, 1); matrices.needsUpdate = true;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  f.scene.remove(native); f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.deepEqual([before, after, updates], [3, 3, 2], 'source callbacks complete once per selected draw');
+  position.array.fill(99); colors.array.fill(99); matrices.array.fill(99);
+  await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 6);
+  const draws = packets.filter(draw => draw.args[1] === 2); assert.equal(draws.length, 4);
+  assert.deepEqual(draws.map(vertex), [[.125, .125, .125], [.125, .125, .125], [.625, .125, .125], [.625, .125, .125]]);
+  const stream = (draw, stride) => {
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.stepMode === 'instance' && layout.arrayStride === stride);
+    if (slot < 0) return null;
+    const bytes = draw.contents.get(draw.streams.get(slot)); return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+  };
+  assert.deepEqual(draws.map(draw => [...stream(draw, 12).slice(0, 4)]),
+    [[.125, .375, .625, .25], [.125, .375, .625, .25], [.875, .375, .625, .25], [.875, .375, .625, .25]]);
+  const matrixValues = draws.map(draw => stream(draw, 64) ?? uniformBlocks(draw).find(words => words.length === 48));
+  assert.deepEqual(matrixValues.map(words => [words[12], words[28]]), capacity === 3
+    ? [[0, .5], [0, .5], [2, 99], [2, 99]] : [[0, .5], [0, .5], [2, .5], [2, .5]]);
+  assert.equal(position.updateRanges.length, 0); assert.equal(colors.updateRanges.length, 0);
+  if (capacity > 3) assert.equal(matrices.updateRanges.length, 0);
+  assert.deepEqual([before, after, updates], [3, 3, 2], 'deferred preparation never replays callbacks');
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._pending.length, 0);
+});
+
+for (const instanceFirst of [false, true]) test(`ordinary shared instances observe aliased dynamic uploads (instance first=${instanceFirst})`, async t => {
+  const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, 2);
+  instance.frustumCulled = false; f.renderer.sortObjects = false; f.scene.remove(f.mesh);
+  const native = addNativeMesh(t, f); native.geometry = f.geometry;
+  f.scene.remove(native); f.scene.add(...(instanceFirst ? [instance, native] : [native, instance]));
+  const position = f.geometry.attributes.position; position.setUsage(T.DynamicDrawUsage); position.array.fill(.125);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  position.array.fill(.625); f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  position.array.fill(99); await drain(f.renderer);
+  const draws = nativePackets(f.device); assert.equal(draws.length, 4);
+  assert.deepEqual(draws.map(vertex), [[.125, .125, .125], [.125, .125, .125], [.625, .625, .625], [.625, .625, .625]]);
+  assert.equal(position.version, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('growing an empty-capacity instance retains its established fixed upload history', async t => {
+  const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, 0);
+  f.scene.remove(f.mesh); f.scene.add(instance); instance.frustumCulled = false;
   const position = f.geometry.attributes.position; position.array.fill(.125);
   await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
-  // Legacy generated instance uploads have no transferable raw capture. A
-  // native owner must not interpret an unrequested CPU edit as fresh content.
-  position.array[0] = 99;
+  instance.instanceMatrix = new T.InstancedBufferAttribute(new Float32Array(new T.Matrix4().elements), 16); instance.count = 1;
+  position.array.fill(99); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const draws = f.device.snapshots.flat().filter(draw => draw.streams.size && draw.args[1] > 0);
+  assert.equal(draws.length, 1); assert.deepEqual(vertex(draws[0]), [.125, .125, .125]);
+  assert.equal(draws[0].pipeline.vertex.entryPoint, 'vertex_main'); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a refused legacy fixed-shadow transition preserves its prior route and GPU-stale bytes', async t => {
+  const f = fixture(t);
+  f.renderer.shadowMap.enabled = true; f.mesh.castShadow = true; f.mesh.frustumCulled = false;
+  const position = f.geometry.attributes.position; position.array.fill(.125);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  position.array[0] = 99; f.renderer.shadowMap.enabled = false;
   const native = addNativeMesh(t, f);
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._pending.length, 0);
-  f.scene.remove(native); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.scene.remove(native); f.renderer.shadowMap.enabled = true; f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   const packets = f.device.snapshots.flat().filter(draw => draw.streams.size);
   assert.equal(packets.length, 2); assert.deepEqual(packets.map(vertex), [[.125, .125, .125], [.125, .125, .125]]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.info.f3d.presentedRenders, 2);
 });

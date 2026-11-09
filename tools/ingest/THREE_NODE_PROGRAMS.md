@@ -243,6 +243,15 @@ at the source draw boundary. Shared attributes retain source upload generations,
 partial ranges and the stale GPU bytes of unrequested CPU edits. Cold and warm
 bundle updates preserve their ordering relative to ordinary companions.
 
+Supported nonempty native-WebGPU `InstancedMesh` objects now select the existing
+native instance owner from their first draw. Small matrix uniforms and larger
+matrix/color attribute streams retain the source observer's FULL/SHARED refresh
+rules. Adding authored companions or callbacks later shares the recorded upload
+history. Shared geometry refresh reads only recorded generations; later uploads
+to the same allocation become visible before submission, while disposal and
+replacement cannot retarget an earlier accepted binding. Empty-capacity meshes
+and attributes already owned by a legacy fixed residency retain their prior route.
+
 Ordinary rigid fixed scenes can enter this mixed route with earlier renders
 still queued. A successfully promoted root keeps its capture owner after its
 authored nodes are removed. Failed admission does not change that ownership or
@@ -257,8 +266,13 @@ and source-ordered node/shared-attribute updates against pinned r186 WebGPU.
 Both cases match exactly across seven frames each (688,128 RGBA bytes) on
 Chromium 153 SwiftShader with no browser or GPU errors. Source JavaScript still
 constructs shaders and supplies callback semantics; the new WebGPU backend
-submits these draws. These checks establish software GPU correctness, with no
-hardware performance claim.
+submits these draws. Two additional ordinary-instance cases exercise small and
+large matrix paths, late callbacks and node companions, unmarked edits, partial
+ranges and source refresh decisions. Their fourteen checkpoints also match
+exactly (688,128 RGBA bytes) on Chromium 153 SwiftShader with no GPU errors.
+Fifty-two focused snapshot/history/instance tests pass, including shared uploads
+in both draw orders and disposal boundaries. These checks establish software GPU
+correctness, with no hardware performance claim.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and

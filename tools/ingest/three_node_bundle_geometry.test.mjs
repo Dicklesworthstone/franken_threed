@@ -202,6 +202,31 @@ test('source disposal forwards residency events while accepted data survives and
   assert.throws(() => owner.capture(source, 3), {code: 'THREE_NODE_BUNDLE_GEOMETRY_DISPOSED'});
 });
 
+test('shared refresh follows uploaded generations while freezing layouts and allocation boundaries', t => {
+  const owner = histories(t), source = geometry(), attribute = source.attributes.position;
+  const alias = new T.BufferGeometry().setAttribute('position', attribute);
+  source.setDrawRange(1, 2); const first = owner.capture(source, 1);
+  attribute.array.fill(7); attribute.addUpdateRange(0, 1); attribute.needsUpdate = true;
+  const uploaded = owner.capture(alias, 2);
+  source.setDrawRange(0, 1); attribute.itemSize = 1; attribute.count = 9;
+  const refreshed = first.refreshUploaded(true), reused = first.refreshUploaded(true);
+  assert.equal(refreshed.geometry, reused.geometry, 'unchanged refreshes reuse private geometry identities');
+  assert.equal(refreshed.geometry.attributes.position.itemSize, 3);
+  assert.equal(refreshed.geometry.attributes.position.count, 3);
+  assert.deepEqual(refreshed.geometry.drawRange, {start: 1, count: 2});
+  assert.deepEqual([...refreshed.geometry.attributes.position.array], [7, 0, 0, 1, 0, 0, 0, 1, 0]);
+  assert.deepEqual(first.geometry.attributes.position.array, new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]));
+  attribute.itemSize = 3; attribute.count = 3; attribute.array.fill(9); alias.dispose();
+  const replacement = owner.capture(alias, 3);
+  assert.equal(refreshed.refreshUploaded(true), null, 'new allocations do not rewrite already recorded bindings');
+  const rebound = refreshed.refreshUploaded();
+  assert.deepEqual([...rebound.geometry.attributes.position.array], Array(9).fill(9));
+  assert.deepEqual(rebound.geometry.drawRange, {start: 1, count: 2});
+  owner.dispose();
+  for (const packet of [first, uploaded, refreshed, reused, replacement, rebound]) packet.release();
+  assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
 test('invalid ranges, mutable storage layouts and unproven GPU storage inputs fail before publishing new histories', t => {
   const owner = histories(t), source = geometry(), first = owner.capture(source, 1), attribute = source.attributes.position;
   attribute.addUpdateRange(8, 2); attribute.needsUpdate = true;

@@ -705,20 +705,24 @@ test('fixed dynamic attributes keep source render frequency when late hooks are 
   assert.equal(position.version,0);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
-test('late hooks still reject fixed generated instance history before source effects',async t=>{
+test('late hooks follow ordinary instance geometry history across shared source owners',async t=>{
   const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
   const instanceGeometry=f.mesh.geometry.clone(),linkedGeometry=f.mesh.geometry.clone();
   instanceGeometry.setAttribute('position',f.mesh.geometry.attributes.position);
   linkedGeometry.setAttribute('normal',f.mesh.geometry.attributes.normal);
   const instances=new T.InstancedMesh(instanceGeometry,new T.MeshBasicMaterial(),1),linked=new T.Mesh(linkedGeometry,f.mesh.material);
   instances.frustumCulled=false;linked.frustumCulled=false;f.scene.add(linked,instances);
+  linkedGeometry.attributes.position.array.fill(.25);
   t.after(()=>{instanceGeometry.dispose();linkedGeometry.dispose();});await f.renderer.compileAsync(f.scene,f.camera);
+  linkedGeometry.attributes.position.array.fill(99);
   const otherScene=new T.Scene(),otherGeometry=new T.PlaneGeometry(),other=new T.Mesh(otherGeometry,f.mesh.material);
   otherGeometry.setAttribute('position',linkedGeometry.attributes.position);other.frustumCulled=false;otherScene.add(other);
   t.after(()=>otherGeometry.dispose());let callbacks=0;other.onBeforeRender=()=>{callbacks++;};
-  assert.throws(()=>f.renderer.render(otherScene,f.camera),error=>
-    error.code==='THREE_NODE_PROGRAM_HOOK'&&/fixed owner/.test(error.message));
-  assert.equal(callbacks,0);assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  f.renderer.render(otherScene,f.camera);assert.equal(callbacks,1);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,1);
+  const bytes=draws[0].contents.get(draws[0].streams.get(0));
+  assert.ok(new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4).every(value=>value===.25));
+  assert.equal(callbacks,1);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 test('ordinary hook attribute history follows shared geometry into another scene after hook removal',async t=>{
@@ -1761,27 +1765,39 @@ test('fixed material capture budgets are released on disposal and preparation fa
 });
 
 
-for(const route of ['shadows','instances'])test('fixed raw history rejects legacy '+route+' adoption without poisoning later draws',async t=>{
+test('fixed raw history rejects legacy shadows adoption without poisoning later draws',async t=>{
+  const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
+  const geometry=f.mesh.geometry,position=geometry.attributes.position;position.array.fill(.125);
+  await f.renderer.compileAsync(f.scene,f.camera);position.array.fill(99);
+  const writes=f.device.writes.length,submissions=f.device.submissions.length;
+  f.renderer.shadowMap.enabled=true;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.renderer._nodeCaptureBytes,0,'refused route retains no queued leases');
+  f.renderer.shadowMap.enabled=false;f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=()=>f.device.snapshots.flat().filter(draw=>draw.streams.size>0);
+  const firstWord=draw=>{const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];};
+  assert.equal(draws().length,1);assert.equal(firstWord(draws()[0]),.125,'refusal preserves the accepted history');
+  geometry.dispose();f.renderer.shadowMap.enabled=true;f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const fresh=draws().slice(1);assert.equal(fresh.length,1);
+  assert.ok(fresh.every(draw=>firstWord(draw)===99),'source disposal permits a fresh fixed upload');
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('ordinary instances share earlier fixed geometry generations and source disposal restarts both views',async t=>{
   const f=fixture(t);f.mesh.material=new T.MeshBasicMaterial();f.mesh.frustumCulled=false;
   const geometry=f.mesh.geometry,position=geometry.attributes.position;position.array.fill(.125);
   await f.renderer.compileAsync(f.scene,f.camera);position.array.fill(99);
   const aliasGeometry=geometry.clone();aliasGeometry.setAttribute('position',position);
   const alias=new T.InstancedMesh(aliasGeometry,new T.MeshBasicMaterial(),1);alias.frustumCulled=false;
   t.after(()=>{aliasGeometry.dispose();alias.material.dispose();});
-  const activate=()=>{if(route==='shadows')f.renderer.shadowMap.enabled=true;else f.scene.add(alias);};
-  const deactivate=()=>{f.renderer.shadowMap.enabled=false;f.scene.remove(alias);};
-  const writes=f.device.writes.length,submissions=f.device.submissions.length;
-  activate();
-  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_CHANGED'});
-  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
-  assert.equal(f.renderer._nodeCaptureBytes,0,'refused route retains no queued leases');
-  deactivate();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
-  const draws=()=>f.device.snapshots.flat().filter(draw=>draw.streams.size>0);
+  f.scene.add(alias);f.renderer.render(f.scene,f.camera);f.scene.remove(alias);f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
   const firstWord=draw=>{const bytes=draw.contents.get(draw.streams.get(0));
     return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4)[0];};
-  assert.equal(draws().length,1);assert.equal(firstWord(draws()[0]),.125,'refusal preserves the accepted history');
-  geometry.dispose();activate();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
-  const fresh=draws().slice(1);assert.equal(fresh.length,route==='shadows'?1:2);
-  assert.ok(fresh.every(draw=>firstWord(draw)===99),'source disposal permits a fresh fixed upload');
+  assert.deepEqual(nativeDraws(f.device).map(firstWord),[.125,.125,.125]);
+  geometry.dispose();f.scene.add(alias);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(nativeDraws(f.device).slice(-2).map(firstWord),[99,99]);
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });

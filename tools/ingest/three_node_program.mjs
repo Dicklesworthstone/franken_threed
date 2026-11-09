@@ -2051,8 +2051,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         }
         return packet;
       });
-      return record.packet = {...previous, uniforms, refreshType: kind,
+      // Ordinary draws bind the current shared attribute allocation even when
+      // their object uniforms remain cached. Never upload newer CPU edits here.
+      const geometry = record.fog ? previous.bundleGeometry?.refreshUploaded() : null;
+      const packet = {...previous, uniforms, refreshType: kind,
+        ...(geometry ? {bundleGeometry: geometry} : {}),
         ...(record.fog ? {fogResources: record.resources} : {})};
+      if (geometry) storeBundlePacket(state, record, packet);
+      else record.packet = packet;
+      return packet;
     });
     const object = checkCapture(state, context);
     return withFrame(state, context, () => {

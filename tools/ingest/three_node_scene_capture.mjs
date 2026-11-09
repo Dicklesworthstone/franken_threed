@@ -108,8 +108,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const renderObjectFunction = selectedRenderObject;
   const shadowPass = uniforms ? getThreeNativeShadowPass(renderer, overrideMaterial, renderObjectFunction) : null;
   const customRenderObject = !shadowPass && renderObjectFunction;
-  // Match source RenderContexts identity for the ordinary-material fog
-  // observer. Target objects with the same attachment state share a context.
+  // Match source RenderContexts identity for ordinary-material refresh
+  // observers. Target objects with the same attachment state share a context.
   const sourceRenderContext = !shadowPass && bundles ? `${destination === null ? 'default' :
     [destination.textures.length, destination.texture.format, destination.texture.type, destination.samples,
       destination.depthBuffer, destination.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-${bundleDepth}` : undefined;
@@ -312,6 +312,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const renderable = object => object.isMesh || object.isSprite || object.isPoints || object.isLine;
   const nativeSelection = (object, effective) => bundleMembers.has(object) ||
     object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
+    // Ordinary native-WebGPU instances need the source uniform/attribute
+    // split from their first draw. A later node or callback must reuse those
+    // uploaded generations, not initialize another owner from edited CPU data.
+    // Empty-capacity meshes and attributes already held by a legacy fixed
+    // owner retain that route; automatic selection cannot invent their history.
+    object.isInstancedMesh === true && object.instanceMatrix?.count > 0 &&
+      (object.instanceColor == null || object.instanceColor.count > 0) &&
+      !attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner)) ||
     // Mesh billboards and point materials need the source primitive builder.
     (object.isMesh === true || object.isSprite === true) && effective.some(material =>
       object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
@@ -903,7 +911,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         ...(draw.binding.lights ? {lights: draw.binding.lights} : {}),
         captureVertexAttribute, clippingContext: draw.binding.clippingContext,
         captureIndirect: () => captureIndirectUpload(draw.object, draw.geometry),
-        ...(sourceRenderContext !== undefined && (sceneFogNode && draw.material.fog === true || draw.geometry.indirect != null)
+        // Ordinary instances retain object uniforms on SHARED refresh. In
+        // particular, unmarked matrix edits are not an upload request even on
+        // the small uniform-buffer path; the pinned observer selects FULL.
+        ...(sourceRenderContext !== undefined && (sceneFogNode && draw.material.fog === true || draw.geometry.indirect != null || draw.object.isInstancedMesh === true)
           ? {fogRenderContext: sourceRenderContext,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),
@@ -928,6 +939,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       for (const binding of captured.textures) recordTexture(binding.texture);
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
+      draw.nodeSharedGeometry = !draw.nodeBundle && updateContext.fogRenderContext !== undefined &&
+        captured.refreshType !== undefined && captured.refreshType !== three.RenderObjectRefreshType.FULL;
       if (captured.bundleGeometry) {
         // Bundle and ordinary fog observer records own their packet's lease.
         // Each accepted render needs an independent lifetime for that view.
@@ -1356,6 +1369,20 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         else captureStorage();
       }
     }, destination);
+    // A later FULL draw can upload a shared buffer before source submission.
+    // Earlier SHARED draws see those bytes, but keep their uniforms and ranges.
+    // A replaced allocation is a distinct binding, never a retroactive upload.
+    for (let i = 0; i < capturedDraws.length; i++) {
+      const draw = capturedDraws[i];
+      if (!draw.nodeSharedGeometry) continue;
+      const geometry = draw.bundleGeometry?.refreshUploaded(true);
+      if (!geometry) continue;
+      bundleGeometries.push(geometry); bytes += geometry.bytes;
+      if (bytes > maxUniformBytes) fail('LIMIT', 'Native geometry exceeds the pending capture byte budget');
+      const binding = Object.freeze({...draw.binding, programGeometry: geometry.geometry});
+      compiledBindings.delete(draw.binding); compiledBindings.add(binding);
+      capturedDraws[i] = Object.freeze({...draw, binding, bundleGeometry: geometry});
+    }
     const storageHistory = storageOwner?.validate(storageUses);
     if (storageHistory) {
       const refreshedGeometries = new Map(), refreshedBindings = new Map(), refreshedDraws = new Map();

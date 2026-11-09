@@ -4,7 +4,53 @@ function stage(T, renderer) {
   return {scene, camera};
 }
 
+function ordinaryInstances(T, renderer, capacity) {
+  const result = stage(T, renderer), {scene} = result;
+  const geometry = new T.PlaneGeometry(.65, .8), material = new T.MeshBasicMaterial();
+  const instances = new T.InstancedMesh(geometry, material, capacity); instances.count = 2; instances.frustumCulled = false;
+  instances.setMatrixAt(0, new T.Matrix4().makeTranslation(-.8, 0, 0));
+  instances.setMatrixAt(1, new T.Matrix4().makeTranslation(.8, 0, 0));
+  instances.setColorAt(0, new T.Color(.125, .375, .625)); instances.setColorAt(1, new T.Color(.25, .5, .75));
+  const position = geometry.attributes.position, matrices = instances.instanceMatrix, colors = instances.instanceColor;
+  const initialPosition = position.array.slice(), initialMatrices = matrices.array.slice(), initialColors = colors.array.slice();
+  const authored = new T.MeshBasicNodeMaterial(); authored.colorNode = T.TSL.vec3(.625, .375, .125);
+  const native = new T.Mesh(new T.PlaneGeometry(.4, .4), authored); native.position.y = .9;
+  const ordinary = new T.Mesh(new T.PlaneGeometry(.4, .4), new T.MeshBasicMaterial({color: 0x446633})); ordinary.position.y = -.9;
+  const render = renderer.render.bind(renderer); let frame = 0, before = 0, after = 0;
+  renderer.render = (...args) => {
+    if (args[0] !== scene) return render(...args);
+    frame++; scene.add(instances); position.array.set(initialPosition); matrices.array.set(initialMatrices); colors.array.set(initialColors);
+    // Ordinary materials retain object uniforms on SHARED refresh. A source
+    // FULL refresh reads all small matrices but only requested large ranges.
+    matrices.array[12] = -.8 + frame / 100;
+    if (frame >= 7) { position.array[0] = .1; colors.array[0] = 99; matrices.array[28] = 99; }
+    if (frame === 7) {
+      instances.onBeforeRender = () => { before++; }; instances.onAfterRender = () => { after++; };
+    }
+    if (frame >= 7 && frame < 10 || frame >= 12) scene.add(native, ordinary);
+    else scene.remove(native, ordinary);
+    if (frame === 10) {
+      position.array[0] = -.25; position.addUpdateRange(0, 1); position.needsUpdate = true;
+      colors.array[0] = .875; colors.addUpdateRange(0, 1); colors.needsUpdate = true;
+      matrices.addUpdateRange(12, 1); matrices.needsUpdate = true;
+    }
+    if (frame === 12) {
+      position.array[1] = .25; position.addUpdateRange(1, 1); position.needsUpdate = true;
+      colors.array[1] = .25; colors.addUpdateRange(1, 1); colors.needsUpdate = true;
+      matrices.array[28] = .65; matrices.addUpdateRange(28, 1); matrices.needsUpdate = true;
+    }
+    renderer._nodes.nodeFrame.update();
+    const value = render(...args), callbacks = Math.max(0, frame - 6);
+    if (before !== callbacks || after !== callbacks) throw Error('Instance callbacks must run once per selected draw');
+    position.array.fill(99); matrices.array.fill(99); colors.array.fill(99);
+    return value;
+  };
+  return result;
+}
+
 export const nativeMixedSnapshotScenarios = {
+  native_ordinary_instance_snapshots: (T, renderer) => ordinaryInstances(T, renderer, 3),
+  native_large_instance_snapshots: (T, renderer) => ordinaryInstances(T, renderer, 1025),
   native_mixed_accepted_inputs(T, renderer) {
     const result = stage(T, renderer), {scene} = result;
     const geometry = new T.PlaneGeometry(1, 1), material = new T.MeshBasicMaterial();

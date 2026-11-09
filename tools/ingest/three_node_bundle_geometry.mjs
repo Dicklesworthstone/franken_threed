@@ -26,6 +26,28 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     return Object.freeze({geometry: view.geometry, bytes: view.bytes,
       // A retired program's wrapper can still name a view retained by a bundle.
       retain() { if (view.refs === 0) reject('RELEASED', 'Bundle geometry view has retired'); return lease(view); },
+      refreshUploaded(sameResidency = false) {
+        if (view.refs === 0) reject('RELEASED', 'Bundle geometry view has retired');
+        const selected = view.selected.map(source => {
+          const generation = !source.gpu && owners.get(source.owner)?.generation;
+          return !generation || generation === source.generation ||
+            sameResidency && generation.residency !== source.generation.residency
+            ? source : {...source, generation};
+        });
+        if (selected.every((source, index) => source === view.selected[index])) return null;
+        const latest = view.state.latest;
+        if (latest?.key === view.key && selected.every((source, index) =>
+          source.owner === latest.selected[index].owner && source.generation === latest.selected[index].generation)) return lease(latest);
+        // Refresh only bytes already uploaded by another source draw. Retain
+        // this accepted layout/range, without reading any live CPU attributes.
+        const next = makeView(view.state, selected, view.geometry.drawRange,
+          view.geometry.vertexCount, view.geometry.isInstancedBufferGeometry, view.key);
+        if (view.state.latest === view) {
+          view.state.latest = next; dropView(view);
+          return lease(next);
+        }
+        const result = lease(next); dropView(next); return result;
+      },
       refreshStorage(refresh) {
         if (view.refs === 0) reject('RELEASED', 'Bundle geometry view has retired');
         const attributes = {}; let changed = false;
@@ -40,7 +62,9 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         // Only GPU metadata changes. Keep the exact retained CPU generations,
         // ranges and index instead of recapturing live source geometry bytes.
         for (const generation of view.generations) keep(generation);
-        const next = {refs: 1, generations: view.generations, bytes: view.bytes,
+        const selected = view.selected.map(source => source.gpu
+          ? {...source, attribute: attributes[source.name], generation: attributes[source.name]} : source);
+        const next = {refs: 1, state: view.state, key: view.key, selected, generations: view.generations, bytes: view.bytes,
           geometry: Object.freeze({...view.geometry, attributes: Object.freeze(attributes)})};
         if (previous) dropView(previous);
         view.storageView = next;
@@ -74,7 +98,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     if (!Array.isArray(owner.updateRanges) || owner.updateRanges.some(range => !Number.isSafeInteger(range?.start) || range.start < 0 ||
         !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length))
       reject('ATTRIBUTE', 'Bundle attribute update ranges must fit their source array');
-    return {attribute, owner, array, interleaved, stride, offset,
+    return {attribute, owner, array, interleaved, stride, offset, usage: owner.usage,
       shape: [attribute.count, attribute.itemSize, stride, offset, attribute.normalized, attribute.gpuType,
         attribute.isFloat16BufferAttribute === true, attribute.isInstancedBufferAttribute === true,
         owner.isInstancedInterleavedBuffer === true, owner.meshPerAttribute]};
@@ -117,8 +141,9 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
           for (const {start, count} of ranges) array.set(source.array.subarray(start, start + count), start);
           source.owner.clearUpdateRanges();
         }
+        const residency = first ? {} : record.generation?.residency;
         if (record.generation) drop(record.generation);
-        record.generation = {array, refs: 1}; allocatedBytes += array.byteLength; record.version = source.owner.version;
+        record.generation = {array, refs: 1, residency}; allocatedBytes += array.byteLength; record.version = source.owner.version;
         record.type = source.array.constructor; record.length = source.array.length;
       }
       record.renderId = renderId;
@@ -157,34 +182,38 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       geometry.isInstancedBufferGeometry === true, vertexCount]);
     if (state.latest?.key === key && selected.every((source, i) => source.owner === state.latest.selected[i].owner &&
         source.generation === state.latest.selected[i].generation)) return lease(state.latest);
+    const view = makeView(state, selected, range, vertexCount, geometry.isInstancedBufferGeometry === true, key);
+    if (state.latest) dropView(state.latest); state.latest = view;
+    return lease(view);
+  }
+  function makeView(state, selected, range, vertexCount, instanced, key) {
     const privateOwners = new Map(), capturedAttributes = {}; let index = null;
     for (const source of selected) {
       if (source.gpu) { capturedAttributes[source.name] = source.attribute; continue; }
+      const [count, itemSize, stride, offset, normalized, gpuType, half, instanceAttribute, instanceBuffer, divisor] = source.shape;
       let owner = privateOwners.get(source.owner);
       if (!owner) {
-        const array = source.generation.array, divisor = source.owner.meshPerAttribute ?? 1;
+        const array = source.generation.array;
         owner = source.interleaved
-          ? source.owner.isInstancedInterleavedBuffer ? new three.InstancedInterleavedBuffer(array, source.stride, divisor) : new three.InterleavedBuffer(array, source.stride)
-          : source.attribute.isInstancedBufferAttribute ? new three.InstancedBufferAttribute(array, source.attribute.itemSize, source.attribute.normalized, divisor)
-            : new three.BufferAttribute(array, source.attribute.itemSize, source.attribute.normalized);
-        owner.count = source.owner.count; owner.usage = source.owner.usage;
-        if (!source.interleaved) { owner.gpuType = source.attribute.gpuType; if (source.attribute.isFloat16BufferAttribute) owner.isFloat16BufferAttribute = true; }
+          ? instanceBuffer ? new three.InstancedInterleavedBuffer(array, stride, divisor ?? 1) : new three.InterleavedBuffer(array, stride)
+          : instanceAttribute ? new three.InstancedBufferAttribute(array, itemSize, normalized, divisor ?? 1)
+            : new three.BufferAttribute(array, itemSize, normalized);
+        owner.count = count; owner.usage = source.usage;
+        if (!source.interleaved) { owner.gpuType = gpuType; if (half) owner.isFloat16BufferAttribute = true; }
         privateOwners.set(source.owner, owner);
       }
-      const attribute = source.interleaved ? new three.InterleavedBufferAttribute(owner, source.attribute.itemSize, source.offset, source.attribute.normalized) : owner;
-      if (source.interleaved && source.attribute.gpuType !== undefined) attribute.gpuType = source.attribute.gpuType;
+      const attribute = source.interleaved ? new three.InterleavedBufferAttribute(owner, itemSize, offset, normalized) : owner;
+      if (source.interleaved && gpuType !== undefined) attribute.gpuType = gpuType;
       if (source.name === null) index = attribute; else capturedAttributes[source.name] = attribute;
     }
     const generations = new Set(selected.filter(source => !source.gpu).map(source => source.generation));
     for (const generation of generations) keep(generation);
-    const view = {refs: 1, key, selected, generations,
+    return {refs: 1, state, key, selected, generations,
       bytes: [...generations].reduce((sum, generation) => sum + generation.array.byteLength, 0),
       geometry: Object.freeze({attributes: Object.freeze(capturedAttributes), index, drawRange: Object.freeze({...range}), vertexCount,
-        isInstancedBufferGeometry: geometry.isInstancedBufferGeometry === true,
+        isInstancedBufferGeometry: instanced,
         addEventListener: (...args) => state.source.addEventListener?.(...args),
         removeEventListener: (...args) => state.source.removeEventListener?.(...args)})};
-    if (state.latest) dropView(state.latest); state.latest = view;
-    return lease(view);
   }
   return Object.freeze({capture, hasHistory: owner => !!owners.get(owner)?.generation,
     dispose() {
