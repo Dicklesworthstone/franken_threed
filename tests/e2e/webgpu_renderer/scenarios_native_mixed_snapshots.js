@@ -48,7 +48,64 @@ function ordinaryInstances(T, renderer, capacity) {
   return result;
 }
 
+function ordinaryDeformation(T, renderer, skinned) {
+  const result = stage(T, renderer), {scene} = result;
+  const geometry = new T.PlaneGeometry(1.5, 1.7, 4, 6), position = geometry.attributes.position;
+  const material = new T.MeshBasicMaterial({color: 0x59a6cf}), initial = position.array.slice();
+  geometry.morphTargetsRelative = !skinned;
+  geometry.morphAttributes.position = [0, 1].map(target => new T.Float32BufferAttribute(Array.from(initial, (value, i) =>
+    (skinned ? value : 0) + (i % 3 === target ? Math.sin(initial[i - i % 3 + 1] * 2.4) * .35 : 0)), 3));
+  const targets = geometry.morphAttributes.position, targetData = targets.map(attribute => attribute.array.slice());
+  let root, tip, updates = 0;
+  const mesh = skinned ? new T.SkinnedMesh(geometry, material) : new T.Mesh(geometry, material); mesh.frustumCulled = false;
+  if (skinned) {
+    const indices = [], weights = [];
+    for (let i = 0; i < position.count; i++) {
+      const weight = Math.round((position.getY(i) + .85) / 1.7 * 255);
+      indices.push(0, 1, 0, 0); weights.push(255 - weight, weight, 0, 0);
+    }
+    geometry.setAttribute('skinIndex', new T.Uint16BufferAttribute(indices, 4));
+    geometry.setAttribute('skinWeight', new T.Uint8BufferAttribute(weights, 4, true));
+    root = new T.Bone(); tip = new T.Bone(); root.position.y = -.85; tip.position.y = 1.7;
+    root.add(tip); mesh.add(root); mesh.bind(new T.Skeleton([root, tip]));
+    const update = mesh.skeleton.update; mesh.skeleton.update = function () { updates++; return update.call(this); };
+  }
+  const authored = new T.MeshBasicNodeMaterial(); authored.colorNode = T.TSL.vec3(.625, .375, .125);
+  const native = new T.Mesh(new T.PlaneGeometry(.4, .4), authored); native.position.set(1.2, .9, 0);
+  const render = renderer.render.bind(renderer); let frame = 0, before = 0, after = 0;
+  renderer.render = (...args) => {
+    if (args[0] !== scene) return render(...args);
+    frame++; scene.add(mesh); position.array.set(initial);
+    targets.forEach((attribute, i) => attribute.array.set(targetData[i]));
+    if (frame >= 7) {
+      position.array[0] += .3;
+      for (let i = 0; i < targets[0].array.length; i += 3) targets[0].array[i] += .35;
+    }
+    mesh.morphTargetInfluences = frame < 7 ? [.25, .5] : frame < 8 ? [.5, -.25] : frame < 10 ? [.85, .25] : frame < 12 ? [.75, .15] : [.1, .9];
+    mesh.static = frame === 8 || frame === 9;
+    if (skinned) { root.rotation.z = Math.sin(frame / 7) * .15; tip.rotation.z = Math.sin(frame / 11) * .5; }
+    if (frame === 7) { mesh.onBeforeRender = () => { before++; }; mesh.onAfterRender = () => { after++; }; }
+    if (frame >= 7 && frame < 10 || frame >= 12) scene.add(native); else scene.remove(native);
+    if (frame === 10) {
+      position.array[1] -= .2; position.addUpdateRange(1, 1); position.needsUpdate = true;
+      targets[0].needsUpdate = true; // Target edits do not rebuild the existing source morph graph.
+    }
+    if (frame === 12) geometry.dispose();
+    if (frame === 13) material.needsUpdate = true;
+    if (frame === 18) { material.alphaHash = true; material.needsUpdate = true; }
+    renderer._nodes.nodeFrame.update(); const value = render(...args), callbacks = Math.max(0, frame - 6);
+    if (before !== callbacks || after !== callbacks || skinned && updates !== frame)
+      throw Error('Deformation callbacks and skeleton updates must retain source multiplicity');
+    position.array.fill(99); targets.forEach(attribute => attribute.array.fill(99)); mesh.morphTargetInfluences.fill(99);
+    if (skinned) mesh.skeleton.boneMatrices.fill(99);
+    return value;
+  };
+  return result;
+}
+
 export const nativeMixedSnapshotScenarios = {
+  native_ordinary_morph_snapshots: (T, renderer) => ordinaryDeformation(T, renderer, false),
+  native_ordinary_skin_morph_snapshots: (T, renderer) => ordinaryDeformation(T, renderer, true),
   native_ordinary_instance_snapshots: (T, renderer) => ordinaryInstances(T, renderer, 3),
   native_large_instance_snapshots: (T, renderer) => ordinaryInstances(T, renderer, 1025),
   native_mixed_accepted_inputs(T, renderer) {

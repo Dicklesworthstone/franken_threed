@@ -407,6 +407,75 @@ for (const instanceFirst of [false, true]) test(`ordinary shared instances obser
   assert.equal(position.version, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const kind of ['morph', 'skin', 'morph and skin']) test(`ordinary ${kind} draws retain source deformation through queued mixed transitions`, async t => {
+  const f = fixture(t), skinned = kind.includes('skin'), morphed = kind.includes('morph');
+  const position = f.geometry.attributes.position; position.array.fill(.125);
+  if (morphed) {
+    f.geometry.morphAttributes.position = [position.clone()];
+    f.geometry.morphTargetsRelative = true;
+  }
+  const mesh = skinned ? new T.SkinnedMesh(f.geometry, f.material) : new T.Mesh(f.geometry, f.material);
+  mesh.frustumCulled = false; f.renderer.sortObjects = false; f.scene.remove(f.mesh); f.scene.add(mesh);
+  let tip, updates = 0, before = 0, after = 0, nodes = 0;
+  if (skinned) {
+    f.geometry.setAttribute('skinIndex', new T.Uint16BufferAttribute(Array.from({length: position.count * 4}, (_, i) => i % 4 === 0 ? 1 : 0), 4));
+    f.geometry.setAttribute('skinWeight', new T.Uint8BufferAttribute(Array.from({length: position.count * 4}, (_, i) => i % 4 === 0 ? 255 : 0), 4, true));
+    const root = new T.Bone(); tip = new T.Bone(); root.add(tip); mesh.add(root); mesh.bind(new T.Skeleton([root, tip]));
+    const update = mesh.skeleton.update; mesh.skeleton.update = function () { updates++; return update.call(this); };
+    tip.position.x = .25;
+    if (!morphed) {
+      const shared = new T.SkinnedMesh(f.geometry, f.material); shared.bind(mesh.skeleton, mesh.bindMatrix);
+      shared.frustumCulled = false; shared.position.x = .5; f.scene.add(shared);
+    }
+  }
+  if (morphed) mesh.morphTargetInfluences[0] = .25;
+  for (const attribute of Object.values(f.geometry.attributes)) Object.defineProperty(attribute, 'onUploadCallback', {
+    get() { assert.fail('native deformation must not observe WebGL upload callbacks'); },
+  });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  position.array.fill(99); if (tip) tip.position.x = .5;
+  if (morphed) mesh.morphTargetInfluences[0] = .5;
+  mesh.onBeforeRender = () => { before++; }; mesh.onAfterRender = () => { after++; };
+  const native = addNativeMesh(t, f, T.TSL.vec3(T.TSL.uniform(.5).onObjectUpdate(() => { nodes++; return .5; })));
+  f.renderer.render(f.scene, f.camera);
+  if (skinned) { f.scene.updateMatrixWorld(true); mesh.skeleton.update(); }
+  position.array[0] = .625; position.addUpdateRange(0, 1); position.needsUpdate = true;
+  if (morphed) {
+    mesh.morphTargetInfluences = [.75];
+    f.geometry.morphAttributes.position[0].array.fill(9); f.geometry.morphAttributes.position[0].needsUpdate = true;
+  }
+  f.renderer.render(f.scene, f.camera);
+  f.scene.remove(native); mesh.static = true;
+  if (tip) tip.position.x = .875; if (morphed) mesh.morphTargetInfluences[0] = .875;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.deepEqual([before, after, nodes], [3, 3, 2]); if (skinned) assert.equal(updates, 3, 'shared skeleton updates once per frame plus the explicit update');
+  position.array.fill(99); if (skinned) mesh.skeleton.boneMatrices.fill(99); if (morphed) mesh.morphTargetInfluences.fill(99);
+  await drain(f.renderer);
+  const draws = nativePackets(f.device).filter(draw => draw.pipeline.vertex.module.code.includes(skinned ? 'skinWeight' : 'texture_2d_array'));
+  const repeated = values => values.flatMap(value => kind === 'skin' ? [value, value] : [value]);
+  assert.equal(draws.length, kind === 'skin' ? 8 : 4);
+  assert.deepEqual(draws.map(vertex), repeated([[.125, .125, .125], [.125, .125, .125], [.625, .125, .125], [.625, .125, .125]]));
+  if (skinned) for (const [i, translation] of repeated([.25, .25, .5, .875]).entries())
+    assert.ok(uniformBlocks(draws[i]).some(words => words.length === 32 && words[28] === translation), `source bone palette ${translation} survives deferred preparation`);
+  if (morphed) for (const [i, influence] of [.25, .5, .75, skinned ? .875 : .75].entries())
+    assert.ok(uniformBlocks(draws[i]).some(words => words.length === 4 && words[0] === influence && words.slice(1).every(value => value === 0)), `source influence ${influence} survives deferred preparation`);
+  assert.deepEqual([before, after, nodes], [3, 3, 2]); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const legacy of ['normal-only morph', 'nonstandard palette']) test(`automatic skin capture preserves the existing ${legacy} route`, async t => {
+  const f = fixture(t), count = f.geometry.attributes.position.count;
+  f.geometry.setAttribute('skinIndex', new T.Uint16BufferAttribute(new Uint16Array(count * 4), 4));
+  f.geometry.setAttribute('skinWeight', new T.Float32BufferAttribute(Array.from({length: count * 4}, (_, i) => i % 4 === 0 ? 1 : 0), 4));
+  if (legacy === 'normal-only morph') f.geometry.morphAttributes.normal = [f.geometry.attributes.normal.clone()];
+  const mesh = new T.SkinnedMesh(f.geometry, f.material), bone = new T.Bone(); mesh.add(bone); mesh.bind(new T.Skeleton([bone]));
+  if (legacy === 'nonstandard palette') mesh.skeleton.boneMatrices = new Float64Array(mesh.skeleton.boneMatrices);
+  mesh.frustumCulled = false; f.scene.remove(f.mesh); f.scene.add(mesh); await f.renderer.init();
+  const captured = f.renderer._captureNodeFrame({scene: f.scene, camera: f.camera, destination: f.renderer,
+    overrideMaterial: null, captureCameras: true, renderId: 1});
+  assert.equal(captured.objects.has(mesh), false); assert.equal(captured.draws.length, 0);
+  assert.equal(captured.bytes, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('growing an empty-capacity instance retains its established fixed upload history', async t => {
   const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, 0);
   f.scene.remove(f.mesh); f.scene.add(instance); instance.frustumCulled = false;

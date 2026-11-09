@@ -550,7 +550,7 @@ test('source morph influences retain independent same-frame captures and live re
   assert.deepEqual(uniformValues(second, member), [.75, 0, 0, 0, .5, 0, 0, 0]);
   assert.deepEqual(uniformValues(third, member), [1.25, 0, 0, 0, -.5, 0, 0, 0]);
 });
-test('source morph texture packing remains cached until geometry disposal and preserves old captures', t => {
+test('source morph graphs retain packed targets through geometry disposal and version-only material updates', t => {
   const f = morphRig(t), d = f.compile(), first = f.owner.captureDraw(d, f.context);
   const texture = first.textures.find(binding => binding.texture.isDataArrayTexture).texture;
   assert.deepEqual([texture.image.width, texture.image.height, texture.image.depth], [8, 1, 2]);
@@ -560,19 +560,41 @@ test('source morph texture packing remains cached until geometry disposal and pr
   assert.equal(f.compile(), d); f.owner.captureDraw(d, {...f.context, renderId: 2});
   assert.deepEqual(texture.image.data, oldData, 'same-count source attribute edits do not regenerate its cached texture');
   f.object.geometry.dispose();
-  const next = f.compile(), second = f.owner.captureDraw(next, {...f.context, renderId: 3});
+  assert.equal(f.compile(), d, 'geometry disposal keeps the existing source node graph');
+  f.material.needsUpdate = true;
+  assert.equal(f.compile(), d, 'version-only updates keep an unchanged source shader key');
+  assert.equal(f.compile(), d, 'the new material version is acknowledged without rebuilding next time');
+  const retained = f.owner.captureDraw(d, {...f.context, renderId: 3});
+  assert.equal(retained.textures.find(binding => binding.texture.isDataArrayTexture).texture, texture);
+  assert.deepEqual(texture.image.data, oldData);
+  f.material.dispose();
+  const next = f.compile(), second = f.owner.captureDraw(next, {...f.context, renderId: 4});
   const replacement = second.textures.find(binding => binding.texture.isDataArrayTexture).texture;
   assert.notEqual(next, d); assert.notEqual(replacement, texture); assert.equal(replacement.image.data[0], 5);
   assert.deepEqual(texture.image.data, oldData); assert.equal(first.textures.find(binding => binding.texture.isDataArrayTexture).texture, texture);
 });
 test('morph count changes rebuild source textures and influence buffers before accepting another draw', t => {
   const f = morphRig(t), d = f.compile(), first = f.owner.capture(d, f.context), saved = first.map(bytes => bytes.slice());
+  f.object.geometry.dispose();
   for (const name of ['position', 'normal']) f.object.geometry.morphAttributes[name].push(f.object.geometry.morphAttributes[name][0].clone());
   f.object.updateMorphTargets();
+  f.material.needsUpdate = true;
   assert.throws(() => f.owner.capture(d, {...f.context, renderId: 2}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   const next = f.compile(); assert.notEqual(next, d); assert.equal(morphMember(next, 3).byteLength, 48);
   assert.equal(f.owner.captureDraw(next, {...f.context, renderId: 2}).textures.find(binding => binding.texture.isDataArrayTexture).texture.image.depth, 3);
   assert.deepEqual(first, saved);
+});
+test('retained morph graphs rebuild for new geometry and actual material graph changes', t => {
+  const f = morphRig(t), first = f.compile(), geometry = f.object.geometry;
+  geometry.dispose(); f.material.alphaHash = true; f.material.needsUpdate = true;
+  const changed = f.compile(); assert.notEqual(changed, first); assert.match(changed.fragment, /getAlphaHashThreshold/);
+  f.object.geometry = geometry.clone();
+  f.object.geometry.morphAttributes.position[0].array[0] = 7;
+  f.material.needsUpdate = true;
+  const replaced = f.compile(); assert.notEqual(replaced, changed);
+  const draw = f.owner.captureDraw(replaced, {...f.context, renderId: 2});
+  assert.equal(draw.textures.find(binding => binding.texture.isDataArrayTexture).texture.image.data[0], 7);
+  assert.equal(f.compile(), replaced);
 });
 test('source morphing precedes skinning and their independently captured uniforms coexist', t => {
   const f = morphRig(t, {relative: true, skinned: true}), d = f.compile();

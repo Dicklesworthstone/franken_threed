@@ -320,6 +320,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     object.isInstancedMesh === true && object.instanceMatrix?.count > 0 &&
       (object.instanceColor == null || object.instanceColor.count > 0) &&
       !attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner)) ||
+    // Source skinning palettes and cached morph textures must also own their
+    // first draw. Later node companions reuse their uploaded base attributes
+    // and source pose updates instead of migrating a generated fixed stream.
+    // Nonstandard palettes and morph channels outside the source node owner
+    // keep their established deformation route.
+    (object.isSkinnedMesh === true || object.geometry?.morphAttributes?.position?.length > 0) &&
+      (!object.isSkinnedMesh || object.skeleton?.boneMatrices instanceof Float32Array) &&
+      (object.geometry?.morphAttributes?.position?.length > 0 ||
+        !Object.values(object.geometry?.morphAttributes ?? {}).some(targets => targets?.length)) &&
+      !attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner)) ||
     // Mesh billboards and point materials need the source primitive builder.
     (object.isMesh === true || object.isSprite === true) && effective.some(material =>
       object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
@@ -911,10 +921,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         ...(draw.binding.lights ? {lights: draw.binding.lights} : {}),
         captureVertexAttribute, clippingContext: draw.binding.clippingContext,
         captureIndirect: () => captureIndirectUpload(draw.object, draw.geometry),
-        // Ordinary instances retain object uniforms on SHARED refresh. In
-        // particular, unmarked matrix edits are not an upload request even on
-        // the small uniform-buffer path; the pinned observer selects FULL.
-        ...(sourceRenderContext !== undefined && (sceneFogNode && draw.material.fog === true || draw.geometry.indirect != null || draw.object.isInstancedMesh === true)
+        // The source observer selects FULL for animated skins and changed
+        // morph weights. Unchanged ordinary object uniforms remain retained
+        // on SHARED refresh, including the small instance-matrix buffer.
+        ...(sourceRenderContext !== undefined && (sceneFogNode && draw.material.fog === true || draw.geometry.indirect != null ||
+          draw.object.isInstancedMesh === true || draw.object.isSkinnedMesh === true || draw.object.morphTargetInfluences != null)
           ? {fogRenderContext: sourceRenderContext,
           renderContext: {width: destination?.width ?? renderer.domElement?.width ?? 1,
             height: destination?.height ?? renderer.domElement?.height ?? 1}} : {}),

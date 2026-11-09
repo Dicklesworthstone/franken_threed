@@ -503,8 +503,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('OBJECT', 'Native morph targets require matching source attribute counts and vector layouts');
     }
     // The pinned Morph.js owns packing and caches by geometry/count. Influence
-    // values and relative mode stay live; attribute edits do not silently
-    // regenerate a source texture that remains cached until geometry disposal.
+    // values and relative mode stay live node inputs. Target edits do not
+    // replace a retained graph's texture; geometry disposal clears the packing
+    // cache used by future graph construction.
     return JSON.stringify([count, vertices, normal !== undefined && geometry.hasAttribute('normal'), color !== undefined,
       texture ? sourceId(texture) : null]);
   }
@@ -1223,11 +1224,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side) {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
-    return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), side,
+    return JSON.stringify([version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       object.isMesh === true && material.wireframe === true ? [object.geometry.index?.array.length ?? null,
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
@@ -1322,15 +1323,25 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // layout/graph check, so invalidation still builds under the current side.
     const side = context.sidePass === true && previousState?.sidePass === true &&
       previousState.materialVersion === material.version ? previousState.materialSide : preparedMaterial.side;
-    const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side)
+    // A version-only material invalidation keeps the source RenderObject when
+    // its shader key is unchanged. Rebuilding a morph graph would repack target
+    // arrays after geometry disposal, even though that source graph retains its
+    // previous texture. All graph, layout and sampler checks still participate.
+    const version = morphSignature !== null && previousState ? previousState.materialVersion : preparedMaterial.version;
+    const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side || version !== preparedMaterial.version)
       ? keyOf(preparedMaterial, object, context, lights, environment,
-        instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side) : key;
+        instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, version) : key;
     if (previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
         attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) {
       updateThreeNodeClipping(previous.builder.clippingContext, context);
+      if (version !== preparedMaterial.version) {
+        previous.key = keyOf(preparedMaterial, object, context, lights, environment,
+          instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side);
+        previousState.materialVersion = material.version;
+      }
       return previous.descriptor;
     }
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
@@ -1635,7 +1646,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const next = byMaterial ?? new Map(), nextPasses = passes ?? new Map();
     nextPasses.set(passId, entry); next.set(material, nextPasses); cache.set(object, next);
     entries.add(entry);
-    material.addEventListener('dispose', entry.onDispose); object.geometry.addEventListener('dispose', entry.onDispose);
+    material.addEventListener('dispose', entry.onDispose);
+    // Source geometry disposal clears attribute residency without retiring a
+    // RenderObject's compiled morph graph or its captured target texture.
+    // Attribute/wireframe owners retain their independent disposal listeners.
+    if (morphSignature === null) object.geometry.addEventListener('dispose', entry.onDispose);
     return descriptor;
   }
   function stateOf(descriptor) {

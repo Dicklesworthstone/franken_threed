@@ -252,6 +252,15 @@ to the same allocation become visible before submission, while disposal and
 replacement cannot retarget an earlier accepted binding. Empty-capacity meshes
 and attributes already owned by a legacy fixed residency retain their prior route.
 
+Ordinary source `SkinnedMesh` objects with standard Float32 palettes and Mesh
+position morphs select the native deformation owner from their first draw.
+Their raw geometry upload history survives later node companions and callbacks.
+The pinned observer forces FULL refresh for skins and selects FULL/SHARED for
+morph weights; shared skeletons update once per source frame, explicit application
+palette updates remain visible, and queued draws retain independent palettes and
+influences. Normal-only morph skins, nonstandard legacy palettes and genuinely
+uncaptured legacy fixed histories keep their prior boundaries.
+
 Ordinary rigid fixed scenes can enter this mixed route with earlier renders
 still queued. A successfully promoted root keeps its capture owner after its
 authored nodes are removed. Failed admission does not change that ownership or
@@ -273,6 +282,14 @@ exactly (688,128 RGBA bytes) on Chromium 153 SwiftShader with no GPU errors.
 Fifty-two focused snapshot/history/instance tests pass, including shared uploads
 in both draw orders and disposal boundaries. These checks establish software GPU
 correctness, with no hardware performance claim.
+
+Two further ordinary morph and combined skin/morph browser cases match pinned
+r186 exactly at fourteen checkpoints (688,128 RGBA bytes) on Chromium 153
+SwiftShader, with zero GPU/browser errors. They cover queued influence/palette
+changes, late callbacks and companions, stale and partial raw uploads, geometry
+disposal, version-only invalidation and an actual shader-graph change. Source
+morph graphs retain their packed target image across geometry disposal; new
+material/graph construction reads the then-current target data.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
@@ -1153,9 +1170,12 @@ set `frustumCulled = false`; the renderer does not infer GPU bounds or change th
 source setting.
 
 Captured graph descriptors, raster state, source list properties, draw ranges and
-uniform bytes survive later source edits. Material/geometry disposal invalidates
-the compiler cache, and subsequent graph or structural changes select a new
-program. Native programs also capture ordinary CPU geometry through the existing
+uniform bytes survive later source edits. Material disposal invalidates the
+compiler cache. For morphed native graphs, geometry disposal resets raw attribute
+residency and the cache used by future morph construction while existing compiled
+graphs retain their packed target texture. Version-only material updates retain
+that graph when its complete key is unchanged; actual graph/layout changes rebuild
+it. Native programs also capture ordinary CPU geometry through the existing
 immutable geometry owner at the source upload boundary. Shared geometry uploads
 once per logical render; unmarked edits and untouched partial ranges stay stale,
 including when a render callback is added after initial compilation. This is not
