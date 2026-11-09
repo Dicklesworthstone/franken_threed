@@ -72,9 +72,17 @@ admitted. The source rules are in the
   oriented `depth32float` sampling image. The bound image owner supplies the
   flag, so a later public texture edit cannot change an accepted image's domain.
 - Signed and unsigned integer 2D, 2D-array and 3D samplers implement nearest
-  `texture`, `textureLod` and `textureGrad` through typed `textureLoad`, preserving
-  all 32 bits. Helpers apply clamp/repeat/mirror addressing, rounded array layers,
-  and explicit or derivative-based mip selection. Sampler arrays and function
+  `texture`, `textureLod` and `textureGrad`, including their constant-offset
+  variants, through typed `textureLoad`, preserving all 32 bits. Integer 2D/3D
+  samplers also support all six projected forms with implicit LOD, explicit LOD
+  or gradients, with or without offsets. Projective coordinates divide once;
+  explicit gradients are already projected. Vertex implicit sampling uses level
+  zero. Offsets apply in the selected mip's texel coordinates before wrapping,
+  without changing an array layer. Helpers apply clamp/repeat/mirror addressing,
+  rounded array layers, and explicit or derivative-based mip selection, following
+  [ESSL 3.00 section 8.8](https://registry.khronos.org/OpenGL/specs/es/3.0/GLSL_ES_Specification_3.00.pdf)
+  and [OpenGL ES 3.0 section 3.8.10](https://registry.khronos.org/OpenGL/specs/es/3.0/es_spec_3.0.pdf).
+  Sampler arrays and function
   parameters carry independent controls in 16-byte uniform slots at each
   texture's `samplingOffset`. The admitted binding's frozen sampler descriptor
   supplies those controls; retained direct draws keep their accepted bytes.
@@ -150,9 +158,7 @@ admitted. The source rules are in the
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
 integer cube sampling and integer sampling bias, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
-conversions).
-Integer projected/filtered-offset sampling remains outside the admitted integer
-slice; integer `texelFetchOffset` is supported. Shadow sampling with bias,
+conversions). Shadow sampling with bias,
 explicit LOD or explicit gradients remains unsupported; those forms are
 not approximated with implicit sampling or an arbitrary level.
 
@@ -205,14 +211,27 @@ zero GPU/browser errors. These are software GPU correctness checks.
   The candidate uses `general-webgpu`; Chromium 153 SwiftShader reports no
   browser or GPU errors. These are software GPU correctness checks, not a
   hardware performance result or complete ESSL closure.
+- `essl_integer_projected_sampling.test.mjs`: six focused tests cover valid
+  signed/unsigned overloads, typed payloads, projection and gradient dimensions,
+  constant offsets, source argument order, sampler arrays/helpers and vertex LOD.
+  The new suite and three adjacent compiler/sampling suites pass all 53 tests.
+  `program_integer_projected_sampling.mjs` compares 118 pinned WebGL/WebGPU
+  checkpoints exactly (241,664 RGBA bytes), including 2D/3D/array offsets,
+  projected `vec3`/`vec4` coordinates, independent sampler controls, side effects,
+  mip selection and vertex sampling. Exact reflected texel boundaries and large
+  finite positive/negative coordinates retain the observed source addressing,
+  including floating-point loss of a small offset at large coordinates.
+  Chromium 153.0.8010.0 / SwiftShader reports `general-webgpu` and zero GPU/browser
+  errors. These are software GPU correctness checks, not complete ESSL closure.
 - `three_program_integer_sampling.test.mjs`: six focused lowering, layout,
   signature and bound-sampler metadata regressions. The existing 32 compiler
   and 25 texture-owner tests also pass. `program_integer_sampling.mjs` compares
   all 50 source/candidate checkpoints exactly (307,200 RGBA bytes), including
   high-bit integer values, wraps, mip boundaries, explicit gradients, arrays,
   volume slices and vertex sampling. Both sides use pinned r186; the candidate
-  reports `general-webgpu` with native draws. Chromium 151.0.7922.34 SwiftShader
-  reported no GPU/browser errors. This is software GPU correctness evidence,
+  reports `general-webgpu` with native draws. Re-running this suite alongside
+  the projected/offset extension on Chromium 153.0.8010.0 / SwiftShader again
+  matched all 50 checkpoints with no GPU/browser errors. This is software GPU correctness evidence,
   not a physical-device performance result or complete ESSL closure.
 - `essl_wgsl.test.mjs`: lowering and layout regressions. Switch tests execute
   emitted scalar helper control flow through a small test-only JS syntax adapter

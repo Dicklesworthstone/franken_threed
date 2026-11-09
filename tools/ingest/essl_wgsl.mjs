@@ -1648,10 +1648,9 @@ class Unit {
       return this.projectedShadowTextureCall(name, s, rest, ctx, line, expressions.slice(1));
     if (st.shadow && ['textureLod', 'textureLodOffset', 'textureGrad', 'textureGradOffset'].includes(name))
       essError('Shadow sampling with explicit LOD or gradients is not supported', line);
-    if (isInt && ['texture', 'textureLod', 'textureGrad'].includes(name))
-      return this.integerTextureCall(name, s, rest, ctx, line);
+    if (isInt && TEXTURE_SAMPLE_FORMS.has(name))
+      return this.integerTextureCall(name, s, rest, ctx, line, expressions.slice(1));
     if (!st.shadow && TEXTURE_SAMPLE_FORMS.has(name)) {
-      if (isInt) essError('Integer projected/offset sampling is not supported; use texelFetchOffset for integer texel offsets', line);
       return this.floatTextureCall(name, s, rest, ctx, line, expressions.slice(1));
     }
     if (name === 'texelFetch' || name === 'texelFetchOffset') {
@@ -1796,39 +1795,68 @@ class Unit {
    * builtins accept float textures, so carry the source wrap/mip controls in
    * the draw's uniform snapshot and load the selected integer texel directly.
    * OpenGL ES 3.0 sections 3.8.10/3.8.13 define these selection rules. */
-  integerTextureCall(name, sampler, args, ctx, line) {
+  integerTextureCall(name, sampler, args, ctx, line, expressions) {
     const {type, tex, sampling} = sampler, dim = type.dim;
+    if (this.version !== 300) essError('Integer texture sampling requires ESSL 3.00', line);
     this.shared.integerSampling = true;
     if (dim === 'cube') essError('Integer cube sampling needs a layered cube view', line);
-    const count = {texture: 1, textureLod: 2, textureGrad: 3}[name];
+    const projected = name.includes('Proj'), offset = name.endsWith('Offset');
+    const operation = name.includes('Grad') ? 'grad' : name.includes('Lod') ? 'lod' : 'implicit';
+    const count = (operation === 'grad' ? 3 : operation === 'lod' ? 2 : 1) + Number(offset);
     if (args.length !== count) essError(`${name} integer sampling expects ${count + 1} arguments; bias is not admitted`, line);
+    if (projected && dim !== '2d' && dim !== '3d') essError(`${name} needs a 2D or 3D sampler`, line);
     const dimensions = dim === '3d' ? 3 : 2, coordinates = dim === '2d' ? 2 : 3;
-    if (!same(args[0].t, V('float', coordinates))) essError(`${name} needs vec${coordinates} coordinates`, line);
-    if (name === 'textureLod' && !same(args[1].t, FLOAT)) essError('textureLod needs a float LOD', line);
-    if (name === 'textureGrad' && args.slice(1).some(a => !same(a.t, V('float', dimensions))))
-      essError(`textureGrad needs vec${dimensions} derivatives`, line);
-    const p = this.capture(args[0], ctx), uv = dim === '2d-array' ? `${p.c}.xy` : p.c;
-    let lod = name === 'textureLod' ? args[1].c : '0.0';
-    if (name === 'textureGrad' || name === 'texture' && this.stage === 'fragment') {
+    const sizes = projected ? dim === '2d' ? [3, 4] : [4] : [coordinates];
+    if (!sizes.some(n => same(args[0].t, V('float', n)))) essError(`${name} needs ${sizes.map(n => `vec${n}`).join(' or ')} coordinates`, line);
+    if (operation === 'lod' && !same(args[1].t, FLOAT)) essError(`${name} needs a float LOD`, line);
+    if (operation === 'grad' && args.slice(1, 3).some(a => !same(a.t, V('float', dimensions))))
+      essError(`${name} needs vec${dimensions} derivatives`, line);
+    const delta = offset ? this.textureOffset(expressions[count - 1], args[count - 1], dimensions, ctx, line) : null;
+    // Integer LOD lowering emits statements for gradients. Copy the coordinate
+    // first even when it is a plain variable that a gradient-producing call can
+    // change, then compute a projected coordinate once for derivatives and load.
+    let point = this.tmp(); ctx.pre.push(`let ${point} = ${args[0].c};`);
+    if (projected) {
+      const p = this.tmp();
+      ctx.pre.push(`let ${p} = ${point}.${'xyz'.slice(0, dimensions)} / ${point}.${args[0].t.n === 4 ? 'w' : 'z'};`);
+      point = p;
+    }
+    const uv = dim === '2d-array' ? `${point}.xy` : point;
+    let lod = operation === 'lod' ? args[1].c : '0.0';
+    if (operation === 'grad' || operation === 'implicit' && this.stage === 'fragment') {
       const size = this.tmp(), dx = this.tmp(), dy = this.tmp();
       ctx.pre.push(`let ${size} = vec${dimensions}<f32>(textureDimensions(${tex}, 0));`,
-        `let ${dx} = ${name === 'textureGrad' ? args[1].c : `dpdx(${uv})`} * ${size};`,
-        `let ${dy} = ${name === 'textureGrad' ? args[2].c : `dpdy(${uv})`} * ${size};`);
+        `let ${dx} = ${operation === 'grad' ? args[1].c : `dpdx(${uv})`} * ${size};`,
+        `let ${dy} = ${operation === 'grad' ? args[2].c : `dpdy(${uv})`} * ${size};`);
       lod = `(0.5 * log2(max(max(dot(${dx}, ${dx}), dot(${dy}, ${dy})), 1e-30)))`;
     }
-    const wrap = 'f3d_integer_nearest_index';
-    if (!this.helpers.has(wrap)) this.helpers.set(wrap, `fn ${wrap}(p: f32, size: u32, mode: u32) -> i32 {
+    const wrap = offset ? 'f3d_integer_nearest_offset_index' : 'f3d_integer_nearest_index';
+    if (offset && !this.helpers.has(wrap)) this.helpers.set(wrap, `fn ${wrap}(p: f32, size: u32, mode: u32, delta: i32) -> i32 {
+  // Offset the selected mip's texel coordinate before wrapping. As in the
+  // ordinary nearest helper, mirror the continuous coordinate before flooring
+  // to retain the pinned source's choice at exact reflected texel boundaries.
+  let coordinate = p * f32(size) + f32(delta);
+  let extent = f32(size);
+  var wrapped = clamp(coordinate, 0.0, extent);
+  if (mode == 1u) { wrapped = coordinate - extent * floor(coordinate / extent); }
+  else if (mode == 2u) {
+    let period = 2.0 * extent;
+    wrapped = extent - abs(coordinate - period * floor(coordinate / period) - extent);
+  }
+  return min(i32(floor(wrapped)), i32(size) - 1);
+}`);
+    else if (!this.helpers.has(wrap)) this.helpers.set(wrap, `fn ${wrap}(p: f32, size: u32, mode: u32) -> i32 {
   var uv = clamp(p, 0.0, 1.0);
   if (mode == 1u) { uv = fract(p); }
   else if (mode == 2u) { uv = 1.0 - abs(2.0 * fract(p * 0.5) - 1.0); }
   return min(i32(floor(uv * f32(size))), i32(size) - 1);
 }`);
-    const helper = `f3d_integer_sample_${dim.replace('-', '_')}_${type.s}`;
+    const helper = `f3d_integer_sample_${dim.replace('-', '_')}_${type.s}${offset ? '_offset' : ''}`;
     if (!this.helpers.has(helper)) {
-      const components = 'xyz'.slice(0, dimensions).split('').map(c => `${wrap}(p.${c}, size.${c}, control.${c})`);
+      const components = 'xyz'.slice(0, dimensions).split('').map(c => `${wrap}(p.${c}, size.${c}, control.${c}${offset ? `, delta.${c}` : ''})`);
       const layer = dim === '2d-array'
         ? ', i32(clamp(floor(p.z + 0.5), 0.0, f32(textureNumLayers(image) - 1u)))' : '';
-      this.helpers.set(helper, `fn ${helper}(image: ${textureType(type)}, control: vec4<u32>, p: vec${coordinates}<f32>, lod: f32) -> vec4<${WGSL_SCALAR[type.s]}> {
+      this.helpers.set(helper, `fn ${helper}(image: ${textureType(type)}, control: vec4<u32>, p: vec${coordinates}<f32>, lod: f32${offset ? `, delta: vec${dimensions}<i32>` : ''}) -> vec4<${WGSL_SCALAR[type.s]}> {
   // ES 3.0 equation 3.23, footnote 4 permits floor for minification;
   // the pinned ANGLE path uses it. The base-level half tie stays at zero.
   let level = select(0, i32(clamp(floor(lod + 0.5), 0.0, f32(textureNumLevels(image) - 1u))), control.w != 0u && lod > 0.5);
@@ -1837,7 +1865,7 @@ class Unit {
   return textureLoad(image, point${layer}, level);
 }`);
     }
-    return {c: `${helper}(${tex}, ${sampling}, ${p.c}, ${lod})`, t: V(type.s, 4)};
+    return {c: `${helper}(${tex}, ${sampling}, ${point}, ${lod}${delta ? `, ${delta}` : ''})`, t: V(type.s, 4)};
   }
   /** ESSL geometric genType includes float; WGSL's direction operators only
    * accept vectors. Scalar helpers take copied values so repeated terms do not

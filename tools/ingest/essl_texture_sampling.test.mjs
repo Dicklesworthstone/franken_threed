@@ -90,8 +90,8 @@ test('sampling signatures reject invalid coordinates, gradients, offsets, dimens
   assert.throws(() => compile('color=textureOffset(image,vec3(.2),ivec3(1));', 'uniform samplerCube image;'), /cube samplers/);
   assert.throws(() => compile('color=textureProj(image,vec4(.2));', 'uniform highp sampler2DArray image;'), /2D or 3D sampler/);
   assert.throws(() => compile('color=texelFetchOffset(image,ivec2(1),0,ivec2(1));', 'uniform samplerCube image;'), /non-shadow/);
-  assert.throws(() => compile('color=vec4(textureGradOffset(image,vec2(.2),vec2(.1),vec2(.1),ivec2(1)));',
-    'uniform highp isampler2D image;'), /Integer projected\/offset/);
+  assert.match(compile('color=vec4(textureGradOffset(image,vec2(.2),vec2(.1),vec2(.1),ivec2(1)));',
+    'uniform highp isampler2D image;').fragment, /f3d_integer_sample_2d_int_offset\(/);
   for (const expression of ['textureOffset(image,vec2(.2),ivec2(1),1.)', 'textureProj(image,vec3(.2),1.)']) {
     const source = vertex.replace('void main()', 'uniform sampler2D image;void main()').replace('vec4(position,1.0)', expression);
     assert.throws(() => compileEsslProgram(source, fragment('color=vec4(1.);', '')), /only valid in fragment/);
