@@ -227,11 +227,16 @@ function textureInspector(T,{
       fail('SOURCE','Expected a data texture, VideoTexture or CubeTexture');
     const video=t.isVideoTexture===true,cube=t.isCubeTexture===true;
     const volume=t.isData3DTexture===true,array=t.isDataArrayTexture===true,layered=volume||array;
+    // Native Textures.updateTexture allocates a one-texel default before the
+    // first requested upload, and full empty storage when dataReady is false.
+    // These are real zero-initialized GPU allocations, not captured CPU pixels.
+    const nativeAllocation=nativeMedia&&!video&&!cube&&!layered
+      ?t.version===0?'default':t.source?.dataReady===false?'unready':null:null;
     if(layered&&(video||cube||t.isDataTexture||volume&&array||
         typeof T[volume?'Data3DTexture':'DataArrayTexture']!=='function'||
         !(t instanceof T[volume?'Data3DTexture':'DataArrayTexture'])))
       fail('SOURCE','Expected an unambiguous source Data3DTexture or DataArrayTexture');
-    if((layered||t.isDataTexture)&&(!t.image||t.image.data==null))fail('NOT_READY','Source texture data has not loaded');
+    if(!nativeAllocation&&(layered||t.isDataTexture)&&(!t.image||t.image.data==null))fail('NOT_READY','Source texture data has not loaded');
     const layers=layered?integer(t.image?.depth,1,volume?maxDimension3D:maxLayers,'image depth'):cube?6:1;
     const media=video&&nativeMedia?mediaSnapshots?.get(t.image):null,frame=video&&t.isVideoFrameTexture===true;
     const mediaDefault=video&&nativeMedia&&t.version===0;
@@ -258,7 +263,8 @@ function textureInspector(T,{
     if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
         (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
-    if(!Number.isSafeInteger(t.version)||t.version<(video||initialize?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||t.source.dataReady!==true)
+    if(!Number.isSafeInteger(t.version)||t.version<(video||initialize||nativeAllocation?0:1)||!Number.isSafeInteger(t.source?.version)||t.source.version<0||
+        !nativeAllocation&&t.source.dataReady!==true)
       fail('NOT_READY','Set needsUpdate after providing ready source data');
     if(t.onUpdate!==null&&typeof t.onUpdate!=='function')fail('SOURCE','Invalid upload callback');
     const filter=filters.get(t.minFilter),mag=filters.get(t.magFilter);
@@ -274,7 +280,7 @@ function textureInspector(T,{
       fail('SAMPLER','Anisotropic nearest minification requires an explicit sampler profile');
     const maxAnisotropy=mag[0]==='linear'&&t.minFilter===T.LinearMipmapLinearFilter?anisotropy:1;
     const data=layered||(cube?t.image[0]?.isDataTexture===true:t.isDataTexture===true);
-    if((integral||bpc!==1)&&(!data||video))fail('FORMAT','Integer, half-float and float storage require data textures');
+    if(!nativeAllocation&&(integral||bpc!==1)&&(!data||video))fail('FORMAT','Integer, half-float and float storage require data textures');
     if(integral&&(mag[0]!=='nearest'||filter[0]!=='nearest'||filter[1]!=='nearest'||anisotropy!==1))
       fail('SAMPLER','Integer textures require nearest sampling without anisotropy');
     if(integral&&t.generateMipmaps)fail('MIPS','Integer textures require authored mip levels, not filtered mip generation');
@@ -303,12 +309,15 @@ function textureInspector(T,{
       }
       return image;
     };
-    const base=cube?t.image.map(unwrap):[unwrap(t.image)];
-    const {width,height}=mediaDefault?{width:1,height:1}:dimensions(base[0],data,video,volume),full=1+Math.floor(Math.log2(Math.max(width,height,volume?layers:1)));
+    const base=nativeAllocation==='default'?[{width:1,height:1}]:cube?t.image.map(unwrap):[unwrap(t.image)];
+    if(nativeAllocation==='unready'&&(!base[0]||base[0].complete===false))fail('NOT_READY','Source image is unavailable or incomplete');
+    const {width,height}=mediaDefault||nativeAllocation==='default'?{width:1,height:1}:nativeAllocation==='unready'
+      ?{width:integer(base[0].width||1,1,maxDimension,'image width'),height:integer(base[0].height||1,1,maxDimension,'image height')}
+      :dimensions(base[0],data,video,volume),full=1+Math.floor(Math.log2(Math.max(width,height,volume?layers:1)));
     if(cube&&width!==height)fail('SOURCE','Cube faces must be square');
     if(width*height*layers>maxPixels)fail('LIMIT','All texture faces/layers/voxels together exceed the pixel budget');
     if(!Array.isArray(t.mipmaps))fail('SOURCE','Expected source mipmaps');
-    const manual=t.mipmaps.length>0;
+    const manual=nativeAllocation!=='default'&&t.mipmaps.length>0;
     // r186's uncompressed array/3D branches upload only image at level zero.
     // Do not reinterpret their ignored mipmaps array as an authored pyramid.
     if(layered&&manual)fail('MIPS','Authored array and 3D mipmaps require an explicit source profile');
@@ -319,10 +328,11 @@ function textureInspector(T,{
     if(manual&&cube&&t.generateMipmaps)fail('MIPS','Authored cube mips require generation disabled');
     // r186 uncompressed cubes list ADDITIONAL mip levels; ordinary DataTextures
     // include the base level in mipmaps. Do not drop or duplicate either base.
-    const levels=manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
+    const levels=nativeAllocation==='default'?1:manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
     if(levels>full||(filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
     const uploads=[];
-    if(cube){
+    if(nativeAllocation){ /* Source readiness controls allocation, not image validation or upload. */ }
+    else if(cube){
       // Native WebGPU flips the +Y/-Y faces as well as each face's rows.
       const faceLayer=layer=>nativeCube&&t.flipY&&[2,3].includes(layer)?5-layer:layer;
       for(let layer=0;layer<6;layer++)uploads.push({image:base[layer],level:0,layer:faceLayer(layer)});
@@ -335,7 +345,7 @@ function textureInspector(T,{
     let bytes=0;
     for(let level=0;level<levels;level++)bytes+=Math.max(1,width>>level)*Math.max(1,height>>level)*channels*bpc*(volume?Math.max(1,layers>>level):layers);
     if(bytes>maxTextureBytes)fail('LIMIT','Texture exceeds byte budget');
-    if(data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
+    if(!nativeAllocation&&data&&t.premultiplyAlpha)fail('FORMAT','Premultiplied byte data requires an explicit upload profile');
     for(const {image,level} of uploads){
       if(!data){
         const bitmap=instance(image,'ImageBitmap');
@@ -364,7 +374,7 @@ function textureInspector(T,{
     }
     const images=uploads.map(entry=>entry.image);
     if(!Array.isArray(t.updateRanges))fail('RANGE','Expected source update ranges');
-    if(t.updateRanges.length&&!(nativeMedia&&data&&!layered&&!cube)){
+    if(!nativeAllocation&&t.updateRanges.length&&!(nativeMedia&&data&&!layered&&!cube)){
       if(integral||cube||layered||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
       for(const r of t.updateRanges){
         integer(r.start,0,width*height*4,'range start');integer(r.count,0,width*height*4-r.start,'range count');
@@ -384,12 +394,13 @@ function textureInspector(T,{
         fail('RANGE','Partial layer uploads require tightly packed source rows');
     }
     const prefix=channels===4?'rgba':channels===2?'rg':'r';
-    const format=integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float',viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':format;
+    const baseFormat=integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float';
+    const viewFormat=t.colorSpace===T.SRGBColorSpace?'rgba8unorm-srgb':baseFormat,format=nativeAllocation==='default'?viewFormat:baseFormat;
     const sampler={addressModeU:wraps.get(t.wrapS),addressModeV:wraps.get(t.wrapT),magFilter:mag[0],minFilter:filter[0],
       mipmapFilter:filter[1],lodMinClamp:0,lodMaxClamp:filter[2]?levels-1:0,maxAnisotropy,...(layered?{addressModeW:wraps.get(t.wrapR)}:{})};
     const viewDimension=volume?'3d':array?'2d-array':cube?'cube':'2d';
-    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
-    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,
+    const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(nativeAllocation==='default'?['native-default']:layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
+    return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,nativeAllocation,
       native2D:nativeMedia&&!layered&&!cube,native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
       integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
@@ -476,7 +487,7 @@ export function createGpuThreeTextures(device,{
     for(const {t,d} of list){
       if(d.imagesPending)fail('NOT_READY','Captured source image is still preparing');
       if(d.video&&!d.nativeMedia&&!d.videoReady&&!match(t,d))fail('NOT_READY','A new video residency requires a current decoded frame');
-      if(!d.data&&typeof device.queue.copyExternalImageToTexture!=='function')
+      if(!d.data&&!d.nativeAllocation&&typeof device.queue.copyExternalImageToTexture!=='function')
         fail('DEVICE','External source uploads require GPUQueue.copyExternalImageToTexture');
       if(!records.has(t))addedCount++;
       if(!sources.get(d.source)?.has(d.key)){
@@ -535,7 +546,8 @@ export function createGpuThreeTextures(device,{
     if(r.version===t.version)return;
     const a=r.resource;
     if(a.sourceVersion!==t.source.version){
-      if(d.data){
+      if(d.nativeAllocation==='unready'){ /* Keep allocated or GPU-seeded pixels until a ready requested version. */ }
+      else if(d.data){
         if(d.blockUploads){
           for(const u of d.uploads){
             const data=new Uint8Array(u.image.data.buffer,u.image.data.byteOffset,u.image.data.byteLength);
@@ -586,7 +598,7 @@ export function createGpuThreeTextures(device,{
             ...(d.cube?{origin:[0,0,layer]}:{})},
           [Math.max(1,d.width>>level),Math.max(1,d.height>>level)]));stats.externalCopies++;
       }
-      downsample(a,d);stats.uploads++;a.sourceVersion=t.source.version;
+      downsample(a,d);if(!d.nativeAllocation)stats.uploads++;a.sourceVersion=t.source.version;
       // WebGLTextures.uploadTexture: authored 2D mips turn generation off.
       if(d.manual&&!d.cube&&!d.native2D)t.generateMipmaps=false;
       // Upstream acknowledges the source BEFORE onUpdate, and the texture AFTER.

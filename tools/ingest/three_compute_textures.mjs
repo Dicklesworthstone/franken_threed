@@ -80,6 +80,22 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       return sourcePool().inspect(destination.texture, {initialize});
     }
     let input = t;
+    const accepted = current.get(t);
+    // The source checks Texture.version before image readiness. Loading an
+    // image or toggling dataReady without needsUpdate cannot replace either a
+    // default or an explicitly acknowledged no-data allocation.
+    if (accepted?.alive && accepted.nativeAllocation && accepted.version === t.version)
+      return sourcePool().inspect(accepted.texture, {initialize: true});
+    if (accepted?.alive && accepted.nativeAllocation !== 'default' &&
+        t.source?.dataReady === false && t.version > 0 && !t.isVideoTexture &&
+        !t.isCubeTexture && !t.isDataArrayTexture && !t.isData3DTexture && !t.isCompressedTexture) {
+      // A no-data update keeps its existing physical extent. Sampler changes
+      // still belong to the new binding; the CPU image cannot resize storage.
+      input = privateDescriptor(t);
+      input.source = Object.assign(Object.create(Object.getPrototypeOf(t.source)), t.source,
+        {data: {width: accepted.width, height: accepted.height, data: null}});
+      input.mipmaps = accepted.texture.mipmaps;
+    }
     const previous = t.isVideoTexture === true ? current.get(t) : null;
     if (previous?.alive && previous.source === t.source && (previous.version === t.version ||
         instance(t.image, 'VideoFrame') && !(t.image.displayWidth > 0 && t.image.displayHeight > 0) ||
@@ -93,7 +109,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const shape = sourcePool().inspect(input, {initialize});
     if (t.isVideoTexture === true && shape.nativeMedia !== true) fail('SOURCE', 'Queued media requires the native WebGPU upload profile');
     if (shape.nativeMedia && input !== t) shape.previousMedia = previous.pixels;
-    if (!shape.data && !shape.nativeMedia && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(image => decodedImage(image) || mutableImage(image))))
+    if (!shape.data && !shape.nativeMedia && !shape.nativeAllocation && (!Array.isArray(shape.images) || !shape.images.length || !shape.images.every(image => decodedImage(image) || mutableImage(image))))
       fail('SOURCE', 'Compute image inputs require ImageData, ImageBitmap, HTML images or canvases');
     updatePlan(t, shape);
     return shape;
@@ -105,7 +121,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function updatePlan(texture, shape) {
     // Pinned WebGPUTextureUtils uploads an entire DataTexture image on every
     // requested version. Its row ranges are a WebGL upload contract only.
-    if (shape.native2DData) return null;
+    if (shape.native2DData || shape.nativeAllocation) return null;
     const ranges = (texture.updateRanges ?? []).map(range => ({...range}));
     const layers = [...texture.layerUpdates ?? []];
     if (!ranges.length && !layers.length) return null;
@@ -289,7 +305,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // A copied texture owns its uploads independently of Source aliases. After
     // disposal, the same public version must capture current CPU pixels instead
     // of reviving an alias's older payload. Warm captures reuse their record.
-    const key = privateDestination ? {} : JSON.stringify(shape.nativeMedia
+    const key = privateDestination ? {} : JSON.stringify(shape.nativeMedia || shape.nativeAllocation
       ? [sourceVersion, shape.key, original.id, version] : [sourceVersion, shape.key]);
     const shared = sources.get(source)?.get(key);
     // Private submitted reads retain their pixels, not a future source upload
@@ -465,8 +481,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       }
       try {
-        const image = shape.nativeMedia ? copyMedia() : copyImage(original.image), mipmaps = Array.isArray(original.mipmaps)
-          ? original.mipmaps.map(copyImage) : original.mipmaps;
+        const image = shape.nativeAllocation ? {width: shape.width, height: shape.height, data: null}
+          : shape.nativeMedia ? copyMedia() : copyImage(original.image);
+        const mipmaps = shape.nativeAllocation ? shape.manual ? Array.from({length: shape.levels}, (_, level) =>
+          ({width: Math.max(1, shape.width >> level), height: Math.max(1, shape.height >> level), data: null})) : []
+          : Array.isArray(original.mipmaps) ? original.mipmaps.map(copyImage) : original.mipmaps;
         const ready = pendingImages.length ? Promise.all(pendingImages).then(() => {}) : null;
         ready?.catch(() => {});
         pixels = {key, descriptorKey: shape.key, source: Object.assign(Object.create(Object.getPrototypeOf(source)), source, {data: image}), mipmaps, bytes, refs: 0,
@@ -502,6 +521,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     };
     texture.onUpdate = () => acknowledge(original.onUpdate);
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
+      nativeAllocation: shape.nativeAllocation, width: shape.width, height: shape.height,
       partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
       partialLayers: updates && layerValues.length ? layerValues : null,
       pixels, acknowledge, refs: 0, alive: true, binding: null};
@@ -537,12 +557,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const shape = describe(binding, {copyDestination}), original = binding.texture;
     let record = current.get(original);
     const privateDestination = copyDestination || copyDestinations.has(original);
-    const unchanged = record && record.key === shape.key && (privateDestination || record.source === original.source) &&
+    const unchanged = record && record.key === shape.key && (privateDestination || record.source === original.source || record.nativeAllocation) &&
       record.version === original.version;
     // An unused alias can increment Source.version without requesting an upload
     // through this texture. Only an already captured alias payload changes the
     // shared residency; a later uncaptured version must not hide that payload.
-    const sharedPixels = unchanged && !shape.nativeMedia && !privateDestination ? histories.get(original.source)?.get(shape.key) : null;
+    const sharedPixels = unchanged && !shape.nativeMedia && !shape.nativeAllocation && !privateDestination ? histories.get(original.source)?.get(shape.key) : null;
     if (!unchanged || sharedPixels && sharedPixels !== record.pixels) {
       if (records.size >= maxTextures) fail('BUDGET', 'Captured compute texture versions exceed maxTextures');
       // A sampler change must not reread an advancing video or wait for an
@@ -553,6 +573,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       try { watch(original); }
       catch (error) { if (pixels.refs === 0) pixels.disposeImages?.(); throw error; }
       retainPixels(replacement.source, pixels);
+      if (shape.nativeAllocation === 'unready' && record?.alive && record.nativeAllocation !== 'default') {
+        // The source retains previous GPU content when dataReady is false.
+        // Reuse the existing immutable-version seed operation so a queued old
+        // draw and this acknowledged no-data version cannot overwrite each other.
+        replacement.copyBase = record; record.refs++;
+      }
       if (privateDestination) {
         replacement.privateDestination = true;
         replacement.texture.source = {...replacement.texture.source};
@@ -566,7 +592,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         }
       }
       records.add(replacement);
-      if (!replacement.nativeMedia && !privateDestination) setHistory(replacement.source, replacement.key, pixels);
+      if (!replacement.nativeMedia && !replacement.nativeAllocation && !privateDestination) setHistory(replacement.source, replacement.key, pixels);
       current.set(original, replacement);
       if (record && record.refs === 0 && !captureState?.records.has(record)) { retire(record); syncPool(); }
       record = replacement;
@@ -657,6 +683,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     validate(snapshot);
     if (copiesOnly && !copyDestinations.has(snapshot.record.original)) return null;
     const previous = snapshot.record, accepted = previous.nativeMedia ? current.get(previous.original) : null;
+    if (previous.nativeAllocation) return null;
     if (copyDestinations.has(previous.original)) {
       const resident = current.get(previous.original);
       if (!resident || resident === previous) return null;
@@ -896,7 +923,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         histories.clear();
         for (const [source, group] of before.histories) for (const [key, pixels] of group)
           if ([...records].some(record => !record.privateDestination && record.source === source && record.key === key)) setHistory(source, key, pixels);
-        for (const record of uploaded) if (!record.nativeMedia && !record.privateDestination) setHistory(record.source, record.key, record.pixels);
+        for (const record of uploaded) if (!record.nativeMedia && !record.nativeAllocation && !record.privateDestination) setHistory(record.source, record.key, record.pixels);
         throw error;
       } finally {
         captureState = null;

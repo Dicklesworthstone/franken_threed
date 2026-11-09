@@ -1872,12 +1872,33 @@ matches all seven checkpoints and 344,064 RGBA bytes exactly on Chromium
 153.0.8010.0, with native draws and zero browser/GPU errors. This is software
 correctness evidence, not a hardware performance measurement.
 
-Ordinary sampled version-zero defaults and `source.dataReady === false` remain
-outside the shared owner's admitted input profile. A first mutable HTML/canvas
-capture that needs asynchronous bitmap preparation is rejected synchronously and
-rolled back, including retirement of its eventual private bitmap. The async
-alias does not widen that profile or defer `onUpdate`. These remain
-source-supported compatibility gaps, not complete texture-source coverage.
+Native uncompressed 2D textures now admit their source loading states through
+that same owner. Before the first requested upload, ordinary and DataTexture
+inputs use the pinned source's one-texel, zero-initialized GPU format, including
+sRGB and the admitted signed/unsigned integer formats. No application image or
+pixel array is copied into that default. A requested version with
+`source.dataReady === false` allocates full-sized zero storage initially, or
+preserves the previously accepted GPU pixels through the existing immutable-version
+seed operation. It acknowledges the callback synchronously without uploading the
+edited CPU bytes. Merely making data ready does not upload; a subsequent requested
+version does. Disposal starts a fresh residency, and Source aliases retain their
+own loading acknowledgement.
+
+Five added source-derived cases compare actual default formats/extents and source
+callback/version behavior, pending older generations, alias/disposal histories,
+and no-data width/height fallback. The facade and adjacent texture pool suites
+pass 42/42. The existing `native_tsl_texture_loading` runner matches seven
+checkpoints and 344,064 RGBA bytes exactly on Chromium 153.0.8010.0, with four
+native draws and zero browser/GPU errors. This is software correctness evidence,
+not hardware-performance evidence.
+
+Cube, array, volume and compressed loading defaults require separate source
+profiles. Marked incomplete HTML images, changes to an already allocated storage
+format/mip layout, and source inputs outside the existing format/sampler admission
+remain compatibility boundaries. Initial mutable HTML/canvas captures needing
+asynchronous bitmap preparation still reject and roll back in synchronous
+`initTexture()`, including retirement of their eventual private bitmap. The
+async alias retains that synchronous upload contract.
 
 ## Native compressed texture inputs
 

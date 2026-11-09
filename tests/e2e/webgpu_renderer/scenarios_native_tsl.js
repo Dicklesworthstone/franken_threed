@@ -1118,6 +1118,48 @@ export const nativeTSLScenarios = {
     };
     return result;
   },
+  native_tsl_texture_loading(T, renderer) {
+    const N = T.TSL, initial = new T.Texture();
+    initial.minFilter = initial.magFilter = T.NearestFilter; initial.generateMipmaps = false;
+    const staged = new T.DataTexture(new Uint8Array(64).fill(47), 4, 4);
+    staged.needsUpdate = true; staged.source.dataReady = false;
+    const retained = new T.DataTexture(new Uint8Array(64).fill(83), 4, 4); retained.needsUpdate = true;
+    const integer = new T.DataTexture(null, 8, 8, T.RedIntegerFormat, T.IntType);
+    const inputs = [initial, staged, retained, integer], callbacks = inputs.map(() => 0);
+    for (const [index, map] of inputs.entries()) map.onUpdate = texture => {
+      if (texture !== map) throw Error('Loading callback lost texture identity'); callbacks[index]++;
+    };
+    for (const map of inputs) renderer.initTexture(map);
+    if (String(callbacks) !== '0,1,1,0') throw Error('Source loading callback boundary changed');
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [index, map] of inputs.entries()) {
+      const sample = N.textureLoad(map, N.ivec2(0)), material = new T.MeshBasicNodeMaterial();
+      material.colorNode = N.vec3(N.float(sample.r).div(index === 3 ? 16 : 1),
+        N.float(sample.a), N.float(N.textureSize(sample).x).div(16));
+      const mesh = new T.Mesh(new T.PlaneGeometry(1.65, 1.2), material);
+      mesh.position.set(index % 2 ? .95 : -.95, index < 2 ? .72 : -.72, 0); result.scene.add(mesh);
+    }
+    let frame = 0; const render = renderer.render.bind(renderer);
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 7) {
+        initial.image = new ImageData(new Uint8ClampedArray(64).fill(113), 4, 4);
+        staged.source.dataReady = true; // Readiness alone does not request an upload.
+        retained.image.data.fill(179); retained.source.dataReady = false; retained.needsUpdate = true;
+      } else if (frame === 8) {
+        initial.needsUpdate = staged.needsUpdate = true;
+        integer.image = {width: 4, height: 4, data: new Int32Array(16).fill(7)}; integer.needsUpdate = true;
+      } else if (frame === 10) retained.source.dataReady = true;
+      else if (frame === 12) retained.needsUpdate = true;
+      else if (frame === 13) {retained.dispose(); retained.source.dataReady = false;}
+      else if (frame === 20) {retained.source.dataReady = true; retained.needsUpdate = true;}
+      for (const map of inputs) renderer.initTexture(map);
+      return render(...args);
+    };
+    const dispose = renderer.dispose.bind(renderer);
+    renderer.dispose = () => {for (const map of inputs) map.dispose(); return dispose();};
+    return result;
+  },
   native_tsl_texture_preload(T, renderer) {
     const map = sampledTexture(T, 0, T.NoColorSpace);
     let callbacks = 0;

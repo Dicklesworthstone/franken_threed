@@ -5,6 +5,8 @@ import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import SourceTextures from '../../upstream/three.js/src/renderers/common/Textures.js';
+import SourceTextureUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUTextureUtils.js';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
 const deferred = () => { let resolve; const promise = new Promise(yes => {resolve = yes;}); return {promise, resolve}; };
@@ -25,19 +27,26 @@ function fixture(t) {
   device.createSampler = descriptor => ({...descriptor});
   device.queue.writeTexture = (destination, data, layout, size) => {
     const upload = {destination, bytes: new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength).slice(), layout, size};
-    destination.texture.uploads.push(upload); uploads.push(upload);
+    destination.texture.uploads.push(upload); destination.texture.pixels = upload.bytes.slice(); uploads.push(upload);
   };
   device.createRenderPipeline = descriptor => ({...descriptor, getBindGroupLayout: () => ({})});
   device.createComputePipeline = device.createRenderPipeline;
   device.createComputePipelineAsync = async descriptor => device.createComputePipeline(descriptor);
   const encode = device.createCommandEncoder;
   device.createCommandEncoder = () => {
-    const encoder = encode(), passes = [];
+    const encoder = encode(), passes = [], copies = [];
     return {...encoder, beginComputePass(descriptor) {
       const pass = {descriptor, draws: [], groups: new Map(), dispatches: []}; passes.push(pass); computes.push(pass);
       return {setPipeline(value) {pass.pipeline = value;}, setBindGroup(index, group) {pass.groups.set(index, group);},
         dispatchWorkgroups(...size) {pass.dispatches.push(size);}, end() {}};
-    }, finish() {return [...encoder.finish(), ...passes];}};
+    }, copyTextureToTexture(source, destination, size) {copies.push({source, destination, size});},
+    finish() {return [...encoder.finish(), ...passes, ...(copies.length ? [{draws: [], copies}] : [])];}};
+  };
+  const submit = device.queue.submit;
+  device.queue.submit = commands => {
+    for (const passes of commands) for (const pass of passes) for (const {source, destination} of pass.copies ?? [])
+      destination.texture.pixels = source.texture.pixels?.slice();
+    submit(commands);
   };
   let configuration;
   const canvas = {width: 16, height: 16, style: {}, getContext: () => ({configure(value) {configuration = value;},
@@ -174,12 +183,8 @@ test('native data preloads keep full two-dimensional uploads and accepted partia
   assert.equal(array.layerUpdates.size, 0, 'the acknowledged source layer request is consumed');
 });
 
-test('unready defaults and pending mutable-image captures fail synchronously without publishing upload history', async t => {
+test('pending mutable-image captures fail synchronously without publishing upload history', async t => {
   const f = fixture(t); await f.renderer.init();
-  const unready = new T.DataTexture(new Uint8Array(16), 2, 2); t.after(() => unready.dispose());
-  assert.throws(() => f.renderer.initTexture(unready), {code: 'THREE_TEXTURE_NOT_READY'});
-  unready.needsUpdate = true; unready.source.dataReady = false;
-  assert.throws(() => f.renderer.initTexture(unready), {code: 'THREE_TEXTURE_NOT_READY'});
   const gate = deferred(); let captures = 0, closed = 0;
   class Canvas {constructor() {this.width = this.height = 2;}}
   class Bitmap extends Canvas {close() {closed++;}}
@@ -197,4 +202,112 @@ test('unready defaults and pending mutable-image captures fail synchronously wit
   gate.resolve(new Bitmap()); await gate.promise; await Promise.resolve();
   assert.equal(closed, 1, 'a rejected pending capture retires its private bitmap');
   assert.equal(texture.image, image, 'the application image is retained');
+});
+
+function sourceTextureOwner(t, device) {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'GPUTextureUsage');
+  Object.defineProperty(globalThis, 'GPUTextureUsage', {configurable: true, value: {COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16}});
+  t.after(() => {if (previous) Object.defineProperty(globalThis, 'GPUTextureUsage', previous); else delete globalThis.GPUTextureUsage;});
+  const data = new WeakMap(), operations = [];
+  const backend = {device, get(texture) {let value = data.get(texture); if (!value) data.set(texture, value = {}); return value;},
+    delete: texture => data.delete(texture), utils: {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})}};
+  const gpu = new SourceTextureUtils(backend);
+  Object.assign(backend, {createDefaultTexture(texture) {gpu.createDefaultTexture(texture); operations.push('default');},
+    createTexture(texture, options) {gpu.createTexture(texture, options); operations.push('allocate');},
+    updateTexture() {operations.push('upload');}, generateMipmaps() {operations.push('mips');},
+    destroyTexture: (texture, isDefault) => gpu.destroyTexture(texture, isDefault)});
+  const owner = new SourceTextures({getRenderTarget: () => null}, backend, {createTexture() {}, destroyTexture() {}});
+  return {update: texture => owner.updateTexture(texture), view: texture => backend.get(texture).texture, operations};
+}
+
+test('native version-zero placeholders match source allocation formats without reading CPU pixels', async t => {
+  const f = fixture(t); await f.renderer.init(); const source = sourceTextureOwner(t, f.device);
+  for (const [format, type] of [[T.RGBAFormat, T.UnsignedByteType], [T.RedFormat, T.HalfFloatType],
+    [T.RGIntegerFormat, T.IntType], [T.RGBAIntegerFormat, T.UnsignedIntType]]) {
+    const input = new T.DataTexture(null, 8192, 8192, format, type), oracle = new T.DataTexture(null, 8192, 8192, format, type);
+    let callbacks = 0; input.onUpdate = () => {callbacks++;};
+    source.update(oracle); f.renderer.initTexture(input);
+    const actual = view(f.renderer, input).texture, expected = source.view(oracle);
+    assert.deepEqual([actual.width, actual.height, actual.format], [expected.width, expected.height, expected.format]);
+    assert.deepEqual([actual.width, actual.height], [1, 1]); assert.equal(callbacks, 0);
+    assert.equal(f.renderer._getSampledTextureInputs().diagnostics.snapshotBytes, 0);
+    input.image = {width: 2, height: 2, data: new Uint8Array(16).fill(93)};
+    f.renderer.initTexture(input); assert.equal(view(f.renderer, input).texture, actual);
+    input.dispose(); oracle.dispose();
+  }
+  const empty = new T.Texture(); f.renderer.initTexture(empty);
+  assert.equal(view(f.renderer, empty).texture.width, 1); empty.dispose();
+  const color = new T.Texture(), expectedColor = new T.Texture();
+  color.colorSpace = expectedColor.colorSpace = T.SRGBColorSpace;
+  source.update(expectedColor); f.renderer.initTexture(color);
+  assert.equal(view(f.renderer, color).texture.format, source.view(expectedColor).format);
+  color.dispose(); expectedColor.dispose();
+  assert.equal(f.uploads.length, 0);
+});
+
+test('native no-data allocation follows source callbacks and waits for another requested version', async t => {
+  const f = fixture(t); await f.renderer.init(); const source = sourceTextureOwner(t, f.device);
+  const input = data(t, 37), oracle = new T.DataTexture(new Uint8Array(16).fill(37), 2, 2);
+  oracle.needsUpdate = true; input.source.dataReady = oracle.source.dataReady = false;
+  const events = [], expected = []; input.onUpdate = texture => {assert.equal(texture, input); events.push('updated');};
+  oracle.onUpdate = () => expected.push('updated');
+  source.update(oracle); f.renderer.initTexture(input);
+  const allocated = view(f.renderer, input).texture;
+  assert.deepEqual([allocated.width, allocated.height, allocated.format], [source.view(oracle).width, source.view(oracle).height, source.view(oracle).format]);
+  assert.deepEqual(events, expected); assert.equal(f.uploads.length, 0);
+  input.source.dataReady = oracle.source.dataReady = true;
+  source.update(oracle); f.renderer.initTexture(input);
+  assert.equal(view(f.renderer, input).texture, allocated); assert.equal(f.uploads.length, 0); assert.deepEqual(events, expected);
+  input.needsUpdate = oracle.needsUpdate = true;
+  source.update(oracle); f.renderer.initTexture(input);
+  assert.equal(f.uploads.length, 1); assert.deepEqual([...view(f.renderer, input).texture.pixels], Array(16).fill(37));
+  assert.deepEqual(events, expected); oracle.dispose();
+});
+
+test('native no-data extents use source width/height fallback without decoded image bytes', async t => {
+  const f = fixture(t); await f.renderer.init(); const source = sourceTextureOwner(t, f.device);
+  for (const image of [{width: 0, height: 0, data: null}, {width: 3, height: 2, naturalWidth: 19, naturalHeight: 13}]) {
+    const input = new T.Texture(image), oracle = new T.Texture(image);
+    input.source.dataReady = oracle.source.dataReady = false; input.needsUpdate = oracle.needsUpdate = true;
+    source.update(oracle); f.renderer.initTexture(input);
+    const actual = view(f.renderer, input).texture, expected = source.view(oracle);
+    assert.deepEqual([actual.width, actual.height], [expected.width, expected.height]);
+    input.dispose(); oracle.dispose();
+  }
+  assert.equal(f.uploads.length, 0);
+});
+
+test('native no-data versions preserve earlier GPU pixels and queued texture generations', async t => {
+  const f = fixture(t), input = data(t, 29); await f.renderer.init();
+  const owner = f.renderer._getSampledTextureInputs(), first = owner.captureBinding({texture: input, isSampledTexture: true});
+  assert.equal(f.uploads.length, 0, 'the earlier accepted draw has not prepared its texture yet');
+  input.image.data.fill(91); input.source.dataReady = false; input.needsUpdate = true;
+  f.renderer.initTexture(input); const deferred = view(f.renderer, input).texture;
+  const before = owner.resolve(first).texture;
+  assert.notEqual(deferred, before); assert.deepEqual([...deferred.pixels], Array(16).fill(29));
+  assert.deepEqual([...owner.resolve(first).texture.pixels], Array(16).fill(29));
+  input.source.dataReady = true; f.renderer.initTexture(input); assert.equal(view(f.renderer, input).texture, deferred);
+  input.needsUpdate = true; f.renderer.initTexture(input);
+  assert.deepEqual([...view(f.renderer, input).texture.pixels], Array(16).fill(91));
+  assert.equal(f.uploads.length, 2); owner.release(first);
+  input.dispose(); assert.equal(owner.diagnostics.snapshotBytes, 0);
+  input.source.dataReady = false; f.renderer.initTexture(input);
+  assert.equal(view(f.renderer, input).texture.pixels, undefined, 'a new no-data residency starts at WebGPU zero initialization');
+});
+
+test('native default and no-data texture aliases keep independent acknowledgement and disposal', async t => {
+  const f = fixture(t), first = new T.Texture(); await f.renderer.init();
+  const alias = first.clone(); alias.version = 0;
+  f.renderer.initTexture(first); f.renderer.initTexture(alias);
+  const originalDefault = view(f.renderer, first).texture;
+  alias.dispose(); assert.equal(originalDefault.destroyed, undefined);
+  const input = data(t, 51), sibling = input.clone(); input.source.dataReady = false;
+  let a = 0, b = 0; input.onUpdate = () => {a++;}; sibling.onUpdate = () => {b++;};
+  f.renderer.initTexture(input); f.renderer.initTexture(sibling);
+  assert.deepEqual([a, b], [1, 1]); assert.equal(f.uploads.length, 0);
+  const retained = view(f.renderer, sibling).texture;
+  input.source.dataReady = true; input.needsUpdate = true; f.renderer.initTexture(input);
+  assert.equal(view(f.renderer, sibling).texture, retained); assert.equal(retained.pixels, undefined);
+  input.dispose(); assert.equal(retained.destroyed, undefined);
+  sibling.dispose(); first.dispose();
 });
