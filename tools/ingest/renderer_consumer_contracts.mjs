@@ -1,6 +1,6 @@
 /**
- * Source-verified ownership summaries for retained camera controls and standard
- * postprocessing passes (r186, 148ef33ecb6d2502ff796d4554abd1549c95d519).
+ * Source-verified ownership summaries for retained camera controls, inspectors
+ * and standard postprocessing passes (r186, 148ef33ecb6d2502ff796d4554abd1549c95d519).
  * These objects retain their canvas or renderer. Callers must track the
  * returned instances, inherited methods and callbacks; this is not a generic
  * exemption for imported calls.
@@ -23,11 +23,14 @@ const CONTROL_SOURCES = new Map([
   ['sha256:8063858389f2ccd5cd6f0968562752dbab4b21a03c7a6e1dcbb5cc746fc06373', {name: 'FlyControls', role: 'fly'}],
 ]);
 const CORE = 'sha256:9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
+const WEBGPU = 'sha256:a78400fa1d359e81fcc12b84ed0a89a7fbecb4b8373e28ae8f9d2b11f6ea13bc';
 const BUILDS = new Set([
   'sha256:9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea',
-  'sha256:a78400fa1d359e81fcc12b84ed0a89a7fbecb4b8373e28ae8f9d2b11f6ea13bc',
+  WEBGPU,
 ]);
 const BASE_EXPORTS = new Set(['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase']);
+const RENDERER_INSPECTOR = 'sha256:4252223601805bb32df911328e1626c3161284b5211d95ad399865d880dbeeae';
+const TSL = 'sha256:6e6b92d8ce467818944f73815a96abadc6392fb34de577d479a23810b6aeeed0';
 
 /** Return contracts only for a completely analyzed graph and verified imports.
  * The analyzer's default remains conservative when this proof is unavailable.
@@ -63,22 +66,34 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
   contracts.postprocessingSources = passes;
   const computations = verifiedGpuComputationSources(modules, bases, passes);
   contracts.gpuComputationSources = computations;
-  if (!controls.size && !passes.size && !computations.size) return contracts;
+  const inspectors = new Set();
+  for (const [id, mod] of modules) {
+    if (mod.content_hash !== RENDERER_INSPECTOR || mod.static_imports.length !== 2) continue;
+    const renderer = mod.static_imports.find(request => request.specifier === 'three/webgpu')?.resolved_id;
+    const tsl = modules.get(mod.static_imports.find(request => request.specifier === 'three/tsl')?.resolved_id);
+    // The inspector and its TSL helpers must share the same pinned renderer
+    // instance and core. A renamed addon is fine; redirected dependencies are not.
+    if (bases.has(renderer) && modules.get(renderer)?.content_hash === WEBGPU && tsl?.content_hash === TSL && tsl.static_imports.length === 1 &&
+        tsl.static_imports[0].resolved_id === renderer) inspectors.add(id);
+  }
+  if (!controls.size && !passes.size && !computations.size && !inspectors.size) return contracts;
 
-  const role = (id, name) => computations.has(id) && name === 'GPUComputationRenderer' ? 'gpu-computation' :
+  const role = (id, name) => inspectors.has(id) && name === 'RendererInspector' ? 'renderer-inspector' :
+    computations.has(id) && name === 'GPUComputationRenderer' ? 'gpu-computation' :
     passes.get(id)?.exports[name] ?? (controls.get(id)?.name === name ? controls.get(id).role :
     bases.has(id) && BASE_EXPORTS.has(name) ? 'base' :
     bases.has(id) && name === 'WebGPURenderer' ? 'webgpu' :
     bases.has(id) && name === 'WebGLRenderer' ? 'webgl' : null);
   for (const [id, mod] of modules) {
     // These exact implementations are the audited contract, not its callers.
-    if (bases.has(id) || controls.has(id) || passes.has(id) || computations.has(id)) continue;
+    if (bases.has(id) || controls.has(id) || passes.has(id) || computations.has(id) || inspectors.has(id)) continue;
     const bindings = new Map(), namespaces = new Map(), reexports = new Set();
     for (const request of mod.static_imports) {
       for (const binding of request.imported_bindings ?? []) {
         if (binding.type === 'namespace') {
           if (controls.has(request.resolved_id)) namespaces.set(binding.local, controls.get(request.resolved_id).role);
           else if (computations.has(request.resolved_id)) namespaces.set(binding.local, 'gpu-computation');
+          else if (inspectors.has(request.resolved_id)) namespaces.set(binding.local, 'renderer-inspector');
           else if (bases.has(request.resolved_id)) namespaces.set(binding.local, 'base');
         } else {
           const kind = role(request.resolved_id, binding.imported);
@@ -92,7 +107,7 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
         if (role(exp.resolved_id, binding.local)) reexports.add(`${exp.specifier}\0${binding.local}`);
       }
     }
-    contracts.set(id, {bindings, namespaces, reexports});
+    contracts.set(id, {bindings, namespaces, reexports, inspectors: inspectors.size > 0});
   }
   return contracts;
 }

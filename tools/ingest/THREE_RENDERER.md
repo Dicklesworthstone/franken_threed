@@ -117,6 +117,17 @@ builds source and routed applications, applies real pointer/keyboard/wheel input
 and compares camera state at each lifecycle boundary. This is compatibility and
 new-backend routing validation, not a controls rewrite or a speedup measurement.
 
+Applications using the pinned `RendererInspector` can retain its original class
+while selecting the native WebGPU route. The graph verifies its exact source,
+WebGPU/core dependencies and resolved TSL identity, then tracks attachment,
+local aliases, `getRenderer`/`setRenderer`, frame observations and supported
+settings. An emitted-application regression submits native draws and verifies
+that the unchanged Inspector records the original scene and camera. Custom
+hooks, private state, unknown renderer owners, escaped inspectors, changed
+dependencies and open import graphs retain exact routing. This covers the
+RendererInspector consumer; the full Settings/TSL Graph Inspector used by H1
+retains its separate open-code and backend-mutation boundaries.
+
 H1 still retains the exact renderer: its Inspector Settings component replaces
 `WebGPURenderer.prototype.init` to select a real WebGL backend from persisted
 settings, and the TSL Graph extension evaluates user-authored code with the full

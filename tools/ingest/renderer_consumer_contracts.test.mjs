@@ -38,6 +38,74 @@ function inspect(body) {
   return analyzeModuleAst(imports + setup + body, 'file:///application.js', {}, contract).routing_facts;
 }
 
+const rendererInspector = new URL('examples/jsm/inspector/RendererInspector.js', upstream).href;
+const inspectorSetup = `import {RendererInspector as Metrics} from 'metrics';
+  const inspector = new Metrics(); renderer.inspector = inspector;`;
+const inspectorFixture = (body = '', options = {}) => fixture(inspectorSetup + body, {
+  ...options, map: {imports: {metrics: rendererInspector, ...options.map?.imports}, ...(options.map?.scopes ? {scopes: options.map.scopes} : {})},
+});
+
+test('retained RendererInspector attachment, aliases and public observations close native ownership', async () => {
+  const f = inspectorFixture(), graph = await buildModuleGraph(f.entry);
+  const contract = verifiedRendererConsumerContracts(new Map(Object.entries(graph.modules))).get(graph.root_entries[0]);
+  assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  const source = imports + setup + inspectorSetup;
+  for (const body of [
+    'inspector.enabled=true; inspector.overdraw=true; inspector.maxFrames=32;',
+    'const local=renderer.inspector; const attached=local===inspector; const owner=local.getRenderer()===renderer;',
+    'inspector.begin(); inspector.getFrame(); inspector.getPrimaryPass(); inspector.finish(); inspector.resolveTimestamp();',
+    'const observed=inspector.frames.length; const latest=inspector.lastFrame; const running=renderer.inspector.isRunning;',
+    'inspector.getRenderer().setSize(32,24,false); document.body.appendChild(inspector.getRenderer().domElement);',
+    'inspector.setRenderer(null); inspector.setRenderer(renderer).begin(); inspector.finish();',
+    'const Constructor=Metrics; const local=new Constructor(); renderer.inspector=local; const same=local instanceof Constructor;',
+    'function create(owner) { return new Metrics().setRenderer(owner); } const local=create(renderer); renderer.inspector=local;',
+    'const state={inspector}; const local=state.inspector; local.maxFrames=4; local.dispose();',
+  ]) assert.deepEqual(analyzeModuleAst(source + body, 'file:///inspector.js', {}, contract).routing_facts.escapes, [], body);
+});
+
+test('RendererInspector consumers retain custom hooks, private state, unknown owners and escaping aliases', async () => {
+  const f = inspectorFixture(), graph = await buildModuleGraph(f.entry);
+  const contract = verifiedRendererConsumerContracts(new Map(Object.entries(graph.modules))).get(graph.root_entries[0]);
+  for (const body of [
+    'plugin(inspector);', 'plugin(renderer.inspector);', 'export {inspector};', 'globalThis.metrics=inspector;',
+    'const owner=inspector.getRenderer(); plugin(owner);', 'inspector.getRenderer().backend;', 'inspector.nodeFrame;',
+    'inspector._renderer;', 'inspector.getRenderer().getCanvasTarget();',
+    'inspector.begin=plugin;', 'inspector.resolveTimestamp=plugin;', "inspector.addEventListener('dispose',plugin);",
+    'renderer.inspector=plugin;', 'renderer.inspector+=inspector;', 'renderer.inspector||=inspector;',
+    '({value:renderer.inspector}=plugin);', 'for(renderer.inspector of values) {}',
+    'delete renderer.inspector;', 'inspector.setRenderer(host.renderer);', 'inspector.setRenderer(...owners);',
+    'let local=inspector; local=plugin; local.begin();', 'const method=inspector.getRenderer; plugin(method);',
+    'Metrics.prototype.begin=plugin;', 'THREE.InspectorBase.prototype.getRenderer=plugin;', 'class Custom extends Metrics {}',
+    'const values=[inspector];', 'export {Metrics};',
+  ]) {
+    const facts = analyzeModuleAst(imports + setup + inspectorSetup + body, 'file:///inspector.js', {}, contract).routing_facts;
+    assert.equal(decideRendererRoute({constructorName: 'WebGPURenderer', analysis: facts, ...environment}).route, 'exact-backend', body);
+  }
+  const legacy = analyzeModuleAst(imports + setup.replace('WebGPURenderer', 'WebGLRenderer') + inspectorSetup,
+    'file:///legacy.js', {}, contract).routing_facts;
+  assert.equal(legacy.has_opaque_gl_escapes, true, 'legacy WebGLRenderer has no source inspector setter');
+});
+
+test('RendererInspector proof follows source and resolved dependency identity, including renamed and namespace imports', async () => {
+  const f = inspectorFixture();
+  for (const suffix of ['/inspector/RendererInspector.js', '/build/three.tsl.js', '/build/three.core.js']) {
+    const graph = await buildModuleGraph(f.entry, {transformModule: (code, {url}) => url.endsWith(suffix) ? code + '\n// changed\n' : null});
+    assert.equal(evaluateGraphRoutes(graph, decideRendererRoute, environment)[0].decision.route, 'exact-backend', suffix);
+  }
+  const renamed = inspectorFixture('inspector.maxFrames=4;', {modules: {'renamed.js': fs.readFileSync(new URL(rendererInspector), 'utf8')},
+    map: {imports: {metrics: './renamed.js'}}});
+  assert.equal(evaluateGraphRoutes(await buildModuleGraph(renamed.entry), decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  fs.writeFileSync(renamed.entry, fs.readFileSync(renamed.entry, 'utf8')
+    .replace("import {RendererInspector as Metrics} from 'metrics';", "import * as Metrics from 'metrics';")
+    .replace('new Metrics()', 'new Metrics.RendererInspector()'));
+  assert.equal(evaluateGraphRoutes(await buildModuleGraph(renamed.entry), decideRendererRoute, environment)[0].decision.route, 'general-webgpu');
+  const redirected = inspectorFixture('', {modules: {'tsl.js': `export * from ${JSON.stringify(new URL('build/three.tsl.js', upstream).href)};`},
+    map: {imports: {'three/tsl': './tsl.js'}}});
+  assert.equal(evaluateGraphRoutes(await buildModuleGraph(redirected.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+  const open = inspectorFixture('import(location.hash.slice(1));');
+  assert.equal(evaluateGraphRoutes(await buildModuleGraph(open.entry), decideRendererRoute, environment)[0].decision.route, 'exact-backend');
+});
+
 test('the original H2 graph becomes eligible while H1 retains its Inspector backend mutation', async () => {
   const h2 = await buildModuleGraph(fileURLToPath(new URL('examples/webgl_marchingcubes.html', upstream)));
   assert.deepEqual(extractGraphRoutingFacts(h2).escapes, []);

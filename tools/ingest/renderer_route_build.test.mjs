@@ -335,6 +335,58 @@ export const gl = document.createElement('canvas').getContext('webgl2');`);
   assert.equal(n.rendererRoute.reason, "no-webgpu-renderer-construction");
 });
 
+test('an emitted application attaches the actual retained RendererInspector and records native draws', async () => {
+  const inspectorUrl = pathToFileURL(path.resolve(upstreamBuild, '../examples/jsm/inspector/RendererInspector.js')).href;
+  const a = app(`import * as THREE from 'three/webgpu';
+import {RendererInspector as Metrics} from ${JSON.stringify(inspectorUrl)};
+const renderer=new THREE.WebGPURenderer({device:globalThis.__f3d_inspector_host.device});
+globalThis.__f3d_inspector_host.dispose=()=>renderer.dispose();
+const scene=new THREE.Scene();
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(),new THREE.MeshBasicNodeMaterial()));
+const camera=new THREE.PerspectiveCamera(60,1,.1,10); camera.position.z=2;
+await renderer.compileAsync(scene,camera);
+const inspector=new Metrics(); renderer.inspector=inspector; inspector.maxFrames=2;
+inspector.begin(); const rendering=renderer.renderAsync(scene,camera); inspector.finish();
+// Observe this completed source frame before an asynchronous host tick starts
+// the next frame. GPU submission and timestamp resolution still finish below.
+const frame=inspector.getFrame();
+export const observed={native:renderer.isF3DRenderer===true, route:renderer.info.f3d?.route,
+  attached:renderer.inspector===inspector, owner:inspector.getRenderer()===renderer,
+  type:inspector instanceof Metrics, renders:frame.renders.length,
+  scene:frame.renders[0].scene===scene, camera:frame.renders[0].camera===camera,
+  frames:inspector.frames.length, running:inspector.isRunning};
+await rendering; await inspector.resolveTimestamp();
+export const dispose=()=>renderer.dispose();
+`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.decisions[0].route, 'general-webgpu');
+  const device = geometryDevice(); device.features = new Set(); device.limits.maxTextureDimension2D = 8192;
+  device.createSampler = descriptor => descriptor;
+  device.createTexture = descriptor => ({...descriptor, dimension: '2d', sampleCount: 1, depthOrArrayLayers: 1,
+    width: descriptor.size.width ?? descriptor.size[0],
+    height: descriptor.size.height ?? descriptor.size[1], createView(options = {}) {return {texture: this, ...options};}, destroy() {}});
+  let configuration;
+  const canvas = {width: 16, height: 16, style: {}, getContext: () => ({configure(value) {configuration = value;},
+    unconfigure() {}, getCurrentTexture: () => device.createTexture({size: [16, 16], format: configuration.format, usage: 16})})};
+  const previous = {document: globalThis.document, request: globalThis.requestAnimationFrame,
+    cancel: globalThis.cancelAnimationFrame, host: globalThis.__f3d_inspector_host};
+  globalThis.document = {createElementNS: () => canvas}; globalThis.__f3d_inspector_host = {device};
+  globalThis.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0);
+  globalThis.cancelAnimationFrame = clearTimeout;
+  let emitted;
+  try {
+    emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.deepEqual(emitted.observed, {native: true, route: 'general-webgpu', attached: true, owner: true,
+      type: true, renders: 1, scene: true, camera: true, frames: 1, running: false});
+    assert.ok(device.encodedDrawCalls > 0); assert.ok(device.submissions.length > 0);
+  } finally {
+    await globalThis.__f3d_inspector_host.dispose?.(); globalThis.document = previous.document;
+    globalThis.requestAnimationFrame = previous.request; globalThis.cancelAnimationFrame = previous.cancel;
+    if (previous.host === undefined) delete globalThis.__f3d_inspector_host; else globalThis.__f3d_inspector_host = previous.host;
+  }
+});
+
 test("H1 retains its upstream owner for the Inspector's native backend prototype mutation", async () => {
   const out = fs.mkdtempSync(path.join(tmpdir(), "f3d_route_h1_"));
   const entry = path.resolve(upstreamBuild, "../examples/webgpu_performance_renderbundle.html");

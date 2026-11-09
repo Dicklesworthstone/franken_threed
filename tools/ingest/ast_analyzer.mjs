@@ -606,12 +606,14 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const MAP_CTOR = 1048576, MAP_NAMESPACE = 2097152;
   const TRACKBALL_CTOR = 4194304, TRACKBALL_NAMESPACE = 8388608;
   const FLY_CTOR = 16777216, FLY_NAMESPACE = 33554432;
+  const INSPECTOR_CTOR = 67108864, INSPECTOR = 134217728, INSPECTOR_NAMESPACE = 268435456;
   const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR | MAP_CTOR | TRACKBALL_CTOR | FLY_CTOR;
-  const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | CONTROL_CONSTRUCTORS | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR | GPGPU_CTOR;
-  const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS | GPGPU;
+  const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | CONTROL_CONSTRUCTORS | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR | GPGPU_CTOR | INSPECTOR_CTOR;
+  const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS | GPGPU | INSPECTOR;
   const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
     role === "first-person" ? FIRST_PERSON_CTOR : role === "gpu-computation" ? GPGPU_CTOR :
     role === "map" ? MAP_CTOR : role === "trackball" ? TRACKBALL_CTOR : role === "fly" ? FLY_CTOR :
+    role === "renderer-inspector" ? INSPECTOR_CTOR :
     role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : role === "composer" ? COMPOSER_CTOR : role === "pass" ? PASS_CTOR : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
@@ -662,6 +664,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           const cell = scopes.get(ast).get(spec.local.name);
           cell.consumerSource = role === "orbit" ? ORBIT_NAMESPACE : role === "first-person" ? FIRST_PERSON_NAMESPACE :
             role === "map" ? MAP_NAMESPACE : role === "trackball" ? TRACKBALL_NAMESPACE : role === "fly" ? FLY_NAMESPACE :
+            role === "renderer-inspector" ? INSPECTOR_NAMESPACE :
             role === "gpu-computation" ? GPGPU_NAMESPACE : role === "base" ? BASE_NAMESPACE : 0;
           cell.kind |= NAMESPACE | cell.consumerSource;
         }
@@ -703,10 +706,12 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & TRACKBALL_NAMESPACE && names.includes("TrackballControls")) result |= TRACKBALL_CTOR;
     if (object & FLY_NAMESPACE && names.includes("FlyControls")) result |= FLY_CTOR;
     if (object & GPGPU_NAMESPACE && names.includes("GPUComputationRenderer")) result |= GPGPU_CTOR;
+    if (object & INSPECTOR_NAMESPACE && names.includes("RendererInspector")) result |= INSPECTOR_CTOR;
     if (object & BASE_NAMESPACE && names.some(name =>
       ["Controls", "EventDispatcher", "Renderer", "CanvasTarget", "InspectorBase"].includes(name))) result |= BASE_CTOR;
     if (object & (RENDERER | CONTROLS) && names.some(name => name === "domElement")) result |= CANVAS;
     if (object & COMPOSER && names.includes("renderer")) result |= RENDERER;
+    if (consumerContract?.inspectors && object & RENDERER && names.includes("inspector")) result |= INSPECTOR;
     if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
     return result;
   };
@@ -824,7 +829,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         const constructor = child(node.callee);
         value = (constructor & CONSTRUCTOR ? RENDERER : 0) | (constructor & CONTROL_CONSTRUCTORS ? CONTROLS : 0) |
           (constructor & COMPOSER_CTOR ? COMPOSER : 0) | (constructor & PASS_CTOR ? PASS : 0) |
-          (constructor & GPGPU_CTOR ? GPGPU : 0);
+          (constructor & GPGPU_CTOR ? GPGPU : 0) | (constructor & INSPECTOR_CTOR ? INSPECTOR : 0);
         break;
       }
       case "MemberExpression": {
@@ -854,6 +859,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
             staticPropertyNames(callee)?.every(name => name === "lookAt")) value = CONTROLS;
         if (callee.type === "MemberExpression" && child(callee.object) & GPGPU &&
             staticPropertyNames(callee)?.every(name => name === "setDataType")) value = GPGPU;
+        if (callee.type === "MemberExpression" && child(callee.object) & INSPECTOR) {
+          const names = staticPropertyNames(callee);
+          if (names?.every(name => name === "getRenderer")) value = RENDERER;
+          else if (names?.every(name => name === "setRenderer")) value = INSPECTOR;
+        }
         break;
       }
     }
@@ -1106,8 +1116,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
     if (node.type === "NewExpression") return expected === CONTROLS ? visit(node.callee, CONTROL_CONSTRUCTORS) :
       expected === COMPOSER ? visit(node.callee, COMPOSER_CTOR) : expected === PASS ? visit(node.callee, PASS_CTOR) :
-      expected === GPGPU ? visit(node.callee, GPGPU_CTOR) :
-      expected === WEBGL ? visit(node.callee, WEBGL) : expected === RENDERER && visit(node.callee, CONSTRUCTOR);
+      expected === GPGPU ? visit(node.callee, GPGPU_CTOR) : expected === INSPECTOR ? visit(node.callee, INSPECTOR_CTOR) :
+      expected === WEBGL || expected === WEBGPU ? visit(node.callee, expected) : expected === RENDERER && visit(node.callee, CONSTRUCTOR);
     if (node.type === "MemberExpression") {
       const names = staticPropertyNames(node);
       if (!names) return false;
@@ -1118,6 +1128,10 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         names.every(name => name === "FlyControls") && visit(node.object, FLY_NAMESPACE);
       if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
       if (expected === GPGPU_CTOR) return names.every(name => name === "GPUComputationRenderer") && visit(node.object, GPGPU_NAMESPACE);
+      if (expected === INSPECTOR_CTOR) return names.every(name => name === "RendererInspector") && visit(node.object, INSPECTOR_NAMESPACE);
+      if (expected === INSPECTOR && consumerContract?.inspectors && names.every(name => name === "inspector"))
+        return visit(node.object, WEBGPU);
+      if (expected === WEBGPU) return names.every(name => name === "WebGPURenderer") && visit(node.object, BASE_NAMESPACE);
       if (expected === WEBGL) return names.every(name => name === "WebGLRenderer") && visit(node.object, BASE_NAMESPACE) ||
         names.every(name => name === "renderer") && visit(node.object, COMPOSER);
     }
@@ -1125,6 +1139,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         staticPropertyNames(node.callee)?.every(name => name === "lookAt")) return visit(node.callee.object);
     if (expected === GPGPU && node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
         staticPropertyNames(node.callee)?.every(name => name === "setDataType")) return visit(node.callee.object);
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
+        staticPropertyNames(node.callee)?.every(name => name === (expected === INSPECTOR ? "setRenderer" : "getRenderer")) &&
+        (expected === INSPECTOR || expected === RENDERER || expected === WEBGPU)) return visit(node.callee.object, INSPECTOR);
     return false;
   };
   const closedDomValue = (node, visiting = new Set(), depth = 0) => {
@@ -1202,6 +1219,14 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "createRenderTarget", "createTexture", "renderTexture", "doRenderTarget"]);
   const computationSettings = new Set(["currentTextureIndex"]);
   const computationViews = new Set(["variables", ...computationSettings]);
+  // The retained inspector owns a renderer just like a retained control owns
+  // its canvas. Public frame records contain scene/compute observations; its
+  // nodeFrame, private state, event hooks and method replacements stay opaque.
+  const inspectorMethods = new Set(["setRenderer", "getRenderer", "getParent", "getPrimaryPass", "getFrame", "getFrameById",
+    "begin", "finish", "inspect", "resolveTimestamp", "beginRender", "finishRender", "beginCompute", "finishCompute", "dispose"]);
+  const inspectorSettings = new Set(["enabled", "overdraw", "maxFrames"]);
+  const inspectorViews = new Set([...inspectorSettings, "isRunning", "isAvailable", "isRendererInspector", "fps", "frames",
+    "lastFrame", "currentFrame", "currentContext", "currentRender", "currentCompute", "currentNodes"]);
   const reflection = new Set(["prototype", "__proto__", "constructor", "getPrototypeOf", "setPrototypeOf",
     "defineProperty", "defineProperties", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
     "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "eval", "Function", "Reflect"]);
@@ -1220,6 +1245,12 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const isComputationInput = (call, argument, index) => index === 2 && call.type === "NewExpression" &&
     !call.arguments.some(value => value.type === "SpreadElement") && closedConsumerValue(call.callee, GPGPU_CTOR) &&
     kind(argument) & RENDERER && closedConsumerValue(argument, WEBGL);
+  const isInspectorInput = (call, argument, index) => index === 0 && call.type === "CallExpression" &&
+    call.callee.type === "MemberExpression" && staticPropertyNames(call.callee)?.every(name => name === "setRenderer") &&
+    closedConsumerValue(call.callee.object, INSPECTOR) && closedConsumerValue(argument, WEBGPU);
+  const inspectorAttachment = node => node.type === "AssignmentExpression" && node.operator === "=" && node.left.type === "MemberExpression" &&
+    staticPropertyNames(node.left)?.every(name => name === "inspector") && consumerContract?.inspectors &&
+    closedConsumerValue(node.left.object, WEBGPU) && closedConsumerValue(node.right, INSPECTOR);
   const publicMethods = new Set([
     "init", "render", "renderAsync", "compile", "compileAsync", "compute", "computeAsync", "dispose",
     "setAnimationLoop", "setSize", "setPixelRatio", "setDrawingBufferSize", "getSize", "getPixelRatio",
@@ -1260,8 +1291,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
         (staticPropertyNames(node.callee)?.every(name => ["setMRT", "init"].includes(name)) ||
           kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "lookAt") ||
-          kind(node.callee.object) & GPGPU && staticPropertyNames(node.callee)?.every(name => name === "setDataType"))) return visit(node.callee.object);
-    if (node.type === "NewExpression" && kind(node) & (RENDERER | CONTROLS | GPGPU)) return true;
+          kind(node.callee.object) & GPGPU && staticPropertyNames(node.callee)?.every(name => name === "setDataType") ||
+          kind(node.callee.object) & INSPECTOR && staticPropertyNames(node.callee)?.every(name => name === "setRenderer"))) return visit(node.callee.object);
+    if (node.type === "NewExpression" && kind(node) & (RENDERER | CONTROLS | GPGPU | INSPECTOR)) return true;
     if (node.type === "MemberExpression" && staticPropertyNames(node)?.every(name => name === "domElement"))
       return visit(node.object);
     return closedDomValue(node);
@@ -1307,6 +1339,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           (!closedConsumerValue(node.callee, GPGPU_CTOR) || node.arguments.some(value => value.type === "SpreadElement") ||
             !(kind(node.arguments[2]) & RENDERER) || !closedConsumerValue(node.arguments[2], WEBGL)))
         report(node, "unclosed-gpu-computation-constructor");
+      if (node.type === "NewExpression" && kind(node.callee) & INSPECTOR_CTOR &&
+          (!closedConsumerValue(node.callee, INSPECTOR_CTOR) || node.arguments.some(value => value.type === "SpreadElement")))
+        report(node, "unclosed-inspector-constructor");
       if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
           kind(node.callee.object) & RENDERER &&
           !staticPropertyNames(node.callee)?.every(name => publicMethods.has(name)))
@@ -1325,6 +1360,14 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (kind(node.callee.object) & GPGPU && (!closedConsumerValue(node.callee.object, GPGPU) ||
             !staticPropertyNames(node.callee)?.every(name => computationMethods.has(name))))
           report(node, "opaque-gpu-computation-method");
+        if (kind(node.callee.object) & INSPECTOR) {
+          const names = staticPropertyNames(node.callee);
+          if (!closedConsumerValue(node.callee.object, INSPECTOR) || !names?.every(name => inspectorMethods.has(name)))
+            report(node, "opaque-inspector-method");
+          if (names?.some(name => name === "setRenderer") && (node.arguments.length !== 1 ||
+              !(node.arguments[0]?.type === "Literal" && node.arguments[0].value === null) &&
+              !closedConsumerValue(node.arguments[0], WEBGPU))) report(node, "opaque-inspector-renderer-input");
+        }
         if (kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "connect")) {
           const canvas = node.arguments[0];
           if (canvas && !(canvas.type === "Literal" && canvas.value == null) && !closedDomValue(canvas))
@@ -1339,13 +1382,13 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       for (const [index, argument] of node.arguments.entries()) {
         const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
         const helper = localHelper(node);
-        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) && !isPassInput(node, argument, index) && !isComputationInput(node, argument, index) &&
+        if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) && !isPassInput(node, argument, index) && !isComputationInput(node, argument, index) && !isInspectorInput(node, argument, index) &&
             !(helper && index < helper.params.length))
           report(node, "opaque-call-argument");
       }
     } else if (node.type === "AssignmentExpression") {
       if (kind(node.right) & RESOURCE &&
-          (node.left.type !== "Identifier" || !binding(node.left).local)) report(node, "external-store");
+          (node.left.type !== "Identifier" || !binding(node.left).local) && !inspectorAttachment(node)) report(node, "external-store");
       if (node.left.type === "MemberExpression" && kind(node.left.object) & RENDERER &&
           staticPropertyNames(node.left)?.some(name => publicMethods.has(name)))
         report(node, "renderer-method-replacement");
@@ -1359,10 +1402,16 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       if (node.left.type === "MemberExpression" && kind(node.left.object) & GPGPU &&
           !staticPropertyNames(node.left)?.every(name => computationSettings.has(name)))
         report(node, "gpu-computation-member-write");
+      if (node.left.type === "MemberExpression" && kind(node.left.object) & INSPECTOR &&
+          !staticPropertyNames(node.left)?.every(name => inspectorSettings.has(name))) report(node, "inspector-member-write");
+      if (consumerContract?.inspectors && node.left.type === "MemberExpression" && kind(node.left.object) & RENDERER &&
+          staticPropertyNames(node.left)?.some(name => name === "inspector") && !inspectorAttachment(node))
+        report(node, "unclosed-inspector-assignment");
     } else if ((node.type === "UpdateExpression" || node.type === "UnaryExpression" && node.operator === "delete") &&
-        node.argument.type === "MemberExpression" && kind(node.argument.object) & (CONTROLS | COMPOSER | PASS | GPGPU)) {
+        node.argument.type === "MemberExpression" && kind(node.argument.object) & (CONTROLS | COMPOSER | PASS | GPGPU | INSPECTOR)) {
       report(node, kind(node.argument.object) & CONTROLS ? "controls-member-write" :
-        kind(node.argument.object) & GPGPU ? "gpu-computation-member-write" : "postprocessing-member-write");
+        kind(node.argument.object) & GPGPU ? "gpu-computation-member-write" :
+        kind(node.argument.object) & INSPECTOR ? "inspector-member-write" : "postprocessing-member-write");
     } else if (node.type === "ReturnStatement" || node.type === "YieldExpression" || node.type === "ThrowStatement" ||
         node.type === "ArrowFunctionExpression" && node.body.type !== "BlockStatement") {
       const helper = node.type === "ArrowFunctionExpression" ? node : functionOf(node);
@@ -1377,7 +1426,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     } else if (node.type === "TaggedTemplateExpression" && node.quasi.expressions.some(value => kind(value) & RESOURCE)) {
       report(node, "opaque-call-argument");
     } else if (consumerContract && node.type === "BinaryExpression" && node.operator === "instanceof" && kind(node.left) & RESOURCE &&
-        !closedConsumerValue(node.right, kind(node.left) & CONTROLS ? CONTROL_CONSTRUCTORS : kind(node.left) & COMPOSER ? COMPOSER_CTOR : kind(node.left) & PASS ? PASS_CTOR : kind(node.left) & GPGPU ? GPGPU_CTOR : CONSTRUCTOR)) {
+        !closedConsumerValue(node.right, kind(node.left) & CONTROLS ? CONTROL_CONSTRUCTORS : kind(node.left) & COMPOSER ? COMPOSER_CTOR : kind(node.left) & PASS ? PASS_CTOR : kind(node.left) & GPGPU ? GPGPU_CTOR : kind(node.left) & INSPECTOR ? INSPECTOR_CTOR : CONSTRUCTOR)) {
       report(node, "opaque-instance-check");
     } else if (node.type === "ExportNamedDeclaration") {
       if (node.source && node.specifiers.some(spec =>
@@ -1395,7 +1444,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     } else if (node.type === "MemberExpression" && kind(node.object) & RESOURCE) {
       const names = staticPropertyNames(node);
       if (!names) report(node, "unresolved-resource-member");
-      else if (kind(node.object) & RENDERER && names.some(name => nativeState.has(name) || name.startsWith("_")))
+      else if (kind(node.object) & RENDERER && names.some(name => name === "inspector" && consumerContract?.inspectors
+          ? !closedConsumerValue(node.object, WEBGPU) || recordWrite(node) && !inspectorAttachment(parents.get(node))
+          : nativeState.has(name) || name.startsWith("_")))
         report(node, "native-renderer-state");
       else if (kind(node.object) & ALL_CONSTRUCTORS && names.some(name => name === "prototype"))
         report(node, "renderer-prototype-access");
@@ -1409,6 +1460,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       else if (kind(node.object) & GPGPU && !names.every(name => computationViews.has(name) ||
           computationMethods.has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
         report(node, "opaque-gpu-computation-member");
+      else if (kind(node.object) & INSPECTOR && !names.every(name => inspectorViews.has(name) ||
+          inspectorMethods.has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
+        report(node, "opaque-inspector-member");
     } else if (node.type === "VariableDeclarator" && node.id.type !== "Identifier" && kind(node.init) & RESOURCE) {
       if (!(node.id.type === "ObjectPattern" && node.id.properties.every(property =>
           property.type === "Property" && property.value.type === "Identifier" &&
