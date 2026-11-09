@@ -304,7 +304,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const textures = compiled.program.reflection.textures.map(t => {
       const texture = uniforms[t.name]?.value, b = texture && (maps.get(texture)?.depthBinding ?? colorBindings.get(texture));
       if (!b) fail('PREPARE', 'VSM blur source texture is not prepared');
-      return {view: b.view, sampler: b.sampler, sampleType: b.sampleType, texture};
+      return {view: b.view, sampler: b.sampler, sampleType: b.sampleType,
+        samplerDescriptor: b.samplerDescriptor, depthReferenceClamp: b.depthReferenceClamp, texture};
     });
     const raster = support.raster(material, {side: material.side});
     const glRaster = {...raster, frontFace: raster.frontFace === 'ccw' ? 'cw' : 'ccw', blend: null};
@@ -323,7 +324,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
   }
   function blurCommand(entry, material, camera, width, height) {
     const reflection = entry.record.reflection, bytes = new Uint8Array(reflection.uniformBufferSize);
-    const current = support.pack(reflection, support.refresh(material), fullScreenMesh, camera, bytes, {targetSize: [width, height, width, height]});
+    const current = support.pack(reflection, support.refresh(material), fullScreenMesh, camera, bytes,
+      {targetSize: [width, height, width, height], textureBindings: entry.textures});
     if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'VSM blur textures changed; call prepare()');
     const command = {};
     blurMeshes.stage(entry.record, {programUniforms: bytes, first: 0, count: 3, frontFaceCW: false, instanceCount: 1}, command);
@@ -338,21 +340,25 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     const compare = depth.compareFunction != null;
     if (compare && depth.compareFunction !== T.LessEqualCompare && depth.compareFunction !== T.GreaterEqualCompare)
       fail('MAP', 'Source shadow maps require LessEqual or GreaterEqual depth comparisons');
+    const samplerDescriptor = Object.freeze({...(compare ? {
+      compare: depth.compareFunction === T.GreaterEqualCompare ? 'greater-equal' : 'less-equal', magFilter: 'linear', minFilter: 'linear'} : {}),
+      addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge'});
     m = {texture, width: target.width, height: target.height, cube, depth,
       faces: Array.from({length: cube ? 6 : 1}, (_, face) => texture.createView({dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1})),
       binding: {view: texture.createView({dimension: cube ? 'cube' : '2d'}),
-        sampler: device.createSampler({label, ...(compare ? {compare: depth.compareFunction === T.GreaterEqualCompare ? 'greater-equal' : 'less-equal', magFilter: 'linear', minFilter: 'linear'} : {}),
-          addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge'}),
+        sampler: device.createSampler({label, ...samplerDescriptor}), samplerDescriptor,
+        depthReferenceClamp: depth.type !== T.FloatType,
         sampleType: compare ? 'depth' : 'unfilterable-float'}};
     if (isVSMTarget(target)) {
       // map.texture / mapPass.texture: RG16F with linear filtering (r186 options);
       // mapPass also owns a depth buffer that VSMPass clears and tests against.
       const color = name => device.createTexture({label: `${label}/${name}`, size: [target.width, target.height], format: VSM_FORMAT, usage: 16 | 4});
-      const linear = device.createSampler({label, magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
+      const linearDescriptor = Object.freeze({magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge'});
+      const linear = device.createSampler({label, ...linearDescriptor});
       m.vsm = {map: color(target.texture.name), pass: color(`${target.texture.name}.pass`),
         passDepth: device.createTexture({label: `${label}/vsm-pass-depth`, size: [target.width, target.height], format: DEPTH_FORMAT, usage: 16})};
-      m.vsm.mapBinding = {view: m.vsm.map.createView(), sampler: linear, sampleType: 'float'};
-      m.vsm.passBinding = {view: m.vsm.pass.createView(), sampler: linear, sampleType: 'float'};
+      m.vsm.mapBinding = {view: m.vsm.map.createView(), sampler: linear, samplerDescriptor: linearDescriptor, sampleType: 'float'};
+      m.vsm.passBinding = {view: m.vsm.pass.createView(), sampler: linear, samplerDescriptor: linearDescriptor, sampleType: 'float'};
       m.vsm.texture = target.texture;
       colorBindings.set(target.texture, m.vsm.mapBinding);
     }
@@ -405,7 +411,8 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
       const value = samplers?.[t.name] ?? uniforms?.[t.name]?.value, texture = t.element === null ? value : value?.[t.element];
       if (!texture) fail('TEXTURE', `Depth program sampler ${t.name} has no texture`);
       const b = bindingOf(texture);
-      return {view: b.view, sampler: b.sampler, sampleType: b.sampleType ?? 'float', texture};
+      return {view: b.view, sampler: b.sampler, sampleType: b.sampleType ?? 'float',
+        samplerDescriptor: b.samplerDescriptor, depthReferenceClamp: b.depthReferenceClamp, texture};
     });
   }
   function refresh(depthMaterial) {
@@ -596,7 +603,7 @@ export function createThreeProgramShadows({three: T, device, support, bindingOf,
     for (const {id, first, count} of ranges) {
       const bytes = new Uint8Array(reflection.uniformBufferSize);
       const values = {...(support.bindsClippingPlanes(depthMaterial) ? {clippingPlanes: clip.planes} : {}), ...(batch ? {_gl_DrawID: id} : {})};
-      const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values, targetSize});
+      const current = support.pack(reflection, uniforms, object, shadowCamera, bytes, {values, targetSize, textureBindings: entry.textures});
       if (current.some((t, k) => (t ?? null) !== entry.textures[k].texture)) fail('PREPARE', 'Shadow caster textures changed; call prepare()');
       const command = {};
       meshes.stage(entry.record, {programUniforms: bytes, first, count, programRangeCaptured: batch,

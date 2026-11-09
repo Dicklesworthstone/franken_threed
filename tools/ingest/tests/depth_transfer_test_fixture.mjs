@@ -98,15 +98,16 @@ export function depthDevice() {
                 source.texture.data[(source.origin.y + j) * source.texture.width + source.origin.x + i];
             continue;
           }
-          if (packet.desc.colorAttachments.length) {
-            // Reference only the UV orientation pass. Mip passes stay recorded.
-            if (packet.pipeline.desc.label.includes('UV orientation')) {
-              const source = packet.group.entries[0].resource.texture, destination = packet.desc.colorAttachments[0].view.texture;
-              for (let y = 0; y < destination.height; y++) for (let x = 0; x < destination.width; x++)
-                destination.data[y * destination.width + x] = source.data[(source.height - 1 - y) * source.width + x];
-            }
+          // Independent row-order reference for color and comparison depth
+          // replicas. This models their copy contract, not WGSL execution.
+          if (packet.pipeline.desc.label.includes('UV orientation')) {
+            const source = packet.group.entries[0].resource.texture;
+            const destination = (packet.desc.colorAttachments[0]?.view ?? packet.desc.depthStencilAttachment.view).texture;
+            for (let y = 0; y < destination.height; y++) for (let x = 0; x < destination.width; x++)
+              destination.data[y * destination.width + x] = source.data[(source.height - 1 - y) * source.width + x];
             continue;
           }
+          if (packet.desc.colorAttachments.length) continue;
           const sourceView = packet.group.entries[0].resource, source = sourceView.texture;
           const destinationView = packet.desc.depthStencilAttachment.view, destination = destinationView.texture;
           const sourceOffset = (sourceView.options.baseArrayLayer ?? 0) * source.width * source.height * source.sampleCount;

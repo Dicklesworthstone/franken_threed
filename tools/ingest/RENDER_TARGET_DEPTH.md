@@ -73,14 +73,14 @@ For source targets and detached depth inputs, `DepthFormat` with
 `depth32float-stencil8`, requiring that feature on the enabled device.
 Depth24plus's backing representation remains implementation-defined.
 The target's dimensions define attachment storage, including after `setSize`.
-Source depth image metadata remains borrowed and is not rewritten to simulate an
-upload. The native renderer retains depth comparison and multisample bindings
+The owner initializes depth image dimensions lazily from the selected target,
+retaining the source texture identity. The native renderer retains depth comparison and multisample bindings
 under the target owner's dimension rules; shared/layered attachment ownership is
 described in `THREE_RENDER_TARGETS.md`. Generated/manual depth mipmaps remain
 unsupported. The WebGL sampler2D replica described below cannot invent a resolve
 or sample-index policy for multisampled depth.
 
-The first read creates a GPU-only, single-level `r32float` sampling image. A
+The first ordinary read creates a GPU-only, single-level `r32float` sampling image. A
 fullscreen textureLoad pass reads the actual rendered depth attachment, flips
 its rows to the established source texture UV convention, and stores the loaded
 f32 depth value without RGBA8/half-float quantization, color transfer, packing or
@@ -101,9 +101,48 @@ and the three ordinary wrapping modes are admitted, with LOD clamped to zero.
 Depth and color sampling images have independent dirty flags. Another target
 render invalidates both, but a depth read neither generates nor acknowledges
 color mipmaps, and a color read cannot acknowledge a pending depth refresh.
-Repeated depth reads reuse the image, view, bind group and sampler; sampler-only
-edits replace only that sampler and acknowledge the current source versions.
+Repeated depth reads reuse the image, view, bind group and sampler. The WebGL
+sampler is captured when the source target first allocates depth. Public edits
+without `needsUpdate` retain those installed parameters. An acknowledged
+compare-function change updates only the comparison sampler; setting the public
+function to `null` keeps an installed comparison mode, as pinned WebGLTextures
+does. Changing initialized filters, wrapping, unpack controls or Source identity
+with `needsUpdate` is explicitly refused until the target is disposed/recreated:
+the source replaces its GL image in that case, so preserving the old attachment
+contents would be incorrect.
 `entry.depthCopies` counts submitted depth-orientation passes, not render calls.
+
+### Custom comparison shaders
+
+An attached single-sample 2D `DepthTexture` can feed a `sampler2DShadow` in either
+`ShaderMaterial` or GLSL3 `RawShaderMaterial`. Set its comparison function and
+nearest/linear filters before initializing the target:
+
+```js
+target.depthTexture.compareFunction = THREE.LessEqualCompare;
+target.depthTexture.minFilter = target.depthTexture.magFilter = THREE.LinearFilter;
+// GLSL3 fragment expression, with shadowCoord a vec4:
+// float visibility = textureProj(tDepth, shadowCoord);
+```
+
+The owner creates a separate UV-oriented `depth32float` image and writes the
+loaded attachment value through `frag_depth`. Its native comparison sampler
+retains the installed comparison function, filters and wrapping. Linear depth
+comparison does not require `float32-filterable`; it uses depth filtering, not
+an R32F color sampler. Fixed-point source formats carry a per-binding reference
+clamp into the compiler; float depth keeps its unclamped comparison reference.
+This applies to ordinary and projected comparisons, including sampler helpers,
+arrays and vertex-stage base-level comparisons.
+
+Ordinary and comparison images have independent caches and dirty state. A
+versioned transition into comparison mode leaves already issued ordinary views
+alive; a new depth write invalidates both copies. Comparison-only reads do not
+allocate an R32F image or regenerate color mipmaps. Each allocated replica costs
+four bytes per texel in the shared budget and follows the existing generation
+leases, resize, disposal, feedback and validation rules. `depthComparison.copies`
+counts the comparison orientation submissions. Cube/array comparison replicas
+and multisample depth resolves remain outside this WebGL profile; native
+node/compute depth bindings retain their existing dimension/sample support.
 
 The shared source-target budget includes native attachments, complete color
 pyramids/replicas when present, and four bytes per depth-sampling-image texel.
@@ -129,9 +168,18 @@ node --test tools/ingest/gpu_render_target.test.mjs \
 ```
 
 These tests execute the production owner against native-call recorders. They
-check attachment identity, all three depth formats, multisample descriptors,
+check attachment identity, supported depth formats, multisample descriptors,
 color/depth independence, budgets, retirement, cancellation and failures. They
 are not native shader execution, pixel-parity evidence or performance results.
+
+`three_depth_sampler_source.test.mjs` executes the pinned WebGLTextures code to
+check its sampler acknowledgement and image-replacement behavior.
+`three_program_depth_sampling.test.mjs` exercises actual converted and raw
+ShaderMaterial consumers, including submitted fixed/float comparison flags,
+queued coordinates, copy ordering, warm reuse and source comparison updates.
+The projected-shadow browser checkpoints in `program_texture_sampling.mjs`
+were added but could not be run because Chromium could not launch in this
+environment; these new paths have no fresh pixel or performance result.
 
 The source-depth suite additionally checks the r186 association rule, native-depth
 input to the R32F pass, independent refreshes, feature-dependent filtering, source

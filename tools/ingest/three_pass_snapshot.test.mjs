@@ -50,7 +50,7 @@ test('textures keep identity; changing derived automatic matrices does not inval
   c.install(); assert.equal(c.root.material.uniforms.map.value, texture); c.check(); c.release(); owner.dispose();
 });
 
-for (const mutate of [t => t.version++, t => t.source.version++, t => t.minFilter++, t => t.offset.x++, t => t.dispose()])
+for (const mutate of [t => t.version++, t => t.source.version++, t => t.minFilter++, t => t.compareFunction = 515, t => t.offset.x++, t => t.dispose()])
   test(`source texture mutation/disposal fails explicitly: ${mutate}`, () => {
     const {owner, root, camera, material} = setup(), t = new T.Texture(); material.uniforms.map = {value: t};
     const c = owner.capture(root, camera); mutate(t);

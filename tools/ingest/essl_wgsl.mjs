@@ -244,10 +244,11 @@ function reflect(shared, units, varyings) {
     fields.push({name, glslType: glslName(u.type), offset, size: lay.size, node: describe(u.type, u.repr, offset, shared)});
     offset += lay.size; align = Math.max(align, lay.align);
   }
-  const samplingOffsets = new Map();
-  for (const sampler of shared.samplers.values()) if (integerSampler(sampler.type)) {
+  const samplingOffsets = new Map(), depthReferenceClampOffsets = new Map();
+  for (const sampler of shared.samplers.values()) if (integerSampler(sampler.type) || sampler.type.shadow) {
+    const offsets = sampler.type.shadow ? depthReferenceClampOffsets : samplingOffsets;
     for (const binding of sampler.bindings) {
-      offset = roundUp(16, offset); samplingOffsets.set(binding, offset); offset += 16;
+      offset = roundUp(16, offset); offsets.set(binding, offset); offset += 16;
     }
   }
   let targetOffset = null;
@@ -258,7 +259,8 @@ function reflect(shared, units, varyings) {
     name, element: s.count === null ? null : element, glslType: s.type.name, dimension: s.type.dim,
     sampleType: s.type.shadow ? 'depth' : s.type.s === 'float' ? 'float' : s.type.s === 'int' ? 'sint' : 'uint',
     comparison: !!s.type.shadow, textureBinding: binding * 2, samplerBinding: binding * 2 + 1,
-    ...(samplingOffsets.has(binding) ? {samplingOffset: samplingOffsets.get(binding)} : {})}));
+    ...(samplingOffsets.has(binding) ? {samplingOffset: samplingOffsets.get(binding)} : {}),
+    ...(depthReferenceClampOffsets.has(binding) ? {depthReferenceClampOffset: depthReferenceClampOffsets.get(binding)} : {})}));
   return {
     uniformBufferSize: size, uniforms: fields, targetOffset, integerSampling: shared.integerSampling === true,
     blocks: [...shared.blocks].map(([name, members]) => ({name, members: members.map(m => fields.find(f => f.name === m))})),
@@ -607,8 +609,8 @@ class Unit {
       }
     }
     const uniformFields = this.shared.uniformOrder.map(n => { const u = this.shared.uniforms.get(n); return `  ${u.field}: ${this.wgslUniform(u.repr)},`; });
-    for (const sampler of this.shared.samplers.values()) if (integerSampler(sampler.type))
-      for (const binding of sampler.bindings) uniformFields.push(`  f3d_sampling_${binding}: vec4<u32>,`);
+    for (const sampler of this.shared.samplers.values()) if (integerSampler(sampler.type) || sampler.type.shadow)
+      for (const binding of sampler.bindings) uniformFields.push(`  f3d_${sampler.type.shadow ? 'depth_reference_clamp' : 'sampling'}_${binding}: vec4<u32>,`);
     if (this.shared.needsTarget) uniformFields.push('  f3d_target: vec4<f32>,');
     if (!uniformFields.length) uniformFields.push('  f3d_pad: vec4<f32>,');
     body.push('struct F3DUniforms {', ...uniformFields, '};', '@group(0) @binding(0) var<uniform> f3d_u: F3DUniforms;');
@@ -757,6 +759,7 @@ class Unit {
       if (p.type.k === 'smp') {
         params.push(`${w}_texture: ${textureType(p.type)}`, `${w}_sampler: ${p.type.shadow ? 'sampler_comparison' : 'sampler'}`);
         if (integerSampler(p.type)) params.push(`${w}_sampling: vec4<u32>`);
+        if (p.type.shadow) params.push(`${w}_depth_reference_clamp: u32`);
         scope.vars.set(p.name, {kind: 'samplerParam', type: p.type, w});
       } else if (p.q === 'out' || p.q === 'inout') {
         params.push(`${w}: ptr<function, ${this.wgsl(p.type)}>`);
@@ -1200,11 +1203,12 @@ class Unit {
   samplerNames(r, line) {
     if (!r.smp) essError('Expected a sampler', line);
     if (r.smp.kind === 'param') return {tex: `${r.smp.w}_texture`, smp: `${r.smp.w}_sampler`, type: r.t,
-      sampling: `${r.smp.w}_sampling`};
+      sampling: `${r.smp.w}_sampling`, depthReferenceClamp: `${r.smp.w}_depth_reference_clamp`};
     const s = r.smp.sampler, base = s.count === null ? safe(r.smp.name) : `${safe(r.smp.name)}_${r.smp.element}`;
     if (s.count !== null && r.smp.element === undefined) essError('Sampler arrays must be indexed with a constant', line);
     return {tex: `${base}_texture`, smp: `${base}_sampler`, type: s.type,
-      sampling: `f3d_u.f3d_sampling_${s.bindings[r.smp.element ?? 0]}`};
+      sampling: `f3d_u.f3d_sampling_${s.bindings[r.smp.element ?? 0]}`,
+      depthReferenceClamp: `f3d_u.f3d_depth_reference_clamp_${s.bindings[r.smp.element ?? 0]}.x`};
   }
   index(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
@@ -1513,6 +1517,7 @@ class Unit {
       if (p.type.k === 'smp') {
         const s = this.samplerNames(raw[i], e.line); callArgs.push(s.tex, s.smp);
         if (integerSampler(p.type)) callArgs.push(s.sampling);
+        if (p.type.shadow) callArgs.push(s.depthReferenceClamp);
         return;
       }
       if (p.q === 'out' || p.q === 'inout') {
@@ -1639,6 +1644,10 @@ class Unit {
     const vec4 = st.s === 'float' ? V('float', 4) : V(st.s, 4);
     const coordNeed = {'2d': 2, '3d': 3, 'cube': 3, '2d-array': 3}[st.dim] + (st.shadow ? 1 : 0);
     const isInt = st.s !== 'float';
+    if (st.shadow && name.startsWith('textureProj'))
+      return this.projectedShadowTextureCall(name, s, rest, ctx, line, expressions.slice(1));
+    if (st.shadow && ['textureLod', 'textureLodOffset', 'textureGrad', 'textureGradOffset'].includes(name))
+      essError('Shadow sampling with explicit LOD or gradients is not supported', line);
     if (isInt && ['texture', 'textureLod', 'textureGrad'].includes(name))
       return this.integerTextureCall(name, s, rest, ctx, line);
     if (!st.shadow && TEXTURE_SAMPLE_FORMS.has(name)) {
@@ -1664,12 +1673,17 @@ class Unit {
     };
     const call = (fn, extra = []) => {
       const p = coords(rest[0], coordNeed);
-      const list = [s.tex, s.smp, p.xy, ...(p.layer ? [p.layer] : []), ...(p.ref ? [p.ref] : []), ...extra];
+      const list = [s.tex, s.smp, p.xy, ...(p.layer ? [p.layer] : []), ...(p.ref ? [this.depthReference(s, p.ref)] : []), ...extra];
       return `${fn}(${list.join(', ')})`;
     };
     switch (name) {
       case 'texture': {
         if (isInt) essError('Filtered sampling of integer textures is not supported; use texelFetch', line);
+        if (st.shadow) {
+          if (rest.length > 1) essError('Shadow sampling with bias is not supported', line);
+          if (rest.length !== 1 || !same(rest[0].t, V('float', coordNeed)))
+            essError(`Shadow texture sampling needs vec${coordNeed} coordinates`, line);
+        }
         // Outside fragment shaders ESSL implicit LOD is the base level.
         if (this.stage !== 'fragment') return st.shadow ? {c: call('textureSampleCompareLevel'), t: FLOAT} : {c: call('textureSampleLevel', ['0.0']), t: vec4};
         if (st.shadow) return {c: call('textureSampleCompare'), t: FLOAT};
@@ -1682,7 +1696,17 @@ class Unit {
         return {c: call('textureSampleLevel', [rest[1].c]), t: vec4};
       }
       case 'textureGrad': if (st.shadow) essError('textureGrad on shadow samplers is not supported', line); return {c: call('textureSampleGrad', [rest[1].c, rest[2].c]), t: vec4};
-      case 'textureOffset': return {c: call(st.shadow ? 'textureSampleCompare' : 'textureSample', [rest[1].c]), t: st.shadow ? FLOAT : vec4};
+      case 'textureOffset': {
+        if (st.shadow) {
+          if (this.version !== 300) essError('Shadow offset sampling requires ESSL 3.00', line);
+          if (!['2d', '2d-array'].includes(st.dim)) essError('Shadow textureOffset requires a 2D or 2D-array depth sampler', line);
+          if (rest.length !== 2) essError('Shadow textureOffset expects a coordinate and constant offset; bias is not supported', line);
+          if (!same(rest[0].t, V('float', coordNeed))) essError(`Shadow textureOffset needs vec${coordNeed} coordinates`, line);
+          const delta = this.textureOffset(expressions[2], rest[1], 2, ctx, line);
+          return {c: call(this.stage === 'fragment' ? 'textureSampleCompare' : 'textureSampleCompareLevel', [delta]), t: FLOAT};
+        }
+        return {c: call('textureSample', [rest[1].c]), t: vec4};
+      }
       case 'textureLodOffset': return {c: call('textureSampleLevel', [rest[1].c, rest[2].c]), t: vec4};
       case 'textureProj': case 'textureProjLod': {
         if (st.dim !== '2d' || st.shadow) essError(`${name} is supported for sampler2D only`, line);
@@ -1698,6 +1722,33 @@ class Unit {
       }
     }
     essError(`Unsupported texture function ${name}`, line);
+  }
+  // GLES clamps Dref for fixed-point depth, but leaves floating depth references
+  // unchanged. The binding owner identifies the source image even when its UV
+  // replica uses depth32float; helper parameters retain that per-image flag.
+  depthReference(sampler, reference) {
+    return `select(${reference}, clamp(${reference}, 0.0, 1.0), ${sampler.depthReferenceClamp} != 0u)`;
+  }
+  /** ES 3.00 section 8.8 projects both the sample coordinate and Dref. The
+   * native comparison sampler keeps source filtering and comparison semantics;
+   * explicit LOD/gradients/bias need their own lowering, never a level-zero substitute. */
+  projectedShadowTextureCall(name, sampler, args, ctx, line, expressions) {
+    if (this.version !== 300) essError('Projected shadow sampling requires ESSL 3.00', line);
+    if (sampler.type.dim !== '2d') essError(`${name} needs a sampler2DShadow`, line);
+    if (!['textureProj', 'textureProjOffset'].includes(name))
+      essError('Projected shadow sampling with explicit LOD or gradients is not supported', line);
+    const offset = name === 'textureProjOffset', count = offset ? 2 : 1;
+    if (args.length === count + 1) {
+      if (this.stage !== 'fragment') essError(`${name} bias is only valid in fragment shaders`, line);
+      essError('Projected shadow sampling with bias is not supported', line);
+    }
+    if (args.length !== count) essError(`${name} expects ${count + 1} arguments without bias`, line);
+    if (!same(args[0].t, V('float', 4))) essError(`${name} needs vec4 coordinates for sampler2DShadow`, line);
+    const point = this.capture(args[0], ctx), projected = this.tmp();
+    ctx.pre.push(`let ${projected} = ${point.c}.xyz / ${point.c}.w;`);
+    const delta = offset ? this.textureOffset(expressions[1], args[1], 2, ctx, line) : null;
+    const fn = this.stage === 'fragment' ? 'textureSampleCompare' : 'textureSampleCompareLevel';
+    return {c: `${fn}(${sampler.tex}, ${sampler.smp}, ${projected}.xy, ${this.depthReference(sampler, `${projected}.z`)}${delta ? `, ${delta}` : ''})`, t: FLOAT};
   }
   /** Floating-point ES 3.00 section 8.8 sampling forms share the same operation
    * after projection and array-layer splitting. Explicit projected gradients

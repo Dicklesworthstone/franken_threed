@@ -8,6 +8,8 @@
  * charged, including NPOT tails.
  * The WebGL surface samples ordinary DepthTexture attachments through a separate
  * UV-oriented r32float image: no color conversion or half-float quantization.
+ * Comparison inputs use an independent depth32float image and preserve the
+ * source fixed/float comparison domain plus its initialized sampler lifetime.
  * Native node/compute inputs borrow the depth attachment directly, with distinct
  * ordinary and comparison samplers captured for each accepted use.
  * Native MRT inputs retain each ordered source color attachment, format and
@@ -387,13 +389,13 @@ struct SliceVertex {
 // replica uses the program renderer's existing sampler2D float binding route.
 // Its red channel is depth; G/B are zero and A is one. Never use RGBA8 or half
 // floats here: small depth errors become large reconstructed-distance errors.
-const DEPTH_FLIP_WGSL = flipY => `
+const DEPTH_FLIP_WGSL = (flipY, comparison = false) => `
 @group(0) @binding(0) var source: texture_depth_2d;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
   let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
   return vec4f(p[i], 0, 1);
 }
-@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) f32 {
+@fragment fn fs(@builtin(position) p: vec4f) -> ${comparison ? '@builtin(frag_depth)' : '@location(0)'} f32 {
   let size = textureDimensions(source);
   return textureLoad(source, vec2i(i32(p.x), ${flipY ? 'i32(size.y) - 1 - i32(p.y)' : 'i32(p.y)'}), 0);
 }`;
@@ -429,12 +431,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           if (historyGroups.get(group.target) === group) historyGroups.delete(group.target);
         }
       } else entry.storage?.dispose();
-      entry.sample?.destroy(); entry.depthSample?.destroy();
+      entry.sample?.destroy(); entry.depthSample?.destroy(); entry.depthComparison?.sample?.destroy();
       for (const sample of entry.colorSamples.values()) sample.sample?.destroy();
       entry.colorSamples.clear();
       allocatedBytes -= entry.charged; entry.charged = 0;
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
-      entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = null;
+      entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = entry.depthComparison = null;
       entry._wanted.clear();
       entry.releaseDepthOwner?.(); entry.releaseDepthOwner = null;
     }
@@ -678,7 +680,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       group.onDispose = () => retireHistory(group);
       historyGroups.set(target, group);
       if (existing?.alive) {
-        if (existing.sample || existing.colorSamples.size || existing.depthSample) fail('UNSUPPORTED', 'Pass histories require native attachment sampling');
+        if (existing.sample || existing.colorSamples.size || existing.depthSample || existing.depthComparison) fail('UNSUPPORTED', 'Pass histories require native attachment sampling');
         existing.historyGroup = group; existing.colorSlots = Object.freeze(shape.textures.map(() => 0));
         group.entries.add(existing); historyEntries.add(existing); group.variants.set(existing.colorSlots.join(','), existing);
         group.storage = existing.storage; group.charged = existing.charged; existing.charged = 0; existing.storage = null;
@@ -738,6 +740,33 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     depthTexture.isArrayTexture = depthViewDimension === '2d-array';
     Object.assign(depthTexture.image, {width, height, depth: depthLayers});
   }
+  function captureDepthSampler(texture) {
+    const parameters = Object.freeze({...captureWebGLTargetSampler(texture), compareFunction: texture.compareFunction});
+    // Exact WebGLTextures.getTextureCacheKey fields. Even unpack controls with
+    // no depth texel payload can select a new GL image after needsUpdate.
+    const key = JSON.stringify([texture.wrapS, texture.wrapT, texture.wrapR || 0,
+      texture.magFilter, texture.minFilter, texture.anisotropy, texture.internalFormat,
+      texture.format, texture.type, texture.generateMipmaps, texture.premultiplyAlpha,
+      texture.flipY, texture.unpackAlignment, texture.colorSpace]);
+    return {parameters, key, source: texture.source,
+      version: texture.version, sourceVersion: texture.source.version};
+  }
+  function depthSamplerState(entry, texture) {
+    const previous = entry.depthSetupSampler;
+    if (!previous) return captureDepthSampler(texture).parameters;
+    // r186 setTexture2D uploads depth parameters only after needsUpdate. A
+    // compare-only update reuses the GL image; clearing compareFunction never
+    // issues TEXTURE_COMPARE_MODE=NONE, so the previously installed mode stays.
+    if (texture.version === previous.version || texture.version === 0) return previous.parameters;
+    const next = captureDepthSampler(texture);
+    if (next.key !== previous.key || next.source !== previous.source)
+      fail('SAMPLER', 'Changing initialized depth storage parameters requires recreating the source target');
+    next.parameters = next.sourceVersion !== previous.sourceVersion
+      ? Object.freeze({...previous.parameters, compareFunction: next.parameters.compareFunction ?? previous.parameters.compareFunction})
+      : previous.parameters;
+    entry.depthSetupSampler = next;
+    return next.parameters;
+  }
   function ensure(entry) {
     assertCurrent(entry);
     const depthEntry = entry.depthEntry;
@@ -757,6 +786,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before acquiring target storage');
     prepareDepthTexture(entry);
+    if (flipY && entry.shape.depthTexture && !depthEntry)
+      entry.depthSetupSampler ??= captureDepthSampler(entry.shape.depthTexture);
     const {width, height, format, colorFormats, colorMipLevelCounts, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
     const nativeMrt = !flipY && (colorFormats.length > 1 || !cube && !array && !volume) || !!group;
     const mipOptions = nativeMrt ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
@@ -941,15 +972,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry.shape.cube || entry.shape.depthArray) fail('UNSUPPORTED', 'Cube and array depth sampling requires native texture bindings');
     if (entry.shape.sampleCount !== 1)
       fail('UNSUPPORTED', 'Multisampled depth requires a native per-sample binding, not the WebGL float replica');
-    if (texture.compareFunction != null)
-      fail('UNSUPPORTED', 'Comparison depth sampling requires the native depth binding, not the WebGL float replica');
+    const samplerState = depthSamplerState(entry, texture);
+    if (samplerState.compareFunction != null) return comparisonDepthSampling(entry, texture, samplerState);
     if (entry.busy) fail('REENTRANT', 'Cannot sample depth during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target depth');
     const filterable = device.features?.has?.('float32-filterable') === true;
-    if (!filterable && (texture.minFilter !== three.NearestFilter || texture.magFilter !== three.NearestFilter))
+    if (!filterable && (samplerState.minFilter !== three.NearestFilter || samplerState.magFilter !== three.NearestFilter))
       fail('SAMPLER', 'Linear depth sampling requires the device float32-filterable feature');
-    const descriptor = {...samplerDescriptor(texture, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1};
+    const descriptor = {...samplerDescriptor(samplerState, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1};
     const samplerKey = JSON.stringify(descriptor);
     ensure(entry);
     // Retirement may be requested by a throwing/reentrant host boundary. Do not
@@ -1002,6 +1033,67 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         version: texture.version, sourceVersion: texture.source.version};
     } finally { entry.busy = false; if (!entry.alive) release(entry); }
   }
+  // Public target attachments keep top-down rows. Comparison shaders need the
+  // same source UV orientation as ordinary sampler2D reads, but an R32F color
+  // replica cannot be bound as texture_depth_2d. Preserve the loaded depth in
+  // depth32float instead; comparison filtering needs no float32-filterable
+  // feature. Each replica has independent dirtiness and survives sampler edits.
+  function comparisonDepthSampling(entry, texture, samplerState) {
+    if (entry.busy) fail('REENTRANT', 'Cannot sample depth during a target submission');
+    const descriptor = {...samplerDescriptor(samplerState, three, 1), mipmapFilter: 'nearest', maxAnisotropy: 1,
+      compare: depthComparison(samplerState, three)};
+    const samplerKey = JSON.stringify(descriptor);
+    ensure(entry);
+    entry.busy = true;
+    try {
+      let sample = entry.depthComparison;
+      if (!sample) {
+        budget(entry.shape.depthSampleBytes);
+        sample = entry.depthComparison = {sample: null, dirty: true, copies: 0};
+        checked(entry, device => {
+          sample.sample = device.createTexture({label: 'Source target comparison depth UV sampling image',
+            size: {width: entry.shape.width, height: entry.shape.height, depthOrArrayLayers: 1},
+            format: 'depth32float', dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 4 | 16});
+          entry.charged += entry.shape.depthSampleBytes; allocatedBytes += entry.shape.depthSampleBytes;
+          sample.view = sample.sample.createView({aspect: 'depth-only'});
+          let pipeline = pipelines.get('depth-to-comparison');
+          if (!pipeline) {
+            const module = device.createShaderModule({label: 'Source target comparison depth UV orientation',
+              code: DEPTH_FLIP_WGSL(flipY, true)});
+            pipeline = device.createRenderPipeline({label: 'Source target comparison depth UV orientation', layout: 'auto',
+              vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: []},
+              primitive: {topology: 'triangle-list'},
+              depthStencil: {format: 'depth32float', depthCompare: 'always', depthWriteEnabled: true}});
+            pipelines.set('depth-to-comparison', pipeline);
+          }
+          sample.pipeline = pipeline;
+          entry.storage.withDepthTexture(source => {
+            sample.group = device.createBindGroup({layout: pipeline.getBindGroupLayout(0),
+              entries: [{binding: 0, resource: source.createView({aspect: 'depth-only'})}]});
+          });
+        });
+      }
+      if (sample.samplerKey !== samplerKey) {
+        sample.sampler = checked(entry, device => device.createSampler(descriptor));
+        sample.samplerKey = samplerKey;
+      }
+      if (sample.dirty) {
+        checked(entry, device => entry.storage.withDepthTexture(() => {
+          assertCurrent(entry);
+          const encoder = device.createCommandEncoder({label: 'Source target comparison depth UV orientation'});
+          const pass = encoder.beginRenderPass({colorAttachments: [], depthStencilAttachment: {
+            view: sample.view, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store'}});
+          pass.setPipeline(sample.pipeline); pass.setBindGroup(0, sample.group); pass.draw(3); pass.end();
+          assertCurrent(entry); device.queue.submit([encoder.finish()]);
+        }));
+        sample.dirty = false; sample.copies++;
+      }
+      assertCurrent(entry);
+      return {view: sample.view, sampler: sample.sampler, samplerDescriptor: Object.freeze(descriptor),
+        depthReferenceClamp: !entry.shape.depthFormat.startsWith('depth32float'),
+        sampleType: 'depth', viewDimension: '2d', version: texture.version, sourceVersion: texture.source.version};
+    } finally { entry.busy = false; if (!entry.alive) release(entry); }
+  }
   // r186 assigns renderTarget on DepthTexture without setting the color-only
   // isRenderTargetTexture flag. Never mutate source texture flags to route it.
   const textureTarget = texture => (texture?.isRenderTargetTexture === true || texture?.isDepthTexture === true)
@@ -1024,9 +1116,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           fail('FEEDBACK', 'A render pass cannot sample an attached color or depth image');
         const entry = capturedEntry?.(texture) ?? capture(target);
         if (entry.target !== target) fail('SOURCE', 'Captured texture generation belongs to another target');
-        if (entry.shape.depthTexture === texture) return depthSampling(entry, texture);
-        if (!entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
-        const binding = sampling(entry, texture);
+        const depth = entry.shape.depthTexture === texture;
+        if (!depth && !entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
+        const binding = depth ? depthSampling(entry, texture) : sampling(entry, texture);
         // Asynchronous source program preparation (PMREM) may hold this view
         // across pipeline compilation. The ordinary draw path stays synchronous;
         // the generator explicitly acquires/releases this existing generation.
@@ -1046,6 +1138,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function dirtyColor(entry, colorIndex) {
     if (colorIndex === 0) entry.dirty = true;
     else { const sample = entry.colorSamples.get(colorIndex); if (sample) sample.dirty = true; }
+  }
+  function dirtyDepth(entry) {
+    entry.depthDirty = true;
+    if (entry.depthComparison) entry.depthComparison.dirty = true;
   }
   function copyTarget(source, destination, options, depth = false, generateMipmaps = null) {
     assertCurrent(source); assertCurrent(destination);
@@ -1073,7 +1169,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     ensure(source); ensure(destination);
     source.busy = destination.busy = true;
     if (group) group.busy = true;
-    if (depth) { destination.depthDirty = true; if (destination.depthEntry) destination.depthEntry.depthDirty = true; }
+    if (depth) { dirtyDepth(destination); if (destination.depthEntry) dirtyDepth(destination.depthEntry); }
     else dirtyColor(destination, plan.colorIndex);
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
@@ -1387,8 +1483,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
       // Higher private depth levels never modify the source's level-zero depth.
       if (mipLevel === 0 && entry.shape.depthAttachment) {
-        entry.depthDirty = true;
-        if (entry.depthEntry) entry.depthEntry.depthDirty = true;
+        dirtyDepth(entry);
+        if (entry.depthEntry) dirtyDepth(entry.depthEntry);
       }
       const withFrame = borrowed ? (run, options) => borrowed.withFrame(run, {...options, colorSlots: entry.colorSlots,
         generateColorMipmaps}) : entry.storage.withFrame;

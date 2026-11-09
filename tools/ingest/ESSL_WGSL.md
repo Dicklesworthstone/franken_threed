@@ -61,6 +61,16 @@ admitted. The source rules are in the
   have side effects. `texelFetchOffset` preserves float, signed and unsigned
   payloads for 2D, 3D and array textures. The legacy `texture2DProjGradEXT` alias
   uses the same projected-gradient lowering.
+- ESSL 3.00 `sampler2DShadow` supports `textureProj` and `textureProjOffset`.
+  The complete `xyz` coordinate, including the comparison reference, is divided
+  by `w` exactly once. Fragment code uses native comparison sampling; vertex
+  code compares at the base level without implicit derivatives. Constant texel
+  offsets, sampler arrays and nested sampler helpers retain their source inputs.
+  Comparison bindings carry a `depthReferenceClampOffset` control in a 16-byte
+  uniform slot. Fixed-point source depth clamps the comparison reference to
+  `[0, 1]`; floating depth leaves it unchanged, including when both use an
+  oriented `depth32float` sampling image. The bound image owner supplies the
+  flag, so a later public texture edit cannot change an accepted image's domain.
 - Signed and unsigned integer 2D, 2D-array and 3D samplers implement nearest
   `texture`, `textureLod` and `textureGrad` through typed `textureLoad`, preserving
   all 32 bits. Helpers apply clamp/repeat/mirror addressing, rounded array layers,
@@ -142,10 +152,21 @@ admitted. The source rules are in the
 integer cube sampling and integer sampling bias, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
 Integer projected/filtered-offset sampling remains outside the admitted integer
-slice; integer `texelFetchOffset` is supported. Projected and explicit-gradient
-shadow sampling remain unimplemented.
+slice; integer `texelFetchOffset` is supported. Shadow sampling with bias,
+explicit LOD or explicit gradients remains unsupported; those forms are
+not approximated with implicit sampling or an arbitrary level.
 
 ## Evidence
+
+- `essl_shadow_sampling.test.mjs` covers projected comparison signatures,
+  projective depth-reference division, constant offsets, single evaluation,
+  helper/array propagation, mixed integer/depth metadata and actual source
+  ShaderMaterial program preparation. `three_program_depth_sampling.test.mjs`
+  exercises the public renderer through real target ownership and comparison
+  bindings. The six new shadow checkpoints in `program_texture_sampling.mjs`
+  are ready for browser comparison, but were not executed in this session;
+  Chromium could not launch in the available environment. Earlier pixel counts
+  below describe the earlier cases, not these new comparison paths.
 
 `essl_geometric.test.mjs` covers the typed scalar/vector boundary, stage-local
 helper reuse, constant normalization and one evaluation of helper arguments.

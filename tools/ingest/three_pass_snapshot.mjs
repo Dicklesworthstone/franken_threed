@@ -27,7 +27,7 @@ const positive = n => Number.isSafeInteger(n) && n > 0;
 const TYPED_ARRAYS = new Map([Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array].map(Type => [Type.prototype, Type]));
 const MATH = ['Vector2', 'Vector3', 'Vector4', 'Matrix3', 'Matrix4', 'Color', 'Quaternion', 'Euler', 'Plane', 'Sphere', 'Box3', 'Layers', 'Uniform'];
 const TEXTURE_STATE = ['version', 'format', 'type', 'colorSpace', 'mapping', 'channel', 'wrapS', 'wrapT', 'magFilter', 'minFilter',
-  'anisotropy', 'flipY', 'premultiplyAlpha', 'generateMipmaps', 'rotation', 'matrixAutoUpdate'];
+  'anisotropy', 'compareFunction', 'flipY', 'premultiplyAlpha', 'generateMipmaps', 'rotation', 'matrixAutoUpdate'];
 
 /** The projection portion of pinned Renderer._updateCamera. Reversal is a
  * source-visible, one-way camera transition, including ArrayCamera children.

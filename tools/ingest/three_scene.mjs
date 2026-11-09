@@ -534,9 +534,9 @@ export async function createGpuThreeScene(device,scene,{
   function textureBinding(t,reflection=null,initialize=false){
     const generated=pmremOwner?.binding(t)??programShadowOwner?.binding(t)??transmissionOwner?.binding(t);
     if(generated)return generated;
-    // Shadow-map depth textures belong to the program shadow owner, which binds
-    // them after preparing its maps; a scan only needs a stand-in.
-    if(t?.isDepthTexture&&textureScan)return placeholderBinding();
+    // A scan needs the reflected depth/comparison type before the target or
+    // program shadow owner prepares its actual sampled attachment.
+    if(t?.isDepthTexture&&textureScan)return placeholderBinding(t,reflection);
     return textureBindings.binding(t,reflection,{initialize});
   }
   function checkedBatchHistory(operation){
@@ -900,14 +900,16 @@ export async function createGpuThreeScene(device,scene,{
         if(texture!=null&&!(texture instanceof three.Texture))fail('TEXTURE',`Uniform ${t.name} is not a texture`);
         if(texture&&t.dimension!==textureBindings.dimension(texture))fail('TEXTURE',`Uniform ${t.name} texture dimension differs from its sampler`);
         const shadowMap=!!texture&&!!programShadowOwner?.binding(texture);
-        if(texture&&t.comparison&&!shadowMap&&!textureScan)fail('TEXTURE',`Sampler ${t.glslType} textures are not admitted yet`);
         // A shadow sampler without a rendered map (r186 binds an incomplete unit).
         if(!texture&&!textureScan&&/Shadow/.test(t.glslType))fail('SHADOW',`Shadow map ${t.name} was never rendered`);
         if(direct&&texture&&!textures.has(texture)&&!shadowMap){
           ownedTextures().prepare([texture]);retainedTextures.add(texture);
         }
         const binding=texture?textureBinding(texture,t,object.isBatchedMesh===true&&texture===object._indirectTexture):placeholderBinding(null,t);
-        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float',samplerDescriptor:binding.samplerDescriptor});textureKey.push(texture??null,binding.view,binding.sampler);
+        if(texture&&t.comparison&&!shadowMap&&!textureScan&&
+            (!texture.isDepthTexture||!binding.samplerDescriptor?.compare))
+          fail('TEXTURE',`Sampler ${t.glslType} requires an acknowledged depth comparison binding`);
+        sourceTextures.push(texture??null);bindings.push({view:binding.view,sampler:binding.sampler,sampleType:binding.sampleType??'float',samplerDescriptor:binding.samplerDescriptor,depthReferenceClamp:binding.depthReferenceClamp});textureKey.push(texture??null,binding.view,binding.sampler);
       }
       const raster=programSupport.raster(m,{side,topology});
       const options={program:compiled.program,textures:bindings,raster,topology,

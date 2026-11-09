@@ -37,7 +37,8 @@ export function gpuTargetMipmapFixture() {
       const passes = [];
       return {
         beginRenderPass(descriptor) {
-          const output = descriptor.colorAttachments[0].view;
+          const output = descriptor.colorAttachments?.[0]?.view ?? descriptor.depthStencilAttachment?.view;
+          assert.ok(output, 'a render pass has a color or depth attachment');
           assert.equal(output.descriptor.mipLevelCount, 1, 'a render attachment has one mip');
           assert.equal(output.texture.sampleCount, 1);
           const pass = {descriptor, ended: false, pipeline: null, group: null}; passes.push(pass);

@@ -141,6 +141,42 @@ async function capture(mode) {
             try {await draw((signed ? 'i' : 'u') + dimension + '-fetch-offset', value);} finally {value.dispose(); texture.dispose();}
           }
         }
+        // A depth pattern varying in both axes exposes row-orientation and
+        // projected-reference errors. Keep nearest comparison deterministic.
+        const depth = new T.DepthTexture(8, 8, T.FloatType); depth.compareFunction = T.LessEqualCompare;
+        depth.minFilter = depth.magFilter = T.NearestFilter;
+        const shadow = new T.WebGLRenderTarget(8, 8, {depthTexture: depth});
+        const producer = new T.RawShaderMaterial({glslVersion: T.GLSL3, vertexShader: vertex,
+          fragmentShader: 'precision highp float;in vec2 vUv;out vec4 color;void main(){' +
+            'gl_FragDepth=.15+vUv.x*.25+vUv.y*.5;color=vec4(0.);}', blending: T.NoBlending});
+        try {
+          mesh.material = producer; renderer.setRenderTarget(shadow); renderer.render(mesh, camera);
+          if (mode === 'candidate') await renderer.waitForGPU();
+          renderer.setRenderTarget(output);
+          for (const [name, expression] of [
+            ['shadow-proj', 'textureProj(item,p)'],
+            ['shadow-divided', 'texture(item,p.xyz/p.w)'],
+            ['shadow-proj-offset', 'textureProjOffset(item,p,delta)'],
+            ['shadow-divided-offset', 'textureOffset(item,p.xyz/p.w,delta)'],
+          ]) {
+            const shader = 'precision highp float;precision highp int;in vec2 vUv;out vec4 color;' +
+              'uniform highp sampler2DShadow image;int calls=0;' +
+              'vec4 point(){calls++;float q=1.25+vUv.y;return vec4(vUv*q,.8,q);}' +
+              `float tap(highp sampler2DShadow item,vec4 p){const ivec2 delta=ivec2(1,-1);return ${expression};}` +
+              'void main(){float visibility=tap(image,point());color=vec4(visibility,float(calls),0.,1.);}';
+            const value = material(depth, shader);
+            try {await draw(name, value);} finally {value.dispose();}
+          }
+          for (const [name, expression] of [
+            ['shadow-vertex-proj', 'textureProj(image,vec4(.6,1.4,1.1,2.))'],
+            ['shadow-vertex-proj-offset', 'textureProjOffset(image,vec4(.6,1.4,1.1,2.),ivec2(1,-1))'],
+          ]) {
+            const vs = 'precision highp float;in vec3 position;uniform highp sampler2DShadow image;flat out float visibility;' +
+              `void main(){visibility=${expression};gl_Position=vec4(position.xy,0.,1.);}`;
+            const value = material(depth, 'precision highp float;flat in float visibility;out vec4 color;void main(){color=vec4(visibility);}', vs);
+            try {await draw(name, value);} finally {value.dispose();}
+          }
+        } finally {renderer.setRenderTarget(output); producer.dispose(); shadow.dispose();}
         return {frames, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
       } finally {output.dispose(); geometry.dispose(); renderer.dispose();}
     }, mode);
@@ -157,6 +193,10 @@ try {
   assert.notDeepEqual(frame('2D-offset'), frame('2D-offset-bias'), 'offset bias selects another source mip');
   assert.deepEqual(frame('2D-proj'), frame('2D-proj-vec3'), '2D vec4 projection ignores its third component');
   assert.deepEqual(frame('2D-proj-grad'), frame('legacy-proj-grad'), 'r186 legacy gradient alias keeps projection semantics');
+  assert.deepEqual(frame('shadow-proj'), frame('shadow-divided'), 'source projection divides the depth reference as well as xy');
+  assert.deepEqual(frame('shadow-proj-offset'), frame('shadow-divided-offset'), 'source offset applies after shadow projection');
+  assert.notDeepEqual(frame('shadow-proj'), frame('shadow-proj-offset'), 'shadow offsets select different source depth texels');
+  assert.notDeepEqual(frame('shadow-vertex-proj'), frame('shadow-vertex-proj-offset'), 'vertex comparison uses the source base depth level');
   for (const [index, expected] of source.frames.entries()) {
     const actual = candidate.frames[index]; assert.equal(actual.name, expected.name);
     const difference = actual.pixels.findIndex((value, offset) => value !== expected.pixels[offset]);

@@ -22,6 +22,12 @@ for(const kind of ['BasicShadowMap','PCFShadowMap','VSMShadowMap'])for(const lig
   const settings={enabled:true,autoUpdate:true,needsUpdate:false,type:T[kind]};
   try{
     await owner.prepare([light],scene,camera,settings,null);
+    const depth=light.shadow.map.depthTexture,binding=owner.binding(depth),sourceType=depth.type;
+    assert.equal(binding.depthReferenceClamp,kind!=='VSMShadowMap');
+    assert.equal(binding.samplerDescriptor.compare,kind==='PCFShadowMap'?'less-equal':undefined);
+    depth.type=sourceType===T.FloatType?T.UnsignedIntType:T.FloatType;
+    assert.equal(owner.binding(depth).depthReferenceClamp,kind!=='VSMShadowMap','private bindings retain the captured source depth domain');
+    depth.type=sourceType;
     const issue=owner.render([light],scene,camera,settings,null);assert.equal(typeof issue,'function');issue();
     const passes=d.submissions.at(-1).flat();
     assert.equal(passes.length,kind==='VSMShadowMap'?3:1);
@@ -38,6 +44,53 @@ for(const kind of ['BasicShadowMap','PCFShadowMap','VSMShadowMap'])for(const lig
   }finally{owner.dispose();}
   assert.ok(d.textures.every(x=>x.destroyed));assert.ok(d.buffers.every(x=>x.destroyed));
  });
+
+test('custom shadow caster draws pack each admitted comparison depth domain',async()=>{
+  const d=geometryDevice(),textures=textureDevice();Object.assign(d.limits,textures.limits);
+  Object.assign(d,{features:textures.features,textures:textures.textures,createTexture:textures.createTexture,createSampler:textures.createSampler});
+  const sources=[new T.DepthTexture(2,2,T.UnsignedIntType),new T.DepthTexture(2,2,T.FloatType)];
+  const descriptor=Object.freeze({compare:'less-equal',magFilter:'nearest',minFilter:'nearest'});
+  const bindings=new Map(sources.map((source,index)=>{
+    const texture=d.createTexture({size:[2,2],format:'depth32float',usage:4});
+    return [source,{view:texture.createView(),sampler:d.createSampler(descriptor),samplerDescriptor:descriptor,
+      sampleType:'depth',depthReferenceClamp:index===0}];
+  }));
+  const scene=new T.Scene(),camera=new T.PerspectiveCamera(50,1,.1,20);camera.position.z=4;camera.updateMatrixWorld();
+  const object=new T.Mesh(new T.PlaneGeometry(),new T.MeshBasicMaterial());object.castShadow=true;object.frustumCulled=false;
+  const custom=new T.RawShaderMaterial({glslVersion:T.GLSL3,uniforms:{images:{value:sources}},
+    vertexShader:'precision highp float;in vec3 position;void main(){gl_Position=vec4(position,1.);}',
+    fragmentShader:'precision highp float;uniform highp sampler2DShadow images[2];void main(){'+
+      'float v=textureProj(images[0],vec4(.5,.5,-2.,2.))+textureOffset(images[1],vec3(.5,.5,-1.),ivec2(0));if(v<.5)discard;}'});
+  object.customDepthMaterial=custom;
+  const light=new T.DirectionalLight();light.position.z=3;light.castShadow=true;light.shadow.mapSize.set(8,8);
+  scene.add(object,light);scene.updateMatrixWorld();
+  const support=createThreeProgramSupport({three:T,state:()=>({toneMapping:T.NoToneMapping,outputColorSpace:T.LinearSRGBColorSpace})});
+  let reflection;const packed=[];
+  const tracked={...support,pack(...args){
+    reflection=args[0];const result=support.pack(...args),options=args[5];
+    assert.deepEqual(options.textureBindings.map(b=>b.depthReferenceClamp),[true,false]);
+    assert.ok(options.textureBindings.every(b=>b.samplerDescriptor===descriptor));
+    packed.push(reflection.textures.map(t=>new DataView(args[4].buffer).getUint32(t.depthReferenceClampOffset,true)));
+    return result;
+  }};
+  const owner=createThreeProgramShadows({three:T,device:d,support:tracked,bindingOf:texture=>bindings.get(texture)});
+  const settings={enabled:true,autoUpdate:true,needsUpdate:false,type:T.PCFShadowMap};
+  try{
+    await owner.prepare([light],scene,camera,settings,null);
+    owner.render([light],scene,camera,settings,null)();
+    assert.deepEqual(packed,[[1,0]]);
+    const draws=d.snapshots.flat();assert.equal(draws.length,1);
+    const group=draws[0].groups.get(0),resource=group.group.entries.find(e=>e.resource.buffer).resource;
+    const bytes=draws[0].contents.get(resource.buffer),base=(resource.offset??0)+(group.offsets[0]??0);
+    const view=new DataView(bytes.buffer,bytes.byteOffset);
+    assert.deepEqual(reflection.textures.map(t=>view.getUint32(base+t.depthReferenceClampOffset,true)),[1,0]);
+    assert.deepEqual(draws[0].groups.get(1).group.entries.filter(e=>e.resource.texture).map(e=>e.resource),sources.map(source=>bindings.get(source).view));
+  }finally{
+    owner.dispose();support.dispose();custom.dispose();object.geometry.dispose();object.material.dispose();
+    for(const [source,binding]of bindings){source.dispose();binding.view.texture.destroy();}
+  }
+});
+
 for(const sampleCount of [1,4])test(`RG16F attachment admission does not depend on optional float32 features (${sampleCount} samples)`,()=>{
   const p=createAnimationColorTargetProfile({features:new Set()},{format:'rg16float',sampleCount},message=>{throw Error(message);});
   assert.equal(p.blendable,true);assert.deepEqual(p.blendModes(),[false,true]);p.assertBlend({});

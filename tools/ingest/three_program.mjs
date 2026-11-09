@@ -240,6 +240,13 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
         : [wrap(texture?.wrapS), wrap(texture?.wrapT), wrap(texture?.wrapR), texture?.minFilter === T.NearestMipmapNearestFilter ? 1 : 0];
       for (let i = 0; i < 4; i++) view.setUint32(t.samplingOffset + i * 4, controls[i], true);
     }
+    if (t.depthReferenceClampOffset !== undefined) {
+      // Comparison replicas can use depth32float for fixed-point source images.
+      // Public texture edits cannot override the admitted image's depth domain;
+      // private floating shadow owners need no clamp and omit this flag.
+      const clamp = textureBindings?.[index]?.depthReferenceClamp === true;
+      for (let i = 0; i < 4; i++) view.setUint32(t.depthReferenceClampOffset + i * 4, i === 0 && clamp ? 1 : 0, true);
+    }
     return texture;
   });
 }
