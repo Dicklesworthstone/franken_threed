@@ -639,6 +639,30 @@ test('native omitted regions copy only the first layer and retain the source bas
   assert.equal(f.commands.length, before, 'nonzero source mip cannot silently shrink an omitted source region');
 });
 
+for (const kind of ['storage', 'sampled', 'target']) for (const dimension of ['2d-array', '3d'])
+test(`${kind} ${dimension} omitted regions reach ordinary target and storage destinations without copying sibling slices`, async t => {
+  const f = cubeSetup(t, {producers: true});
+  let source, nativeSource;
+  if (kind === 'storage') {
+    source = gpuSource(f, {dimension}); nativeSource = storageNative(f, source); pattern(nativeSource);
+  } else if (kind === 'sampled') {
+    const Type = dimension === '3d' ? f.T.Data3DTexture : f.T.DataArrayTexture;
+    source = new Type(Uint8Array.from({length: 4 * 4 * 4 * 4}, (_, index) => (index * 17 + 13) % 251), 4, 4, 4);
+    nativeSource = sampledNative(f, source);
+  } else {
+    const target = f.target({dimension, depth: 4}); source = target.texture;
+    nativeSource = targetNative(f, target); pattern(nativeSource);
+  }
+  const target = f.target({dimension: '2d', mips: 1}), storage = gpuSource(f);
+  f.renderer.copyTextureToTexture(source, target.texture);
+  f.renderer.copyTextureToTexture(source, storage);
+  for (const native of [targetNative(f, target), storageNative(f, storage)])
+    checkRegion(nativeSource, native, {size: [4, 4, 1]});
+  assert.deepEqual(f.commands.slice(-2).map(command => command.size), [[4, 4, 1], [4, 4, 1]]);
+  assert.deepEqual(f.renderer.inspections, [[source, target.texture], [source, storage]]);
+  await f.renderer.waitForGPU();
+});
+
 test('queued producer copies observe GPU bytes at their FIFO position and freeze boxes and destination initialization', async t => {
   const f = cubeSetup(t, {producers: true}), source = gpuSource(f, {width: 2}), nativeSource = storageNative(f, source);
   const destination = new f.T.DataTexture(rgba([1, 2, 3, 4]), 2, 2), region = box(0, 0, 0, 1, 1, 1), position = point(0, 0, 0);

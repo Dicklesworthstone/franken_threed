@@ -149,7 +149,7 @@ export function cubeCopyFixture(options = {}) {
   }
   function storageTexture({dimension = '2d-array', width = 4, height = width, depth = 6, mips = 3, format = 'rgba8unorm'} = {}) {
     const shape = {width, height, depth, mipLevelCount: mips, viewDimension: dimension, format};
-    const texture = {isStorageTexture: true, shape};
+    const texture = {isTexture: true, isStorageTexture: true, image: {width, height, depth}, shape};
     const native = device.createTexture({size: {width, height, depthOrArrayLayers: depth},
       format, dimension: dimension === '3d' ? '3d' : '2d', mipLevelCount: mips, usage: 3});
     texture.entry = {texture, shape, native, alive: true}; return texture;

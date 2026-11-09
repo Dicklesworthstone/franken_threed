@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
-import {targetCopyFixture, point, failure} from './three_target_copy_fixtures.mjs';
+import {targetCopyFixture, box, point, failure} from './three_target_copy_fixtures.mjs';
 const filename = new URL('./three_storage_texture_copy.mjs', import.meta.url);
 const boundaries = new Map([
   ['./three_storage_texture_transfer.mjs', 'export const createStorageTextureTransfers = renderer => renderer._pixelTransfers;'],
@@ -37,10 +37,10 @@ test('public initialized native copies reach cube target destinations without a 
   assert.equal(f.commands.length, 1); assert.equal(f.commands[0].to.origin.z, 5); assert.equal(f.legacy.length, 0);
 });
 
-test('the public native path admits complete cube sources and array targets', () => {
+test('the public native path admits explicitly selected complete cube sources and array targets', () => {
   const f = fixture(), source = f.target({dimension: 'cube', pointer: false}), destination = f.target({dimension: '2d-array', depth: 6});
-  f.renderer.copyTextureToTexture(source.texture, destination.texture);
-  assert.equal(f.commands.length, 6); assert.equal(f.legacy.length, 0);
+  f.renderer.copyTextureToTexture(source.texture, destination.texture, box(0, 0, 0, 4, 4, 6));
+  assert.equal(f.commands.length, 1); assert.deepEqual(f.commands[0].size, [4, 4, 6]); assert.equal(f.legacy.length, 0);
 });
 
 test('WebGL, target depth and pre-initialization calls retain their existing transfer path', () => {
@@ -56,14 +56,14 @@ test('WebGL, target depth and pre-initialization calls retain their existing tra
 
 test('source-shaped cube-to-storage copies share the new generation-aware submission slot', () => {
   const f = fixture(), source = f.target({dimension: 'cube', pointer: false}); f.renderer._preparing = true;
-  f.renderer.copyTextureToTexture(source.texture, f.storageTexture());
+  f.renderer.copyTextureToTexture(source.texture, f.storageTexture(), box(0, 0, 0, 4, 4, 6));
   assert.equal(f.renderer._pending.length, 1); f.flush();
   assert.deepEqual(f.commands[0].size, [4, 4, 6]); assert.equal(f.legacy.length, 0);
 });
 
 test('sampled-image and inherited copy routes are not redirected into native target copies', () => {
   const f = fixture(), destination = f.target();
-  f.renderer.copyTextureToTexture({isTexture: true}, destination.texture);
+  f.renderer.copyTextureToTexture({isTexture: true, image: {width: 4, height: 4}}, destination.texture);
   assert.equal(f.renderer._sampledCalls.length, 1); assert.equal(f.commands.length, 0);
   assert.equal(f.renderer.copyTextureToTexture({}, {}), 'inherited'); assert.equal(f.renderer._fallbackCalls.length, 1);
 });
@@ -77,7 +77,7 @@ test('native write guards run before any target is retained or work is queued', 
 
 test('the public facade keeps deferred failures visible after the failed request is released', async () => {
   const f = fixture(), source = f.target({dimension: 'cube'}), destination = f.target({dimension: 'cube'});
-  f.renderer._preparing = true; f.renderer.copyTextureToTexture(source.texture, destination.texture);
+  f.renderer._preparing = true; f.renderer.copyTextureToTexture(source.texture, destination.texture, box(0, 0, 0, 4, 4, 6));
   source.dispose(); f.flush();
   assert.throws(() => f.renderer.copyTextureToTexture(source.texture, destination.texture), {code: 'TARGET_DISPOSED'});
   await assert.rejects(f.renderer.waitForGPU(), {code: 'TARGET_DISPOSED'});
@@ -86,7 +86,7 @@ test('the public facade keeps deferred failures visible after the failed request
 
 test('renderer disposal cancels the complete queued target range', () => {
   const f = fixture(), source = f.target({dimension: 'cube'}), destination = f.target({dimension: 'cube'});
-  f.renderer._preparing = true; f.renderer.copyTextureToTexture(source.texture, destination.texture);
+  f.renderer._preparing = true; f.renderer.copyTextureToTexture(source.texture, destination.texture, box(0, 0, 0, 4, 4, 6));
   f.renderer.dispose(); f.flush();
   assert.equal(f.commands.length, 0); assert.equal(f.releases, 2);
   assert.throws(() => f.renderer.copyTextureToTexture(source.texture, destination.texture), {code: 'THREE_STORAGE_COPY_DISPOSED'});

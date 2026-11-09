@@ -41,29 +41,36 @@ export function withStorageTextureCopies(Base) {
       }
       if (!this.isWebGPURenderer) fail('ROUTE', 'Storage texture copies require the WebGPU renderer surface');
       if (!this._initialized) fail('INITIALIZATION', 'Initialize the renderer before copying textures');
+      // r186's public copy defaults to the BASE image width/height and one
+      // slice, even for an array, volume or nonzero source mip. The internal
+      // range planner can copy a whole mip; that default is not the source API.
+      // Resolve only on an admitted native route so inherited operations keep
+      // their own argument/error behavior, and capture the scalar extent now.
+      const sourceRegion = () => region === null ? {isBox2: true,
+        min: {x: 0, y: 0}, max: {x: source.image.width, y: source.image.height}} : region;
       const rejected = error => {
         if (!failures.has(this)) failures.set(this, error);
         this._deferredError ??= error;
       };
       let request;
       if (nativeTargets) {
-        request = captureTargetColorCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
+        request = captureTargetColorCopy(this, source, destination, sourceRegion(), position, sourceLevel, destinationLevel);
       } else if (targetColor(source) && destination?.isStorageTexture) {
-        request = captureTargetToStorageCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
+        request = captureTargetToStorageCopy(this, source, destination, sourceRegion(), position, sourceLevel, destinationLevel);
       } else if (source?.isStorageTexture && targetColor(destination)) {
-        request = captureStorageToTargetCopy(this, source, destination, region, position, sourceLevel, destinationLevel);
+        request = captureStorageToTargetCopy(this, source, destination, sourceRegion(), position, sourceLevel, destinationLevel);
       } else if (source?.isStorageTexture && destination?.isStorageTexture) {
         const owner = this._storageTextures;
-        const copy = owner.captureCopy(source, destination, region, position, sourceLevel, destinationLevel);
+        const copy = owner.captureCopy(source, destination, sourceRegion(), position, sourceLevel, destinationLevel);
         request = {issue: () => { owner.copy(copy); }};
       } else if ((source?.isStorageTexture || targetColor(source)) && destination?.isTexture &&
           !destination.isStorageTexture && !destination.isRenderTargetTexture && !destination.isDepthTexture && !destination.isFramebufferTexture) {
-        copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
+        copySampledTexture(this, source, destination, sourceRegion(), position, sourceLevel, destinationLevel, rejected);
         this.inspector?.copyTextureToTexture?.(source, destination);
         return;
       } else if (source?.isTexture && !source.isStorageTexture && !source.isRenderTargetTexture &&
           (destination?.isStorageTexture || destination?.isRenderTargetTexture || destination?.isTexture)) {
-        copySampledTexture(this, source, destination, region, position, sourceLevel, destinationLevel, rejected);
+        copySampledTexture(this, source, destination, sourceRegion(), position, sourceLevel, destinationLevel, rejected);
         this.inspector?.copyTextureToTexture?.(source, destination);
         return;
       } else {

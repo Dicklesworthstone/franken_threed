@@ -240,7 +240,7 @@ for (const kind of ['storage', 'target']) test(`public copyTextureToTexture rout
   const source = kind === 'storage' ? f.storageTexture() : f.target();
   const native = kind === 'storage' ? source.entry.native : f.native(source); pattern(native);
   const texture = kind === 'storage' ? source : source.texture;
-  assert.equal(renderer.copyTextureToTexture(texture, destination.texture, null, null, 1, 1), undefined);
+  assert.equal(renderer.copyTextureToTexture(texture, destination.texture, box(0, 0, 0, 2, 2, 6), null, 1, 1), undefined);
   checkRegion(native, f.native(destination), {sourceLevel: 1, destinationLevel: 1});
   assert.deepEqual(renderer.writeChecks, [destination.texture]); assert.equal(renderer.inspections.length, 1);
   await renderer.waitForGPU(); renderer.dispose();

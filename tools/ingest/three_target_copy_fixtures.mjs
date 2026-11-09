@@ -92,7 +92,8 @@ export function targetCopyFixture() {
     format = 'rgba8unorm', samples = 1, count = 1, pointer = true} = {}) {
     const cube = dimension === 'cube', volume = dimension === '3d', array = dimension === '2d-array';
     const target = {epoch: 1}, textures = Array.from({length: count}, () => ({isTexture: true,
-      isRenderTargetTexture: true, renderTarget: pointer ? target : null}));
+      isRenderTargetTexture: true, renderTarget: pointer ? target : null,
+      image: cube ? Array.from({length: 6}, () => ({width, height})) : {width, height, depth}}));
     const colors = textures.map(() => ({width, height, format, mipLevelCount: mips}));
     const entry = {target, epoch: 1, alive: true, lifetime: new AbortController(),
       shape: {...colors[0], cube, volume, array, layers: cube ? 6 : depth,
@@ -107,7 +108,7 @@ export function targetCopyFixture() {
   }
   function storageTexture({dimension = '2d-array', width = 4, height = 4, depth = 6, mips = 3, format = 'rgba8unorm'} = {}) {
     const texture = {isTexture: true, isStorageTexture: true,
-      shape: {width, height, depth, mipLevelCount: mips, viewDimension: dimension, format}};
+      image: {width, height, depth}, shape: {width, height, depth, mipLevelCount: mips, viewDimension: dimension, format}};
     texture.entry = {texture, shape: texture.shape, alive: true, native: {storage: texture}};
     return texture;
   }

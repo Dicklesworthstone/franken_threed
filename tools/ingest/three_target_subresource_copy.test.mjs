@@ -17,6 +17,16 @@ const drain = async renderer => { while (renderer._drain) await renderer._drain;
 async function fixture(t, initialized = true) {
   const f = mrtTransferDevice(); f.device.features = new Set();
   f.device.limits.maxTextureDimension3D = 2048;
+  const encoder = f.device.createCommandEncoder;
+  f.device.createCommandEncoder = () => {
+    const result = encoder();
+    const origin = value => Array.isArray(value) ? {x: value[0], y: value[1], z: value[2]} : value;
+    return {...result, copyTextureToTexture(source, destination, size) {
+      result.copyTextureToTexture({...source, origin: origin(source.origin)},
+        {...destination, origin: origin(destination.origin)}, Array.isArray(size)
+          ? {width: size[0], height: size[1], depthOrArrayLayers: size[2]} : size);
+    }};
+  };
   const canvas = {width: 4, height: 4, style: {}, getContext: () => ({
     configure() {}, unconfigure() {}, getCurrentTexture() { throw new Error('Transfers do not render the canvas'); },
   })};
@@ -50,6 +60,63 @@ function sourceCopy(texture, region, position, sourceLevel, destinationLevel) {
 }
 const descriptor = copy => ({from: copy.source.origin, to: copy.destination.origin, size: copy.size,
   sourceLevel: copy.source.mipLevel, destinationLevel: copy.destination.mipLevel});
+
+for (const kind of ['array', 'volume']) for (const offset of [0, 2])
+test(`${kind}: omitted copy region transfers only the first source slice into slice ${offset}`, async t => {
+  const f = await fixture(t), r = f.renderer, source = target(t, {kind}), destination = target(t, {kind, count: 2});
+  const expected = imageBytes(8, 71), untouched = imageBytes(8, 193);
+  await r.writeRenderTargetPixelsAsync(source, expected, {face: 0});
+  for (let face = 0; face < 4; face++)
+    await r.writeRenderTargetPixelsAsync(destination, untouched, {face, colorIndex: 1});
+  const position = new T.Vector3(0, 0, offset);
+  assert.equal(r.copyTextureToTexture(source.texture, destination.textures[1], null, position), undefined);
+  assert.equal(f.copies.length, 1);
+  assert.deepEqual(f.copies.map(descriptor), sourceCopy(source.texture, null, position, 0, 0));
+  for (let face = 0; face < 4; face++)
+    assert.deepEqual(await r.readRenderTargetMipPixelsAsync(destination, 0, {face, colorIndex: 1}),
+      face === offset ? expected : untouched, `destination slice ${face}`);
+  await r.waitForGPU(); assert.equal(r._targets.capture(source).references, 0);
+  assert.equal(r._targets.capture(destination).references, 0);
+});
+
+for (const kind of ['array', 'volume']) test(`${kind}: omitted region can copy a layered source into an ordinary 2D target`, async t => {
+  const f = await fixture(t), r = f.renderer, source = target(t, {kind}), destination = target(t);
+  const expected = imageBytes(8, 97);
+  await r.writeRenderTargetPixelsAsync(source, expected, {face: 0});
+  r.copyTextureToTexture(source.texture, destination.texture);
+  assert.deepEqual(f.copies.map(descriptor), sourceCopy(source.texture, null, null, 0, 0));
+  assert.deepEqual(await r.readRenderTargetMipPixelsAsync(destination, 0), expected);
+  await r.waitForGPU();
+});
+
+test('omitted region keeps the source base-image extent at higher mips instead of shrinking the requested copy', async t => {
+  const f = await fixture(t), r = f.renderer, source = target(t), destination = target(t);
+  const [reference] = sourceCopy(source.texture, null, null, 1, 1);
+  assert.deepEqual(reference.size, {width: 8, height: 8, depthOrArrayLayers: 1});
+  assert.throws(() => r.copyTextureToTexture(source.texture, destination.texture, null, null, 1, 1),
+    {code: 'THREE_STORAGE_COPY_BOUNDS'});
+  assert.equal(f.copies.length, 0); assert.equal(r._targets.allocatedBytes, 0);
+  assert.equal(r._targets.capture(source).references, 0); assert.equal(r._targets.capture(destination).references, 0);
+});
+
+test('queued omitted regions retain source dimensions through source-managed resize and Inspector observes the accepted copy once', async t => {
+  const f = await fixture(t), r = f.renderer, source = target(t, {kind: 'array'}), destination = target(t);
+  const expected = imageBytes(8, 37), inspections = [];
+  r.inspector.copyTextureToTexture = (...args) => inspections.push(args);
+  await r.writeRenderTargetPixelsAsync(source, expected, {face: 0});
+  const previous = r._targets.capture(source); r._preparing = Promise.resolve();
+  r.copyTextureToTexture(source.texture, destination.texture);
+  assert.deepEqual(inspections, [[source.texture, destination.texture]]);
+  r._targets.withNativePassResize(source, 16, 16, () => source.setSize(16, 16, 4));
+  const next = r._targets.capture(source); r._targets.ensure(next);
+  assert.notEqual(previous, next); assert.equal(previous.references, 1);
+  r._preparing = null; await drain(r);
+  assert.deepEqual(await r.readRenderTargetMipPixelsAsync(destination, 0), expected);
+  assert.equal(f.copies[0].source.texture.width, 8);
+  assert.deepEqual(f.copies[0].size, {width: 8, height: 8, depthOrArrayLayers: 1});
+  assert.equal(inspections.length, 1); assert.equal(previous.references, 0); assert.equal(previous.alive, false);
+  await r.waitForGPU();
+});
 
 for (const profile of [
   {kind: '2d', from: [1, 1, 0], to: [0, 0, 0], extent: [2, 2, 1], levels: [1, 2]},
