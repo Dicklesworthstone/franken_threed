@@ -14,6 +14,16 @@ export class ThreeDepthTextureError extends Error {
 const fail = (code, message) => { throw new ThreeDepthTextureError(code, message); };
 const positive = value => Number.isSafeInteger(value) && value > 0;
 
+/** Pinned WebGPUTextureUtils depth format/type mapping, independent of residency. */
+export function threeDepthTextureFormat(texture, three) {
+  if (texture.format === three.DepthStencilFormat)
+    return texture.type === three.UnsignedInt248Type ? 'depth24plus-stencil8'
+      : texture.type === three.FloatType ? 'depth32float-stencil8' : null;
+  if (texture.format !== three.DepthFormat) return null;
+  return texture.type === three.UnsignedShortType ? 'depth16unorm'
+    : texture.type === three.UnsignedIntType ? 'depth24plus' : texture.type === three.FloatType ? 'depth32float' : null;
+}
+
 export function createThreeDepthTextures({three, device, getSamples = () => 1, signal = null, maxTextures = 256,
   maxBytes = 64 * 1024 * 1024, maxBindings = 4096, maxSamplers = 256, maxPending = 1024} = {}) {
   if (typeof three?.DepthTexture !== 'function' || !device?.queue || typeof getSamples !== 'function' ||
@@ -80,17 +90,17 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
     if (![three.DepthFormat, three.DepthStencilFormat].includes(texture.format) || texture.internalFormat != null || texture.colorSpace !== three.NoColorSpace ||
         texture.generateMipmaps !== false || texture.mipmaps?.length || texture.flipY !== false || texture.image?.data != null)
       fail('FORMAT', 'Detached depth requires no pixels, mipmaps, color transform or internal format override');
-    const format = texture.format === three.DepthStencilFormat
-      ? texture.type === three.UnsignedInt248Type ? 'depth24plus-stencil8' : null
-      : texture.type === three.UnsignedIntType ? 'depth24plus' : texture.type === three.FloatType ? 'depth32float' : null;
-    if (!format) fail('FORMAT', 'Detached depth requires matching 24-bit, float32 or 24-bit depth/stencil storage');
+    const format = threeDepthTextureFormat(texture, three);
+    if (!format) fail('FORMAT', 'Unsupported source depth format/type combination');
+    if (format === 'depth32float-stencil8' && !device.features?.has?.(format))
+      fail('FEATURE', 'depth32float-stencil8 must be enabled on the supplied device');
     const requestedSamples = getSamples(), sampleCount = requestedSamples || 1;
     if (![1, 4].includes(sampleCount)) fail('SAMPLES', 'Detached depth requires one or four native samples');
     const width = texture.image?.width || 1, height = texture.image?.height || 1;
     if (!positive(width) || !positive(height) || (texture.image?.depth ?? 1) !== 1 ||
         width > device.limits.maxTextureDimension2D || height > device.limits.maxTextureDimension2D)
       fail('SHAPE', 'Detached depth dimensions must fit one 2D GPU texture');
-    const size = width * height * (format === 'depth24plus-stencil8' ? 8 : 4) * sampleCount;
+    const size = width * height * (format.endsWith('-stencil8') ? 8 : format === 'depth16unorm' ? 2 : 4) * sampleCount;
     if (!Number.isSafeInteger(size)) fail('BUDGET', 'Depth texture byte size exceeds integer precision');
     return Object.freeze({width, height, format, sampleCount, bytes: size});
   }

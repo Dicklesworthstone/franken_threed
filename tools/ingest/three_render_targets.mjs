@@ -60,6 +60,7 @@
 import * as gpuTargets from './gpu_render_target.mjs';
 import {inspectGpuTargetWrite, inspectGpuTargetCopy, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy} from './gpu_depth_transfer.mjs';
+import {threeDepthTextureFormat} from './three_depth_textures.mjs';
 
 export class ThreeRenderTargetError extends Error {
   constructor(code, message) {
@@ -228,13 +229,8 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     // WebGLTextures.setupDepthTexture selects the attachment from the texture's
     // format, not stencilBuffer: a depth-only texture has no stencil aspect,
     // while DepthStencilFormat attaches both even with stencilBuffer:false.
-    if (combined) {
-      if (three.UnsignedInt248Type === undefined || depthTexture.type !== three.UnsignedInt248Type)
-        fail('UNSUPPORTED', 'Source depth/stencil textures require UnsignedInt248Type');
-      depthFormat = 'depth24plus-stencil8';
-    } else if (depthTexture.type === three.UnsignedIntType) depthFormat = 'depth24plus';
-    else if (depthTexture.type === three.FloatType) depthFormat = 'depth32float';
-    else fail('UNSUPPORTED', 'Source depth type must be UnsignedIntType or FloatType');
+    depthFormat = threeDepthTextureFormat(depthTexture, three);
+    if (!depthFormat) fail('UNSUPPORTED', 'Unsupported source depth format/type combination');
     // Match the ordinary sampler2D depth-read profile. Do not pretend a missing
     // float32-filterable device feature can be replaced by lower precision.
     if (![three.NearestFilter, three.LinearFilter].includes(depthTexture.minFilter) ||
@@ -276,7 +272,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   }
   const depthOwner = depthTexture?.renderTarget ?? null, sharedDepth = depthOwner !== null && depthOwner !== target;
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
-    (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : 4) * sampleCount * depthLayers : 0);
+    (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : depthFormat === 'depth16unorm' ? 2 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, baseColorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32, integerType,

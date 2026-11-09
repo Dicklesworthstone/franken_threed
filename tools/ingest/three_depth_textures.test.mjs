@@ -151,7 +151,7 @@ test('detached depth remains read-only and target-owned, layered or malformed im
   const target = new T.RenderTarget(1, 1, {depthTexture: new T.DepthTexture()});
   assert.throws(() => f.owner.layoutOf(sampled(target.depthTexture)), {code: 'THREE_DEPTH_TEXTURE_SOURCE'}); target.dispose();
   for (const change of [x => { x.image.depth = 2; }, x => { x.image.width = -1; }, x => { x.image.data = new Uint32Array(1); },
-    x => { x.generateMipmaps = true; }, x => { x.type = T.UnsignedShortType; }]) {
+    x => { x.generateMipmaps = true; }, x => { x.type = T.UnsignedByteType; }]) {
     const value = new T.DepthTexture(1, 1); change(value);
     assert.throws(() => f.owner.captureBinding(sampled(value)), error => /^THREE_DEPTH_TEXTURE_(SHAPE|FORMAT)$/.test(error.code));
   }

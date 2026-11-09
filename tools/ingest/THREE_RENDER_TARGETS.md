@@ -212,10 +212,31 @@ zero GPU/browser errors and assert the actual shared GPUTexture identity. This
 is software-GPU correctness evidence, not a hardware performance measurement.
 
 Ordinary detached 2D `DepthTexture` inputs also have native, zero-initialized
-storage at source version zero. `UnsignedIntType` uses `depth24plus` and
-`FloatType` uses `depth32float`. Graphics and compute share this owner, including
+storage at source version zero. Attached and detached depth share the pinned
+format mapping:
+
+| Source format | Source type | Native storage |
+| --- | --- | --- |
+| `DepthFormat` | `UnsignedShortType` | `depth16unorm` |
+| `DepthFormat` | `UnsignedIntType` | `depth24plus` |
+| `DepthFormat` | `FloatType` | `depth32float` |
+| `DepthStencilFormat` | `UnsignedInt248Type` | `depth24plus-stencil8` |
+| `DepthStencilFormat` | `FloatType` | `depth32float-stencil8` |
+
+Float depth/stencil requires the enabled `depth32float-stencil8` device feature.
+Depth16 is charged at two bytes per texel; combined depth/stencil at eight.
+Existing dimension and single/four-sample rules remain: sampling selects the depth aspect,
+while a detached framebuffer snapshot preserves all aspects and samples.
+Graphics and compute share this owner, including
 captured sampler state, versioned generations, resource limits and cancellation.
 No CPU color upload or invented source render target supplies the initial depth.
+`native_depth_formats.mjs` matches fourteen pinned-source browser checkpoints:
+14,336 RGBA bytes and 24 depth floats are identical in Chromium 153/SwiftShader,
+with zero GPU/browser errors. Both new formats cover 1x/4x rendering, framebuffer
+snapshots and stencil preservation; depth16 also covers compute reads. Pinned
+r186 emits an invalid all-aspects view for float-depth/stencil compute sampling,
+so that operation has only candidate layout/ownership checks here, not claimed
+source pixel parity.
 Recognized automatic target resizing preserves accepted transfer generations
 until their validation, GPU completion and readback publication finish.
 

@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import vm from 'node:vm';
+import {threeDepthTextureFormat} from './three_depth_textures.mjs';
 export const plain = value => JSON.parse(JSON.stringify(value));
 export class Events {
   addEventListener(type, listener) { ((this.listeners ??= {})[type] ??= new Set()).add(listener); }
@@ -153,7 +154,7 @@ export async function rig({features = [], maxBytes, maxTargets, adapterOptions =
     ['./three_storage_texture_copy.mjs', synthetic({withStorageTextureCopies: Base => Base})],
     ['./three_textures.mjs', synthetic({createGpuThreeTextures() { throw new Error('Render targets must not use the CPU texture uploader'); }})],
     ['./three_framebuffer_textures.mjs', synthetic({createThreeFramebufferTextures() { throw new Error('No framebuffer textures in this fixture'); }})],
-    ['./three_depth_textures.mjs', synthetic({createThreeDepthTextures() { throw new Error('No detached depth textures in this fixture'); }})],
+    ['./three_depth_textures.mjs', synthetic({threeDepthTextureFormat, createThreeDepthTextures() { throw new Error('No detached depth textures in this fixture'); }})],
   ]);
   for (const name of ['three_compute_targets', 'three_compute_textures', 'three_render_targets', 'three_compute', 'three_node_shadows', 'gpu_compute_attributes'])
     modules.set(`./${name}.mjs`, new vm.SourceTextModule(await readFile(new URL(`./${name}.mjs`, import.meta.url), 'utf8'), {context, identifier: name}));

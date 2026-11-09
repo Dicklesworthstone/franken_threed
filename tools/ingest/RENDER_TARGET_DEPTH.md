@@ -30,7 +30,8 @@ and issues no copies or resolves. The callback has the same synchronous,
 submitted-use lifetime and reentry restrictions as `withTexture`. Use with no
 depth attachment is rejected, including for suspended zero-sized targets.
 
-Native depth formats are `depth16unorm`, `depth24plus`, and `depth32float`.
+Native depth formats are `depth16unorm`, `depth24plus`, `depth32float`,
+`depth24plus-stencil8` and feature-gated `depth32float-stencil8`.
 One- and four-sample attachments are supported. Four-sample depth remains a
 multisampled texture: use `texture_depth_multisampled_2d` and an explicit sample
 index in WGSL. This API does not choose a depth-resolve policy for the application.
@@ -42,7 +43,8 @@ APIs remain independent. Peak resize budgets include retired generations; a
 depth-only consumer counts as use and keeps its old attachment alive until the
 queue fence completes. Disposal, partial allocation failures, validation errors,
 and device loss follow the same terminal-state/resource-release rules as color.
-Depth16 is charged at two bytes per texel; Depth24plus and Depth32 at four.
+Depth16 is charged at two bytes per texel; Depth24plus and Depth32 at four;
+combined depth/stencil at eight.
 These are logical storage budgets, not measurements of driver allocation overhead.
 
 ## Source DepthTexture and renderer bindings
@@ -64,16 +66,19 @@ objects through their `renderTarget` association, without requiring or mutating
 renderer still requires its existing initialization and scene-preparation steps.
 This does not add node/TSL material support or change renderer route selection.
 
-For source targets, `DepthFormat` with `UnsignedIntType` uses `depth24plus` and
-`FloatType` uses `depth32float`. The latter is useful when a precise native depth
-format is required; Depth24plus's backing representation is implementation-defined.
+For source targets and detached depth inputs, `DepthFormat` with
+`UnsignedShortType`, `UnsignedIntType` or `FloatType` uses `depth16unorm`,
+`depth24plus` or `depth32float` respectively. `DepthStencilFormat` with
+`UnsignedInt248Type` uses `depth24plus-stencil8`; with `FloatType` it uses
+`depth32float-stencil8`, requiring that feature on the enabled device.
+Depth24plus's backing representation remains implementation-defined.
 The target's dimensions define attachment storage, including after `setSize`.
 Source depth image metadata remains borrowed and is not rewritten to simulate an
-upload. Shared depth attachments, source UnsignedShortType, cube/array/volume
-attachments, stencil, comparison samplers, generated/manual depth mipmaps, and
-multisampled source depth textures remain explicit refusals. The native API above
-can expose multisample depth directly; this source sampler2D path cannot invent a
-resolve or sample-index policy for it.
+upload. The native renderer retains depth comparison and multisample bindings
+under the target owner's dimension rules; shared/layered attachment ownership is
+described in `THREE_RENDER_TARGETS.md`. Generated/manual depth mipmaps remain
+unsupported. The WebGL sampler2D replica described below cannot invent a resolve
+or sample-index policy for multisampled depth.
 
 The first read creates a GPU-only, single-level `r32float` sampling image. A
 fullscreen textureLoad pass reads the actual rendered depth attachment, flips
@@ -132,6 +137,14 @@ The source-depth suite additionally checks the r186 association rule, native-dep
 input to the R32F pass, independent refreshes, feature-dependent filtering, source
 replacement/resizing/disposal, feedback, shared budgets, and injected allocation,
 pipeline, bind-group, sampler, submit, validation and device-loss failures. The
-implementation session passed 147 tests across these six suites (53 new depth
-tests and 94 existing regressions). A Chromium attempt was blocked before GPU
-initialization; native shader execution and pixel equivalence remain unverified.
+initial implementation passed 147 tests across these six suites (53 new depth
+tests and 94 existing regressions).
+
+The later depth-format slice adds sixteen source-backed owner checks in
+`three_depth_formats.test.mjs`. `native_depth_formats.mjs` matches fourteen real
+Chromium 153/SwiftShader checkpoints with pinned r186: 14,336 color bytes and
+24 depth floats, including depth16 compute reads, both new formats at 1x/4x,
+framebuffer copies and stencil retention. GPU/browser errors are zero. Pinned
+float-depth/stencil compute sampling creates an invalid all-aspects view, so it
+is excluded from the claimed browser parity; candidate depth-only views have
+recording-device checks. These results establish correctness, not performance.

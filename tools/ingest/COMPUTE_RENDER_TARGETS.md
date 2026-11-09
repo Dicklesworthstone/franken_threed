@@ -42,10 +42,12 @@ texture, not a multisampled texture binding. Generated color mipmaps are refresh
 before a color consumer. Float32 nearest sampling uses explicit unfilterable-float
 layouts; linear float32 color sampling requires `float32-filterable`.
 
-Depth inputs use the target-owned single-sample source DepthTexture profile:
-UnsignedIntType/DepthFormat (`depth24plus`), FloatType/DepthFormat
-(`depth32float`), or UnsignedInt248Type/DepthStencilFormat
-(`depth24plus-stencil8`). Bindings use `sampleType: 'depth'` and a `depth-only` view
+Depth inputs use the target-owned source DepthTexture profile:
+UnsignedShortType/DepthFormat (`depth16unorm`), UnsignedIntType/DepthFormat
+(`depth24plus`), FloatType/DepthFormat (`depth32float`),
+UnsignedInt248Type/DepthStencilFormat (`depth24plus-stencil8`) or
+FloatType/DepthStencilFormat (`depth32float-stencil8`). The last requires its
+enabled device feature. Bindings use `sampleType: 'depth'` and a `depth-only` view
 of mip zero. Depth is not copied through RGBA, half floats or the WebGL bridge's
 R32F replica. Ordinary nearest/linear native depth sampling does not require the
 float32 **color** filtering feature. Stencil remains owned by the rendering path
@@ -55,11 +57,10 @@ Both attachments of one target can be bound by a single kernel. The native owner
 borrows them together once, while multiple targets remain borrowed through the
 same dispatch. A depth-only consumer neither generates nor dirties color mips.
 
-The scope remains explicit: comparison depth samplers, multisampled source depth,
-array/cube/multiple-color targets, writable ordinary target attachments, decoded
-image/video compute inputs, and partial CPU texture snapshots are not enabled by
-this feature. The independent native target API can expose multisampled depth;
-this does not expand the source target inspector's single-sample depth contract.
+The shared target owner supplies current dimension, comparison-sampler and
+multisample support; four-sample depth retains its native per-sample binding,
+without an implicit resolve. Ordinary target attachments remain read-only
+compute inputs. Other sampled/storage image inputs use their existing owners.
 
 ## Compute-buffer output to render targets
 
