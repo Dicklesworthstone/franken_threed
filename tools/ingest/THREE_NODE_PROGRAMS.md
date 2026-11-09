@@ -2009,11 +2009,16 @@ CubeUV atlases directly. Its bake work uses six module identities for six unique
 WGSL sources, compared with 40 module identities before native module sharing
 in the recording-device probe; this is an allocation count, not a timing result.
 
-A separate four-sphere native PBR diagnostic still differs in the panorama-lit
-pair (4,236 channel values), while the cube-lit pair and both raw atlases match.
-The difference reproduces with cold bakes, warmup, and the previous uncached GPU
-program owner. It remains an environment-lighting compatibility gap and is not
-included in the exact atlas/loading claim.
+A separate four-sphere native PBR diagnostic identifies a pinned source
+NodeBuilderState cache-sharing boundary. The source mixed-environment scene is
+byte-identical to an all-cube control: r186 reuses the first cube atlas on all
+four materials. The candidate all-cube control matches that source exactly;
+its mixed case samples the authored panorama on the lower pair and differs in
+4,236 channel values. Both raw atlases match, and the same result reproduces
+with cold bakes, warmup, and the previous uncached GPU program owner. Exact
+source compatibility here requires the source graph-cache keys and lifetime,
+rather than a change to GPU module sharing or PMREM baking. These diagnostic
+pixels are not included in the exact atlas/loading claim.
 
 ## Native compressed texture inputs
 

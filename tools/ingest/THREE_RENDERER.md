@@ -512,7 +512,7 @@ Existing shader, material and shadow-map profile limits remain in force. This is
 retained-JavaScript program preparation with owned WebGPU rendering, without a
 performance claim or a claim of complete physical-material/shadow coverage.
 
-## Public PMREM texture inputs for WebGL-authored applications
+## Public PMREM generation for WebGL-authored applications
 
 After `await renderer.init()`, the public
 `PMREMGenerator.fromEquirectangular()` and `fromCubemap()` methods execute the
@@ -531,10 +531,39 @@ aliases and unmarked CPU edits. An input already resident in the separate
 automatic WebGL scene texture pool refuses instead of reconstructing its prior
 GPU bytes. Custom input upload callbacks and ordinary GPU-written copy
 destinations are outside this detached-input profile; render-target inputs use
-the existing GPU target owner and its lifetime guards. Pre-initialization texture
-calls and `fromScene()` retain their previous delayed behavior; scene snapshot
-capture and sigma pre-blur remain incomplete. The pinned WebGL helper does not
-use an `options.renderTarget` destination for `fromScene()`.
+the existing GPU target owner and its lifetime guards. Pre-initialization calls
+retain their previous delayed behavior.
+
+Initialized `fromScene()` now executes the retained source's six camera views,
+sigma pre-blur and GGX filtering into a real CubeUV target. A single immutable
+scene generation serves all six captured cameras, preserving accepted transforms,
+material values, lights, shader uniforms and CPU instance matrices/counts while
+later edits and disposal proceed. Actual pinned `RoomEnvironment` and `Sky`
+inputs are covered. The WebGL helper ignores `options.renderTarget` for this
+method, so the returned output remains a newly allocated source target.
+
+The admitted scene profile comprises rigid untextured meshes, CPU instances,
+ordinary source materials/shaders and unshadowed lights, with a solid or absent
+background. Textured scene inputs, environments/overrides, custom render or shader
+hooks, custom sorting, shadows, transmission, skinned/morphed/batched meshes, LOD, wireframes,
+lines, points and sprites retain explicit boundaries. These restrictions keep
+unsupported mutable state from being silently read after acceptance.
+
+Captured geometry follows WebGL first-upload, version and partial-range history.
+Only meshes selected by visible ancestry, layers and at least one cube frustum
+advance those histories; hidden or culled inputs retain pending updates. Index
+uploads retain source material/draw selection. Unmarked edits preserve the last
+uploaded bytes, while source geometry/instance disposal starts a new history.
+An attribute already resident in a separate ordinary WebGL scene owner requires
+disposal before moving between owners. These histories persist across generator
+retirement like source renderer attributes, and remain bounded by the snapshot
+owner's budgets.
+
+The new output's normal depth storage is initialized to the source value of one
+before the six views load it with `autoClear = false`. Private background boxes,
+scene bridges and ping-pong targets retire only after all active GPU waits release
+them, including concurrent application waits and generator disposal. Returned
+output targets retain their independent lifetime.
 
 `compileCubemapShader()` and `compileEquirectangularShader()` now retain r186's
 conversion-material construction and capture translated shaders before
@@ -579,6 +608,23 @@ execution reports zero browser/GPU errors; at most 6 of 6,144 pixels in any
 checkpoint exceed channel delta 12 (0.0977%, within the existing 2% gate). The
 largest individual channel difference is 34. This is tolerance-based rendering
 evidence, not a hardware-performance measurement.
+
+The focused scene PMREM, existing public PMREM, pass snapshot and geometry suites
+pass **58 tests** (7, 10, 22 and 19 respectively). The new
+`three_renderer_pmrem_scene.test.mjs` cases exercise actual source
+RoomEnvironment/Sky capture, source attribute-range oracles, visibility/layer/
+frustum history, disposal-based owner transfer, pre-allocation budget rejection,
+and concurrent GPU waits across size changes and generator disposal.
+
+`tests/e2e/webgpu_renderer/program_public_pmrem_scene.mjs` compares five
+source/candidate captures (**122,880 RGBA bytes**): RoomEnvironment with sigma
+0 and 0.35, a queued room with changed instances/light/material/capture position,
+and two Sky uniform/sigma states. Source assertions establish that those edits
+visibly affect the result. The existing channel-delta-12 / 2% pixel gate is
+unchanged; over-threshold counts are 9, 5, 54, 1 and 0 of 6,144 pixels, at most
+**0.879%**. The run used Chromium 153.0.8010.0/SwiftShader, the pinned r186 inputs
+and `general-webgpu`, with zero browser/GPU errors. This is tolerance-based
+rendering evidence, not exact equality or a hardware performance result.
 
 ## Custom tone mapping for WebGL-authored programs
 

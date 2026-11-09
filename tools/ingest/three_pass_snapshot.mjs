@@ -7,6 +7,7 @@
  * resource identity: this captures shader inputs, not copies of GPU images.
  */
 import {captureThreeUniformGroup} from './three_uniform_group_state.mjs';
+import {claimWebGLGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 
 export class ThreePassSnapshotError extends Error {
   constructor(code, message) {
@@ -116,7 +117,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
   if (![maxBytes, maxCaptureBytes, maxRoots, maxVertices, maxValues].every(positive)) fail('OPTIONS', 'Expected positive snapshot limits');
   const states = new WeakMap(), retained = new Set(), records = new Set();
   const math = new Set(MATH.map(name => T[name]?.prototype).filter(Boolean));
-  let disposed = false, allocatedBytes = 0;
+  let disposed = false, allocatedBytes = 0, pmremScenes = null;
   function live() { if (disposed) fail('DISPOSED', 'Pass snapshot owner is disposed'); }
   const plain = object => Object.getPrototypeOf(object) === Object.prototype || Object.getPrototypeOf(object) === null;
   function eligible(root, camera, vertexLimit = maxVertices) {
@@ -167,7 +168,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
     let bytes = 0, values = 0;
     const charge = n => {
       bytes += n;
-      if (!Number.isSafeInteger(bytes) || bytes > maxCaptureBytes || bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Pass snapshots exceed their byte budget');
+      if (!Number.isSafeInteger(bytes) || bytes > maxCaptureBytes || bytes > maxBytes - allocatedBytes - (pmremScenes?.bytes ?? 0)) fail('BUDGET', 'Pass snapshots exceed their byte budget');
       if (++values > maxValues) fail('BUDGET', 'Pass snapshot contains too many values');
     };
     const memo = new Map(), textures = new Map(), targetEntries = new Map();
@@ -370,6 +371,12 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       release() { if (!record.pending) return; record.pending = false; collect(record); }});
   }
   return Object.freeze({capture,
+    capturePMREMScene(root, camera, device, options) {
+      live();
+      pmremScenes ??= createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxValues,
+        available: () => maxBytes - allocatedBytes});
+      return pmremScenes.capture(root, camera, device, options);
+    },
     // The retained r186 PMREM helper draws six faces in one 36-vertex mesh.
     // Its caller verifies the generator's private mesh/material identities;
     // keep this larger capture profile restricted to the source plane layout.
@@ -389,6 +396,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
     // roots only after its accepted draws drain, without evicting application
     // fullscreen roots or resetting their shared uniform/upload identities.
     retire(root) {
+      if (pmremScenes?.has(root)) { pmremScenes.retire(root); return; }
       const state = states.get(root);
       if (!state) return;
       const owned = [...records].filter(record => record.state === state);
@@ -400,9 +408,9 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       state.attributeViews.clear(); state.uniformViews = new WeakMap();
       states.delete(root); retained.delete(state);
     },
-    get allocatedBytes() { return allocatedBytes; }, get rootCount() { return retained.size; },
+    get allocatedBytes() { return allocatedBytes + (pmremScenes?.bytes ?? 0); }, get rootCount() { return retained.size + (pmremScenes?.roots ?? 0); },
     dispose() {
-      if (disposed) return; disposed = true;
+      if (disposed) return; disposed = true; pmremScenes?.dispose();
       for (const record of [...records]) { record.pending = record.installed = false; collect(record); }
       // WeakMap entries and renderer lookup keys may outlive disposal. Leave no
       // copied uniform/geometry payload reachable through those private views.
@@ -415,4 +423,265 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       retained.clear();
     },
   });
+}
+
+/** Detached, callback-free WebGL PMREM scene views. These retain source upload
+ * versions across captures; their attribute owner is intentionally separate
+ * from ordinary WebGL scene bridges until an explicit disposal boundary. */
+function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxValues, available}) {
+  const states = new WeakMap(), retained = new Set(), records = new Set(), histories = new Map(), resources = new Map();
+  const duplicate = value => new (TYPED_ARRAYS.get(Object.getPrototypeOf(value)))(value);
+  const token = {}, math = new Set([...MATH, 'Fog', 'FogExp2'].map(name => T[name]?.prototype).filter(Boolean));
+  let bytes = 0, historyBytes = 0, disposed = false;
+  const field = (object, key) => {
+    for (let value = object; value; value = Object.getPrototypeOf(value))
+      if (Object.hasOwn(value, key)) return own(value, key);
+  };
+  const live = () => { if (disposed) fail('DISPOSED', 'PMREM scene snapshot owner is disposed'); };
+  const releaseHistory = owner => {
+    const history = histories.get(owner);
+    if (history) { histories.delete(owner); historyBytes -= history.array.byteLength; history.release(); }
+  };
+  function observe(resource, owners) {
+    let record = resources.get(resource);
+    if (!record) {
+      const listener = () => {
+        resource.removeEventListener('dispose', listener);
+        resources.delete(resource); for (const owner of record.owners) releaseHistory(owner);
+      };
+      resources.set(resource, record = {owners: new Set(), listener}); resource.addEventListener('dispose', listener);
+    }
+    for (const owner of owners) record.owners.add(owner);
+  }
+  function collect(record) {
+    if (record.pending || record.installed || !records.delete(record)) return;
+    bytes -= record.bytes; record.data = record.sources = null;
+  }
+  function capture(root, camera, device, {cube = false, position = null, sortObjects = true} = {}) {
+    live();
+    if (!(root instanceof T.Object3D) || !(camera instanceof T.Camera) || camera.isArrayCamera ||
+        camera.updateMatrixWorld !== T.Camera.prototype.updateMatrixWorld)
+      fail('SCENE', 'PMREM scene capture requires source objects and an ordinary camera');
+    let state = states.get(root);
+    if (!state && retained.size >= maxRoots) fail('BUDGET', 'Too many PMREM scene roots');
+    const nodes = [], stack = [root], seen = new Set(), sourceResources = new Map();
+    const sourceOwners = geometry => [...Object.values(geometry.attributes), ...(geometry.index ? [geometry.index] : [])]
+      .map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+    while (stack.length) {
+      const object = stack.pop();
+      if (!(object instanceof T.Object3D) || seen.has(object) || seen.size >= maxValues || !Array.isArray(object.children))
+        fail('SCENE', 'PMREM capture requires a bounded source hierarchy');
+      seen.add(object); nodes.push(object);
+      if (field(object, 'onBeforeRender') !== T.Object3D.prototype.onBeforeRender || field(object, 'onAfterRender') !== T.Object3D.prototype.onAfterRender ||
+          field(object, 'updateMatrixWorld') !== T.Object3D.prototype.updateMatrixWorld || field(object, 'updateMatrix') !== T.Object3D.prototype.updateMatrix)
+        fail('SCENE', 'PMREM scene callbacks require their source synchronous draw owner');
+      if (object.isScene && (object.background && !object.background.isColor || object.environment || object.overrideMaterial))
+        fail('SCENE', 'PMREM scene capture currently requires a solid background without an environment or override');
+      if (object.isLOD || object.isSkinnedMesh || object.isBatchedMesh || object.isLine || object.isPoints || object.isSprite ||
+          object.isLight && object.castShadow || object.isInstancedMesh && object.morphTexture)
+        fail('SCENE', 'PMREM capture requires rigid meshes, CPU instances and unshadowed source lights');
+      if (object.isMesh) {
+        const geometry = object.geometry, materials = Array.isArray(object.material) ? object.material : [object.material];
+        if (!(geometry instanceof T.BufferGeometry) || Object.values(geometry.morphAttributes).some(list => list.length))
+          fail('SCENE', 'PMREM scene geometry requires source BufferGeometry without morph targets');
+        for (const material of materials) if (material && (
+          !(material instanceof T.Material) || field(material, 'onBeforeRender') !== T.Material.prototype.onBeforeRender ||
+          field(material, 'onBeforeCompile') !== T.Material.prototype.onBeforeCompile ||
+          field(material, 'customProgramCacheKey') !== T.Material.prototype.customProgramCacheKey || material.transmission > 0 || material.wireframe))
+          fail('SCENE', 'PMREM scene materials require ordinary source programs without custom hooks or transmission');
+        sourceResources.set(geometry, sourceOwners(geometry));
+        if (field(object, 'intersectsFrustum') !== T.Mesh.prototype.intersectsFrustum ||
+            field(geometry, 'computeBoundingSphere') !== T.BufferGeometry.prototype.computeBoundingSphere ||
+            object.isInstancedMesh && field(object, 'computeBoundingSphere') !== T.InstancedMesh.prototype.computeBoundingSphere)
+          fail('SCENE', 'PMREM bounds require ordinary source computation');
+        if (object.isInstancedMesh) sourceResources.set(object, [object.instanceMatrix, ...(object.instanceColor ? [object.instanceColor] : [])]);
+      }
+      stack.push(...object.children);
+    }
+    if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
+    if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+
+    const frusta = [], project = new T.Matrix4(), forward = [1, 1, 1, -1, -1, -1], up = [1, -1, 1, 1, 1, 1];
+    for (let face = 0; face < (cube ? 6 : 1); face++) {
+      if (cube) {
+        const axis = face % 3;
+        camera.position.copy(position); camera.up.set(0, axis === 1 ? 0 : up[face], axis === 1 ? up[face] : 0);
+        const look = new T.Vector3().copy(position); look.setComponent(axis, look.getComponent(axis) + forward[face]); camera.lookAt(look);
+        camera.updateMatrixWorld();
+      }
+      frusta.push(new T.Frustum().setFromProjectionMatrix(project.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
+        camera.coordinateSystem, camera.reversedDepth));
+    }
+    const selectedOwners = new Set(), visible = [root];
+    while (visible.length) {
+      const object = visible.pop(); if (object.visible === false) continue;
+      if (object.isMesh && object.layers.test(camera.layers) &&
+          (!object.frustumCulled || frusta.some(frustum => frustum.intersectsObject(object)))) {
+        const geometry = object.geometry, materials = Array.isArray(object.material)
+          ? geometry.groups.map(group => [object.material[group.materialIndex], group]) : [[object.material, null]];
+        // WebGLObjects uploads vertex/instance data before material selection.
+        for (const attribute of Object.values(geometry.attributes))
+          selectedOwners.add(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+        if (object.isInstancedMesh) for (const owner of sourceResources.get(object)) selectedOwners.add(owner);
+        if (sortObjects) {
+          const bounds = object.boundingSphere !== undefined ? object : geometry;
+          if (bounds.boundingSphere === null) bounds.computeBoundingSphere();
+        }
+        if (geometry.index && materials.some(([material, group]) => {
+          const range = geometry.drawRange, start = Math.max(0, range.start, group?.start ?? 0),
+            end = Math.min(geometry.index.count, range.start + range.count, group ? group.start + group.count : Infinity);
+          return material?.visible && end - start >= 0 && end - start !== Infinity;
+        })) selectedOwners.add(geometry.index);
+      }
+      visible.push(...object.children);
+    }
+    let charged = 0, values = 0, addedHistory = 0;
+    const pending = new Map(), sources = new Map(), memo = new Map();
+    const charge = size => {
+      charged += size;
+      if (++values > maxValues || charged > maxCaptureBytes || charged + bytes + historyBytes + addedHistory > Math.min(maxBytes, available()))
+        fail('BUDGET', 'PMREM scene snapshots exceed their byte/value budget');
+    };
+    const attributeOwners = new Set([...sourceResources.values()].flat());
+    function uploaded(owner) {
+      if (pending.has(owner)) return pending.get(owner);
+      const previous = histories.get(owner), array = own(owner, 'array'), version = own(owner, 'version');
+      const prototype = owner.isInterleavedBuffer ? T.InterleavedBuffer.prototype : T.BufferAttribute.prototype;
+      if (!TYPED_ARRAYS.has(Object.getPrototypeOf(array ?? {})) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+          field(owner, 'onUploadCallback') !== prototype.onUploadCallback || field(owner, 'clearUpdateRanges') !== prototype.clearUpdateRanges ||
+          owner.isStorageBufferAttribute || owner.isStorageInstancedBufferAttribute || !Number.isSafeInteger(version) || version < 0)
+        fail('SCENE', 'PMREM attributes require fixed CPU arrays and default upload callbacks');
+      if (previous && (previous.array.constructor !== array.constructor || previous.array.length !== array.length))
+        fail('SCENE', 'Replace or dispose resized PMREM attributes before another capture');
+      const copies = !previous || version > previous.version ? 2 : 1;
+      if (array.byteLength > maxCaptureBytes - charged ||
+          charged + copies * array.byteLength + bytes + historyBytes + addedHistory > Math.min(maxBytes, available()))
+        fail('BUDGET', 'PMREM attribute history exceeds the remaining snapshot budget');
+      const next = {array: previous?.array ?? duplicate(array), version: previous?.version ?? version, clear: false, release: previous?.release};
+      if (!previous) {
+        addedHistory += array.byteLength;
+        next.release = claimWebGLGeometrySnapshot(device, owner, token);
+      } else if (version > previous.version) {
+        next.array = duplicate(previous.array); next.version = version;
+        const ranges = owner.updateRanges.map(range => ({start: range.start, count: range.count, source: range}));
+        for (const range of ranges) if (!Number.isSafeInteger(range.start) || range.start < 0 ||
+            !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length)
+          fail('SCENE', 'Invalid PMREM attribute update range');
+        ranges.sort((a, b) => a.start - b.start);
+        const merged = [];
+        for (const range of ranges) {
+          const last = merged.at(-1);
+          if (last && range.start <= last.start + last.count + 1) last.count = Math.max(last.count, range.start + range.count - last.start);
+          else merged.push(range);
+        }
+        if (!merged.length) next.array.set(array);
+        else for (const {start, count} of merged) next.array.set(array.subarray(start, count ? start + count : array.length), start);
+        next.clear = merged.length > 0; next.ranges = merged;
+      }
+      pending.set(owner, next); return next;
+    }
+    function copy(value, depth = 0) {
+      if (depth > 48) fail('BUDGET', 'PMREM scene data nesting is too deep');
+      if (value == null || ['number', 'boolean', 'string'].includes(typeof value)) { charge(typeof value === 'string' ? value.length * 2 : 8); return value; }
+      if (typeof value !== 'object') fail('SCENE', 'PMREM capture requires ordinary data fields');
+      if (value instanceof T.Texture) fail('SCENE', 'PMREM scene texture inputs require their explicit uploaded-history owner');
+      if (memo.has(value)) return memo.get(value);
+      if (ArrayBuffer.isView(value)) {
+        if (!TYPED_ARRAYS.has(Object.getPrototypeOf(value)) || !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable)
+          fail('SCENE', 'PMREM capture requires ordinary fixed typed arrays');
+        charge(value.byteLength); const result = duplicate(value); memo.set(value, result); return result;
+      }
+      const object = value instanceof T.Object3D, geometry = value instanceof T.BufferGeometry, material = value instanceof T.Material;
+      const attribute = attributeOwners.has(value) || value.isInterleavedBufferAttribute === true;
+      const prototype = Object.getPrototypeOf(value), array = Array.isArray(value);
+      if (!object && !geometry && !material && !attribute && !array && !math.has(prototype) &&
+          prototype !== Object.prototype && prototype !== null)
+        fail('SCENE', 'Unsupported mutable PMREM scene field');
+      charge(128); const result = array ? [] : view(value); memo.set(value, result); sources.set(result, value);
+      const upload = attributeOwners.has(value) ? selectedOwners.has(value) ? uploaded(value) : histories.get(value) : null;
+      for (const key of Object.getOwnPropertyNames(value)) {
+        if (['_listeners', 'userData', '_onChangeCallback'].includes(key) || array && key === 'length' ||
+            object && ['parent', 'children', 'animations', 'shadow'].includes(key)) continue;
+        let input = own(value, key);
+        if (upload && key === 'array') input = upload.array;
+        if (upload && key === 'updateRanges') input = [];
+        if (typeof input === 'function') {
+          if (input !== prototype[key]) fail('SCENE', 'Custom callable PMREM fields require their source owner');
+          put(result, key, input); continue;
+        }
+        put(result, key, copy(input, depth + 1));
+      }
+      if (array) result.length = value.length;
+      if (object) {
+        put(result, 'parent', null); put(result, 'children', copy(value.children, depth + 1));
+        put(result, 'animations', []); put(result, 'matrixAutoUpdate', false); put(result, 'matrixWorldAutoUpdate', false);
+        put(result, 'matrixWorldNeedsUpdate', false);
+        if (value.shadow) put(result, 'shadow', value.shadow); // castShadow was excluded above.
+      }
+      return result;
+    }
+    let data;
+    try {
+      data = copy(root);
+      if (root.isScene && root.background?.isColor) data.background = null;
+      for (const [owner, history] of pending) {
+        if (!histories.has(owner)) historyBytes += history.array.byteLength;
+        histories.set(owner, history);
+        if (history.clear) { for (const range of history.ranges) range.source.count = range.count; owner.clearUpdateRanges(); }
+        delete history.ranges;
+      }
+      for (const [resource, owners] of sourceResources) {
+        const selected = owners.filter(owner => pending.has(owner)); if (selected.length) observe(resource, selected);
+      }
+    } catch (error) {
+      for (const [owner, history] of pending) if (!histories.has(owner)) history.release();
+      throw error;
+    }
+    if (!state) { state = {root: view(root), views: new WeakMap(), record: null}; states.set(root, state); retained.add(state); }
+    state.views.set(root, new WeakRef(state.root));
+    const record = {state, data, sources, bytes: charged, pending: 0, installed: false}; records.add(record); bytes += charged;
+    function install() {
+      live(); if (!record.pending) fail('RELEASED', 'PMREM scene capture was released');
+      if (state.record === record) return;
+      if (state.record) { state.record.installed = false; collect(state.record); }
+      const installed = new Map();
+      function apply(value) {
+        const source = record.sources.get(value);
+        if (!source) return value;
+        if (installed.has(source)) return installed.get(source);
+        let target = state.views.get(source)?.deref();
+        if (!target) { target = Array.isArray(value) ? [] : view(value); state.views.set(source, new WeakRef(target)); }
+        installed.set(source, target);
+        for (const key of Object.getOwnPropertyNames(target)) if (key !== '_listeners' && !(Array.isArray(target) && key === 'length') && !Object.hasOwn(value, key)) delete target[key];
+        for (const key of Object.getOwnPropertyNames(value)) if (!(Array.isArray(value) && key === 'length')) put(target, key, apply(value[key]));
+        if (Array.isArray(value)) target.length = value.length;
+        return target;
+      }
+      apply(record.data); record.installed = true; state.record = record;
+    }
+    function retain(camera) {
+      live(); record.pending++;
+      if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
+      let released = false;
+      return Object.freeze({root: state.root, camera: captureThreeCamera(T, camera), bytes: charged, install, retain,
+        release() { if (!released) { released = true; record.pending--; collect(record); } }});
+    }
+    return retain(camera);
+  }
+  return {capture, has: root => states.has(root), get bytes() { return bytes + historyBytes; }, get roots() { return retained.size; },
+    retire(root) {
+      const state = states.get(root); if (!state) return;
+      for (const record of records) if (record.state === state && record.pending) fail('PENDING', 'PMREM scene still has queued captures');
+      for (const record of [...records]) if (record.state === state) { record.installed = false; collect(record); }
+      for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key];
+      state.views = new WeakMap(); state.record = null; retained.delete(state); states.delete(root);
+    },
+    dispose() {
+      disposed = true;
+      for (const record of [...records]) { record.pending = record.installed = false; collect(record); }
+      for (const [resource, record] of resources) resource.removeEventListener('dispose', record.listener);
+      resources.clear(); for (const owner of histories.keys()) releaseHistory(owner);
+      for (const state of retained) { for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key]; state.record = null; state.views = new WeakMap(); }
+      retained.clear();
+    }};
 }

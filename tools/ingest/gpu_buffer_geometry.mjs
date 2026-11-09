@@ -51,6 +51,24 @@ export class BufferGeometryGpuError extends Error {
 }
 const fail = (code, message) => { throw new BufferGeometryGpuError('GEOMETRY_GPU_' + code, message); };
 const states = new WeakMap(), instanceStates = new WeakMap();
+// Separate WebGL scene bridges cannot reconstruct one another's uploaded
+// bytes. PMREM's detached scene capture claims original attributes, while its
+// private copies use the existing GPU owner normally.
+const webglAttributeHistories = new WeakMap();
+function webglHistory(device, attribute) {
+  let attributes = webglAttributeHistories.get(device);
+  if (!attributes) webglAttributeHistories.set(device, attributes = new WeakMap());
+  let history = attributes.get(attribute);
+  if (!history) attributes.set(attribute, history = {residents: 0, snapshot: null});
+  return history;
+}
+export function claimWebGLGeometrySnapshot(device, attribute, owner) {
+  const history = webglHistory(device, attribute);
+  if (history.residents || history.snapshot && history.snapshot !== owner)
+    fail('HISTORY', 'PMREM scene inputs already have a separate WebGL geometry owner');
+  history.snapshot = owner;
+  return () => { if (history.snapshot === owner) history.snapshot = null; };
+}
 const FIELDS = Object.freeze({position: [0, 3], normal: [1, 3], tangent: [2, 4], uv: [3, 2], color: [4, 0], uv1: [10, 2], uv2: [11, 2], uv3: [12, 2]});
 const align4 = n => Math.ceil(n / 4) * 4;
 function integer(n, min, max, name) {
@@ -249,7 +267,10 @@ function createResidency(device, geometry, {
   const stats = {allocations: 0, uploads: 0, uploadedBytes: 0, updates: 0};
   const worldMatrix = new Float64Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
   function release() {
-    for (const record of records.values()) if (!record.borrowed) record.buffer.destroy();
+    for (const [owner, record] of records) if (!record.borrowed) {
+      record.buffer.destroy();
+      if (sourceAttributeCallbacks) webglHistory(device, owner).residents--;
+    }
     records = new Map(); allocatedBytes = 0; current = null; generation++;
   }
   function stop(error) {
@@ -315,6 +336,8 @@ function createResidency(device, geometry, {
       // or callback. An invalid later attribute cannot partly upload the frame.
       for (const {owner, source, requiredBytes, conversion, stride, borrowed, divisor = 1} of shape.owners.values()) {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
+        if (sourceAttributeCallbacks && webglHistory(device, owner).snapshot)
+          fail('HISTORY', 'PMREM-captured attributes require disposal before moving to a separate WebGL scene owner');
         const previous = records.get(owner);
         if (previous && !!previous.borrowed !== !!borrowed) fail('SHAPE', 'Replace the attribute when changing its CPU/compute ownership');
         if (borrowed) {
@@ -382,6 +405,7 @@ function createResidency(device, geometry, {
           // Own the allocation even when an upload callback throws; retry the
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
+          if (sourceAttributeCallbacks) webglHistory(device, owner).residents++;
           write(record, array, 0, array.length);
           remember(owner, array);
           if (sourceAttributeCallbacks) owner.onUploadCallback();
