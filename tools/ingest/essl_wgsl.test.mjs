@@ -175,9 +175,13 @@ test('uniform matrix arrays support whole-array values and evaluate dynamic indi
   assert.match(r.fragment, /fn f3d_from_u_mat3x2_2_\(v: array<f3d_uniform_mat3x2, 2>\) -> array<mat3x2<f32>, 2>/);
   assert.match(r.fragment, /r\[i\] = v\[i\]\.value;/);
   assert.match(r.fragment, /var copy: array<mat3x2<f32>, 2> = f3d_from_u_mat3x2_2_\(f3d_u\.frames\);/);
-  assert.match(r.fragment, /consume\(f3d_from_u_mat3x2_2_\(f3d_u\.frames\)\)/);
-  assert.equal(r.fragment.match(/\[nextIndex\(\)\]/g)?.length, 1);
-  assert.match(r.fragment, /var frame: mat3x2<f32> = f3d_u\.frames\[nextIndex\(\)\]\.value;/);
+  const argument = /let (f3d_t\d+) = f3d_from_u_mat3x2_2_\(f3d_u\.frames\);/.exec(r.fragment);
+  assert.ok(argument, 'whole-array arguments are converted and copied before the call');
+  assert.ok(r.fragment.includes(`consume(${argument[1]})`));
+  const index = /let (f3d_t\d+) = nextIndex\(\);/.exec(r.fragment);
+  assert.ok(index, 'dynamic index is captured before its value is consumed');
+  assert.equal(r.fragment.match(/= nextIndex\(\);/g)?.length, 1);
+  assert.ok(r.fragment.includes(`var frame: mat3x2<f32> = f3d_u.frames[${index[1]}].value;`));
 });
 
 test('nested uniform structs convert matrix arrays while retaining independent private layouts', () => {

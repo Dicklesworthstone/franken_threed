@@ -57,7 +57,8 @@ function fixture(t, native = false) {
   return {renderer, scene, camera, mesh, material, device, canvasCalls};
 }
 const fragment = draw => draw.pipeline.fragment.module.code;
-const customCall = /fn toneMapping\([\s\S]*?return CustomToneMapping\(color\);/;
+const toneCall = name => new RegExp('fn toneMapping\\([^}]*?let (f3d_t\\d+) = color;\\s+return ' + name + '\\(\\1\\);');
+const customCall = toneCall('CustomToneMapping');
 function uniformScalar(draw, reflection, name) {
   const {group, offsets} = draw.groups.get(0), {resource} = group.entries.find(entry => entry.binding === 0);
   const bytes = draw.contents.get(resource.buffer), uniform = reflection.uniforms.find(u => u.name === name);
@@ -145,7 +146,7 @@ test('queued custom and built-in operators keep their accepted exposure on one c
     const [tone, value] = requests[i], support = makeSupport({toneMapping: tone});
     const {reflection} = support.compile(f.material, f.mesh).program;
     assert.equal(exposure(draws[i], reflection), value);
-    assert.match(fragment(draws[i]), tone === T.CustomToneMapping ? customCall : /return LinearToneMapping\(color\);/);
+    assert.match(fragment(draws[i]), tone === T.CustomToneMapping ? customCall : toneCall('LinearToneMapping'));
   }
   assert.equal(f.renderer._session, session);
   assert.equal(f.renderer._hdr, false);

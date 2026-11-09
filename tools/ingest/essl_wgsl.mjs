@@ -983,6 +983,10 @@ class Unit {
   /** Emit an assignment (simple or compound) including swizzle stores. */
   assign(target, op, valueExpr, ctx, line) {
     const lv = this.lvalue(target, ctx);
+    return this.storeLvalue(lv, op, valueExpr, ctx, line);
+  }
+  lvalueRead(lv) { return lv.swizzle ? `${lv.base}.${lv.swizzle.join('')}` : lv.c; }
+  storeLvalue(lv, op, valueExpr, ctx, line) {
     let value = valueExpr.inc ? {c: lv.t.k === 's' && lv.t.s === 'float' || scalarOf(lv.t) === 'float' ? '1.0' : scalarOf(lv.t) === 'uint' ? '1u' : '1', t: S(scalarOf(lv.t))} : this.expr(valueExpr, ctx);
     const binop = op === '=' ? null : op.slice(0, -1);
     if (binop === null) value = this.coerce(value, lv.t, line);
@@ -1000,9 +1004,9 @@ class Unit {
     const r = this.binaryCode(binop, {c: lv.c, t: lv.t}, value, line);
     return [`${lv.c} = ${r.c};`];
   }
-  lvalue(e, ctx) {
+  lvalue(e, ctx, indices = null) {
     switch (e.k) {
-      case 'paren': return this.lvalue(e.e, ctx);
+      case 'paren': return this.lvalue(e.e, ctx, indices);
       case 'id': {
         const s = this.lookup(e.name, ctx.scope);
         if (this.version === 100 && this.stage === 'fragment' && (e.name === 'gl_FragColor' || e.name === 'gl_FragData') && !s)
@@ -1015,21 +1019,32 @@ class Unit {
         essError(`${e.name} is not assignable`, e.line);
       }
       case 'index': {
-        const base = this.lvalue(e.a, ctx), index = this.indexCode(e.index, ctx);
+        const base = this.lvalue(e.a, ctx, indices);
+        let index = indices?.get(e);
+        if (index === undefined) {
+          const code = this.indexCode(e.index, ctx);
+          index = this.tmp(); ctx.pre.push(`let ${index} = ${code};`);
+        }
+        if (base.swizzle) {
+          const components = base.swizzle.map(component => 'xyzw'.indexOf(component)).join(', ');
+          return {c: `${base.base}[array<i32, ${base.swizzle.length}>(${components})[${index}]]`, t: elementType(base.t, e.line)};
+        }
         return {c: `${base.c}[${index}]`, t: elementType(base.t, e.line)};
       }
       case 'field': {
-        const base = this.lvalue(e.a, ctx);
+        const base = this.lvalue(e.a, ctx, indices);
         if (base.t.k === 'st') {
           const f = this.shared.structs.get(base.t.name).fields.find(x => x.name === e.name);
           if (!f) essError(`No field ${e.name}`, e.line);
           return {c: `${base.c}.${safe(e.name)}`, t: f.type};
         }
         if (base.t.k === 'v') {
-          const sw = swizzle(e.name, base.t.n, e.line);
+          let sw = swizzle(e.name, base.t.n, e.line);
           if (new Set(sw).size !== sw.length) essError('Repeated swizzle components cannot be assigned', e.line);
-          if (sw.length === 1) return {c: `${base.c}.${sw[0]}`, t: S(base.t.s)};
-          return {base: base.c, swizzle: sw, t: V(base.t.s, sw.length), c: null};
+          if (base.swizzle) sw = sw.map(component => base.swizzle['xyzw'.indexOf(component)]);
+          const code = base.swizzle ? base.base : base.c;
+          if (sw.length === 1) return {c: `${code}.${sw[0]}`, t: S(base.t.s)};
+          return {base: code, swizzle: sw, t: V(base.t.s, sw.length), c: null};
         }
         essError(`Cannot access .${e.name}`, e.line);
       }
@@ -1065,7 +1080,7 @@ class Unit {
     const r = this.exprRaw(e, ctx);
     return r.u ? this.uniformValue(r) : r;
   }
-  uniformValue(r) { return {c: this.fromUniform(r.c, r.t), t: r.t}; }
+  uniformValue(r) { return {c: this.fromUniform(r.c, r.t), t: r.t, ref: true}; }
   fromUniform(code, t) {
     switch (t.k) {
       case 's': return t.s === 'bool' ? `(${code} != 0u)` : code;
@@ -1092,10 +1107,11 @@ class Unit {
       const r = part();
       if (ctx.pre.length > mark) {
         // Earlier operands must be evaluated before these hoisted effects.
+        let insertion = mark;
         for (let k = 0; k < out.length; k++) {
-          if (isTrivialCode(out[k].c)) continue;
+          if (out[k].smp || !out[k].c || isLiteralCode(out[k].c)) continue;
           const t = this.tmp();
-          ctx.pre.splice(mark, 0, `let ${t} = ${out[k].c};`);
+          ctx.pre.splice(insertion++, 0, `let ${t} = ${out[k].c};`);
           out[k] = {...out[k], c: t};
         }
       }
@@ -1107,24 +1123,27 @@ class Unit {
     switch (e.k) {
       case 'num': { const n = parseNumber(e.v); return {c: n.code, t: n.type}; }
       case 'bool': return {c: String(e.v), t: BOOL};
-      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u ? r : {c: `(${r.c})`, t: r.t, smp: r.smp}; }
+      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u ? r : {c: `(${r.c})`, t: r.t, smp: r.smp, ref: r.ref}; }
       case 'id': return this.identifier(e, ctx);
       case 'seq': {
         for (const x of e.list.slice(0, -1)) ctx.pre.push(...this.exprStatement(x, ctx));
         return this.expr(e.list.at(-1), ctx);
       }
       case 'assign': {
-        ctx.pre.push(...this.assign(e.target, e.op, e.value, ctx, e.line));
-        const lv = this.lvalue(e.target, ctx);
-        return lv.swizzle ? {c: `${lv.base}.${lv.swizzle.join('')}`, t: lv.t} : {c: lv.c, t: lv.t};
+        const lv = this.lvalue(e.target, ctx), result = this.tmp();
+        ctx.pre.push(...this.storeLvalue(lv, e.op, e.value, ctx, e.line), `let ${result} = ${this.lvalueRead(lv)};`);
+        return {c: result, t: lv.t};
       }
       case 'preinc': {
-        ctx.pre.push(...this.exprStatement(e, ctx));
-        const lv = this.lvalue(e.a, ctx); return {c: lv.c, t: lv.t};
+        const lv = this.lvalue(e.a, ctx), result = this.tmp();
+        ctx.pre.push(...this.storeLvalue(lv, e.op === '++' ? '+=' : '-=', {inc: true}, ctx, e.line),
+          `let ${result} = ${this.lvalueRead(lv)};`);
+        return {c: result, t: lv.t};
       }
       case 'postinc': {
         const lv = this.lvalue(e.a, ctx), t = this.tmp();
-        ctx.pre.push(`let ${t} = ${lv.c};`, ...this.exprStatement({k: 'preinc', op: e.op, a: e.a, line: e.line}, ctx));
+        ctx.pre.push(`let ${t} = ${this.lvalueRead(lv)};`,
+          ...this.storeLvalue(lv, e.op === '++' ? '+=' : '-=', {inc: true}, ctx, e.line));
         return {c: t, t: lv.t};
       }
       case 'unary': {
@@ -1158,13 +1177,13 @@ class Unit {
       this.outputs.push({name: 'gl_FragColor', type: V('float', 4), w: 'f3d_FragColor', flat: false, location: 0});
       this.privates.push('var<private> f3d_FragColor: vec4<f32>;');
     }
-    return {c: 'f3d_FragColor', t: V('float', 4)};
+    return {c: 'f3d_FragColor', t: V('float', 4), ref: true};
   }
   identifier(e, ctx) {
     if (this.version === 100 && this.stage === 'fragment' && (e.name === 'gl_FragColor' || e.name === 'gl_FragData') && !this.lookup(e.name, ctx.scope))
       return this.essl1FragColor(e.name, e.line);
     const b = BUILTIN_VARS[this.stage][e.name];
-    if (b && !this.lookup(e.name, ctx.scope)) { this.used.add(e.name); this.builtinPrivate(e.name, b); return {c: b.w, t: b.type}; }
+    if (b && !this.lookup(e.name, ctx.scope)) { this.used.add(e.name); this.builtinPrivate(e.name, b); return {c: b.w, t: b.type, ref: true}; }
     if (e.name === 'gl_DepthRange' && !this.lookup(e.name, ctx.scope)) return this.depthRange();
     if (e.name === 'gl_PointCoord' && !this.points) essError('gl_PointCoord is only defined when drawing points (compile with points: true)', e.line);
     const s = this.lookup(e.name, ctx.scope);
@@ -1173,9 +1192,9 @@ class Unit {
       case 'uniform': return {c: `f3d_u.${this.shared.uniforms.get(s.name).field}`, t: s.type, u: true};
       case 'sampler': return {c: null, t: s.type, smp: {kind: 'global', name: s.name, sampler: s.sampler}};
       case 'samplerParam': return {c: null, t: s.type, smp: {kind: 'param', w: s.w}};
-      case 'pparam': return {c: `(*${s.w})`, t: s.type};
+      case 'pparam': return {c: `(*${s.w})`, t: s.type, ref: true};
       case 'ublock': return {c: null, t: {k: 'ublock'}, block: s};
-      default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type};
+      default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type, ref: true};
     }
   }
   samplerNames(r, line) {
@@ -1195,21 +1214,26 @@ class Unit {
       if (k < 0 || k >= a.smp.sampler.count) essError('Sampler array index out of range', e.line);
       return {c: null, t: a.t.of, smp: {...a.smp, element: k}};
     }
-    const [base, idx] = a.u ? [a, null] : [a, null];
-    void idx;
-    const parts = this.sequence(ctx, [() => base, () => this.expr(e.index, ctx)]);
-    const index = parts[1];
+    // A stored aggregate contributes its address, not an early value copy:
+    // the index expression may itself change its eventual selected element.
+    const base = a.u || a.ref || this.constEvaluable(e.a, ctx.scope) ? a : this.capture(a, ctx);
+    let index = this.expr(e.index, ctx);
     if (!(index.t.k === 's' && (index.t.s === 'int' || index.t.s === 'uint'))) essError('Index must be an integer', e.line);
+    if (!this.constEvaluable(e.index, ctx.scope)) {
+      const code = this.tmp(); ctx.pre.push(`let ${code} = ${index.c};`);
+      index = {...index, c: code};
+    }
+    ctx.argumentIndices?.set(e, index.c);
     const t = elementType(a.t, e.line);
     if (a.u) {
       const repr = uniformRepr(a.t, this.shared);
       if (repr.wrapped) {
-        const code = `${parts[0].c}[${index.c}].${t.k === 'm' ? 'value' : 'xyzw'.slice(0, comps(t))}`;
-        return {c: this.fromUniform(code, t), t};
+        const code = `${base.c}[${index.c}].${t.k === 'm' ? 'value' : 'xyzw'.slice(0, comps(t))}`;
+        return {c: this.fromUniform(code, t), t, ref: true};
       }
-      return {c: `${parts[0].c}[${index.c}]`, t, u: true};
+      return {c: `${base.c}[${index.c}]`, t, u: true};
     }
-    return {c: `${parts[0].c}[${index.c}]`, t};
+    return {c: `${base.c}[${index.c}]`, t, ref: a.ref};
   }
   field(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
@@ -1226,12 +1250,12 @@ class Unit {
         const r = uniformRepr(f.type, this.shared);
         return {c: `${a.c}.${safe(e.name)}`, t: f.type, u: true, repr: r};
       }
-      return {c: `${a.c}.${safe(e.name)}`, t: f.type};
+      return {c: `${a.c}.${safe(e.name)}`, t: f.type, ref: a.ref};
     }
     const v = a.u ? this.uniformValue(a) : a;
     if (v.t.k === 'v') {
       const sw = swizzle(e.name, v.t.n, e.line);
-      return {c: `${v.c}.${sw.join('')}`, t: vecOf(v.t.s, sw.length)};
+      return {c: `${v.c}.${sw.join('')}`, t: vecOf(v.t.s, sw.length), ref: v.ref};
     }
     if (v.t.k === 's') {
       const sw = swizzle(e.name, 1, e.line);
@@ -1467,33 +1491,39 @@ class Unit {
     if (this.functions.has(e.name)) return this.userCall(e, ctx);
     return this.builtin(e, ctx);
   }
+  callArgument(e, ctx) {
+    const previous = ctx.argumentIndices, indices = new Map();
+    ctx.argumentIndices = indices;
+    try { return {...this.hoisted(ctx, () => this.exprRaw(e, ctx)), indices}; }
+    finally { ctx.argumentIndices = previous; }
+  }
   userCall(e, ctx) {
     const list = this.functions.get(e.name).filter(f => f.decl);
-    // Translate arguments in order; out arguments are lvalues, not values.
-    const raw = [];
-    const parts = this.sequence(ctx, e.args.map((a, i) => () => {
-      const r = this.exprRaw(a, ctx);
-      raw[i] = r;
-      return r.smp ? {c: '', t: r.t, smp: r.smp} : r.u ? this.uniformValue(r) : r;
-    }));
+    // Resolve the overload from one translation per argument, then publish
+    // each argument's effects and copied value/address in source order.
+    // An out argument evaluates its address without loading its old value.
+    const arguments_ = e.args.map(a => this.callArgument(a, ctx));
+    const raw = arguments_.map(a => a.result), parts = raw.map(r => r.smp || !r.u ? r : this.uniformValue(r));
     const f = list.find(x => x.params.length === parts.length && x.params.every((p, i) => p.type.k === 'smp'
       ? !!parts[i].smp && this.samplerNames(raw[i], e.line).type.name === p.type.name : !parts[i].smp && same(p.type, parts[i].t)));
     if (!f) essError(`No matching overload for ${e.name}(${parts.map(p => glslName(p.t)).join(', ')})`, e.line);
     const callArgs = [], writeback = [];
     f.params.forEach((p, i) => {
+      ctx.pre.push(...arguments_[i].pre);
       if (p.type.k === 'smp') {
         const s = this.samplerNames(raw[i], e.line); callArgs.push(s.tex, s.smp);
         if (integerSampler(p.type)) callArgs.push(s.sampling);
         return;
       }
       if (p.q === 'out' || p.q === 'inout') {
-        const lv = this.lvalue(e.args[i], ctx), t = this.tmp();
-        ctx.pre.push(`var ${t}: ${this.wgsl(p.type)}${p.q === 'inout' ? ` = ${lv.swizzle ? `${lv.base}.${lv.swizzle.join('')}` : lv.c}` : ''};`);
+        const lv = this.lvalue(e.args[i], ctx, arguments_[i].indices), t = this.tmp();
+        ctx.pre.push(`var ${t}: ${this.wgsl(p.type)}${p.q === 'inout' ? ` = ${parts[i].c}` : ''};`);
         callArgs.push(`&${t}`);
-        writeback.push(() => this.assign(e.args[i], '=', {k: 'f3d_code', c: t, t: p.type}, ctx, e.line));
+        writeback.push(() => this.storeLvalue(lv, '=', {k: 'f3d_code', c: t, t: p.type}, ctx, e.line));
         return;
       }
-      callArgs.push(parts[i].c);
+      const value = this.tmp(); ctx.pre.push(`let ${value} = ${parts[i].c};`);
+      callArgs.push(value);
     });
     const code = `${f.wname}(${callArgs.join(', ')})`;
     if (!writeback.length) return {c: code, t: f.ret};
@@ -1505,7 +1535,15 @@ class Unit {
   }
   builtin(e, ctx) {
     const name = e.name;
-    const raw = this.sequence(ctx, e.args.map(a => () => { const r = this.exprRaw(a, ctx); return r.smp || !r.u ? r : this.uniformValue(r); }));
+    let outIndices;
+    const raw = this.sequence(ctx, e.args.map((a, i) => () => {
+      let r;
+      if (name === 'modf' && i === 1) {
+        const argument = this.callArgument(a, ctx); outIndices = argument.indices;
+        ctx.pre.push(...argument.pre); r = argument.result;
+      } else r = this.exprRaw(a, ctx);
+      return r.smp || !r.u ? r : this.uniformValue(r);
+    }));
     const args = raw;
     const line = e.line;
     const n = args.length;
@@ -1517,7 +1555,7 @@ class Unit {
     switch (name) {
       case 'radians': case 'degrees': case 'sin': case 'cos': case 'tan': case 'asin': case 'acos': case 'sinh': case 'cosh': case 'tanh':
       case 'asinh': case 'acosh': case 'atanh': case 'exp': case 'log': case 'exp2': case 'log2': case 'sqrt': case 'floor': case 'ceil':
-      case 'fract': case 'trunc': case 'normalize':
+      case 'fract': case 'trunc':
         need(1); return simple(name, args[0].t);
       case 'round': case 'roundEven': need(1); return simple('round', args[0].t);
       case 'inversesqrt': need(1); return simple('inverseSqrt', args[0].t);
@@ -1547,16 +1585,13 @@ class Unit {
         need(2);
         const r = this.tmp();
         ctx.pre.push(`let ${r} = modf(${args[0].c});`);
-        ctx.pre.push(...this.assign(e.args[1], '=', {k: 'f3d_code', c: `${r}.whole`, t: args[0].t}, ctx, line));
+        const target = this.lvalue(e.args[1], ctx, outIndices);
+        ctx.pre.push(...this.storeLvalue(target, '=', {k: 'f3d_code', c: `${r}.whole`, t: args[0].t}, ctx, line));
         return {c: `${r}.fract`, t: args[0].t};
       }
-      case 'length': need(1); return {c: `length(${args[0].c})`, t: FLOAT};
-      case 'distance': need(2); return {c: `distance(${args[0].c}, ${args[1].c})`, t: FLOAT};
-      case 'dot': need(2); return {c: args[0].t.k === 's' ? `(${args[0].c} * ${args[1].c})` : `dot(${args[0].c}, ${args[1].c})`, t: S(scalarOf(args[0].t))};
-      case 'cross': need(2); return simple('cross', V('float', 3));
-      case 'faceforward': need(3); return simple('faceForward', args[0].t);
-      case 'reflect': need(2); return simple('reflect', args[0].t);
-      case 'refract': need(3); return simple('refract', args[0].t);
+      case 'length': case 'distance': case 'dot': case 'cross':
+      case 'normalize': case 'faceforward': case 'reflect': case 'refract':
+        return this.geometricBuiltin(name, args, line);
       case 'transpose': need(1); return {c: `transpose(${args[0].c})`, t: M(args[0].t.r, args[0].t.c)};
       case 'determinant': need(1); return {c: `determinant(${args[0].c})`, t: FLOAT};
       case 'inverse': need(1); return {c: `${this.inverseHelper(args[0].t, line)}(${args[0].c})`, t: args[0].t};
@@ -1753,6 +1788,31 @@ class Unit {
     }
     return {c: `${helper}(${tex}, ${sampling}, ${p.c}, ${lod})`, t: V(type.s, 4)};
   }
+  /** ESSL geometric genType includes float; WGSL's direction operators only
+   * accept vectors. Scalar helpers take copied values so repeated terms do not
+   * repeat user calls or observe later changes to an argument. */
+  geometricBuiltin(name, args, line) {
+    const count = {length: 1, distance: 2, dot: 2, cross: 2, normalize: 1, faceforward: 3, reflect: 2, refract: 3}[name];
+    if (args.length !== count) essError(`${name} expects ${count} arguments`, line);
+    const type = args[0].t;
+    if (!['s', 'v'].includes(type.k) || type.s !== 'float' ||
+        name === 'cross' && !same(type, V('float', 3)) ||
+        args.some((arg, i) => !same(arg.t, name === 'refract' && i === 2 ? FLOAT : type)))
+      essError(`${name} requires matching floating-point ${name === 'cross' ? 'vec3' : 'scalar or vector'} arguments${name === 'refract' ? ' and a scalar float ratio' : ''}`, line);
+    let builtin = name === 'faceforward' ? 'faceForward' : name;
+    if (type.k === 's') {
+      if (name === 'dot') return {c: `(${args[0].c} * ${args[1].c})`, t: FLOAT};
+      // For nonzero scalars the unit direction is their sign. Keep this a
+      // WGSL constant expression when the ESSL argument is constant.
+      if (name === 'normalize') builtin = 'sign';
+      else if (SCALAR_GEOMETRIC[name]) {
+        builtin = `f3d_${name}_scalar`;
+        if (!this.helpers.has(builtin)) this.helpers.set(builtin, SCALAR_GEOMETRIC[name]);
+      }
+    }
+    return {c: `${builtin}(${args.map(arg => arg.c).join(', ')})`,
+      t: ['length', 'distance', 'dot'].includes(name) ? FLOAT : type};
+  }
   inverseHelper(t, line) {
     if (t.k !== 'm' || t.c !== t.r) essError('inverse needs a square matrix', line);
     const name = `f3d_inverse${t.c}`;
@@ -1764,6 +1824,21 @@ class Unit {
 // Handle synthesized code operands (writebacks/modf) in expr().
 const baseExprRaw = Unit.prototype.exprRaw;
 Unit.prototype.exprRaw = function (e, ctx) { return e.k === 'f3d_code' ? {c: e.c, t: e.t} : baseExprRaw.call(this, e, ctx); };
+
+const SCALAR_GEOMETRIC = {
+  faceforward: `fn f3d_faceforward_scalar(n: f32, i: f32, nref: f32) -> f32 {
+  return select(-n, n, nref * i < 0.0);
+}`,
+  reflect: `fn f3d_reflect_scalar(i: f32, n: f32) -> f32 {
+  return i - 2.0 * (n * i) * n;
+}`,
+  refract: `fn f3d_refract_scalar(i: f32, n: f32, eta: f32) -> f32 {
+  let d = n * i;
+  let k = 1.0 - eta * eta * (1.0 - d * d);
+  if (k < 0.0) { return 0.0; }
+  return eta * i - (eta * d + sqrt(k)) * n;
+}`,
+};
 
 const INVERSE = {
   2: `fn f3d_inverse2(m: mat2x2<f32>) -> mat2x2<f32> {
@@ -1842,4 +1917,5 @@ function endsWithReturn(lines) {
   const last = lines.filter(l => l.trim()).at(-1)?.trim() ?? '';
   return last.startsWith('return') || last === 'discard;';
 }
-const isTrivialCode = c => /^[A-Za-z_][\w]*$/.test(c) || /^-?[\d.]+[uf]?$/.test(c) || c === 'true' || c === 'false';
+const isLiteralCode = c => /^-?[\d.]+[uf]?$/.test(c) || c === 'true' || c === 'false';
+const isTrivialCode = c => /^[A-Za-z_][\w]*$/.test(c) || isLiteralCode(c);

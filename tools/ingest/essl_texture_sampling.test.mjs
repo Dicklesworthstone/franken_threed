@@ -64,7 +64,9 @@ test('named local offsets remain compile-time constants and side effects run onc
     'uniform sampler2D image;const int stepSize=1;int calls=0;vec3 point(){calls++;return vec3(.2,.4,2.);}');
   assert.match(wgsl, /const base: vec2<i32>/); assert.match(wgsl, /const delta: vec2<i32>/);
   assert.equal((wgsl.match(/= point\(\);/g) ?? []).length, 1);
-  assert.match(wgsl, /textureSampleBias\(image_texture, image_sampler, .*, f32\(calls\), delta\)/);
+  const bias = /calls = \(calls \+ 1\);\n\s+let (f3d_t\d+) = calls;/.exec(wgsl);
+  assert.ok(bias, 'prefix increment returns a captured value');
+  assert.ok(wgsl.includes(`f32(${bias[1]}), delta)`));
   const captured = compile('color=textureProjOffset(image,vec3(.2,.4,2.),ivec2(1,-1),float(++calls));',
     'uniform sampler2D image;int calls=0;').fragment;
   assert.match(captured, /textureSampleBias\(image_texture, image_sampler, .*, vec2<i32>\(1, \(-1\)\)\)/,

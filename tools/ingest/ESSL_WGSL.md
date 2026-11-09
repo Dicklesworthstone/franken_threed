@@ -77,6 +77,14 @@ admitted. The source rules are in the
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
   shift counts become `u32`; `inverse`, `matrixCompMult`, `outerProduct` are
   generated helpers.
+- Geometric functions retain ESSL's scalar and floating-vector signatures.
+  Scalar `normalize` uses `sign`, including in constant expressions; scalar
+  `faceforward`, `reflect` and `refract` use cached, typed value helpers because
+  WGSL only provides vector overloads. Each argument runs once. Refraction
+  returns zero before taking a square root when its discriminant is negative.
+  Vector calls retain the corresponding native WGSL builtins. Integer inputs,
+  mixed vector widths, non-`vec3` cross products and vector refraction ratios
+  are rejected according to the source signatures.
 - ESSL 3.00 whole-array and struct equality compare all corresponding elements
   and fields, including nested structs, arrays, matrices and booleans. Cached
   typed helpers take each operand by value once; matrix-producing expressions
@@ -100,9 +108,20 @@ admitted. The source rules are in the
   8-byte WGSL columns. Pinned r186 `WebGLUniforms` only supplies ordinary
   material upload setters for square matrix types.
 - Global stage I/O becomes private variables copied by the entry points.
-- `out`/`inout` arguments copy through temporaries in source evaluation order;
-  side-effecting `?:`, `&&`, `||`, `++`/`--` and assignments inside expressions
-  are lowered to statements; multi-component swizzle stores are split.
+- Assignment and increment destinations capture every dynamic subscript once,
+  before the right-hand expression. Their expression results read the same
+  captured destination. Nested struct/array/matrix and swizzle destinations
+  retain the selected original storage, including indexing a swizzled vector.
+- User-function arguments evaluate once from left to right: `in` copies a value,
+  `out` captures a destination without reading its old value, and `inout` copies
+  both. Copy-back reuses the captured destination even if a later argument or
+  the function body changes its index. `modf` applies the same destination
+  rule. Hoisted builtin/constructor effects preserve earlier argument values
+  and their order; constant aggregate indices remain constant expressions.
+  Output-parameter copy-back order for aliased destinations is unspecified by
+  [ESSL 3.00 section 6.1.1](https://registry.khronos.org/OpenGL/specs/es/3.0/GLSL_ES_Specification_3.00.pdf).
+  Side-effecting `?:`, `&&`, `||`, `++`/`--` and assignments inside expressions
+  lower to statements; multi-component swizzle stores split into component writes.
 - Nonempty switch fallthrough uses reachable source-case suffixes in native WGSL
   cases. The selector runs once; conditional breaks, defaults between labels,
   return/discard and continue targets retain source control flow. A nested loop
@@ -128,6 +147,33 @@ shadow sampling remain unimplemented.
 
 ## Evidence
 
+`essl_geometric.test.mjs` covers the typed scalar/vector boundary, stage-local
+helper reuse, constant normalization and one evaluation of helper arguments.
+`node tests/e2e/webgpu_renderer/program_geometric.mjs` compares 53 checkpoints
+against pinned r186 WebGL: scalar normalization, faceforward, reflection and
+refraction in ESSL 1.00/3.00 vertex and fragment programs, total internal
+reflection and its boundary, constants, side effects and vector regressions.
+Chromium 153.0.8010.0 / SwiftShader matches all 27,136 RGBA bytes exactly with
+zero GPU/browser errors. These are software GPU correctness checks.
+
+- `essl_lvalues.test.mjs` has ten focused regressions for destination capture,
+  function argument value/address order, nested swizzles, `modf`, stored versus
+  computed aggregates, constant offset/switch expressions and invalid targets.
+  `program_lvalues.mjs` exercises 23 programs in both vertex and fragment stages.
+  On Chromium 153.0.8010.0 / SwiftShader, 40 checkpoints match pinned r186 WebGL
+  exactly (5,120 RGBA bytes); all 46 candidate checkpoints match their specified
+  expected values (5,888 bytes), with zero GPU/browser errors.
+  Six checkpoints remain explicit source differences: a later argument mutating
+  an earlier `inout` value gives source 73 versus specified 13; a `modf` output
+  index mutating its earlier input gives whole/fraction 99/0 versus 14/0.25;
+  `combine(x, ++x, x++)` gives 46 versus 26 for the fixture's initial value and
+  function. Each occurs in both stages. Raw WebGL2, without Three's renderer,
+  reproduces the source values. The compiler retains the once-only, left-to-right
+  argument-copy rules of ESSL 3.00 section 6.1.1. The runner accepts either a
+  conformant source result or exactly the observed driver alternative, records
+  actual differences separately, and never counts them as source parity. This
+  driver/source equivalence limitation remains open; these results do not claim
+  complete ESSL parity or hardware performance.
 - `essl_texture_sampling.test.mjs`: six focused tests cover projected/offset
   signatures, projective divisors, already-projected gradients, source constant
   offsets, argument side effects, vertex LOD and typed texel fetches. The new
