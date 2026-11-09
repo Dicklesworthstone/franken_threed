@@ -42,6 +42,7 @@ import {inspectThreeNodeClipping, updateThreeNodeClipping} from './three_node_cl
 import {createThreeNodeEffects} from './three_node_effects.mjs';
 import {inspectThreeNativeBatch} from './three_node_batch.mjs';
 import {createThreeNodeWireframes} from './three_node_wireframe.mjs';
+import {threeNodeBuilderMaterialKey, cloneThreeNodeBuilderBindings} from './three_node_builder_cache.mjs';
 
 export class ThreeNodeProgramError extends Error {
   constructor(code, message, options) {
@@ -180,8 +181,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     [three.PointsMaterial, three.PointsNodeMaterial], [three.LineBasicMaterial, three.LineBasicNodeMaterial],
     [three.LineDashedMaterial, three.LineDashedNodeMaterial]
   ].filter(([Source, Native]) => Source && Native).map(([Source, Native]) => [Source.prototype, {Source, Native}]));
-  // Share immutable source text only. Each render object keeps its own builder,
-  // observer and bindings, since source nodes may close over its live values.
+  // Ordinary rigid PBR materials additionally share source builder state.
+  // Other profiles retain their existing per-object construction owners.
+  const sharedBuilders = new Map(), builderContexts = new Map();
+  const emptyLightsKey = three.TSL.lights([]).getCacheKey(true);
   const shaderPairs = new Map();
   let disposed = false, shaderBytes = 0, serial = 0;
   function retainShaders(pair) {
@@ -1313,6 +1316,39 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return JSON.stringify(values);
   }
+  function builderScope(context) {
+    const target = renderer.getRenderTarget?.() ?? null;
+    const attachment = context.sourceRenderContext ?? `${target === null ? 'default' :
+      [target.textures.length, target.texture.format, target.texture.type, target.samples, target.depthBuffer, target.stencilBuffer].join(':')}-default-0`;
+    return {attachment, chain: JSON.stringify([context.passId ?? null, attachment, sourceId(context.scene ?? null)])};
+  }
+  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature) {
+    // Source builder sharing is first admitted for callback-free, rigid PBR
+    // material graphs. These nodes read live object/material uniforms through
+    // NodeFrame, but retain their construction-time environment selection.
+    if (![three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(Object.getPrototypeOf(prepared)) ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
+        Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
+        prepared.transparent || prepared.wireframe || prepared.useTransmission || prepared.lights !== true ||
+        [...GRAPH_SLOTS, 'contextNode'].some(name => prepared[name] != null) ||
+        [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
+        Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
+        Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
+          attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute || attribute.isStorageBufferAttribute) ||
+        context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode ||
+        context.camera?.isArrayCamera || context.lightsNode || lights.length || context.lightingEnabled === false ||
+        renderer.lighting?.enabled === false || rendererContextSignature !== null ||
+        context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
+        (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
+        renderer.getOutputRenderTarget?.()?.multiview) return null;
+    const {attachment, chain} = builderScope(context);
+    let contextId = builderContexts.get(attachment);
+    if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
+    const {hash, hashArray} = three.NodeUtils;
+    const dynamic = hash(hashArray([0, 1, emptyLightsKey, renderer.shadowMap?.enabled ? 1 : 0, renderer.shadowMap?.type]),
+      renderer.contextNode.id, renderer.contextNode.version);
+    return {contextId, dynamic, chain};
+  }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
@@ -1353,8 +1389,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const record of state?.bundleLeases ?? []) releaseBundleGeometry(record);
     for (const record of state?.fogRecords?.values() ?? []) releaseFogResources(record);
     releaseShaders(entry.shaders);
+    if (entry.sharedBuilder && --entry.sharedBuilder.references === 0) sharedBuilders.delete(entry.sharedBuilder.key);
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
+    entry.object.removeEventListener('dispose', entry.onDispose);
     if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
     if (entry.descriptor.wireframe) wireframes.release(entry.descriptor);
     const materials = cache.get(entry.object), passes = materials?.get(entry.material);
@@ -1373,19 +1411,41 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
+    const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
     const backdropKey = backdropSignature(preparedMaterial);
     const clippingKey = inspectThreeNodeClipping(three, context, maxNodes, fail);
     const mrtKey = inspectThreeMRT(three, renderer, preparedMaterial)?.key ?? null;
-    let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
     const byMaterial = cache.get(object);
     // Source render objects distinguish the transparent back-side pass from
     // the ordinary front-side pass. Both may own generated attribute streams;
     // compiling one must not retire the other's accepted descriptor.
-    const passId = context.passId ?? null, passes = byMaterial?.get(material);
-    const previous = passes?.get(passId);
+    const passes = byMaterial?.get(material);
+    const chain = construction?.chain ?? (passes ? builderScope(context).chain : null);
+    // Retire the same logical render object when it enters/leaves sharing.
+    // An excluded authored graph must not keep an obsolete shared reference
+    // alive merely because its preparation path changed.
+    const passId = construction || passes?.has(chain) ? chain : context.passId ?? null;
+    const previous = passes?.get(passId) ?? (construction ? passes?.get(context.passId ?? null) : undefined);
     const previousState = previous && nodeStates.get(previous.descriptor);
+    if (construction) construction.key = previous?.sharedBuilder &&
+      previousState.materialVersion === material.version && previousState.sharedDynamic === construction.dynamic
+      ? previous.sharedBuilder.key
+      : threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId) + construction.dynamic;
+    // RenderObjects rechecks material keys only on needsUpdate or a dynamic
+    // context change. A version-only change with the same source key retains
+    // the very same builder nodes, including their captured PMREM texture.
+    if (construction && previous?.sharedBuilder && previous.geometry === object.geometry &&
+        previousState.sharedDynamic === construction.dynamic &&
+        (previousState.materialVersion === material.version || previous.sharedBuilder.key === construction.key)) {
+      previousState.materialVersion = material.version;
+      previousState.environment = environment;
+      previousState.materialEnvironment = materialEnvironment(preparedMaterial, environment);
+      previousState.environmentGraph = environmentGraphKey(preparedMaterial, context);
+      return previous.descriptor;
+    }
+    let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
     // r186's highPrecision setter changes only context values. Existing render
     // objects keep their matrix graph until context identity/version or another
     // construction key changes; material.needsUpdate alone is not that change.
@@ -1430,7 +1490,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side || version !== preparedMaterial.version || retainedPrecision)
       ? keyOf(preparedMaterial, object, context, lights, environment,
         instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, version, contextKey) : key;
-    if (previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
+    if (!previous?.sharedBuilder && previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
         uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
@@ -1451,40 +1511,45 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // setup() itself may filter a PMREM source. An existing stale atlas must
     // reach the first draw's ordered preparation boundary through its cached
     // graph, rather than being rewritten while another graph is constructed.
-    assertEnvironmentVersion(environment);
+    const sharedKey = construction && previous?.sharedBuilder && previousState.materialVersion === material.version &&
+      previousState.sharedDynamic === construction.dynamic ? previous.sharedBuilder.key : construction?.key;
+    let sharedBuilder = construction ? sharedBuilders.get(sharedKey) : null;
+    if (!sharedBuilder) assertEnvironmentVersion(environment);
     for (const entry of entries) for (const node of entry.pmremNodes) assertEnvironmentVersion(node.value);
-    const builder = new three.WGSLNodeBuilder(object, renderer);
-    const captureShadowGraphs = captureThreeNativeShadowGraphs(three, builder);
-    effects.installBuilder(builder);
-    installThreeNativeShadowTargets(renderer, builder);
-    builder.material = material; builder.context.material = material;
-    builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
-    builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
-      [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
+    const builder = sharedBuilder?.builder ?? new three.WGSLNodeBuilder(object, renderer);
+    const captureShadowGraphs = sharedBuilder?.captureShadowGraphs ?? captureThreeNativeShadowGraphs(three, builder);
     const authored = authoredLightsNode(preparedMaterial);
-    // Keep the scene entrance distinct from material.lightsNode, just as the
-    // pinned NodeManager does. NodeMaterial selects the authored graph itself.
-    if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
-      ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
+    const environmentNode = sharedBuilder?.environmentNode ?? (environmentGraph(preparedMaterial, context) || environmentNodeFor(environment));
+    let graphicsNode = sharedBuilder?.graphicsNode;
+    if (!sharedBuilder) {
+      effects.installBuilder(builder);
+      installThreeNativeShadowTargets(renderer, builder);
+      builder.material = material; builder.context.material = material;
+      builder.scene = context.scene ?? null; builder.camera = context.camera ?? null;
+      builder.clippingContext = Object.fromEntries(['unionPlanes', 'intersectionPlanes'].map(key =>
+        [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
+      // Keep the scene entrance distinct from material.lightsNode, just as the
+      // pinned NodeManager does. NodeMaterial selects the authored graph itself.
+      if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
+        ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
+      if (environmentNode) builder.environmentNode = environmentNode;
+      builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
+      // Compute setup writes do not become graphics bindings.
+      const computeChildren = new Set(), graphicsNodes = new Set(), generatedNodes = new Set(), addChain = builder.addChain;
+      builder.addChain = function (node) {
+        (this.chaining.some(parent => parent.isComputeNode) ? computeChildren : graphicsNodes).add(node);
+        if (this.buildStage === 'generate') generatedNodes.add(node);
+        return addChain.call(this, node);
+      };
+      try { builder.build(); }
+      catch (cause) {
+        if (cause instanceof ThreeNodeProgramError) throw cause;
+        throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
+      } finally { builder.addChain = addChain; }
+      graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
+      if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode, references: 0};
+    }
     const lightsNode = authored ?? builder.lightsNode;
-    const environmentNode = environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
-    if (environmentNode) builder.environmentNode = environmentNode;
-    builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
-    // ComputeNode.setup constructs its body in this graphics builder, but its
-    // generate() emits only outputComputeNode. Keep source update lists intact
-    // while separating setup-only compute writes from actual graphics nodes.
-    const computeChildren = new Set(), graphicsNodes = new Set(), generatedNodes = new Set(), addChain = builder.addChain;
-    builder.addChain = function (node) {
-      (this.chaining.some(parent => parent.isComputeNode) ? computeChildren : graphicsNodes).add(node);
-      if (this.buildStage === 'generate') generatedNodes.add(node);
-      return addChain.call(this, node);
-    };
-    try { builder.build(); }
-    catch (cause) {
-      if (cause instanceof ThreeNodeProgramError) throw cause;
-      throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
-    } finally { builder.addChain = addChain; }
-    const graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
     assertInstances(object, instanceSignature);
     assertBatch(object, batchSignature);
     assertSkinning(object, skinSignature);
@@ -1514,7 +1579,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       environmentVersions.set(node.value, node.value.pmremVersion);
     const pmremKey = pmremSignature(pmremNodes);
     if (builder.nodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
-    const bindings = builder.getBindings();
+    const bindings = sharedBuilder ? cloneThreeNodeBuilderBindings(builder) : builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
     const analyticLightNodes = [...builder.nodes].filter(node => checkAnalyticLight(node, lights));
@@ -1710,6 +1775,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       generated.length ? generatedAttributes.geometry(descriptor) : object.geometry);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, shadowGraphs,
+      sharedBuilder, sharedDynamic: construction?.dynamic,
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       basicEnvironmentSignature: basicEnvironmentSignature(preparedMaterial, environment),
       transmissionSignature: transmissionSignature(preparedMaterial),
@@ -1735,7 +1801,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // instead of rebuilding that constructor and repeating onInit next frame.
     if (geometryKey !== null) key = keyOf(preparedMaterial, object, context, lights, environment,
       instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
-    const entry = {key, passId, descriptor, builder, material, object, geometry: object.geometry, shaders, pmremNodes, pmremSignature: pmremKey,
+    const entry = {key, passId, descriptor, builder, sharedBuilder, material, object, geometry: object.geometry, shaders, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
@@ -1749,6 +1815,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     // Acquire before retiring to preserve an unchanged pair's cache identity.
     retainShaders(shaders);
+    if (sharedBuilder) {
+      sharedBuilder.references++;
+      sharedBuilders.set(sharedBuilder.key, sharedBuilder);
+    }
     if (previous) retire(previous);
     const next = byMaterial ?? new Map(), nextPasses = passes ?? new Map();
     nextPasses.set(passId, entry); next.set(material, nextPasses); cache.set(object, next);
@@ -1757,7 +1827,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Source geometry disposal clears attribute residency without retiring a
     // RenderObject's compiled morph graph or its captured target texture.
     // Attribute/wireframe owners retain their independent disposal listeners.
-    if (morphSignature === null) object.geometry.addEventListener('dispose', entry.onDispose);
+    if (morphSignature === null && !sharedBuilder) object.geometry.addEventListener('dispose', entry.onDispose);
+    if (sharedBuilder) object.addEventListener('dispose', entry.onDispose);
     return descriptor;
   }
   function stateOf(descriptor) {
@@ -1895,7 +1966,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (pmremSignature(state.pmremNodes) !== state.pmremSignature)
       fail('CHANGED', 'Native PMREM input identity or sampling orientation changed; compile the graph again');
     if (versions) {
-      assertEnvironmentVersion(state.environment);
+      if (!state.sharedBuilder) assertEnvironmentVersion(state.environment);
       for (const node of state.pmremNodes) assertEnvironmentVersion(node.value);
     }
   }

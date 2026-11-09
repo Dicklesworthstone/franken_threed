@@ -119,9 +119,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const customRenderObject = !shadowPass && renderObjectFunction;
   // Match source RenderContexts identity for ordinary-material refresh
   // observers. Target objects with the same attachment state share a context.
-  const sourceRenderContext = !shadowPass && bundles ? `${destination === null ? 'default' :
+  const builderRenderContext = !shadowPass ? `${destination === null ? 'default' :
     [destination.textures.length, destination.texture.format, destination.texture.type, destination.samples,
       destination.depthBuffer, destination.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-${bundleDepth}` : undefined;
+  const sourceRenderContext = bundles ? builderRenderContext : undefined;
   const hierarchy = new Map(), objects = new Set(), bindings = [], pairs = new Map(), stack = [renderRoot], hookedObjects = new Set();
   let nativeOverrides = false;
   const phaseBindings = {opaque: new Set(), transparent: new Set()}, compiledBindings = new Set();
@@ -657,7 +658,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     renderId};
   let programs = null;
   const context = {scene: root, camera, lights: Object.freeze([]), colorAttachmentCount: destination?.textures.length ?? 1,
-    lightingEnabled: renderer.lighting?.enabled !== false, compilation: !uniforms};
+    lightingEnabled: renderer.lighting?.enabled !== false, compilation: !uniforms, sourceRenderContext: builderRenderContext};
   const withBinding = (binding, run) => {
     const previous = context.clippingContext, previousPass = context.passId, previousSide = binding.material.side;
     const previousLights = context.lights, previousSidePass = context.sidePass;

@@ -2009,16 +2009,52 @@ CubeUV atlases directly. Its bake work uses six module identities for six unique
 WGSL sources, compared with 40 module identities before native module sharing
 in the recording-device probe; this is an allocation count, not a timing result.
 
-A separate four-sphere native PBR diagnostic identifies a pinned source
-NodeBuilderState cache-sharing boundary. The source mixed-environment scene is
-byte-identical to an all-cube control: r186 reuses the first cube atlas on all
-four materials. The candidate all-cube control matches that source exactly;
-its mixed case samples the authored panorama on the lower pair and differs in
-4,236 channel values. Both raw atlases match, and the same result reproduces
-with cold bakes, warmup, and the previous uncached GPU program owner. Exact
-source compatibility here requires the source graph-cache keys and lifetime,
-rather than a change to GPU module sharing or PMREM baking. These diagnostic
-pixels are not included in the exact atlas/loading claim.
+### Native PBR builder-state sharing
+
+Ordinary rigid Standard/Physical materials now share retained source builder
+state when the pinned `RenderObject` keys agree. This closes the four-sphere
+mixed-environment discrepancy described by the earlier diagnostic: source r186
+captures the first material's PMREM input in the shared graph, even when a
+later structurally equivalent material names a different CubeUV atlas. The
+implementation shares the complete constructed nodes and observer, then clones
+binding wrappers per render object as `NodeBuilderState.createBindings` does.
+Live colors, roughness, intensity, rotation and object transforms still update
+through each draw's `NodeFrame`; accepted uniform packets remain independent.
+
+`three_node_builder_cache.mjs` follows source material property/getter order,
+numeric zero/nonzero reductions, sampler properties, geometry layout and the
+pinned hash. Attachment state and nesting select source render contexts.
+Material keys are reconsidered at source version/context boundaries; a
+version-only invalidation with the same key keeps the constructed graph.
+Material and object disposal release references, while geometry disposal keeps
+the builder. The final user releases the shared cache entry. Moving into an
+authored graph retires the prior shared reference, so returning to the ordinary
+profile cannot revive an environment whose source builder has already retired.
+
+The initial sharing profile is opaque, rigid Mesh Standard/Physical materials
+(ordinary or node classes) with float attributes and material-local environments.
+Authored graph slots, other material maps, analytic lights, scene environments
+or fog, clipping, shadows, deformation, transmission, wireframes and multiview
+retain their existing preparation paths; their cross-material builder-sharing
+semantics remain incomplete. GPU modules and pipelines keep their separate
+existing owners. This is source graph compatibility, not a measured speedup.
+
+Ten focused tests compare real pinned `RenderObject`, `RenderObjects` and
+`NodeManager` behavior with the candidate, including all four material classes,
+binding ownership, queued uniforms, version-only reuse, disposal, attachment
+contexts and profile transitions. Together with adjacent environment and scene
+capture suites, **83 tests pass**. A broader native program run passes 249 of
+253 checks; its four existing admission-expectation failures also reproduce
+with the original `5bcbba8` program owner. The browser cases
+`native_pbr_environment_cache`, `native_physical_environment_cache` and
+`native_pbr_environment_cache_panorama_first` in
+`scenarios_native_environment_cache.js` match all **21 checkpoints and
+1,032,192 RGBA bytes exactly**, with zero GPU/browser errors on Chromium
+153.0.8010.0/SwiftShader and the `general-webgpu` route against the pinned
+r186 source. They exercise real cube/panorama PMREM atlases, both input orders,
+Standard/Physical materials, same-key invalidation, partial material disposal
+and live color/roughness/intensity changes. These are software-GPU correctness
+results, with no hardware acceleration claim.
 
 ## Native compressed texture inputs
 
