@@ -95,7 +95,7 @@ test('explicit fragment graphs retain source alpha-hash bypass semantics', t => 
   assert.equal(descriptor.fragment, reference.fragmentShader); assert.doesNotMatch(descriptor.fragment, /getAlphaHashThreshold/);
 });
 
-async function facade(t, Material = T.MeshBasicMaterial) {
+async function facade(t, Material = T.MeshBasicMaterial, {samples = 1} = {}) {
   const device = geometryDevice();
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
   device.textures = [];
@@ -113,7 +113,7 @@ async function facade(t, Material = T.MeshBasicMaterial) {
   let configuration;
   const canvas = {width: 16, height: 16, style: {}, getContext: () => ({configure(value) { configuration = value; }, unconfigure() {},
     getCurrentTexture() { return device.createTexture({size: [16, 16], format: configuration.format, usage: configuration.usage}); }})};
-  const Renderer = createWebGPURendererClass(T), renderer = new Renderer({canvas, device});
+  const Renderer = createWebGPURendererClass(T), renderer = new Renderer({canvas, device, samples});
   renderer.outputColorSpace = T.LinearSRGBColorSpace; t.after(() => renderer.dispose()); await renderer.init();
   const scene = new T.Scene(), material = new Material({alphaHash: true, opacity: .25});
   const object = new T.Mesh(new T.PlaneGeometry(), material); object.frustumCulled = false;
@@ -181,3 +181,45 @@ test('ordinary alpha hashing shares source shadow ownership and leaves shadow-ma
   assert.equal(diagnostics.shadowBytes, 0); assert.equal(diagnostics.shadowStats, null);
 });
 
+
+for (const Material of [T.MeshBasicMaterial, T.MeshBasicNodeMaterial, T.MeshStandardMaterial, T.MeshStandardNodeMaterial])
+for (const samples of [1, 4])
+test(`${Material.name} alpha-to-coverage without hashing retains the exact source shader at ${samples} samples`, t => {
+  const f = program(t, Material);
+  f.material.alphaHash = false; f.material.alphaToCoverage = true; f.material.alphaTest = .375;
+  f.renderer.currentSamples = samples;
+  const descriptor = f.compile(), reference = source(f);
+  assert.equal(descriptor.vertex, reference.vertexShader); assert.equal(descriptor.fragment, reference.fragmentShader);
+  assert.doesNotMatch(descriptor.fragment, /getAlphaHashThreshold/);
+  if (samples === 4) assert.match(descriptor.fragment, /fwidth/);
+  const first = f.owner.capture(descriptor, f.context);
+  f.material.alphaTest = .625; f.material.opacity = .875;
+  assert.equal(f.compile(), descriptor, 'positive alpha thresholds and opacity remain live uniforms');
+  const second = f.owner.capture(descriptor, {...f.context, renderId: 2});
+  assert.ok(packetValues(first).includes(.375)); assert.ok(!packetValues(first).includes(.625));
+  assert.ok(packetValues(second).includes(.625)); assert.ok(packetValues(second).includes(.875));
+});
+
+for (const Material of [T.MeshBasicMaterial, T.MeshBasicNodeMaterial])
+test(`${Material.name} coverage-only draws route automatically and preserve queued coverage changes`, async t => {
+  const f = await facade(t, Material, {samples: 4});
+  f.material.alphaHash = false; f.material.alphaToCoverage = true; f.material.alphaTest = .375;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.device.snapshots.flat().length, 0, 'compilation does not submit a draw');
+  f.renderer.render(f.scene, f.camera);
+  f.material.alphaToCoverage = false; f.material.needsUpdate = true; f.material.opacity = .5;
+  f.renderer.render(f.scene, f.camera);
+  f.material.alphaToCoverage = true; f.material.needsUpdate = true;
+  f.material.alphaTest = .625; f.material.opacity = .875;
+  f.renderer.render(f.scene, f.camera); f.material.alphaTest = .9375; f.material.opacity = .9375;
+  await f.renderer.waitForGPU();
+  const submitted = f.device.snapshots.flat(), native = submitted.filter(draw => draw.pipeline.vertex.entryPoint === 'main');
+  assert.equal(submitted.length, 3); assert.equal(native.length, 2);
+  assert.deepEqual(submitted.map(draw => draw.pipeline.multisample.alphaToCoverageEnabled === true), [true, false, true]);
+  assert.ok(native.every(draw => draw.pipeline.multisample.count === 4 && !hashed(draw)));
+  assert.ok(uniforms(native[0]).includes(.375)); assert.ok(!uniforms(native[0]).includes(.625));
+  assert.ok(uniforms(native[1]).includes(.625)); assert.ok(uniforms(native[1]).includes(.875));
+  assert.ok(!uniforms(native[1]).includes(.9375));
+  assert.equal(f.material.colorNode == null, true, 'coverage needs no dummy authored node');
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});

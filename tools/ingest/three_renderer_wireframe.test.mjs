@@ -186,3 +186,32 @@ test('wireframe topology changes inside node updates fail before publication and
   f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
   assert.equal(draws(f.device)[0].pipeline.primitive.topology, 'triangle-list');
 });
+
+for (const Material of [T.MeshNormalMaterial, T.MeshNormalNodeMaterial, T.MeshMatcapMaterial, T.MeshMatcapNodeMaterial])
+for (const deformation of ['instanced', 'morphed'])
+test(`${Material.name} ${deformation} wireframes automatically use source native geometry`, async t => {
+  const geometry = new T.PlaneGeometry(), material = new Material({wireframe: true});
+  let mesh;
+  if (deformation === 'instanced') {
+    mesh = new T.InstancedMesh(geometry, material, 2);
+    mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(-.25, 0, 0));
+    mesh.setMatrixAt(1, new T.Matrix4().makeTranslation(.25, 0, 0));
+    mesh.instanceMatrix.needsUpdate = true; t.after(() => mesh.dispose());
+  } else {
+    geometry.morphTargetsRelative = true;
+    geometry.morphAttributes.position = [new T.Float32BufferAttribute(
+      Array.from({length: geometry.attributes.position.count}, () => [.125, 0, 0]).flat(), 3)];
+    mesh = new T.Mesh(geometry, material); mesh.morphTargetInfluences[0] = .5;
+  }
+  const f = await fixture(t, {geometry, material, mesh});
+  geometry.setDrawRange(3, 3);
+  const expected = [...f.expectedIndex().array], range = f.expectedRange(null);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const submitted = draws(f.device); assert.equal(submitted.length, 1);
+  const [draw] = submitted;
+  assert.equal(draw.pipeline.primitive.topology, 'line-list'); assert.equal(draw.indexed, true);
+  assert.deepEqual(indices(draw).slice(0, expected.length), expected);
+  assert.deepEqual(draw.args.slice(0, 3), [range.vertexCount, range.instanceCount, range.firstVertex]);
+  assert.equal(material.colorNode == null, true, 'wireframe needs no dummy authored node');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

@@ -28,13 +28,13 @@ const attributeOwners = object => [...Object.values(object.geometry?.attributes 
 // Users must not add a dummy TSL slot to reach an existing implementation.
 // Keep admission separate: every selected material is checked before updates.
 const nativeFeatures = material => hasThreeNodeProgram(material) || hasThreeNativeMedia(material) || material?.isMaterial === true && (
-  material.alphaHash === true ||
+  material.alphaHash === true || material.alphaToCoverage === true ||
   material.isVolumeNodeMaterial === true ||
   material.isPointsNodeMaterial === true || material.isLineBasicNodeMaterial === true ||
   material.isLineDashedNodeMaterial === true || material.isLineDashedMaterial === true || material.isLine2NodeMaterial === true ||
   material.isPointsMaterial === true && (material.map != null || material.alphaMap != null) ||
   material.wireframe === true &&
-    ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
+    ['MeshBasic', 'MeshToon', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical', 'MeshNormal', 'MeshMatcap'].some(name =>
       material[`is${name}Material`] === true || material[`is${name}NodeMaterial`] === true) ||
   material.bumpMap != null || material.displacementMap != null || material.lightMap != null ||
   (['MeshBasic', 'MeshLambert', 'MeshPhong', 'MeshStandard', 'MeshPhysical'].some(name =>
