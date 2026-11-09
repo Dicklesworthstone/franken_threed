@@ -67,7 +67,7 @@ test('integer sampling validates source coordinate and derivative signatures bef
     'textureGrad(map,vec2(.1),vec3(.2),vec3(.2))','texture(map,vec2(.1),1)'])
     assert.throws(() => compileEsslProgram(vertex, fragment('uniform highp usampler2D map;', `color=vec4(${call});`)));
   assert.throws(() => compileEsslProgram(vertex, fragment('uniform highp isamplerCube map;',
-    'color=vec4(texture(map,vec3(.1)));')), /layered cube view/);
+    'color=vec4(textureGrad(map,vec3(.1),vec3(.2),vec3(.2)));')), /cube gradients/);
 });
 
 test('installed sampler descriptors govern integer addressing after unrequested public edits', () => {

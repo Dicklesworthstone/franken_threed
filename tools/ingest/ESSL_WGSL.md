@@ -108,6 +108,25 @@ admitted. The source rules are in the
   footnote 4, matching the tested ANGLE path; the base-level half tie stays at
   zero. This does not close the automatic texture owner's pre-existing gap for
   public sampler-property edits made without `needsUpdate`.
+- Signed and unsigned integer cube samplers support `texture`, `textureLod`,
+  `textureSize` and fragment bias within the same proved `[-2, 2]` range.
+  The existing texture owner exposes a six-layer view of its accepted image;
+  there is no copied texture or floating-point conversion of integer payloads.
+  Reflection keeps the source `cube` dimension and separately records the GPU
+  `2d-array` view. Nearest sampling selects the source face and texel, ignores
+  authored cube wrap modes, and retains mip controls, sampler arrays and nested
+  helpers. Vertex implicit sampling uses the base level. Fragment implicit LOD
+  projects direction derivatives onto the selected face. Equal major-axis
+  magnitudes use deterministic X/Y/Z priority; GLES permits implementation-specific
+  ties, and a zero direction has no defined source result. See
+  [GLES 3.0 §§3.8.9–3.8.10](https://registry.khronos.org/OpenGL/specs/es/3.0/es_spec_3.0.pdf).
+  Explicit cube gradients remain refused: a probe using ideal projected gradients
+  disagreed with SwiftShader's native cube footprint at mip boundaries. Its
+  [cube sampler](https://swiftshader.googlesource.com/SwiftShader.git/+/7bc7120b639db871e9119c18085a21c8cacd4ca6/src/Pipeline/SamplerCore.cpp)
+  uses a different footprint estimate. No driver-specific approximation is
+  substituted. WebGL-authored integer render-target sampling retains its existing
+  separate boundary; this path covers the shared CPU cube owner and acknowledged
+  caller bindings with a matching layered view.
 - `gl_DepthRange` is the GL default `{near: 0, far: 1, diff: 1}`: r186 never
   calls `gl.depthRange`, and pipelines record viewports with depth 0..1.
 - Vector `==`/`!=` reduce with `all`/`any`; `mod` uses `x - y*floor(x/y)`;
@@ -175,13 +194,24 @@ admitted. The source rules are in the
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
-integer cube sampling and integer bias outside the proved portable range, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
+integer cube explicit gradients and integer bias outside the proved portable range, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions). Shadow sampling with bias, explicit gradients, or LOD outside the
 proved constant-zero 2D profile remains unsupported; those forms are not
 approximated with implicit sampling or an arbitrary level.
 
 ## Evidence
 
+- `essl_integer_cube.test.mjs` covers source/GPU dimension reflection, both integer
+  signs, arrays/helpers, argument effects, base-level vertex sampling, alias views,
+  upload history, Source sharing, disposal and loading defaults. Together with the
+  existing integer, projected and offset suites it passes **30 tests**.
+  `program_integer_cube.mjs` compares **58 exact browser checkpoints**
+  (**356,352 RGBA bytes**) against pinned r186, including all six faces, authored
+  mips, signed/unsigned 32-bit payloads, fragment bias, both stages, nested sampler
+  helpers and marked/unmarked/disposed upload histories. The run uses Chromium
+  153.0.8010.0/SwiftShader, the `general-webgpu` route and zero GPU/browser errors.
+  Explicit-gradient probe failures are outside the admitted profile and are not
+  counted as passes. No hardware timing or complete cube-gradient claim is made.
 - `essl_shadow_sampling.test.mjs` and `essl_shadow_lod.test.mjs` cover
   comparison signatures, zero-LOD proof, projective reference division,
   constant offsets, single evaluation, helper/array propagation, mixed

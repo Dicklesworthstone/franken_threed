@@ -327,7 +327,10 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
           borrowed.push({binding: b, release: b.retain?.()});
           external.set(t, b);
         }
-        return {view: b.view, sampler: d.samplers[k] ?? b.sampler, sampleType: b.sampleType ?? 'float'};
+        const reflection = d.kind === 'scene' ? d.compiled.program.reflection : d.entry.compiled.reflection;
+        const layeredCube = reflection.textures[k].viewDimension === '2d-array' && reflection.textures[k].dimension === 'cube';
+        if (layeredCube && !b.cubeArrayView && b.viewDimension !== '2d-array') fail('TEXTURE', 'Integer cube input needs a layered view of its acknowledged image');
+        return {view: layeredCube ? b.cubeArrayView ?? b.view : b.view, sampler: d.samplers[k] ?? b.sampler, sampleType: b.sampleType ?? 'float'};
       });
       const bindings = draws.map(d => views(d));
       for (const [i, d] of draws.entries()) {
@@ -419,7 +422,7 @@ export function createThreeProgramPMREM({three: T, device, bindingOf, label = 'f
     const layouts = [...geometry.layouts, ...geometry.channels.missing.map(location => ({arrayStride: 0, stepMode: 'vertex', attributes: [{shaderLocation: location, offset: 0, format: 'float32x4'}]}))];
     const uniformLayout = device.createBindGroupLayout({label, entries: [{binding: 0, visibility: VERTEX | FRAGMENT, buffer: {type: 'uniform'}}]});
     const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap((t, i) => [
-      {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.dimension}},
+      {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.viewDimension ?? t.dimension}},
       {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : sampleTypeOf(t, i) === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
     const pipeline = await device.createRenderPipelineAsync({label, layout: device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]}),
       vertex: {module: device.createShaderModule({label: `${label}/capture-vertex`, code: compiled.program.vertex}), entryPoint: 'f3d_vertex', buffers: layouts},

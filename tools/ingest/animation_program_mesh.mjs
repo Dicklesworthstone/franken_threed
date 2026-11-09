@@ -103,11 +103,12 @@ export function createProgramMeshes({device, format, colorFormats = format === n
       // Float32 textures without float32-filterable bind as unfilterable (nearest only).
       const sampleTypeOf = (t, i) => t.sampleType === 'float' && textures[i].sampleType === 'unfilterable-float' ? 'unfilterable-float' : t.sampleType;
       const textureLayout = reflection.textures.length ? device.createBindGroupLayout({label, entries: reflection.textures.flatMap((t, i) => [
-        {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.dimension}},
+        {binding: t.textureBinding, visibility: VERTEX | FRAGMENT, texture: {sampleType: sampleTypeOf(t, i), viewDimension: t.viewDimension ?? t.dimension}},
         {binding: t.samplerBinding, visibility: VERTEX | FRAGMENT, sampler: {type: t.comparison ? 'comparison' : sampleTypeOf(t, i) === 'float' ? 'filtering' : 'non-filtering'}}])}) : null;
       const layout = device.createPipelineLayout({label, bindGroupLayouts: textureLayout ? [uniformLayout, textureLayout] : [uniformLayout]});
       const textureGroup = textureLayout ? device.createBindGroup({label, layout: textureLayout, entries: reflection.textures.flatMap((t, i) => [
-        {binding: t.textureBinding, resource: textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
+        {binding: t.textureBinding, resource: t.viewDimension === '2d-array' && t.dimension === 'cube'
+          ? textures[i].cubeArrayView ?? textures[i].view : textures[i].view}, {binding: t.samplerBinding, resource: textures[i].sampler}])}) : null;
       const vertexModule = gpuProgramModule(device, {label: `${label}/vertex`, code: vertex});
       const fragmentModule = gpuProgramModule(device, {label: `${label}/fragment`, code: fragment});
       const modulesReady = Promise.all([vertexModule.ready, fragmentModule.ready]);

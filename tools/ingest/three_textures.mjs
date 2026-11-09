@@ -650,7 +650,14 @@ export function createGpuThreeTextures(device,{
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;
-            try{resource.view=native(()=>texture.createView({format:d.viewFormat,...(d.cube||d.layered?{dimension:d.viewDimension}:{})}));resource.sampler=samplerFor(d.sampler);}
+            try{
+              resource.view=native(()=>texture.createView({format:d.viewFormat,...(d.cube||d.layered?{dimension:d.viewDimension}:{})}));
+              // Integer cubemaps are read through typed textureLoad after cube
+              // projection. This is another view of the same six owned layers,
+              // with the same upload history and disposal, not a copied image.
+              if(d.cube&&d.integral)resource.cubeArrayView=native(()=>texture.createView({format:d.viewFormat,dimension:'2d-array',baseArrayLayer:0,arrayLayerCount:6}));
+              resource.sampler=samplerFor(d.sampler);
+            }
             catch(e){texture.destroy();keys.delete(d.key);textureBytes=Math.max(0,textureBytes-d.bytes);throw e;}
             stats.allocations++;
             created=true;
@@ -679,6 +686,7 @@ export function createGpuThreeTextures(device,{
   }
   function check(t){live();const d=inspect(t,{initialize:records.has(t)}),r=match(t,d);if(!r)fail('PREPARE','Prepare the current texture storage and sampler before drawing');return {r,d};}
   function binding(t){const {r,d}=check(t);return Object.freeze({view:r.resource.view,sampler:r.resource.sampler,samplerDescriptor:Object.freeze({...d.sampler}),version:r.version,sourceVersion:r.resource.sourceVersion,
+    ...(r.resource.cubeArrayView?{cubeArrayView:r.resource.cubeArrayView}:{}),
     ...(d.layered?{viewDimension:d.viewDimension}:{}),sampleType:d?.sampleType??'float',filtering:(d?.sampleType??'float')==='float'});}
   function update(input){
     const list=plans(input);if(busy)fail('REENTRANT','Cannot update during a texture operation');
@@ -739,7 +747,7 @@ export function createThreeTextureBindings(device,state) {
   function live(){if(disposed)fail('DISPOSED','Source texture bindings are disposed');}
   function placeholder(t=null,reflection=null){
     live();
-    const viewDimension=reflection?.dimension??dimension(t);
+    const sourceDimension=reflection?.dimension??dimension(t),viewDimension=reflection?.viewDimension??sourceDimension;
     const glsl=reflection?.glslType??'';
     const T=state.three;
     const integral=T&&['RedIntegerFormat','RGIntegerFormat','RGBAIntegerFormat'].some(k=>T[k]!==undefined&&t?.format===T[k]);
@@ -747,11 +755,11 @@ export function createThreeTextureBindings(device,state) {
     const sampleType=reflection?.sampleType??(reflection?.comparison?'depth':glsl.startsWith('u')?'uint':glsl.startsWith('i')?'sint':integral?signed?'sint':'uint':'float');
     if(!['2d','2d-array','3d','cube'].includes(viewDimension)||!['float','uint','sint','depth'].includes(sampleType)||(sampleType==='depth'&&viewDimension==='3d'))
       fail('TEXTURE','Unsupported default texture view dimension');
-    const key=viewDimension+'/'+sampleType;
+    const key=sourceDimension+'/'+viewDimension+'/'+sampleType;
     let result=defaults.get(key);
     if(!result){
       const format=sampleType==='depth'?'depth32float':sampleType==='uint'?'rgba8uint':sampleType==='sint'?'rgba8sint':'rgba8unorm';
-      const texture=device.createTexture({label:'f3d-default-texture',size:[1,1,viewDimension==='cube'?6:1],
+      const texture=device.createTexture({label:'f3d-default-texture',size:[1,1,sourceDimension==='cube'?6:1],
         format,dimension:viewDimension==='3d'?'3d':'2d',usage:4});
       try{
         result=Object.freeze({texture,view:texture.createView({dimension:viewDimension}),
@@ -769,6 +777,10 @@ export function createThreeTextureBindings(device,state) {
       const actual=b.sampleType??'float',expected=reflection?.sampleType;
       if(expected&&actual!==expected&&!(expected==='float'&&actual==='unfilterable-float'))
         fail('TEXTURE',`Sampler ${reflection.name??reflection.glslType??''} requires ${expected} storage, not ${actual}`);
+      if(reflection?.dimension==='cube'&&reflection.viewDimension==='2d-array'){
+        if(b.cubeArrayView)return {...b,view:b.cubeArrayView,viewDimension:'2d-array'};
+        if(b.viewDimension!=='2d-array')fail('TEXTURE','Integer cube sampling requires a layered view of the acknowledged cube image');
+      }
       return b;
     };
     if(state.textures.has(t)){
@@ -795,7 +807,8 @@ export function createThreeTextureBindings(device,state) {
       // Inspection tokens never reach addMesh: prepare() resolves them to the
       // shared owner's native view/sampler after all real sources are admitted.
       scan.add(t);
-      return checked({view:t,sampler:t,samplerDescriptor:shape.sampler,viewDimension:shape.viewDimension,sampleType:shape.sampleType});
+      return checked({view:t,sampler:t,samplerDescriptor:shape.sampler,viewDimension:shape.viewDimension,sampleType:shape.sampleType,
+        ...(shape.cube&&shape.integral?{cubeArrayView:t}:{})});
     }
     let result;
     try{result=owner.binding(t);}

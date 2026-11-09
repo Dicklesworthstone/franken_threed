@@ -36,7 +36,9 @@
  * break/continue targets; switch-local storage is shared across source labels.
  * ESSL 3.00 struct varyings flatten numeric members into inter-stage locations,
  * preserving matrix columns and smooth/flat/centroid interpolation.
- * Unsupported constructs (gl_ClipDistance, integer cube sampling, ...)
+ * Integer cube samplers use a layered view of the same owned image, retaining
+ * source face selection, nearest texels and derivative/explicit mip levels.
+ * Unsupported constructs (gl_ClipDistance, ...)
  * throw EsslError; nothing is dropped.
  * No performance claim.
  */
@@ -257,6 +259,7 @@ function reflect(shared, units, varyings) {
   const textures = [];
   for (const [name, s] of shared.samplers) s.bindings.forEach((binding, element) => textures.push({
     name, element: s.count === null ? null : element, glslType: s.type.name, dimension: s.type.dim,
+    ...(integerSampler(s.type) && s.type.dim === 'cube' ? {viewDimension: '2d-array'} : {}),
     sampleType: s.type.shadow ? 'depth' : s.type.s === 'float' ? 'float' : s.type.s === 'int' ? 'sint' : 'uint',
     comparison: !!s.type.shadow, textureBinding: binding * 2, samplerBinding: binding * 2 + 1,
     ...(samplingOffsets.has(binding) ? {samplingOffset: samplingOffsets.get(binding)} : {}),
@@ -1866,7 +1869,6 @@ class Unit {
     const {type, tex, sampling} = sampler, dim = type.dim;
     if (this.version !== 300) essError('Integer texture sampling requires ESSL 3.00', line);
     this.shared.integerSampling = true;
-    if (dim === 'cube') essError('Integer cube sampling needs a layered cube view', line);
     const projected = name.includes('Proj'), offset = name.endsWith('Offset');
     const operation = name.includes('Grad') ? 'grad' : name.includes('Lod') ? 'lod' : 'implicit';
     const count = (operation === 'grad' ? 3 : operation === 'lod' ? 2 : 1) + Number(offset);
@@ -1880,7 +1882,9 @@ class Unit {
         essError('Integer texture bias must be proven within [-2, 2] by a literal, const alias or explicit builtin clamp', line);
     }
     if (projected && dim !== '2d' && dim !== '3d') essError(`${name} needs a 2D or 3D sampler`, line);
-    const dimensions = dim === '3d' ? 3 : 2, coordinates = dim === '2d' ? 2 : 3;
+    if (offset && dim === 'cube') essError(`${name} does not support cube samplers`, line);
+    if (dim === 'cube' && operation === 'grad') essError('Integer cube gradients need native cube LOD selection', line);
+    const dimensions = dim === '3d' || dim === 'cube' ? 3 : 2, coordinates = dim === '2d' ? 2 : 3;
     const sizes = projected ? dim === '2d' ? [3, 4] : [4] : [coordinates];
     if (!sizes.some(n => same(args[0].t, V('float', n)))) essError(`${name} needs ${sizes.map(n => `vec${n}`).join(' or ')} coordinates`, line);
     if (operation === 'lod' && !same(args[1].t, FLOAT)) essError(`${name} needs a float LOD`, line);
@@ -1896,6 +1900,7 @@ class Unit {
       ctx.pre.push(`let ${p} = ${point}.${'xyz'.slice(0, dimensions)} / ${point}.${args[0].t.n === 4 ? 'w' : 'z'};`);
       point = p;
     }
+    if (dim === 'cube') return this.integerCubeTextureCall(sampler, args, operation, bias, point, ctx);
     const uv = dim === '2d-array' ? `${point}.xy` : point;
     let lod = operation === 'lod' ? args[1].c : '0.0';
     if (operation === 'grad' || operation === 'implicit' && this.stage === 'fragment') {
@@ -1942,6 +1947,55 @@ class Unit {
 }`);
     }
     return {c: `${helper}(${tex}, ${sampling}, ${point}, ${lod}${delta ? `, ${delta}` : ''})`, t: V(type.s, 4)};
+  }
+  /** GLES 3.0 §§3.8.9–3.8.10: select one face, project its direction and
+   * gradients, and clamp nearest texels regardless of the cube's wrap modes.
+   * The array view aliases the source image; no conversion or float payload
+   * round trip is involved. Ties use a deterministic X/Y/Z priority, permitted
+   * by the source contract; the zero direction has no defined source result. */
+  integerCubeTextureCall(sampler, args, operation, bias, point, ctx) {
+    const {type, tex, sampling} = sampler;
+    if (!this.helpers.has('f3d_integer_cube_face')) {
+      this.helpers.set('f3d_integer_cube_face', `fn f3d_integer_cube_face(p: vec3<f32>) -> u32 {
+  let a = abs(p);
+  if (a.x >= a.y && a.x >= a.z) { return select(1u, 0u, p.x >= 0.0); }
+  if (a.y >= a.z) { return select(3u, 2u, p.y >= 0.0); }
+  return select(5u, 4u, p.z >= 0.0);
+}`);
+      this.helpers.set('f3d_integer_cube_project', `fn f3d_integer_cube_project(p: vec3<f32>, face: u32) -> vec3<f32> {
+  switch (face) {
+    case 0u: { return vec3<f32>(-p.z, -p.y, p.x); }
+    case 1u: { return vec3<f32>(p.z, -p.y, -p.x); }
+    case 2u: { return vec3<f32>(p.x, p.z, p.y); }
+    case 3u: { return vec3<f32>(p.x, -p.z, -p.y); }
+    case 4u: { return vec3<f32>(p.x, -p.y, p.z); }
+    default: { return vec3<f32>(-p.x, -p.y, -p.z); }
+  }
+}`);
+    }
+    const face = this.tmp(), projected = this.tmp(), uv = this.tmp();
+    ctx.pre.push(`let ${face} = f3d_integer_cube_face(${point});`,
+      `let ${projected} = f3d_integer_cube_project(${point}, ${face});`,
+      `let ${uv} = ${projected}.xy / ${projected}.z;`);
+    let lod = operation === 'lod' ? args[1].c : '0.0';
+    if (operation === 'implicit' && this.stage === 'fragment') {
+      const size = this.tmp(), gx = this.tmp(), gy = this.tmp(), dx = this.tmp(), dy = this.tmp();
+      ctx.pre.push(`let ${size} = vec2<f32>(textureDimensions(${tex}, 0));`,
+        `let ${gx} = f3d_integer_cube_project(dpdx(${point}), ${face});`,
+        `let ${gy} = f3d_integer_cube_project(dpdy(${point}), ${face});`,
+        `let ${dx} = (${gx}.xy - ${uv} * ${gx}.z) * (0.5 / ${projected}.z) * ${size};`,
+        `let ${dy} = (${gy}.xy - ${uv} * ${gy}.z) * (0.5 / ${projected}.z) * ${size};`);
+      lod = `(0.5 * log2(max(max(dot(${dx}, ${dx}), dot(${dy}, ${dy})), 1e-30)))`;
+    }
+    if (bias) lod = `(${lod} + ${args.at(-1).c})`;
+    const helper = `f3d_integer_sample_cube_${type.s}`;
+    if (!this.helpers.has(helper)) this.helpers.set(helper, `fn ${helper}(image: ${textureType(type)}, control: vec4<u32>, uv: vec2<f32>, face: u32, lod: f32) -> vec4<${WGSL_SCALAR[type.s]}> {
+  let level = select(0, i32(clamp(floor(lod + 0.5), 0.0, f32(textureNumLevels(image) - 1u))), control.w != 0u && lod > 0.5);
+  let size = textureDimensions(image, level);
+  let point = min(vec2<i32>(floor(clamp(uv * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0)) * vec2<f32>(size))), vec2<i32>(size) - vec2<i32>(1));
+  return textureLoad(image, point, i32(face), level);
+}`);
+    return {c: `${helper}(${tex}, ${sampling}, ${uv}, ${face}, ${lod})`, t: V(type.s, 4)};
   }
   /** ESSL geometric genType includes float; WGSL's direction operators only
    * accept vectors. Scalar helpers take copied values so repeated terms do not
@@ -2027,6 +2081,7 @@ const INVERSE = {
 function textureType(t) {
   if (t.shadow) return {'2d': 'texture_depth_2d', cube: 'texture_depth_cube', '2d-array': 'texture_depth_2d_array'}[t.dim];
   const s = WGSL_SCALAR[t.s];
+  if (integerSampler(t) && t.dim === 'cube') return `texture_2d_array<${s}>`;
   return `${{'2d': 'texture_2d', '3d': 'texture_3d', cube: 'texture_cube', '2d-array': 'texture_2d_array'}[t.dim]}<${s}>`;
 }
 function elementType(t, line) {
