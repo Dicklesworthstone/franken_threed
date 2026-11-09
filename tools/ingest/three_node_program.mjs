@@ -834,16 +834,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           texture.renderTarget == null)))
       fail('TEXTURE', 'Native depth sampling requires a source DepthTexture or attached CubeDepthTexture');
     const viewDimension = volume ? '3d' : texture.isCubeTexture === true ? 'cube' : array ? '2d-array' : '2d';
+    // The shared owner supplies native cube defaults and no-data allocations.
+    // Their source images are deliberately not ready and must not be sampled
+    // from CPU bytes during shader construction or PMREM warmup.
+    const loadingCube = !target && !compressed && typeof renderer._getSampledTextureInputs === 'function' &&
+      (texture.version === 0 || texture.source?.dataReady === false);
     if (!depth && viewDimension === 'cube' && (!(texture instanceof three.CubeTexture) &&
         !(compressed && typeof three.CompressedCubeTexture === 'function' && texture instanceof three.CompressedCubeTexture) ||
         ![three.CubeReflectionMapping, three.CubeRefractionMapping].includes(texture.mapping) ||
-        !Array.isArray(texture.image) || texture.image.length !== 6 || (target
+        !loadingCube && (!Array.isArray(texture.image) || texture.image.length !== 6 || (target
           ? typeof renderer._getSampledTextureInputs !== 'function' : !compressed && texture.image.some(face =>
           !(face instanceof three.DataTexture && face.isDataTexture === true &&
             ArrayBuffer.isView(face.image?.data) && !(face.image.data instanceof DataView)) &&
           !(typeof renderer._getSampledTextureInputs === 'function' &&
             ['ImageData', 'ImageBitmap', 'HTMLImageElement', 'HTMLCanvasElement', 'OffscreenCanvas'].some(name =>
-              typeof globalThis[name] === 'function' && face instanceof globalThis[name]))))))
+              typeof globalThis[name] === 'function' && face instanceof globalThis[name])))))))
       fail('TEXTURE', 'Native cube sampling requires six source data/image/compressed faces or a registered native cube target with reflection or refraction mapping');
     const integerType = integerTextureType(texture);
     const integerData = integerType && (dataVolume || texture.isDataArrayTexture === true || typeof three.DataTexture === 'function' &&

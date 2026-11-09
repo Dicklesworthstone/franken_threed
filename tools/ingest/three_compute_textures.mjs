@@ -63,12 +63,15 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   const live = () => { if (disposed) fail('DISPOSED', 'Compute texture inputs are disposed'); };
   const sourcePool = () => { live(); return pool ??= poolFactory({imageSnapshots, mediaSnapshots}); };
   const isStorage = binding => binding?.texture?.isStorageTexture === true;
+  function allocationImage({width, height, layers, cube, layered}) {
+    const image = {width, height, data: null, ...(layered ? {depth: layers} : {})};
+    return cube ? Array.from({length: 6}, () => ({...image})) : image;
+  }
   function describe(binding, {initialize = false, copyDestination = false} = {}) {
     live();
     const t = binding?.texture;
     if (!t || !(t.isTexture || t.isDataTexture || t.isDataArrayTexture || t.isData3DTexture || t.isCompressedTexture || t.isCubeTexture) ||
-        t.isRenderTargetTexture ||
-        t.isCubeTexture && (!Array.isArray(t.image) || t.image.length !== 6))
+        t.isRenderTargetTexture)
       fail('SOURCE', 'Compute sampled inputs require ready source data, decoded images or canvases');
     if (binding.store) fail('ACCESS', 'Source textures are read-only compute inputs; use StorageTexture for writes');
     if (!binding.isSampler && !binding.isSampledTexture) fail('BINDING', 'Expected a source texture or sampler binding');
@@ -87,13 +90,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (accepted?.alive && accepted.nativeAllocation && accepted.version === t.version)
       return sourcePool().inspect(accepted.texture, {initialize: true});
     if (accepted?.alive && accepted.nativeAllocation !== 'default' &&
-        t.source?.dataReady === false && t.version > 0 && !t.isVideoTexture &&
-        !t.isCubeTexture && !t.isDataArrayTexture && !t.isData3DTexture && !t.isCompressedTexture) {
+        t.source?.dataReady === false && t.version > 0 && !t.isVideoTexture && !t.isCompressedTexture) {
       // A no-data update keeps its existing physical extent. Sampler changes
       // still belong to the new binding; the CPU image cannot resize storage.
       input = privateDescriptor(t);
       input.source = Object.assign(Object.create(Object.getPrototypeOf(t.source)), t.source,
-        {data: {width: accepted.width, height: accepted.height, data: null}});
+        {data: allocationImage(accepted)});
       input.mipmaps = accepted.texture.mipmaps;
     }
     const previous = t.isVideoTexture === true ? current.get(t) : null;
@@ -481,10 +483,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         return result;
       }
       try {
-        const image = shape.nativeAllocation ? {width: shape.width, height: shape.height, data: null}
+        const image = shape.nativeAllocation ? allocationImage(shape)
           : shape.nativeMedia ? copyMedia() : copyImage(original.image);
-        const mipmaps = shape.nativeAllocation ? shape.manual ? Array.from({length: shape.levels}, (_, level) =>
-          ({width: Math.max(1, shape.width >> level), height: Math.max(1, shape.height >> level), data: null})) : []
+        const mipmaps = shape.nativeAllocation ? shape.manual ? Array.from({length: shape.levels - Number(shape.cube)}, (_, index) => {
+          const level = index + Number(shape.cube);
+          return {width: Math.max(1, shape.width >> level), height: Math.max(1, shape.height >> level), data: null};
+        }) : []
           : Array.isArray(original.mipmaps) ? original.mipmaps.map(copyImage) : original.mipmaps;
         const ready = pendingImages.length ? Promise.all(pendingImages).then(() => {}) : null;
         ready?.catch(() => {});
@@ -522,6 +526,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     texture.onUpdate = () => acknowledge(original.onUpdate);
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
       nativeAllocation: shape.nativeAllocation, width: shape.width, height: shape.height,
+      layers: shape.layers, cube: shape.cube, layered: shape.layered,
       partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
       partialLayers: updates && layerValues.length ? layerValues : null,
       pixels, acknowledge, refs: 0, alive: true, binding: null};

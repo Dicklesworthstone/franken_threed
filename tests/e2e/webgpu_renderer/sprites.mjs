@@ -87,7 +87,7 @@ async function capture(mode, name) {
         device = renderer.backend?.device ?? renderer._device;
         device.addEventListener('uncapturederror', event => errors.push(event.error.message));
         device.pushErrorScope('validation'); scope = true;
-        const {scene, camera} = scenarios[name](T, renderer);
+        const {scene, camera} = await scenarios[name](T, renderer);
         await renderer.compileAsync(scene, camera);
         for (let frame = 1; frame <= checkpoints.at(-1); frame++) {
           renderer.render(scene, camera);

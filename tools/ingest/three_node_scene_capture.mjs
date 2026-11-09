@@ -851,7 +851,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // compile authored graphs, acquire resources or run node lifecycle updates.
   // Transparent selection follows opaque updates, as in Renderer._renderScene.
   const preparePhase = (selected, phase, bundled = false) => {
-    const selectedBindings = bundled || customRenderObject ? [...new Set(selected.flatMap(draw => draw.shadowBindings ?? draw.colorBindings))]
+    // Public native compilation uses the same projected objects as source
+    // rendering. Culled bindings can contain intentionally incomplete graphs.
+    const selectedBindings = bundled || customRenderObject || !uniforms ? [...new Set(selected.flatMap(draw => draw.shadowBindings ?? draw.colorBindings))]
       : [...phaseBindings[phase]].filter(binding => !binding.bundle);
     if (!selectedBindings.length) return;
     programs ??= getPrograms();

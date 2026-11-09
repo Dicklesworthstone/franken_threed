@@ -548,8 +548,12 @@ preserves accepted warmup; renderer disposal cancels pending work. Validation
 failures remain observable through the existing renderer error boundary.
 
 The native renderer also exposes the source `compile` accessor, which returns
-`compileAsync`. Native PMREM warmup retains a separate empty-placeholder
-texture admission gap; the alias does not close that path.
+`compileAsync`. Native compilation now honors source frustum and layer
+selection. Its pinned PMREM helpers use empty, culled geometry, so both public
+warmup methods complete without compiling GPU programs, matching r186. Native
+cube/array loading states are also admitted through the shared sampled-texture
+owner. The native loading and subsequent real cube/panorama atlas comparisons
+are described in [THREE_NODE_PROGRAMS.md](THREE_NODE_PROGRAMS.md).
 
 The new module-cache and public-warmup suites pass all ten tests, covering
 device isolation, eviction, retry, cancellation, pre-initialization capture,

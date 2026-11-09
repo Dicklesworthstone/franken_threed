@@ -1964,13 +1964,56 @@ checkpoints and 344,064 RGBA bytes exactly on Chromium 153.0.8010.0, with four
 native draws and zero browser/GPU errors. This is software correctness evidence,
 not hardware-performance evidence.
 
-Cube, array, volume and compressed loading defaults require separate source
-profiles. Marked incomplete HTML images, changes to an already allocated storage
-format/mip layout, and source inputs outside the existing format/sampler admission
-remain compatibility boundaries. Initial mutable HTML/canvas captures needing
-asynchronous bitmap preparation still reject and roll back in synchronous
-`initTexture()`, including retirement of their eventual private bitmap. The
-async alias retains that synchronous upload contract.
+Native cube and array textures also retain their loading allocations.
+Version-zero cubes use the pinned six-layer, one-texel `rgba8unorm` default,
+including when the requested cube type or color space differs; version-zero
+arrays use one default layer. Requested uncompressed cube, array and 3D versions
+with `source.dataReady === false` allocate empty storage or preserve the
+previous GPU generation, including all cube faces, array layers, volume slices
+and authored mip levels. Their accepted dimensions and sampler state stay with
+that generation; later CPU edits cannot resize a retained no-data allocation.
+The same callback/version, alias, disposal and readiness rules apply.
+
+This extension does not provide a native Data3DTexture version-zero loading
+default: the pinned default helper creates a 2D allocation for that source case.
+The admitted pending-volume path starts with a requested version and a valid 3D
+shape. Compressed loading defaults, marked incomplete HTML images, changes to an
+already allocated storage format/mip layout, and source inputs outside the
+existing format/sampler admission retain their separate boundaries. Initial
+mutable HTML/canvas captures needing asynchronous bitmap preparation still reject
+and roll back in synchronous `initTexture()`, including retirement of their
+eventual private bitmap. The async alias retains that synchronous upload contract.
+
+Native `compileAsync` now prepares only source-projected draws, respecting
+frustum and layer selection. Culled geometry no longer builds otherwise invalid
+shaders. The pinned native PMREM warmup helpers construct empty, frustum-culled
+meshes, so both public methods now complete with zero compiled GPU programs, as
+the actual source renderer does. The subsequent cube and panorama bakes execute
+through the existing owned target path.
+
+The focused facade, shared texture-pool and native capture suites pass
+**109 tests** (24, 29 and 56 respectively). They include source default
+format/extent oracles, acknowledgement and queued-version histories, authored
+cube mip chains, and the actual pinned native compilation queue with visible,
+off-camera, off-layer and empty geometry. An adjacent renderer-node run retains
+three existing failures (DepthTexture rejection, RectAreaLight missing-LTC
+diagnostics and a fixed-material capture-budget expectation), each reproduced
+with the unchanged production owners.
+
+The `native_layered_texture_loading` and `native_pmrem_texture_warmup` browser
+cases each match seven checkpoints exactly: **688,128 RGBA bytes in total**,
+with 12 and two native presentation draws respectively, and zero GPU errors on
+Chromium 153.0.8010.0/SwiftShader against pin
+`148ef33ecb6d2502ff796d4554abd1549c95d519`. The PMREM case compares both real
+CubeUV atlases directly. Its bake work uses six module identities for six unique
+WGSL sources, compared with 40 module identities before native module sharing
+in the recording-device probe; this is an allocation count, not a timing result.
+
+A separate four-sphere native PBR diagnostic still differs in the panorama-lit
+pair (4,236 channel values), while the cube-lit pair and both raw atlases match.
+The difference reproduces with cold bakes, warmup, and the previous uncached GPU
+program owner. It remains an environment-lighting compatibility gap and is not
+included in the exact atlas/loading claim.
 
 ## Native compressed texture inputs
 
