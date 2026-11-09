@@ -27,7 +27,7 @@ const BUILDS = new Set([
   'sha256:9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea',
   'sha256:a78400fa1d359e81fcc12b84ed0a89a7fbecb4b8373e28ae8f9d2b11f6ea13bc',
 ]);
-const BASE_EXPORTS = new Set(['Controls', 'EventDispatcher']);
+const BASE_EXPORTS = new Set(['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase']);
 
 /** Return contracts only for a completely analyzed graph and verified imports.
  * The analyzer's default remains conservative when this proof is unavailable.

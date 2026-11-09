@@ -840,6 +840,47 @@ test("Regression (Mail 5523): HTML parser ignores commented scripts, handles whi
   assert.equal(graph.summary.total_modules, 2); // inline module + real_external.js
 });
 
+test("HTML module spans use external file coordinates and retain inline document coordinates", async () => {
+  const scratch = makeScratchDir("f3d_html_module_spans");
+  const externalImport = "import { WebGPURenderer } from 'three/webgpu';";
+  const externalConstructor = "new WebGPURenderer()";
+  const externalSource = `// External entry\n${externalImport}\nconst renderer = ${externalConstructor};\n`;
+  const inlineImport = "import { WebGPURenderer as InlineRenderer } from 'three/webgpu';";
+  const inlineConstructor = "new InlineRenderer()";
+  const inlineSource = `${inlineImport}\nconst renderer = ${inlineConstructor};`;
+  const html = `<!doctype html>
+<script type="importmap">{"imports":{"three/webgpu":"./three.mjs"}}</script>
+<p>The external module's source coordinates must not include this document prefix.</p>
+<script type="module" src="./main.mjs"></script>
+<script type="module">${inlineSource}</script>
+`;
+  const entry = path.join(scratch, "index.html"), externalFile = path.join(scratch, "main.mjs");
+  fs.writeFileSync(entry, html);
+  fs.writeFileSync(externalFile, externalSource);
+  fs.writeFileSync(path.join(scratch, "three.mjs"), "export class WebGPURenderer {}\n");
+
+  const graph = await buildModuleGraph(entry);
+  assert.equal(graph.root_entries.length, 2);
+  assert.equal(graph.summary.total_modules, 3);
+  const externalId = pathToFileURL(externalFile).href;
+  const external = graph.modules[externalId];
+  const inline = graph.modules[graph.root_entries.find(id => id !== externalId)];
+  const assertSpan = (source, span, text) => {
+    const offset = source.indexOf(text);
+    assert.notEqual(offset, -1);
+    const position = offset => {
+      const lines = source.slice(0, offset).split("\n");
+      return {line: lines.length, column: lines.at(-1).length, offset};
+    };
+    assert.deepEqual(span, {start: position(offset), end: position(offset + text.length)});
+    assert.equal(source.slice(span.start.offset, span.end.offset), text);
+  };
+  assertSpan(externalSource, external.static_imports[0].source_span, externalImport);
+  assertSpan(externalSource, external.renderer_construction_sites[0].source_span, externalConstructor);
+  assertSpan(html, inline.static_imports[0].source_span, inlineImport);
+  assertSpan(html, inline.renderer_construction_sites[0].source_span, inlineConstructor);
+});
+
 // ---------------------------------------------------------------------------
 // ROLLUP INTEGRATION & BUNDLING
 // ---------------------------------------------------------------------------

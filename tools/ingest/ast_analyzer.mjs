@@ -703,7 +703,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & TRACKBALL_NAMESPACE && names.includes("TrackballControls")) result |= TRACKBALL_CTOR;
     if (object & FLY_NAMESPACE && names.includes("FlyControls")) result |= FLY_CTOR;
     if (object & GPGPU_NAMESPACE && names.includes("GPUComputationRenderer")) result |= GPGPU_CTOR;
-    if (object & BASE_NAMESPACE && names.some(name => name === "Controls" || name === "EventDispatcher")) result |= BASE_CTOR;
+    if (object & BASE_NAMESPACE && names.some(name =>
+      ["Controls", "EventDispatcher", "Renderer", "CanvasTarget", "InspectorBase"].includes(name))) result |= BASE_CTOR;
     if (object & (RENDERER | CONTROLS) && names.some(name => name === "domElement")) result |= CANVAS;
     if (object & COMPOSER && names.includes("renderer")) result |= RENDERER;
     if (object & DOM && names.some(name => ["body", "documentElement", "parentElement", "ownerDocument"].includes(name))) result |= DOM;
@@ -842,8 +843,11 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         if (closedHelpers.has(helper)) value |= helperReturns.get(helper).reduce((bits, result) => bits | child(result), 0);
         if (callee.type === "MemberExpression" && child(callee.object) & DOM &&
             staticPropertyNames(callee)?.every(name => ["createElement", "createElementNS", "getElementById", "querySelector"].includes(name))) value = DOM;
+        // init() resolves to its renderer. The promise itself can publish that
+        // renderer to an opaque then/catch/finally callback, so retain the same
+        // ownership bit before and after await as well as through local aliases.
         if (callee.type === "MemberExpression" && child(callee.object) & RENDERER &&
-            staticPropertyNames(callee)?.every(name => name === "setMRT")) value = RENDERER;
+            staticPropertyNames(callee)?.every(name => ["setMRT", "init"].includes(name))) value = RENDERER;
         // FirstPersonControls.lookAt returns its receiver. Chained calls,
         // local aliases and factories retain the same canvas ownership.
         if (callee.type === "MemberExpression" && child(callee.object) & CONTROLS &&
@@ -1166,7 +1170,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       staticPropertyNames(callee)?.every(name => !replacedDomMethods.has(name) &&
         ["appendChild", "append", "prepend", "insertBefore", "replaceChild"].includes(name));
   };
-  const nativeState = new Set(["backend", "state", "properties", "context", "extensions", "xr", "constructor", "__proto__"]);
+  // InspectorBase.getRenderer() and private renderer state carry the renderer,
+  // canvas or backend even when the immediate field is not itself a handle.
+  const nativeState = new Set(["backend", "state", "properties", "context", "extensions", "xr", "inspector", "constructor", "__proto__"]);
   // These retained methods never hand their receiver to an application callback
   // unless event registration or a hook was changed; those exits stay opaque.
   const controlsMethods = new Set(["connect", "disconnect", "dispose", "update", "saveState", "reset",
@@ -1224,7 +1230,9 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "copyTextureToTexture", "copyFramebufferToTexture", "initTexture", "initRenderTarget", "hasFeature",
     "hasFeatureAsync", "hasInitialized", "getMaxAnisotropy", "clearAsync", "clearColorAsync",
     "clearDepthAsync", "clearStencilAsync", "getClearDepth", "setClearDepth", "getClearStencil",
-    "setClearStencil", "getCanvasTarget", "getOutputRenderTarget", "setOutputRenderTarget",
+    // getCanvasTarget() exposes the owned canvas through its domElement and
+    // event callbacks. Keep it opaque until that carrier has its own proof.
+    "setClearStencil", "getOutputRenderTarget", "setOutputRenderTarget",
     "getOutputBufferType", "getMRT", "setMRT", "writeRenderTargetPixelsAsync", "copyRenderTargetPixelsAsync",
     "waitForGPU", "getAnimationLoop", "getCurrentViewport",
   ]);
@@ -1250,7 +1258,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       return results.length > 0 && results.every(visit);
     }
     if (node.type === "CallExpression" && node.callee.type === "MemberExpression" &&
-        (staticPropertyNames(node.callee)?.every(name => name === "setMRT") ||
+        (staticPropertyNames(node.callee)?.every(name => ["setMRT", "init"].includes(name)) ||
           kind(node.callee.object) & CONTROLS && staticPropertyNames(node.callee)?.every(name => name === "lookAt") ||
           kind(node.callee.object) & GPGPU && staticPropertyNames(node.callee)?.every(name => name === "setDataType"))) return visit(node.callee.object);
     if (node.type === "NewExpression" && kind(node) & (RENDERER | CONTROLS | GPGPU)) return true;
@@ -1387,7 +1395,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     } else if (node.type === "MemberExpression" && kind(node.object) & RESOURCE) {
       const names = staticPropertyNames(node);
       if (!names) report(node, "unresolved-resource-member");
-      else if (kind(node.object) & RENDERER && names.some(name => nativeState.has(name)))
+      else if (kind(node.object) & RENDERER && names.some(name => nativeState.has(name) || name.startsWith("_")))
         report(node, "native-renderer-state");
       else if (kind(node.object) & ALL_CONSTRUCTORS && names.some(name => name === "prototype"))
         report(node, "renderer-prototype-access");

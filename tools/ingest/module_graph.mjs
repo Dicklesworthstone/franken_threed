@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { analyzeModuleAst } from "./ast_analyzer.mjs";
 import { verifiedRendererConsumerContracts } from "./renderer_consumer_contracts.mjs";
+import { closeRendererModuleOwnership } from "./renderer_module_ownership.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { parseHtmlEntries } from "./html_parser.mjs";
@@ -138,11 +139,11 @@ export async function buildModuleGraph(entryPath, options = {}) {
         id: script.id,
         isInline: script.inlineContent !== null,
         inlineContent: script.inlineContent,
-        offsets: {
+        offsets: script.inlineContent !== null ? {
           lineOffset: script.startLine - 1,
           columnOffset: script.startColumn - 1,
           charOffset: script.startOffset,
-        },
+        } : {},
         referrerUrl: entryUrl,
       });
     }
@@ -560,6 +561,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
     node.routing_facts = node.routingFacts = analyzeModuleAst(code, input.sourceUrl, {}, contract).routing_facts;
     node.gpu_computation_transform = record;
   }
+
+  await closeRendererModuleOwnership(modules, sourceInputs, rootEntryIds, {
+    packageRootUrl: options.packageRootUrl, externalModules,
+  });
 
   // Build adjacency map for cycle detection
   const adjacency = new Map();

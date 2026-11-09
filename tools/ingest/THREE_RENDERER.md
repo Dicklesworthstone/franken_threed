@@ -57,8 +57,28 @@ an owner. Exports, external stores, returned renderer factories, unknown consume
 dynamic member selection, native renderer state and custom subclasses retain the
 upstream component. Unknown constructor options or externally supplied canvas
 identities also stay upstream. Closed renderer calls, local aliases, locally
-created DOM canvases and ordinary DOM attachment remain eligible. General
-imported helpers remain opaque.
+created DOM canvases and ordinary DOM attachment remain eligible.
+
+Ordinary static ESM factories, setup/frame helpers, aliases and reexport chains
+can also retain closed renderer ownership across modules. The compiler links a
+private analysis copy and applies the existing lexical ownership proof to it;
+the original application modules, evaluation effects and construction spans
+remain intact in production emission. Both WebGPU-authored and WebGL-authored
+applications can use this route, including mixed explicit `forceWebGL: true`
+sites that retain their genuine source constructor.
+
+This proof requires one application entry, the exact pinned Three build bytes
+and dependency identities, a closed static graph of at most 128 application
+modules, and at most 2 MiB of application and linked analysis source each.
+It never evaluates source. Exported factories or resources, unknown consumers,
+native observations, mutable/indirect helper calls, dynamic imports, external
+modules, cycles and unsupported linking shapes retain their original exact
+route. Every original construction profile must survive linking; generated
+positions never replace source diagnostics. The production-build regression
+command is `node --max-old-space-size=768 --test tools/ingest/renderer_module_build.test.mjs`;
+the smaller ownership regressions are in `renderer_module_ownership.test.mjs`.
+This expands new-backend eligibility while retaining application JavaScript;
+it is not a Rust rewrite or a measured acceleration result.
 
 Private constant records can hold renderer constructors, renderer instances,
 canvases and verified controls without forcing an exact backend. Static field
@@ -99,7 +119,9 @@ new-backend routing validation, not a controls rewrite or a speedup measurement.
 
 H1 still retains the exact renderer: its Inspector Settings component replaces
 `WebGPURenderer.prototype.init` to select a real WebGL backend from persisted
-settings. Closing its controls edge does not close that native contract.
+settings, and the TSL Graph extension evaluates user-authored code with the full
+Three namespace. Closing ordinary imported helpers does not close those native
+and dynamic ownership boundaries.
 Direct new-backend tests establish renderer functionality separately from
 automatic application routing and do not establish an H1 acceleration claim.
 
