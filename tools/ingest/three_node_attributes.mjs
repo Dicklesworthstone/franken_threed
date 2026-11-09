@@ -3,6 +3,8 @@
  * their WebGPU version/range history at the logical render boundary, then give
  * the existing geometry uploader private owners containing that history. A
  * queued render can install its bytes without rewriting application attributes.
+ * Public attribute inputs instead retain their original owner for the shared
+ * ordinary-geometry capture, which owns their queued bytes and upload history.
  */
 export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
   const arrayType = attribute?.array?.constructor;
@@ -38,7 +40,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   const owners = new Map(), geometries = new Map(), views = new WeakMap();
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Native attribute histories are disposed'); };
-  function shape(attribute) {
+  function shape(attribute, shared = false) {
     if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute)
       return inspectThreeNodeStorageAttribute(three, attribute, reject);
     const interleaved = attribute?.isInterleavedBufferAttribute === true;
@@ -46,7 +48,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     if (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
         !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
         !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
-        attribute.normalized || attribute.gpuType === three.IntType ||
+        attribute.normalized || !shared && attribute.gpuType === three.IntType ||
         !Number.isSafeInteger(owner.version) || owner.version < 0)
       reject('ATTRIBUTE', 'Native generated attributes require fixed, unshared Float32, Int32 or Uint32 scalar/vector streams');
     try { new Uint8Array(array.buffer, 0, 0); }
@@ -65,14 +67,14 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   function register(descriptor, geometry, attributes) {
     live();
     if (views.has(descriptor)) reject('ATTRIBUTE', 'Native generated geometry is already registered');
-    const sources = attributes.map(({name, attribute}) => ({name, attribute, ...shape(attribute)}));
+    const sources = attributes.map(({name, attribute, shared = false}) => ({name, attribute, shared, ...shape(attribute, shared)}));
     const ordinaryOwners = new Set(Object.values(geometry.attributes).map(attribute =>
       attribute.isInterleavedBufferAttribute ? attribute.data : attribute));
-    if (sources.some(source => !source.gpu && ordinaryOwners.has(source.owner)))
+    if (sources.some(source => !source.gpu && !source.shared && ordinaryOwners.has(source.owner)))
       reject('ATTRIBUTE', 'Native generated streams cannot also be ordinary geometry sources');
     const newOwners = new Map();
     for (const source of sources) {
-      if (source.gpu) continue;
+      if (source.gpu || source.shared) continue;
       const previous = owners.get(source.owner);
       if (previous && previous.bytes !== source.array.byteLength)
         reject('CHANGED', 'Replace a generated attribute when changing its resident storage size');
@@ -99,6 +101,14 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     }
     const privateOwners = new Map(), mapped = {}, gpuSources = [];
     for (const source of sources) {
+      if (source.shared) {
+        // This is an application-owned input, possibly also selected by an
+        // ordinary geometry attribute. Preserve its identity so the shared
+        // geometry capture consumes its upload history once at the source
+        // boundary. It also owns queued bytes, budgets and disposal.
+        mapped[source.name] = source.attribute;
+        continue;
+      }
       if (source.gpu) {
         // Metadata view only: the storage owner supplies the actual vertex
         // allocation. Do not clone or upload the source CPU simulation array.
@@ -143,11 +153,12 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
     const state = stateOf(descriptor);
     // Validate the entire selection before consuming a later stream's ranges.
     for (const source of state.sources) {
-      const current = shape(source.attribute);
+      const current = shape(source.attribute, source.shared);
       if (current.owner !== source.owner || current.signature !== source.signature)
         reject('CHANGED', 'Native generated attribute identity or layout changed; compile the graph again');
     }
-    for (const {source} of state.privateOwners.values()) {
+    for (const {owner: source, gpu} of state.sources) {
+      if (gpu) continue;
       if (!Array.isArray(source.updateRanges) || source.updateRanges.some(range =>
         !Number.isSafeInteger(range?.start) || range.start < 0 || !Number.isSafeInteger(range?.count) ||
         range.count < 0 || range.start + range.count > source.array.length))

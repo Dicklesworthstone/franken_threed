@@ -262,12 +262,19 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       (value instanceof three.InstancedBufferAttribute || value instanceof three.InstancedInterleavedBuffer) &&
       inputs.some(input => input instanceof three.InstancedBufferAttribute && !input.isStorageInstancedBufferAttribute &&
         value.array === input.array);
-    if (!derivedInstance)
-      fail('ATTRIBUTE', 'Native generated streams require raw Float32Array, Int32Array or Uint32Array inputs or the source-derived CPU instance owners; public attribute inputs need shared residency');
+    if (derivedInstance) return false;
+    // Public BufferAttributeNode inputs retain their original upload owner.
+    // The scene's geometry capture already shares version/range history with
+    // ordinary attributes and other render objects; a private generated copy
+    // here would consume the same ranges twice or expose unrequested CPU edits.
+    if (value instanceof three.BufferAttribute && value.itemSize <= 4 && node.attribute === value ||
+        value instanceof three.InterleavedBuffer && (node.attribute === null || node.attribute?.data === value))
+      return true;
+    fail('ATTRIBUTE', 'Native generated streams require raw 32-bit arrays, source buffer attributes or source interleaved buffers');
   }
   function attributeSignature(nodes, object) {
     return JSON.stringify(nodes.map(node => {
-      inspectAttributeInput(node, object);
+      const shared = inspectAttributeInput(node, object) === true;
       const attribute = node.attribute, owner = attribute?.isInterleavedBufferAttribute ? attribute.data : attribute;
       const array = owner?.array, inputArray = ArrayBuffer.isView(node.value) ? node.value : node.value?.array;
       if (owner?.isStorageBufferAttribute || owner?.isStorageInstancedBufferAttribute) {
@@ -278,7 +285,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!attribute || !array || inputArray !== array)
         fail('CHANGED', 'Native buffer attribute nodes must retain their source backing array; replace the node or instance attribute');
       return [node.id, node.nodeType, node.bufferType, node.bufferStride, node.bufferOffset, node.instanced, node.usage,
-        sourceId(node.value), sourceId(attribute), sourceId(owner), sourceId(array), array.length, array.byteLength,
+        sourceId(node.value), sourceId(attribute), sourceId(owner), shared ? array.constructor.name : sourceId(array), array.length, array.byteLength,
         attribute.count, attribute.itemSize, attribute.normalized, attribute.gpuType, attribute.isInterleavedBufferAttribute,
         attribute.offset, attribute.isInstancedBufferAttribute, owner.stride, owner.meshPerAttribute,
         owner.isInstancedInterleavedBuffer, owner.usage];
@@ -1601,15 +1608,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
         fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
-      if (ArrayBuffer.isView(node?.value)) {
+      const inputArray = ArrayBuffer.isView(node?.value) ? node.value : node?.value?.array;
+      if (inputArray && !storage) {
         // r186 derives the vertex format from the source array. A differently
         // signed or floating shader input is invalid even if our general
         // geometry uploader could convert its elements to that requested type.
-        const expected = node.value instanceof Uint32Array ? 'uint' : node.value instanceof Int32Array ? 'int' : 'float';
+        const expected = inputArray instanceof Uint32Array ? 'uint' : inputArray instanceof Int32Array ? 'int' : 'float';
         if (scalar !== expected)
           fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
       }
-      if (node || storage) generated.push({name: attribute.name, attribute: source});
+      if (node || storage) generated.push({name: attribute.name, attribute: source,
+        shared: node ? inspectAttributeInput(node, object) === true : false});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
     const vertex = builder.vertexShader, fragment = builder.fragmentShader;
@@ -1706,7 +1715,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       materialSide: preparedMaterial.side, sidePass: context.sidePass === true,
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
-      attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});
+      attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0,
+      sharedAttributes: [...new Set(generated.filter(source => source.shared).map(({attribute}) =>
+        attribute.isInterleavedBufferAttribute ? attribute.data : attribute))]});
     // Source geometry constructors may add named storage attributes. Adopt
     // their accepted layout now, including the canonical vec3 padding above,
     // instead of rebuilding that constructor and repeating onInit next frame.
@@ -1971,10 +1982,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (uniformSignature(state.uniformNodes, state.builder) !== state.uniformSignature)
       fail('CHANGED', 'Native uniform array layout, group or binding aliases changed; compile the graph again');
   }
-  function checkAttributes(state) {
+  function checkAttributes(state, context = null) {
     if (attributeSignature(state.attributeNodes, state.object) !== state.attributeSignature)
       fail('CHANGED', 'Native source attribute identity, backing array or layout changed; compile the graph again');
     if (state.generated) generatedAttributes.validate(state.descriptor);
+    if (state.sharedAttributes.length) context?.validateAttributeOwners?.(state.sharedAttributes);
   }
   function readUniformBuffer(binding, byteLength) {
     let history = uniformBuffers.get(binding);
@@ -2068,6 +2080,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       install() { generated?.install(); wireframe.install(); }});
   }
   function checkCapture(state, context) {
+    if (state.sharedAttributes.length && typeof context.captureGeometry !== 'function')
+      fail('ATTRIBUTE', 'Native public attribute inputs require the shared source geometry capture owner');
     const object = context.object ?? state.object;
     checkWireframe(state, object);
     if (spriteSignature(prepareMaterial(state.material), object) !== state.spriteSignature)
@@ -2101,7 +2115,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // readStorage below also catches mutations performed by those updates.
     if (state.storageNodes.length) readStorage(state);
     checkUniformBuffers(state);
-    checkAttributes(state);
+    checkAttributes(state, context);
     return object;
   }
   function runBefore(state) {
@@ -2177,7 +2191,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkSSS(state);
       checkGeometry(state);
       checkBackdrop(state);
-      checkAttributes(state);
+      checkAttributes(state, context);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
       // updateBefore and before ordinary node updates and uniform uploads.
@@ -2199,7 +2213,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkLights(state);
       checkPMREM(state);
       checkUniformBuffers(state);
-      checkAttributes(state);
+      checkAttributes(state, context);
       checkPipelineContext(state, object);
       checkFog(state, context);
       checkEnvironment(state, context);
@@ -2252,7 +2266,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)
       + (descriptor.wireframe ? wireframes.byteLength(descriptor) : 0); },
     captureAttributes(descriptor, context = {}) {
-      const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state);
+      const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state, context);
       checkWireframe(state);
       return captureGeometry(state, context.renderId ?? renderer.info.calls, context.captureVertexAttribute);
     },

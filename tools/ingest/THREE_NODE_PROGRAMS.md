@@ -1001,11 +1001,28 @@ that WebGL-only property therefore do not refuse native geometry, bundles,
 instances, generated streams or storage/compute bindings, and callback changes
 do not invalidate a native program. WebGL-authored uploads retain their source
 callbacks, including ordering, exceptions and version acknowledgement.
-Public BufferAttribute/InterleavedBuffer inputs and
-compute-backed attribute conversion need additional shared-residency profiles;
-they are refused rather than allowing ordinary and generated consumers to
-diverge after partial updates. The pinned instance nodes' private derived
-matrix/color owners are admitted.
+Public `BufferAttribute` and `InterleavedBuffer` scalar/vector inputs with fixed,
+unshared, unnormalized Float32, Int32 or Uint32 storage use the same source
+geometry history as ordinary attributes. `bufferAttribute(existingAttribute)`
+and interleaved `bufferAttribute(buffer, type, stride, offset)` retain the
+application's attribute/owner identity, shader input type and selected offsets.
+Shared consumers upload once per source render, keep unmarked CPU edits stale,
+consume requested partial ranges, and retain accepted bytes across queued
+renders, material changes and geometry disposal. Same-layout public array
+replacement follows the original attribute's upload version. Use the source
+`dynamicBufferAttribute()` factory for per-render dynamic uploads; its ordinary
+`bufferAttribute()` counterpart sets static usage on a supplied attribute.
+The existing shared geometry owner charges and retires these snapshots; no
+second generated history consumes their ranges. Standalone program callers must
+supply that shared geometry capture callback before capturing a draw. Attributes
+that previously reached an uncaptured fixed upload owner retain the existing
+refusal, including references outside the consuming object's geometry. The pinned
+instance nodes' private derived matrix/color owners keep their existing path;
+compute-backed attribute conversion retains its separate storage-owner profile.
+Pinned builder comparisons and recording-device renderer tests cover eager/lazy
+graphs, ordinary aliases, integer bits, partial uploads, queued changes and
+disposal/reuse. These checks establish construction and submission behavior;
+fresh browser pixel parity and hardware performance remain unverified.
 
 The program records the smaller matrix/color capacity, or the matrix capacity
 when colors are absent. After node updates, the captured count must fit that

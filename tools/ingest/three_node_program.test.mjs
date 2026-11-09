@@ -6,6 +6,7 @@ import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
 import {inspectThreeLightingContext} from './three_node_passes.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {createThreeNodeBundles} from './three_node_bundles.mjs';
 import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import SourceRenderObject from '../../upstream/three.js/src/renderers/common/RenderObject.js';
 const N = THREE.TSL;
@@ -1509,7 +1510,7 @@ test('generated attributes capture after before-updates and before current node 
   assert.deepEqual(Array.from(source.array), Array(12).fill(.75));
   assert.match(d.vertex, new RegExp(`@location\\( ${d.attributes.find(attribute => attribute.name === name).location} \\) ${name} : vec3<f32>`));
 });
-test('public direct attribute inputs refuse before callbacks or consuming shared update ranges', t => {
+test('public direct attribute nodes share ordinary geometry upload histories', t => {
   for (const deferred of [false, true]) {
     const f = rig(t), source = new THREE.Float32BufferAttribute(new Float32Array(12).fill(.25), 3), gain = N.uniform(1);
     let updates = 0; gain.updateBeforeType = 'object'; gain.updateBefore = () => { updates++; };
@@ -1518,18 +1519,39 @@ test('public direct attribute inputs refuse before callbacks or consuming shared
     const graph = () => N.bufferAttribute(source).mul(gain);
     f.material.colorNode = deferred ? N.Fn(graph)() : graph();
     source.addUpdateRange(0, 3); source.needsUpdate = true;
-    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
-    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+    const descriptor = f.compile(), sourceBuilder = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    sourceBuilder.scene = f.scene; sourceBuilder.camera = f.camera; sourceBuilder.build();
+    assert.equal(descriptor.vertex, sourceBuilder.vertexShader); assert.equal(descriptor.fragment, sourceBuilder.fragmentShader);
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 1);
     assert.deepEqual(source.updateRanges, [{start: 0, count: 3}]);
     assert.deepEqual(Array.from(source.array), Array(12).fill(.25));
+    assert.throws(() => f.owner.captureDraw(descriptor, f.context), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'},
+      'standalone draw capture must supply the same geometry owner as ordinary inputs');
+    assert.equal(updates, 0);
+    const histories = createThreeNodeBundles(THREE); t.after(() => histories.dispose());
+    const capture = renderId => {
+      const packet = f.owner.captureDraw(descriptor, {...f.context, renderId,
+        captureGeometry: (view, attributes, inputs) => histories.captureGeometry(view, attributes, renderId, inputs)});
+      t.after(() => packet.bundleGeometry.release()); return packet.bundleGeometry.geometry;
+    };
+    const name = descriptor.attributes.find(input => input.name !== 'color' && f.owner.geometry(descriptor).attributes[input.name] === source).name;
+    assert.equal(f.owner.geometry(descriptor).attributes[name], source);
+    assert.equal(f.owner.attributeBytes(descriptor), 0, 'the generated owner does not duplicate shared CPU history');
+    const first = capture(1);
+    assert.equal(first.attributes.color, first.attributes[name], 'ordinary and authored bindings share one captured owner');
+    assert.deepEqual(source.updateRanges, [{start: 0, count: 3}], 'source first allocation retains ranges');
+    source.array.fill(.875); source.array.fill(.5, 0, 3); source.needsUpdate = true;
+    const second = capture(2);
+    assert.deepEqual([...second.attributes[name].array], [...Array(3).fill(.5), ...Array(9).fill(.25)]);
+    assert.deepEqual(source.updateRanges, []);
+    source.array = new Float32Array(12);
+    assert.equal(f.compile(), descriptor, 'same-layout public array replacement does not replace the source shader');
+    assert.deepEqual([...capture(3).attributes[name].array], [...second.attributes[name].array], 'unmarked CPU edits remain stale');
+    assert.deepEqual([...first.attributes[name].array], Array(12).fill(.25), 'accepted geometry remains immutable');
+    assert.equal(updates, 6);
   }
-  const f = cpuInstanceRig(t), original = f.object.instanceColor;
-  original.addUpdateRange(0, 3); original.needsUpdate = true;
-  f.material.colorNode = N.instancedBufferAttribute(original, 'vec3', 3, 0);
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}, 'the original instance input is not its separate source-derived owner');
-  assert.deepEqual(original.updateRanges, [{start: 0, count: 3}]);
 });
-test('public interleaved attribute inputs refuse before callbacks or consuming shared update ranges', t => {
+test('public interleaved attribute nodes share position/color owners and partial ranges', t => {
   for (const deferred of [false, true]) {
     const f = rig(t), source = new THREE.InterleavedBuffer(new Float32Array(24).fill(.25), 6), gain = N.uniform(1);
     const position = new THREE.InterleavedBufferAttribute(source, 3, 0), color = new THREE.InterleavedBufferAttribute(source, 3, 3);
@@ -1540,11 +1562,30 @@ test('public interleaved attribute inputs refuse before callbacks or consuming s
     const graph = () => N.bufferAttribute(source, 'vec3', 6, 3).mul(gain);
     f.material.colorNode = deferred ? N.Fn(graph)() : graph();
     source.addUpdateRange(3, 3); source.needsUpdate = true;
-    assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
-    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+    const descriptor = f.compile(), sourceBuilder = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    sourceBuilder.scene = f.scene; sourceBuilder.camera = f.camera; sourceBuilder.build();
+    assert.equal(descriptor.vertex, sourceBuilder.vertexShader); assert.equal(descriptor.fragment, sourceBuilder.fragmentShader);
+    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 1);
     assert.deepEqual(source.updateRanges, [{start: 3, count: 3}]);
     assert.deepEqual(Array.from(source.array), Array(24).fill(.25));
     assert.equal(f.object.geometry.attributes.position, position); assert.equal(f.object.geometry.attributes.color, color);
+    const histories = createThreeNodeBundles(THREE); t.after(() => histories.dispose());
+    const capture = renderId => {
+      const packet = f.owner.captureDraw(descriptor, {...f.context, renderId,
+        captureGeometry: (view, attributes, inputs) => histories.captureGeometry(view, attributes, renderId, inputs)});
+      t.after(() => packet.bundleGeometry.release()); return packet.bundleGeometry.geometry;
+    };
+    const name = descriptor.attributes.find(input => !['position', 'color'].includes(input.name)).name;
+    const first = capture(1);
+    assert.equal(first.attributes.position.data, first.attributes[name].data);
+    assert.equal(first.attributes.color.data, first.attributes[name].data);
+    assert.equal(first.attributes[name].offset, 3);
+    source.array.fill(.875); source.array.fill(.5, 3, 6); source.needsUpdate = true;
+    const second = capture(2), expected = Array(24).fill(.25); expected.fill(.5, 3, 6);
+    assert.deepEqual([...second.attributes[name].data.array], expected);
+    assert.deepEqual(source.updateRanges, []);
+    assert.deepEqual([...first.attributes[name].data.array], Array(24).fill(.25));
+    assert.equal(updates, 4);
   }
 });
 test('small CPU matrix uniforms see current updates while RGB attributes keep the preceding geometry upload', t => {

@@ -869,7 +869,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     prepareEnvironment(prepared, draw);
     return prepared;
   };
-  const frameContext = {...context, ...frameStamp};
+  const frameContext = {...context, ...frameStamp, validateAttributeOwners: owners => {
+    if (owners.some(owner => fixedAttributeHistory.get(renderer)?.has(owner)))
+      fail('CHANGED', 'Public node attributes cannot migrate an uncaptured fixed upload history');
+  }};
   const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
   const vertexUploads = new Map();
   const captureVertexAttribute = (attribute, view) => {

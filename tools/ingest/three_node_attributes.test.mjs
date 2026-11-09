@@ -2,6 +2,37 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createThreeNodeAttributes} from './three_node_attributes.mjs';
+import {createThreeNodeBundleGeometry} from './three_node_bundle_geometry.mjs';
+
+test('public node attributes share budgets, first-upload gates and disposal with ordinary geometry',()=>{
+  const histories=createThreeNodeAttributes(T),captures=createThreeNodeBundleGeometry(T,{maxBytes:192});
+  const source=new T.BufferAttribute(new Float32Array(12).fill(.25),3);
+  const geometry=new T.BufferGeometry().setAttribute('color',source),other=new T.BufferGeometry().setAttribute('color',source);
+  const descriptor={},secondDescriptor={},selection=[{name:'nodeColor',attribute:source,shared:true}];
+  const view=histories.register(descriptor,geometry,selection),secondView=histories.register(secondDescriptor,other,selection);
+  const leases=[];
+  const capture=(selected,renderId)=>{const lease=captures.capture(selected,renderId,['color','nodeColor']);leases.push(lease);return lease.geometry;};
+  try{
+    assert.equal(view.attributes.nodeColor,source);assert.equal(secondView.attributes.nodeColor,source);
+    const packet=histories.capture(descriptor,1);packet.install();
+    assert.equal(packet.bytes,0);assert.equal(histories.diagnostics.allocatedBytes,0);
+    const first=capture(view,1);assert.equal(first.attributes.color,first.attributes.nodeColor);
+    assert.equal(captures.diagnostics.allocatedBytes,48,'two shader names retain one source allocation');
+    source.array.fill(.875);source.array.fill(.5,0,3);source.addUpdateRange(0,3);source.needsUpdate=true;
+    const sameRender=capture(secondView,1);
+    assert.deepEqual([...sameRender.attributes.nodeColor.array],Array(12).fill(.25));
+    assert.deepEqual(source.updateRanges,[{start:0,count:3}],'a second render object cannot consume ranges after the source upload gate');
+    const next=capture(secondView,2);
+    assert.deepEqual([...next.attributes.nodeColor.array],[...Array(3).fill(.5),...Array(9).fill(.25)]);
+    assert.deepEqual(source.updateRanges,[]);
+    source.array.fill(.75);geometry.dispose();
+    const reused=capture(secondView,3);
+    assert.deepEqual([...reused.attributes.nodeColor.array],Array(12).fill(.75),'source geometry disposal invalidates shared residency');
+    assert.deepEqual([...first.attributes.nodeColor.array],Array(12).fill(.25),'accepted generations survive disposal');
+    assert.equal(histories.diagnostics.allocatedBytes,0);
+  }finally{for(const lease of leases)lease.release();histories.dispose();captures.dispose();}
+  assert.equal(captures.diagnostics.allocatedBytes,0);
+});
 
 test('generated instance colors retain queued versions, partial uploads and unmarked stale bytes',()=>{
   const histories=createThreeNodeAttributes(T),descriptor={},geometry=new T.PlaneGeometry();
