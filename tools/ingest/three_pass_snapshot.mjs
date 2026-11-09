@@ -6,6 +6,8 @@
  * objects are never temporarily rewritten across an await. Textures keep their
  * resource identity: this captures shader inputs, not copies of GPU images.
  */
+import {captureThreeUniformGroup} from './three_uniform_group_state.mjs';
+
 export class ThreePassSnapshotError extends Error {
   constructor(code, message) {
     super(`THREE_PASS_${code}: ${message}`);
@@ -193,6 +195,17 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
         return value;
       }
       if (memo.has(value)) return memo.get(value);
+      if (T.UniformsGroup && Object.getPrototypeOf(value) === T.UniformsGroup.prototype) {
+        const clone = view(value); memo.set(value, clone); charge(128);
+        for (const key of ['id', 'name', 'usage', 'isUniformsGroup']) put(clone, key, copy(own(value, key), depth + 1));
+        const uniforms = own(value, 'uniforms');
+        put(clone, 'uniforms', copy(uniforms, depth + 1));
+        const sources = new WeakMap();
+        for (const item of uniforms) for (const uniform of Array.isArray(item) ? item : [item])
+          sources.set(memo.get(uniform), uniform);
+        captureThreeUniformGroup(value, clone, sources);
+        return clone;
+      }
       if (ArrayBuffer.isView(value)) {
         if (typeof SharedArrayBuffer !== 'undefined' && value.buffer instanceof SharedArrayBuffer) fail('VALUE', 'Shared-memory pass inputs need an explicit synchronization boundary');
         charge(value.byteLength + 64);
@@ -209,6 +222,9 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
         if (key === 'length' && Array.isArray(value)) continue;
         // These are internal math change notifications, not shader inputs.
         if (key === '_onChangeCallback' && math.has(Object.getPrototypeOf(value))) continue;
+        // The group owner retains its layout/upload history. Copying these
+        // derived fields would duplicate it and retain obsolete buffer payloads.
+        if (Object.getPrototypeOf(value) === T.Uniform?.prototype && ['__data', '__offset'].includes(key)) continue;
         if (typeof key !== 'string') fail('VALUE', 'Symbol-backed pass data is not admitted');
         charge(key.length * 2 + 16); put(clone, key, copy(own(value, key), depth + 1));
       }
@@ -233,6 +249,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       return out;
     }
     const sourceMaterial = overrideMaterial ?? root.material, sourceGeometry = root?.geometry;
+    const sourceUniforms = own(sourceMaterial, 'uniforms');
     const attributes = {}, attributeSources = {}, owners = new Map(), interleavedSources = new Map();
     function attribute(a) {
       if (owners.has(a)) return owners.get(a);
@@ -273,7 +290,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
     }
     if (!state) {
       state = {root: root ? view(root) : null, record: null, material: overrideMaterial ? view(material) : null,
-        materialSource: overrideMaterial, geometry: null, attributeViews: new Map()};
+        materialSource: overrideMaterial, geometry: null, attributeViews: new Map(), uniformViews: new WeakMap()};
       // Type flags suffice until the first serialized install; it is not an
       // independently traversed render root until that request is prepared.
       if (state.root) { put(state.root, 'isMesh', true); put(state.root, 'isObject3D', true); }
@@ -306,8 +323,8 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
           fail('STALE', 'A captured pass texture changed before submission');
       }
     }
-    function overwrite(target, source) {
-      for (const key of Object.getOwnPropertyNames(target)) if (key !== '_listeners' && !Object.hasOwn(source, key)) delete target[key];
+    function overwrite(target, source, listeners = true) {
+      for (const key of Object.getOwnPropertyNames(target)) if ((!listeners || key !== '_listeners') && !Object.hasOwn(source, key)) delete target[key];
       for (const key of Object.getOwnPropertyNames(source)) put(target, key, source[key]);
     }
     function install() {
@@ -316,6 +333,16 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       const previous = state.record;
       if (previous) { previous.installed = false; collect(previous); }
       if (state.materialSource !== sourceMaterial) { state.material = view(material); state.materialSource = sourceMaterial; }
+      // WebGL programs retain their first uniforms dictionary. Keep its private
+      // identity while installing each accepted value set, just as mutations
+      // of the original dictionary remain visible to an already linked program.
+      // Application preset lists must not pin old copied payloads: identity is
+      // needed only while an execution view or linked program retains the copy.
+      if (sourceUniforms && typeof sourceUniforms === 'object') {
+        let uniforms = state.uniformViews.get(sourceUniforms)?.deref();
+        if (!uniforms) { uniforms = view(material.uniforms); state.uniformViews.set(sourceUniforms, new WeakRef(uniforms)); }
+        overwrite(uniforms, material.uniforms, false); material.uniforms = uniforms;
+      }
       overwrite(state.material, material);
       if (overrideMaterial) { record.installed = true; state.record = record; return; }
       if (state.geometrySource !== sourceGeometry) {
@@ -357,7 +384,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
         const data = state.root ?? state.material;
         if (data) for (const key of Object.getOwnPropertyNames(data)) delete data[key];
         state.record = state.material = state.geometry = state.materialSource = state.geometrySource = null;
-        state.attributeViews.clear();
+        state.attributeViews.clear(); state.uniformViews = new WeakMap();
       }
       retained.clear();
     },

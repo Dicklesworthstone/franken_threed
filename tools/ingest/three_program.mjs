@@ -22,6 +22,7 @@
  * extensions, onBeforeCompile hooks. No performance claim.
  */
 import {compileEsslProgram} from './essl_wgsl.mjs';
+import {threeUniformGroupState} from './three_uniform_group_state.mjs';
 import {SHADER_IDS, webglParameters, webglProgramSources, webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms, materialNeedsLights} from './three_webgl_program.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {animationDfgHalves} from './animation_dfg.mjs';
@@ -484,7 +485,7 @@ function createUniformBlocks() {
     if (ArrayBuffer.isView(value)) return {boundary: 16, storage: value.byteLength};
     fail('UNIFORMS', value?.isTexture ? 'Texture samplers can not be part of an uniforms group' : 'Unsupported uniforms group value type');
   }
-  function prepare(group) {
+  function prepare(group, identity) {
     let offset = 0;
     const chunkSize = 16;
     for (const item of group.uniforms) for (const uniform of Array.isArray(item) ? item : [item]) {
@@ -493,13 +494,14 @@ function createUniformBlocks() {
         const chunkOffset = offset % chunkSize, chunkPadding = chunkOffset % info.boundary, chunkStart = chunkOffset + chunkPadding;
         offset += chunkPadding;
         if (chunkStart !== 0 && (chunkSize - chunkStart) < info.storage) offset += chunkSize - chunkStart;
-        uniform.__data = new Float32Array(info.storage / 4);
-        uniform.__offset = offset;
+        const source = identity.uniforms?.get(uniform) ?? uniform;
+        source.__data = new Float32Array(info.storage / 4);
+        source.__offset = offset;
         offset += info.storage;
       }
     }
     if (offset % chunkSize > 0) offset += chunkSize - offset % chunkSize;
-    group.__size = offset; group.__cache = {};
+    identity.source.__size = offset; identity.source.__cache = {};
     const buffer = new ArrayBuffer(offset);
     return {buffer, bytes: new Uint8Array(buffer), view: new DataView(buffer), frame: -1};
   }
@@ -511,8 +513,8 @@ function createUniformBlocks() {
     } else if (ArrayBuffer.isView(value)) data.set(new value.constructor(value.buffer, value.byteOffset, data.length));
     else value.toArray(data, offset);
   }
-  function changed(uniform, index, indexArray, cache) {
-    const value = uniform.value, key = index + '_' + indexArray, cached = cache[key];
+  function changed(value, index, indexArray, cache) {
+    const key = index + '_' + indexArray, cached = cache[key];
     if (cached === undefined) {
       cache[key] = typeof value === 'number' || typeof value === 'boolean' ? value : ArrayBuffer.isView(value) ? value.slice() : value.clone();
       return true;
@@ -522,28 +524,30 @@ function createUniformBlocks() {
     if (cached.equals(value) === false) { cached.copy(value); return true; }
     return false;
   }
-  function update(state, group) {
+  function update(state, group, identity) {
     const write = (uniform, i, j) => {
-      if (!changed(uniform, i, j, group.__cache)) return;
       const value = uniform.value;
+      if (!changed(value, i, j, identity.source.__cache)) return;
+      const source = identity.uniforms?.get(uniform) ?? uniform;
       if (Array.isArray(value)) {
         let arrayOffset = 0;
         for (const v of value) {
           const info = uniformSize(v);
-          writeValue(v, uniform.__data, arrayOffset);
+          writeValue(v, source.__data, arrayOffset);
           if (typeof v !== 'number' && typeof v !== 'boolean' && !v.isMatrix3 && !ArrayBuffer.isView(v)) arrayOffset += info.storage / 4;
         }
-      } else writeValue(value, uniform.__data, 0);
+      } else writeValue(value, source.__data, 0);
       // gl.bufferSubData: a write past the buffer end is an INVALID_VALUE no-op.
-      const data = new Uint8Array(uniform.__data.buffer, uniform.__data.byteOffset, uniform.__data.byteLength);
-      if (uniform.__offset + data.byteLength <= state.bytes.byteLength) state.bytes.set(data, uniform.__offset);
+      const data = new Uint8Array(source.__data.buffer, source.__data.byteOffset, source.__data.byteLength);
+      if (source.__offset + data.byteLength <= state.bytes.byteLength) state.bytes.set(data, source.__offset);
     };
     group.uniforms.forEach((item, i) => { if (Array.isArray(item)) item.forEach((u, j) => write(u, i, j)); else write(item, i, 0); });
   }
   function bytesOf(group) {
-    let state = states.get(group);
-    if (!state) states.set(group, state = prepare(group));
-    if (state.frame !== self.frame) { update(state, group); state.frame = self.frame; }
+    const identity = threeUniformGroupState(group);
+    let state = states.get(identity.generation);
+    if (!state) states.set(identity.generation, state = prepare(group, identity));
+    if (state.frame !== self.frame) { update(state, group, identity); state.frame = self.frame; }
     return state;
   }
   // std140 alignment/size of a reflection layout node.

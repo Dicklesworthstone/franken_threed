@@ -36,7 +36,7 @@ const server = http.createServer(async (request, response) => {
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 
-async function capture(mode) {
+async function capture(mode, rootKind) {
   const browser = await chromium.launch({headless: true,
     executablePath: process.env.CHROMIUM_PATH ?? '/opt/pw-browsers/chromium',
     args: ['--no-sandbox', '--no-zygote', '--renderer-process-limit=1', '--enable-unsafe-webgpu',
@@ -46,7 +46,7 @@ async function capture(mode) {
     page.on('pageerror', error => browserErrors.push(String(error)));
     page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    const result = await page.evaluate(async mode => {
+    const result = await page.evaluate(async ({mode, rootKind}) => {
       const T = await import('/upstream/three.js/build/three.module.js');
       const Renderer = mode === 'source' ? T.WebGLRenderer : (await import('/renderer.mjs')).createWebGLRendererClass(T);
       const renderer = new Renderer({antialias: false}), errors = [], frames = [];
@@ -73,8 +73,9 @@ async function capture(mode) {
           out vec4 color; void main() {
             int x = int(gl_FragCoord.x); color = vec4(frames.matrices[x % 2][(x / 2) % 3], frames.lead, frames.tail) / 255.0; }`});
       const mesh = new T.Mesh(geometry, material), scene = new T.Scene(); mesh.frustumCulled = false; scene.add(mesh);
-      const draw = async name => {
-        renderer.render(scene, camera);
+      const draw = async (name, afterRender = null) => {
+        renderer.render(rootKind === 'mesh' ? mesh : scene, camera);
+        afterRender?.();
         if (mode === 'candidate') await renderer.waitForGPU();
         else {
           const error = renderer.getContext().getError();
@@ -99,27 +100,37 @@ async function capture(mode) {
         mesh.material = blockMaterial; await draw('mat3x2-ubo-initial');
         data[25] = 149; data[0] = 151; await draw('mat3x2-ubo-edited');
         data[4] = 157; data[28] = 163; await draw('mat3x2-ubo-edited-again');
+        await draw('mat3x2-ubo-before-dispose', () => {
+          group.dispose();
+          const first = data.slice(0, 16), second = data.slice(16);
+          first[0] = 43; first[4] = 47; second[12] = 53;
+          group.uniforms = [new T.Uniform(first), new T.Uniform(second)];
+          data.fill(255);
+        });
+        await draw('mat3x2-ubo-reused');
         return {frames, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
       } finally {
         target.dispose(); geometry.dispose(); material.dispose(); blockMaterial.dispose(); group.dispose(); renderer.dispose();
       }
-    }, mode);
+    }, {mode, rootKind});
     assert.deepEqual(browserErrors, [], `${mode} browser errors`);
     assert.deepEqual(result.errors, [], `${mode} GPU errors`);
     return {...result, browserVersion: browser.version()};
   } finally { await browser.close(); }
 }
 try {
-  const source = await capture('source'), candidate = await capture('candidate');
+  for (const rootKind of ['scene', 'mesh']) {
+  const source = await capture('source', rootKind), candidate = await capture('candidate', rootKind);
   assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
   assert.equal(candidate.frames.length, source.frames.length);
-  for (const index of [1, 2, 4, 5])
+  for (const index of [1, 2, 4, 5, 7])
     assert.notDeepEqual(source.frames[index].pixels, source.frames[index - 1].pixels, 'source uniform changes affect the output');
   for (const [index, expected] of source.frames.entries()) {
     const actual = candidate.frames[index]; assert.equal(actual.name, expected.name);
     assert.deepEqual(actual.pixels, expected.pixels, `${expected.name}: source/candidate storage differs`);
   }
-  console.log(JSON.stringify({case: 'program_matrix_arrays', status: 'pass', checkpoints: source.frames.map(frame => frame.name),
+  console.log(JSON.stringify({case: 'program_matrix_arrays', rootKind, status: 'pass', checkpoints: source.frames.map(frame => frame.name),
     rgbaBytes: source.frames.reduce((sum, frame) => sum + frame.pixels.length, 0), route: candidate.route,
     nativeDrawCalls: candidate.draws, gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
+  }
 } finally { await new Promise(resolve => server.close(resolve)); }

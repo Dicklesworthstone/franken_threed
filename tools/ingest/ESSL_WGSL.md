@@ -162,9 +162,12 @@ shadow sampling remain unimplemented.
   data and preserves the source's once-per-frame upload visibility.
   `tests/e2e/webgpu_renderer/program_matrix_arrays.mjs` compares the pinned
   WebGL renderer with the new WebGPU renderer for global `mat2[]` values and
-  typed std140 `mat3x2[]` blocks. All six initial/edit/replacement checkpoints
-  match exactly (2,304 RGBA bytes) on Chromium 153 SwiftShader, with no browser
-  or GPU errors. Rectangular block reads use direct dynamic indexing; the
+  typed std140 `mat3x2[]` blocks. All sixteen Scene/fullscreen Mesh checkpoints,
+  including live edits and queued group disposal/reuse, match exactly (6,144
+  RGBA bytes) on Chromium 153 SwiftShader, with no browser or GPU errors.
+  Fullscreen captures preserve linked ordinary-uniform dictionary identity and
+  share the source block's once-per-frame upload history and disposal generation.
+  Rectangular block reads use direct dynamic indexing; the
   local whole-array conversion remains covered by compiler/packer tests.
   This is software GPU correctness evidence, not hardware or speedup evidence.
 - Struct-interface regressions execute the generated pack/unpack assignments
