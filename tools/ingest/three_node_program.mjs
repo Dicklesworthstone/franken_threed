@@ -1308,7 +1308,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     return JSON.stringify(values);
   }
-  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version) {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
@@ -1326,7 +1326,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       camera?.isArrayCamera === true ? [camera.id, camera.cameras.length] : null,
       instanceSignature, inspectThreeNativeBatch(three, object, fail), skinSignature, morphSignature, fogKey, materialMapSignature(material, filtering),
       inspectThreePipelineContext(three, renderer, material, object, effects),
-      inspectThreeLightingContext(three, renderer.contextNode),
+      rendererContextSignature,
       inspectThreeMRT(three, renderer, material)?.key ?? null, environmentGraphKey(material, {scene}),
       basicEnvironmentSignature(material, environment),
       environment ? [environment.id, environment.mapping, environment.isRenderTargetTexture === true,
@@ -1367,6 +1367,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const skinSignature = inspectSkinning(object);
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
+    const rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
     const backdropKey = backdropSignature(preparedMaterial);
@@ -1380,6 +1381,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const passId = context.passId ?? null, passes = byMaterial?.get(material);
     const previous = passes?.get(passId);
     const previousState = previous && nodeStates.get(previous.descriptor);
+    // r186's highPrecision setter changes only context values. Existing render
+    // objects keep their matrix graph until context identity/version or another
+    // construction key changes; material.needsUpdate alone is not that change.
+    const retainedPrecision = previousState && previousState.rendererContextCache === rendererContextCache &&
+      previousState.rendererContextSignature !== rendererContextSignature;
+    const contextKey = retainedPrecision ? previousState.rendererContextSignature : rendererContextSignature;
     if (previousState?.basicEnvironmentSignature !== null && previousState?.basicEnvironmentSignature !== undefined &&
         basicEnvironmentSignature(preparedMaterial, environment) !== null) {
       const [combine, mapping] = JSON.parse(previousState.basicEnvironmentSignature);
@@ -1413,11 +1420,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // previous texture. All graph, layout and sampler checks still participate.
     let morphKey = morphSignature === null ? null : previousState?.materialVersion === material.version
       ? previousState.morphConstructionKey : morphConstructionKey(material, object.geometry);
-    const version = morphSignature !== null && previousState && morphKey !== null && morphKey === previousState.morphConstructionKey
+    const version = retainedPrecision || morphSignature !== null && previousState && morphKey !== null && morphKey === previousState.morphConstructionKey
       ? previousState.materialVersion : preparedMaterial.version;
-    const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side || version !== preparedMaterial.version)
+    const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side || version !== preparedMaterial.version || retainedPrecision)
       ? keyOf(preparedMaterial, object, context, lights, environment,
-        instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, version) : key;
+        instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, version, contextKey) : key;
     if (previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
@@ -1426,7 +1433,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       updateThreeNodeClipping(previous.builder.clippingContext, context);
       if (version !== preparedMaterial.version) {
         previous.key = keyOf(preparedMaterial, object, context, lights, environment,
-          instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side);
+          instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, preparedMaterial.version, contextKey);
         previousState.materialVersion = material.version;
       }
       return previous.descriptor;
@@ -1705,7 +1712,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       wideLineSignature: wideLineSignature(preparedMaterial),
       volumeSignature: volumeKey,
       sssSignature: sssKey, geometrySignature: geometryKey, backdropSignature: backdropKey,
-      instanceSignature, batchSignature, skinSignature, morphSignature, morphConstructionKey: morphKey, pipelineSignature, rendererContextSignature,
+      instanceSignature, batchSignature, skinSignature, morphSignature, morphConstructionKey: morphKey, pipelineSignature, rendererContextSignature, rendererContextCache,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,
@@ -2014,7 +2021,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return history.bytes;
   }
   function checkPipelineContext(state, object = state.object) {
-    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature)
+    if (inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED') !== state.rendererContextSignature &&
+        inspectThreeLightingContext(three, renderer.contextNode, 'CHANGED', false) !== state.rendererContextCache)
       fail('CHANGED', 'Native renderer lighting context changed; compile the material graph again');
     if (inspectThreePipelineContext(three, renderer, state.material, object, effects) !== state.pipelineSignature)
       fail('CHANGED', 'Native render-pipeline context changed; compile its output graph again');

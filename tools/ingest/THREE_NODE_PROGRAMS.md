@@ -1438,6 +1438,62 @@ dispatch, lifecycle, lighting, shadow and bundle regressions pass with the
 recording device. These checks establish command and upload behavior, without a
 new browser-pixel or performance result.
 
+## High-precision model/view matrices
+
+The native renderer exposes the pinned `highPrecision` accessor. Enabling it
+installs the exact source `highpModelViewMatrix` and
+`highpModelNormalViewMatrix` context nodes. The retained builder multiplies
+model/view matrices and calculates inverse-transpose normals using CPU number
+precision before packing float uniforms. Fractional camera-relative positions
+therefore survive large world translations that independent float matrix
+uploads would discard.
+
+This context selects the native source path for ordinary Basic, Normal and lit
+materials, authored node graphs, sprites, points and lines. Partial canonical
+matrix overrides are admitted; custom replacement matrix graphs remain outside
+the profile. Accepted draws retain their matrix packets across asynchronous
+pipeline preparation. A successful precision draw keeps its geometry owner
+when the mode changes, preserving prior uploads, unmarked CPU edits and partial
+attribute update ranges. Failed admission does not publish that ownership.
+
+As in r186, changing `highPrecision` alone does not reconstruct an existing
+native shader. Neither does `material.needsUpdate` alone when its construction
+key is unchanged. Set `renderer.contextNode.needsUpdate = true`, or replace the
+renderer context, when the new matrix mode should affect an existing graph.
+The cache omits only the two canonical matrix values from that retention check;
+live context validation, identity/version, other hooks and resource keys remain
+active. The first promotion of a previously fixed scene requires this explicit
+context invalidation and otherwise reports `THREE_NODE_PROGRAM_CONTEXT_CACHE`;
+it does not reconstruct the fixed shader's earlier matrix graph.
+
+Eight `three_renderer_high_precision.test.mjs` cases compare exact source
+accessors and generated shaders, retained CPU model/view and normal/view bytes
+around `2 ** 28`, source render-object cache keys, primitive routing, queued
+geometry history and failed-admission rollback. The directly related existing
+context/snapshot selection passes 19 of 20 tests; its remaining assertion still
+expects an already-supported `getUV` context to reject and also predates these
+changes.
+
+`scenarios_high_precision.js`, run through the existing `sprites.mjs` runner,
+compares perspective, orthographic and mode-change scenes against pinned r186.
+All 21 checkpoints and 1,032,192 RGBA bytes match exactly on Chromium
+153.0.8010.0 / SwiftShader, with seven native draws and no browser/GPU errors.
+The mode-change case covers a bare toggle, material-only invalidation, context
+invalidation, unmarked geometry edits and a later marked upload. These are
+software-GPU correctness results. The pinned source itself documents
+`InstancedMesh` and `SkinnedMesh` as incompatible with this precision mode;
+this extension does not broaden that source contract or establish XR/multiview,
+ArrayCamera/shadow pixel coverage, or hardware performance.
+
+Run the browser cases with:
+
+```sh
+F3D_NATIVE_SCENARIO_MODULE=/tests/e2e/webgpu_renderer/scenarios_high_precision.js \
+F3D_NATIVE_SCENARIO_EXPORT=highPrecisionScenarios \
+node tests/e2e/webgpu_renderer/sprites.mjs native_high_precision \
+  native_high_precision_orthographic native_high_precision_toggles
+```
+
 ## Logarithmic and reversed depth
 
 Native perspective and orthographic mesh scenes accept `logarithmicDepthBuffer`

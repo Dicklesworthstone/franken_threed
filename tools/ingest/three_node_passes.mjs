@@ -28,7 +28,7 @@ export function inspectThreeNativeCamera(three, camera, code = 'CAMERA') {
  * retained builder; never evaluate them during admission.
  * Hook identity and ContextNode.version are structural, uniform values live.
  */
-export function inspectThreeLightingContext(three, context, code = 'GRAPH') {
+export function inspectThreeLightingContext(three, context, code = 'GRAPH', matrixValues = true) {
   if (context == null) return null;
   const seen = new Set(), signature = [];
   let hasHooks = false;
@@ -54,21 +54,44 @@ export function inspectThreeLightingContext(three, context, code = 'GRAPH') {
           ['getUV', 'getTextureLevel'].includes(key) && descriptor.value === null) {
         hooks.push([key, descriptor.value]); hasHooks = true; continue;
       }
+      const matrix = key === 'modelViewMatrix' ? three.TSL?.highpModelViewMatrix :
+        key === 'modelNormalViewMatrix' ? three.TSL?.highpModelNormalViewMatrix : null;
+      if (matrix && descriptor.value === matrix) {
+        if (matrixValues) hooks.push([key, 'source-high-precision']);
+        hasHooks = true; continue;
+      }
       if (!['getAO', 'getGI', 'getUV', 'getTextureLevel'].includes(key) || typeof descriptor.value !== 'function')
-        fail('Native contexts admit source AO/GI and texture UV/level hooks, with a boolean forceUVContext', code);
+        fail('Native contexts admit source high-precision matrices, AO/GI and texture UV/level hooks, with a boolean forceUVContext', code);
       let id = lightingHooks.get(descriptor.value);
       if (id === undefined) lightingHooks.set(descriptor.value, id = ++lightingHookSerial);
       hooks.push([key, id]); hasHooks = true;
     }
     // The source traverses every public node field. Extra child graphs could
     // contribute a context not represented by this finite chain's cache key.
-    for (const {property, childNode} of three.Node.prototype._getChildren.call(node))
-      if (property !== 'node' || childNode !== child)
+    for (const {property, index, childNode} of three.Node.prototype._getChildren.call(node))
+      if (!(property === 'node' && childNode === child) &&
+          !(property === 'value' && index === 'modelViewMatrix' && childNode === three.TSL?.highpModelViewMatrix) &&
+          !(property === 'value' && index === 'modelNormalViewMatrix' && childNode === three.TSL?.highpModelNormalViewMatrix))
         fail('Native lighting contexts cannot carry additional context graphs', code);
     signature.push([node.uuid, node.version, hooks]);
     node = child;
   }
-  return hasHooks ? JSON.stringify(['lighting-context', signature]) : null;
+  // Source RenderObject keys renderer context identity/version, not these
+  // matrix values. Keep empty context identities when comparing that cache
+  // boundary, while still validating every live field above.
+  return hasHooks || !matrixValues ? JSON.stringify(['lighting-context', signature]) : null;
+}
+
+/** Inspect only already admitted source ContextNode data. Matrix overrides
+ * affect unlit geometry and primitive materials as well as lit meshes. */
+export function hasThreeHighPrecisionContext(three, context) {
+  const modelView = three.TSL?.highpModelViewMatrix, normalView = three.TSL?.highpModelNormalViewMatrix;
+  for (let node = context, depth = 0; node && depth++ < 64; node = node.node) {
+    const data = node.value;
+    if (modelView && data.modelViewMatrix === modelView ||
+        normalView && data.modelNormalViewMatrix === normalView) return true;
+  }
+  return false;
 }
 
 /** Capture the source's named output mapping. Uniform values and clear colors

@@ -723,6 +723,21 @@ export function withThreeCompute(Base, THREE) {
         this._backend.hasCompatibility = name => name === THREE.Compatibility.TEXTURE_COMPARE && textureCompare;
       }
     }
+    get highPrecision() {
+      const data = this.contextNode.value;
+      return data.modelViewMatrix === THREE.TSL.highpModelViewMatrix &&
+        data.modelNormalViewMatrix === THREE.TSL.highpModelNormalViewMatrix;
+    }
+    set highPrecision(value) {
+      const data = this.contextNode.value;
+      if (value === true) {
+        data.modelViewMatrix = THREE.TSL.highpModelViewMatrix;
+        data.modelNormalViewMatrix = THREE.TSL.highpModelNormalViewMatrix;
+      } else if (this.highPrecision) {
+        delete data.modelViewMatrix;
+        delete data.modelNormalViewMatrix;
+      }
+    }
     hasCompatibility(name) {
       if (!this._initialized) throw new Error('THREE.Renderer: .hasCompatibility() called before the backend is initialized. Use "await renderer.init();" before using this method.');
       return this._backend.hasCompatibility(name);

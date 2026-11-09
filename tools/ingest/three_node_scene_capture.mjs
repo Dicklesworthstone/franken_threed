@@ -6,7 +6,7 @@
 import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
-import {inspectThreeLightingContext, inspectThreeNativeCamera} from './three_node_passes.mjs';
+import {inspectThreeLightingContext, inspectThreeNativeCamera, hasThreeHighPrecisionContext} from './three_node_passes.mjs';
 import {captureThreeNodeClipping} from './three_node_clipping.mjs';
 import {inspectThreeNativeBatch, captureThreeNativeBatch} from './three_node_batch.mjs';
 import {updateThreeCameraProjection} from './three_pass_snapshot.mjs';
@@ -18,6 +18,8 @@ const transparent = material => material.transparent === true || transmissive(ma
 const environmentMaterialHistory = new WeakMap();
 const sampledTextureMaterialHistory = new WeakMap();
 const sampledTextureSceneHistory = new WeakMap();
+const highPrecisionSceneHistory = new WeakMap();
+const fixedPrecisionContexts = new WeakMap();
 const nativeSceneHistory = new WeakMap();
 const hookSceneHistory = new WeakMap();
 const hookAttributeHistory = new WeakMap();
@@ -99,6 +101,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // later graph replacement. The fixed adapter must not apply scene.fog again.
   const sceneFogNode = !!root?.fogNode;
   const lightingContext = inspectThreeLightingContext(three, renderer?.contextNode);
+  const retainedPrecisionScene = highPrecisionSceneHistory.get(renderer)?.has(renderRoot) === true;
+  const precisionRequested = lightingContext !== null && hasThreeHighPrecisionContext(three, renderer?.contextNode);
+  const nativePrecisionScene = retainedPrecisionScene || precisionRequested;
+  const fixedPrecision = fixedPrecisionContexts.get(renderer)?.get(renderRoot);
+  if (precisionRequested && !retainedPrecisionScene && fixedPrecision?.context === renderer?.contextNode &&
+      fixedPrecision.version === renderer.contextNode.version)
+    fail('CONTEXT_CACHE', 'Enabling highPrecision after fixed rendering requires contextNode.needsUpdate or a new contextNode');
   if (backgroundMesh !== null && (!(backgroundMesh instanceof three.Mesh) || backgroundMesh === root ||
       backgroundMesh.parent !== null || backgroundMesh.children.length || Array.isArray(backgroundMesh.material) ||
       !hasThreeNodeProgram(backgroundMesh.material)))
@@ -311,7 +320,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   // Once queried, an object's callbacks may keep observing its last completed
   // result after the application disables queries. Retain that capture route.
-  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeSampledTextureScene || nativeOcclusionScene || nativeHookScene
+  const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativePrecisionScene || nativeWideLineScene || nativeGeometryScene || nativeSampledTextureScene || nativeOcclusionScene || nativeHookScene
     ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
   const renderable = object => object.isMesh || object.isSprite || object.isPoints || object.isLine;
   const nativeSelection = (object, effective) => bundleMembers.has(object) ||
@@ -624,6 +633,14 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
     const fixed = captureFixedGeometry();
     rememberFixedAttributes(phases, fixed.fixedGeometries);
+    // A first native graph cannot reconstruct a fixed draw's cached source
+    // shader under an unversioned precision toggle. Require the actual source
+    // reconstruction boundary before changing this owner.
+    if (renderer?.contextNode && [...fixed.fixedGeometries.values()].some(value => value !== null)) {
+      let scenes = fixedPrecisionContexts.get(renderer);
+      if (!scenes) fixedPrecisionContexts.set(renderer, scenes = new WeakMap());
+      scenes.set(renderRoot, {context: renderer.contextNode, version: renderer.contextNode.version});
+    }
     return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sceneHierarchy, sortObjects, sceneEnvironmentNode, sceneFogNode, phases: Object.freeze(phases), bindings: Object.freeze([]), draws: Object.freeze([]),
       ...fixed, background: false, prepareAttributes() {}, installAttributes() {},
       textureOwner: null, textureUses: Object.freeze([]), storageOwner: null, storageUses: Object.freeze([])});
@@ -1515,6 +1532,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   rememberFixedAttributes(phases);
   // A failed admission must leave the former fixed route usable. Commit this
   // ownership only once the accepted draw captures and their histories exist.
+  if (nativePrecisionScene && renderer) {
+    let scenes = highPrecisionSceneHistory.get(renderer);
+    if (!scenes) highPrecisionSceneHistory.set(renderer, scenes = new WeakSet());
+    scenes.add(renderRoot);
+  }
   if (nativeCompanionScene) {
     let scenes = nativeSceneHistory.get(renderer);
     if (!scenes) nativeSceneHistory.set(renderer, scenes = new WeakSet());
