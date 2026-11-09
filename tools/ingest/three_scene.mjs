@@ -1591,13 +1591,14 @@ export async function createGpuThreeScene(device,scene,{
   }
   function render(camera,frame,options={}){
     live();if(busy)fail('REENTRANT','A source-scene operation is already running');busy=true;
-    let backgroundSubmitted=false;
+    let backgroundSubmitted=false,drawCallbacksRan=false;
     const publicRenderer=programRoute()?shadowRenderer():null;
     const passProgram=programSupport?.state?.(),passState=passProgram?.passState??null;
     const previousDrawContext=publicRenderer?._programDrawContext;
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
-      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','sortState','framebuffer','depthbuffer'].includes(k)))
+      if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','sortState','framebuffer','depthbuffer','onDrawCallbacks'].includes(k))||
+          options.onDrawCallbacks!==undefined&&typeof options.onDrawCallbacks!=='function')
         fail('OPTIONS','Expected draw options with optional overrideMaterial, native node frame, background state and matrix-update flag');
       passOverride=Object.hasOwn(options,'overrideMaterial')?options.overrideMaterial:scene.overrideMaterial;
       passNodeFrame=options.nodeFrame??null;
@@ -2131,11 +2132,11 @@ export async function createGpuThreeScene(device,scene,{
           const count=item.group?integer(item.group.count,0,Number.MAX_SAFE_INTEGER,'group count'):0xffffffff;
           // renderObject: onBeforeRender, matrices, draw (uniforms packed now), onAfterRender.
           const hooked=object.onBeforeRender!==three.Object3D.prototype.onBeforeRender||object.onAfterRender!==three.Object3D.prototype.onAfterRender;
-          if(hooked)object.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);
+          if(hooked){drawCallbacksRan=true;object.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,item.material,item.group);}
           object.modelViewMatrix.multiplyMatrices(drawCamera.matrixWorldInverse,object.matrixWorld);
           object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
           // renderBufferDirect: material.onBeforeRender(renderer, scene, camera, geometry, object, group).
-          if(item.material.onBeforeRender!==three.Material.prototype.onBeforeRender)item.material.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,object,item.group);
+          if(item.material.onBeforeRender!==three.Material.prototype.onBeforeRender){drawCallbacksRan=true;item.material.onBeforeRender(shadowRenderer(),root,drawCamera,object.geometry,object,item.group);}
           const frontFaceCW=object.isMesh===true&&object.matrixWorld.determinant()<0;
           const g=object.geometry;
           const instanceCount=object.isInstancedMesh?integer(object.count,0,0xffffffff,'instance count'):g.isInstancedBufferGeometry?Math.min(g.instanceCount,0xffffffff):1;
@@ -2387,6 +2388,9 @@ export async function createGpuThreeScene(device,scene,{
       if(!programArray&&batchHistory?.latest.size)restoreBatchHistory([...batchHistory.latest.values()]);
       shadowStats=shadowFrame?Object.freeze({lightIndex,casters:shadowDraws.length,
         mapVersion:shadowOwner.version,updated:shadowFrame.update}):null;
+      // Notify only after hooks and the complete source draw finish. The
+      // facade then reads live mip flags before the target owner filters them.
+      if(drawCallbacksRan)options.onDrawCallbacks?.();
       return bridge;
     }catch(error){
       // A successful background prefix cannot be rolled back after color fails.

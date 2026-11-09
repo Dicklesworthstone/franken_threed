@@ -225,10 +225,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
-        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, frame, framebuffer, depthbuffer) {
+        render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, onDrawCallbacks}, frame, framebuffer, depthbuffer) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
-          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, framebuffer, depthbuffer});
+          entry.bridge.render(camera, frame, {overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, framebuffer, depthbuffer, onDrawCallbacks});
           entry.lastDiagnostics = entry.bridge.diagnostics;
           return entry;
         },
@@ -1732,8 +1732,21 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               (!this._shaderEncodedOutput && destination.shape.sharedDepth ||
                 outputPass && sourceTarget !== null && !copiedDepth);
             const targetFrame = firstDepth && !clearOnly ? {...frame, depthLoadOp: 'clear'} : frame;
-            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState}, {...targetFrame, ...attachments}, framebuffer, depthbuffer),
-              {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps,
+            // Callback-free queued draws keep the accepted generation flags.
+            // WebGL hooks retain live source state and can change those flags
+            // before source mip generation; refresh only this execution's copy.
+            const colorMipmaps = this._shaderEncodedOutput && generateColorMipmaps !== null ? generateColorMipmaps.slice() : generateColorMipmaps;
+            const onDrawCallbacks = this._shaderEncodedOutput && colorMipmaps !== null ? () => {
+              const selected = [];
+              for (const [index, color] of destination.shape.colors.entries()) if (color.texture.generateMipmaps) {
+                if (color.mipLevelCount < color.maximumMipLevels)
+                  fail('MIP', 'Enable WebGL MRT mip generation before initializing that attachment, or recreate the target');
+                selected.push(index);
+              }
+              colorMipmaps.splice(0, colorMipmaps.length, ...selected);
+            } : undefined;
+            this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, onDrawCallbacks}, {...targetFrame, ...attachments}, framebuffer, depthbuffer),
+              {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps: colorMipmaps,
                 resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape.sampleCount > 1)});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.

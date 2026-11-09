@@ -496,6 +496,13 @@ resolved and generated images. Sampling borrows the existing GPU orientation
 replicas with the full selected color pyramid, original precision and setup
 sampler; warm sampling reuses those images.
 
+Callback-free queued draws retain the generation flags accepted by each call.
+Supported WebGL object and material draw hooks retain their existing live source
+identities and execution timing. If those hooks run, the facade reads their final
+flags after the complete draw, before filtering; each nested render has its own
+generation selection. This admits disabling or re-enabling an allocated chain
+inside `onBeforeRender` or object `onAfterRender`, including deferred draws.
+
 For this profile, configure generation before an attachment is first initialized. An initialized
 chain can be disabled and re-enabled without replacing its rendered contents,
 including across `needsUpdate` and sampler edits. Enabling generation on an
@@ -511,6 +518,13 @@ They verify per-color/layer descriptors, generation and resolve order, captured
 flags, immutable setup samplers, exact byte charges, budget failures and
 disposal. They do not execute the mip shaders or establish fresh rasterized
 parity or hardware performance; browser execution was unavailable in this host.
+
+Eight additional regressions run the actual facade, ESSL compiler and source
+scene bridge against the existing recording device. They cover warm and
+deferred callbacks with one/four samples, callback identity and order, material-only
+hooks, nested targets, queued callback-free flags, and explicit failure when a
+callback requests a chain that was not allocated. These are command and ownership
+checks, with no new rasterized parity or performance claim.
 
 ## Native array MRT mipmaps
 
