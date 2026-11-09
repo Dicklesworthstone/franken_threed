@@ -169,7 +169,11 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Native owners capture probe/area, authored and many-light selection. The fixed owner must not
   // reread or reject these lights, including inactive lights and lights ignored
   // by a material's source lighting model. Their children remain traversable.
-  const authoredLight = object => object.isLight === true && (object.colorNode || object.isSpotLight === true && object.map);
+  // These exact source spot families have attenuation beyond the fixed cone,
+  // even before an IES/projected image is assigned. Keep their first graph on
+  // the native owner so later FRAME updates preserve the source cache history.
+  const authoredLight = object => object.isLight === true && (object.constructor === three.IESSpotLight ||
+    object.constructor === three.ProjectorLight || object.colorNode || object.isSpotLight === true && object.map);
   const projectedLights = new Set([...hierarchy.keys()].filter(object => object.isLight === true &&
     visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers)));
   for (const object of extraLights) projectedLights.add(object);

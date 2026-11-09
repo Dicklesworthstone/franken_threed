@@ -158,7 +158,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     ...(three.VolumeNodeMaterial ? [three.VolumeNodeMaterial.prototype] : [])];
   const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
     [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode],
-    [three.LightProbe, three.LightProbeNode], [three.RectAreaLight, three.RectAreaLightNode]]);
+    [three.LightProbe, three.LightProbeNode], [three.RectAreaLight, three.RectAreaLightNode],
+    [three.IESSpotLight, three.IESSpotLightNode], [three.ProjectorLight, three.ProjectorLightNode]]
+    .filter(([Source, Native]) => Source && Native));
+  const spotLightClasses = new Set([three.SpotLight, three.IESSpotLight, three.ProjectorLight].filter(Boolean));
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
   const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
@@ -553,7 +556,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // SpotLightNode calls its authored color with projected coordinates;
       // other analytic nodes consume an authored color graph directly. Keep
       // those source entrances distinct and let the pinned builder call Fn.
-      const spot = Native === three.SpotLightNode, color = light.colorNode || null;
+      const spot = spotLightClasses.has(light.constructor), color = light.colorNode || null;
       if (light.map != null && !spot)
         fail('LIGHTS', 'Native projected maps require the source SpotLightNode');
       if (color && (spot ? typeof color !== 'function' || typeof color.getCacheKey !== 'function' : !(color instanceof three.Node)))
@@ -561,6 +564,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const map = spot && !color ? light.map || null : null;
       if (map && (inspectTexture(map).viewDimension !== '2d' || integerTextureType(map)))
         fail('LIGHTS', 'Projected spot maps require floating-point source 2D textures');
+      // IESSpotLightNode selects its attenuation branch during construction,
+      // then updates a constructed texture at FRAME frequency. The source
+      // light cache does not include iesMap: compatible replacement, removal,
+      // and adding a map to an already built ordinary cone must retain that
+      // lifecycle rather than forcing a new graph from the public map slot.
+      const iesMap = Native === three.IESSpotLightNode && light.iesMap?.isTexture === true ? light.iesMap : null;
+      if (iesMap && (inspectTexture(iesMap).viewDimension !== '2d' || integerTextureType(iesMap)))
+        fail('LIGHTS', 'IES attenuation maps require floating-point source 2D textures');
       // A projected map is a render-update TextureNode inside the source
       // lighting graph. Rebuild on replacement so layout and binding aliases
       // are checked before that callback selects the new resource.
@@ -571,7 +582,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const shadowGraph = shadow ? inspectThreeNativeShadowGraph(three, shadow.shadowNode, light) : null;
       if (shadow && (!(shadow instanceof three.LightShadow) ||
           ![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap.type) ||
-          ![three.DirectionalLight, three.SpotLight, three.PointLight].includes(light.constructor) &&
+          ![three.DirectionalLight, three.PointLight].includes(light.constructor) && !spotLightClasses.has(light.constructor) &&
             !(light.isSunLight === true && shadow.isSunLightShadow === true)))
         fail('SHADOW', 'Native source shadows require ordinary directional, spot, point or registered SunLight Basic/PCF/VSM maps');
       // The grid's setup closes over the atlas identity and its falloff branch.
@@ -579,7 +590,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const grid = light.isLightProbeGrid === true ? [light.texture ?
         [sourceId(light.texture), textureSignature([{value: light.texture}])] : null, light.falloff > 0] : null;
       return [light.id, id(light.constructor), id(Native), id(Native.prototype.setup), id(Native.prototype.update), id(Native.prototype.setupDirect),
-        id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), light.castShadow === true, shadow ? id(shadow) : null,
+        id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), spot ? id(Native.prototype.getSpotAttenuation) : null,
+        light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
         filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null,
         shadowGraph ? [sourceId(shadowGraph), shadowGraph.getCacheKey()] : null, projected, authored, grid];

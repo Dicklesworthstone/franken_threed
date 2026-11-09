@@ -411,6 +411,29 @@ their matrices, accepted map versions and replacement-map bindings; versionless
 CPU edits do not change an already accepted upload. Projected maps also compose
 with the existing PCF shadow owner.
 
+The exact pinned `IESSpotLight` and `ProjectorLight` classes also select native
+lighting for ordinary lit materials. Their registered source nodes retain the
+inherited spotlight projection and their distinct attenuation: IES photometric
+tables use ready floating-point 2D textures, including the half-float red-channel
+tables produced by `IESLoader`; projector aspect, penumbra and projected colors
+use the source projection matrix and update lifecycle. Projector `colorNode`
+functions retain precedence over its texture map.
+
+IES maps follow the source light cache rather than a new per-map shader policy.
+A constructed IES graph updates replacement textures at FRAME frequency;
+removing the public map retains the source texture-node history. Adding an IES
+map after an ordinary cone was constructed waits for the source's actual graph
+invalidation boundary. Accepted draws keep their uploaded texels and uniforms;
+unversioned CPU edits do not alter an already captured image.
+
+Both families compose with native Basic, PCF and VSM shadows, retaining caster
+callbacks, map dimensions, `autoUpdate` and `needsUpdate`. Inactive lights do not
+read their map slots. Unknown subclasses and altered library mappings keep the
+existing admission boundaries. The new `three_node_spot_lights.test.mjs` and
+`three_renderer_spot_lights.test.mjs` provide 25 source-WGSL and actual-facade
+regressions; together with existing projection/shadow-filter checks, 45 tests
+pass. Fresh browser pixels and hardware performance remain unverified.
+
 Authored light colors use the distinct source contracts: spotlight `colorNode`
 is a callable projection with a source cache key, such as
 `TSL.Fn(([uv]) => TSL.texture(projectedTexture, uv.xy).rgb)`, while other analytic

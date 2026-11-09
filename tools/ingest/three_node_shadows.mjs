@@ -107,7 +107,8 @@ export function registerThreeNativeShadow(three, renderer, node, provenance = nu
   }
   if ((!ordinary && !sun && !point) || !virtual && !(node.light instanceof three.Light) || node.shadow !== node.light.shadow ||
       !(node.shadow instanceof three.LightShadow) || !point && node.shadow.isPointLightShadow ||
-      ordinary && !virtual && !(node.light.constructor === three.DirectionalLight || node.light.constructor === three.SpotLight))
+      ordinary && !virtual && !(node.light.constructor === three.DirectionalLight ||
+        [three.SpotLight, three.IESSpotLight, three.ProjectorLight].includes(node.light.constructor)))
     reject('Native shadow maps require directional, spot, point or registered SunLight source shadows');
   if (![three.BasicShadowMap, three.PCFShadowMap, three.VSMShadowMap].includes(renderer.shadowMap?.type))
     reject('Native shadow maps require Basic, PCF or VSM filtering');
