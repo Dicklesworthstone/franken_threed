@@ -140,6 +140,144 @@ test('WebGL MRT refuses authored framebuffer arrays before native allocation', (
   assert.equal(f.calls.textures.length, 0); f.owner.dispose();
 });
 
+function webglMipFixture(options = {}) {
+  const f = gpuTargetMipmapFixture();
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32, maxTextureArrayLayers: 256});
+  f.device.features = new Set();
+  return {...f, owner: createThreeRenderTargets(T, {getDevice: () => f.device, flipY: true, ...options})};
+}
+function webglMipTarget(samples = 0) {
+  const target = new T.WebGLRenderTarget(8, 4, {count: 2, depthBuffer: false, samples});
+  target.textures[1].type = T.HalfFloatType;
+  for (const texture of target.textures) Object.assign(texture,
+    {generateMipmaps: true, minFilter: T.NearestMipmapNearestFilter, magFilter: T.NearestFilter});
+  return target;
+}
+
+for (const samples of [0, 4]) test(`WebGL MRT generates and orients each resolved color pyramid (${samples})`, async () => {
+  const f = webglMipFixture(), target = webglMipTarget(samples), entry = f.owner.capture(target);
+  const nativeBytes = 43 * 12 + (samples === 4 ? 8 * 4 * 12 * 4 : 0);
+  f.owner.render(entry, frame => {
+    assert.equal(frame.colorViews.length, 2);
+    if (samples === 4) assert.equal(frame.resolveTargets.length, 2);
+    f.device.queue.submit([{draw: true}]);
+  }, {generateColorMipmaps: [0, 1]});
+  assert.equal(f.submissions[0][0].draw, true);
+  const generated = f.submissions[1][0].passes;
+  assert.equal(generated.length, 6);
+  assert.deepEqual(generated.map(pass => pass.pipeline.descriptor.fragment.targets[0].format),
+    ['rgba8unorm', 'rgba8unorm', 'rgba8unorm', 'rgba16float', 'rgba16float', 'rgba16float']);
+  assert.deepEqual(generated.map(pass => pass.descriptor.colorAttachments[0].view.descriptor.baseMipLevel), [1, 2, 3, 1, 2, 3]);
+  assert.equal(f.owner.allocatedBytes, nativeBytes);
+  const bindings = f.owner.bindingsFor(), sampled = target.textures.map(texture => bindings.get(texture));
+  assert.deepEqual(sampled.map(binding => binding.view.texture.mipLevelCount), [4, 4]);
+  assert.deepEqual(sampled.map(binding => binding.sampler.descriptor.lodMaxClamp), [3, 3]);
+  for (const commands of f.submissions.slice(2)) {
+    assert.equal(commands[0].passes.length, 4);
+    for (const pass of commands[0].passes) {
+      const source = pass.group.entries[0].resource, destination = pass.descriptor.colorAttachments[0].view;
+      assert.equal(source.descriptor.baseMipLevel, destination.descriptor.baseMipLevel);
+      assert.notEqual(source.texture, destination.texture);
+      assert.equal(source.texture.format, destination.texture.format);
+    }
+  }
+  assert.equal(f.owner.allocatedBytes, nativeBytes + 43 * 12);
+  const submitted = f.submissions.length;
+  sampled.forEach((binding, index) => assert.equal(bindings.get(target.textures[index]).view, binding.view));
+  assert.equal(f.submissions.length, submitted, 'clean pyramids and replicas are reused');
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('WebGL MRT retains initialized mip allocations and samplers across captured generation changes', async () => {
+  const f = webglMipFixture(), target = webglMipTarget(), entry = f.owner.capture(target);
+  f.owner.render(entry, () => {}, {generateColorMipmaps: [0, 1]});
+  const bindings = f.owner.bindingsFor(), before = target.textures.map(texture => bindings.get(texture));
+  const allocated = f.owner.allocatedBytes;
+  target.texture.generateMipmaps = false;
+  target.textures[1].generateMipmaps = false;
+  target.textures[1].minFilter = T.LinearFilter;
+  target.textures[1].needsUpdate = true;
+  assert.equal(f.owner.capture(target), entry);
+  assert.equal(bindings.get(target.textures[1]).sampler, before[1].sampler);
+  const submitted = f.submissions.length;
+  f.owner.render(entry, () => {}, {generateColorMipmaps: [1]});
+  assert.equal(f.submissions.length, submitted + 1, 'captured flags survive later public mutations');
+  assert.ok(f.submissions.at(-1)[0].passes.every(pass =>
+    pass.descriptor.colorAttachments[0].view.texture.format === 'rgba16float'));
+  f.owner.render(entry, () => {}, {generateColorMipmaps: []});
+  assert.equal(f.submissions.length, submitted + 1);
+  target.texture.generateMipmaps = true;
+  assert.equal(f.owner.capture(target), entry);
+  assert.equal(f.owner.allocatedBytes, allocated);
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('WebGL MRT keeps a base-only sibling independent of a generated secondary chain', async () => {
+  const f = webglMipFixture(), target = webglMipTarget();
+  Object.assign(target.texture, {generateMipmaps: false, minFilter: T.LinearFilter});
+  const entry = f.owner.capture(target);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [1, 4]);
+  f.owner.render(entry, () => {}, {generateColorMipmaps: [1]});
+  const passes = f.submissions[0][0].passes;
+  assert.equal(passes.length, 3);
+  assert.ok(passes.every(pass => pass.descriptor.colorAttachments[0].view.texture.format === 'rgba16float'));
+  const bindings = f.owner.bindingsFor(), primary = bindings.get(target.texture), secondary = bindings.get(target.textures[1]);
+  assert.deepEqual([primary.view.texture.mipLevelCount, secondary.view.texture.mipLevelCount], [1, 4]);
+  assert.equal(f.owner.allocatedBytes, 2 * (32 * 4 + 43 * 8));
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('WebGL array MRT generated mip chains keep every color and layer separate', async () => {
+  const f = webglMipFixture(), target = new T.WebGLArrayRenderTarget(8, 4, 3, {count: 2, depthBuffer: false});
+  target.textures[1] = target.texture.clone(); target.textures[1].isRenderTargetTexture = true;
+  target.textures[1].renderTarget = target; target.textures[1].type = T.HalfFloatType;
+  for (const texture of target.textures) Object.assign(texture,
+    {generateMipmaps: true, minFilter: T.NearestMipmapNearestFilter, magFilter: T.NearestFilter});
+  const entry = f.owner.capture(target);
+  f.owner.render(entry, frame => assert.deepEqual(frame.colorViews.map(view => view.descriptor.baseArrayLayer), [2, 2]),
+    {face: 2, generateColorMipmaps: [0, 1]});
+  const passes = f.submissions[0][0].passes;
+  assert.equal(passes.length, 18);
+  for (const pass of passes) {
+    const input = pass.group.entries[0].resource, output = pass.descriptor.colorAttachments[0].view;
+    assert.equal(input.texture, output.texture);
+    assert.equal(input.descriptor.baseArrayLayer, output.descriptor.baseArrayLayer);
+    assert.equal(input.descriptor.baseMipLevel + 1, output.descriptor.baseMipLevel);
+  }
+  const bindings = f.owner.bindingsFor();
+  for (const texture of target.textures) {
+    const binding = bindings.get(texture);
+    assert.equal(binding.view.descriptor.dimension, '2d-array');
+    assert.equal(f.submissions.at(-1)[0].passes.length, 12);
+  }
+  assert.equal(f.owner.allocatedBytes, 2 * 3 * 43 * 12);
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('WebGL MRT mip replicas enforce the shared budget without replacing existing storage', async () => {
+  const f = webglMipFixture({maxBytes: 2 * 43 * 12 - 1}), target = webglMipTarget();
+  const entry = f.owner.capture(target), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, () => {}, {generateColorMipmaps: [0, 1]});
+  const primary = bindings.get(target.texture), allocated = f.owner.allocatedBytes;
+  assert.throws(() => bindings.get(target.textures[1]), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.owner.allocatedBytes, allocated); assert.equal(f.textures.length, 3);
+  assert.equal(bindings.get(target.texture).view, primary.view);
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
+test('WebGL MRT currently requires recreation before adding an unallocated generated chain', async () => {
+  const f = webglMipFixture(), target = sampledTarget(), entry = f.owner.capture(target);
+  f.owner.render(entry, () => {});
+  target.textures[1].generateMipmaps = true;
+  assert.throws(() => f.owner.capture(target), {code: 'THREE_TARGET_MIP'});
+  assert.equal(f.textures.length, 2, 'a refused policy change does not erase rendered data');
+  target.dispose();
+  const next = f.owner.capture(target);
+  f.owner.render(next, () => {}, {generateColorMipmaps: [1]});
+  assert.deepEqual(next.shape.colorMipLevelCounts, [1, 5]);
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f.textures);
+});
+
 test('unresolved WebGL MSAA clears preserve sampled attachments until the next render', async () => {
   const f = sampledFixture(), target = sampledTarget(4), entry = f.owner.capture(target), bindings = f.owner.bindingsFor();
   f.owner.render(entry, frame => assert.equal(frame.resolveTargets.length, 2));

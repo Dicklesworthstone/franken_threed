@@ -524,7 +524,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
     if (entry.shape.cube) entry.cubeInitialized = true;
-    if (!flipY) entry.mrtInitialized = true;
+    if (!flipY || entry.shape.textures.length > 1) entry.mrtInitialized = true;
     if (entry.historyGroup) initializeHistory(entry.historyGroup);
     let held = true;
     return () => {
@@ -539,13 +539,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const frozen = entry?.alive && entry.shape.cube && !entry.shape.webglCube && (entry.cubeInitialized || entry.storage) &&
       entry.shape.texture === target.texture && entry.shape.sourceVersion === target.texture.version;
     const group = entry?.historyGroup ?? historyGroups.get(target);
-    const nativeMrt = !flipY && !nativePasses.has(target) && (target.textures?.length > 1 ||
+    const capturedMips = !nativePasses.has(target) && (target.textures?.length > 1 || !flipY &&
       !target.isCubeRenderTarget && !target.isWebGLCubeRenderTarget && !target.isRenderTarget3D &&
       !target.isWebGL3DRenderTarget && target.depth === 1 && !target.texture?.isDataArrayTexture && !target.texture?.isArrayTexture);
-    const frozenMrt = nativeMrt && entry?.alive && (entry.mrtInitialized || entry.storage) &&
+    const frozenMrt = capturedMips && entry?.alive && (entry.mrtInitialized || entry.storage) &&
       entry.shape.width === (target.width || 1) && entry.shape.height === (target.height || 1) &&
       entry.shape.sampleCount === (target.samples === 4 ? 4 : 1) && entry.shape.textures.length === target.textures.length &&
-      entry.shape.colors.every((color, index) => color.texture === target.textures[index] && color.sourceVersion === color.texture.version);
+      entry.shape.colors.every((color, index) => color.texture === target.textures[index] &&
+        (flipY || color.sourceVersion === color.texture.version));
     const base = group?.sourceShape ?? group?.shape;
     const frozenHistory = group?.mipInitialized && base.width === (target.width || 1) && base.height === (target.height || 1) &&
       base.sampleCount === (target.samples === 4 ? 4 : 1) && base.textures.length === target.textures.length &&
@@ -554,10 +555,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       colorMipProfiles: frozenHistory ? base.colors : frozenMrt ? entry.shape.colors : null});
     if (flipY && shape.textures.length > 1) for (const color of shape.colors)
       color.webglSampler ??= captureWebGLTargetSampler(color.texture, color.webglVolume);
-    // The source keeps each initialized image's mip allocation until its texture
-    // version changes. Per-render generation flags are separately captured by
-    // the facade; editing a flag must not replace previous rendered contents.
-    if (nativeMrt && shape.colors.some(color => color.mipLevelCount > 1))
+    // Native allocation follows the texture version; WebGL MRT allocation
+    // follows framebuffer setup. The facade captures per-render generation
+    // flags separately so editing a flag cannot replace rendered contents.
+    if (capturedMips && !flipY && shape.colors.some(color => color.mipLevelCount > 1))
       shape.key += `/mipVersions/${shape.colors.map(color => color.sourceVersion).join(',')}`;
     return shape;
   }
@@ -566,8 +567,15 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const shape = sourceShape(target);
     if (flipY && shape.colors.some(color => color.integerType !== null))
       fail('UNSUPPORTED', 'Integer targets currently require the native WebGPU renderer surface');
-    if (flipY && shape.textures.length > 1 && shape.colors.some(color => color.mipLevelCount > 1 || color.generateMipmaps || color.texture.mipmaps.length > 0))
-      fail('UNSUPPORTED', 'MRT mip pyramids currently require the native WebGPU renderer surface');
+    if (flipY && shape.textures.length > 1) {
+      // Pinned WebGL setup allocates MRT framebuffer attachments at level zero;
+      // authored framebuffer arrays do not use that path. Generated pyramids
+      // are per-color and run at the captured render/copy boundary instead.
+      if (shape.colors.some(color => color.authoredMipLevelCount > 0))
+        fail('UNSUPPORTED', 'WebGL MRT requires generated mip pyramids, not authored framebuffer arrays');
+      if (shape.colors.some(color => color.texture.generateMipmaps && color.mipLevelCount < color.maximumMipLevels))
+        fail('MIP', 'Enable WebGL MRT mip generation before initializing that attachment, or recreate the target');
+    }
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
       const owner = ownedColorTargets.get(texture);
       if (owner && owner !== target && owner.textures.includes(texture))
@@ -602,12 +610,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry && (!sameShape(entry.shape, shape) || entry.depthEntry && !entry.depthEntry.alive)) { retire(entry); entry = null; }
     if (entry) {
       if (initialize && shape.cube) entry.cubeInitialized = true;
-      if (initialize && !flipY) entry.mrtInitialized = true;
+      if (initialize && (!flipY || shape.textures.length > 1)) entry.mrtInitialized = true;
       return entry;
     }
     entry = createEntry(target, shape);
     entry.cubeInitialized = initialize && shape.cube;
-    entry.mrtInitialized = initialize && !flipY;
+    entry.mrtInitialized = initialize && (!flipY || shape.textures.length > 1);
     entries.set(target, entry);
     return entry;
   }
@@ -789,8 +797,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (flipY && entry.shape.depthTexture && !depthEntry)
       entry.depthSetupSampler ??= captureDepthSampler(entry.shape.depthTexture);
     const {width, height, format, colorFormats, colorMipLevelCounts, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
-    const nativeMrt = !flipY && (colorFormats.length > 1 || !cube && !array && !volume) || !!group;
-    const mipOptions = nativeMrt ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
+    const capturedMips = colorFormats.length > 1 || !flipY && !cube && !array && !volume || !!group;
+    const mipOptions = capturedMips ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
     const depthOptions = depthEntry ? entry.shape.depthAttachment
       ? {depthSource: depthEntry.storage} : {depthFormat: null, sampleDepth: false} : {};
     if (group) {
@@ -802,7 +810,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       entry.storage = group.storage.selectColorSlots(entry.colorSlots);
       initializeHistory(group);
     } else {
-      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube || nativeMrt ? false : generateMipmaps, mipLevelCount, ...mipOptions,
+      entry.storage = gpuTargets.createGpuRenderTarget(device, {width, height, format, colorFormats, depthFormat, sampleCount, maxBytes, generateMipmaps: cube || capturedMips ? false : generateMipmaps, mipLevelCount, ...mipOptions,
         sampleDepth: entry.shape.depthTexture !== null, copyDestination: true, cube, ...depthOptions, ...(array ? {arrayLayers: layers, depthArray} : volume ? {volumeDepth: layers, depthArray} : {})});
       entry.charged += entry.shape.bytes; allocatedBytes += entry.shape.bytes;
     }

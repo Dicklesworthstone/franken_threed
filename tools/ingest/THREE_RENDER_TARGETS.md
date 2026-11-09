@@ -485,6 +485,33 @@ General scenes, large meshes and callback-bearing roots keep the existing
 live-source path. This is **not** a complete per-call scene-state snapshot. Shader
 compiler and renderer admission restrictions also remain in force.
 
+## WebGL MRT generated mipmaps
+
+WebGL-authored 2D and array MRT targets can now generate independent mip
+pyramids for each color attachment. Mixed formats and base-only siblings keep
+their own allocation sizes; every array mip retains all layers. Rendering
+captures each attachment's generation flag, resolves any four-sample color,
+then generates only the requested chains. Manual clears preserve the existing
+resolved and generated images. Sampling borrows the existing GPU orientation
+replicas with the full selected color pyramid, original precision and setup
+sampler; warm sampling reuses those images.
+
+For this profile, configure generation before an attachment is first initialized. An initialized
+chain can be disabled and re-enabled without replacing its rendered contents,
+including across `needsUpdate` and sampler edits. Enabling generation on an
+attachment initialized with only a base level currently requires disposing and
+recreating the target in F3D; the pinned WebGL source can grow that chain in place.
+Authored WebGL MRT framebuffer arrays remain unsupported.
+The existing shared budget charges every color level, multisample base and
+sampling replica, and queued leases retain old generations through retirement.
+
+The focused MRT, facade and mip-owner suites pass 101 Node tests, including nine
+new cases using pinned r186 source classes and the existing recording devices.
+They verify per-color/layer descriptors, generation and resolve order, captured
+flags, immutable setup samplers, exact byte charges, budget failures and
+disposal. They do not execute the mip shaders or establish fresh rasterized
+parity or hardware performance; browser execution was unavailable in this host.
+
 ## Native array MRT mipmaps
 
 Native 2D-array targets now support multiple color attachments with independent
