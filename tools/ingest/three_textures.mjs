@@ -600,9 +600,9 @@ export function createGpuThreeTextures(device,{
         if(list.length!==1)fail('OPTIONS','A GPU seed requires exactly one sampled destination');
         seed=check(copyFrom);
         const d=list[0].d,s=seed.d;
-        if(d.viewDimension!=='2d'||s.viewDimension!=='2d'||d.levels!==s.levels||
-          d.width!==s.width||d.height!==s.height||d.format!==s.format)
-          fail('COPY','Sampled GPU seeds require matching complete 2D mip storage');
+        if(!['2d','2d-array','3d'].includes(d.viewDimension)||d.viewDimension!==s.viewDimension||
+          d.levels!==s.levels||d.layers!==s.layers||d.width!==s.width||d.height!==s.height||d.format!==s.format)
+          fail('COPY','Sampled GPU seeds require matching complete mip and layer storage');
         if(d.source===s.source&&d.key===s.key)fail('COPY','A sampled GPU seed requires independent storage');
       }else if(copyOnly)fail('OPTIONS','A copy-only initialization requires a GPU seed');
       validatePlans(list);
@@ -632,7 +632,8 @@ export function createGpuThreeTextures(device,{
           const encoder=native(()=>device.createCommandEncoder({label:label+'/preserve-copy'}));
           for(let level=0;level<d.levels;level++)native(()=>encoder.copyTextureToTexture(
             {texture:seed.r.resource.texture,mipLevel:level,origin:[0,0,0]},
-            {texture:r.resource.texture,mipLevel:level,origin:[0,0,0]},[Math.max(1,d.width>>level),Math.max(1,d.height>>level),1]));
+            {texture:r.resource.texture,mipLevel:level,origin:[0,0,0]},
+            [Math.max(1,d.width>>level),Math.max(1,d.height>>level),d.volume?Math.max(1,d.layers>>level):d.layers]));
           native(()=>device.queue.submit([encoder.finish()]));
           if(copyOnly){r.resource.sourceVersion=t.source.version;r.version=t.version;}
         }
@@ -661,8 +662,10 @@ export function createGpuThreeTextures(device,{
     writeTexture(t,run,{validation=null,generateMipmaps=false}={}){
       live();if(busy)fail('REENTRANT','Cannot write during a texture operation');
       if(typeof run!=='function')fail('OPTIONS','Expected a synchronous native texture write');
-      const {r,d}=check(t);if(d.viewDimension!=='2d')
-        fail('COPY','Sampled writes require 2D storage');
+      const {r,d}=check(t);if(!['2d','2d-array','3d'].includes(d.viewDimension))
+        fail('COPY','Sampled writes require 2D, array or volume storage');
+      if(d.volume&&generateMipmaps)
+        fail('COPY','Ordinary volume copies do not generate mipmaps in the pinned native backend');
       if(generateMipmaps&&d.levels>1&&(d.integral||d.sampleType==='unfilterable-float'))
         fail('COPY','Generated sampled mips require filterable floating-point samples');
       busy=true;

@@ -493,6 +493,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     };
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
       partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
+      partialLayers: updates && layerValues.length ? layerValues : null,
       pixels, refs: 0, alive: true, binding: null};
   }
   function captureBinding(binding, {copyDestination = false} = {}) {
@@ -545,11 +546,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       if (privateDestination) {
         replacement.privateDestination = true;
         replacement.texture.source = {...replacement.texture.source};
-        if (replacement.partialRanges && record?.privateDestination && record.key === replacement.key && record.source === replacement.source) {
+        if ((replacement.partialRanges || replacement.partialLayers) && record?.privateDestination &&
+            record.key === replacement.key && record.source === replacement.source) {
           // Preserve GPU patches outside the captured host ranges. The old
           // residency remains pinned until this version has been initialized.
           replacement.copyBase = record; record.refs++;
-          replacement.texture.updateRanges = replacement.partialRanges.map(range => ({...range}));
+          if (replacement.partialRanges) replacement.texture.updateRanges = replacement.partialRanges.map(range => ({...range}));
+          if (replacement.partialLayers) replacement.texture.layerUpdates = new Set(replacement.partialLayers);
         }
       }
       records.add(replacement);
@@ -574,8 +577,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function captureCopyDestination(texture, level = 0) {
     const shape = describe({texture, isSampledTexture: true}, {copyDestination: true});
     if (!Number.isSafeInteger(level) || level < 0 || level >= shape.levels ||
-        shape.viewDimension !== '2d' || shape.blockUploads || shape.nativeMedia)
-      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D mip level');
+        !['2d', '2d-array', '3d'].includes(shape.viewDimension) || shape.blockUploads || shape.nativeMedia)
+      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D, array or volume mip level');
+    // The pinned native mip generator builds 2D layer views; it has no 3D
+    // shader entry. Keep ordinary volume copies on their source-valid base
+    // allocation instead of treating our general pool's reducer as that API.
+    if (shape.volume && (texture.generateMipmaps === true || shape.levels !== 1))
+      fail('COPY', 'Ordinary volume copy destinations require a base-only, non-generated allocation');
     // This policy belongs to the copy call, not the residency descriptor:
     // r186 reads generateMipmaps even when updateTexture kept an older upload.
     const generateMipmaps = level === 0 && texture.generateMipmaps === true;
