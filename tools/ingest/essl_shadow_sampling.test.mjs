@@ -112,14 +112,14 @@ test('projected shadow overloads require ES3 2D depth comparisons and complete t
       `precision highp float;uniform sampler2DShadow image;void main(){gl_FragColor=vec4(${name}(image,vec4(.5)));}`), /requires ESSL 3.00/);
 });
 
-test('projected shadow bias, explicit gradients and explicit LOD never become an implicit or level-zero approximation', () => {
+test('projected shadow bias, explicit gradients and nonzero explicit LOD never become an implicit or level-zero approximation', () => {
   for (const expression of ['textureProj(image,vec4(.5),1.)', 'textureProjOffset(image,vec4(.5),ivec2(1),1.)'])
     assert.throws(() => compile(expression), /with bias is not supported/);
-  for (const expression of ['textureProjLod(image,vec4(.5),0.)',
+  for (const expression of ['textureProjLod(image,vec4(.5),.5)',
     'textureProjLodOffset(image,vec4(.5),1.,ivec2(1))',
     'textureProjGrad(image,vec4(.5),vec2(.1),vec2(.2))',
     'textureProjGradOffset(image,vec4(.5),vec2(.1),vec2(.2),ivec2(1))'])
-    assert.throws(() => compile(expression), /explicit LOD or gradients/);
+    assert.throws(() => compile(expression), /explicit LOD or gradients|proven constant zero/);
   for (const expression of ['textureProj(image,vec4(.5),1.)', 'textureProjOffset(image,vec4(.5),ivec2(1),1.)']) {
     const source = vertex.replace('void main()', 'uniform highp sampler2DShadow image;void main()')
       .replace('vec4(position,1.)', `vec4(position*${expression},1.)`);
@@ -127,12 +127,12 @@ test('projected shadow bias, explicit gradients and explicit LOD never become an
   }
 });
 
-test('ordinary shadow bias and explicit LOD or gradients never silently discard source arguments', () => {
+test('ordinary shadow bias and nonzero explicit LOD or gradients never silently discard source arguments', () => {
   assert.throws(()=>compile('texture(image,vec3(.5),1.)'),/with bias is not supported/);
-  for(const expression of ['textureLod(image,vec3(.5),0.)','textureLod(image,vec3(.5),2.)',
-    'textureLodOffset(image,vec3(.5),0.,ivec2(1))','textureGrad(image,vec3(.5),vec2(.1),vec2(.2))',
+  for(const expression of ['textureLod(image,vec3(.5),.5)','textureLod(image,vec3(.5),2.)',
+    'textureLodOffset(image,vec3(.5),.5,ivec2(1))','textureGrad(image,vec3(.5),vec2(.1),vec2(.2))',
     'textureGradOffset(image,vec3(.5),vec2(.1),vec2(.2),ivec2(1))'])
-    assert.throws(()=>compile(expression),/explicit LOD or gradients/);
+    assert.throws(()=>compile(expression),/explicit LOD or gradients|proven constant zero/);
   for(const expression of ['texture(image)','texture(image,vec2(.5))','texture(image,ivec3(1))'])
     assert.throws(()=>compile(expression),/needs vec3 coordinates/);
 });

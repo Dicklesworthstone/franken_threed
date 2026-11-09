@@ -48,19 +48,19 @@ async function capture(mode) {
     const result = await page.evaluate(async mode => {
       const T = await import('/upstream/three.js/build/three.module.js');
       const Renderer = mode === 'source' ? T.WebGLRenderer : (await import('/renderer.mjs')).createWebGLRendererClass(T);
-      const renderer = new Renderer({antialias: false}), errors = [], frames = [];
+      const renderer = new Renderer({antialias: false}), errors = [], frames = [], diagnostics = [];
       const width = 32, height = 16, output = new T.WebGLRenderTarget(width, height);
       const camera = new T.OrthographicCamera(-1, 1, 1, -1, 0, 2), geometry = new T.PlaneGeometry(2, 2);
       const vertexBody = 'out vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}';
       const vertex = 'precision highp float;in vec3 position;in vec2 uv;' + vertexBody;
       const mesh = new T.Mesh(geometry); mesh.frustumCulled = false; mesh.material.dispose();
-      const draw = async (name, material) => {
+      const draw = async (name, material, destination = frames) => {
         mesh.material = material; renderer.render(mesh, camera);
         if (mode === 'candidate') await renderer.waitForGPU();
         else {const error = renderer.getContext().getError(); if (error) errors.push(`${name}: GL error ${error}`);}
         const pixels = new Uint8Array(width * height * 4);
         await renderer.readRenderTargetPixelsAsync(output, 0, 0, width, height, pixels);
-        frames.push({name, pixels: Array.from(pixels)});
+        destination.push({name, pixels: Array.from(pixels)});
       };
       const material = (texture, shader, customVertex = vertex, legacy = false) => new (legacy ? T.ShaderMaterial : T.RawShaderMaterial)({
         glslVersion: legacy ? null : T.GLSL3, vertexShader: customVertex, fragmentShader: shader,
@@ -177,7 +177,61 @@ async function capture(mode) {
             try {await draw(name, value);} finally {value.dispose();}
           }
         } finally {renderer.setRenderTarget(output); producer.dispose(); shadow.dispose();}
-        return {frames, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
+        // Explicit base-level comparison retains source magnification filtering,
+        // even when minFilter differs. Interior Dref keeps this exact oracle
+        // independent of the source driver endpoint discrepancy recorded below.
+        for (const [domain, type] of [['fixed', T.UnsignedIntType], ['float', T.FloatType]]) {
+          for (const [filter, minFilter, magFilter] of [
+            ['NN', T.NearestFilter, T.NearestFilter], ['LN', T.LinearFilter, T.NearestFilter],
+            ['NL', T.NearestFilter, T.LinearFilter], ['LL', T.LinearFilter, T.LinearFilter],
+          ]) {
+            const depth = new T.DepthTexture(8,8,type); depth.compareFunction=T.LessEqualCompare;
+            depth.minFilter=minFilter; depth.magFilter=magFilter;
+            const shadow=new T.WebGLRenderTarget(8,8,{depthTexture:depth});
+            const producer=new T.RawShaderMaterial({glslVersion:T.GLSL3,vertexShader:vertex,
+              fragmentShader:'precision highp float;in vec2 vUv;out vec4 color;void main(){'+
+                'gl_FragDepth=vUv.x<.25?0.:(vUv.x>.75?1.:(.25+vUv.y*.5));color=vec4(0.);}',blending:T.NoBlending});
+            const forms=[
+              ['lod','textureLod(item,p.xyz/p.w,zero)'],
+              ['lod-offset','textureLodOffset(item,p.xyz/p.w,zero,delta)'],
+              ['proj-lod','textureProjLod(item,p,zero)'],
+              ['proj-lod-offset','textureProjLodOffset(item,p,zero,delta)'],
+            ];
+            try {
+              mesh.material=producer;renderer.setRenderTarget(shadow);renderer.render(mesh,camera);
+              if(mode==='candidate')await renderer.waitForGPU();renderer.setRenderTarget(output);
+              for(const [name,expression] of forms) {
+                const declarations='uniform highp sampler2DShadow image;int calls=0;'+
+                  'vec4 point(vec2 uv){calls++;float q=1.25+uv.y;return vec4((uv+vec2(.013,-.019))*q,(.2+uv.x*.8)*q,q);}'+
+                  'float tap(highp sampler2DShadow item,vec4 p){const float zero=-(0.);const ivec2 delta=ivec2(1,-1);return '+expression+';}';
+                const fs='precision highp float;precision highp int;in vec2 vUv;out vec4 color;'+declarations+
+                  'void main(){float visibility;if(vUv.x<.43)visibility=tap(image,point(vUv));else visibility=1.-tap(image,point(vUv));'+
+                  'color=vec4(visibility,float(calls),0.,1.);}';
+                const value=material(depth,fs);
+                try{await draw('shadow-'+domain+'-'+filter+'-'+name,value);}finally{value.dispose();}
+                const vs='precision highp float;precision highp int;in vec3 position;in vec2 uv;flat out vec2 sampleColor;'+declarations+
+                  'void main(){float visibility=tap(image,point(vec2(.36,.61)));sampleColor=vec2(visibility,float(calls));gl_Position=vec4(position.xy,0.,1.);}';
+                const vertexValue=material(depth,'precision highp float;flat in vec2 sampleColor;out vec4 color;void main(){color=vec4(sampleColor,0.,1.);}',vs);
+                try{await draw('shadow-'+domain+'-'+filter+'-vertex-'+name,vertexValue);}finally{vertexValue.dispose();}
+              }
+              if(domain==='fixed'&&filter==='NN') {
+                // ES 3.0 section 3.8.15 requires fixed-point Dref clamping. Some
+                // source drivers disagree at Dref > 1 against stored depth 1.
+                // Preserve both readbacks, and check that the new explicit path
+                // agrees with the already supported implicit path on each API.
+                for(const [name,expression] of [
+                  ['implicit','texture(image,vec3(.875,.5,1.25))'],
+                  ['explicit','textureLod(image,vec3(.875,.5,1.25),0.)'],
+                ]) {
+                  const value=material(depth,'precision highp float;out vec4 color;uniform highp sampler2DShadow image;'+
+                    'void main(){color=vec4('+expression+',0.,0.,1.);}');
+                  try{await draw('fixed-depth-endpoint-'+name,value,diagnostics);}finally{value.dispose();}
+                }
+              }
+            }finally{renderer.setRenderTarget(output);producer.dispose();shadow.dispose();}
+          }
+        }
+        return {frames, diagnostics, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
       } finally {output.dispose(); geometry.dispose(); renderer.dispose();}
     }, mode);
     assert.deepEqual(browserErrors, [], `${mode} browser errors`); assert.deepEqual(result.errors, [], `${mode} GPU errors`);
@@ -197,6 +251,20 @@ try {
   assert.deepEqual(frame('shadow-proj-offset'), frame('shadow-divided-offset'), 'source offset applies after shadow projection');
   assert.notDeepEqual(frame('shadow-proj'), frame('shadow-proj-offset'), 'shadow offsets select different source depth texels');
   assert.notDeepEqual(frame('shadow-vertex-proj'), frame('shadow-vertex-proj-offset'), 'vertex comparison uses the source base depth level');
+  for(const domain of ['fixed','float'])for(const name of ['lod','lod-offset','proj-lod','proj-lod-offset']) {
+    assert.deepEqual(frame('shadow-'+domain+'-NN-'+name),frame('shadow-'+domain+'-LN-'+name),'explicit level zero uses the source magnification filter');
+    assert.deepEqual(frame('shadow-'+domain+'-NL-'+name),frame('shadow-'+domain+'-LL-'+name),'changing only minification leaves level-zero output unchanged');
+  }
+  assert.notDeepEqual(frame('shadow-fixed-NN-lod'),frame('shadow-fixed-NL-lod'),'independent magnification filters visibly differ');
+  assert.notDeepEqual(frame('shadow-fixed-NN-vertex-lod'),frame('shadow-fixed-NN-vertex-lod-offset'),'vertex offsets visibly select another comparison texel');
+  for(const capture of [source,candidate]) assert.deepEqual(capture.diagnostics[0].pixels,capture.diagnostics[1].pixels,
+    'explicit base-level comparison preserves the existing implicit endpoint behavior within each renderer');
+  assert.ok(candidate.diagnostics[1].pixels.every((value,index)=>value===([255,0,0,255][index%4])),
+    'fixed-depth endpoint obeys the established ES Dref clamp requirement');
+  const endpointDiagnostic={reference:1.25,storedDepth:1,sourceImplicit:source.diagnostics[0].pixels[0],
+    sourceExplicit:source.diagnostics[1].pixels[0],candidateImplicit:candidate.diagnostics[0].pixels[0],
+    candidateExplicit:candidate.diagnostics[1].pixels[0],differingBytes:candidate.diagnostics[1].pixels.reduce(
+      (count,value,index)=>count+Number(value!==source.diagnostics[1].pixels[index]),0)};
   for (const [index, expected] of source.frames.entries()) {
     const actual = candidate.frames[index]; assert.equal(actual.name, expected.name);
     const difference = actual.pixels.findIndex((value, offset) => value !== expected.pixels[offset]);
@@ -204,5 +272,5 @@ try {
   }
   console.log(JSON.stringify({case: 'program_texture_sampling', status: 'pass', checkpoints: source.frames.map(frame => frame.name),
     rgbaBytes: source.frames.reduce((sum, frame) => sum + frame.pixels.length, 0), route: candidate.route,
-    nativeDrawCalls: candidate.draws, gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
+    nativeDrawCalls: candidate.draws, endpointDiagnostic, gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
 } finally {await new Promise(resolve => server.close(resolve));}

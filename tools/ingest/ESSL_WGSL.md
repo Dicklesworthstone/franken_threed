@@ -71,6 +71,15 @@ admitted. The source rules are in the
   `[0, 1]`; floating depth leaves it unchanged, including when both use an
   oriented `depth32float` sampling image. The bound image owner supplies the
   flag, so a later public texture edit cannot change an accepted image's domain.
+- ESSL 3.00 `sampler2DShadow` also supports `textureLod`,
+  `textureLodOffset`, `textureProjLod` and `textureProjLodOffset` in
+  vertex and fragment stages when the float LOD is proven constant zero.
+  The shared lowering uses `textureSampleCompareLevel`, preserving the
+  comparison sampler, independent min/mag filters, per-image reference domain,
+  single coordinate evaluation and projected reference division. Signed zero,
+  scalar float constructors and safe constant aliases are admitted; nonzero
+  or runtime levels, arbitrary arithmetic and unsigned-derived values are
+  refused. Offsets retain the existing constant integer-expression checks.
 - Signed and unsigned integer 2D, 2D-array and 3D samplers implement nearest
   `texture`, `textureLod` and `textureGrad`, including their constant-offset
   variants, through typed `textureLoad`, preserving all 32 bits. Integer 2D/3D
@@ -167,21 +176,37 @@ admitted. The source rules are in the
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
 integer cube sampling and integer bias outside the proved portable range, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
-conversions). Shadow sampling with bias,
-explicit LOD or explicit gradients remains unsupported; those forms are
-not approximated with implicit sampling or an arbitrary level.
+conversions). Shadow sampling with bias, explicit gradients, or LOD outside the
+proved constant-zero 2D profile remains unsupported; those forms are not
+approximated with implicit sampling or an arbitrary level.
 
 ## Evidence
 
-- `essl_shadow_sampling.test.mjs` covers projected comparison signatures,
-  projective depth-reference division, constant offsets, single evaluation,
-  helper/array propagation, mixed integer/depth metadata and actual source
-  ShaderMaterial program preparation. `three_program_depth_sampling.test.mjs`
-  exercises the public renderer through real target ownership and comparison
-  bindings. The six new shadow checkpoints in `program_texture_sampling.mjs`
-  are ready for browser comparison, but were not executed in this session;
-  Chromium could not launch in the available environment. Earlier pixel counts
-  below describe the earlier cases, not these new comparison paths.
+- `essl_shadow_sampling.test.mjs` and `essl_shadow_lod.test.mjs` cover
+  comparison signatures, zero-LOD proof, projective reference division,
+  constant offsets, single evaluation, helper/array propagation, mixed
+  integer/depth metadata and public ShaderMaterial preparation. The focused
+  compiler suites passed **29 tests**. `three_program_depth_sampling.test.mjs`
+  separately exercises real target ownership and comparison bindings.
+- `program_texture_sampling.mjs` passed **112 exact browser checkpoints**
+  (**229,376 RGBA bytes**), including 48 existing cases and 64 new explicit-LOD
+  cases: four forms, both shader stages, fixed/floating depth and four independent
+  min/mag filter pairs. The new cases use interior comparison references;
+  source assertions establish visible filtering and vertex offset effects.
+  The run used pinned r186 `148ef33ecb6d2502ff796d4554abd1549c95d519`,
+  Chromium 153.0.8010.0/SwiftShader and the `general-webgpu` route, with zero
+  GPU or browser errors. This also executes the six earlier projected-shadow
+  cases whose previous browser launch was blocked.
+- A **separate endpoint diagnostic is not exact** on that source driver:
+  with fixed-point stored depth 1 and reference 1.25, source implicit and
+  explicit samples both return 0; candidate implicit and explicit samples
+  both return 255 (512 differing red bytes). The existing candidate clamp is
+  retained, consistent with [OpenGL ES 3.0 §3.8.15](https://registry.khronos.org/OpenGL/specs/es/3.0/es_spec_3.0.pdf).
+  The runner reports the discrepancy and checks agreement between implicit and
+  explicit operations within each renderer; it does not include these bytes in
+  the exact claim or relax the ordinary pixel comparisons. This pre-existing
+  endpoint difference remains a compatibility gap. The new lowering follows
+  [WGSL base-level comparison semantics](https://www.w3.org/TR/WGSL/#texturesamplecomparelevel).
 
 `essl_geometric.test.mjs` covers the typed scalar/vector boundary, stage-local
 helper reuse, constant normalization and one evaluation of helper arguments.

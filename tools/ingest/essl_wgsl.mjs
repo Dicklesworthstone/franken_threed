@@ -1647,6 +1647,8 @@ class Unit {
     const vec4 = st.s === 'float' ? V('float', 4) : V(st.s, 4);
     const coordNeed = {'2d': 2, '3d': 3, 'cube': 3, '2d-array': 3}[st.dim] + (st.shadow ? 1 : 0);
     const isInt = st.s !== 'float';
+    if (st.shadow && ['textureLod', 'textureLodOffset', 'textureProjLod', 'textureProjLodOffset'].includes(name))
+      return this.shadowLodTextureCall(name, s, rest, ctx, line, expressions.slice(1));
     if (st.shadow && name.startsWith('textureProj'))
       return this.projectedShadowTextureCall(name, s, rest, ctx, line, expressions.slice(1));
     if (st.shadow && ['textureLod', 'textureLodOffset', 'textureGrad', 'textureGradOffset'].includes(name))
@@ -1730,6 +1732,30 @@ class Unit {
   // replica uses depth32float; helper parameters retain that per-image flag.
   depthReference(sampler, reference) {
     return `select(${reference}, clamp(${reference}, 0.0, 1.0), ${sampler.depthReferenceClamp} != 0u)`;
+  }
+  /** ES 3.00's four explicit-LOD comparison overloads are 2D-only.
+   * WGSL comparison levels have no LOD operand and always sample level zero.
+   * Admit only a closed zero expression; never discard a dynamic/nonzero LOD.
+   * Reuse the narrow numeric proof, not the integer constant evaluator. */
+  shadowLodTextureCall(name, sampler, args, ctx, line, expressions) {
+    if (this.version !== 300) essError('Explicit shadow LOD requires ESSL 3.00', line);
+    if (sampler.type.dim !== '2d') essError(`${name} needs a sampler2DShadow`, line);
+    const projected = name.includes('Proj'), offset = name.endsWith('Offset');
+    if (args.length !== (offset ? 3 : 2)) essError(`${name} expects ${offset ? 4 : 3} arguments`, line);
+    if (!same(args[0].t, V('float', projected ? 4 : 3)))
+      essError(`${name} needs vec${projected ? 4 : 3} comparison coordinates`, line);
+    if (!same(args[1].t, FLOAT)) essError(`${name} needs a float LOD`, line);
+    const range = this.textureBiasRange(expressions[1], ctx.scope);
+    if (!range?.constant || range.min !== 0 || range.max !== 0)
+      essError('Explicit shadow LOD must be a proven constant zero; other levels need separate comparison lowering', line);
+    const point = this.capture(args[0], ctx);
+    let coordinates = point.c;
+    if (projected) {
+      coordinates = this.tmp();
+      ctx.pre.push(`let ${coordinates} = ${point.c}.xyz / ${point.c}.w;`);
+    }
+    const delta = offset ? this.textureOffset(expressions[2], args[2], 2, ctx, line) : null;
+    return {c: `textureSampleCompareLevel(${sampler.tex}, ${sampler.smp}, ${coordinates}.xy, ${this.depthReference(sampler, `${coordinates}.z`)}${delta ? `, ${delta}` : ''})`, t: FLOAT};
   }
   /** ES 3.00 section 8.8 projects both the sample coordinate and Dref. The
    * native comparison sampler keeps source filtering and comparison semantics;
