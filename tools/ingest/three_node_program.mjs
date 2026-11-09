@@ -1236,6 +1236,71 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
+  const morphAccessorFields = new Map([
+    [Object.getOwnPropertyDescriptor(three.Material.prototype, 'alphaTest').get, '_alphaTest'],
+    ...['anisotropy', 'clearcoat', 'iridescence', 'dispersion', 'retroreflectivity', 'sheen', 'transmission'].map(name =>
+      [Object.getOwnPropertyDescriptor(three.MeshPhysicalMaterial.prototype, name).get, `_${name}`])]);
+  const keyedMorphAccessors = new Set([
+    Object.getOwnPropertyDescriptor(three.NodeMaterial.prototype, 'type')?.get,
+    ...['useClearcoat', 'useIridescence', 'useSheen', 'useAnisotropy', 'useTransmission', 'useDispersion', 'useRetroreflection'].map(name =>
+      Object.getOwnPropertyDescriptor(three.MeshPhysicalNodeMaterial.prototype, name)?.get),
+    Object.getOwnPropertyDescriptor(three.MeshSSSNodeMaterial?.prototype ?? {}, 'useSSS')?.get,
+  ].filter(Boolean));
+  function morphConstructionKey(material, geometry) {
+    // Supplement keyOf with the pinned RenderObject's material-property and
+    // morph-identity dimensions. Read descriptors, not application getters;
+    // unproven values retain the existing reconstruction path.
+    const unknown = Symbol(), descriptors = Object.getOwnPropertyDescriptors(material), values = [];
+    const data = (object, name) => {
+      for (let source = object; source; source = Object.getPrototypeOf(source)) {
+        const descriptor = Object.getOwnPropertyDescriptor(source, name);
+        if (descriptor) return Object.hasOwn(descriptor, 'value') ? descriptor.value : unknown;
+      }
+      return undefined;
+    };
+    const encode = (name, value) => {
+      if (value === unknown) return null;
+      if (typeof value === 'number') return name === 'side' ? String(value) : value !== 0 ? '1' : '0';
+      if (typeof value === 'function') {
+        if (data(value, 'toString') !== functionToString || data(value, Symbol.toPrimitive) != null) return null;
+        const text = functionToString.call(value); return /\{\s*\[native code\]\s*\}$/.test(text) ? null : text;
+      }
+      if (value === null || typeof value !== 'object') return String(value);
+      const texture = data(value, 'isTexture'); if (texture === unknown) return null;
+      if (!texture) return '{}';
+      let key = '{';
+      for (const field of ['mapping', ...(renderer.backend?.isWebGPUBackend === true ? ['magFilter', 'minFilter', 'wrapS', 'wrapT', 'wrapR'] : [])]) {
+        const component = data(value, field);
+        if (component === unknown || component !== null && ['object', 'function', 'symbol'].includes(typeof component)) return null;
+        key += component;
+      }
+      return key + '}';
+    };
+    const append = (name, value) => { const key = encode(name, value); if (key === null) return false; values.push(key); return true; };
+    if (!(material instanceof three.NodeMaterial) && !append('onBeforeCompile', data(material, 'onBeforeCompile'))) return null;
+    for (const [name, descriptor] of Object.entries(descriptors)) {
+      if (!descriptor.enumerable || /^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/.test(name)) continue;
+      if (!Object.hasOwn(descriptor, 'value') || !append(name, descriptor.value)) return null;
+    }
+    for (let prototype = Object.getPrototypeOf(material); prototype; prototype = Object.getPrototypeOf(prototype))
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(prototype))) if (descriptor.get) {
+        if (/^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/.test(name)) continue;
+        const field = morphAccessorFields.get(descriptor.get);
+        if (field) { if (!append(name, data(material, field))) return null; }
+        else if (!keyedMorphAccessors.has(descriptor.get)) return null;
+      }
+    const morphs = data(geometry, 'morphAttributes');
+    if (morphs === unknown || !morphs || typeof morphs !== 'object') return null;
+    for (const name of Object.keys(morphs).sort()) {
+      const targets = data(morphs, name); if (!Array.isArray(targets)) return null;
+      values.push(`morph-${name}`);
+      for (let index = 0; index < targets.length; index++) {
+        const attribute = data(targets, index);
+        const id = data(attribute, 'id'); if (!Number.isSafeInteger(id)) return null; values.push(id);
+      }
+    }
+    return JSON.stringify(values);
+  }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
@@ -1339,7 +1404,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // its shader key is unchanged. Rebuilding a morph graph would repack target
     // arrays after geometry disposal, even though that source graph retains its
     // previous texture. All graph, layout and sampler checks still participate.
-    const version = morphSignature !== null && previousState ? previousState.materialVersion : preparedMaterial.version;
+    let morphKey = morphSignature === null ? null : previousState?.materialVersion === material.version
+      ? previousState.morphConstructionKey : morphConstructionKey(material, object.geometry);
+    const version = morphSignature !== null && previousState && morphKey !== null && morphKey === previousState.morphConstructionKey
+      ? previousState.materialVersion : preparedMaterial.version;
     const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side || version !== preparedMaterial.version)
       ? keyOf(preparedMaterial, object, context, lights, environment,
         instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side, version) : key;
@@ -1356,6 +1424,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
       return previous.descriptor;
     }
+    // A different graph/context can rebuild without a material version bump.
+    // That construction acknowledges the current source properties as well.
+    if (morphSignature !== null && previousState?.materialVersion === material.version)
+      morphKey = morphConstructionKey(material, object.geometry);
     if (entries.size - (previous ? 1 : 0) >= maxPrograms) fail('LIMIT', 'Native node program capacity exceeded');
     // setup() itself may filter a PMREM source. An existing stale atlas must
     // reach the first draw's ordered preparation boundary through its cached
@@ -1624,7 +1696,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       wideLineSignature: wideLineSignature(preparedMaterial),
       volumeSignature: volumeKey,
       sssSignature: sssKey, geometrySignature: geometryKey, backdropSignature: backdropKey,
-      instanceSignature, batchSignature, skinSignature, morphSignature, pipelineSignature, rendererContextSignature,
+      instanceSignature, batchSignature, skinSignature, morphSignature, morphConstructionKey: morphKey, pipelineSignature, rendererContextSignature,
       fogSignature: fogKey, mrtSignature: mrtKey,
       clippingSignature: clippingKey, alphaHash, alphaToCoverage: material.alphaToCoverage, wideLineCoverage: wideLineCoverage(material),
       clippingSamples: material.alphaToCoverage && renderer.currentSamples > 1, pmremNodes, pmremSignature: pmremKey,

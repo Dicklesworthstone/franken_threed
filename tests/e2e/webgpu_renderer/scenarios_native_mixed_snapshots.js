@@ -48,10 +48,12 @@ function ordinaryInstances(T, renderer, capacity) {
   return result;
 }
 
-function ordinaryDeformation(T, renderer, skinned) {
+function ordinaryDeformation(T, renderer, skinned, materialKeys = false) {
   const result = stage(T, renderer), {scene} = result;
   const geometry = new T.PlaneGeometry(1.5, 1.7, 4, 6), position = geometry.attributes.position;
-  const material = new T.MeshBasicMaterial({color: 0x59a6cf}), initial = position.array.slice();
+  const material = materialKeys ? new T.MeshStandardMaterial({color: 0x59a6cf, roughness: 0}) : new T.MeshBasicMaterial({color: 0x59a6cf});
+  if (materialKeys) scene.add(new T.AmbientLight(0xffffff, 1));
+  const initial = position.array.slice();
   geometry.morphTargetsRelative = !skinned;
   geometry.morphAttributes.position = [0, 1].map(target => new T.Float32BufferAttribute(Array.from(initial, (value, i) =>
     (skinned ? value : 0) + (i % 3 === target ? Math.sin(initial[i - i % 3 + 1] * 2.4) * .35 : 0)), 3));
@@ -79,19 +81,28 @@ function ordinaryDeformation(T, renderer, skinned) {
     targets.forEach((attribute, i) => attribute.array.set(targetData[i]));
     if (frame >= 7) {
       position.array[0] += .3;
-      for (let i = 0; i < targets[0].array.length; i += 3) targets[0].array[i] += .35;
+      for (let i = 0; i < targets[0].array.length; i += 3) targets[0].array[i] += materialKeys && frame >= 12 ? .7 : .35;
     }
     mesh.morphTargetInfluences = frame < 7 ? [.25, .5] : frame < 8 ? [.5, -.25] : frame < 10 ? [.85, .25] : frame < 12 ? [.75, .15] : [.1, .9];
     mesh.static = frame === 8 || frame === 9;
     if (skinned) { root.rotation.z = Math.sin(frame / 7) * .15; tip.rotation.z = Math.sin(frame / 11) * .5; }
-    if (frame === 7) { mesh.onBeforeRender = () => { before++; }; mesh.onAfterRender = () => { after++; }; }
+    if (frame === 7) {
+      mesh.onBeforeRender = () => { before++; }; mesh.onAfterRender = () => { after++; };
+      if (materialKeys) geometry.dispose();
+    }
+    if (materialKeys && frame === 8) material.roughness = .5;
     if (frame >= 7 && frame < 10 || frame >= 12) scene.add(native); else scene.remove(native);
     if (frame === 10) {
-      position.array[1] -= .2; position.addUpdateRange(1, 1); position.needsUpdate = true;
+      if (!materialKeys) { position.array[1] -= .2; position.addUpdateRange(1, 1); position.needsUpdate = true; }
       targets[0].needsUpdate = true; // Target edits do not rebuild the existing source morph graph.
+      if (materialKeys) material.needsUpdate = true;
     }
     if (frame === 12) geometry.dispose();
-    if (frame === 13) material.needsUpdate = true;
+    if (materialKeys && frame === 12) { material.roughness = .75; material.needsUpdate = true; }
+    if (frame === 13) {
+      if (materialKeys) targets[0] = targets[0].clone();
+      material.needsUpdate = true;
+    }
     if (frame === 18) { material.alphaHash = true; material.needsUpdate = true; }
     renderer._nodes.nodeFrame.update(); const value = render(...args), callbacks = Math.max(0, frame - 6);
     if (before !== callbacks || after !== callbacks || skinned && updates !== frame)
@@ -104,6 +115,7 @@ function ordinaryDeformation(T, renderer, skinned) {
 }
 
 export const nativeMixedSnapshotScenarios = {
+  native_morph_material_keys: (T, renderer) => ordinaryDeformation(T, renderer, false, true),
   native_ordinary_morph_snapshots: (T, renderer) => ordinaryDeformation(T, renderer, false),
   native_ordinary_skin_morph_snapshots: (T, renderer) => ordinaryDeformation(T, renderer, true),
   native_ordinary_instance_snapshots: (T, renderer) => ordinaryInstances(T, renderer, 3),

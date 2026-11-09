@@ -7,6 +7,7 @@ import {inspectThreeLightingContext} from './three_node_passes.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
+import SourceRenderObject from '../../upstream/three.js/src/renderers/common/RenderObject.js';
 const N = THREE.TSL;
 function rig(t, options = {}) {
   const frame = new THREE.NodeFrame();
@@ -595,6 +596,61 @@ test('retained morph graphs rebuild for new geometry and actual material graph c
   const draw = f.owner.captureDraw(replaced, {...f.context, renderId: 2});
   assert.equal(draw.textures.find(binding => binding.texture.isDataArrayTexture).texture.image.data[0], 7);
   assert.equal(f.compile(), replaced);
+});
+function sourceMorphMaterialKey(f, material) {
+  return SourceRenderObject.prototype.getMaterialCacheKey.call({object: f.object, material, geometry: f.object.geometry,
+    renderer: f.renderer, context: {id: 1}, clippingContextCacheKey: '0/0',
+    getGeometryCacheKey: SourceRenderObject.prototype.getGeometryCacheKey});
+}
+for (const Material of [THREE.MeshStandardMaterial, THREE.MeshStandardNodeMaterial])
+test(`${Material.name} morph invalidation follows source numeric keys at the version boundary`, t => {
+  const f = morphRig(t), material = new Material({roughness: 0}); f.object.material = material;
+  material.onBeforeCompile = () => { assert.fail('native cache checks must not invoke a legacy compile hook'); };
+  const context = {...f.context, material}, compile = () => f.owner.compile(material, f.object, context);
+  const texture = descriptor => f.owner.captureDraw(descriptor, context).textures.find(binding => binding.texture.isDataArrayTexture).texture;
+  const key = sourceMorphMaterialKey(f, material), first = compile(), original = texture(first), target = f.object.geometry.morphAttributes.position[0];
+  target.array[0] = 7; f.object.geometry.dispose(); material.roughness = .5;
+  assert.notEqual(sourceMorphMaterialKey(f, material), key);
+  assert.equal(compile(), first, 'unversioned source edits update uniforms without replacing the morph graph');
+  material.needsUpdate = true;
+  const changed = compile(); assert.notEqual(changed, first); assert.equal(texture(changed).image.data[0], 7);
+  const nonzeroKey = sourceMorphMaterialKey(f, material);
+  target.array[0] = 11; f.object.geometry.dispose(); material.roughness = .75; material.needsUpdate = true;
+  assert.equal(sourceMorphMaterialKey(f, material), nonzeroKey);
+  assert.equal(compile(), changed, 'nonzero-to-nonzero source properties keep the same graph');
+  assert.equal(texture(changed).image.data[0], 7); assert.notEqual(original.image.data[0], 7);
+  material.roughness = 0; material.needsUpdate = true;
+  assert.notEqual(sourceMorphMaterialKey(f, material), nonzeroKey);
+  const zero = compile(); assert.notEqual(zero, changed); assert.equal(texture(zero).image.data[0], 11);
+});
+test('morph target identity changes wait for source invalidation and preserve the old packed texture', t => {
+  const f = morphRig(t), key = sourceMorphMaterialKey(f, f.material), first = f.compile();
+  const target = f.object.geometry.morphAttributes.position[0].clone(); target.array[0] = 7;
+  f.object.geometry.dispose(); f.object.geometry.morphAttributes.position[0] = target;
+  f.object.geometry.morphAttributes.position[Symbol.iterator] = () => { assert.fail('source morph keys use indexed targets'); };
+  assert.notEqual(sourceMorphMaterialKey(f, f.material), key); assert.equal(f.compile(), first);
+  f.material.needsUpdate = true;
+  const changed = f.compile(); assert.notEqual(changed, first);
+  assert.equal(f.owner.captureDraw(changed, f.context).textures.find(binding => binding.texture.isDataArrayTexture).texture.image.data[0], 7);
+});
+test('a context-driven morph reconstruction acknowledges current material construction properties', t => {
+  const f = morphRig(t), material = new THREE.MeshStandardNodeMaterial({roughness: 0}); f.object.material = material;
+  const context = {...f.context, material}, compile = () => f.owner.compile(material, f.object, context), first = compile();
+  material.roughness = .5; f.renderer.contextNode = N.builtinAOContext(N.uniform(.5));
+  const changed = compile(); assert.notEqual(changed, first);
+  const key = sourceMorphMaterialKey(f, material);
+  f.object.geometry.morphAttributes.position[0].array[0] = 7; f.object.geometry.dispose(); material.needsUpdate = true;
+  assert.equal(sourceMorphMaterialKey(f, material), key); assert.equal(compile(), changed);
+  assert.notEqual(f.owner.captureDraw(changed, context).textures.find(binding => binding.texture.isDataArrayTexture).texture.image.data[0], 7);
+});
+for (const property of ['alphaTest', 'clearcoat']) test(`morph source ${property} accessors retain zero/nonzero construction semantics`, t => {
+  const f = morphRig(t), material = new THREE.MeshPhysicalMaterial({[property]: -1}); f.object.material = material;
+  const context = {...f.context, material}, compile = () => f.owner.compile(material, f.object, context);
+  const key = sourceMorphMaterialKey(f, material), first = compile();
+  f.object.geometry.morphAttributes.position[0].array[0] = 7; f.object.geometry.dispose(); material[property] = 0; material.needsUpdate = true;
+  assert.notEqual(sourceMorphMaterialKey(f, material), key);
+  const changed = compile(); assert.notEqual(changed, first);
+  assert.equal(f.owner.captureDraw(changed, context).textures.find(binding => binding.texture.isDataArrayTexture).texture.image.data[0], 7);
 });
 test('source morphing precedes skinning and their independently captured uniforms coexist', t => {
   const f = morphRig(t, {relative: true, skinned: true}), d = f.compile();

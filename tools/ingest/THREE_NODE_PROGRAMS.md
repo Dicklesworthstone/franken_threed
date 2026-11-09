@@ -291,6 +291,15 @@ disposal, version-only invalidation and an actual shader-graph change. Source
 morph graphs retain their packed target image across geometry disposal; new
 material/graph construction reads the then-current target data.
 
+A further Standard-material browser case matches all 344,064 RGBA bytes at
+seven checkpoints on Chromium 153 SwiftShader, with zero GPU/browser errors.
+It checks an unversioned roughness edit, later zero/nonzero invalidation,
+nonzero-to-nonzero reuse after disposal, target-attribute replacement and a real
+graph change. Six source-key regressions compare against the pinned
+`RenderObject.getMaterialCacheKey()`; the focused skin/morph and queued-capture
+selection passes 27 tests. These checks establish source construction and
+software GPU correctness, without a hardware performance claim.
+
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and
 `outputNode` and `depthNode`. Ordinary source node arithmetic, functions and custom scalar/vector
@@ -1197,8 +1206,19 @@ uniform bytes survive later source edits. Material disposal invalidates the
 compiler cache. For morphed native graphs, geometry disposal resets raw attribute
 residency and the cache used by future morph construction while existing compiled
 graphs retain their packed target texture. Version-only material updates retain
-that graph when its complete key is unchanged; actual graph/layout changes rebuild
-it. Native programs also capture ordinary CPU geometry through the existing
+that graph only when both the structural key and the proven source construction
+signature agree; actual graph/layout changes rebuild it.
+
+For ordinary source data properties, the construction comparison preserves
+r186's numeric zero/nonzero encoding (with exact side values), texture sampler
+fields, pinned accessor backing values and morph-target attribute identities.
+It compares the original material without calling application getters. Uniform
+edits without invalidation retain the acknowledged construction state; any real
+shader/context rebuild records a fresh baseline. Stable ordinary callback text
+also retains the source key. Unknown accessor/coercion cases keep the existing
+reconstruction path and remain outside this proved reuse profile.
+
+Native programs also capture ordinary CPU geometry through the existing
 immutable geometry owner at the source upload boundary. Shared geometry uploads
 once per logical render; unmarked edits and untouched partial ranges stay stale,
 including when a render callback is added after initial compilation. This is not
