@@ -93,7 +93,7 @@ function ordinaryDeformation(T, renderer, skinned, materialKeys = false) {
     if (materialKeys && frame === 8) material.roughness = .5;
     if (frame >= 7 && frame < 10 || frame >= 12) scene.add(native); else scene.remove(native);
     if (frame === 10) {
-      if (!materialKeys) { position.array[1] -= .2; position.addUpdateRange(1, 1); position.needsUpdate = true; }
+      position.array[1] -= .2; position.addUpdateRange(1, 1); position.needsUpdate = true;
       targets[0].needsUpdate = true; // Target edits do not rebuild the existing source morph graph.
       if (materialKeys) material.needsUpdate = true;
     }

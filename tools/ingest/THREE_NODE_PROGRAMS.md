@@ -1253,9 +1253,28 @@ update ranges. Enabling vertex colors after an earlier render or
 `compileAsync()` therefore takes the color attribute's current bytes on its
 first actual use. An active interleaved view still captures its complete backing
 owner, so unversioned edits to another view of that same owner remain stale.
-Source geometry disposal invalidates current shared attributes even when that
-geometry's own shader never selected them; accepted older packets retain their
-bytes until released.
+The first source geometry disposal invalidates current shared attributes even
+when that geometry's own shader never selected them; accepted older packets
+retain their bytes until released. Pinned r186 retains the geometry's initialized
+record after removing that listener. Later disposals therefore preserve uploaded
+attribute and index history, including stale bytes outside partial updates.
+The lifetime belongs to the canonical source geometry within each renderer, so
+new private views cannot re-arm it and another source geometry keeps its own
+first disposal. Private GPU residency can be recreated from accepted immutable
+bytes. Explicit owner shutdown still releases all histories when their retained
+leases finish.
+
+Six `three_node_geometry_lifetime.test.mjs` regressions compare this behavior
+with the pinned `Geometries`, `Attributes` and `WebGPUAttributeUtils` executing
+against a recording device. Together with the existing fourteen raw-history
+tests they cover indexed and nonindexed uploads, private aliases, shared
+attributes, independent renderers and final release accounting.
+
+The `native_morph_material_keys` browser case now also retains the base-position
+partial upload through repeated disposal. All 344,064 RGBA bytes at seven
+checkpoints match r186 exactly in Chromium 153 SwiftShader, with zero GPU errors
+and the owned general-WebGPU route. This is software GPU correctness evidence;
+it does not measure hardware performance.
 
 Shaders driven by `vertexIndex` can omit position entirely. Their captured
 geometry retains the source vertex count separately, preserving nonindexed draw

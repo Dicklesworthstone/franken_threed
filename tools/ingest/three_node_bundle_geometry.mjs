@@ -11,7 +11,7 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     error.code = `THREE_NODE_BUNDLE_GEOMETRY_${code}`; throw error;
   };
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) reject('LIMIT', 'Invalid bundle geometry history budget');
-  const owners = new Map(), geometries = new Map();
+  const owners = new Map(), geometries = new Map(), disposedSources = new WeakSet();
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Bundle geometry histories are disposed'); };
   const keep = generation => { generation.refs++; };
@@ -155,6 +155,10 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       while (source.geometry && source.geometry !== source && !seen.has(source.geometry)) { seen.add(source); source = source.geometry; }
       state = {source, owned: new Set(), latest: null};
       state.onDispose = () => {
+        // r186 Geometries removes its first disposal listener but retains the
+        // initialized record. Later uses upload missing residency without
+        // rearming disposal, including uses through a newly compiled view.
+        disposedSources.add(source);
         if (state.latest) { dropView(state.latest); state.latest = null; }
         // Source disposal invalidates every current attribute, even one this
         // geometry never uploaded but another geometry shares. Inspect only
@@ -170,7 +174,8 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         }
         geometries.delete(geometry); source.removeEventListener?.('dispose', state.onDispose);
       };
-      geometries.set(geometry, state); source.addEventListener?.('dispose', state.onDispose);
+      geometries.set(geometry, state);
+      if (!disposedSources.has(source)) source.addEventListener?.('dispose', state.onDispose);
     }
     for (const owner of unique.keys()) { state.owned.add(owner); owners.get(owner).geometries.add(state); }
     const selected = selection.map(source => ({...source, generation: source.gpu ? source.attribute : owners.get(source.owner).generation}));
