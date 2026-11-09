@@ -47,6 +47,45 @@ export function sendFileError(res, error) {
   res.end(missing ? "File not found" : denied ? "Access denied" : "Unable to read file");
 }
 
+
+/** A server may decline multipart/invalid ranges and return the full asset.
+ * A valid but unsatisfiable single range produces 416 instead.
+ */
+function requestedByteRange(header, size) {
+  if (typeof header !== "string" || !header.startsWith("bytes=")) return null;
+  const value = header.slice(6).trim();
+  if (value.includes(",")) return null;
+  const match = /^(\d*)-(\d*)$/.exec(value);
+  if (!match || (!match[1] && !match[2])) return null;
+  const toIndex = digits => {
+    const number = BigInt(digits);
+    return number > BigInt(Number.MAX_SAFE_INTEGER) ? Infinity : Number(number);
+  };
+  let start, end;
+  if (!match[1]) {
+    const suffix = toIndex(match[2]);
+    if (suffix === 0 || size === 0) return { unsatisfiable: true };
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = toIndex(match[1]);
+    if (start >= size || size === 0) return { unsatisfiable: true };
+    end = match[2] ? Math.min(size - 1, toIndex(match[2])) : size - 1;
+    if (end < start) return { unsatisfiable: true };
+  }
+  return { start, end };
+}
+
+// A weak or stale If-Range validator cannot authorize a partial response.
+// HTTP dates have second precision while local mtimes may not.
+function matchesIfRange(header, etag, mtimeMs) {
+  if (typeof header !== "string") return true;
+  if (header.startsWith('"')) return header === etag;
+  if (header.startsWith("W/")) return false;
+  const timestamp = Date.parse(header);
+  return Number.isFinite(timestamp) && Math.trunc(mtimeMs / 1000) * 1000 <= timestamp;
+}
+
 /** Return false only for absent files/directories, allowing a safe fallback. */
 export function serveStaticFile(
   req,
@@ -60,25 +99,40 @@ export function serveStaticFile(
   try {
     const resolved = resolveStaticFile(root, filePath, repositoryRoot);
     if (resolved === null) return false;
+    const stats = fs.statSync(resolved);
+    const etag = '"' + stats.size.toString(16) + "-" + Math.trunc(stats.mtimeMs).toString(16) + '"';
     const responseHeaders = {
       "Content-Type": mimeTypes[path.extname(filePath).toLowerCase()] || fallbackType,
       ...headers,
+      "Accept-Ranges": "bytes",
+      "ETag": etag,
+      "Last-Modified": stats.mtime.toUTCString(),
     };
-    if (req.method === "HEAD") {
-      res.writeHead(200, responseHeaders);
+    const range = matchesIfRange(req.headers?.["if-range"], etag, stats.mtimeMs)
+      ? requestedByteRange(req.headers?.range, stats.size) : null;
+    if (range?.unsatisfiable) {
+      res.writeHead(416, { ...responseHeaders, "Content-Range": "bytes */" + stats.size, "Content-Length": "0" });
       res.end();
       return true;
     }
-    // Delay the 200 response until the file actually opens. Disappearance,
-    // permission errors and failed reads must not become unhandled events.
-    const stream = fs.createReadStream(resolved);
+    if (range) responseHeaders["Content-Range"] = "bytes " + range.start + "-" + range.end + "/" + stats.size;
+    responseHeaders["Content-Length"] = String(range ? range.end - range.start + 1 : stats.size);
+    const status = range ? 206 : 200;
+    if (req.method === "HEAD") {
+      res.writeHead(status, responseHeaders);
+      res.end();
+      return true;
+    }
+    // Wait for open before sending success; broken/disappearing files still
+    // report errors, and aborting a client tears down its underlying stream.
+    const stream = fs.createReadStream(resolved, range ? { start: range.start, end: range.end } : undefined);
     const stop = () => stream.destroy();
     res.once("close", stop);
     stream.once("close", () => res.off("close", stop));
     stream.once("error", (error) => sendFileError(res, error));
     stream.once("open", () => {
       if (res.destroyed) return stream.destroy();
-      res.writeHead(200, responseHeaders);
+      res.writeHead(status, responseHeaders);
       stream.pipe(res);
     });
     return true;
