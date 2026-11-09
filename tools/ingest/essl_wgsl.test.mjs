@@ -452,7 +452,7 @@ function scalarSwitch(body, {unsigned = false} = {}) {
     label.trim() === 'default' ? 'default:' : 'case ' + label.trim() + ':').join('\n') + '{')
     .replace(/\bvar (\w+): (?:i32|u32)\s*;/g, 'let $1 = 0;')
     .replace(/\bvar (\w+): bool\s*;/g, 'let $1 = false;')
-    .replace(/\b(?:var|let) (\w+): (?:i32|u32|bool)\s*=/g, 'let $1 =')
+    .replace(/\b(?:var|let|const) (\w+): (?:i32|u32|bool)\s*=/g, 'let $1 =')
     .replace(/\b(\d+)u\b/g, '$1');
   const params = signature[1].split(',').map(parameter => parameter.trim().split(':')[0]);
   return {wgsl, run: Function('i32', 'u32', ...params, code).bind(null, value => value | 0, value => value >>> 0)};

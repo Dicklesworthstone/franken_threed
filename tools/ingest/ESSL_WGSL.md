@@ -51,6 +51,16 @@ admitted. The source rules are in the
   then need no flip; the caller swaps the pipeline's front face.
 - `gl_FragCoord` in GL window coordinates (bottom-left origin); `dFdy` keeps GL's
   upward sign; `texture()` outside fragment shaders samples level 0.
+- Floating-point 2D/3D projected sampling supports implicit LOD, bias, explicit
+  LOD and explicit gradients, with or without texel offsets. Only the texture
+  coordinates are divided by the final projective component; explicit gradients
+  are already projected, and a 2D `vec4` coordinate ignores its third component.
+  Offset sampling also supports 2D arrays without changing their layer index.
+  Vertex implicit sampling uses level zero; bias is fragment-only. Named local
+  constant offsets retain WGSL `const` bindings, including when other arguments
+  have side effects. `texelFetchOffset` preserves float, signed and unsigned
+  payloads for 2D, 3D and array textures. The legacy `texture2DProjGradEXT` alias
+  uses the same projected-gradient lowering.
 - Signed and unsigned integer 2D, 2D-array and 3D samplers implement nearest
   `texture`, `textureLod` and `textureGrad` through typed `textureLoad`, preserving
   all 32 bits. Helpers apply clamp/repeat/mirror addressing, rounded array layers,
@@ -112,10 +122,22 @@ admitted. The source rules are in the
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
 integer cube sampling and integer sampling bias, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions).
-Integer projected/offset sampling remains outside the admitted integer slice.
+Integer projected/filtered-offset sampling remains outside the admitted integer
+slice; integer `texelFetchOffset` is supported. Projected and explicit-gradient
+shadow sampling remain unimplemented.
 
 ## Evidence
 
+- `essl_texture_sampling.test.mjs`: six focused tests cover projected/offset
+  signatures, projective divisors, already-projected gradients, source constant
+  offsets, argument side effects, vertex LOD and typed texel fetches. The new
+  tests and existing ESSL/integer-sampling suites pass all 47 tests.
+  `program_texture_sampling.mjs` compares 42 pinned WebGL/WebGPU checkpoints
+  exactly (86,016 RGBA bytes), including bias-selected mips, 3D/array offsets,
+  signed/unsigned texels, vertex sampling and the r186 legacy gradient alias.
+  The candidate uses `general-webgpu`; Chromium 153 SwiftShader reports no
+  browser or GPU errors. These are software GPU correctness checks, not a
+  hardware performance result or complete ESSL closure.
 - `three_program_integer_sampling.test.mjs`: six focused lowering, layout,
   signature and bound-sampler metadata regressions. The existing 32 compiler
   and 25 texture-owner tests also pass. `program_integer_sampling.mjs` compares

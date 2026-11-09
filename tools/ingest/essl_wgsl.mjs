@@ -229,7 +229,9 @@ function esslVersion(v) {
 // ESSL 1.00 texture builtins and their ESSL 3.00 equivalents.
 const ESSL1_TEXTURE = {texture2D: 'texture', textureCube: 'texture', texture2DProj: 'textureProj', texture2DLod: 'textureLod',
   textureCubeLod: 'textureLod', texture2DProjLod: 'textureProjLod', texture2DLodEXT: 'textureLod', textureCubeLodEXT: 'textureLod',
-  texture2DProjLodEXT: 'textureProjLod', texture2DGradEXT: 'textureGrad', textureCubeGradEXT: 'textureGrad'};
+  texture2DProjLodEXT: 'textureProjLod', texture2DGradEXT: 'textureGrad', texture2DProjGradEXT: 'textureProjGrad', textureCubeGradEXT: 'textureGrad'};
+const TEXTURE_SAMPLE_FORMS = new Set(['texture', 'textureLod', 'textureGrad', 'textureOffset', 'textureLodOffset', 'textureGradOffset',
+  'textureProj', 'textureProjLod', 'textureProjGrad', 'textureProjOffset', 'textureProjLodOffset', 'textureProjGradOffset']);
 
 function reflect(shared, units, varyings) {
   // Layout must match Unit.uniformStruct(); computed once here.
@@ -624,17 +626,19 @@ class Unit {
       ...[...this.helpers.values()], ...fnLines, ...entry];
     return out.join('\n') + '\n';
   }
-  constEvaluable(e) {
+  constEvaluable(e, scope = null) {
+    const constant = a => this.constEvaluable(a, scope);
     switch (e.k) {
       case 'num': case 'bool': return true;
-      case 'paren': return this.constEvaluable(e.e);
-      case 'id': return !!this.globals.get(e.name)?.wgslConst;
-      case 'unary': return this.constEvaluable(e.a);
-      case 'bin': return this.constEvaluable(e.a) && this.constEvaluable(e.b);
-      case 'ctor': return e.args.every(a => this.constEvaluable(a));
-      case 'field': return this.constEvaluable(e.a);
-      case 'index': return this.constEvaluable(e.a) && this.constEvaluable(e.index);
-      case 'call': return ['sin', 'cos', 'sqrt', 'pow', 'normalize', 'abs', 'min', 'max', 'clamp', 'exp', 'log', 'exp2', 'log2', 'radians', 'degrees', 'tan', 'floor', 'ceil', 'fract', 'length', 'dot', 'cross'].includes(e.name) && e.args.every(a => this.constEvaluable(a));
+      case 'paren': return constant(e.e);
+      case 'id': return !!this.lookup(e.name, scope)?.wgslConst;
+      case 'unary': return constant(e.a);
+      case 'bin': return constant(e.a) && constant(e.b);
+      case 'cond': return constant(e.c) && constant(e.a) && constant(e.b);
+      case 'ctor': return e.args.every(constant);
+      case 'field': return constant(e.a);
+      case 'index': return constant(e.a) && constant(e.index);
+      case 'call': return !this.functions.has(e.name) && ['sin', 'cos', 'sqrt', 'pow', 'normalize', 'abs', 'min', 'max', 'clamp', 'exp', 'log', 'exp2', 'log2', 'radians', 'degrees', 'tan', 'floor', 'ceil', 'fract', 'length', 'dot', 'cross'].includes(e.name) && e.args.every(constant);
       default: return false;
     }
   }
@@ -933,26 +937,28 @@ class Unit {
         if (v.init?.k !== 'ctor') essError('Cannot size array', v.line);
         type = {k: 'a', of: type.of, n: v.init.args.length};
       }
-      let init = null;
+      let init = null, wgslConst = false;
       if (v.init) {
         const {pre, result} = this.hoisted(ctx, () => this.coerce(this.expr(v.init, ctx), type, v.line));
         (scope.switchDeclarations && s.q.storage === 'const' ? scope.switchDeclarations : out).push(...pre);
         init = result.c;
+        wgslConst = s.q.storage === 'const' && !pre.length && this.constEvaluable(v.init, scope);
       }
       const constant = s.q.storage === 'const' ? this.constValue(v.init, scope) : undefined;
       const w = this.local(v.name, type, scope);
       const sym = scope.vars.get(v.name);
       if (s.q.storage === 'const') {
         if (typeof constant === 'number') sym.constValue = constant;
-        sym.readonly = true;
+        sym.readonly = true; sym.wgslConst = wgslConst;
       }
+      const binding = wgslConst ? 'const' : 'let';
       if (scope.switchDeclarations) {
-        if (s.q.storage === 'const') scope.switchDeclarations.push(`let ${w}: ${this.wgsl(type)} = ${init};`);
+        if (s.q.storage === 'const') scope.switchDeclarations.push(`${binding} ${w}: ${this.wgsl(type)} = ${init};`);
         else {
           scope.switchDeclarations.push(`var ${w}: ${this.wgsl(type)};`);
           if (init !== null) out.push(`${w} = ${init};`);
         }
-      } else if (s.q.storage === 'const') out.push(`let ${w}: ${this.wgsl(type)} = ${init};`);
+      } else if (s.q.storage === 'const') out.push(`${binding} ${w}: ${this.wgsl(type)} = ${init};`);
       else out.push(`var ${w}: ${this.wgsl(type)}${init !== null ? ` = ${init}` : ''};`);
     }
     return out;
@@ -1588,11 +1594,11 @@ class Unit {
       case 'dFdy': need(1); return {c: this.shared.glRows ? `dpdy(${args[0].c})` : `(-dpdy(${args[0].c}))`, t: args[0].t};
       case 'fwidth': need(1); return {c: `fwidth(${args[0].c})`, t: args[0].t};
     }
-    if (this.version === 100 && ESSL1_TEXTURE[name]) return this.textureCall(ESSL1_TEXTURE[name], args, ctx, line);
-    if (/^texture|^texelFetch/.test(name)) return this.textureCall(name, args, ctx, line);
+    if (this.version === 100 && ESSL1_TEXTURE[name]) return this.textureCall(ESSL1_TEXTURE[name], args, ctx, line, e.args);
+    if (/^texture|^texelFetch/.test(name)) return this.textureCall(name, args, ctx, line, e.args);
     essError(`Unknown function ${name}`, line);
   }
-  textureCall(name, args, ctx, line) {
+  textureCall(name, args, ctx, line, expressions) {
     if (!args[0]?.smp) essError(`${name} needs a sampler`, line);
     const s = this.samplerNames(args[0], line), st = s.type, rest = args.slice(1);
     const vec4 = st.s === 'float' ? V('float', 4) : V(st.s, 4);
@@ -1600,6 +1606,20 @@ class Unit {
     const isInt = st.s !== 'float';
     if (isInt && ['texture', 'textureLod', 'textureGrad'].includes(name))
       return this.integerTextureCall(name, s, rest, ctx, line);
+    if (!st.shadow && TEXTURE_SAMPLE_FORMS.has(name)) {
+      if (isInt) essError('Integer projected/offset sampling is not supported; use texelFetchOffset for integer texel offsets', line);
+      return this.floatTextureCall(name, s, rest, ctx, line, expressions.slice(1));
+    }
+    if (name === 'texelFetch' || name === 'texelFetchOffset') {
+      if (st.shadow || st.dim === 'cube') essError(`${name} needs a non-shadow 2D, 3D or array sampler`, line);
+      const offset = name === 'texelFetchOffset', n = st.dim === '2d' ? 2 : 3;
+      if (rest.length !== (offset ? 3 : 2) || !same(rest[0].t, V('int', n)) || !same(rest[1].t, INT))
+        essError(`${name} needs ivec${n} coordinates and an int LOD${offset ? ', followed by a constant offset' : ''}`, line);
+      const p = this.capture(rest[0], ctx);
+      const delta = offset ? this.textureOffset(expressions[3], rest[2], st.dim === '3d' ? 3 : 2, ctx, line) : null;
+      const xy = st.dim === '2d-array' ? `${p.c}.xy` : p.c;
+      return {c: `textureLoad(${s.tex}, ${delta ? `(${xy} + ${delta})` : xy}${st.dim === '2d-array' ? `, ${p.c}.z` : ''}, ${rest[1].c})`, t: vec4};
+    }
     const coords = (p, n) => {
       // Split coordinate (+ array layer / depth reference) per WGSL signatures.
       const c = this.capture(p, ctx);
@@ -1636,12 +1656,6 @@ class Unit {
         if (name === 'textureProj' && this.stage === 'fragment') return {c: `textureSample(${s.tex}, ${s.smp}, ${uv})`, t: vec4};
         return {c: `textureSampleLevel(${s.tex}, ${s.smp}, ${uv}, ${name === 'textureProj' ? '0.0' : rest[1].c})`, t: vec4};
       }
-      case 'texelFetch': {
-        const p = rest[0];
-        const lod = rest[1]?.c ?? '0';
-        if (st.dim === '2d-array') { const c = this.capture(p, ctx); return {c: `textureLoad(${s.tex}, ${c.c}.xy, ${c.c}.z, ${lod})`, t: vec4}; }
-        return {c: `textureLoad(${s.tex}, ${p.c}, ${lod})`, t: vec4};
-      }
       case 'textureSize': {
         const dims = st.dim === '2d' || st.dim === 'cube' ? 2 : 3;
         if (st.dim === '2d-array') return {c: `vec3<i32>(vec3<u32>(textureDimensions(${s.tex}, ${rest[0].c}), textureNumLayers(${s.tex})))`, t: V('int', 3)};
@@ -1649,6 +1663,48 @@ class Unit {
       }
     }
     essError(`Unsupported texture function ${name}`, line);
+  }
+  /** Floating-point ES 3.00 section 8.8 sampling forms share the same operation
+   * after projection and array-layer splitting. Explicit projected gradients
+   * are already divided by the source projection and must not be divided again. */
+  floatTextureCall(name, sampler, args, ctx, line, expressions) {
+    const {type, tex, smp} = sampler, dim = type.dim;
+    const projected = name.includes('Proj'), offset = name.endsWith('Offset');
+    const operation = name.includes('Grad') ? 'grad' : name.includes('Lod') ? 'lod' : 'implicit';
+    const count = (operation === 'grad' ? 3 : operation === 'lod' ? 2 : 1) + Number(offset);
+    const bias = operation === 'implicit' && args.length === count + 1;
+    if (args.length !== count && !bias) essError(`${name} expects ${count + 1}${operation === 'implicit' ? ` or ${count + 2}` : ''} arguments`, line);
+    if (bias && this.stage !== 'fragment') essError(`${name} bias is only valid in fragment shaders`, line);
+    if (offset && dim === 'cube') essError(`${name} does not support cube samplers`, line);
+    if (projected && dim !== '2d' && dim !== '3d') essError(`${name} needs a 2D or 3D sampler`, line);
+    const dimensions = dim === '2d' || dim === '2d-array' ? 2 : 3;
+    const sizes = projected ? dim === '2d' ? [3, 4] : [4] : [dim === '2d-array' ? 3 : dimensions];
+    if (!sizes.some(n => same(args[0].t, V('float', n)))) essError(`${name} needs ${sizes.map(n => `vec${n}`).join(' or ')} coordinates`, line);
+    if (operation === 'lod' && !same(args[1].t, FLOAT)) essError(`${name} needs a float LOD`, line);
+    if (operation === 'grad' && args.slice(1, 3).some(a => !same(a.t, V('float', dimensions))))
+      essError(`${name} needs vec${dimensions} derivatives`, line);
+    if (bias && !same(args.at(-1).t, FLOAT)) essError(`${name} needs a float bias`, line);
+    const p = this.capture(args[0], ctx);
+    let uv = dim === '2d-array' ? `${p.c}.xy` : p.c;
+    if (projected) uv = `(${p.c}.${'xyz'.slice(0, dimensions)} / ${p.c}.${args[0].t.n === 4 ? 'w' : 'z'})`;
+    const list = [tex, smp, uv];
+    if (dim === '2d-array') list.push(`i32(floor(${p.c}.z + 0.5))`);
+    let fn;
+    if (operation === 'grad') { fn = 'textureSampleGrad'; list.push(args[1].c, args[2].c); }
+    else if (operation === 'lod' || this.stage !== 'fragment') { fn = 'textureSampleLevel'; list.push(operation === 'lod' ? args[1].c : '0.0'); }
+    else if (bias) { fn = 'textureSampleBias'; list.push(args.at(-1).c); }
+    else fn = 'textureSample';
+    if (offset) list.push(this.textureOffset(expressions[count - 1], args[count - 1], dimensions, ctx, line));
+    return {c: `${fn}(${list.join(', ')})`, t: V('float', 4)};
+  }
+  textureOffset(expression, value, dimensions, ctx, line) {
+    if (!same(value.t, V('int', dimensions))) essError(`Texture offset needs ivec${dimensions}`, line);
+    if (!this.constEvaluable(expression, ctx.scope)) essError('Texture offset must be a constant expression', line);
+    // Argument sequencing may have captured this expression before a later
+    // side effect. Regenerate the pure constant to meet WGSL's const-offset rule.
+    const {pre, result} = this.hoisted(ctx, () => this.expr(expression, ctx));
+    if (pre.length) essError('Texture offset is not a WGSL constant expression', line);
+    return result.c;
   }
   /** Integer samplers admit only nearest texels/mips. WGSL's filtered sample
    * builtins accept float textures, so carry the source wrap/mip controls in
