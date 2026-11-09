@@ -9,6 +9,8 @@
  * Straight-alpha presentation keeps encoded drawing-buffer texels separate
  * from the premultiplied page image, including framebuffer-copy sources.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class GpuCanvasError extends Error {
   constructor(code, message) {
     super(`GPU_CANVAS_${code}: ${message}`);
@@ -91,7 +93,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   const rendererOptions = Object.freeze({format, depthFormat, sampleCount});
   let context, configured = false, current = null, width = 0, height = 0;
   let disposed = false, terminal = null, busy = false, version = 0, frames = 0;
-  let validation = Promise.resolve(), rejectStopped;
+  let validation = Promise.resolve(), rejectStopped, releaseDeviceLoss = null;
   let presentationPipeline;
   // getCurrentTexture returns the same object until browser presentation or
   // replacement. Weak keys identify direct drawing-buffer lifetimes without
@@ -103,6 +105,7 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
   const bytes = () => (current?.bytes ?? 0) + [...retired].reduce((n, t) => n + t.bytes, 0);
   const destroy = t => { t?.color?.destroy(); t?.depth?.destroy(); t?.preserved?.destroy(); };
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     destroy(current); current = null;
     for (const t of retired) destroy(t);
     retired.clear();
@@ -357,7 +360,8 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
       resize(initialWidth, initialHeight);
     });
     if (device.lost && typeof device.lost.then === 'function')
-      device.lost.then(info => stop(new GpuCanvasError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+        info => stop(new GpuCanvasError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     return target;
   } catch (error) { release(); throw error; }
 }

@@ -6,6 +6,7 @@
  * It borrows the device; the session owns the returned renderer. No frame loop.
  */
 import {createGpuCanvasTarget, GpuCanvasError} from './gpu_canvas.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 const fail = (code, message) => { throw new GpuCanvasError(code, message); };
 const object = (value, label) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('OPTIONS', `Expected ${label}`);
@@ -38,13 +39,14 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
       typeof signal.removeEventListener !== 'function')) fail('OPTIONS', 'Expected an AbortSignal');
   let device = suppliedDevice, ownsDevice = false, target = null, renderer = null;
   let disposed = false, terminal = null, busy = false, preparing = false, lastFrameRendered = false;
-  let rejectStopped;
+  let rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
   stopped.catch(() => {});
   const lifetime = new AbortController();
   const closed = () => disposed || terminal !== null;
   const aborted = () => stop(new GpuCanvasError('ABORTED', 'Canvas renderer initialization or lifetime was aborted'));
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     signal?.removeEventListener('abort', aborted);
     lifetime.abort(terminal ?? new GpuCanvasError('DISPOSED', 'Canvas renderer is disposed'));
     const owned = renderer; renderer = null;
@@ -174,7 +176,8 @@ export async function createGpuCanvasRenderer(canvas, createRenderer, options = 
     }
     capabilities(device);
     if (device.lost && typeof device.lost.then === 'function')
-      device.lost.then(info => stop(new GpuCanvasError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+        info => stop(new GpuCanvasError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     targetOptions.format ??= gpu?.getPreferredCanvasFormat?.() ?? 'bgra8unorm';
     target = createGpuCanvasTarget(device, canvas, targetOptions);
     await wait(target.whenIdle()); live();

@@ -96,6 +96,7 @@
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
 import {inspectGpuDepthCopy, submitGpuDepthCopy} from './gpu_depth_transfer.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 // Authenticate target handles and device identity without exposing GPU textures.
 const transferTargets = new WeakMap();
 
@@ -367,7 +368,9 @@ export function createGpuRenderTarget(device, options = {}) {
     }
     for (const depth of pair?.mipDepths?.values() ?? []) depth.destroy();
   };
+  let releaseDeviceLoss = null;
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     destroy(current); current = null;
     for (const pair of retired) destroy(pair);
     retired.clear();
@@ -948,7 +951,8 @@ export function createGpuRenderTarget(device, options = {}) {
     if (bytes > maxBytes) fail('BUDGET', 'Initial target exceeds maxBytes');
     current = allocate(width, height, bytes);
     if (device.lost && typeof device.lost.then === 'function')
-      device.lost.then(info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+        info => stop(new GpuRenderTargetError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     transferTargets.set(api, {owner: api, device, exclusive, shape: transferShape, depthShape,
       shareDepth(shape) {
         live();

@@ -44,6 +44,7 @@
  * GPU-authored motion: no CPU readback is performed to recompute bounds.
  */
 import {isComputeAttribute, computeAttributeSnapshot} from './gpu_compute_attributes.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class BufferGeometryGpuError extends Error {
   constructor(code, message) { super(`${code}: ${message}`); this.name = 'BufferGeometryGpuError'; this.code = code; }
@@ -243,7 +244,7 @@ function createResidency(device, geometry, {
   }
   const maximum = integer(device.limits.maxBufferSize, 4, Number.MAX_SAFE_INTEGER, 'device buffer limit');
   let records = new Map(), allocatedBytes = 0, disposed = false, terminal = null, busy = false,
-    current = null, version = 0, generation = 0, pending = Promise.resolve(), rejectStopped;
+    current = null, version = 0, generation = 0, pending = Promise.resolve(), rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const stats = {allocations: 0, uploads: 0, uploadedBytes: 0, updates: 0};
   const worldMatrix = new Float64Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
@@ -252,7 +253,10 @@ function createResidency(device, geometry, {
     records = new Map(); allocatedBytes = 0; current = null; generation++;
   }
   function stop(error) {
-    if (!terminal) { terminal = error; release(); rejectStopped(terminal); }
+    if (!terminal) {
+      terminal = error; releaseDeviceLoss?.(); releaseDeviceLoss = null;
+      release(); rejectStopped(terminal);
+    }
     return terminal;
   }
   function live() {
@@ -458,13 +462,15 @@ function createResidency(device, geometry, {
     dispose() {
       if (busy) fail('REENTRANT', 'Cannot dispose during upload');
       if (!disposed) {
+        releaseDeviceLoss?.(); releaseDeviceLoss = null;
         disposed = true; geometry.removeEventListener?.('dispose', onDispose); release();
         rejectStopped(new BufferGeometryGpuError('GEOMETRY_GPU_DISPOSED', 'Geometry adapter is disposed'));
       }
     },
   });
   registry.set(handle, {device, geometry, live, current: () => current});
-  device.lost.then(info => { if (!disposed) stop(new BufferGeometryGpuError('GEOMETRY_GPU_LOST', info?.message || 'Device lost')); },
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => { if (!disposed) stop(new BufferGeometryGpuError('GEOMETRY_GPU_LOST', info?.message || 'Device lost')); },
     error => { if (!disposed) stop(error); });
   try { update({maxAdditionalBytes: maxInitialBytes}); geometry.addEventListener?.('dispose', onDispose); }
   catch (error) { handle.dispose(); throw error; }

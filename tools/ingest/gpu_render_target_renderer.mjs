@@ -5,6 +5,7 @@
  * caller's device. Native attachments come only from the owned target.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class GpuRenderTargetRendererError extends Error {
   constructor(code, message) {
@@ -26,13 +27,14 @@ export async function createGpuRenderTargetRenderer(device, createRenderer, opti
     fail('OPTIONS', 'Expected AbortSignal');
   const lifetime = new AbortController();
   let target = null, renderer = null, disposed = false, terminal = null, busy = false, preparing = false;
-  let rejectStopped;
+  let rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; });
   stopped.catch(() => {});
   const closed = () => disposed || terminal !== null;
   const wait = promise => Promise.race([promise, stopped]);
   const abort = () => stop(signal.reason ?? new GpuRenderTargetRendererError('ABORTED', 'Offscreen session aborted'));
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     signal?.removeEventListener('abort', abort);
     const child = renderer, storage = target;
     renderer = target = null;
@@ -126,7 +128,8 @@ export async function createGpuRenderTargetRenderer(device, createRenderer, opti
     live();
     target = createGpuRenderTarget(device, targetOptions);
     if (device.lost && typeof device.lost.then === 'function')
-      device.lost.then(info => stop(new GpuRenderTargetRendererError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+        info => stop(new GpuRenderTargetRendererError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     // A late factory result still belongs to this owner and must be retired.
     const acquisition = Promise.resolve(createRenderer(device, target.rendererOptions, {signal: lifetime.signal})).then(value => {
       if (closed()) { value?.dispose?.(); throw terminal ?? new GpuRenderTargetRendererError('DISPOSED', 'Offscreen session disposed'); }
