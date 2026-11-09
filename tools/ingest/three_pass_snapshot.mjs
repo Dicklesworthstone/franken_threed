@@ -119,7 +119,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
   let disposed = false, allocatedBytes = 0;
   function live() { if (disposed) fail('DISPOSED', 'Pass snapshot owner is disposed'); }
   const plain = object => Object.getPrototypeOf(object) === Object.prototype || Object.getPrototypeOf(object) === null;
-  function eligible(root, camera) {
+  function eligible(root, camera, vertexLimit = maxVertices) {
     // General scenes, instancing, user hooks and large geometry keep their existing
     // explicit live-source path. No user clone()/copy()/serialization hook runs.
     if (!T.Mesh || Object.getPrototypeOf(root ?? {}) !== T.Mesh.prototype || !T.Camera || !(camera instanceof T.Camera)) return false;
@@ -135,7 +135,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
         m.onBeforeRender !== T.Material.prototype.onBeforeRender || m.onBeforeCompile !== T.Material.prototype.onBeforeCompile ||
         m.customProgramCacheKey !== T.Material.prototype.customProgramCacheKey) return false;
     const attributes = own(g, 'attributes'), position = attributes && own(attributes, 'position');
-    if (!position || !positive(position.count) || position.count > maxVertices || Object.values(g.morphAttributes ?? {}).some(a => a.length)) return false;
+    if (!position || !positive(position.count) || position.count > vertexLimit || Object.values(g.morphAttributes ?? {}).some(a => a.length)) return false;
     for (const a of [...Object.values(attributes), ...(g.index ? [g.index] : [])]) {
       const owner = a.isInterleavedBufferAttribute ? a.data : a;
       const expected = owner.isInterleavedBuffer ? T.InterleavedBuffer?.prototype : T.BufferAttribute?.prototype;
@@ -152,7 +152,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
     record.targetReleases.length = 0;
     record.data = record.camera = null;
   }
-  function capture(root, camera, overrideMaterial = null) {
+  function capture(root, camera, overrideMaterial = null, vertexLimit = maxVertices) {
     live();
     if (overrideMaterial) {
       if (![T.ShaderMaterial?.prototype, T.RawShaderMaterial?.prototype].includes(Object.getPrototypeOf(overrideMaterial)) ||
@@ -160,7 +160,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
           overrideMaterial.onBeforeRender !== T.Material.prototype.onBeforeRender ||
           overrideMaterial.onBeforeCompile !== T.Material.prototype.onBeforeCompile ||
           overrideMaterial.customProgramCacheKey !== T.Material.prototype.customProgramCacheKey) return null;
-    } else if (!eligible(root, camera)) return null;
+    } else if (!eligible(root, camera, vertexLimit)) return null;
     const identity = overrideMaterial ?? root;
     let state = states.get(identity);
     if (!state && retained.size >= maxRoots) fail('BUDGET', 'Too many retained pass inputs');
@@ -370,10 +370,36 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       release() { if (!record.pending) return; record.pending = false; collect(record); }});
   }
   return Object.freeze({capture,
+    // The retained r186 PMREM helper draws six faces in one 36-vertex mesh.
+    // Its caller verifies the generator's private mesh/material identities;
+    // keep this larger capture profile restricted to the source plane layout.
+    capturePMREM(root, camera) {
+      const geometry = own(root, 'geometry'), attributes = geometry && own(geometry, 'attributes');
+      const position = attributes && own(attributes, 'position'), direction = attributes && own(attributes, 'outputDirection');
+      if (!attributes || Object.keys(attributes).length !== 2 || geometry.index !== null ||
+          ![position, direction].every(attribute => attribute?.itemSize === 3 && attribute.count === 36 &&
+            Object.getPrototypeOf(attribute.array) === Float32Array.prototype)) return null;
+      return capture(root, camera, null, 36);
+    },
     // A verified pass's scene-wide ShaderMaterial override reuses the same
     // bounded value copies and sampled-target leases as a fullscreen pass.
     // Its stable private material is installed only during serialized work.
     captureMaterial(material) { return material ? capture(null, null, material) : null; },
+    // A retained generator has a finite private mesh generation. Retire those
+    // roots only after its accepted draws drain, without evicting application
+    // fullscreen roots or resetting their shared uniform/upload identities.
+    retire(root) {
+      const state = states.get(root);
+      if (!state) return;
+      const owned = [...records].filter(record => record.state === state);
+      if (owned.some(record => record.pending)) fail('PENDING', 'Cannot retire a pass root with queued draws');
+      for (const record of owned) { record.installed = false; collect(record); }
+      for (const value of [state.root, state.material, state.geometry])
+        if (value) for (const key of Object.getOwnPropertyNames(value)) delete value[key];
+      state.record = state.material = state.geometry = state.materialSource = state.geometrySource = null;
+      state.attributeViews.clear(); state.uniformViews = new WeakMap();
+      states.delete(root); retained.delete(state);
+    },
     get allocatedBytes() { return allocatedBytes; }, get rootCount() { return retained.size; },
     dispose() {
       if (disposed) return; disposed = true;

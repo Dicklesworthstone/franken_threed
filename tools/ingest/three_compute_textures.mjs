@@ -208,8 +208,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     pixels.disposeImages?.();
     snapshotBytes -= pixels.bytes;
     const variants = sources.get(source);
-    variants.delete(pixels.key);
-    if (!variants.size) sources.delete(source);
+    // A detached read can outlive disposal and a fresh upload at the same
+    // public version. Releasing that older payload must not erase the new one.
+    if (variants?.get(pixels.key) === pixels) {
+      variants.delete(pixels.key);
+      if (!variants.size) sources.delete(source);
+    }
   }
   function setHistory(source, key, pixels) {
     let group = histories.get(source);
@@ -221,7 +225,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   function pruneHistories() {
     for (const [source, group] of histories) {
-      for (const [key, pixels] of group) if (![...records].some(record => !record.privateDestination && record.source === source && record.key === key)) {
+      for (const [key, pixels] of group) if (![...records].some(record => !record.detached && !record.privateDestination && record.source === source && record.key === key)) {
         group.delete(key); releasePixels(source, pixels);
       }
       if (!group.size) histories.delete(source);
@@ -287,7 +291,12 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // of reviving an alias's older payload. Warm captures reuse their record.
     const key = privateDestination ? {} : JSON.stringify(shape.nativeMedia
       ? [sourceVersion, shape.key, original.id, version] : [sourceVersion, shape.key]);
-    let pixels = existingPixels ?? sources.get(source)?.get(key);
+    const shared = sources.get(source)?.get(key);
+    // Private submitted reads retain their pixels, not a future source upload
+    // lifetime. Once all ordinary owners have been disposed, recapture current
+    // source bytes even when a prior bake still holds that public version.
+    let pixels = existingPixels ?? (shared && [...records].some(record =>
+      !record.detached && record.source === source && record.pixels === shared) ? shared : null);
     if (!pixels) {
       // Residency is keyed by the same complete descriptor as the native pool.
       // A new source/shape/sampler starts from zero, just like a fresh GPUTexture.
@@ -445,7 +454,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         // records or CompressedTextures. Preserve prototypes without public IDs.
         if (image.isTexture || image.isDataTexture || image.isCompressedTexture || image.isCubeTexture) {
           const texture = privateDescriptor(image); images.set(image, texture);
-          texture.source = {...image.source, data: copyImage(image.image)};
+          texture.source = Object.assign(Object.create(Object.getPrototypeOf(image.source)), image.source, {data: copyImage(image.image)});
           texture.mipmaps = image.mipmaps.map(copyImage);
           return texture;
         }
@@ -460,7 +469,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
           ? original.mipmaps.map(copyImage) : original.mipmaps;
         const ready = pendingImages.length ? Promise.all(pendingImages).then(() => {}) : null;
         ready?.catch(() => {});
-        pixels = {key, descriptorKey: shape.key, source: {...source, data: image}, mipmaps, bytes, refs: 0,
+        pixels = {key, descriptorKey: shape.key, source: Object.assign(Object.create(Object.getPrototypeOf(source)), source, {data: image}), mipmaps, bytes, refs: 0,
           disposeImages, ready, readyState: ready ? 'pending' : 'ready', readyError: null};
         if (ready) ready.then(() => { pixels.readyState = 'ready'; }, error => {
           pixels.readyState = 'failed'; pixels.readyError = error;
@@ -469,7 +478,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     }
     let record;
     texture.source = pixels.source; texture.mipmaps = pixels.mipmaps;
-    texture.onUpdate = () => {
+    const acknowledge = callback => {
       // A source history can outlive the alias that first uploaded it. Recreate
       // native residency as needed without replaying that version's callback.
       if (record.privateDestination ? record.uploaded : pixels.uploaded) return;
@@ -489,12 +498,13 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         if (updates && original.layerUpdates === layersAtCapture && layersAtCapture?.size === layerValues.length &&
             layerValues.every(layer => layersAtCapture.has(layer))) original.clearLayerUpdates?.();
       }
-      original.onUpdate?.call(original, original);
+      callback?.call(original, original);
     };
+    texture.onUpdate = () => acknowledge(original.onUpdate);
     return record = {original, texture, key: shape.key, source, version, sourceVersion, nativeMedia: shape.nativeMedia === true,
       partialRanges: updates && rangeValues.length ? rangeValues.map(({start, count}) => ({start, count})) : null,
       partialLayers: updates && layerValues.length ? layerValues : null,
-      pixels, refs: 0, alive: true, binding: null};
+      pixels, acknowledge, refs: 0, alive: true, binding: null};
   }
   function captureBinding(binding, {copyDestination = false} = {}) {
     live();
@@ -620,6 +630,23 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     if (snapshot.released || !snapshot.record.alive)
       fail('STALE', 'Sampled texture was disposed or its captured use was released');
   }
+  function captureWebGL(texture) {
+    const binding = {texture, isSampledTexture: true}, previous = current.get(texture);
+    let captured;
+    // r186 checks Texture.version before consulting changed image/sampler
+    // fields. A sibling's already accepted upload can still refresh its shared
+    // Source; an unobserved sibling version must not trigger a CPU reread.
+    if (previous?.alive && previous.version === texture.version) {
+      const layout = inputLayout(binding, sourcePool().inspect(previous.texture, {initialize: true}));
+      previous.refs++;
+      captured = {record: previous, layout, sampler: false, released: false}; leases.add(captured);
+    } else captured = captureBinding(binding);
+    try {
+      const shared = captureShared(captured);
+      if (shared) { releaseLease(captured); captured = shared; }
+      return captured;
+    } catch (error) { releaseLease(captured); throw error; }
+  }
   function captureShared(snapshot, {copiesOnly = false} = {}) {
     live();
     // A source SHARED refresh keeps its existing sampler/view binding. Another
@@ -659,7 +686,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       // Borrow the accepted immutable descriptor while retaining the frozen
       // binding's original disposal identity. No pixel copy or upload callback
       // is made here, and a later queued capture cannot replace this selection.
-      record = {...previous, texture: resident.texture, pixels, sourceVersion: resident.sourceVersion,
+      record = {...previous, texture: resident.texture, pixels, sourceVersion: resident.sourceVersion, acknowledge: resident.acknowledge,
         refs: 0, alive: true, binding: resident.binding};
       retainPixels(record.source, pixels); records.add(record);
     }
@@ -669,6 +696,60 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding, captureShared, captureCopyDestination,
+    /** Retained synchronous GPU bakers own an accepted input independently of
+     * later source disposal. Ordinary leases keep their existing invalidation
+     * rules; this read shares the same captured payload and native residency. */
+    captureDetachedBinding(texture, {webglVersioning = false} = {}) {
+      live();
+      const binding = {texture, isSampledTexture: true};
+      if (isStorage(binding) || isTarget(binding) || isFramebuffer(binding) || isDetachedDepth(binding))
+        fail('SOURCE', 'Detached reads require ordinary sampled textures');
+      const captured = webglVersioning ? captureWebGL(texture) : captureBinding(binding);
+      try {
+        if (records.size >= maxTextures) fail('BUDGET', 'Detached texture reads exceed maxTextures');
+        const accepted = captured.record;
+        if (accepted.privateDestination) fail('SOURCE', 'Detached baking of copied sampled storage requires a GPU input target');
+        const privateTexture = privateDescriptor(accepted.texture), callback = texture.onUpdate;
+        privateTexture.source = accepted.texture.source; privateTexture.mipmaps = accepted.texture.mipmaps;
+        // Freeze this accepted upload's callback without changing the ordinary
+        // descriptor used by later versions. Both descriptors share one pool.
+        privateTexture.onUpdate = () => accepted.acknowledge(callback);
+        const record = {...accepted, texture: privateTexture, original: Object.freeze({}), detached: true, refs: 1, binding: null};
+        retainPixels(record.source, record.pixels); records.add(record);
+        const lease = {record, layout: captured.layout, sampler: false, released: false};
+        leases.add(lease); return lease;
+      } finally { releaseLease(captured); }
+    },
+    capturedTexture(snapshot) {
+      live();
+      if (!leases.has(snapshot) || !snapshot.record.detached) fail('SOURCE', 'Expected a detached sampled read');
+      validate(snapshot); return snapshot.record.texture;
+    },
+    capturedBinding(snapshot) {
+      live();
+      if (!leases.has(snapshot) || !snapshot.record.detached) fail('SOURCE', 'Expected a detached sampled read');
+      this.resolve(snapshot); return snapshot.record.binding;
+    },
+    /** Ordinary WebGL consumers of a previously baked input keep its current
+     * shared upload history. Pending decoded-image copies are preparation
+     * tokens only; the scene's existing asynchronous boundary waits for them. */
+    webglBinding(texture) {
+      live();
+      const captured = captureWebGL(texture), record = captured.record;
+      let pending = null;
+      try {
+        pending = this.preparation([captured]);
+        if (pending) {
+          const shape = sourcePool().inspect(record.texture, {initialize: true});
+          pending.then(() => releaseLease(captured), () => releaseLease(captured));
+          return {view: record.texture, sampler: record.texture, samplerDescriptor: shape.sampler,
+            sampleType: shape.sampleType, viewDimension: shape.viewDimension,
+            version: record.version, sourceVersion: record.sourceVersion, webglVersioned: true, ready: pending};
+        }
+        this.resolve(captured);
+        return {...record.binding, version: record.version, webglVersioned: true};
+      } finally { if (!pending) releaseLease(captured); }
+    },
     isCopyDestination: texture => copyDestinations.has(texture),
     sameTexture(first, second) {
       validate(first); validate(second);

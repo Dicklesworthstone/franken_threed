@@ -512,6 +512,50 @@ Existing shader, material and shadow-map profile limits remain in force. This is
 retained-JavaScript program preparation with owned WebGPU rendering, without a
 performance claim or a claim of complete physical-material/shadow coverage.
 
+## Public PMREM texture inputs for WebGL-authored applications
+
+After `await renderer.init()`, the public
+`PMREMGenerator.fromEquirectangular()` and `fromCubemap()` methods execute the
+retained r186 conversion and GGX shaders through F3D-owned render requests. They
+return real CubeUV `WebGLRenderTarget` objects; a compatible explicit destination
+retains its identity and can be sampled or read back. Source pass state, filter
+uniforms and ordinary input pixels are captured before the call returns, so
+queued bakes retain independent accepted inputs. Disposing an input or the
+generator after acceptance preserves those reads; private filter snapshots and
+destination bridges retire after submission drains without retiring the returned
+output.
+
+A panorama or cube first uploaded through this path retains the same accepted
+history when later used as an ordinary map or background, including Source-sharing
+aliases and unmarked CPU edits. An input already resident in the separate
+automatic WebGL scene texture pool refuses instead of reconstructing its prior
+GPU bytes. Custom input upload callbacks and ordinary GPU-written copy
+destinations are outside this detached-input profile; render-target inputs use
+the existing GPU target owner and its lifetime guards. Pre-initialization texture
+calls and `fromScene()` retain their previous delayed behavior; `fromScene()`
+sigma capture and explicit targets are not completed by this change.
+`compileCubemapShader()` and `compileEquirectangularShader()` remain no-ops on
+this facade.
+
+Ten recording-device regressions cover source filter uniforms, destination
+reuse, queued versions, Source aliases, accepted disposal, callback isolation and
+repeated generator cleanup. Twelve generators can reuse one live output while
+each disposed generator leaves zero private snapshot roots or dispatcher entries.
+The adjacent snapshot/PMREM run passes 40 of 42 tests. Its two native clear-count
+assertions, `native queued Color clears retain each accepted value` and
+`pre-init native rendering captures background selection with deferred node updates`,
+also fail with all five changed production modules replaced by their pre-change
+versions; they remain existing failures.
+
+`program_public_pmrem_targets.mjs` compares nine real source/candidate checkpoints
+(221,184 RGBA bytes) for panorama and cube inputs, original-panorama background
+reuse, marked updates, explicit output reuse and GPU input targets. Three direct
+background/map history checkpoints are byte exact. Chromium 153 software-GPU
+execution reports zero browser/GPU errors; at most 6 of 6,144 pixels in any
+checkpoint exceed channel delta 12 (0.0977%, within the existing 2% gate). The
+largest individual channel difference is 34. This is tolerance-based rendering
+evidence, not a hardware-performance measurement.
+
 ## Custom tone mapping for WebGL-authored programs
 
 The WebGL-authored facade admits `THREE.CustomToneMapping` through the source

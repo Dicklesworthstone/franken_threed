@@ -45,6 +45,7 @@ import {registerThreePassState, captureThreePassState, finishThreePassState, req
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
+import {hasThreeWebGLTextureResidency} from './three_textures.mjs';
 import {createThreeProgramShadows} from './three_program_shadows.mjs';
 import {createThreeProgramTransmission} from './three_program_transmission.mjs';
 import {withThreeCompute} from './three_compute.mjs';
@@ -82,6 +83,12 @@ const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth
 // yield: even LightProbeGrid's default 2x2x2 bake submits 84 render operations.
 // Keep a bounded FIFO; captured uniform/material bytes have separate limits.
 const MAX_PENDING = 1024;
+// Only the retained PMREM helper's own conversion/filter meshes use the
+// larger immutable pass profile. Ordinary application meshes keep their route.
+const PMREM_CAPTURES = new WeakMap();
+const PMREM_INPUTS = new WeakMap();
+const PMREM_SOURCES = new WeakMap();
+const PMREM_EXECUTIONS = new WeakMap();
 const MAX_NODE_CAPTURE_BYTES = 64 * 1024 * 1024;
 const MAX_MATERIAL_CAPTURE_VALUES = 1024 * 1024;
 const SOURCE_RENDERER_CONSTRUCTORS = new WeakMap();
@@ -225,6 +232,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             bridges: [...entries.values()].map(e => e.bridge.diagnostics)});
         },
         entry(scene) { return entries.get(scene) ?? null; },
+        retire(scene) { const entry = entries.get(scene); if (entry) { entries.delete(scene); entry.bridge.dispose(); } },
         render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, onDrawCallbacks}, frame, framebuffer, depthbuffer) {
           const entry = entries.get(scene);
           if (!entry) fail('PREPARE', 'Scene has not been prepared');
@@ -844,9 +852,16 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
       const renderer = this;
       return new class extends Map {
-        has(texture) { return texture?.isFramebufferTexture === true || retained.has(texture); }
+        has(texture) { return texture?.isFramebufferTexture === true || PMREM_INPUTS.get(renderer)?.has(texture) ||
+          PMREM_SOURCES.get(renderer)?.has(texture?.source) || retained.has(texture); }
         get(texture) {
           if (retained.has(texture)) return retained.get(texture);
+          const input = PMREM_INPUTS.get(renderer)?.get(texture);
+          if (input) return input.owner.capturedBinding(input.leases.values().next().value);
+          if (PMREM_SOURCES.get(renderer)?.has(texture?.source)) {
+            if (texture.onUpdate !== null) fail('UNSUPPORTED', 'Scene upload callbacks require their explicit source texture owner');
+            return renderer._getSampledTextureInputs().webglBinding(texture);
+          }
           return texture?.isFramebufferTexture === true
             ? renderer._getSampledTextureInputs().framebufferBinding(texture, {initialize: renderer._webglSubmissionDepth > 0,
               snapshot: renderer._programFramebufferFrame?.bindings.get(texture) ?? null})
@@ -1208,7 +1223,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const c = this._clearColor, a = this._clearAlpha;
       // Small callback-free shader passes (FullScreenQuad) are private data views;
       // general scenes and hooked roots retain their established source path.
-      const snapshot = this._shaderEncodedOutput ? this._passSnapshots.capture(scene, camera) : null;
+      const pmremScope = this._shaderEncodedOutput && PMREM_CAPTURES.get(this), pmrem = pmremScope?.generator;
+      const pmremDraw = pmrem && pmrem._lodMeshes.includes(scene) &&
+        [pmrem._cubemapMaterial, pmrem._equirectMaterial, pmrem._ggxMaterial, pmrem._blurMaterial].includes(scene.material);
+      const snapshot = this._shaderEncodedOutput ? pmremDraw ? this._passSnapshots.capturePMREM(scene, camera)
+        : this._passSnapshots.capture(scene, camera) : null;
+      if (pmremDraw && !snapshot) fail('UNSUPPORTED', 'PMREM filtering requires its ordinary source plane and shader values');
       let cameraSource = snapshot ? camera : null;
       if (this._shaderEncodedOutput && destination.shape?.webglCube && !snapshot && captureCameras) {
         // CubeCamera submits six public renders before preparation can finish.
@@ -1259,7 +1279,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       // Captures already own source resource leases. Publish each additional
       // lease immediately so a later acquisition failure can release all of it.
-      const request = {snapshot, nodeFrame, materialFrame};
+      const request = {snapshot, nodeFrame, materialFrame, pmremInput: pmremDraw ? pmremScope.input : null};
       try {
         if (passCameraRequired && overrideMaterial?.isShaderMaterial) {
           request.overrideSnapshot = this._passSnapshots.captureMaterial(overrideMaterial);
@@ -1303,6 +1323,13 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 depth: this.autoClear && this.autoClearDepth, stencil: this.autoClear && this.autoClearStencil},
               passBackgroundClear: clearOnly ? null : {color: this.autoClearColor, depth: this.autoClearDepth, stencil: this.autoClearStencil},
             } : {})}});
+        if (pmremDraw) {
+          let roots = PMREM_EXECUTIONS.get(pmrem);
+          if (!roots) PMREM_EXECUTIONS.set(pmrem, roots = new Map());
+          let destinations = roots.get(scene);
+          if (!destinations) roots.set(scene, destinations = new Map());
+          destinations.set(destination, request.scene);
+        }
         request.programTextures = this._captureFramebufferBindings();
         request.releaseDestination = destination === this ? null : this._targets.retainGeneration(destination);
         request.releaseCanvas = this._canvases.retain(canvasTarget, canvas);
@@ -1660,6 +1687,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         return this._defer(request);
       try {
         const captured = request.nodeFrame;
+        if (request.pmremInput?.owner.preparation([request.pmremInput.lease])) return this._defer(request);
         if (captured?.textureOwner?.preparation(captured.textureUses)) return this._defer(request);
         this._submit(request); this._releaseRequest(request);
       }
@@ -1909,6 +1937,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _prepare(destination = this, request = null) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
+        if (request?.pmremInput) await request.pmremInput.owner.preparation([request.pmremInput.lease]);
         if (request?.nodeCaptureDeferred) {
           // The source's async-before-init path observes scene inputs at this
           // boundary. Refresh the selector before callbacks so fixed background
@@ -2484,16 +2513,18 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
  * not construct a source renderer or backend. Its real CubeUV targets can be
  * sampled by native node materials and backgrounds through the target owner.
  *
- * The WebGL-authored route still describes the source for the scene bridge's
- * environment owner to prepare at its preparation boundary:
- * - fromScene(scene, sigma, near, far, {size, position}): captured into an
- *   rgba16float cubemap with the native scene bridge when first prepared (not at
- *   this call; later edits to the captured scene before preparation are seen),
- *   then GGX/DFG-filtered. sigma pre-blur is not reproduced.
- * - fromEquirectangular(texture): a clone sharing the source pixels (so the
- *   application may dispose its original), filtered from the panorama.
- * Neither is Three PMREM/CubeUV pixel equivalence. fromCubemap and explicit
- * render targets fail explicitly. Other renderers get the upstream class.
+ * Once the WebGL-authored renderer is initialized, texture-input calls run the
+ * retained source conversion and GGX helper against its existing target owner.
+ * They return real CubeUV targets, including an explicitly reused destination;
+ * source draws and ordinary input bytes are captured before this call returns.
+ * Private reads survive later input disposal and share acknowledged upload
+ * history with subsequent ordinary maps and panorama/cube backgrounds.
+ *
+ * Pre-initialization calls retain their earlier delayed source descriptors.
+ * fromScene also retains delayed scene capture: later edits before preparation
+ * are observed, sigma pre-blur is not reproduced, and explicit targets refuse.
+ * Shader warmup methods remain no-ops on this facade. These legacy paths do not
+ * claim source PMREM pixel equivalence. Other renderers get the upstream class.
  */
 export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
   const nativeGenerator = renderer => {
@@ -2506,6 +2537,7 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
       // r186 replaces these fields on a size change. Capture their resource
       // identities now: cleanup of the live generator after the queue drains
       // would otherwise dispose the next generation's targets and materials.
+      const roots = generator._lodMeshes.slice();
       const retired = Object.assign(Object.create(source), {
         _blurMaterial: generator._blurMaterial, _ggxMaterial: generator._ggxMaterial,
         _pingPongRenderTarget: generator._pingPongRenderTarget,
@@ -2517,7 +2549,16 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
           geometry: generator._backgroundBox.geometry, material: generator._backgroundBox.material,
         },
       });
-      const release = () => source[method].call(retired);
+      const release = () => {
+        if (renderer._shaderEncodedOutput) for (const root of roots) {
+          const executions = PMREM_EXECUTIONS.get(generator);
+          for (const [destination, execution] of executions?.get(root) ?? []) {
+            destination._dispatcher?.retire(execution); destination._wanted.delete(execution);
+          }
+          executions?.delete(root); renderer._passSnapshots.retire(root);
+        }
+        source[method].call(retired);
+      };
       // Submitted GPU work already owns its resources. Deferred preparation and
       // submission still need the source objects to remain valid. Both rejected
       // drains and successful drains must release the retired private resources;
@@ -2547,6 +2588,7 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
           typeof THREE.WGSLNodeBuilder === 'function' && typeof THREE.PMREMGenerator === 'function')
         return nativeGenerator(renderer);
       this._renderer = renderer;
+      this._generator = nativeGenerator(renderer);
     }
     fromScene(scene, sigma = 0, near = 0.1, far = 100, options = {}) {
       const {size = 256, position = new THREE.Vector3(), renderTarget = null} = options;
@@ -2563,31 +2605,65 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
     }
     async fromSceneAsync(...args) { return this.fromScene(...args); }
     fromEquirectangular(equirectangular, renderTarget = null) {
-      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
-      const texture = equirectangular.clone();
-      texture.mapping = THREE.EquirectangularReflectionMapping;
-      texture.needsUpdate = true;
-      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+      // Preserve the existing pre-initialization admission. A generator made
+      // before init can use real targets on every later initialized call.
+      if (!this._renderer._initialized) {
+        if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM targets require an initialized renderer');
+        const texture = equirectangular.clone();
+        texture.mapping = THREE.EquirectangularReflectionMapping; texture.needsUpdate = true;
+        return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+      }
+      return this._fromTexture('fromEquirectangular', equirectangular, renderTarget);
     }
     async fromEquirectangularAsync(...args) { return this.fromEquirectangular(...args); }
-    /** The cube-UV result is generated from the source at the scene bridge's
-     * preparation boundary (WebGL surface programs run r186 PMREMGenerator
-     * there); other routes reject the placeholder explicitly when preparing. */
+    /** Initialized calls capture the retained source conversion/filter passes.
+     * Earlier calls preserve the delayed scene-environment descriptor. */
     fromCubemap(cubemap, renderTarget = null) {
-      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM render targets are not admitted');
-      if (!cubemap?.isCubeTexture) fail('SOURCE', 'Expected a source CubeTexture');
-      const texture = new THREE.Texture();
-      texture.name = 'PMREM.cubeUv';
-      texture.mapping = THREE.CubeUVReflectionMapping;
-      texture.colorSpace = THREE.LinearSRGBColorSpace;
-      texture.isF3DPMREMSource = true;
-      texture.f3dPMREMSource = cubemap;
-      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+      if (!this._renderer._initialized) {
+        if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM targets require an initialized renderer');
+        if (!cubemap?.isCubeTexture) fail('SOURCE', 'Expected a source CubeTexture');
+        const texture = new THREE.Texture();
+        texture.name = 'PMREM.cubeUv'; texture.mapping = THREE.CubeUVReflectionMapping;
+        texture.colorSpace = THREE.LinearSRGBColorSpace;
+        texture.isF3DPMREMSource = true; texture.f3dPMREMSource = cubemap;
+        return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
+      }
+      return this._fromTexture('fromCubemap', cubemap, renderTarget);
     }
     async fromCubemapAsync(...args) { return this.fromCubemap(...args); }
     compileCubemapShader() {}
     compileEquirectangularShader() {}
-    dispose() {}
+    _fromTexture(method, texture, target) {
+      const renderer = this._renderer, previous = PMREM_CAPTURES.get(renderer);
+      let input = null;
+      if (!texture?.isRenderTargetTexture) {
+        if (texture?.onUpdate !== null) fail('UNSUPPORTED', 'PMREM input upload callbacks require their explicit source texture owner');
+        if (hasThreeWebGLTextureResidency(renderer._device, texture))
+          fail('UNSUPPORTED', 'PMREM input is already resident in a separate scene texture owner');
+        const owner = renderer._getSampledTextureInputs();
+        const lease = owner.captureDetachedBinding(texture, {webglVersioning: true});
+        let sources = PMREM_SOURCES.get(renderer);
+        if (!sources) PMREM_SOURCES.set(renderer, sources = new WeakSet());
+        sources.add(texture.source);
+        texture = owner.capturedTexture(lease); input = {owner, lease};
+        let bindings = PMREM_INPUTS.get(renderer);
+        if (!bindings) PMREM_INPUTS.set(renderer, bindings = new Map());
+        let binding = bindings.get(texture);
+        if (!binding) bindings.set(texture, binding = {owner, leases: new Set()});
+        binding.leases.add(lease);
+        input.release = () => {
+          binding.leases.delete(lease); if (!binding.leases.size) bindings.delete(texture);
+          owner.release(lease);
+        };
+      }
+      PMREM_CAPTURES.set(renderer, {generator: this._generator, input});
+      try { return this._generator[method](texture, target); }
+      finally {
+        if (previous) PMREM_CAPTURES.set(renderer, previous); else PMREM_CAPTURES.delete(renderer);
+        if (input) renderer.waitForGPU().then(input.release, input.release).catch(error => { renderer._deferredError ??= error; });
+      }
+    }
+    dispose() { this._generator.dispose(); }
   }
   return PMREMGenerator;
 }

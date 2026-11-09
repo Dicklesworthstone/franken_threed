@@ -1272,6 +1272,7 @@ export async function createGpuThreeScene(device,scene,{
       // already submitted; retire their cache before sharing that byte budget.
       releaseBatchHistory();
       textureOwner?.prepare(owned,{initialize:true});
+      await Promise.race([textureBindings.prepare(),stopped]);live();
       preparedShadowMode=programShadowMode;
       if(programShadowMode){
         const camera=programCamera??new three.Camera();

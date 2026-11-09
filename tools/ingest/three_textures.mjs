@@ -28,6 +28,12 @@ export class ThreeTextureError extends Error {
   constructor(code,message){super(`THREE_TEXTURE_${code}: ${message}`);this.name='ThreeTextureError';this.code='THREE_TEXTURE_'+code;}
 }
 const fail=(code,message)=>{throw new ThreeTextureError(code,message);};
+// GPU bakers must not start fresh CPU history for a texture already owned by
+// a WebGL scene pool. These weak keys observe ownership without owning pixels.
+const webglResidencies=new WeakMap(),webglSourceResidencies=new WeakMap();
+export const hasThreeWebGLTextureResidency=(device,texture)=>
+  (webglResidencies.get(device)?.get(texture)??0)>0||
+  (webglSourceResidencies.get(device)?.get(texture?.source)??0)>0;
 const integer=(v,min,max,label)=>{if(!Number.isSafeInteger(v)||v<min||v>max)fail('VALUE',`Invalid ${label}`);return v;};
 const instance=(value,name)=>typeof globalThis[name]==='function'&&value instanceof globalThis[name];
 // Same native downsample profile as gltf_textures.mjs. The source and destination
@@ -430,6 +436,11 @@ export function createGpuThreeTextures(device,{
   }
   function live(){if(disposed)fail('DISPOSED','Texture owner is disposed');if(terminal)throw terminal;}
   function drop(t){const r=records.get(t);if(!r)return;t.removeEventListener('dispose',r.listener);records.delete(t);
+    if(webglVersioning){
+      for(const [registry,key] of [[webglResidencies,t],[webglSourceResidencies,r.resource.source]]){
+        const owners=registry.get(device),count=owners.get(key)-1;if(count)owners.set(key,count);else owners.delete(key);
+      }
+    }
     if(--r.resource.refs===0){const a=r.resource;a.texture.destroy();textureBytes-=a.bytes;sources.get(a.source)?.delete(a.key);
       if(sources.get(a.source)?.size===0)sources.delete(a.source);}}
   function release(){for(const t of [...records.keys()])drop(t);
@@ -627,6 +638,9 @@ export function createGpuThreeTextures(device,{
           resource.refs++;drop(t);
           r={resource,version:-1,listener:()=>{if(busy)fail('REENTRANT','Cannot dispose source during upload');drop(t);}};
           records.set(t,r);t.addEventListener('dispose',r.listener);
+          if(webglVersioning)for(const [registry,key] of [[webglResidencies,t],[webglSourceResidencies,resource.source]]){
+            let owners=registry.get(device);if(!owners)registry.set(device,owners=new WeakMap());owners.set(key,(owners.get(key)??0)+1);
+          }
         }
         if(seed&&created){
           const encoder=native(()=>device.createCommandEncoder({label:label+'/preserve-copy'}));
@@ -699,7 +713,7 @@ export function createGpuThreeTextures(device,{
  * the same owner. Only bounded zero-initialized sampler defaults are private.
  */
 export function createThreeTextureBindings(device,state) {
-  const defaults=new Map();let disposed=false;
+  const defaults=new Map(),pendingBindings=new Set();let disposed=false;
   const fail=(code,message)=>state.fail(code,message);
   const dimension=t=>t?.isData3DTexture===true?'3d':(t?.isDataArrayTexture===true||t?.isCompressedArrayTexture===true)?'2d-array':t?.isCubeTexture===true?'cube':'2d';
   function live(){if(disposed)fail('DISPOSED','Source texture bindings are disposed');}
@@ -739,8 +753,12 @@ export function createThreeTextureBindings(device,state) {
     };
     if(state.textures.has(t)){
       const b=state.textures.get(t);
-      if(!b?.view||!b.sampler||b.version!==t.version||b.sourceVersion!==t.source.version)
+      if(!b?.view||!b.sampler||b.version!==t.version||!b.webglVersioned&&b.sourceVersion!==t.source.version)
         fail('TEXTURE','Supply a completed texture binding matching both texture and source upload versions');
+      if(b.ready){
+        if(!state.textureScan)fail('PREPARE','A captured borrowed texture is still preparing');
+        pendingBindings.add(b.ready);
+      }
       return checked(b);
     }
     if(!state.autoTextures)fail('TEXTURE','Supply an acknowledged binding or enable automatic textures');
@@ -771,6 +789,7 @@ export function createThreeTextureBindings(device,state) {
     return checked(result);
   }
   return Object.freeze({binding,placeholder,dimension,
+    async prepare(){const pending=[...pendingBindings];pendingBindings.clear();await Promise.all(pending);live();},
     dispose(){if(!disposed){disposed=true;for(const b of defaults.values())b.texture.destroy();defaults.clear();}},
   });
 }
