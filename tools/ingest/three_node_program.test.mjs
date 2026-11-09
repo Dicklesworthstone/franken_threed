@@ -138,7 +138,7 @@ test('lighting contexts retain nested source precedence and reject arbitrary con
   assert.notEqual(inspectThreeLightingContext(THREE, nested), null);
   assert.equal(inspectThreeLightingContext(THREE, N.context()), null);
   assert.equal(inspectThreeLightingContext(THREE, N.context(N.context())), null);
-  for (const context of [N.context({getUV: () => N.uv()}), N.context({getAO: ao}),
+  for (const context of [N.context({getOutput: output => output}), N.context({getAO: ao}),
     N.builtinAOContext(ao, N.float(1)), N.context(Object.defineProperty({}, 'getAO', {get() { assert.fail('accessor evaluated'); }}))])
     assert.throws(() => inspectThreeLightingContext(THREE, context), {code: 'THREE_NODE_PROGRAM_GRAPH'});
   const cycle = N.context(); cycle.node = cycle;

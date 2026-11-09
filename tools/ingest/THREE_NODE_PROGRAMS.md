@@ -167,6 +167,34 @@ at twenty-eight checkpoints match in Chromium 151.0.7922.34 / SwiftShader with
 zero GPU errors. These comparisons use the native F3D backend. Hardware
 performance remains unmeasured.
 
+### Texture UV and mip-level contexts
+
+Renderer, ordinary material and scene-pass `ContextNode` chains admit the pinned
+`getUV` and `getTextureLevel` construction hooks, plus boolean `forceUVContext`.
+The original builder invokes the hooks with the source texture nodes and builder;
+admission never evaluates them. Material values override renderer values, while
+PassNode retains its source merged-context cache. Explicit UVs and mip levels
+keep their source precedence; `forceUVContext` overrides explicit UVs, and a
+material's null texture hook masks the corresponding renderer hook.
+
+Returned node graphs use the existing texture, uniform and update owners. Uniform
+values remain live, and queued draws retain their captured values and shader
+identities. Renderer context replacement or `contextNode.needsUpdate` changes
+the source dynamic key. For node materials, replace the context object and mark
+`material.needsUpdate`; changing hooks inside the same context does not change
+the source material key, even if that context's version advances. Ordinary
+material context changes also need an independent source reconstruction boundary.
+Replacing a pass context requires `pass.needsUpdate` to refresh its cached
+composition. Arbitrary unversioned hook mutation is not a verified compatibility
+claim. Unsupported keys, accessor fields and custom traversal remain outside
+this profile.
+
+Ten focused tests compare complete generated shaders with the pinned builder
+and exercise ordinary-material queued uniforms, texture residency, callback
+identities and recursive pass context precedence/restoration. The recording
+device verifies captured commands and bytes; it does not execute shaders or
+establish raster equivalence or acceleration.
+
 ### Materials and node graphs
 
 Native programs preserve ordinary `onBeforeCompile` functions carried by
@@ -2041,7 +2069,7 @@ unfilterable or integer profiles beyond those admitted above still require
 additional native profiles. Sampled
 texture capture transactions reject reentrant texture capture from node updates
 or upload callbacks.
-The profile excludes shader context extensions and unregistered shadow lifecycles,
+The profile excludes other shader context extensions and unregistered shadow lifecycles,
 skinned or morph meshes,
 including per-instance morph textures; XR/multiview and layered ArrayCamera bundles;
 object render hooks outside the source lifecycle profile above.

@@ -23,9 +23,9 @@ export function inspectThreeNativeCamera(three, camera, code = 'CAMERA') {
     fail('Native ArrayCamera views require at most 256 ordinary perspective or orthographic children', code);
 }
 
-/** Source AO/GI contexts participate in material lighting, before BRDF and
- * output composition. Keep the original hooks for the retained builder; do
- * not evaluate them during admission or substitute a final-color operation.
+/** Source AO/GI and texture contexts participate in material construction,
+ * before lighting and output composition. Keep the original hooks for the
+ * retained builder; never evaluate them during admission.
  * Hook identity and ContextNode.version are structural, uniform values live.
  */
 export function inspectThreeLightingContext(three, context, code = 'GRAPH') {
@@ -48,8 +48,14 @@ export function inspectThreeLightingContext(three, context, code = 'GRAPH') {
     const hooks = [];
     for (const key of Reflect.ownKeys(data)) {
       const descriptor = Object.getOwnPropertyDescriptor(data, key);
-      if (!['getAO', 'getGI'].includes(key) || !('value' in descriptor) || typeof descriptor.value !== 'function')
-        fail('Native lighting contexts admit only source-builder getAO and getGI hooks', code);
+      if (!('value' in descriptor))
+        fail('Native context fields require ordinary data properties', code);
+      if (key === 'forceUVContext' && typeof descriptor.value === 'boolean' ||
+          ['getUV', 'getTextureLevel'].includes(key) && descriptor.value === null) {
+        hooks.push([key, descriptor.value]); hasHooks = true; continue;
+      }
+      if (!['getAO', 'getGI', 'getUV', 'getTextureLevel'].includes(key) || typeof descriptor.value !== 'function')
+        fail('Native contexts admit source AO/GI and texture UV/level hooks, with a boolean forceUVContext', code);
       let id = lightingHooks.get(descriptor.value);
       if (id === undefined) lightingHooks.set(descriptor.value, id = ++lightingHookSerial);
       hooks.push([key, id]); hasHooks = true;
