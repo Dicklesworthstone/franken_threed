@@ -141,6 +141,68 @@ test('uniform boolean-vector arrays retain every component through aggregate and
   }
 });
 
+test('uniform matrix arrays align each element without changing its column layout', () => {
+  for (const columns of [2, 3, 4]) for (const rows of [2, 3, 4]) {
+    const type = `mat${columns}x${rows}`, columnStride = rows === 2 ? 8 : 16;
+    const stride = Math.ceil(columns * columnStride / 16) * 16;
+    const r = program(minimalVS, F('color = vec4(frames[1][0][0] + lead + tail);',
+      `uniform float lead; uniform ${type} frames[2]; uniform float tail;`));
+    const by = Object.fromEntries(r.reflection.uniforms.map(u => [u.name, u]));
+    assert.equal(by.lead.offset, 64);
+    assert.equal(by.frames.offset, 80, type + ' array begins on a uniform alignment boundary');
+    assert.equal(by.frames.node.stride, stride);
+    assert.equal(by.frames.node.elem.colStride, columnStride);
+    assert.equal(by.frames.size, 2 * stride);
+    assert.equal(by.tail.offset, 80 + 2 * stride);
+    if (rows === 2) {
+      for (const stage of [r.vertex, r.fragment]) {
+        assert.ok(stage.includes(`struct f3d_uniform_${type} { @align(16) value: ${type}<f32>, };`));
+        assert.ok(stage.includes(`frames: array<f3d_uniform_${type}, 2>`));
+        assert.equal(stage.split(`struct f3d_uniform_${type} `).length - 1, 1);
+      }
+      assert.match(r.fragment, /f3d_u\.frames\[1\]\.value\[0\]\[0\]/);
+    } else assert.ok(r.fragment.includes(`frames: array<${type}<f32>, 2>`));
+  }
+});
+
+test('uniform matrix arrays support whole-array values and evaluate dynamic indices once', () => {
+  const r = program(minimalVS, F(`mat3x2 copy[2] = frames;
+  mat3x2 frame = frames[nextIndex()];
+  color = vec4(consume(frames) + frame[2].y + copy[1][1].x + float(calls));`,
+  `uniform mat3x2 frames[2];
+  int calls = 0; int nextIndex() { return calls++; }
+  float consume(mat3x2 value[2]) { return value[1][2].y; }`));
+  assert.match(r.fragment, /fn f3d_from_u_mat3x2_2_\(v: array<f3d_uniform_mat3x2, 2>\) -> array<mat3x2<f32>, 2>/);
+  assert.match(r.fragment, /r\[i\] = v\[i\]\.value;/);
+  assert.match(r.fragment, /var copy: array<mat3x2<f32>, 2> = f3d_from_u_mat3x2_2_\(f3d_u\.frames\);/);
+  assert.match(r.fragment, /consume\(f3d_from_u_mat3x2_2_\(f3d_u\.frames\)\)/);
+  assert.equal(r.fragment.match(/\[nextIndex\(\)\]/g)?.length, 1);
+  assert.match(r.fragment, /var frame: mat3x2<f32> = f3d_u\.frames\[nextIndex\(\)\]\.value;/);
+});
+
+test('nested uniform structs convert matrix arrays while retaining independent private layouts', () => {
+  const declarations = `struct FrameSet { float lead; mat3x2 frames[2]; bool active; };
+  struct Payload { FrameSet groups[2]; float tail; };
+  uniform Payload payload;`;
+  const r = program(minimalVS, F(`Payload copy = payload;
+  mat3x2 frames[2] = payload.groups[1].frames;
+  color = vec4(frames[1][2].y + copy.groups[0].frames[0][1].x + copy.tail);`, declarations));
+  const payload = r.reflection.uniforms.find(u => u.name === 'payload');
+  assert.equal(payload.offset, 64); assert.equal(payload.size, 208);
+  const groups = payload.node.fields.find(f => f.name === 'groups').node;
+  assert.equal(groups.stride, 96);
+  const fields = Object.fromEntries(groups.elem.fields.map(f => [f.name, f.node]));
+  assert.equal(fields.lead.offset, 0); assert.equal(fields.frames.offset, 16);
+  assert.equal(fields.frames.stride, 32); assert.equal(fields.frames.elem.colStride, 8);
+  assert.equal(fields.active.offset, 80);
+  assert.equal(payload.node.fields.find(f => f.name === 'tail').node.offset, 256);
+  assert.match(r.fragment, /struct FrameSet \{[\s\S]*?frames: array<mat3x2<f32>, 2>,/);
+  assert.match(r.fragment, /struct FrameSet_u \{[\s\S]*?frames: array<f3d_uniform_mat3x2, 2>,/);
+  assert.match(r.fragment, /r\.frames = f3d_from_u_mat3x2_2_\(v\.frames\);/);
+  assert.match(r.fragment, /f3d_from_u_mat3x2_2_\(f3d_u\.payload\.groups\[1\]\.frames\)/);
+  assert.match(r.fragment, /var copy: Payload = f3d_from_u_Payload\(f3d_u\.payload\);/);
+});
+
 test('aggregate equality enforces matching types and the ESSL 1.00 array boundary', () => {
   assert.throws(() => compileEsslStage('fragment', F('color = vec4(1.0);',
     'bool probe(float a[2], float b[3]) { return a == b; }')), /Cannot compare float\[2\] with float\[3\]/);

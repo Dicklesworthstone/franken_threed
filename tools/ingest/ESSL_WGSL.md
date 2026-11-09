@@ -19,7 +19,7 @@ not shipped), and the browser's own WGSL compiler is the final check.
 
 | Resource | Binding | Notes |
 | --- | --- | --- |
-| Uniform buffer | group 0, binding 0 | Every non-sampler uniform of both stages. `reflection.uniforms[*].node` gives each leaf's byte offset/stride. `bool` → `u32`; scalar/`vec2` arrays → `vec4` elements; structs `@align(16)`. Internal `f3d_target` (framebuffer width, height) at `reflection.targetOffset` when `gl_FragCoord` is read. |
+| Uniform buffer | group 0, binding 0 | Every non-sampler uniform of both stages. `reflection.uniforms[*].node` gives each leaf's byte offset/stride. `bool` → `u32`; scalar/`vec2` arrays → `vec4` elements; structs `@align(16)`. Two-row matrix arrays use aligned wrappers with their original 8-byte column stride. Internal `f3d_target` (framebuffer width, height) at `reflection.targetOffset` when `gl_FragCoord` is read. |
 | Textures | group 1, binding 2k / 2k+1 | Texture / sampler of the k-th sampler uniform (arrays expand per element; ESSL already requires constant indices). Shadow samplers → depth texture + comparison sampler. |
 
 Attributes keep declaration order (`layout(location)` honored; matrices take one
@@ -79,6 +79,16 @@ admitted. The source rules are in the
   section 5.7 of the respective Khronos specifications. Existing uniform layout
   conversion feeds comparisons; wrapped boolean-vector arrays now preserve all
   components for both whole-array and indexed reads.
+- Uniform arrays of `mat2`, `mat3x2` and `mat4x2` align their first element to
+  16 bytes and use 16-, 32- and 32-byte element strides respectively. Their
+  matrix columns remain 8 bytes apart; padding never becomes matrix data.
+  Indexed access, whole-array values, function arguments and nested uniform
+  structs unwrap to the original GLSL matrix type. Reflection drives the
+  ordinary uniform packer, including live edits without recompiling. The
+  rectangular types also work through source `UniformsGroup` blocks supplied
+  as typed std140 data, including conversion from 16-byte source columns to
+  8-byte WGSL columns. Pinned r186 `WebGLUniforms` only supplies ordinary
+  material upload setters for square matrix types.
 - Global stage I/O becomes private variables copied by the entry points.
 - `out`/`inout` arguments copy through temporaries in source evaluation order;
   side-effecting `?:`, `&&`, `||`, `++`/`--` and assignments inside expressions
@@ -119,6 +129,22 @@ Integer projected/offset sampling remains outside the admitted integer slice.
   emitted scalar helper control flow through a small test-only JS syntax adapter
   and check loop targets and scope diagnostics. These checks do not validate
   WGSL or establish rendered parity; Naga/browser validation remains separate.
+- Matrix-array regressions cover all nine matrix dimensions, neighboring scalar
+  uniforms, nested structs, whole-array reads and single evaluation of dynamic
+  indices. `three_program.test.mjs` checks global `mat2` arrays and live edits
+  through the material packer. Its nested struct-array values are compiler/packer
+  coverage only: this nested fixture has not established source pixel parity.
+  A separate compiler-level packing
+  test checks all six `mat3x2` components and its trailing padding. A production
+  `UniformsGroup` regression exercises rectangular arrays from typed std140
+  data and preserves the source's once-per-frame upload visibility.
+  `tests/e2e/webgpu_renderer/program_matrix_arrays.mjs` compares the pinned
+  WebGL renderer with the new WebGPU renderer for global `mat2[]` values and
+  typed std140 `mat3x2[]` blocks. All six initial/edit/replacement checkpoints
+  match exactly (2,304 RGBA bytes) on Chromium 153 SwiftShader, with no browser
+  or GPU errors. Rectangular block reads use direct dynamic indexing; the
+  local whole-array conversion remains covered by compiler/packer tests.
+  This is software GPU correctness evidence, not hardware or speedup evidence.
 - Struct-interface regressions execute the generated pack/unpack assignments
   with distinct scalar, vector and matrix-column values, and check locations,
   smooth/flat/centroid interpolation, identifier collisions, independent stage

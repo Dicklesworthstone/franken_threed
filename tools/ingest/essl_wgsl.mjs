@@ -285,8 +285,10 @@ function uniformRepr(t, shared) {
       const of = t.of;
       if ((of.k === 's') || (of.k === 'v' && of.n <= 2)) return {k: 'a', n: t.n, of: V(of.s === 'bool' ? 'uint' : of.s, 4), wrapped: of};
       if (of.k === 'v' && of.s === 'bool') return {k: 'a', n: t.n, of: V('uint', 4), wrapped: of};
-      if (of.k === 'm' && roundUp(16, layoutOf(of, shared).size) !== layoutOf(of, shared).size)
-        essError(`Uniform arrays of ${glslName(of)} are not supported`);
+      // Two-row matrices have 8-byte columns. Uniform arrays still require
+      // 16-byte alignment/stride: wrap each matrix without padding its columns.
+      // mat3x2 therefore occupies 32 bytes per array element, not 24 or 48.
+      if (of.k === 'm' && of.r === 2) return {k: 'a', n: t.n, of: {...of, arrayElement: true}, wrapped: of};
       if (of.k === 'a') essError('Arrays of arrays are not ESSL 3.00');
       return {k: 'a', n: t.n, of: uniformRepr(of, shared)};
     }
@@ -301,7 +303,10 @@ function layoutOf(t, shared) {
   switch (t.k) {
     case 's': return {align: 4, size: 4};
     case 'v': return {align: t.n === 2 ? 8 : 16, size: t.n * 4};
-    case 'm': { const col = layoutOf(V('float', t.r), shared); const stride = roundUp(col.align, col.size); return {align: col.align, size: stride * t.c, colStride: stride}; }
+    case 'm': {
+      const col = layoutOf(V('float', t.r), shared), stride = roundUp(col.align, col.size), size = stride * t.c;
+      return {align: t.arrayElement ? 16 : col.align, size: t.arrayElement ? roundUp(16, size) : size, colStride: stride};
+    }
     case 'a': { const e = layoutOf(t.of, shared); const stride = roundUp(e.align, e.size); return {align: e.align, size: stride * t.n, stride}; }
     case 'st': {
       const s = shared.structs.get(t.name);
@@ -360,6 +365,7 @@ class Unit {
     this.used = new Set();
     this.usedGlobals = new Set();
     this.helpers = new Map();
+    this.uniformMatrixElements = new Map();
     this.localStructs = [];
     this.temp = 0;
     this.discards = false;
@@ -545,7 +551,12 @@ class Unit {
     switch (r.k) {
       case 's': return WGSL_SCALAR[r.s];
       case 'v': return `vec${r.n}<${WGSL_SCALAR[r.s]}>`;
-      case 'm': return `mat${r.c}x${r.r}<f32>`;
+      case 'm': {
+        if (!r.arrayElement) return `mat${r.c}x${r.r}<f32>`;
+        const name = `f3d_uniform_mat${r.c}x${r.r}`;
+        this.uniformMatrixElements.set(name, r);
+        return name;
+      }
       case 'st': return this.shared.structs.get(r.name).wname + (r.uniform ? '_u' : '');
       case 'a': return `array<${this.wgslUniform(r.of)}, ${r.n}>`;
     }
@@ -607,7 +618,9 @@ class Unit {
       body.push(`@group(1) @binding(${b * 2}) var ${base}_texture: ${textureType(s.type)};`,
         `@group(1) @binding(${b * 2 + 1}) var ${base}_sampler: ${s.type.shadow ? 'sampler_comparison' : 'sampler'};`);
     });
-    const out = ['diagnostic(off, derivative_uniformity);', ...body, ...this.consts, ...this.privates, ...this.localStructs,
+    const matrixElements = [...this.uniformMatrixElements].map(([name, t]) =>
+      `struct ${name} { @align(16) value: mat${t.c}x${t.r}<f32>, };`);
+    const out = ['diagnostic(off, derivative_uniformity);', ...matrixElements, ...body, ...this.consts, ...this.privates, ...this.localStructs,
       ...[...this.helpers.values()], ...fnLines, ...entry];
     return out.join('\n') + '\n';
   }
@@ -1057,8 +1070,9 @@ class Unit {
         const r = uniformRepr(t, this.shared);
         if (!r.wrapped && !(t.of.k === 'st' && needsStructConversion(t.of.name, this.shared))) return code;
         const name = `f3d_from_u_${typeKey(t).replace(/\W/g, '_')}`;
+        const element = r.wrapped ? `v[i].${t.of.k === 'm' ? 'value' : 'xyzw'.slice(0, comps(t.of))}` : 'v[i]';
         if (!this.helpers.has(name)) this.helpers.set(name, [`fn ${name}(v: ${this.wgslUniform(r)}) -> ${this.wgsl(t)} {`, `  var r: ${this.wgsl(t)};`,
-          `  for (var i = 0; i < ${t.n}; i++) { r[i] = ${r.wrapped ? this.fromUniform(`v[i].${'xyzw'.slice(0, comps(t.of))}`, t.of) : this.fromUniform('v[i]', t.of)}; }`, '  return r;', '}'].join('\n'));
+          `  for (var i = 0; i < ${t.n}; i++) { r[i] = ${this.fromUniform(element, t.of)}; }`, '  return r;', '}'].join('\n'));
         return `${name}(${code})`;
       }
     }
@@ -1184,7 +1198,7 @@ class Unit {
     if (a.u) {
       const repr = uniformRepr(a.t, this.shared);
       if (repr.wrapped) {
-        const code = `${parts[0].c}[${index.c}].${'xyzw'.slice(0, comps(t))}`;
+        const code = `${parts[0].c}[${index.c}].${t.k === 'm' ? 'value' : 'xyzw'.slice(0, comps(t))}`;
         return {c: this.fromUniform(code, t), t};
       }
       return {c: `${parts[0].c}[${index.c}]`, t, u: true};

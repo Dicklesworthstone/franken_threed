@@ -316,6 +316,110 @@ test('aggregate equality: live ShaderMaterial uniforms and unseen runtime varian
   assert.match(second.program.fragment, /!f3d_equal_Payload\(/);
 });
 
+test('matrix-array packing retains live values and compiler-only nested layouts', t => {
+  // Global mat2[] values use the r186 material upload contract. The nested
+  // struct arrays below probe compiler/packer layout only: this nested fixture
+  // has not established source pixel parity.
+  const material = shader({glslVersion: T.GLSL3,
+    uniforms: {lead: {value: 17}, frames: {value: new Float32Array([1, 2, 3, 4, 5, 6, 7, 8])},
+      groups: {value: [{lead: 19, frames: [21, 22, 23, 24, 25, 26, 27, 28], tail: 29},
+        {lead: 31, frames: [41, 42, 43, 44, 45, 46, 47, 48], tail: 49}]}, tail: {value: 59}},
+    fragmentShader: `uniform float lead; uniform mat2 frames[2];
+      struct FrameSet { float lead; mat2 frames[2]; float tail; };
+      uniform FrameSet groups[2]; uniform float tail;
+      out vec4 color;
+      void main() { mat2 copy[2] = frames; FrameSet selected = groups[1];
+        color = vec4(copy[1][1].y, selected.frames[1][1].x, selected.tail, lead + tail); }`});
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  t.after(() => { support.dispose(); material.dispose(); mesh.geometry.dispose(); });
+  const compiled = support.compile(material, mesh), {reflection} = compiled.program;
+  const by = Object.fromEntries(reflection.uniforms.map(u => [u.name, u]));
+  const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
+  const pack = () => support.pack(reflection, support.refresh(material), mesh, camera, bytes, {});
+  const f32 = offset => view.getFloat32(offset, true);
+  const readFrames = (node, base = 0) => Array.from({length: 8}, (_, i) =>
+    f32(base + node.offset + Math.floor(i / 4) * node.stride + Math.floor(i % 4 / 2) * node.elem.colStride + i % 2 * 4));
+  pack();
+  assert.equal(by.frames.offset % 16, 0);
+  assert.equal(by.frames.node.stride, 16); assert.equal(by.frames.node.elem.colStride, 8);
+  assert.deepEqual(readFrames(by.frames.node), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(f32(by.lead.offset), 17); assert.equal(f32(by.tail.offset), 59);
+  const fields = Object.fromEntries(by.groups.node.elem.fields.map(f => [f.name, f.node]));
+  assert.equal(fields.frames.offset, 16); assert.equal(by.groups.node.stride, 64);
+  for (let i = 0; i < 2; i++) {
+    const base = by.groups.offset + i * by.groups.node.stride, value = material.uniforms.groups.value[i];
+    assert.deepEqual(readFrames(fields.frames, base), value.frames);
+    assert.equal(f32(base + fields.lead.offset), value.lead);
+    assert.equal(f32(base + fields.tail.offset), value.tail);
+    assert.deepEqual([...bytes.slice(base + 4, base + 16)], Array(12).fill(0), 'alignment padding is not source matrix data');
+  }
+  material.uniforms.frames.value[7] = 61;
+  material.uniforms.groups.value[1].frames[6] = 67;
+  material.uniforms.groups.value[1].tail = 71;
+  pack();
+  assert.equal(readFrames(by.frames.node)[7], 61);
+  const second = by.groups.offset + by.groups.node.stride;
+  assert.equal(readFrames(fields.frames, second)[6], 67);
+  assert.equal(f32(second + fields.tail.offset), 71);
+  assert.equal(support.compile(material, mesh), compiled, 'matrix values remain data, not program variants');
+});
+
+test('rectangular ESSL matrix arrays pack each column and leave element padding clear', () => {
+  // r186 WebGLUniforms only uploads square matrix types. This exercises the
+  // compiler/packing API's ESSL type support, not an upstream material claim.
+  const {reflection} = compileEsslProgram(
+    '#version 300 es\nin vec3 position; void main() { gl_Position = vec4(position, 1.0); }',
+    '#version 300 es\nprecision highp float; uniform float lead; uniform mat3x2 frames[2]; uniform float tail;' +
+      'out vec4 color; void main() { color = vec4(frames[1][2], lead, tail); }');
+  const by = Object.fromEntries(reflection.uniforms.map(u => [u.name, u]));
+  const mesh = new T.Mesh(), camera = new T.PerspectiveCamera(), bytes = new Uint8Array(reflection.uniformBufferSize);
+  const values = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  packThreeProgramUniforms(T, reflection, {lead: {value: 17}, frames: {value: values}, tail: {value: 19}}, mesh, camera, bytes);
+  const view = new DataView(bytes.buffer), at = by.frames.offset;
+  assert.equal(at, 16); assert.equal(by.frames.node.stride, 32); assert.equal(by.frames.node.elem.colStride, 8);
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(Array.from({length: 6}, (_, j) => view.getFloat32(at + i * 32 + j * 4, true)), [...values.slice(i * 6, i * 6 + 6)]);
+    assert.deepEqual([...bytes.slice(at + i * 32 + 24, at + (i + 1) * 32)], Array(8).fill(0));
+  }
+  assert.equal(view.getFloat32(by.tail.offset, true), 19);
+  mesh.geometry.dispose(); mesh.material.dispose();
+});
+
+test('UniformsGroup converts source std140 rectangular matrix arrays into compact draw data', t => {
+  // r186 accepts raw typed-array UniformsGroup data even though its ordinary
+  // WebGLUniforms setters do not accept non-square matrix uniform types.
+  const source = new Float32Array(32), values = Array.from({length: 12}, (_, i) => i + 1);
+  source[0] = 17; source[28] = 19;
+  for (let i = 0; i < 2; i++) for (let c = 0; c < 3; c++) for (let row = 0; row < 2; row++)
+    source[4 + i * 12 + c * 4 + row] = values[i * 6 + c * 2 + row];
+  const group = new T.UniformsGroup().setName('Matrices').add(new T.Uniform(source));
+  const material = new T.RawShaderMaterial({glslVersion: T.GLSL3, uniformsGroups: [group],
+    vertexShader: 'precision highp float; in vec3 position; void main() { gl_Position = vec4(position, 1.0); }',
+    fragmentShader: `precision highp float;
+      layout(std140) uniform Matrices { float lead; mat3x2 frames[2]; float tail; } matrices;
+      out vec4 color; void main() { mat3x2 copy[2] = matrices.frames;
+        color = vec4(copy[1][2], matrices.lead, matrices.tail); }`});
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  t.after(() => { support.dispose(); group.dispose(); material.dispose(); mesh.geometry.dispose(); });
+  const {program: {reflection}} = support.compile(material, mesh);
+  const by = Object.fromEntries(reflection.uniforms.map(u => [u.name, u]));
+  const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
+  const pack = () => support.pack(reflection, support.refresh(material), mesh, camera, bytes, {material});
+  const frames = by.matrices_frames, valueAt = i => view.getFloat32(frames.offset + Math.floor(i / 6) * frames.node.stride + i % 6 * 4, true);
+  pack();
+  assert.equal(group.__size, 128, 'the retained source group keeps std140 column/array padding');
+  assert.equal(reflection.uniformBufferSize, 96, 'each draw uses the reflected WGSL layout');
+  assert.equal(frames.offset, 16); assert.equal(frames.node.stride, 32);
+  assert.deepEqual(values.map((_, i) => valueAt(i)), values);
+  assert.equal(view.getFloat32(by.matrices_lead.offset, true), 17);
+  assert.equal(view.getFloat32(by.matrices_tail.offset, true), 19);
+  source[25] = 23;
+  pack(); assert.equal(valueAt(11), 12, 'a source group is uploaded once per render frame');
+  support.beginFrame(); pack(); assert.equal(valueAt(11), 23);
+});
+
 test('PMREM: r186 PMREMGenerator passes record against the host and compile with GL rows', async () => {
   const {createThreeProgramPMREM, pmremSourceComplete, pmremSourceKind} = await import('./three_program_pmrem.mjs');
   const cube = new T.CubeTexture([0, 1, 2, 3, 4].map(() => ({width: 32, height: 32})));
