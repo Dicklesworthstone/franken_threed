@@ -7,7 +7,7 @@ import {createWebGLRendererClass, createPMREMGeneratorClass} from './three_rende
 import {createThreePassSnapshots} from './three_pass_snapshot.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 const Renderer=createWebGLRendererClass(T,{maxDraws:64,maxBindings:64}), Generator=createPMREMGeneratorClass(T);
-function fixture(t){
+function fixture(t,{deferred=false}={}){
   const device=geometryDevice();Object.assign(device.limits,{maxTextureDimension2D:8192,maxBindingsPerBindGroup:1000});
   device.textures=[];device.textureWrites=[];
   device.createTexture=descriptor=>{const texture={dimension:'2d',depthOrArrayLayers:1,sampleCount:1,...descriptor,
@@ -23,7 +23,13 @@ function fixture(t){
   let configuration;
   const canvas={width:32,height:32,style:{},getContext:()=>({configure(value){configuration=value;},unconfigure(){},
     getCurrentTexture(){return device.createTexture({size:[32,32],format:configuration.format,usage:16});}})};
-  const renderer=new Renderer({canvas,device});t.after(()=>renderer.dispose());return {renderer,device};
+  let release;
+  const gpu={requestAdapter:()=>new Promise(resolve=>{release=()=>resolve({features:new Set(),requestDevice:async()=>device});})};
+  const SelectedRenderer=deferred?createWebGLRendererClass(T,{gpu,maxDraws:64,maxBindings:64}):Renderer;
+  const renderer=new SelectedRenderer({canvas,...(deferred?{}:{device})});
+  device.destroy=()=>{device.destroyed=true;};
+  t.after(async()=>{renderer.dispose();await renderer._disposePromise;});
+  return {renderer,device,release:()=>release()};
 }
 const drain=async renderer=>{await renderer.waitForGPU();await Promise.resolve();};
 
@@ -57,6 +63,37 @@ test('Sky uniforms and scene inputs are captured before queued source filtering'
  sky.material.uniforms.turbidity.value=999;sky.geometry.dispose();sky.material.dispose();generator.dispose();
  await drain(renderer);assert.ok(device.snapshots.flat().some(draw=>draw.pipeline.fragment.module.code.includes('turbidity')));
  assert.equal(renderer._passSnapshots.rootCount,0);output.dispose();
+});
+
+test('fromScene before device acquisition captures real targets, sigma and independently queued scenes',async t=>{
+ const {renderer,device,release}=fixture(t,{deferred:true}),room=new RoomEnvironment(),generator=new Generator(renderer);
+ const instances=room.children.find(object=>object.isInstancedMesh),selected=new T.WebGLRenderTarget(8,8);
+ renderer.setRenderTarget(selected);renderer.setClearDepth(.25);renderer.toneMapping=T.ACESFilmicToneMapping;
+ const first=generator.fromScene(room,0,.1,100,{size:16,renderTarget:selected});
+ assert.equal(renderer.initialized,false);assert.equal(first.isWebGLRenderTarget,true);assert.notEqual(first,selected);
+ assert.equal(first.texture.isF3DSceneEnvironment,undefined);
+ instances.count=2;instances.instanceMatrix.array[12]+=2;instances.instanceMatrix.needsUpdate=true;
+ const second=generator.fromScene(room,.2,.1,100,{size:16,position:new T.Vector3(1,2,3)});
+ assert.equal(second.isWebGLRenderTarget,true);assert.notEqual(second,first);
+ assert.equal(renderer.getRenderTarget(),selected);assert.equal(renderer.getClearDepth(),.25);
+ assert.equal(renderer.toneMapping,T.ACESFilmicToneMapping);assert.equal(device.submissions.length,0);
+ room.dispose();instances.dispose();room.clear();generator.dispose();
+ release();await drain(renderer);
+ const draws=device.snapshots.flat();
+ assert.ok(draws.some(draw=>draw.args[1]===6),'first accepted instance count survives later edits');
+ assert.ok(draws.some(draw=>draw.args[1]===2),'second accepted instance count survives disposal');
+ assert.ok(draws.some(draw=>draw.pipeline.fragment.module.code.includes('thetaMax')),'sigma filtering is queued before initialization');
+ assert.equal(renderer._passSnapshots.rootCount,0);assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ first.dispose();second.dispose();selected.dispose();
+});
+
+test('disposing a renderer during pre-init scene baking cancels pending resources',async t=>{
+ const {renderer,device,release}=fixture(t,{deferred:true}),room=new RoomEnvironment(),generator=new Generator(renderer);
+ const output=generator.fromScene(room,.04,.1,100,{size:16});
+ generator.dispose();renderer.dispose();release();await renderer._disposePromise;await Promise.resolve();
+ assert.equal(device.submissions.length,0);assert.equal(renderer._passSnapshots.rootCount,0);
+ assert.equal(renderer._passSnapshots.allocatedBytes,0);assert.equal(renderer._device,null,'cancellation before adapter readiness never acquires a device');
+ output.dispose();room.dispose();room.children.find(object=>object.isInstancedMesh).dispose();
 });
 
 import {createGpuBufferGeometry} from './gpu_buffer_geometry.mjs';
@@ -98,6 +135,20 @@ test('PMREM and ordinary WebGL geometry owners require disposal to transfer hist
  geometry.dispose();const captured=owner.capturePMREMScene(mesh,camera,device);captured.release();
  assert.throws(()=>createGpuBufferGeometry(device,geometry),/PMREM-captured attributes require disposal/);
  geometry.dispose();const next=createGpuBufferGeometry(device,geometry);next.dispose();resident.dispose();owner.dispose();
+});
+test('deferred device binding claims retained histories and rolls back a conflicting batch',()=>{
+ const device=geometryDevice(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(),scene=new T.Scene();
+ const first=new T.Mesh(new T.BoxGeometry(),new T.MeshBasicMaterial()),second=new T.Mesh(new T.BoxGeometry(),new T.MeshBasicMaterial());
+ first.frustumCulled=second.frustumCulled=false;scene.add(first,second);
+ const snapshot=owner.capturePMREMScene(scene,camera,null),resident=createGpuBufferGeometry(device,second.geometry);
+ assert.throws(()=>owner.bindDevice(device),/separate WebGL geometry owner/);
+ const rolledBack=createGpuBufferGeometry(device,first.geometry);
+ first.geometry.dispose();second.geometry.dispose();rolledBack.dispose();resident.dispose();
+ owner.bindDevice(device);snapshot.install();snapshot.release();
+ const accepted=owner.capturePMREMScene(scene,camera,device);accepted.release();
+ assert.throws(()=>createGpuBufferGeometry(device,first.geometry),/PMREM-captured attributes require disposal/);
+ assert.throws(()=>owner.bindDevice(geometryDevice()),/one renderer device/);
+ owner.dispose();first.geometry.dispose();second.geometry.dispose();first.material.dispose();second.material.dispose();
 });
 test('oversized scene arrays are rejected before retaining a history owner',()=>{
  const device=geometryDevice(),geometry=new T.BufferGeometry(),array=new Float32Array(3000);

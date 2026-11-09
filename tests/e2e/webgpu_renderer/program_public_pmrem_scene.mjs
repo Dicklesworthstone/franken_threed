@@ -36,7 +36,7 @@ const server = http.createServer(async (request, response) => {
   } catch (error) { response.writeHead(404).end(String(error)); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-async function capture(mode) {
+async function capture(mode, preinit = false) {
   const browser = await chromium.launch({headless: true, executablePath: process.env.CHROMIUM_PATH ?? '/opt/pw-browsers/chromium',
     args: ['--no-sandbox', '--no-zygote', '--single-process', '--renderer-process-limit=1', '--in-process-gpu',
       '--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']});
@@ -45,7 +45,7 @@ async function capture(mode) {
     page.on('pageerror', error => browserErrors.push(String(error)));
     page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
-    const result = await page.evaluate(async mode => {
+    const result = await page.evaluate(async ({mode, preinit}) => {
 
       const T = await import('/upstream/three.js/build/three.module.js');
       const {RoomEnvironment} = await import('/upstream/three.js/examples/jsm/environments/RoomEnvironment.js');
@@ -62,7 +62,7 @@ async function capture(mode) {
       const gen=new Generator(renderer), room=new RoomEnvironment(), sky=new Sky();
       const instances=room.children.find(object=>object.isInstancedMesh);
       try{
-        if(mode==='candidate'){await renderer.init();renderer._device.addEventListener('uncapturederror',e=>errors.push(e.error.message));}
+        if(mode==='candidate'&&!preinit){await renderer.init();renderer._device.addEventListener('uncapturederror',e=>errors.push(e.error.message));}
         renderer.setSize(96,64,false);renderer.outputColorSpace=T.LinearSRGBColorSpace;renderer.toneMapping=T.NoToneMapping;
         const bake=(root,sigma,options={})=>{
           const atlas=gen.fromScene(root,sigma,.1,200,{size:32,renderTarget:output,...options});
@@ -71,6 +71,10 @@ async function capture(mode) {
           targets.push(atlas);
         };
         bake(room,0);
+        if(mode==='candidate'&&preinit){
+          if(renderer.initialized)throw Error('Expected first bake before initialization');
+          renderer.init().then(()=>renderer._device.addEventListener('uncapturederror',e=>errors.push(e.error.message)));
+        }
         bake(room,.35);
         room.children.find(object=>object.isPointLight).intensity=250;
         instances.count=3;instances.instanceMatrix.array[12]+=5;
@@ -97,17 +101,19 @@ async function capture(mode) {
         for(const target of targets)target.dispose();output.dispose();renderer.dispose();canvas.remove();
       }
 
-    }, mode);
+    }, {mode, preinit});
     assert.deepEqual(browserErrors, [], `${mode} browser errors`); assert.deepEqual(result.errors, [], `${mode} GPU errors`);
     return {...result, browserVersion: browser.version()};
   } finally { await browser.close(); }
 }
 try {
-  const source = await capture('source'), candidate = await capture('candidate');
-  assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
+  const source = await capture('source');
   assert.notDeepEqual(source.frames[0], source.frames[1], 'sigma changes the source RoomEnvironment bake');
   assert.notDeepEqual(source.frames[1], source.frames[2], 'source instance, light, material and capture-position edits change the bake');
   assert.notDeepEqual(source.frames[3], source.frames[4], 'source Sky uniforms change the bake');
+  for (const preinit of [false, true]) {
+  const candidate = await capture('candidate', preinit);
+  assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
   const results = source.frames.map((reference, frame) => {
     const actual = candidate.frames[frame]; assert.equal(actual.length, reference.length);
     let maxError = 0, differingBytes = 0, over = 0;
@@ -119,7 +125,8 @@ try {
     assert.ok(over / (96 * 64) <= .02, `checkpoint ${frame}: ${over} pixels exceed the existing WebGL parity tolerance`);
     return {checkpoint: frame, maxError, differingBytes, pixelsOverTolerance: over};
   });
-  console.log(JSON.stringify({case: 'program_pmrem_public_scene', status: 'pass', results, rgbaBytes: source.frames.length * 96 * 64 * 4,
+  console.log(JSON.stringify({case: 'program_pmrem_public_scene', preinit, status: 'pass', results, rgbaBytes: source.frames.length * 96 * 64 * 4,
     route: candidate.route, nativeDrawCalls: candidate.draws,
     gpuErrors: 0, browserErrors: 0, browserVersion: candidate.browserVersion, sourcePin: pin}));
+  }
 } finally { await new Promise(resolve => server.close(resolve)); }

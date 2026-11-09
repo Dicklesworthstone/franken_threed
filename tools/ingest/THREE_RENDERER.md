@@ -531,16 +531,21 @@ aliases and unmarked CPU edits. An input already resident in the separate
 automatic WebGL scene texture pool refuses instead of reconstructing its prior
 GPU bytes. Custom input upload callbacks and ordinary GPU-written copy
 destinations are outside this detached-input profile; render-target inputs use
-the existing GPU target owner and its lifetime guards. Pre-initialization calls
-retain their previous delayed behavior.
+the existing GPU target owner and its lifetime guards. Texture-input calls before
+initialization retain their previous delayed behavior.
 
-Initialized `fromScene()` now executes the retained source's six camera views,
+`fromScene()` executes the retained source's six camera views,
 sigma pre-blur and GGX filtering into a real CubeUV target. A single immutable
 scene generation serves all six captured cameras, preserving accepted transforms,
 material values, lights, shader uniforms and CPU instance matrices/counts while
 later edits and disposal proceed. Actual pinned `RoomEnvironment` and `Sky`
 inputs are covered. The WebGL helper ignores `options.renderTarget` for this
-method, so the returned output remains a newly allocated source target.
+method, so the returned output remains a newly allocated source target. Calls
+before initialization return that same real target synchronously and capture all
+six views, sigma filtering and scene state before device acquisition completes.
+They enter the renderer's existing FIFO. Geometry histories bind to the real
+device before ordinary renderer uploads; a conflicting batch releases all newly
+acquired claims. Disposal cancels pending work and releases captured payloads.
 
 The admitted scene profile comprises rigid untextured meshes, CPU instances,
 ordinary source materials/shaders and unshadowed lights, with a solid or absent
@@ -609,19 +614,23 @@ checkpoint exceed channel delta 12 (0.0977%, within the existing 2% gate). The
 largest individual channel difference is 34. This is tolerance-based rendering
 evidence, not a hardware-performance measurement.
 
-The focused scene PMREM, existing public PMREM, pass snapshot and geometry suites
-pass **58 tests** (7, 10, 22 and 19 respectively). The new
+The focused scene PMREM, existing public PMREM, shader warmup and pass snapshot
+suites pass **49 tests** (10, 10, 6 and 23 respectively). The
 `three_renderer_pmrem_scene.test.mjs` cases exercise actual source
 RoomEnvironment/Sky capture, source attribute-range oracles, visibility/layer/
 frustum history, disposal-based owner transfer, pre-allocation budget rejection,
-and concurrent GPU waits across size changes and generator disposal.
+and concurrent GPU waits across size changes and generator disposal. Startup
+regressions cover adapter-gated scene acceptance, queued edits/disposal, cancellation
+and atomic device-history claim rollback.
 
 `tests/e2e/webgpu_renderer/program_public_pmrem_scene.mjs` compares five
-source/candidate captures (**122,880 RGBA bytes**): RoomEnvironment with sigma
+source captures against both initialized and pre-initialization candidates
+(**10 checkpoints, 245,760 RGBA bytes**): RoomEnvironment with sigma
 0 and 0.35, a queued room with changed instances/light/material/capture position,
 and two Sky uniform/sigma states. Source assertions establish that those edits
 visibly affect the result. The existing channel-delta-12 / 2% pixel gate is
-unchanged; over-threshold counts are 9, 5, 54, 1 and 0 of 6,144 pixels, at most
+unchanged; both startup paths have over-threshold counts of 9, 5, 54, 1 and 0
+of 6,144 pixels, at most
 **0.879%**. The run used Chromium 153.0.8010.0/SwiftShader, the pinned r186 inputs
 and `general-webgpu`, with zero browser/GPU errors. This is tolerance-based
 rendering evidence, not exact equality or a hardware performance result.

@@ -589,6 +589,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         live();
       }
       if (this.isWebGPURenderer) this._releaseDeviceEvents = observeRendererDevice(this, this._device);
+      // Synchronous WebGL PMREM captures can precede device acquisition. Bind
+      // their accepted geometry histories before any renderer bridge uploads.
+      this._passSnapshots.bindDevice(this._device);
       this._preferredFormat = p.outputType === THREE.HalfFloatType ? 'rgba16float' :
         p.outputType === THREE.UnsignedByteType ? 'bgra8unorm' :
         (defaultGpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.();
@@ -2567,8 +2570,8 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
  * Private reads survive later input disposal and share acknowledged upload
  * history with subsequent ordinary maps and panorama/cube backgrounds.
  *
- * Pre-initialization calls retain their earlier delayed source descriptors.
- * Initialized fromScene captures rigid untextured scenes (including CPU
+ * Texture-input calls before initialization retain their earlier descriptors.
+ * fromScene captures rigid untextured scenes even before initialization (including CPU
  * instances and source shader uniforms), runs all six source views and sigma
  * pre-blur, and returns a real target. Captured geometry keeps WebGL upload
  * history; transferring it to/from an ordinary scene owner requires disposal.
@@ -2667,13 +2670,13 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
     fromScene(scene, sigma = 0, near = 0.1, far = 100, options = {}) {
       if (!(scene instanceof THREE.Object3D)) fail('SOURCE', 'Expected a source Object3D (r186 renders any root)');
       const renderer = this._renderer;
-      if (renderer._initialized) {
+      {
         if (renderer.shadowMap.enabled || renderer.sortObjects && (renderer._opaqueSort || renderer._transparentSort))
           fail('UNSUPPORTED', 'PMREM scene capture requires no shadows or custom sorting');
         // One immutable scene generation serves the six source camera views.
         // Capture before the helper changes background/render state or queues a
         // draw, so unsupported mutable inputs fail at the public call boundary.
-        const snapshot = renderer._passSnapshots.capturePMREMScene(scene, new THREE.PerspectiveCamera(90, 1, near, far), renderer._device,
+        const snapshot = renderer._passSnapshots.capturePMREMScene(scene, new THREE.PerspectiveCamera(90, 1, near, far), renderer._device ?? renderer._parameters.device,
           {cube: true, position: options.position === undefined ? new THREE.Vector3() : options.position, sortObjects: renderer.sortObjects});
         const previous = PMREM_CAPTURES.get(renderer);
         PMREM_CAPTURES.set(renderer, {generator: this._generator, input: null, scene, snapshot});
@@ -2683,16 +2686,6 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
           snapshot.release();
         }
       }
-      const {size = 256, position = new THREE.Vector3(), renderTarget = null} = options;
-      if (renderTarget !== null) fail('UNSUPPORTED', 'Explicit PMREM targets require an initialized renderer');
-      const texture = new THREE.CubeTexture();
-      texture.name = 'PMREM.cubeUv';
-      texture.mapping = THREE.CubeUVReflectionMapping;
-      texture.colorSpace = THREE.LinearSRGBColorSpace;
-      texture.isF3DSceneEnvironment = true;
-      texture.f3dCapture = Object.freeze({scene, sigma, near, far, size, position: position.clone()});
-      texture.needsUpdate = true;
-      return {isRenderTarget: true, texture, dispose() { texture.dispose(); }};
     }
     async fromSceneAsync(...args) { return this.fromScene(...args); }
     fromEquirectangular(equirectangular, renderTarget = null) {

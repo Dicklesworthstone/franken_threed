@@ -371,6 +371,7 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
       release() { if (!record.pending) return; record.pending = false; collect(record); }});
   }
   return Object.freeze({capture,
+    bindDevice(device) { live(); pmremScenes?.bindDevice(device); },
     capturePMREMScene(root, camera, device, options) {
       live();
       pmremScenes ??= createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxValues,
@@ -432,7 +433,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
   const states = new WeakMap(), retained = new Set(), records = new Set(), histories = new Map(), resources = new Map();
   const duplicate = value => new (TYPED_ARRAYS.get(Object.getPrototypeOf(value)))(value);
   const token = {}, math = new Set([...MATH, 'Fog', 'FogExp2'].map(name => T[name]?.prototype).filter(Boolean));
-  let bytes = 0, historyBytes = 0, disposed = false;
+  let bytes = 0, historyBytes = 0, disposed = false, boundDevice = null;
   const field = (object, key) => {
     for (let value = object; value; value = Object.getPrototypeOf(value))
       if (Object.hasOwn(value, key)) return own(value, key);
@@ -440,8 +441,20 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
   const live = () => { if (disposed) fail('DISPOSED', 'PMREM scene snapshot owner is disposed'); };
   const releaseHistory = owner => {
     const history = histories.get(owner);
-    if (history) { histories.delete(owner); historyBytes -= history.array.byteLength; history.release(); }
+    if (history) { histories.delete(owner); historyBytes -= history.array.byteLength; history.release?.(); }
   };
+  function bindDevice(device) {
+    live();
+    if (!device || boundDevice && boundDevice !== device) fail('SCENE', 'PMREM geometry histories require one renderer device');
+    if (boundDevice === device) return;
+    const claimed = [];
+    try {
+      for (const [owner, history] of histories) if (!history.release)
+        claimed.push([history, claimWebGLGeometrySnapshot(device, owner, token)]);
+    } catch (error) { for (const [, release] of claimed) release(); throw error; }
+    for (const [history, release] of claimed) history.release = release;
+    boundDevice = device;
+  }
   function observe(resource, owners) {
     let record = resources.get(resource);
     if (!record) {
@@ -459,6 +472,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
   }
   function capture(root, camera, device, {cube = false, position = null, sortObjects = true} = {}) {
     live();
+    if (device) bindDevice(device);
     if (!(root instanceof T.Object3D) || !(camera instanceof T.Camera) || camera.isArrayCamera ||
         camera.updateMatrixWorld !== T.Camera.prototype.updateMatrixWorld)
       fail('SCENE', 'PMREM scene capture requires source objects and an ordinary camera');
@@ -560,7 +574,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       const next = {array: previous?.array ?? duplicate(array), version: previous?.version ?? version, clear: false, release: previous?.release};
       if (!previous) {
         addedHistory += array.byteLength;
-        next.release = claimWebGLGeometrySnapshot(device, owner, token);
+        if (boundDevice) next.release = claimWebGLGeometrySnapshot(boundDevice, owner, token);
       } else if (version > previous.version) {
         next.array = duplicate(previous.array); next.version = version;
         const ranges = owner.updateRanges.map(range => ({start: range.start, count: range.count, source: range}));
@@ -634,7 +648,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         const selected = owners.filter(owner => pending.has(owner)); if (selected.length) observe(resource, selected);
       }
     } catch (error) {
-      for (const [owner, history] of pending) if (!histories.has(owner)) history.release();
+      for (const [owner, history] of pending) if (!histories.has(owner)) history.release?.();
       throw error;
     }
     if (!state) { state = {root: view(root), views: new WeakMap(), record: null}; states.set(root, state); retained.add(state); }
@@ -668,7 +682,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     }
     return retain(camera);
   }
-  return {capture, has: root => states.has(root), get bytes() { return bytes + historyBytes; }, get roots() { return retained.size; },
+  return {capture, bindDevice, has: root => states.has(root), get bytes() { return bytes + historyBytes; }, get roots() { return retained.size; },
     retire(root) {
       const state = states.get(root); if (!state) return;
       for (const record of records) if (record.state === state && record.pending) fail('PENDING', 'PMREM scene still has queued captures');
