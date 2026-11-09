@@ -1851,6 +1851,34 @@ replacement/removal, shared versus object uniforms, inactive fog, source shadow
 ownership and texture versions across queued renders. Sampled-owner tests also
 check shared image histories, sampler domains and disposal identity.
 
+## Native texture preloading
+
+After `await renderer.init()`, `renderer.initTexture(texture)` synchronously
+preloads ready data and already immutable decoded inputs through the same texture
+owner used by native graphics and compute. It returns `undefined`, runs the
+upload callback before returning, preserves the uploaded pixels despite unmarked
+CPU edits, and retains distinct accepted versions while earlier draws prepare.
+Storage, render-target, detached-depth and framebuffer textures use their
+existing allocation owners. The still-shipped `initTextureAsync()` alias
+preserves its deprecation warning and initializes the renderer before calling the
+synchronous method; ingestion admits both public calls.
+
+Eight focused facade cases cover the source initialization error and callback
+identity/order, shared graphics/compute residency, queued versions, the async
+alias, native allocation owners, disposal/reuse, full native 2D uploads versus
+partial array layers, and rejected-capture cleanup. One routing case verifies
+both method names. The existing `native_tsl_texture_preload` browser comparison
+matches all seven checkpoints and 344,064 RGBA bytes exactly on Chromium
+153.0.8010.0, with native draws and zero browser/GPU errors. This is software
+correctness evidence, not a hardware performance measurement.
+
+Ordinary sampled version-zero defaults and `source.dataReady === false` remain
+outside the shared owner's admitted input profile. A first mutable HTML/canvas
+capture that needs asynchronous bitmap preparation is rejected synchronously and
+rolled back, including retirement of its eventual private bitmap. The async
+alias does not widen that profile or defer `onUpdate`. These remain
+source-supported compatibility gaps, not complete texture-source coverage.
+
 ## Native compressed texture inputs
 
 Source `CompressedTexture`, `CompressedArrayTexture` and

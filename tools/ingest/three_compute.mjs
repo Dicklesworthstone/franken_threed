@@ -727,6 +727,30 @@ export function withThreeCompute(Base, THREE) {
       if (!this._initialized) throw new Error('THREE.Renderer: .hasCompatibility() called before the backend is initialized. Use "await renderer.init();" before using this method.');
       return this._backend.hasCompatibility(name);
     }
+    initTexture(texture) {
+      if (!this._initialized) throw new Error('THREE.Renderer: .initTexture() called before the backend is initialized. Use "await renderer.init();" before using this method.');
+      check(this);
+      assertThreeNativeTextureWrite(this, texture);
+      const textures = this._getSampledTextureInputs();
+      // Initialization is a synchronous source upload boundary, including its
+      // onUpdate callback. The same immutable versions feed queued graphics and
+      // compute; a preload never creates a second texture residency authority.
+      textures.captureDispatch(() => {
+        if (texture?.isFramebufferTexture)
+          textures.prepareFramebuffer(texture, this.getRenderTarget()?.texture.type ?? THREE.UnsignedByteType);
+        const captured = textures.captureBinding({texture, isSampledTexture: true});
+        try {
+          if (textures.preparation([captured]))
+            fail('NOT_READY', 'Synchronous texture initialization requires an immutable decoded image or ready data');
+          textures.withDispatch([captured], () => textures.resolve(captured));
+        } finally { textures.release(captured); }
+      });
+    }
+    async initTextureAsync(texture) {
+      THREE.warnOnce('Renderer: "initTextureAsync()" has been deprecated. Use "initTexture()" and "await renderer.init();" when creating the renderer.');
+      await this.init();
+      this.initTexture(texture);
+    }
     /** Native graphics and compute observe the same captured texture versions.
      * This owner reuses the existing uploader and borrows target/storage images;
      * shader compilation does not initialize a compute pipeline or executor. */

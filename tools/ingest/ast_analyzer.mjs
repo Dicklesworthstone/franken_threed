@@ -1258,7 +1258,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     "clearColor", "clearDepth", "clearStencil", "setRenderTarget", "getRenderTarget", "getActiveCubeFace",
     "getActiveMipmapLevel", "setViewport", "getViewport", "setScissor", "getScissor", "setScissorTest",
     "getScissorTest", "setOpaqueSort", "setTransparentSort", "readRenderTargetPixelsAsync",
-    "copyTextureToTexture", "copyFramebufferToTexture", "initTexture", "initRenderTarget", "hasFeature",
+    "copyTextureToTexture", "copyFramebufferToTexture", "initTexture", "initTextureAsync", "initRenderTarget", "hasFeature",
     "hasFeatureAsync", "hasInitialized", "getMaxAnisotropy", "clearAsync", "clearColorAsync",
     "clearDepthAsync", "clearStencilAsync", "getClearDepth", "setClearDepth", "getClearStencil",
     // getCanvasTarget() exposes the owned canvas through its domElement and

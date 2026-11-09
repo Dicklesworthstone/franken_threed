@@ -20,6 +20,17 @@ function decision(analysis) {
   });
 }
 
+test('texture initialization and its retained async alias admit native renderer ownership', () => {
+  for (const call of ['renderer.initTexture(texture)', 'await renderer.initTextureAsync(texture)']) {
+    const result = analyzeModuleAst(`import * as THREE from 'three/webgpu';
+      const renderer = new THREE.WebGPURenderer();
+      const texture = new THREE.DataTexture(new Uint8Array(16), 2, 2);
+      texture.needsUpdate = true; ${call};`, moduleUrl);
+    assert.deepEqual(result.routingFacts.escapes, []);
+    assert.equal(decision(result).route, 'general-webgpu');
+  }
+});
+
 test("computed and optional native-context calls retain exact renderer ownership", () => {
   for (const constructor of ["WebGPURenderer", "WebGLRenderer"]) {
     for (const body of [

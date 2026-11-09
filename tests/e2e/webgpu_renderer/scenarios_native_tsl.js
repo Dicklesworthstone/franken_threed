@@ -1118,6 +1118,67 @@ export const nativeTSLScenarios = {
     };
     return result;
   },
+  native_tsl_texture_preload(T, renderer) {
+    const map = sampledTexture(T, 0, T.NoColorSpace);
+    let callbacks = 0;
+    map.onUpdate = function (texture) {
+      if (this !== map || texture !== map) throw Error('Texture preload lost callback identity');
+      callbacks++;
+    };
+    const preload = changed => {
+      const before = callbacks, result = renderer.initTexture(map);
+      if (result !== undefined || callbacks !== before + Number(changed))
+        throw Error('Texture preload must finish its upload callback synchronously and once');
+    };
+    preload(true);
+    // The first render must retain the already uploaded image, not this edit.
+    for (let i = 0; i < map.image.data.length; i += 4) map.image.data[i] = 255 - map.image.data[i];
+    preload(false);
+    const material = new T.MeshBasicNodeMaterial(); material.colorNode = T.TSL.texture(map).rgb;
+    const writer = scene(T), writeCamera = new T.OrthographicCamera(-1, 1, 1, -1, .1, 10);
+    writeCamera.position.z = 3; writer.add(new T.Mesh(new T.PlaneGeometry(2, 2), material));
+    const targets = Array.from({length: 2}, () => new T.RenderTarget(64, 64,
+      {depthBuffer: false, generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter}));
+    const result = {scene: scene(T), camera: camera(T, true)};
+    for (const [index, target] of targets.entries()) {
+      renderer.initRenderTarget(target);
+      const panel = new T.Mesh(new T.PlaneGeometry(1.8, 1.8), new T.MeshBasicNodeMaterial({map: target.texture}));
+      panel.position.x = index ? 1 : -1; result.scene.add(panel);
+    }
+    const compile = renderer.compileAsync.bind(renderer), render = renderer.render.bind(renderer);
+    renderer.compileAsync = async (...args) => {
+      const previous = renderer.getRenderTarget(), face = renderer.getActiveCubeFace(), mip = renderer.getActiveMipmapLevel();
+      try {
+        for (const target of targets) {renderer.setRenderTarget(target); await compile(writer, writeCamera);}
+      } finally {renderer.setRenderTarget(previous, face, mip);}
+      return compile(...args);
+    };
+    let frame = 0;
+    renderer.render = (...args) => {
+      frame++;
+      if (frame === 8 || frame === 10) {
+        for (let i = 1; i < map.image.data.length; i += 4) map.image.data[i] = 255 - map.image.data[i];
+        if (frame === 10) map.dispose(); else map.needsUpdate = true;
+        preload(true);
+      } else preload(false);
+      const previous = renderer.getRenderTarget(), face = renderer.getActiveCubeFace(), mip = renderer.getActiveMipmapLevel();
+      try {
+        for (const [index, target] of targets.entries()) {
+          renderer.setRenderTarget(target); render(writer, writeCamera);
+          if (index === 0 && (frame === 1 || frame === 13)) {
+            for (let i = 2; i < map.image.data.length; i += 4) map.image.data[i] = 255 - map.image.data[i];
+            map.needsUpdate = true; preload(true);
+          }
+        }
+      } finally {renderer.setRenderTarget(previous, face, mip);}
+      // Queued calls retain their versions even after an unmarked host edit.
+      for (let i = 0; i < map.image.data.length; i += 4) map.image.data[i] = (map.image.data[i] + 7) % 256;
+      return render(...args);
+    };
+    const dispose = renderer.dispose.bind(renderer);
+    renderer.dispose = () => {map.dispose(); for (const target of targets) target.dispose(); return dispose();};
+    return result;
+  },
   native_tsl_target_texture(T, renderer) {
     const {texture, uv, vec3} = T.TSL;
     const target = new T.RenderTarget(96, 72, {generateMipmaps: false, minFilter: T.LinearFilter, magFilter: T.LinearFilter});
