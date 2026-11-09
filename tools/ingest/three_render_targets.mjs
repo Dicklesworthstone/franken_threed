@@ -27,7 +27,9 @@
  * owner. Cube allocation extents follow the source face descriptors even when
  * setSize() changes only the logical target and viewport dimensions.
  * Layered RenderTarget and WebGLArrayRenderTarget colors retain native 2D-array
- * storage; the selected face integer addresses one array layer. Shared ordinary
+ * storage; the selected face integer addresses one array layer. Native array
+ * MRT colors keep independent mip counts and generation choices, with every
+ * allocated level retaining all array layers. Shared ordinary
  * depth is the source default, while useArrayDepthTexture or authored array
  * depth preserves independent layers. Native sampling borrows whole arrays;
  * WebGL array sampling retains every layer/mip in an oriented GPU replica.
@@ -291,9 +293,9 @@ export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = nul
     fail('SOURCE', 'Expected one to eight distinct target-owned color attachments');
   const colors = target.textures.map((texture, index) => inspectThreeRenderTargetColor(target, three, texture,
     cubeMipLevelCount, colorMipProfiles?.[index])), primary = colors[0];
-  if (colors.length > 1 && (primary.cube || colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1) &&
-      (primary.array || primary.volume)))
-    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D targets');
+  if (colors.length > 1 && (primary.cube || primary.volume &&
+      colors.some(color => color.generateMipmaps || color.mipLevelCount !== 1)))
+    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D or 2D-array targets');
   const bytes = primary.bytes + colors.slice(1).reduce((sum, color) => sum + color.colorBytes +
     (color.sampleCount === 4 ? color.baseColorBytes * 4 : 0), 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');

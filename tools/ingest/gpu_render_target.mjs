@@ -20,8 +20,9 @@
  * or precision conversion is inferred. Consumers choose their shader sample index.
  * colorFormats adds ordered MRT attachments under the same owner. Optional
  * colorMipLevelCounts/colorGenerateMipmaps retain each color's pyramid policy.
- * MRT pyramids currently require 2D color; each rendered mip must exist in every
- * color, while sampling and transfers select one color's levels. MSAA resolves
+ * MRT pyramids support 2D and ordinary 2D-array color; each rendered mip must
+ * exist in every color, while sampling and transfers select one color's levels.
+ * Array generation keeps each color and layer independent. MSAA resolves
  * into level zero before generation, and cannot render higher mip levels.
  * Frames expose colorViews/resolveTargets, retaining their primary aliases.
  * withAttachments borrows all resolved colors and optional sampled depth at once;
@@ -268,8 +269,8 @@ export function createGpuRenderTarget(device, options = {}) {
   if (array && depthArray && sampleDepth && sampleCount !== 1)
     fail('UNSUPPORTED', 'Sampled array depth requires one sample');
   const hasMipPyramids = colorGenerateMipmaps.some(Boolean) || colorMipLevelCounts.some(count => count > 1);
-  if (multiple && (cube || hasMipPyramids && (array || volume)))
-    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D targets');
+  if (multiple && (cube || hasMipPyramids && volume))
+    fail('UNSUPPORTED', 'Multiple color mip pyramids require 2D or 2D-array targets');
   if (cube && sampleCount !== 1)
     fail('UNSUPPORTED', 'Cube targets require one sample');
   if (requestedMipLevels !== undefined && (!Number.isSafeInteger(requestedMipLevels) || requestedMipLevels < 1))
@@ -781,7 +782,9 @@ export function createGpuRenderTarget(device, options = {}) {
       if (cube && w !== h) fail('SIZE', 'Cube faces must be square');
       if (w === width && h === height && nextLayers === layers) return api;
       if (version === Number.MAX_SAFE_INTEGER) fail('VERSION', 'Target version exhausted');
-      if (colorGenerateMipmaps.some((generate, index) => generate && levels(w, h, nextLayers, index) > 1)) requireMipFeatures();
+      const generatedColors = colorFormats.map((_, index) => index)
+        .filter(index => colorGenerateMipmaps[index] && levels(w, h, nextLayers, index) > 1);
+      if (generatedColors.length) requireMipFeatures(generatedColors);
       const bytes = cost(w, h, nextLayers);
       // Budget failures are retryable after existing retirement fences drain.
       if (bytes > maxBytes - allocated()) fail('BUDGET', 'Peak target allocation exceeds maxBytes');

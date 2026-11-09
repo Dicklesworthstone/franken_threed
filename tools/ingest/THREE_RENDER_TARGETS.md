@@ -464,6 +464,32 @@ General scenes, large meshes and callback-bearing roots keep the existing
 live-source path. This is **not** a complete per-call scene-state snapshot. Shader
 compiler and renderer admission restrictions also remain in force.
 
+## Native array MRT mipmaps
+
+Native 2D-array targets now support multiple color attachments with independent
+formats, mip counts and generation choices. Every color level retains the full
+array layer count. Rendering selects one layer and a mip present in every
+attachment; sampling, uploads and copies can select a longer chain on one color
+independently. Invalid layer or common-mip selections fail before allocation.
+
+Generated pyramids reduce each layer separately without mixing attachments.
+RGBA8, half-float and float32 colors keep their original precision; float32
+reduction uses the existing unfilterable texture-load path. Mixed integer and
+floating-point targets retain authored integer levels while generating only
+eligible floating-point colors, including after resize.
+
+Four-sample targets resolve each attachment's selected layer into level zero
+before generating mips. Nonzero render mips still require single-sample color
+and private depth. PassNode history colors each retain their own full layered
+pyramid, generation state and MSAA images. Queued generation leases, disposal
+and resize retirement continue to charge every live image to the shared budget.
+
+The focused array-MRT owner tests check descriptors, command order, sampling
+leases, exact allocation charges, independent history images and retirement.
+They use the existing recording-device fixtures and do not execute mip shaders
+or establish pinned-source pixel equivalence. Cube MRT and volume MRT mip chains
+retain their existing admission limits.
+
 ## Native volume targets and layered transfers
 
 `RenderTarget3D` and registered `WebGL3DRenderTarget` instances now own actual
