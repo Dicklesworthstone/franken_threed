@@ -415,6 +415,47 @@ test('transparent side compilation is callback-free and preserves source frame/r
   f.frame.frameId++; f.renderer.info.calls++; f.capture(); assert.deepEqual(counts, {frame: 2, render: 3, object: 12});
   assert.equal(material.side, THREE.DoubleSide);
 });
+for (const hooked of [false, true])
+test(`transparent DoubleSide precompilation retains restored source normals with object hooks=${hooked}`, t => {
+  const f = rig(t), material = f.material(), object = f.mesh(material);
+  material.transparent = true; material.side = THREE.DoubleSide;
+  material.colorNode = N.normalView.mul(.25).add(.35);
+  if (hooked) object.onAfterRender = () => { assert.equal(material.side, THREE.DoubleSide); };
+  // Pinned compileAsync queues references in renderObject, then constructs the
+  // programs after both temporary side selections and onAfterRender finish.
+  const queued = [];
+  THREE.Renderer.prototype.renderObject.call({_handleObjectFunction(object, material, scene, camera, lights, group, clipping, passId) {
+    queued.push({object, material, scene, camera, passId});
+  }}, object, f.scene, f.camera, object.geometry, material, null, null);
+  const expected = queued.map(item => {
+    const builder = new THREE.WGSLNodeBuilder(item.object, f.renderer);
+    builder.scene = item.scene; builder.camera = item.camera; builder.build();
+    return {vertex: builder.vertexShader, fragment: builder.fragmentShader};
+  });
+  const options = hooked ? {bundles: f.bundles} : {};
+  const prepared = f.capture({...options, uniforms: false});
+  assert.deepEqual(prepared.bindings.map(binding => ({vertex: binding.nodeProgram.vertex, fragment: binding.nodeProgram.fragment})), expected);
+  assert.ok(prepared.bindings.every(binding => binding.raster.side === THREE.DoubleSide));
+  assert.ok(prepared.bindings.every(binding => binding.nodeProgram.fragment.includes('@builtin( front_facing )')));
+  const descriptors = prepared.bindings.map(binding => binding.nodeProgram);
+  const rendered = f.capture(options);
+  assert.deepEqual(rendered.draws.map(draw => draw.binding.nodeProgram), descriptors,
+    'source pass caches keep their precompiled construction side while draw raster state changes');
+  assert.deepEqual(rendered.draws.map(draw => draw.binding.raster.side), [THREE.BackSide, THREE.FrontSide]);
+  assert.equal(material.side, THREE.DoubleSide);
+  material.needsUpdate = true;
+  const changed = f.capture(options);
+  assert.ok(changed.draws.every((draw, index) => draw.binding.nodeProgram !== descriptors[index]));
+  assert.ok(changed.draws.every(draw => !draw.binding.nodeProgram.fragment.includes('@builtin( front_facing )')),
+    'material invalidation reconstructs under the live per-draw side');
+  const renderedDescriptors = changed.draws.map(draw => draw.binding.nodeProgram);
+  const laterCompilation = f.capture({...options, uniforms: false});
+  assert.deepEqual(laterCompilation.bindings.map(binding => binding.nodeProgram), renderedDescriptors,
+    'compileAsync after a direct render also retains the original source construction side');
+  material.dispose();
+  assert.ok(f.capture({...options, uniforms: false}).bindings.every(binding =>
+    binding.nodeProgram.fragment.includes('@builtin( front_facing )')), 'disposal releases both side pass caches');
+});
 test('native transparent variants respect forceSinglePass, opacity and expanded capacity before updates', t => {
   for (const [transparent, side, forceSinglePass, expected] of [
     [true, THREE.DoubleSide, false, [THREE.BackSide, THREE.FrontSide]],

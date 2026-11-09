@@ -1913,13 +1913,14 @@ keeps its source meaning and selects one draw with culling disabled. Native
 transmission uses the separate scene-color and scene-wide back-face protocol
 described above.
 
-There is a remaining parity difference when the pinned reference explicitly
-precompiles a transparent `DoubleSide` normal-dependent graph. Its
-`_createObjectPipeline` queue retains each material after the source restores
-`DoubleSide`, so both queued side programs can compile with double-sided normals.
-The candidate retains separate back/front shader variants. Direct rendering
-without precompilation agrees on the side-specific normals. This is a documented
-precompilation compatibility gap, not complete parity for every call sequence.
+Transparent `DoubleSide` shader construction preserves source call order.
+`compileAsync()` queues material references and builds after the source restores
+`DoubleSide`, so both side programs use double-sided normals when precompilation
+comes first. Later draws retain those shaders while using their separate
+back/front raster sides. A direct render first builds side-specific shaders;
+later precompilation retains them. Material invalidation and disposal rebuild
+using the side observed at the new construction boundary. Queued uniforms and
+per-draw node updates continue to observe the actual draw side.
 
 Unsupported graph slots, material subclasses, bindings and attribute layouts
 produce explicit errors rather than silently selecting another renderer.
@@ -1963,16 +1964,21 @@ These are correctness results, not hardware performance measurements.
 `native_tsl_double_side_transparency` keeps the usual precompile step and checks
 constant-color overlaps, varied opacity and negative scale.
 `native_tsl_double_side_normals` explicitly renders without precompilation to
-check side-specific normals. The precompilation difference above remains
-reproducible with:
+check side-specific normals. Its permanent companion
+`native_tsl_double_side_normals_precompiled` checks the precompile-first sequence:
 
 ```sh
-node tests/e2e/webgpu_renderer/parity.mjs --force-precompile native_tsl_double_side_normals
+node tests/e2e/webgpu_renderer/parity.mjs native_tsl_double_side_normals_precompiled
 ```
 
-That call sequence differed on 13.39% of pixels in the pinned reference
-comparison; it is a known parity gap, not an adjusted tolerance or excluded
-candidate failure. Other scenarios retain precompilation by default.
+The previous implementation differed on 13.39% of pixels for that call sequence.
+The correction now matches complete vertex and fragment WGSL from the pinned
+builder after the actual source `renderObject()` queuing/restoration sequence,
+with and without object hooks. Capture and recording-device regressions cover
+both call orders, mirrored winding, independent queued uniforms, invalidation
+and disposal. Fresh browser pixels remain unverified: Chromium could not launch
+in the managed test environment because its Unix socket was blocked. Other
+scenarios retain precompilation by default.
 
 The owner/capture test files cover actual
 pinned shader generation and packing, callback contexts and frequencies,

@@ -592,22 +592,26 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     renderId};
   let programs = null;
   const context = {scene: root, camera, lights: Object.freeze([]), colorAttachmentCount: destination?.textures.length ?? 1,
-    lightingEnabled: renderer.lighting?.enabled !== false};
+    lightingEnabled: renderer.lighting?.enabled !== false, compilation: !uniforms};
   const withBinding = (binding, run) => {
     const previous = context.clippingContext, previousPass = context.passId, previousSide = binding.material.side;
-    const previousLights = context.lights;
+    const previousLights = context.lights, previousSidePass = context.sidePass;
     context.clippingContext = binding.clippingContext ?? null;
     context.passId = binding.passId;
+    context.sidePass = binding.colorSide !== undefined;
     if (binding.lights) context.lights = binding.lights;
     try {
-      if (binding.colorSide !== undefined) binding.material.side = binding.colorSide;
+      // compileAsync queues material references, not side snapshots. Source
+      // construction and node updates run after renderObject has restored the
+      // original side; only actual draws observe its temporary side selection.
+      if (uniforms && binding.colorSide !== undefined) binding.material.side = binding.colorSide;
       return shadowPass ? withThreeShadowMaterial(three, renderer, binding.material, binding.original, material => {
         material.side = binding.shadowSide; return run();
       }) : run();
     } finally {
-      if (binding.colorSide !== undefined) binding.material.side = previousSide;
+      if (uniforms && binding.colorSide !== undefined) binding.material.side = previousSide;
       context.clippingContext = previous; context.passId = previousPass;
-      context.lights = previousLights;
+      context.lights = previousLights; context.sidePass = previousSidePass;
     }
   };
   updateMatrices();

@@ -97,7 +97,7 @@ const WEBGPU_ONLY = new Set(["node_materials", "pbr_maps_independent", "pbr_maps
   "native_render_mips", "native_render_mips_updates",
   "native_matcap_materials", "native_matcap_updates", "native_matcap_instanced",
   "native_tsl_uniforms", "native_tsl_fragment", "native_tsl_object_targets", "native_tsl_double_side_transparency",
-  "native_tsl_double_side_normals",
+  "native_tsl_double_side_normals", "native_tsl_double_side_normals_precompiled",
   "native_tsl_buffer_arrays",
   "native_tsl_cpu_instanced_mesh",
   "native_tsl_instanced_geometry_indexed", "native_tsl_instanced_geometry_interleaved", "native_tsl_instanced_geometry_targets",

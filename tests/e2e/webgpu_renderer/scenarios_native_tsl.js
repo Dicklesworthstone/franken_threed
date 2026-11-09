@@ -97,9 +97,12 @@ export const nativeTSLScenarios = {
     const result = nativeTSLScenarios.native_tsl_double_side_transparency(T), N = T.TSL;
     for (const mesh of result.scene.children)
       mesh.material.colorNode = N.normalView.mul(.25).add(.35).mul(mesh.material.colorNode);
-    // Pinned r186 compileAsync loses per-pass material.side. Cold rendering
-    // checks side-specific normals; --force-precompile reproduces that source gap.
+    // Cold rendering builds under each temporary side. The companion case
+    // compiles first, after source has restored DoubleSide for both pass caches.
     return {...result, precompile: false};
+  },
+  native_tsl_double_side_normals_precompiled(T) {
+    return {...nativeTSLScenarios.native_tsl_double_side_normals(T), precompile: true};
   },
   native_tsl_cube_textures(T, renderer) {
     const N = T.TSL, size = 16;

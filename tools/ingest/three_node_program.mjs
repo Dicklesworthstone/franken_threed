@@ -1070,7 +1070,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('EFFECT', 'Native WebGPU clipping uses source ClippingGroup objects, not legacy material or renderer planes');
     if (typeof material.alphaToCoverage !== 'boolean')
       fail('RASTER', 'Native alpha-to-coverage requires the source boolean flag');
-    if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass)
+    if (material.transparent && material.side === three.DoubleSide && !material.forceSinglePass &&
+        !(context.compilation === true && context.sidePass === true))
       fail('RASTER', 'Transparent DoubleSide node graphs require captured FrontSide and BackSide draw variants');
     inspectThreeLightingContext(three, renderer.contextNode);
     const pipelineContext = inspectThreePipelineContext(three, renderer, material, object, effects);
@@ -1222,11 +1223,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.getPrototypeOf(node) !== three.MRTNode.prototype)
       fail('MRT', 'Native fragment output structs require the pinned output node construction');
   }
-  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null) {
+  function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side) {
     // Match the source's graph cache key. Uniform values never participate.
     // Object/material references remain separate cache dimensions, preserving
     // builder nodes which close over a particular source object.
-    return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), material.side,
+    return JSON.stringify([material.version, three.NodeMaterial.prototype.customProgramCacheKey.call(material), side,
       material.vertexColors, material.flatShading, material.transparent, material.blending, material.premultipliedAlpha,
       object.isMesh === true && material.wireframe === true ? [object.geometry.index?.array.length ?? null,
         object.geometry.attributes.position?.array.length ?? null, object.geometry.attributes.position?.count >= 65535] : null,
@@ -1314,8 +1315,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // physical layouts, aliases, graph fields and source material versions
     // continue through their existing admission and cache checks.
     const filtering = previousState?.materialVersion === material.version ? previousState.textureFiltering : null;
-    const reuseKey = filtering && previous.key !== key ? keyOf(preparedMaterial, object, context, lights, environment,
-      instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering) : key;
+    // Source RenderObjects also retain each pass's construction side until
+    // invalidation. Async compilation builds after DoubleSide is restored;
+    // rendering the same pass later changes culling, not its cached normals.
+    // Limit this normalization to captured side passes and keep every other
+    // layout/graph check, so invalidation still builds under the current side.
+    const side = context.sidePass === true && previousState?.sidePass === true &&
+      previousState.materialVersion === material.version ? previousState.materialSide : preparedMaterial.side;
+    const reuseKey = previous && previous.key !== key && (filtering || side !== preparedMaterial.side)
+      ? keyOf(preparedMaterial, object, context, lights, environment,
+        instanceSignature, skinSignature, morphSignature, fogKey, clippingKey, filtering, side) : key;
     if (previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
@@ -1599,6 +1608,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       integerTextures: textureNodes.some(node => integerTextureType(node.value)),
       storageTextures: textureNodes.some(node => node.isStorageTextureNode),
       textureNodes, textureReferences, textureFiltering, materialVersion: material.version,
+      materialSide: preparedMaterial.side, sidePass: context.sidePass === true,
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0});

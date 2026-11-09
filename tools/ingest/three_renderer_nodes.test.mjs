@@ -777,6 +777,33 @@ test('transparent native DoubleSide renders submit ordered side pipelines with i
   assert.ok(nativeDraws(f.device).at(-1).pipeline.fragment.module.code.includes('@builtin( front_facing )'));
 });
 
+test('precompiled transparent DoubleSide normals survive queued side pipelines and material invalidation',async t=>{
+  const f=fixture(t);f.material.transparent=true;f.material.side=T.DoubleSide;f.mesh.scale.x=-1;
+  f.material.colorNode=T.TSL.normalView.mul(.25).add(.35).mul(f.tint);
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(nativeDraws(f.device).length,0);
+  f.renderer.render(f.scene,f.camera);
+  f.tint.value.setRGB(.875,.625,.375);f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  assert.ok(draws.every(draw=>draw.pipeline.fragment.module.code.includes('@builtin( front_facing )')),
+    'source compileAsync builds after restoring DoubleSide and retains that shader in each pass cache');
+  assert.ok(draws.every(draw=>draw.pipeline.primitive.cullMode==='back'));
+  assert.deepEqual(draws.map(draw=>draw.pipeline.primitive.frontFace),['ccw','cw','ccw','cw']);
+  assert.ok(draws.slice(0,2).every(draw=>containsColor(draw,[.125,.375,.625])));
+  assert.ok(draws.slice(2).every(draw=>containsColor(draw,[.875,.625,.375])));
+  assert.equal(draws[0].pipeline,draws[2].pipeline);assert.equal(draws[1].pipeline,draws[3].pipeline);
+  f.material.needsUpdate=true;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const rebuilt=nativeDraws(f.device).slice(-2);
+  assert.ok(rebuilt.every(draw=>!draw.pipeline.fragment.module.code.includes('@builtin( front_facing )')));
+  await f.renderer.compileAsync(f.scene,f.camera);
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  assert.deepEqual(nativeDraws(f.device).slice(-2).map(draw=>draw.pipeline),rebuilt.map(draw=>draw.pipeline),
+    'later compilation cannot replace already constructed side-specific normals without invalidation');
+  assert.equal(f.material.side,T.DoubleSide);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('compilation runs no node updates; logical source callbacks run once per visible draw before awaits',async t=>{
   const f=fixture(t),calls=[],frame=f.renderer._nodes.nodeFrame;
   const other=new T.Mesh(f.mesh.geometry,f.material);other.position.x=.5;f.scene.add(other);
