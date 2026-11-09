@@ -188,7 +188,8 @@ original source material identity. Ordinary materials also enter this path when
 they use bump, displacement or baked light maps, Basic/Lambert/Phong material
 `envMap`, or Physical sheen, iridescence, anisotropy, retroreflectivity,
 transmission or dispersion and their maps. They require no authored node slot or
-application rewrite. Other materials keep their existing fixed rendering path.
+application rewrite. Other materials keep their existing fixed rendering path
+unless they are companions in a mixed native scene, as described below.
 When one material group on a mesh needs native shading, its other groups use the
 same source library conversion and geometry owner. All selected groups must pass
 admission before any node update runs. Custom material subclasses and overridden
@@ -232,6 +233,32 @@ fixed-path image upload histories remain live; metadata and custom value objects
 retain their source identities. Exotic material-array selectors and custom
 accessor-backed values preserve their prior live behavior. This is a material
 snapshot, not a deep snapshot of the entire mutable scene.
+
+Mixed ordinary-material and authored-node `Scene` draws now share the existing
+source-ordered native capture owner. Accepted renders retain ordinary geometry,
+world matrices, material values, draw membership and sorting across deferred
+shader preparation. Earlier draws retain their pre-update inputs; later draws
+observe preceding `NodeFrame` effects, including replacement geometry selected
+at the source draw boundary. Shared attributes retain source upload generations,
+partial ranges and the stale GPU bytes of unrequested CPU edits. Cold and warm
+bundle updates preserve their ordering relative to ordinary companions.
+
+Ordinary rigid fixed scenes can enter this mixed route with earlier renders
+still queued. A successfully promoted root keeps its capture owner after its
+authored nodes are removed. Failed admission does not change that ownership or
+prevent the former fixed scene from rendering again. Late transitions involving
+an uncaptured legacy fixed instanced, deformed or shadow attribute history are
+still blocked by `THREE_NODE_PROGRAM_CHANGED`; those owners have no transferable
+raw upload history. This remains a compatibility gap. Mixed non-`Scene` roots
+retain their existing binding behavior.
+
+The `native_mixed_snapshots.mjs` browser cases compare accepted-input mutations
+and source-ordered node/shared-attribute updates against pinned r186 WebGPU.
+Both cases match exactly across seven frames each (688,128 RGBA bytes) on
+Chromium 153 SwiftShader with no browser or GPU errors. Source JavaScript still
+constructs shaders and supplies callback semantics; the new WebGPU backend
+submits these draws. These checks establish software GPU correctness, with no
+hardware performance claim.
 
 Use `MeshBasicNodeMaterial`, or an unlit base `NodeMaterial`, with `colorNode`,
 `positionNode`, `vertexNode`, `fragmentNode`, `opacityNode`, `alphaTestNode` and

@@ -185,3 +185,183 @@ test('fixed ArrayCamera views use accepted matrices and child layer selections',
   assert.deepEqual(fixedPackets(f.device).map(({words}) => words.slice(0, 16)), expected);
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+function addNativeMesh(t, f, node = T.TSL.vec3(.25, .5, .75), parent = f.scene) {
+  const material = new T.MeshBasicNodeMaterial(), geometry = new T.PlaneGeometry();
+  material.colorNode = node;
+  const mesh = new T.Mesh(geometry, material); mesh.frustumCulled = false; parent.add(mesh);
+  t.after(() => { geometry.dispose(); material.dispose(); });
+  return mesh;
+}
+const nativePackets = device => device.snapshots.flat().filter(draw => draw.streams.size && draw.pipeline.vertex.entryPoint === 'main');
+function uniformBlocks(draw) {
+  const blocks = [];
+  for (const {group, offsets} of draw.groups.values()) {
+    const layout = group.layout.entries.filter(entry => entry.buffer?.type === 'uniform').sort((a, b) => a.binding - b.binding);
+    for (const [index, entry] of layout.entries()) {
+      const resource = group.entries.find(value => value.binding === entry.binding).resource, bytes = draw.contents.get(resource.buffer);
+      const offset = (resource.offset ?? 0) + (offsets[index] ?? 0);
+      blocks.push([...new Float32Array(bytes.buffer, bytes.byteOffset + offset, resource.size / 4)]);
+    }
+  }
+  return blocks;
+}
+const colorIn = (draw, color) => uniformBlocks(draw).some(words =>
+  words.some((_, i) => color.every((value, j) => words[i + j] === value)));
+const worldX = draw => uniformBlocks(draw).find(words => words.length === 20)[16];
+const vertex = draw => {
+  const bytes = draw.contents.get(draw.streams.get(0));
+  return [...new Float32Array(bytes.buffer, bytes.byteOffset, 3)];
+};
+
+test('mixed node and ordinary draws keep accepted pose, material, geometry and membership through preparation', async t => {
+  const f = fixture(t); f.renderer.sortObjects = false; f.mesh.frustumCulled = false;
+  addNativeMesh(t, f);
+  const position = f.geometry.attributes.position;
+  await f.renderer.init();
+  f.mesh.position.x = .25; position.setX(0, .125);
+  f.renderer.render(f.scene, f.camera);
+  f.mesh.position.x = .75; position.setX(0, .625); position.needsUpdate = true;
+  f.material.color.setRGB(.75, .5, .25);
+  f.renderer.render(f.scene, f.camera);
+  const replacement = new T.Mesh(new T.PlaneGeometry(), new T.ShaderMaterial());
+  t.after(() => { replacement.geometry.dispose(); replacement.material.dispose(); });
+  f.mesh.position.x = 9; f.mesh.updateMatrixWorld(); f.mesh.geometry = null;
+  f.material.color.setRGB(1, 0, 0); position.setX(0, 99);
+  f.scene.remove(f.mesh); f.scene.add(replacement);
+  await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 4);
+  assert.deepEqual([worldX(packets[0]), worldX(packets[2])], [.25, .75]);
+  assert.deepEqual([vertex(packets[0])[0], vertex(packets[2])[0]], [.125, .625]);
+  assert.ok(colorIn(packets[0], [.125, .375, .625])); assert.ok(colorIn(packets[2], [.75, .5, .25]));
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._pending.length, 0);
+});
+
+for (const transparent of [false, true]) test(`mixed captures keep NodeFrame effects between source draws (transparent=${transparent})`, async t => {
+  const f = fixture(t); f.renderer.sortObjects = false; f.mesh.frustumCulled = false;
+  f.material.transparent = transparent;
+  const position = f.geometry.attributes.position; position.setX(0, .125);
+  let updates = 0, after = 0;
+  const node = T.TSL.uniform(.5).onObjectUpdate(() => {
+    updates++; f.material.color.setRGB(.625, .375, .125);
+    f.mesh.matrixWorld.elements[12] = 7; second.matrixWorld.elements[12] = .5;
+    position.setX(0, .875); position.needsUpdate = true;
+    return .5;
+  });
+  node.updateAfterType = 'object'; node.updateAfter = () => { after++; f.material.color.setRGB(.75, .5, .25); };
+  const native = addNativeMesh(t, f, T.TSL.vec3(node)); native.material.transparent = transparent;
+  const secondGeometry = new T.PlaneGeometry(); secondGeometry.setAttribute('position', position);
+  const second = new T.Mesh(secondGeometry, f.material); second.frustumCulled = false; f.scene.add(second);
+  t.after(() => secondGeometry.dispose());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  assert.deepEqual([updates, after], [1, 1], 'source node lifecycle completes synchronously');
+  f.mesh.matrixWorld.elements[12] = 9; second.matrixWorld.elements[12] = 9;
+  f.material.color.setRGB(1, 0, 0); position.setX(0, 99);
+  await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 3);
+  assert.deepEqual([worldX(packets[0]), worldX(packets[2])], [0, .5]);
+  assert.ok(colorIn(packets[0], [.125, .375, .625])); assert.ok(colorIn(packets[2], [.75, .5, .25]));
+  assert.deepEqual([vertex(packets[0])[0], vertex(packets[2])[0]], [.125, .125],
+    'a shared attribute uploads once per source render, before the intervening node writes');
+  assert.deepEqual([updates, after], [1, 1], 'deferred preparation never replays node effects');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('fixed-to-mixed transition shares uploaded attribute generations and preserves partial ranges', async t => {
+  const f = fixture(t); f.renderer.sortObjects = false; f.mesh.frustumCulled = false;
+  const position = f.geometry.attributes.position; position.array.fill(.125);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  // The first fixed request is still queued. Changing CPU bytes alone cannot
+  // initialize a second upload history when the next scene gains a node draw.
+  position.array[0] = 99; position.array[1] = 77;
+  const native = addNativeMesh(t, f); native.geometry = f.geometry;
+  f.renderer.render(f.scene, f.camera);
+  position.array[0] = .625; position.addUpdateRange(0, 1); position.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  f.scene.remove(native); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  const packets = f.device.snapshots.flat().filter(draw => draw.streams.size);
+  assert.equal(packets.length, 6);
+  assert.equal(packets[0].pipeline.vertex.entryPoint, 'vertex_main');
+  assert.ok(packets.slice(1).every(draw => draw.pipeline.vertex.entryPoint === 'main'));
+  assert.deepEqual(packets.map(vertex), [[.125, .125, .125], [.125, .125, .125], [.125, .125, .125],
+    [.625, .125, .125], [.625, .125, .125], [.625, .125, .125]]);
+  assert.equal(position.updateRanges.length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('mixed source updates can replace a later companion geometry before its physical draw', async t => {
+  const f = fixture(t); f.renderer.sortObjects = false; f.mesh.frustumCulled = false;
+  const original = new T.PlaneGeometry(), replacement = new T.PlaneGeometry();
+  original.attributes.position.array.fill(.125); replacement.attributes.position.array.fill(.625);
+  let calls = 0;
+  addNativeMesh(t, f, T.TSL.vec3(T.TSL.uniform(.5).onObjectUpdate(() => {
+    calls++; later.geometry = replacement; return .5;
+  })));
+  const later = new T.Mesh(original, f.material); later.frustumCulled = false; f.scene.add(later);
+  t.after(() => { original.dispose(); replacement.dispose(); });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  assert.equal(calls, 1); later.geometry = null; replacement.attributes.position.array.fill(99);
+  await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 3);
+  assert.deepEqual(vertex(packets[2]), [.625, .625, .625]);
+  assert.equal(calls, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('mixed source precompilation retains restored DoubleSide normals across queued draws', async t => {
+  const f = fixture(t); f.renderer.sortObjects = false;
+  const native = addNativeMesh(t, f, T.TSL.normalView.mul(.25).add(.35));
+  native.material.transparent = true; native.material.side = T.DoubleSide; native.scale.x = -1;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 6);
+  const sides = [packets[1], packets[2], packets[4], packets[5]];
+  assert.ok(sides.every(draw => draw.pipeline.fragment.module.code.includes('@builtin( front_facing )')));
+  assert.deepEqual(sides.map(draw => draw.pipeline.primitive.frontFace), ['ccw', 'cw', 'ccw', 'cw']);
+  assert.equal(sides[0].pipeline, sides[2].pipeline); assert.equal(sides[1].pipeline, sides[3].pipeline);
+  native.material.needsUpdate = true; f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.ok(nativePackets(f.device).slice(-2).every(draw => !draw.pipeline.fragment.module.code.includes('@builtin( front_facing )')));
+  assert.equal(native.material.side, T.DoubleSide); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('mixed capture retains cold and warm bundle update ordering before ordinary companions', async t => {
+  const f = fixture(t); f.mesh.frustumCulled = false;
+  const group = new T.BundleGroup(); group.static = false; f.scene.add(group);
+  let calls = 0;
+  addNativeMesh(t, f, T.TSL.vec3(T.TSL.uniform(.5).onObjectUpdate(() => {
+    calls++; f.material.color.setRGB(calls / 4, .375, .625); f.mesh.matrixWorld.elements[12] = calls / 4; return .5;
+  })), group);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); f.renderer.render(f.scene, f.camera);
+  f.material.color.setRGB(1, 0, 0); f.mesh.matrixWorld.elements[12] = 9;
+  await drain(f.renderer);
+  const packets = nativePackets(f.device); assert.equal(packets.length, 4);
+  // Bundle node updates precede ordinary draws; their recorded GPU commands
+  // execute afterward. Preserve both orders on cold and warm calls.
+  assert.deepEqual([worldX(packets[0]), worldX(packets[2])], [.25, .5]);
+  assert.ok(colorIn(packets[0], [.25, .375, .625])); assert.ok(colorIn(packets[2], [.5, .375, .625]));
+  assert.equal(calls, 2); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('application material fields on non-renderable groups do not become mixed scene draws', async t => {
+  const f = fixture(t), group = new T.Group(); group.material = f.material; f.scene.add(group);
+  addNativeMesh(t, f);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(nativePackets(f.device).length, 2);
+  assert.equal(group.material, f.material); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a refused legacy fixed instance transition preserves its prior route and GPU-stale bytes', async t => {
+  const f = fixture(t), instance = new T.InstancedMesh(f.geometry, f.material, 1);
+  instance.frustumCulled = false; f.scene.remove(f.mesh); f.scene.add(instance);
+  const position = f.geometry.attributes.position; position.array.fill(.125);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  // Legacy generated instance uploads have no transferable raw capture. A
+  // native owner must not interpret an unrequested CPU edit as fresh content.
+  position.array[0] = 99;
+  const native = addNativeMesh(t, f);
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer._pending.length, 0);
+  f.scene.remove(native); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const packets = f.device.snapshots.flat().filter(draw => draw.streams.size);
+  assert.equal(packets.length, 2); assert.deepEqual(packets.map(vertex), [[.125, .125, .125], [.125, .125, .125]]);
+});

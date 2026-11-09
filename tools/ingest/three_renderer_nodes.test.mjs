@@ -92,15 +92,21 @@ test(`native ${kind} rendering keeps WebGL upload callbacks inert through admiss
   }),[...Array.from({length:perRender},()=>[.125,.125]),...Array.from({length:perRender},()=>[.625,.125])]);
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
-test('native inert upload callbacks do not bypass the shared fixed/authored history guard',async t=>{
+test('native inert upload callbacks share captured history across ordinary and authored draws',async t=>{
   const f=fixture(t),ordinary=new T.Mesh(f.mesh.geometry,new T.MeshBasicMaterial());
   ordinary.frustumCulled=f.mesh.frustumCulled=false;f.scene.add(ordinary);
-  Object.defineProperty(f.mesh.geometry.attributes.position,'onUploadCallback',{
+  const position=f.mesh.geometry.attributes.position;position.array.fill(.125);
+  Object.defineProperty(position,'onUploadCallback',{
     get(){assert.fail('ownership admission must not read a native-inert callback');},
   });
-  await f.renderer.init();
-  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_CHANGED'});
-  assert.equal(f.device.submissions.length,0);assert.equal(f.renderer._nodeCaptureBytes,0);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  position.array.fill(99);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,4);
+  assert.ok(draws.every(draw=>{
+    const bytes=draw.contents.get(draw.streams.get(0));
+    return new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4).every(value=>value===.125);
+  }));
+  assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 test('native custom object dispatch captures queued prepasses and skips source items without replay',async t=>{
@@ -834,13 +840,14 @@ test('queued graph replacement preserves the earlier shader and later visibility
   assert.equal(f.renderer.info.f3d.presentedRenders,3);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
-test('native and fixed meshes share native depth sorting even when material creation order disagrees',async t=>{
-  const f=fixture(t);const fixed=new T.Mesh(new T.PlaneGeometry(),new T.MeshBasicMaterial({color:0xff0000}));
-  // The native material was created first, but the fixed object is nearer.
+test('native and ordinary meshes share captured depth sorting even when material creation order disagrees',async t=>{
+  const f=fixture(t);const fixed=new T.Mesh(new T.PlaneGeometry(),new T.MeshBasicMaterial({color:new T.Color(.875,.625,.125)}));
+  // The authored material was created first, but the ordinary object is nearer.
   fixed.position.z=.5;f.scene.add(fixed);
   await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
-  const draws=f.device.snapshots.at(-1);assert.equal(draws.length,2);
-  assert.deepEqual(draws.map(d=>d.pipeline.vertex.entryPoint),['vertex_main','main']);
+  const draws=nativeDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(containsColor(draws[0],[.875,.625,.125]));
+  assert.ok(containsColor(draws[1],[.125,.375,.625]));
 });
 
 test('unsupported native graph resources fail before canvas acquisition or submission',async t=>{
@@ -1582,7 +1589,7 @@ test('source Physical H7 material maps and compute-authored instance draws retai
   assert.equal(f.renderer._nodeCaptureBytes,0);assert.equal(callbacks,2);await f.renderer.waitForGPU();
 });
 
-test('source material arrays preserve per-group maps while ordinary materials retain fixed rendering',async t=>{
+test('source material arrays preserve per-group maps alongside captured ordinary materials',async t=>{
   const f=fixture(t),a=new T.MeshStandardMaterial({map:dataTexture(220,30,70)}),b=new T.MeshPhysicalMaterial({map:dataTexture(40,170,230)});
   a.positionNode=b.positionNode=T.TSL.positionLocal;
   f.mesh.geometry.clearGroups();f.mesh.geometry.addGroup(0,3,0);f.mesh.geometry.addGroup(3,3,1);f.mesh.material=[a,b];
@@ -1590,11 +1597,11 @@ test('source material arrays preserve per-group maps while ordinary materials re
   f.scene.add(new T.AmbientLight(0xffffff,.5));
   await f.renderer.compileAsync(f.scene,f.camera);assert.equal(f.device.textureWrites.length,0);
   f.renderer.render(f.scene,f.camera);await drain(f.renderer);
-  const native=nativeDraws(f.device);assert.equal(native.length,2);
-  assert.deepEqual(native.map(draw=>draw.args[0]),[3,3]);
-  assert.deepEqual(native.map(draw=>[...textureResources(draw).find(view=>view.texture.format==='rgba8unorm').texture.pixels]),
+  const native=nativeDraws(f.device);assert.equal(native.length,3);
+  assert.deepEqual(native.map(draw=>draw.args[0]),[6,3,3]);
+  assert.deepEqual(native.slice(1).map(draw=>[...textureResources(draw).find(view=>view.texture.format==='rgba8unorm').texture.pixels]),
     [[220,30,70,255],[40,170,230,255]]);
-  assert.equal(f.device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='vertex_main').length,1);
+  assert.equal(f.device.snapshots.flat().filter(draw=>draw.pipeline.vertex.entryPoint==='vertex_main'&&draw.streams.size).length,0);
   assert.equal(f.mesh.material[0],a);assert.equal(f.mesh.material[1],b);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 

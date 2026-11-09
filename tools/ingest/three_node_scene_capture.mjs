@@ -18,6 +18,7 @@ const transparent = material => material.transparent === true || transmissive(ma
 const environmentMaterialHistory = new WeakMap();
 const sampledTextureMaterialHistory = new WeakMap();
 const sampledTextureSceneHistory = new WeakMap();
+const nativeSceneHistory = new WeakMap();
 const hookSceneHistory = new WeakMap();
 const hookAttributeHistory = new WeakMap();
 const fixedAttributeHistory = new WeakMap();
@@ -277,11 +278,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // same renderer history even when the application removes their callbacks.
     for (const object of hookCandidates) for (const owner of attributeOwners(object)) attributes.add(owner);
   }
-  // A scene after-hook can replace geometry, detach nodes or add another tree
-  // before asynchronous preparation resumes. Retain the accepted hierarchy as
-  // well as its complete native draw packets; the bridge must not project again.
-  const sceneHierarchy = nativeHookScene && root.isScene === true ? hierarchy : null;
-  if (sceneHierarchy && renderRoot.isScene === true) objects.add(renderRoot);
   const inspectGeometry = object => {
     const geometry = object.geometry;
     if (!(geometry instanceof three.BufferGeometry) || !Array.isArray(geometry.groups) || geometry.groups.length > maxDraws)
@@ -293,6 +289,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       if (object.instanceColor) owners.add(object.instanceColor);
     }
     for (const owner of owners) {
+      // Earlier uncaptured fixed draws have a separate GPU-visible history.
+      // Selecting a shared native owner cannot seed it from newer CPU bytes.
+      if (nativeCompanionScene && fixedAttributeHistory.get(renderer)?.has(owner))
+        fail('CHANGED', 'A mixed native scene requires captured attribute history from its first upload');
       // r186 Attributes/WebGPUAttributeUtils never reads onUploadCallback.
       // Preserve that inert property, including accessors, on the native route.
       if (nativeHookScene) {
@@ -309,6 +309,39 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // result after the application disables queries. Retain that capture route.
   const nativeMaterial = material => customSort || nativeManyLightScene || nativeShadowScene || nativeMRTScene || nativeClippingScene || nativeDepthScene || nativeWideLineScene || nativeGeometryScene || nativeSampledTextureScene || nativeOcclusionScene || nativeHookScene
     ? material != null : nativeMaterialFeatures(material) || nativeLightMaterial(material) || nativeContextMaterial(material) || nativeEnvironmentMaterial(material) || nativeFogMaterial(material);
+  const renderable = object => object.isMesh || object.isSprite || object.isPoints || object.isLine;
+  const nativeSelection = (object, effective) => bundleMembers.has(object) ||
+    object.geometry?.isInstancedBufferGeometry === true || object.isBatchedMesh === true ||
+    // Mesh billboards and point materials need the source primitive builder.
+    (object.isMesh === true || object.isSprite === true) && effective.some(material =>
+      object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
+      material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true) ||
+    // Native source indices treat 255 as a vertex, not a restart marker.
+    object.geometry?.index?.array instanceof Uint8Array || object.geometry?.indirect != null ||
+    effective.some(nativeMaterial);
+  // Native node updates can change ordinary companions before or after their
+  // source draw. Capture the whole list through the existing ordered owner;
+  // taking fixed snapshots before/after all node callbacks would move effects.
+  // The retained builder prepares shaders, while the new backend submits every
+  // draw. Keep this owner when nodes are later removed from the same root.
+  let nativeCompanionScene = false;
+  if (bundles && renderer && !shadowPass) {
+    nativeCompanionScene = nativeSceneHistory.get(renderer)?.has(renderRoot) === true;
+    let native = bundleSelections.some(selection => selection.warm && selection.entry.draws.length > 0), fixed = false;
+    for (const object of hierarchy.keys()) {
+      if (nativeCompanionScene) break;
+      if (!visibility.get(object) || excludedObjects.has(object) || object.isLineLoop || !renderable(object) || !object.material) continue;
+      const effective = (Array.isArray(object.material) ? object.material : [object.material]).map(material =>
+        object !== backgroundMesh && material?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : material);
+      if (nativeSelection(object, effective)) native = true;
+      else fixed = true;
+      nativeCompanionScene = native && fixed;
+    }
+  }
+  // Source node callbacks and later application code can replace geometry or
+  // edit membership before deferred preparation. Never traverse that newer tree.
+  const sceneHierarchy = nativeCompanionScene || nativeHookScene && root.isScene === true ? hierarchy : null;
+  if (sceneHierarchy && renderRoot.isScene === true) objects.add(renderRoot);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
     if (!object.material) continue;
@@ -323,23 +356,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     }
     if (excludedObjects.has(object)) continue;
     const bundle = bundleMembers.get(object);
-    const instancedGeometry = object.geometry?.isInstancedBufferGeometry === true;
     const batch = object.isBatchedMesh === true;
     const originals = Array.isArray(object.material) ? object.material.slice() : [object.material];
     if (originals.length > maxNodes) fail('LIMIT', 'Native scene material array exceeds its budget');
     if (shadowPass && originals.some(original => original && original.allowOverride !== true))
       fail('SHADOW', 'Native shadow casters currently require the source shadow override material');
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
-    // A Mesh can use the source billboard shader too (for particle instances).
-    // Ordinary Sprite objects without authored nodes retain the fixed path.
-    const spriteMesh = (object.isMesh === true || object.isSprite === true) && effective.some(material =>
-      object.isMesh === true && (material?.isSpriteMaterial === true || material?.isSpriteNodeMaterial === true) ||
-      material?.isPointsMaterial === true || material?.isPointsNodeMaterial === true);
-    // Source WebGPU widens byte indices with 255 as an ordinary vertex. The
-    // native geometry owner also captures their queued per-use upload history;
-    // the fixed/GL owner instead interprets 255 as a primitive restart marker.
-    const byteIndices = object.geometry?.index?.array instanceof Uint8Array;
-    if (!bundle && !instancedGeometry && !batch && !spriteMesh && !byteIndices && object.geometry?.indirect == null && !effective.some(nativeMaterial)) continue;
+    if (!(nativeCompanionScene && renderable(object)) && !nativeSelection(object, effective)) continue;
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
@@ -555,7 +578,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       throw error;
     }
   };
-  const nativeHooks = hookedObjects.size > 0, nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject;
+  // Mixed companions need the same late per-draw geometry/program selection as
+  // source callbacks: a preceding node update can replace a later mesh's inputs.
+  const nativeHooks = hookedObjects.size > 0,
+    nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject || nativeCompanionScene && root.isScene === true;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
   // Source public compilation constructs each geometry graph only after the
   // preceding object's update/pipeline/after sequence has completed.
@@ -1442,6 +1468,13 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nodeCompilation = !uniforms && (deferredCompilation ||
     [...preparationBindings].some(binding => programs.hasCompilationUpdates?.(binding.nodeProgram)));
   rememberFixedAttributes(phases);
+  // A failed admission must leave the former fixed route usable. Commit this
+  // ownership only once the accepted draw captures and their histories exist.
+  if (nativeCompanionScene) {
+    let scenes = nativeSceneHistory.get(renderer);
+    if (!scenes) nativeSceneHistory.set(renderer, scenes = new WeakSet());
+    scenes.add(renderRoot);
+  }
   return Object.freeze({objects, excludedObjects, visibility, nativeLights, bundleObjects, sceneHierarchy,
     get bundleGeometries() { return Object.freeze(bundleGeometries.slice()); },
     sortObjects, sortCaptured: customSort && uniforms, sceneEnvironmentNode, sceneFogNode, occlusionRequested, phases: Object.freeze(phases),
