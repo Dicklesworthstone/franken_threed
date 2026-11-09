@@ -76,7 +76,16 @@ admitted. The source rules are in the
   variants, through typed `textureLoad`, preserving all 32 bits. Integer 2D/3D
   samplers also support all six projected forms with implicit LOD, explicit LOD
   or gradients, with or without offsets. Projective coordinates divide once;
-  explicit gradients are already projected. Vertex implicit sampling uses level
+  explicit gradients are already projected. Fragment `texture`, `textureOffset`,
+  `textureProj` and `textureProjOffset` also accept a float bias proven within
+  `[-2, 2]`: literals with signs/parentheses, scalar `float` constructors, safe
+  `const` aliases, and explicit built-in `clamp(value, low, high)` with ordered
+  closed constant bounds. The proof excludes arbitrary arithmetic and
+  unsigned-derived values, and respects shadowed built-ins and mutable aliases.
+  Bias is added once to derivative LOD after projection; coordinates and bias
+  expressions retain single evaluation and source argument order. OpenGL ES 3.0
+  table 6.28 guarantees this range; larger bias limits are implementation-dependent
+  and have no matching WebGPU capability. Vertex implicit sampling uses level
   zero. Offsets apply in the selected mip's texel coordinates before wrapping,
   without changing an array layer. Helpers apply clamp/repeat/mirror addressing,
   rounded array layers, and explicit or derivative-based mip selection, following
@@ -157,7 +166,7 @@ admitted. The source rules are in the
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
-integer cube sampling and integer sampling bias, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
+integer cube sampling and integer bias outside the proved portable range, `gl_FragData`, token pasting, type mismatches (ESSL has no implicit
 conversions). Shadow sampling with bias,
 explicit LOD or explicit gradients remains unsupported; those forms are
 not approximated with implicit sampling or an arbitrary level.
@@ -211,14 +220,20 @@ zero GPU/browser errors. These are software GPU correctness checks.
   The candidate uses `general-webgpu`; Chromium 153 SwiftShader reports no
   browser or GPU errors. These are software GPU correctness checks, not a
   hardware performance result or complete ESSL closure.
+- `essl_integer_bias.test.mjs`: five focused tests cover signed/unsigned 2D,
+  3D and array bias families, projected/offset signatures, portable bounds,
+  const aliases, built-in shadowing, uint wrap refusal, closed clamp bounds,
+  vertex rejection and argument effects. This suite and three adjacent sampling
+  suites pass all 23 tests.
 - `essl_integer_projected_sampling.test.mjs`: six focused tests cover valid
   signed/unsigned overloads, typed payloads, projection and gradient dimensions,
   constant offsets, source argument order, sampler arrays/helpers and vertex LOD.
   The new suite and three adjacent compiler/sampling suites pass all 53 tests.
-  `program_integer_projected_sampling.mjs` compares 118 pinned WebGL/WebGPU
-  checkpoints exactly (241,664 RGBA bytes), including 2D/3D/array offsets,
+  `program_integer_projected_sampling.mjs` compares 220 pinned WebGL/WebGPU
+  checkpoints exactly (450,560 RGBA bytes), including 2D/3D/array offsets,
   projected `vec3`/`vec4` coordinates, independent sampler controls, side effects,
-  mip selection and vertex sampling. Exact reflected texel boundaries and large
+  portable-bias literals, clamp limits, biased mip selection, bias argument
+  effects and vertex sampling. Exact reflected texel boundaries and large
   finite positive/negative coordinates retain the observed source addressing,
   including floating-point loss of a small offset at large coordinates.
   Chromium 153.0.8010.0 / SwiftShader reports `general-webgpu` and zero GPU/browser

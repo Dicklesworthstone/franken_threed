@@ -94,7 +94,7 @@ test('integer projection and offsets reject invalid ESSL shapes and retain expli
     ['usampler2DArray', 'textureGradOffset(image,vec3(.5),vec3(.25),vec3(.25),ivec2(1))', /derivatives/],
     ['usampler2D', 'textureOffset(image,vec2(.5),ivec3(1))', /ivec2/],
     ['usampler2DArray', 'textureOffset(image,vec3(.5),ivec3(1))', /ivec2/],
-    ['usampler2D', 'textureProjOffset(image,vec4(.5),ivec2(1),1.)', /bias/],
+    ['usampler2D', 'textureProjOffset(image,vec4(.5),ivec2(1),3.)', /bias must be proven/],
   ]) assert.throws(() => compile(expression, sampler), pattern, expression);
   assert.throws(() => compileEsslProgram(vertex, fragment('ivec2 delta=ivec2(1);color=vec4(textureOffset(image,vec2(.5),delta));',
     'uniform highp usampler2D image;')), /constant expression/);

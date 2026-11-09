@@ -1,4 +1,4 @@
-// Projected/offset integer samplers against pinned WebGL, preserving all 32 bits.
+// Projected/offset/portable-bias integer sampling against pinned WebGL, preserving all 32 bits.
 // SwiftShader checks correctness only; this test makes no hardware timing claim.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
@@ -95,20 +95,29 @@ async function capture(mode) {
             ['offset', `textureOffset(image,${coordinate},delta)`],
             ['lod-offset', `textureLodOffset(image,${coordinate},lod,delta)`],
             ['grad-offset', `textureGradOffset(image,${coordinate},${gradientX},${gradientY},delta)`],
+            ['bias-none', `texture(image,${coordinate})`],
+            ['bias-zero', `texture(image,${coordinate},0.)`],
+            ['bias-literal', `texture(image,${coordinate},-1.5)`],
+            ['bias-offset', `textureOffset(image,${coordinate},delta,1.5)`],
           ];
           if (dimension !== '2DArray') expressions.push(
             ['proj', 'textureProj(image,p)'], ['proj-lod', 'textureProjLod(image,p,lod)'],
             ['proj-grad', `textureProjGrad(image,p,${gradientX},${gradientY})`],
             ['proj-offset', 'textureProjOffset(image,p,delta)'], ['proj-lod-offset', 'textureProjLodOffset(image,p,lod,delta)'],
-            ['proj-grad-offset', `textureProjGradOffset(image,p,${gradientX},${gradientY},delta)`]);
+            ['proj-grad-offset', `textureProjGradOffset(image,p,${gradientX},${gradientY},delta)`],
+            ['bias-proj', 'textureProj(image,p,1.)'],
+            ['bias-proj-offset', 'textureProjOffset(image,p,delta,-1.)']);
           if (dimension === '2D') expressions.push(['proj-vec3', 'textureProj(image,vec3(p.xy,p.w))'],
             ['proj-grad-offset-vec3', `textureProjGradOffset(image,vec3(p.xy,p.w),${gradientX},${gradientY},delta)`],
-            ['effects', 'textureProjGradOffset(image,nextPosition(p),nextX(),nextY(),delta)']);
+            ['effects', 'textureProjGradOffset(image,nextPosition(p),nextX(),nextY(),delta)'],
+            ['bias-proj-vec3', 'textureProj(image,vec3(p.xy,p.w),1.)'],
+            ['bias-effects', 'textureProjOffset(image,nextPosition(p),delta,clamp(nextBias(),-2.,2.))']);
           const material = (expression, stage = 'fragment', point = null) => {
-            const declarations = `uniform highp ${sampler} maps[2];uniform float lod;int trace=0;
+            const declarations = `uniform highp ${sampler} maps[2];uniform float lod;uniform float bias;int trace=0;
               vec4 nextPosition(vec4 p){trace=trace*10+1;return p;}
               vec${n} nextX(){trace=trace*10+2;return ${gradientX};}
               vec${n} nextY(){trace=trace*10+3;return ${gradientY};}
+              float nextBias(){trace=trace*10+4;return bias;}
               uint tap(highp ${sampler} image,vec4 p){const ivec${n} delta=${delta};return uint(${expression}.r);}`;
             const sample = 'uint value=tap(maps[0],p)^(tap(maps[1],p+vec4(.37,.21,.61,0.))*1664525u);value^=uint(trace)*0x01010101u;';
             const vs = stage === 'vertex' ? precision + 'in vec3 position;flat out uint sampleBits;' + declarations +
@@ -117,13 +126,20 @@ async function capture(mode) {
               precision + 'in vec2 vUv;out vec4 color;' + declarations +
               `void main(){vec4 p=${point ?? 'vec4(vUv*vec2(9.,6.)+vec2(-2.75,-2.),vUv.x*11.-3.,2.)'};${sample}${encode}}`;
             return new T.RawShaderMaterial({glslVersion: T.GLSL3, vertexShader: vs, fragmentShader: fs,
-              depthTest: false, depthWrite: false, blending: T.NoBlending, uniforms: {maps: {value: [texture, alias]}, lod: {value: 1.5}}});
+              depthTest: false, depthWrite: false, blending: T.NoBlending,
+              uniforms: {maps: {value: [texture, alias]}, lod: {value: 1.5}, bias: {value: .75}}});
           };
           try {
             for (const [name, expression] of expressions) {
               const value = material(expression);
               try {await draw(profile + '-' + name, value);} finally {value.dispose();}
             }
+            const biased = material(`texture(image,${coordinate},clamp(bias,-2.,2.))`);
+            try {
+              for (const bias of [-99, -2, -1, -.5, 0, .49, .5, .51, 1, 2, 99]) {
+                biased.uniforms.bias.value = bias; await draw(profile + '-bias-runtime-' + bias, biased);
+              }
+            } finally {biased.dispose();}
             const offsets = material(`textureLodOffset(image,${coordinate},lod,delta)`);
             try {
               offsets.uniforms.lod.value = 0.;
@@ -165,6 +181,12 @@ try {
     const frame = name => source.frames.find(frame => frame.name === prefix + '2D-' + name).pixels;
     assert.deepEqual(frame('proj'), frame('proj-vec3'), '2D projection ignores the unused vec4 component');
     assert.deepEqual(frame('proj-grad-offset'), frame('proj-grad-offset-vec3'));
+    assert.deepEqual(frame('bias-proj'), frame('bias-proj-vec3'), 'biased projection ignores the unused vec4 component');
+    assert.deepEqual(frame('bias-none'), frame('bias-zero'), 'zero bias preserves implicit sampling');
+    assert.deepEqual(frame('bias-none'), frame('bias-runtime-0'));
+    assert.deepEqual(frame('bias-runtime--99'), frame('bias-runtime--2'), 'runtime lower clamp is observed');
+    assert.deepEqual(frame('bias-runtime-99'), frame('bias-runtime-2'), 'runtime upper clamp is observed');
+    assert.notDeepEqual(frame('bias-runtime--2'), frame('bias-runtime-2'), 'portable bias selects different authored mips');
     assert.notDeepEqual(frame('offset-wrap-clamp'), frame('offset-wrap-repeat'), 'offset texel addressing observes wrapping');
     assert.deepEqual(frame('offset-mip-0.49'), frame('offset-mip-0.5'), 'nearest base-level tie stays at level zero');
     assert.notDeepEqual(frame('offset-mip-0.5'), frame('offset-mip-0.51'), 'offset uses dimensions of the selected mip');

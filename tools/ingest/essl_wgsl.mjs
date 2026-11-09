@@ -527,7 +527,8 @@ class Unit {
       if (storage === 'const') {
         if (!v.init) essError('const needs an initializer', v.line);
         const value = this.constValue(v.init, null);
-        const sym = {kind: 'global', type, w, constValue: typeof value === 'number' ? value : undefined, isConst: true};
+        const sym = {kind: 'global', type, w, constValue: typeof value === 'number' ? value : undefined, isConst: true,
+          textureBiasRange: this.textureBiasRange(v.init, null)};
         this.globals.set(v.name, sym);
         sym.pendingInit = {decl: v, type, w};
         continue;
@@ -948,10 +949,12 @@ class Unit {
         wgslConst = s.q.storage === 'const' && !pre.length && this.constEvaluable(v.init, scope);
       }
       const constant = s.q.storage === 'const' ? this.constValue(v.init, scope) : undefined;
+      const textureBiasRange = s.q.storage === 'const' ? this.textureBiasRange(v.init, scope) : null;
       const w = this.local(v.name, type, scope);
       const sym = scope.vars.get(v.name);
       if (s.q.storage === 'const') {
         if (typeof constant === 'number') sym.constValue = constant;
+        sym.textureBiasRange = textureBiasRange;
         sym.readonly = true; sym.wgslConst = wgslConst;
       }
       const binding = wgslConst ? 'const' : 'let';
@@ -1791,6 +1794,44 @@ class Unit {
     if (pre.length) essError('Texture offset is not a WGSL constant expression', line);
     return result.c;
   }
+  /** GLES guarantees a shader bias range of at least [-2, 2]; its larger limit
+   * is implementation-defined and is not a WebGPU device capability. Admit
+   * only literal/sign/const aliases and explicit builtin clamps proven inside
+   * that portable range. Do not use constValue's integer-oriented arithmetic
+   * evaluator to prove floating-point bounds or bake one driver's bias limit. */
+  textureBiasRange(expression, scope) {
+    if (!expression) return null;
+    switch (expression.k) {
+      case 'num': {
+        const number = parseNumber(expression.v);
+        // Unsigned signs wrap modulo 2^32; they are outside this narrow proof.
+        if (number.type.s === 'uint') return null;
+        const value = Math.fround(number.value);
+        return Number.isFinite(value) ? {min: value, max: value, constant: true} : null;
+      }
+      case 'paren': return this.textureBiasRange(expression.e, scope);
+      case 'id': return this.lookup(expression.name, scope)?.textureBiasRange ?? null;
+      case 'unary': {
+        const value = this.textureBiasRange(expression.a, scope);
+        return !value ? null : expression.op === '+' ? value : expression.op === '-'
+          ? {...value, min: -value.max, max: -value.min} : null;
+      }
+      case 'ctor': return expression.type.name === 'float' && expression.type.array === null && expression.args.length === 1 &&
+        !this.decls.some(decl => ['func', 'proto'].includes(decl.k) && decl.name === 'float')
+        ? this.textureBiasRange(expression.args[0], scope) : null;
+      case 'call': {
+        // Global const initializers are declared before later function bodies;
+        // include those declarations when rejecting a shadowed builtin.
+        if (expression.name !== 'clamp' || expression.args.length !== 3 ||
+            this.decls.some(decl => ['func', 'proto'].includes(decl.k) && decl.name === 'clamp')) return null;
+        const lo = this.textureBiasRange(expression.args[1], scope), hi = this.textureBiasRange(expression.args[2], scope);
+        // Even equal runtime bounds are not closed source constants.
+        return lo?.constant && hi?.constant && lo.min <= hi.min
+          ? {min: lo.min, max: hi.min, constant: false} : null;
+      }
+      default: return null;
+    }
+  }
   /** Integer samplers admit only nearest texels/mips. WGSL's filtered sample
    * builtins accept float textures, so carry the source wrap/mip controls in
    * the draw's uniform snapshot and load the selected integer texel directly.
@@ -1803,7 +1844,15 @@ class Unit {
     const projected = name.includes('Proj'), offset = name.endsWith('Offset');
     const operation = name.includes('Grad') ? 'grad' : name.includes('Lod') ? 'lod' : 'implicit';
     const count = (operation === 'grad' ? 3 : operation === 'lod' ? 2 : 1) + Number(offset);
-    if (args.length !== count) essError(`${name} integer sampling expects ${count + 1} arguments; bias is not admitted`, line);
+    const bias = operation === 'implicit' && args.length === count + 1;
+    if (args.length !== count && !bias) essError(`${name} integer sampling expects ${count + 1}${operation === 'implicit' ? ` or ${count + 2}` : ''} arguments`, line);
+    if (bias) {
+      if (this.stage !== 'fragment') essError(`${name} bias is only valid in fragment shaders`, line);
+      if (!same(args.at(-1).t, FLOAT)) essError(`${name} needs a float bias`, line);
+      const range = this.textureBiasRange(expressions.at(-1), ctx.scope);
+      if (!range || range.min < -2 || range.max > 2)
+        essError('Integer texture bias must be proven within [-2, 2] by a literal, const alias or explicit builtin clamp', line);
+    }
     if (projected && dim !== '2d' && dim !== '3d') essError(`${name} needs a 2D or 3D sampler`, line);
     const dimensions = dim === '3d' ? 3 : 2, coordinates = dim === '2d' ? 2 : 3;
     const sizes = projected ? dim === '2d' ? [3, 4] : [4] : [coordinates];
@@ -1830,6 +1879,7 @@ class Unit {
         `let ${dy} = ${operation === 'grad' ? args[2].c : `dpdy(${uv})`} * ${size};`);
       lod = `(0.5 * log2(max(max(dot(${dx}, ${dx}), dot(${dy}, ${dy})), 1e-30)))`;
     }
+    if (bias) lod = `(${lod} + ${args.at(-1).c})`;
     const wrap = offset ? 'f3d_integer_nearest_offset_index' : 'f3d_integer_nearest_index';
     if (offset && !this.helpers.has(wrap)) this.helpers.set(wrap, `fn ${wrap}(p: f32, size: u32, mode: u32, delta: i32) -> i32 {
   // Offset the selected mip's texel coordinate before wrapping. As in the

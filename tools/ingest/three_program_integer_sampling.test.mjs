@@ -64,7 +64,7 @@ test('program packing snapshots integer sampler controls without disturbing auth
 
 test('integer sampling validates source coordinate and derivative signatures before GPU use', () => {
   for (const call of ['texture(map,vec3(.1))','textureLod(map,vec2(.1),1)',
-    'textureGrad(map,vec2(.1),vec3(.2),vec3(.2))','texture(map,vec2(.1),1.0)'])
+    'textureGrad(map,vec2(.1),vec3(.2),vec3(.2))','texture(map,vec2(.1),1)'])
     assert.throws(() => compileEsslProgram(vertex, fragment('uniform highp usampler2D map;', `color=vec4(${call});`)));
   assert.throws(() => compileEsslProgram(vertex, fragment('uniform highp isamplerCube map;',
     'color=vec4(texture(map,vec3(.1)));')), /layered cube view/);
