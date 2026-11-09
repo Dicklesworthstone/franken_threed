@@ -213,7 +213,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function syncPool() {
     if (resolving) { poolDirty = true; return; }
     poolDirty = false;
-    if (pool) { if (disposed) pool.dispose(); else pool.retain([...records].map(record => record.texture)); }
+    if (pool) {
+      if (disposed) pool.dispose();
+      else pool.retain([...records].flatMap(record => record.pixels.detachedTexture
+        ? [record.texture, record.pixels.detachedTexture] : [record.texture]));
+    }
   }
   function retainPixels(source, pixels) {
     if (pixels.refs++ !== 0) return;
@@ -993,6 +997,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
             ? {copyFrom: record.copyBase.texture, copyOnly: record.copyOnly === true} : undefined);
           validate(snapshot);
           record.binding = sourcePool().binding(record.texture);
+          // A later detached descriptor can retain this accepted image before
+          // it has native residency of its own. Keep one prepared descriptor
+          // with the shared pixels so retiring the first use cannot destroy
+          // and re-upload an image still owned by another queued/read-only use.
+          if (record.detached) record.pixels.detachedTexture ??= record.texture;
           releaseCopyBase(record);
         } finally { resolving = false; if (poolDirty) syncPool(); }
       }

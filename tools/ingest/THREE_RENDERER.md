@@ -547,12 +547,33 @@ They enter the renderer's existing FIFO. Geometry histories bind to the real
 device before ordinary renderer uploads; a conflicting batch releases all newly
 acquired claims. Disposal cancels pending work and releases captured payloads.
 
-The admitted scene profile comprises rigid untextured meshes, CPU instances,
-ordinary source materials/shaders and unshadowed lights, with a solid or absent
-background. Textured scene inputs, environments/overrides, custom render or shader
-hooks, custom sorting, shadows, transmission, skinned/morphed/batched meshes, LOD, wireframes,
-lines, points and sprites retain explicit boundaries. These restrictions keep
-unsupported mutable state from being silently read after acceptance.
+The admitted scene profile comprises rigid meshes, CPU instances, ordinary
+source materials and texture-free shaders, and unshadowed lights, with a solid
+or absent background. Initialized scene bakes also capture ordinary Basic,
+Lambert, Phong, Toon, Standard, Normal, Matcap and depth material maps. Source
+shader assembly/reflection and material uniform refresh select the actual
+sampled inputs; hidden draws and inactive map properties cannot establish a
+texture history during later preparation. A normal map suppresses the source's
+bump sampler, and Toon gradients are sampled only when a direct light invokes
+their source helper. The existing sampled-texture owner
+captures immutable pixels, sampler history and decoded-image readiness. UV
+offset/repeat/center/rotation/matrix values are retained independently of upload
+versions, so unmarked UV changes remain visible while unmarked pixel edits stay
+GPU-stale. Disposing an input after acceptance preserves the bake. One prepared
+descriptor remains with each shared captured image until its last owner retires,
+preventing re-upload between queued uses of the same accepted image.
+Scene admission uses the sampled owner's existing synchronous transaction: a
+later map's rejection restores earlier upload histories, and original Sources
+are registered for ordinary consumers only after the complete capture succeeds.
+
+One Texture per Source is admitted within each scene bake. Aliases across
+successive bakes and ordinary consumers share the existing uploaded history;
+simultaneous aliases need per-face upload ordering and remain explicit. Texture
+inputs before device initialization, ShaderMaterial sampler uniforms, Physical
+material accessors, environments/overrides, custom render or shader hooks, custom
+sorting, shadows, transmission, skinned/morphed/batched meshes, LOD, wireframes,
+lines, points and sprites also retain explicit boundaries. These restrictions
+keep unsupported mutable state from being silently read after acceptance.
 
 Captured geometry follows WebGL first-upload, version and partial-range history.
 Only meshes selected by visible ancestry, layers and at least one cube frustum
@@ -634,6 +655,32 @@ of 6,144 pixels, at most
 **0.879%**. The run used Chromium 153.0.8010.0/SwiftShader, the pinned r186 inputs
 and `general-webgpu`, with zero browser/GPU errors. This is tolerance-based
 rendering evidence, not exact equality or a hardware performance result.
+
+`three_renderer_pmrem_textures.test.mjs` adds ten recording-device regressions
+for accepted map versions and partial updates, UV controls without `needsUpdate`,
+hidden/layer/frustum selection, eight material families, cross-bake Source
+aliases and ordinary consumers, disposal/reuse, and explicit ownership/callback
+boundaries, inactive-to-active sampler transitions, rejected asynchronous image
+preparation, and atomic rollback when a later map fails admission. All ten and the ten
+existing public texture-PMREM tests pass. The
+older sampled-owner suite passes 24 of 25 tests; its unsupported-source assertion
+at `tests_three_compute_textures.mjs:341` fails unchanged against the previous
+implementation.
+
+`tests/e2e/webgpu_renderer/program_public_pmrem_textures.mjs` compares eight
+textured source/candidate atlases (**344,064 RGBA bytes**) in Chromium
+153.0.8010.0/SwiftShader, using the same r186 pin and `general-webgpu` route.
+Basic and Phong/normal maps, unmarked pixels, live UV transforms, Source aliases,
+marked uploads and two queued CanvasTexture paintings are exercised. Five
+checkpoints are byte exact; the other three each differ in one channel by one.
+No pixel exceeds the unchanged delta-12 gate, and there are zero GPU/browser
+errors. This establishes correctness in the tested software-GPU environment,
+without a hardware performance claim.
+The same runner also matches actual source texture-upload activity in **21
+material/light cases**, including opaque/cutout alpha, depth, normal versus bump,
+ambient/direct/hemisphere lighting and Toon gradients. The source still uploads
+several mathematically dead output samplers in that driver; those histories are
+preserved rather than inferred from their apparent contribution to the image.
 
 ## Custom tone mapping for WebGL-authored programs
 

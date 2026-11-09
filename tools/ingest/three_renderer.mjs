@@ -852,6 +852,29 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (!this._shaderEncodedOutput && this.needsFrameBufferTarget) this._nativeFramebufferOutput = true;
       return this._wantsHdr(this._toneMapping()) ? this._outputBufferFormat() : this._preferredFormat ?? 'bgra8unorm';
     }
+    _capturePMREMTexture(texture, pendingSources = null) {
+      if (texture?.onUpdate !== null) fail('UNSUPPORTED', 'PMREM input upload callbacks require their explicit source texture owner');
+      if (hasThreeWebGLTextureResidency(this._device, texture))
+        fail('UNSUPPORTED', 'PMREM input is already resident in a separate scene texture owner');
+      const owner = this._getSampledTextureInputs();
+      const lease = owner.captureDetachedBinding(texture, {webglVersioning: true});
+      if (pendingSources) pendingSources.add(texture.source);
+      else {
+        let sources = PMREM_SOURCES.get(this);
+        if (!sources) PMREM_SOURCES.set(this, sources = new WeakSet());
+        sources.add(texture.source);
+      }
+      texture = owner.capturedTexture(lease);
+      let bindings = PMREM_INPUTS.get(this);
+      if (!bindings) PMREM_INPUTS.set(this, bindings = new Map());
+      let binding = bindings.get(texture);
+      if (!binding) bindings.set(texture, binding = {owner, leases: new Set()});
+      binding.leases.add(lease);
+      return {texture, owner, lease, release() {
+        binding.leases.delete(lease); if (!binding.leases.size) bindings.delete(texture);
+        owner.release(lease);
+      }};
+    }
     _framebufferBindings(retained = new Map()) {
       if (!(retained instanceof Map)) fail('OPTIONS', 'Expected a Map of borrowed texture bindings');
       const renderer = this;
@@ -1695,6 +1718,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       try {
         const captured = request.nodeFrame;
         if (request.pmremInput?.owner.preparation([request.pmremInput.lease])) return this._defer(request);
+        if (request.snapshot?.preparation?.()) return this._defer(request);
         if (captured?.textureOwner?.preparation(captured.textureUses)) return this._defer(request);
         this._submit(request); this._releaseRequest(request);
       }
@@ -1946,6 +1970,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const run = (this._preparing ?? Promise.resolve()).catch(() => {}).then(async () => {
         if (this._disposed) fail('DISPOSED', 'Renderer is disposed');
         if (request?.pmremInput) await request.pmremInput.owner.preparation([request.pmremInput.lease]);
+        const snapshotPreparation = request?.snapshot?.preparation?.();
+        if (snapshotPreparation) await snapshotPreparation;
         if (request?.nodeCaptureDeferred) {
           // The source's async-before-init path observes scene inputs at this
           // boundary. Refresh the selector before callbacks so fixed background
@@ -2571,9 +2597,11 @@ export function createWebGLRendererClass(THREE, classOptions = {}) {
  * history with subsequent ordinary maps and panorama/cube backgrounds.
  *
  * Texture-input calls before initialization retain their earlier descriptors.
- * fromScene captures rigid untextured scenes even before initialization (including CPU
- * instances and source shader uniforms), runs all six source views and sigma
- * pre-blur, and returns a real target. Captured geometry keeps WebGL upload
+ * fromScene captures rigid scenes (including CPU instances and source shader
+ * uniforms), runs all six source views and sigma pre-blur, and returns a real
+ * target. Untextured scenes can be accepted before device initialization;
+ * ordinary material maps use the initialized shared texture owner. Captured
+ * geometry keeps WebGL upload
  * history; transferring it to/from an ordinary scene owner requires disposal.
  * Shader warmup retains source material construction and validates WGSL modules
  * shared with later conversion draws; it needs neither geometry nor an input
@@ -2676,8 +2704,20 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
         // One immutable scene generation serves the six source camera views.
         // Capture before the helper changes background/render state or queues a
         // draw, so unsupported mutable inputs fail at the public call boundary.
-        const snapshot = renderer._passSnapshots.capturePMREMScene(scene, new THREE.PerspectiveCamera(90, 1, near, far), renderer._device ?? renderer._parameters.device,
-          {cube: true, position: options.position === undefined ? new THREE.Vector3() : options.position, sortObjects: renderer.sortObjects});
+        const pendingSources = new Set();
+        const capture = () => renderer._passSnapshots.capturePMREMScene(scene, new THREE.PerspectiveCamera(90, 1, near, far), renderer._device ?? renderer._parameters.device,
+          {cube: true, position: options.position === undefined ? new THREE.Vector3() : options.position, sortObjects: renderer.sortObjects,
+            captureTexture: texture => renderer._capturePMREMTexture(texture, pendingSources)});
+        // Rejecting a later map must not establish an earlier map's upload
+        // history or redirect its future ordinary consumers to this owner.
+        // Only synchronous capture is transactional; source filtering queues
+        // its draws after acceptance, outside the resource transaction.
+        const snapshot = renderer._device ? renderer._getSampledTextureInputs().captureDispatch(capture) : capture();
+        if (pendingSources.size) {
+          let sources = PMREM_SOURCES.get(renderer);
+          if (!sources) PMREM_SOURCES.set(renderer, sources = new WeakSet());
+          for (const source of pendingSources) sources.add(source);
+        }
         const previous = PMREM_CAPTURES.get(renderer);
         PMREM_CAPTURES.set(renderer, {generator: this._generator, input: null, scene, snapshot});
         try { return this._generator.fromScene(scene, sigma, near, far, options); }
@@ -2721,24 +2761,7 @@ export function createPMREMGeneratorClass(THREE, {exactBackend = null} = {}) {
       const renderer = this._renderer, previous = PMREM_CAPTURES.get(renderer);
       let input = null;
       if (!texture?.isRenderTargetTexture) {
-        if (texture?.onUpdate !== null) fail('UNSUPPORTED', 'PMREM input upload callbacks require their explicit source texture owner');
-        if (hasThreeWebGLTextureResidency(renderer._device, texture))
-          fail('UNSUPPORTED', 'PMREM input is already resident in a separate scene texture owner');
-        const owner = renderer._getSampledTextureInputs();
-        const lease = owner.captureDetachedBinding(texture, {webglVersioning: true});
-        let sources = PMREM_SOURCES.get(renderer);
-        if (!sources) PMREM_SOURCES.set(renderer, sources = new WeakSet());
-        sources.add(texture.source);
-        texture = owner.capturedTexture(lease); input = {owner, lease};
-        let bindings = PMREM_INPUTS.get(renderer);
-        if (!bindings) PMREM_INPUTS.set(renderer, bindings = new Map());
-        let binding = bindings.get(texture);
-        if (!binding) bindings.set(texture, binding = {owner, leases: new Set()});
-        binding.leases.add(lease);
-        input.release = () => {
-          binding.leases.delete(lease); if (!binding.leases.size) bindings.delete(texture);
-          owner.release(lease);
-        };
+        input = renderer._capturePMREMTexture(texture); texture = input.texture;
       }
       PMREM_CAPTURES.set(renderer, {generator: this._generator, input});
       try { return this._generator[method](texture, target); }

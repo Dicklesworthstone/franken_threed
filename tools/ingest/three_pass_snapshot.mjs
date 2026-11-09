@@ -8,6 +8,9 @@
  */
 import {captureThreeUniformGroup} from './three_uniform_group_state.mjs';
 import {claimWebGLGeometrySnapshot} from './gpu_buffer_geometry.mjs';
+import {threeProgramSources} from './three_program.mjs';
+import {compileEsslProgram} from './essl_wgsl.mjs';
+import {webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms} from './three_webgl_program.mjs';
 
 export class ThreePassSnapshotError extends Error {
   constructor(code, message) {
@@ -468,9 +471,11 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
   }
   function collect(record) {
     if (record.pending || record.installed || !records.delete(record)) return;
-    bytes -= record.bytes; record.data = record.sources = null;
+    bytes -= record.bytes;
+    for (const input of record.textureInputs) input.release();
+    record.textureInputs.length = 0; record.data = record.sources = null;
   }
-  function capture(root, camera, device, {cube = false, position = null, sortObjects = true} = {}) {
+  function capture(root, camera, device, {cube = false, position = null, sortObjects = true, captureTexture = null} = {}) {
     live();
     if (device) bindDevice(device);
     if (!(root instanceof T.Object3D) || !(camera instanceof T.Camera) || camera.isArrayCamera ||
@@ -501,8 +506,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         for (const material of materials) if (material && (
           !(material instanceof T.Material) || field(material, 'onBeforeRender') !== T.Material.prototype.onBeforeRender ||
           field(material, 'onBeforeCompile') !== T.Material.prototype.onBeforeCompile ||
-          field(material, 'customProgramCacheKey') !== T.Material.prototype.customProgramCacheKey || material.transmission > 0 || material.wireframe))
-          fail('SCENE', 'PMREM scene materials require ordinary source programs without custom hooks or transmission');
+          field(material, 'customProgramCacheKey') !== T.Material.prototype.customProgramCacheKey || material.transmission > 0 || material.wireframe || material.envMap))
+          fail('SCENE', 'PMREM scene materials require ordinary source programs without custom hooks, environments or transmission');
         sourceResources.set(geometry, sourceOwners(geometry));
         if (field(object, 'intersectsFrustum') !== T.Mesh.prototype.intersectsFrustum ||
             field(geometry, 'computeBoundingSphere') !== T.BufferGeometry.prototype.computeBoundingSphere ||
@@ -526,13 +531,17 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       frusta.push(new T.Frustum().setFromProjectionMatrix(project.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
         camera.coordinateSystem, camera.reversedDepth));
     }
-    const selectedOwners = new Set(), visible = [root];
+    const selectedOwners = new Set(), selectedMaterials = new Map(), sceneLights = [], visible = [root];
     while (visible.length) {
       const object = visible.pop(); if (object.visible === false) continue;
+      if (object.isLight && object.layers.test(camera.layers)) sceneLights.push(object);
       if (object.isMesh && object.layers.test(camera.layers) &&
           (!object.frustumCulled || frusta.some(frustum => frustum.intersectsObject(object)))) {
         const geometry = object.geometry, materials = Array.isArray(object.material)
           ? geometry.groups.map(group => [object.material[group.materialIndex], group]) : [[object.material, null]];
+        // WebGLRenderer sets the program (and its sampled uniforms) before
+        // checking the draw range, including an otherwise empty draw.
+        for (const [material] of materials) if (material?.visible) selectedMaterials.set(material, object);
         // WebGLObjects uploads vertex/instance data before material selection.
         for (const attribute of Object.values(geometry.attributes))
           selectedOwners.add(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
@@ -550,7 +559,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       visible.push(...object.children);
     }
     let charged = 0, values = 0, addedHistory = 0;
-    const pending = new Map(), sources = new Map(), memo = new Map();
+    const pending = new Map(), sources = new Map(), memo = new Map(), materialTextures = new Map(), textureInputs = [];
     const charge = size => {
       charged += size;
       if (++values > maxValues || charged > maxCaptureBytes || charged + bytes + historyBytes + addedHistory > Math.min(maxBytes, available()))
@@ -594,11 +603,23 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       }
       pending.set(owner, next); return next;
     }
-    function copy(value, depth = 0) {
+    function copy(value, depth = 0, materialOwner = null) {
       if (depth > 48) fail('BUDGET', 'PMREM scene data nesting is too deep');
       if (value == null || ['number', 'boolean', 'string'].includes(typeof value)) { charge(typeof value === 'string' ? value.length * 2 : 8); return value; }
       if (typeof value !== 'object') fail('SCENE', 'PMREM capture requires ordinary data fields');
-      if (value instanceof T.Texture) fail('SCENE', 'PMREM scene texture inputs require their explicit uploaded-history owner');
+      if (value instanceof T.Texture) {
+        if (!materialOwner || materialOwner.isShaderMaterial)
+          fail('SCENE', 'PMREM texture capture requires ordinary material maps; shader samplers and light maps need their source binding selection');
+        if (field(value, 'updateMatrix') !== T.Texture.prototype.updateMatrix ||
+            Object.values(Object.getOwnPropertyDescriptors(value)).some(descriptor => !Object.hasOwn(descriptor, 'value')))
+          fail('SCENE', 'PMREM material maps require ordinary texture data and transform updates');
+        let textures = materialTextures.get(materialOwner);
+        if (!textures) materialTextures.set(materialOwner, textures = new Set());
+        textures.add(value); charge(256);
+        // Inactive material properties and hidden draws retain identity only.
+        // Resolve actual sampled uniforms after the immutable graph is built.
+        return value;
+      }
       if (memo.has(value)) return memo.get(value);
       if (ArrayBuffer.isView(value)) {
         if (!TYPED_ARRAYS.has(Object.getPrototypeOf(value)) || !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable)
@@ -606,6 +627,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         charge(value.byteLength); const result = duplicate(value); memo.set(value, result); return result;
       }
       const object = value instanceof T.Object3D, geometry = value instanceof T.BufferGeometry, material = value instanceof T.Material;
+      if (material) materialOwner = value;
+      else if (object || geometry) materialOwner = null;
       const attribute = attributeOwners.has(value) || value.isInterleavedBufferAttribute === true;
       const prototype = Object.getPrototypeOf(value), array = Array.isArray(value);
       if (!object && !geometry && !material && !attribute && !array && !math.has(prototype) &&
@@ -623,7 +646,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           if (input !== prototype[key]) fail('SCENE', 'Custom callable PMREM fields require their source owner');
           put(result, key, input); continue;
         }
-        put(result, key, copy(input, depth + 1));
+        put(result, key, copy(input, depth + 1, materialOwner));
       }
       if (array) result.length = value.length;
       if (object) {
@@ -638,6 +661,58 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     try {
       data = copy(root);
       if (root.isScene && root.background?.isColor) data.background = null;
+      const sampled = new Set(), programs = new Map();
+      let lights = null;
+      for (const [material, object] of selectedMaterials) {
+        if (!materialTextures.has(material)) continue;
+        const capturedMaterial = memo.get(material), capturedObject = memo.get(object), fog = data.isScene ? data.fog : null;
+        if (!lights) { lights = webglLights(T); lights.setup(sceneLights); }
+        const source = threeProgramSources(T, capturedMaterial, capturedObject,
+          {fog, lights: lights.state, toneMapping: T.NoToneMapping, outputColorSpace: T.LinearSRGBColorSpace});
+        let reflection = programs.get(source.key);
+        if (!reflection) { reflection = compileEsslProgram(source.vertex, source.fragment).reflection; programs.set(source.key, reflection); }
+        const uniforms = webglMaterialUniforms(T, capturedMaterial);
+        refreshWebGLMaterialUniforms(T, uniforms, capturedMaterial, {fog, lights: lights.state, envMap: null,
+          pixelRatio: 1, height: 1, unlitColorSpace: T.LinearSRGBColorSpace});
+        for (const binding of reflection.textures) {
+          // Reflection includes declarations in unreachable helper functions.
+          // The pinned normal chunk chooses normalMap before bumpMap; Toon
+          // calls its gradient helper only from direct-light evaluation. These
+          // source-inactive samplers must not establish an upload history.
+          const parameters = source.parameters;
+          if (binding.name === 'bumpMap' && (parameters.normalMapObjectSpace || parameters.normalMapTangentSpace)) continue;
+          if (capturedMaterial.isMeshToonMaterial && binding.name === 'gradientMap' &&
+              parameters.numSunLights + parameters.numDirLights + parameters.numPointLights + parameters.numSpotLights === 0) continue;
+          const uniform = uniforms[binding.name]?.value;
+          const texture = binding.element === null ? uniform : uniform?.[binding.element];
+          if (!(texture instanceof T.Texture) || !materialTextures.get(material).has(texture)) continue;
+          sampled.add(texture);
+        }
+      }
+      if (sampled.size && (typeof captureTexture !== 'function' || !boundDevice))
+        fail('SCENE', 'Textured PMREM scenes require an initialized sampled-texture owner');
+      const sourceTextures = new Map(), capturedTextures = new Map();
+      for (const texture of sampled) {
+        const sibling = sourceTextures.get(texture.source);
+        if (sibling && sibling !== texture)
+          fail('SCENE', 'PMREM scene Source aliases need per-face ordered texture captures');
+        sourceTextures.set(texture.source, texture);
+      }
+      for (const texture of sampled) {
+        const input = captureTexture(texture); textureInputs.push(input);
+        const captured = input.texture;
+        // The shared sampled owner freezes image and sampler history. Shader
+        // UV controls are live source values, independent of needsUpdate.
+        for (const key of ['offset', 'repeat', 'center', 'matrix']) put(captured, key, copy(texture[key]));
+        for (const key of ['channel', 'rotation', 'matrixAutoUpdate']) put(captured, key, texture[key]);
+        capturedTextures.set(texture, captured);
+      }
+      for (const captured of sources.keys()) for (const key of Object.getOwnPropertyNames(captured)) {
+        // General scene preparation may inspect hidden materials. Their private
+        // execution views must not introduce an upload that source selection
+        // skipped. A later selected capture restores the actual map normally.
+        if (captured[key] instanceof T.Texture) put(captured, key, capturedTextures.get(captured[key]) ?? null);
+      }
       for (const [owner, history] of pending) {
         if (!histories.has(owner)) historyBytes += history.array.byteLength;
         histories.set(owner, history);
@@ -648,12 +723,13 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         const selected = owners.filter(owner => pending.has(owner)); if (selected.length) observe(resource, selected);
       }
     } catch (error) {
+      for (const input of textureInputs) input.release();
       for (const [owner, history] of pending) if (!histories.has(owner)) history.release?.();
       throw error;
     }
     if (!state) { state = {root: view(root), views: new WeakMap(), record: null}; states.set(root, state); retained.add(state); }
     state.views.set(root, new WeakRef(state.root));
-    const record = {state, data, sources, bytes: charged, pending: 0, installed: false}; records.add(record); bytes += charged;
+    const record = {state, data, sources, textureInputs, bytes: charged, pending: 0, installed: false}; records.add(record); bytes += charged;
     function install() {
       live(); if (!record.pending) fail('RELEASED', 'PMREM scene capture was released');
       if (state.record === record) return;
@@ -678,6 +754,21 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
       let released = false;
       return Object.freeze({root: state.root, camera: captureThreeCamera(T, camera), bytes: charged, install, retain,
+        preparation() {
+          live(); if (!record.pending) fail('RELEASED', 'PMREM scene capture was released');
+          const owners = new Map(), waiting = [];
+          for (const input of record.textureInputs) if (input.owner) {
+            let leases = owners.get(input.owner); if (!leases) owners.set(input.owner, leases = []);
+            leases.push(input.lease);
+          }
+          for (const [owner, leases] of owners) { const pending = owner.preparation(leases); if (pending) waiting.push(pending); }
+          if (!waiting.length) return null;
+          const ready = Promise.all(waiting).then(() => {});
+          // The synchronous dispatch probe may discard this token before its
+          // FIFO consumer awaits it. Observe rejection without swallowing the
+          // error returned to the actual preparation boundary.
+          ready.catch(() => {}); return ready;
+        },
         release() { if (!released) { released = true; record.pending--; collect(record); } }});
     }
     return retain(camera);
