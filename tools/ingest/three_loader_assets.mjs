@@ -28,6 +28,7 @@ const SINGLE_FILE_ADDONS = new Map([
   ["HDRLoader", new Set(["setDataType"])],
   ["RGBELoader", new Set(["setDataType"])],
   ["EXRLoader", new Set(["setDataType", "setOutputFormat", "setPart"])],
+  ["UltraHDRLoader", new Set(["setDataType"])],
   ["FontLoader", new Set()],
   ["STLLoader", new Set()],
   ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],

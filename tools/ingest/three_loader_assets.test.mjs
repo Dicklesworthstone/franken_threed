@@ -18,6 +18,7 @@ const coreUrl = rootUrl + "build/three.core.js";
 const gltfUrl = rootUrl + "examples/jsm/loaders/GLTFLoader.js";
 const dracoUrl = rootUrl + "examples/jsm/loaders/DRACOLoader.js";
 const ktx2Url = rootUrl + "examples/jsm/loaders/KTX2Loader.js";
+const ultraHdrUrl = rootUrl + "examples/jsm/loaders/UltraHDRLoader.js";
 const mtlUrl = rootUrl + "examples/jsm/loaders/MTLLoader.js";
 const objUrl = rootUrl + "examples/jsm/loaders/OBJLoader.js";
 const fbxUrl = rootUrl + "examples/jsm/loaders/FBXLoader.js";
@@ -117,6 +118,38 @@ test("pinned single-file addons retain finite paths, decoder settings and import
     new Addons.FontLoader().load('namespace-font.json');`);
   assert.deepEqual(requests.map(({url}) => url), ['env/day.hdr', 'env/night.hdr', 'legacy.hdr',
     'exr/sky.exr', 'font.json', 'geometry/mesh.stl', 'mesh.ply', 'mesh.obj', 'namespace.hdr', 'namespace-font.json']);
+});
+
+test("H8's original UltraHDR environment request enters the application resource closure", () => {
+  const html = fs.readFileSync(new URL("examples/webgpu_compute_particles_fluid.html", rootUrl), "utf8");
+  const source = /<script type="module">([\s\S]*?)<\/script>/.exec(html)[1];
+  const requests = discover(source, {resolveModule(specifier) {
+    if (specifier.startsWith("three/addons/")) return rootUrl + "examples/jsm/" + specifier.slice("three/addons/".length);
+    if (specifier === "three/tsl") return rootUrl + "build/three.tsl.js";
+    return rootUrl + "build/three.webgpu.js";
+  }});
+  assert.deepEqual(requests.filter(({loader}) => loader === "UltraHDRLoader").map(({url}) => url),
+    ["textures/equirectangular/royal_esplanade_2k.hdr.jpg"]);
+});
+
+test("UltraHDR discovery keeps source data-type settings, aliases, finite choices and opaque routes", () => {
+  const requests = discover(`import { UltraHDRLoader as Source } from ${JSON.stringify(ultraHdrUrl)};
+    import * as HDR from ${JSON.stringify(ultraHdrUrl)};
+    import { UltraHDRLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { UltraHDRLoader as Foreign } from 'file:///other/examples/jsm/loaders/UltraHDRLoader.js';
+    const Loader = Source, loader = new Loader().setPath('env/');
+    loader.setDataType(floatType); loader.parse(runtimeBytes, onLoad);
+    loader.loadAsync(day ? 'day%20%23.hdr.jpg?version=2#sky' : 'night.hdr.jpg');
+    loader.setDataType(halfType); loader.setPath('next/'); loader.load('sky.hdr.jpg');
+    new HDR.UltraHDRLoader().load('namespace.hdr.jpg');
+    new UltraHDRLoader().loadAsync('aggregate.hdr.jpg');
+    new Foreign().load('foreign.hdr.jpg');
+    function shadow(Source) { new Source().load('shadow.hdr.jpg'); }
+    new Source(manager).load('managed.hdr.jpg');
+    const escaped = new Source(); customize(escaped); escaped.load('escaped.hdr.jpg');
+    new Source().setPath(runtimePath).load('dynamic.hdr.jpg');`);
+  assert.deepEqual(requests.map(({url}) => url), ['env/day%20%23.hdr.jpg?version=2#sky',
+    'env/night.hdr.jpg', 'next/sky.hdr.jpg', 'namespace.hdr.jpg', 'aggregate.hdr.jpg']);
 });
 
 test("addon asset discovery preserves opaque loaders and shadows while OBJ material setters retain its model URL", () => {
@@ -597,6 +630,68 @@ function fixture(files) {
   }
   return root;
 }
+
+test("UltraHDR bytes survive relocated networked and packed application builds", async () => {
+  const bytes = fs.readFileSync(new URL("examples/textures/equirectangular/royal_esplanade_2k.hdr.jpg", rootUrl));
+  const logicalUrl = "textures/equirectangular/sky%20%23.hdr.jpg?version=2#environment";
+  const filename = "textures/equirectangular/sky #.hdr.jpg";
+  const root = fixture({
+    "index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": `import { FloatType } from ${JSON.stringify(coreUrl)};
+      import { UltraHDRLoader } from ${JSON.stringify(ultraHdrUrl)};
+      export async function load() {
+        const hdrLoader = new UltraHDRLoader().setPath('textures/equirectangular/').setDataType(FloatType);
+        return hdrLoader.loadAsync('sky%20%23.hdr.jpg?version=2#environment');
+      }`,
+    [filename]: bytes,
+  });
+  const deployment = fixture({});
+  const networked = await buildApplication(path.join(root, "index.html"), path.join(deployment, "networked"));
+  const standalone = await buildApplication(path.join(root, "index.html"), path.join(deployment, "prepared"),
+    {prepareStandaloneLoaders: true});
+  fs.renameSync(root, root + "-source-unavailable");
+  for (const output of [networked, standalone]) {
+    assert.deepEqual(fs.readFileSync(path.join(output.outDir, filename)), bytes);
+  }
+  const packedFile = path.join(deployment, "relocated.html");
+  packHtml(path.join(standalone.outDir, standalone.htmlFile), packedFile);
+  const resources = fs.readFileSync(path.join(standalone.outDir, "f3d-loader-resources.mjs"), "utf8");
+  assert.ok(resources.includes(logicalUrl.slice(0, logicalUrl.indexOf("#"))));
+  const html = fs.readFileSync(packedFile, "utf8");
+  const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+  const embedded = Object.values(imports).find(url =>
+    Buffer.from(url.split(",")[1].split("#")[0], "base64").toString() === resources);
+  assert.ok(embedded, "the source loader's finite resource resolver survives packing");
+  fs.renameSync(standalone.outDir, standalone.outDir + "-not-used-by-packed-page");
+
+  const requests = [], server = http.createServer((request, response) => {
+    requests.push(request.url);
+    try {
+      const pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+      response.setHeader("Content-Type", "image/jpeg");
+      response.end(fs.readFileSync(path.join(networked.outDir, pathname)));
+    } catch { response.writeHead(404); response.end("missing resource"); }
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`, originalDocument = globalThis.document;
+  try {
+    const response = await fetch(new URL(logicalUrl, origin + "/index.html"));
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+    assert.deepEqual(requests, ["/textures/equirectangular/sky%20%23.hdr.jpg?version=2"]);
+    globalThis.document = {URL: origin + "/moved/to/a/different/depth/relocated.html",
+      baseURI: origin + "/moved/to/a/different/depth/relocated.html"};
+    const packedResources = await import(embedded);
+    const resolved = packedResources.resolveThreeLoaderResource(logicalUrl);
+    assert.match(resolved, /^data:image\/jpeg;/);
+    assert.ok(resolved.endsWith("#environment"));
+    assert.deepEqual(Buffer.from(await (await fetch(resolved)).arrayBuffer()), bytes);
+    assert.equal(requests.length, 1, "the relocated packed texture must not reach the server");
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document; else globalThis.document = originalDocument;
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  }
+});
 
 test("Collada assets preserve source path concatenation, TGA bytes, URL identities and pending bases", () => {
   const model = Buffer.from(`<COLLADA><library_images>
