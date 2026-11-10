@@ -316,9 +316,8 @@ test('public PMREM queues skinned scene poses before initialization and retains 
  assert.equal(renderer.info.f3d.route,'general-webgpu');first.dispose();second.dispose();
 });
 
-test('ordinary Basic skin captures feed distinct accepted palettes to the existing GPU deformer',async t=>{
- const {renderer,device}=fixture(t),f=skinnedEnvironment(),generator=new Generator(renderer),palettes=[];
- f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({color:0x80c0ff,side:T.DoubleSide});
+function recordDeformations(device) {
+ const records=[];
  Object.assign(device.limits,{maxComputeInvocationsPerWorkgroup:256,maxComputeWorkgroupSizeX:256,maxComputeWorkgroupsPerDimension:65535});
  device.createComputePipelineAsync=async descriptor=>({...descriptor,getBindGroupLayout:()=>({})});
  const create=device.createCommandEncoder.bind(device),submit=device.queue.submit;
@@ -331,14 +330,59 @@ test('ordinary Basic skin captures feed distinct accepted palettes to the existi
  };
  device.queue.submit=commands=>{
   for(const passes of commands)for(const pass of passes)if(pass.pipeline?.compute?.entryPoint==='deform')
-   palettes.push(new Float32Array(pass.group.entries[3].resource.buffer.data).slice());
+   records.push({vertices:new Float32Array(pass.group.entries[0].resource.buffer.data).slice(),
+    palette:new Float32Array(pass.group.entries[3].resource.buffer.data).slice()});
   submit(commands);
  };
+ return records;
+}
+
+test('ordinary Basic skin captures feed distinct accepted palettes to the existing GPU deformer',async t=>{
+ const {renderer,device}=fixture(t),f=skinnedEnvironment(),generator=new Generator(renderer),records=recordDeformations(device);
+ f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({color:0x80c0ff,side:T.DoubleSide});
  await renderer.init();f.tip.rotation.z=.3;const first=generator.fromScene(f.scene,0,.1,20,{size:16});
  f.tip.rotation.z=-.6;const second=generator.fromScene(f.scene,.1,.1,20,{size:16});
  f.skeleton.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.scene.clear();generator.dispose();
  await drain(renderer);
- assert.ok(palettes.some(palette=>palette[16]===Math.fround(Math.cos(.3))));
- assert.ok(palettes.some(palette=>palette[16]===Math.fround(Math.cos(-.6))));
+ assert.ok(records.some(({palette})=>palette[16]===Math.fround(Math.cos(.3))));
+ assert.ok(records.some(({palette})=>palette[16]===Math.fround(Math.cos(-.6))));
  assert.equal(renderer._passSnapshots.allocatedBytes,0);first.dispose();second.dispose();
+});
+
+
+test('ordinary GPU skinning cannot silently replace PMREM upload history with unmarked CPU edits',async t=>{
+ const {renderer,device}=fixture(t),f=skinnedEnvironment(),generator=new Generator(renderer),records=recordDeformations(device);
+ f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({side:T.DoubleSide});
+ const camera=new T.PerspectiveCamera(60,1,.1,20);camera.position.z=5;
+ t.after(()=>{generator.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();});
+ await renderer.init();renderer.render(f.scene,camera);await drain(renderer);
+ assert.ok(records.length>0);assert.ok(records.every(({vertices})=>vertices[0]===.5));
+ const originalRecords=records.length;
+ const position=f.mesh.geometry.attributes.position,version=position.version;
+ position.array[0]=23;
+ const submissions=device.submissions.length,paletteVersion=f.skeleton.boneTexture?.version;
+ assert.throws(()=>generator.fromScene(f.scene,0,.1,20,{size:16}),/separate WebGL geometry owner/);
+ assert.equal(device.submissions.length,submissions);assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ assert.equal(f.skeleton.boneTexture?.version,paletteVersion,'rejected capture does not advance the source palette');
+ f.mesh.geometry.dispose();const output=generator.fromScene(f.scene,0,.1,20,{size:16});
+ t.after(()=>output.dispose());position.array[0]=42;f.mesh.geometry.dispose();generator.dispose();await drain(renderer);
+ assert.equal(position.version,version,'disposal alone starts a fresh source upload lifetime');
+ assert.ok(records.length>originalRecords);assert.ok(records.slice(originalRecords).every(({vertices})=>vertices[0]===23));
+ assert.equal(renderer._passSnapshots.allocatedBytes,0);
+});
+
+test('PMREM skinning history blocks a separate ordinary GPU owner until source geometry disposal',async t=>{
+ const {renderer,device}=fixture(t),f=skinnedEnvironment(),generator=new Generator(renderer),records=recordDeformations(device);
+ f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({side:T.DoubleSide});
+ const camera=new T.PerspectiveCamera(60,1,.1,20);camera.position.z=5;
+ t.after(()=>{generator.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();});
+ await renderer.init();const output=generator.fromScene(f.scene,0,.1,20,{size:16});t.after(()=>output.dispose());
+ await drain(renderer);assert.ok(records.length>0);assert.ok(records.every(({vertices})=>vertices[0]===.5));
+ const position=f.mesh.geometry.attributes.position,version=position.version,submitted=records.length;
+ position.array[0]=23;
+ await assert.rejects(renderer.compileAsync(f.scene,camera),/PMREM-captured attributes require disposal/);
+ assert.equal(records.length,submitted,'a conflicting owner submits no deformation work');
+ f.mesh.geometry.dispose();renderer.render(f.scene,camera);await drain(renderer);
+ assert.ok(records.length>submitted);assert.ok(records.slice(submitted).every(({vertices})=>vertices[0]===23));
+ assert.equal(position.version,version);
 });

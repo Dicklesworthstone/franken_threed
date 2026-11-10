@@ -593,9 +593,13 @@ advance those histories; hidden or culled inputs retain pending updates. Index
 uploads retain source material/draw selection. Unmarked edits preserve the last
 uploaded bytes, while source geometry/instance disposal starts a new history.
 An attribute already resident in a separate ordinary WebGL scene owner requires
-disposal before moving between owners. These histories persist across generator
-retirement like source renderer attributes, and remain bounded by the snapshot
-owner's budgets.
+source geometry disposal before moving between owners. This includes the fixed
+GPU skin/morph deformer: its copied inputs reserve the original attribute owners
+before asynchronous preparation and release them on source geometry disposal,
+owner disposal, cancellation or failed preparation. It cannot silently introduce
+unmarked CPU edits when moving to or from PMREM. These histories persist across
+generator retirement like source renderer attributes, and remain bounded by the
+snapshot owner's budgets.
 
 The new output's normal depth storage is initialized to the source value of one
 before the six views load it with `autoClear = false`. Private background boxes,

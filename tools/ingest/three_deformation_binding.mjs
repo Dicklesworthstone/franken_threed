@@ -144,9 +144,15 @@ function multiply(a, b, out) {
   }
 }
 
-export function createThreeDeformationBinding(source, options) {
+// The optional internal GPU handshake retains original upload owners after
+// complete metadata admission and before any decoded source values are copied.
+export function createThreeDeformationBinding(source, options, retainInputs = null) {
   const limits = configuration(options), shape = inspect(source, limits), g = source.geometry;
   let disposed = false, invalidated = false, busy = false;
+  const releaseInputs = limits.sourceAttributeCallbacks ? retainInputs?.(shape.attributes.values()) : null;
+  const onDispose = () => { invalidated = true; releaseInputs?.(); };
+  try {
+  if (releaseInputs) g.addEventListener('dispose', onDispose);
   const pose = {nodeCount: 1, version: 0, disposed: false, sample() { fail('CLOCK', 'Advance the source mixer, then capture the binding'); },
     worldMatrices: new Float64Array(16), jointMatrices: new Float64Array((shape.skeleton?.bones.length ?? 0) * 16),
     morphWeights: new Float64Array(shape.targets), morphOffsets: new Uint32Array([0, shape.targets]),
@@ -200,7 +206,6 @@ export function createThreeDeformationBinding(source, options) {
   const world = new Float64Array(16), palette = new Float64Array(pose.jointMatrices.length), morphWeights = new Float64Array(shape.targets);
   const bind = new Float64Array(16), inverse = new Float64Array(16), bone = new Float64Array(16), rest = new Float64Array(16);
   const ab = new Float64Array(16), abc = new Float64Array(16), result = new Float64Array(16);
-  const onDispose = () => { invalidated = true; };
   const check = () => {
     if (disposed) fail('DISPOSED', 'Source deformation binding is disposed');
     if (invalidated || !same(shape.signature, inspect(source, limits).signature)) fail('PREPARE', 'Source deformation layout/content changed; create a new binding through prepare()');
@@ -236,10 +241,17 @@ export function createThreeDeformationBinding(source, options) {
     },
     dispose() {
       if (busy) fail('REENTRANT', 'Cannot dispose during source capture');
-      if (!disposed) { disposed = true; pose.disposed = true; g.removeEventListener('dispose', onDispose); }
+      if (!disposed) {
+        disposed = true; pose.disposed = true;
+        try { g.removeEventListener('dispose', onDispose); } finally { releaseInputs?.(); }
+      }
     },
   });
   binding.capture();
-  g.addEventListener('dispose', onDispose);
+  if (!releaseInputs) g.addEventListener('dispose', onDispose);
   return binding;
+  } catch (error) {
+    try { g.removeEventListener('dispose', onDispose); } finally { releaseInputs?.(); }
+    throw error;
+  }
 }

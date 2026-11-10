@@ -69,6 +69,21 @@ export function claimWebGLGeometrySnapshot(device, attribute, owner) {
   history.snapshot = owner;
   return () => { if (history.snapshot === owner) history.snapshot = null; };
 }
+/** Detached WebGL deformation inputs also own the source upload history even
+ * though their GPU buffers contain decoded/copied values. Admit the complete
+ * input set before retaining any owner; interleaved views share one lease. */
+export function retainWebGLGeometryAttributes(device, attributes) {
+  const histories = [...new Set(Array.from(attributes, ownerOf))].map(attribute => webglHistory(device, attribute));
+  if (histories.some(history => history.snapshot))
+    fail('HISTORY', 'PMREM-captured attributes require disposal before moving to a separate WebGL deformation owner');
+  for (const history of histories) history.residents++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const history of histories) history.residents--;
+  };
+}
 const FIELDS = Object.freeze({position: [0, 3], normal: [1, 3], tangent: [2, 4], uv: [3, 2], color: [4, 0], uv1: [10, 2], uv2: [11, 2], uv3: [12, 2]});
 const align4 = n => Math.ceil(n / 4) * 4;
 function integer(n, min, max, name) {

@@ -4,6 +4,7 @@
  */
 import {createGpuAnimationDeformer, createGpuAnimationDeformerCache, updateGpuAnimationDeformers} from './animation_webgpu.mjs';
 import {createThreeDeformationBinding, ThreeDeformationError} from './three_deformation_binding.mjs';
+import {retainWebGLGeometryAttributes} from './gpu_buffer_geometry.mjs';
 export {hasThreeDeformation, inspectThreeDeformation, createThreeDeformationBinding, ThreeDeformationError} from './three_deformation_binding.mjs';
 const states = new WeakMap(), inputCaches = new WeakMap();
 /** options.cache: an owner-chosen plain object. Deformations created with the same
@@ -31,7 +32,8 @@ export async function createGpuThreeDeformation(device, source, options = {}) {
   if (signal !== undefined && (!signal || typeof signal.aborted !== 'boolean' ||
       typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) fail('OPTIONS', 'Expected AbortSignal');
   if (signal?.aborted) fail('ABORTED', 'Source deformation initialization was aborted');
-  const binding = createThreeDeformationBinding(source, bindingOptions);
+  const binding = createThreeDeformationBinding(source, bindingOptions, bindingOptions.sourceAttributeCallbacks === false
+    ? null : attributes => retainWebGLGeometryAttributes(device, attributes));
   let gpu = null, disposed = false, terminal = null, busy = false, rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const closed = () => disposed || terminal !== null;
