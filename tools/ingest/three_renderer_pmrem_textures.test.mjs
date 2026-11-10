@@ -46,6 +46,17 @@ function room(map, Type = T.MeshBasicMaterial) {
   const root = new T.Mesh(new T.BoxGeometry(10, 10, 10), new Type({map, side: T.BackSide}));
   root.frustumCulled = false; return root;
 }
+function shaderRoom(input, Type = T.ShaderMaterial) {
+  const raw = Type === T.RawShaderMaterial, array = Array.isArray(input);
+  const vertexShader = (raw ? 'precision highp float; attribute vec3 position; attribute vec2 uv; uniform mat4 modelViewMatrix; uniform mat4 projectionMatrix; ' : '') +
+    'varying vec2 vUv; void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}';
+  const fragmentShader = (raw ? 'precision highp float; ' : '') +
+    'varying vec2 vUv; uniform float gain; uniform sampler2D inputs' + (array ? '[2]' : '') + '; void main(){gl_FragColor=' +
+    (array ? 'mix(texture2D(inputs[0],vUv),texture2D(inputs[1],vUv),.5)' : 'texture2D(inputs,vUv)') + '*gain;}';
+  const root = new T.Mesh(new T.BoxGeometry(10, 10, 10), new Type({side: T.BackSide,
+    uniforms: {inputs: {value: input}, gain: {value: .5}}, vertexShader, fragmentShader}));
+  root.frustumCulled = false; return root;
+}
 const drain = async renderer => { await renderer.waitForGPU(); await Promise.resolve(); };
 const sceneWrites = device => device.textureWrites.filter(write => write.texture.width === 2 && write.texture.height === 2);
 
@@ -216,4 +227,174 @@ test('a rejected later map rolls back earlier upload history and ordinary-source
   const input = renderer._capturePMREMTexture(map);
   assert.equal(input.texture.image.data[0], 77, 'the first successful capture sees current unmarked pixels');
   input.release(); generator.dispose(); map.dispose(); alpha.dispose(); root.geometry.dispose(); root.material.dispose();
+});
+
+test('shader sampler arrays and numeric uniforms retain their accepted values across queued installs', () => {
+  for (const Type of [T.ShaderMaterial, T.RawShaderMaterial]) {
+    const first = texture(32), second = texture(96), unused = texture(17), root = shaderRoom([first, second], Type);
+    root.material.uniforms.unused = {value: unused};
+    const owner = createThreePassSnapshots(T), device = geometryDevice(), seen = [];
+    const capture = () => owner.capturePMREMScene(root, new T.PerspectiveCamera(), device, {captureTexture(source) {
+      seen.push(source); return {texture: Object.create(Object.getPrototypeOf(source), Object.getOwnPropertyDescriptors(source)), release() {}};
+    }});
+    const a = capture(); root.material.uniforms.inputs.value.reverse(); root.material.uniforms.gain.value = .75;
+    const b = capture(); root.material.uniforms.inputs.value = []; root.material.uniforms.gain.value = 9;
+    a.install();
+    assert.deepEqual(a.root.material.uniforms.inputs.value.map(value => value.image.data[0]), [32, 96]);
+    assert.equal(a.root.material.uniforms.gain.value, .5); assert.equal(a.root.material.uniforms.unused.value, null);
+    b.install();
+    assert.deepEqual(b.root.material.uniforms.inputs.value.map(value => value.image.data[0]), [96, 32]);
+    assert.equal(b.root.material.uniforms.gain.value, .75);
+    assert.deepEqual(new Set(seen), new Set([first, second]), 'undeclared uniforms never establish texture history');
+    a.release(); b.release(); owner.dispose(); assert.equal(owner.rootCount, 0);
+    for (const map of [first, second, unused]) map.dispose(); root.geometry.dispose(); root.material.dispose();
+  }
+});
+
+test('shader sampler admission rejects dead outputs, inactive declarations and retained uniform state before capture', () => {
+  const bodies = [
+    'gl_FragColor=vec4(1.);',
+    'gl_FragColor=texture2D(inputs,vUv)*0.;',
+    'gl_FragColor=texture2D(inputs,vUv);gl_FragColor=vec4(1.);',
+    'if(false){gl_FragColor=texture2D(inputs,vUv);}else{gl_FragColor=vec4(1.);}',
+    'gl_FragColor=mix(texture2D(inputs,vUv),vec4(1.),1.);',
+    'gl_FragColor=texture2D(inputs,vUv)*1e-38*1e-38;',
+  ];
+  for (const body of bodies) {
+    const map = texture(), root = shaderRoom(map), owner = createThreePassSnapshots(T);
+    root.material.fragmentShader = 'varying vec2 vUv; uniform sampler2D inputs; void main(){' + body + '}';
+    let captures = 0;
+    assert.throws(() => owner.capturePMREMScene(root, new T.PerspectiveCamera(), geometryDevice(), {
+      captureTexture() { captures++; throw new Error('unexpected capture'); },
+    }), /PMREM shader samplers/, body);
+    assert.equal(captures, 0); assert.equal(owner.rootCount, 0);
+    owner.dispose(); map.dispose(); root.geometry.dispose(); root.material.dispose();
+  }
+  for (const mutate of [
+    material => { material.uniforms.inputs.needsUpdate = false; },
+    material => { material.uniforms.gain.needsUpdate = false; },
+    material => { material.lights = true; },
+    material => { material.fragmentShader = material.fragmentShader.replace('inputs', 'dfgLUT').replace('inputs', 'dfgLUT');
+      material.uniforms.dfgLUT = material.uniforms.inputs; delete material.uniforms.inputs; },
+    material => { material.fragmentShader = 'uniform sampler2D dormant; ' + material.fragmentShader;
+      material.uniforms.dormant = {value: texture(77)}; },
+  ]) {
+    const map = texture(), root = shaderRoom(map), owner = createThreePassSnapshots(T);
+    mutate(root.material);
+    assert.throws(() => owner.capturePMREMScene(root, new T.PerspectiveCamera(), geometryDevice(), {
+      captureTexture() { throw new Error('unexpected capture'); },
+    }), /PMREM shader samplers/);
+    owner.dispose(); root.material.uniforms.dormant?.value.dispose(); map.dispose(); root.geometry.dispose(); root.material.dispose();
+  }
+});
+
+test('shared shader uniforms and metadata-like sampler names preserve each selected material input', () => {
+  for (const sharedDictionary of [false, true]) {
+    const map = texture(77), hidden = shaderRoom(map), visible = shaderRoom(map), scene = new T.Scene();
+    for (const mesh of [hidden, visible]) {
+      mesh.material.fragmentShader = mesh.material.fragmentShader.replaceAll('inputs', 'userData');
+      mesh.material.uniforms.userData = mesh.material.uniforms.inputs; delete mesh.material.uniforms.inputs;
+    }
+    if (sharedDictionary) visible.material.uniforms = hidden.material.uniforms;
+    else visible.material.uniforms.userData = hidden.material.uniforms.userData;
+    hidden.visible = false; scene.add(hidden, visible);
+    const owner = createThreePassSnapshots(T), seen = [];
+    const capture = owner.capturePMREMScene(scene, new T.PerspectiveCamera(), geometryDevice(), {captureTexture(source) {
+      seen.push(source); return {texture: Object.create(Object.getPrototypeOf(source), Object.getOwnPropertyDescriptors(source)), release() {}};
+    }});
+    assert.deepEqual(seen, [map], sharedDictionary ? 'shared uniforms dictionary' : 'shared uniform wrapper');
+    capture.install();
+    assert.equal(capture.root.children[1].material.uniforms.userData.value.image.data[0], 77);
+    capture.release(); owner.dispose(); map.dispose();
+    for (const mesh of [hidden, visible]) { mesh.geometry.dispose(); mesh.material.dispose(); }
+  }
+});
+
+test('one shader material captures every selected object-dependent sampler variant', () => {
+  const regularMap = texture(32), instancedMap = texture(96), rigid = shaderRoom(regularMap), material = rigid.material;
+  material.uniforms = {regularMap: {value: regularMap}, instancedMap: {value: instancedMap}};
+  material.fragmentShader = 'varying vec2 vUv;\n#ifdef USE_COLOR\nuniform sampler2D instancedMap;\n#else\nuniform sampler2D regularMap;\n#endif\n' +
+    'void main(){\n#ifdef USE_COLOR\ngl_FragColor=texture2D(instancedMap,vUv);\n#else\ngl_FragColor=texture2D(regularMap,vUv);\n#endif\n}';
+  const instanced = new T.InstancedMesh(new T.BoxGeometry(10, 10, 10), material, 1);
+  instanced.setColorAt(0, new T.Color(1, .5, .25)); instanced.frustumCulled = false;
+  const scene = new T.Scene(); scene.add(rigid, instanced);
+  const owner = createThreePassSnapshots(T), seen = [];
+  const capture = owner.capturePMREMScene(scene, new T.PerspectiveCamera(), geometryDevice(), {captureTexture(source) {
+    seen.push(source); return {texture: Object.create(Object.getPrototypeOf(source), Object.getOwnPropertyDescriptors(source)), release() {}};
+  }});
+  assert.deepEqual(new Set(seen), new Set([regularMap, instancedMap]));
+  capture.install();
+  assert.equal(capture.root.children[0].material.uniforms.regularMap.value.image.data[0], 32);
+  assert.equal(capture.root.children[1].material.uniforms.instancedMap.value.image.data[0], 96);
+  capture.release(); owner.dispose(); regularMap.dispose(); instancedMap.dispose();
+  rigid.geometry.dispose(); instanced.geometry.dispose(); instanced.dispose(); material.dispose();
+});
+
+test('shader sampler output proofs accept GLSL3 outputs and retain skinned material reservations across shared use', () => {
+  const map = texture(), root = shaderRoom(map, T.RawShaderMaterial), camera = new T.PerspectiveCamera();
+  root.material.glslVersion = T.GLSL3;
+  root.material.vertexShader = root.material.vertexShader.replaceAll('attribute', 'in').replaceAll('varying', 'out');
+  root.material.fragmentShader = 'out vec4 bakedColor; ' + root.material.fragmentShader
+    .replaceAll('varying', 'in').replaceAll('gl_FragColor', 'bakedColor').replaceAll('texture2D', 'texture');
+  const owner = createThreePassSnapshots(T), device = geometryDevice(), seen = [];
+  const capture = owner.capturePMREMScene(root, camera, device, {captureTexture(source) {
+    seen.push(source); return {texture: Object.create(Object.getPrototypeOf(source), Object.getOwnPropertyDescriptors(source)), release() {}};
+  }});
+  assert.deepEqual(seen, [map]); capture.release(); owner.dispose();
+  root.geometry.dispose(); root.material.dispose();
+
+  const rigid = shaderRoom(map), geometry = new T.BoxGeometry(), count = geometry.attributes.position.count;
+  const weights = new Float32Array(count * 4); for (let i = 0; i < count; i++) weights[i * 4] = 1;
+  geometry.setAttribute('skinIndex', new T.Uint16BufferAttribute(new Uint16Array(count * 4), 4));
+  geometry.setAttribute('skinWeight', new T.Float32BufferAttribute(weights, 4));
+  rigid.material.fragmentShader = rigid.material.fragmentShader.replaceAll('inputs', 'boneTexture');
+  rigid.material.uniforms.boneTexture = rigid.material.uniforms.inputs; delete rigid.material.uniforms.inputs;
+  const skinned = new T.SkinnedMesh(geometry, rigid.material), bone = new T.Bone();
+  skinned.add(bone); skinned.bind(new T.Skeleton([bone])); skinned.frustumCulled = false;
+  const scene = new T.Scene(); scene.add(rigid, skinned);
+  const reserved = createThreePassSnapshots(T);
+  assert.throws(() => reserved.capturePMREMScene(scene, camera, device, {
+    captureTexture() { throw new Error('unexpected capture'); },
+  }), /PMREM shader samplers/, 'the later rigid representative cannot hide the material\'s selected skinned use');
+  assert.equal(skinned.skeleton.boneTexture, null, 'rejected capture does not perform source skeleton effects');
+  reserved.dispose(); skinned.skeleton.dispose(); geometry.dispose(); rigid.geometry.dispose(); rigid.material.dispose(); map.dispose();
+});
+
+test('shader scene bakes share upload histories, partial updates and retained texture lifetimes', async t => {
+  for (const Type of [T.ShaderMaterial, T.RawShaderMaterial]) {
+    const {renderer, device} = fixture(t); await renderer.init();
+    const map = texture(32), replacement = texture(176), root = shaderRoom(map, Type), generator = new Generator(renderer), outputs = [];
+    const bake = () => outputs.push(generator.fromScene(root, .02, .1, 20, {size: 16}));
+    bake(); map.image.data.fill(64); bake();
+    map.image.data.fill(96); map.needsUpdate = true; bake();
+    map.image.data.fill(200); map.addUpdateRange(4, 4); map.needsUpdate = true; bake();
+    root.material.uniforms.inputs.value = replacement; bake();
+    root.material.uniforms.inputs.value = null; map.dispose(); replacement.dispose();
+    root.geometry.dispose(); root.material.dispose(); generator.dispose(); await drain(renderer);
+    assert.deepEqual(sceneWrites(device).map(write => Array.from(write.bytes)), [
+      new Array(16).fill(32), new Array(16).fill(96),
+      [...new Array(4).fill(96), ...new Array(4).fill(200), ...new Array(8).fill(96)], new Array(16).fill(176),
+    ], Type.name);
+    assert.equal(renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+    assert.equal(renderer._sampledTextureInputs.diagnostics.versions, 0);
+    assert.equal(renderer._passSnapshots.rootCount, 0);
+    for (const output of outputs) output.dispose();
+  }
+});
+
+test('hidden shader samplers and failed later inputs leave first-use texture history untouched', async t => {
+  const {renderer, device} = fixture(t); await renderer.init();
+  const first = texture(32), second = texture(96), root = shaderRoom([first, second]), generator = new Generator(renderer);
+  root.visible = false;
+  const hidden = generator.fromScene(root, 0, .1, 20, {size: 16});
+  root.visible = true; first.image.data.fill(144); second.onUpdate = () => {};
+  assert.throws(() => generator.fromScene(root, 0, .1, 20, {size: 16}), /upload callbacks/);
+  assert.equal(renderer._sampledTextureInputs.diagnostics.versions, 0);
+  assert.equal(renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+  assert.equal(renderer._framebufferBindings().has(first), false);
+  first.image.data.fill(176); second.onUpdate = null;
+  const accepted = generator.fromScene(root, 0, .1, 20, {size: 16});
+  first.dispose(); second.dispose(); generator.dispose(); await drain(renderer);
+  assert.deepEqual(sceneWrites(device).map(write => write.bytes[0]), [176, 96]);
+  hidden.dispose(); accepted.dispose(); root.geometry.dispose(); root.material.dispose();
 });

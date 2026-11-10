@@ -10,6 +10,8 @@ import {captureThreeUniformGroup} from './three_uniform_group_state.mjs';
 import {claimWebGLGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {threeProgramSources} from './three_program.mjs';
 import {compileEsslProgram} from './essl_wgsl.mjs';
+import {parse} from './essl_parse.mjs';
+import {preprocess} from './essl_preprocess.mjs';
 import {webglLights, webglMaterialUniforms, refreshWebGLMaterialUniforms} from './three_webgl_program.mjs';
 
 export class ThreePassSnapshotError extends Error {
@@ -429,6 +431,103 @@ export function createThreePassSnapshots(T, {targets = null, maxBytes = 32 * 102
   });
 }
 
+/** A declared sampler is not necessarily a GL-active uniform. Admit a small
+ * output-rooted shader profile before acknowledging any source texture upload.
+ * Every sampler must contribute to the single fragment output through positive
+ * arithmetic. Dead declarations, helper calls and retained GL uniform state
+ * need their own source-use proof; reflection alone cannot authorize a capture. */
+function inspectPMREMShaderSamplers(source, reflection, material, skinned) {
+  if (!material.isShaderMaterial) return;
+  const refuse = () => fail('SCENE', 'PMREM shader samplers require a single directly sampled fragment output and source-updated uniforms');
+  if (material.lights === true || Object.values(material.uniforms ?? {}).some(uniform => uniform?.needsUpdate === false)) refuse();
+  for (const binding of reflection.textures) if (material.uniforms?.[binding.name] !== undefined &&
+      (binding.name === 'dfgLUT' || skinned && binding.name === 'boneTexture')) refuse();
+  if (reflection.textures.length === 0) return;
+  const declarations = parse(preprocess(source.fragment).tokens);
+  const calls = new Set(['texture2D', 'textureCube', 'texture', 'mix']);
+  if (declarations.some(d => (d.k === 'func' || d.k === 'proto') && calls.has(d.name))) refuse();
+  const mains = declarations.filter(d => d.k === 'func' && d.name === 'main');
+  if (mains.length !== 1 || mains[0].params.length) refuse();
+  const statements = mains[0].body.list.filter(statement => statement.k !== 'empty');
+  const assignment = statements[0]?.e;
+  const outputs = declarations.filter(d => d.k === 'var' && d.q.storage === 'out');
+  const output = outputs.length === 0 ? 'gl_FragColor'
+    : outputs.length === 1 && outputs[0].type.name === 'vec4' && !outputs[0].type.array &&
+      outputs[0].list.length === 1 && !outputs[0].list[0].array ? outputs[0].list[0].name : null;
+  if (statements.length !== 1 || statements[0].k !== 'expr' || assignment?.k !== 'assign' ||
+      assignment.op !== '=' || assignment.target.k !== 'id' || assignment.target.name !== output) refuse();
+  const inputs = new Set(['gl_FragCoord']), scalars = new Set();
+  for (const d of declarations) if (d.k === 'var' && ['uniform', 'in', 'varying'].includes(d.q.storage))
+    for (const v of d.list) {
+      if (!d.type.name.includes('sampler')) inputs.add(v.name);
+      if (d.q.storage === 'uniform' && d.type.name === 'float' && !d.type.array && !v.array && !v.init) scalars.add(v.name);
+    }
+  const unparen = value => { while (value?.k === 'paren') value = value.e; return value; };
+  const literal = value => { const node = unparen(value); return node?.k === 'num' ? Math.fround(Number(node.v.replace(/^0x/i.test(node.v) ? /[uU]$/ : /[fFuU]$/, ''))) : NaN; };
+  const normal = value => Number.isFinite(value) && value >= 2 ** -126;
+  function pure(value, depth = 0) {
+    if (depth > 32) refuse();
+    const node = unparen(value);
+    if (node?.k === 'id') return inputs.has(node.name);
+    if (node?.k === 'num') return Number.isFinite(literal(node));
+    if (node?.k === 'bool') return true;
+    if (node?.k === 'field') return /^[xyzwrgbastpq]{1,4}$/.test(node.name) && pure(node.a, depth + 1);
+    if (node?.k === 'index') return pure(node.a, depth + 1) && pure(node.index, depth + 1);
+    if (node?.k === 'unary') return ['+', '-'].includes(node.op) && pure(node.a, depth + 1);
+    if (node?.k === 'bin') return ['+', '-', '*', '/'].includes(node.op) && pure(node.a, depth + 1) && pure(node.b, depth + 1);
+    return node?.k === 'ctor' && !node.type.array && /^(?:bool|float|int|uint|[biu]?vec[234]|mat[234](?:x[234])?)$/.test(node.type.name) &&
+      node.args.every(argument => pure(argument, depth + 1));
+  }
+  // Module initializers must not invoke an effectful helper before main().
+  for (const d of declarations) if (d.k === 'var') for (const v of d.list) if (v.init) {
+    if (!pure(v.init)) refuse(); inputs.add(v.name);
+  }
+  const key = (name, element) => name + ':' + (element ?? '');
+  const expected = new Set(reflection.textures.map(binding => key(binding.name, binding.element)));
+  const scale = (weights, factor) => new Map([...weights].map(([name, weight]) => {
+    const next = Math.fround(weight * factor); if (!normal(next)) refuse(); return [name, next];
+  }));
+  const combine = (left, right) => {
+    const result = new Map(left);
+    for (const [name, weight] of right) {
+      const next = Math.fround((result.get(name) ?? 0) + weight); if (!normal(next)) refuse(); result.set(name, next);
+    }
+    return result;
+  };
+  function sampled(value, depth = 0) {
+    if (depth > 32) refuse();
+    const node = unparen(value);
+    if (node?.k === 'field' && /^[xyzwrgbastpq]{1,4}$/.test(node.name)) return sampled(node.a, depth + 1);
+    if (node?.k === 'bin' && node.op === '+') return combine(sampled(node.a, depth + 1), sampled(node.b, depth + 1));
+    if (node?.k === 'bin' && node.op === '*') {
+      for (const [factor, expression] of [[node.a, node.b], [node.b, node.a]]) {
+        const scalar = unparen(factor), number = literal(scalar);
+        if (scalar?.k === 'id' && scalars.has(scalar.name)) return sampled(expression, depth + 1);
+        if (normal(number)) return scale(sampled(expression, depth + 1), number);
+      }
+      refuse();
+    }
+    if (node?.k === 'call' && node.name === 'mix' && node.args.length === 3) {
+      const weight = literal(node.args[2]);
+      if (!(weight > 0 && weight < 1)) refuse();
+      return combine(scale(sampled(node.args[0], depth + 1), Math.fround(1 - weight)),
+        scale(sampled(node.args[1], depth + 1), weight));
+    }
+    if (node?.k !== 'call' || !['texture2D', 'textureCube', 'texture'].includes(node.name) ||
+        node.args.length !== 2 || !pure(node.args[1])) refuse();
+    const sampler = unparen(node.args[0]);
+    let name = sampler?.k === 'id' ? key(sampler.name, null) : null;
+    if (sampler?.k === 'index' && sampler.a.k === 'id') {
+      const index = literal(sampler.index); if (!Number.isSafeInteger(index) || index < 0) refuse();
+      name = key(sampler.a.name, index);
+    }
+    if (!expected.has(name)) refuse();
+    return new Map([[name, 1]]);
+  }
+  const used = sampled(assignment.value);
+  if ([...expected].some(name => !used.has(name))) refuse();
+}
+
 /** Detached, callback-free WebGL PMREM scene views. These retain source upload
  * versions across captures; their attribute owner is intentionally separate
  * from ordinary WebGL scene bridges until an explicit disposal boundary. */
@@ -596,7 +695,11 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           ? geometry.groups.map(group => [object.material[group.materialIndex], group]) : [[object.material, null]];
         // WebGLRenderer sets the program (and its sampled uniforms) before
         // checking the draw range, including an otherwise empty draw.
-        for (const [material] of materials) if (material?.visible) selectedMaterials.set(material, object);
+        for (const [material] of materials) if (material?.visible) {
+          let objects = selectedMaterials.get(material);
+          if (!objects) selectedMaterials.set(material, objects = new Set());
+          objects.add(object);
+        }
         if (object.isSkinnedMesh) for (let face = 0; face < frusta.length; face++) {
           if (object.frustumCulled && !frusta[face].intersectsObject(object)) continue;
           skeletonUpdates[face].add(object.skeleton);
@@ -670,8 +773,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       if (value instanceof T.Texture) {
         if (paletteTextures.has(value) || paletteBuffers.has(value.image?.data?.buffer))
           fail('SCENE', 'PMREM skeleton textures cannot also serve as material map inputs');
-        if (!materialOwner || materialOwner.isShaderMaterial)
-          fail('SCENE', 'PMREM texture capture requires ordinary material maps; shader samplers and light maps need their source binding selection');
+        if (!materialOwner)
+          fail('SCENE', 'PMREM texture capture requires material maps or admitted shader sampler uniforms');
         if (field(value, 'updateMatrix') !== T.Texture.prototype.updateMatrix ||
             Object.values(Object.getOwnPropertyDescriptors(value)).some(descriptor => !Object.hasOwn(descriptor, 'value')))
           fail('SCENE', 'PMREM material maps require ordinary texture data and transform updates');
@@ -702,7 +805,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       charge(128); const result = array ? [] : view(value); memo.set(value, result); sources.set(result, value);
       const upload = attributeOwners.has(value) ? selectedOwners.has(value) ? uploaded(value) : histories.get(value) : null;
       for (const key of Object.getOwnPropertyNames(value)) {
-        if (['_listeners', 'userData', '_onChangeCallback'].includes(key) || array && key === 'length' ||
+        if ((object || geometry || material || skeleton || attribute || math.has(prototype)) &&
+            ['_listeners', 'userData', '_onChangeCallback'].includes(key) || array && key === 'length' ||
             object && ['parent', 'children', 'animations', 'shadow'].includes(key) ||
             skeleton && ['boneMatrices', 'boneTexture'].includes(key)) continue;
         let input = own(value, key);
@@ -741,9 +845,27 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     try {
       data = copy(root);
       if (root.isScene && root.background?.isColor) data.background = null;
+      // Uniform wrappers and arrays can be shared by different materials,
+      // including a hidden material copied first. Attribute their validated
+      // private texture identities to every selected shader material.
+      for (const material of selectedMaterials.keys()) if (material.isShaderMaterial) {
+        const textures = materialTextures.get(material) ?? new Set(), scanned = new Set(), pending = [memo.get(material).uniforms];
+        while (pending.length) {
+          const record = pending.pop();
+          if (!sources.has(record) || scanned.has(record)) continue;
+          scanned.add(record);
+          for (const value of Object.values(record)) {
+            if (value instanceof T.Texture) textures.add(value);
+            else if (sources.has(value)) pending.push(value);
+          }
+        }
+        if (textures.size) materialTextures.set(material, textures);
+      }
       const sampled = new Set(), programs = new Map();
       let lights = null;
-      for (const [material, object] of selectedMaterials) {
+      // One material may compile different samplers for rigid, instanced or
+      // skinned draws. Inspect every selected object's assembled program.
+      for (const [material, objects] of selectedMaterials) for (const object of objects) {
         if (!materialTextures.has(material)) continue;
         const capturedMaterial = memo.get(material), capturedObject = memo.get(object), fog = data.isScene ? data.fog : null;
         if (!lights) { lights = webglLights(T); lights.setup(sceneLights); }
@@ -751,6 +873,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           {fog, lights: lights.state, toneMapping: T.NoToneMapping, outputColorSpace: T.LinearSRGBColorSpace});
         let reflection = programs.get(source.key);
         if (!reflection) { reflection = compileEsslProgram(source.vertex, source.fragment).reflection; programs.set(source.key, reflection); }
+        inspectPMREMShaderSamplers(source, reflection, capturedMaterial, object.isSkinnedMesh);
         const uniforms = webglMaterialUniforms(T, capturedMaterial);
         refreshWebGLMaterialUniforms(T, uniforms, capturedMaterial, {fog, lights: lights.state, envMap: null,
           pixelRatio: 1, height: 1, unlitColorSpace: T.LinearSRGBColorSpace});
@@ -760,7 +883,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           // calls its gradient helper only from direct-light evaluation. These
           // source-inactive samplers must not establish an upload history.
           const parameters = source.parameters;
-          if (binding.name === 'bumpMap' && (parameters.normalMapObjectSpace || parameters.normalMapTangentSpace)) continue;
+          if (!capturedMaterial.isShaderMaterial && binding.name === 'bumpMap' &&
+              (parameters.normalMapObjectSpace || parameters.normalMapTangentSpace)) continue;
           if (capturedMaterial.isMeshToonMaterial && binding.name === 'gradientMap' &&
               parameters.numSunLights + parameters.numDirLights + parameters.numPointLights + parameters.numSpotLights === 0) continue;
           const uniform = uniforms[binding.name]?.value;

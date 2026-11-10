@@ -556,7 +556,7 @@ device before ordinary renderer uploads; a conflicting batch releases all newly
 acquired claims. Disposal cancels pending work and releases captured payloads.
 
 The admitted scene profile comprises rigid and skinned meshes, CPU instances,
-ordinary source materials and texture-free shaders, and unshadowed lights, with
+ordinary source materials, texture-free and admitted textured shaders, and unshadowed lights, with
 a solid or absent background. Skinned captures retain call-time bone worlds,
 inverse binds, bind mode and bind matrices, including shared skeletons and
 detached bones outside the captured hierarchy. Each accepted cube face preserves
@@ -582,10 +582,22 @@ Scene admission uses the sampled owner's existing synchronous transaction: a
 later map's rejection restores earlier upload histories, and original Sources
 are registered for ordinary consumers only after the complete capture succeeds.
 
+Unlit `ShaderMaterial` and `RawShaderMaterial` scene captures also admit sampler
+uniforms and literal-indexed sampler arrays when every declared sampler
+contributes to one fragment output. The source ESSL proof accepts direct texture
+samples, positive sums and scales, float-uniform gains, and constant interior
+`mix` weights; it checks the preprocessed program, including GLSL3 outputs.
+Uniform wrappers, arrays and numeric controls retain their accepted values,
+while textures share the existing upload history, partial updates and disposal
+lifetime. Undeclared texture properties do not establish upload history. Dead or
+unproved sampler use, retained `needsUpdate: false` uniforms, renderer-owned
+lighting uniforms, `dfgLUT`, and skinned `boneTexture` collisions remain explicit
+boundaries. Reflection alone cannot establish which declarations are GL-active.
+
 One Texture per Source is admitted within each scene bake. Aliases across
 successive bakes and ordinary consumers share the existing uploaded history;
 simultaneous aliases need per-face upload ordering and remain explicit. Texture
-inputs before device initialization, ShaderMaterial sampler uniforms, Physical
+inputs before device initialization, shaders outside this sampler profile, Physical
 material accessors, environments/overrides, custom render or shader hooks, custom
 sorting, shadows, transmission, morphed/batched meshes, LOD, wireframes,
 lines, points and sprites also retain explicit boundaries. Skinning requires
