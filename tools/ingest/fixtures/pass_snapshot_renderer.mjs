@@ -6,7 +6,7 @@ class Color { constructor(r = 0, g = 0, b = 0) { Object.assign(this, {r, g, b, i
 class Scene extends passThree.Object3D { isScene = true; background = null; environment = null; fog = null; overrideMaterial = null; }
 export const T = {...passThree, ...targetThree, EventDispatcher, Color, Scene, PerspectiveCamera: passThree.Camera, NoToneMapping: 0, ACESFilmicToneMapping: 4, AgXToneMapping: 6, PCFShadowMap: 1};
 export {passFixture};
-export const createThreeProgramSupport = options => options;
+export const createThreeProgramSupport = options => ({...options, dispose() {}});
 export const createThreeProgramPMREM = () => {};
 export const createThreeProgramShadows = () => {};
 const boundary = () => Object.assign(new Error('prepare required'), {code: 'THREE_SCENE_PREPARE'});

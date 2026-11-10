@@ -40,6 +40,7 @@ import {createThreeTimestampQueries} from './three_timestamp_queries.mjs';
 import {createThreeBackendOperations} from './three_backend_operations.mjs';
 import {createThreePassSnapshots, captureThreeArrayCamera, captureThreeCamera, captureThreeBackground, updateThreeCameraProjection} from './three_pass_snapshot.mjs';
 import {captureThreeMaterialState} from './three_material_snapshot.mjs';
+import {createThreePassInstances} from './three_pass_instances.mjs';
 import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera, getThreePassExcludedObjects} from './three_pass_state.mjs';
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
@@ -252,7 +253,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const clipping = needsClipping(scene, overrideMaterial, passOptions?.nodeFrame, passOptions?.materialFrame) || owner._needsGlobalClipping?.() === true;
             const previous = entries.get(scene);
             if (previous && previous.key === key && (previous.clipping || !clipping) && !previous.bridge.failed) {
-              await previous.bridge.prepare(passOptions);
+              const {privateSnapshot, ...bridgeOptions} = passOptions ?? {};
+              await previous.bridge.prepare(passOptions ? bridgeOptions : undefined);
               continue;
             }
             // A changed feature profile selects different bridge pipelines.
@@ -274,6 +276,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
               ...sceneLimits, three: THREE, signal, maxBindings, overrideMaterial, nodeFrame: passOptions?.nodeFrame ?? null,
               backgroundState: passOptions?.backgroundState, materialFrame: passOptions?.materialFrame,
               sourceAttributeCallbacks: owner._shaderEncodedOutput === true,
+              instanceHistory: owner._shaderEncodedOutput && !passOptions?.privateSnapshot ? owner._passInstances.history : null,
               textures: owner._targets.bindingsFor(destination === owner ? null : destination.target,
                 owner._shaderEncodedOutput ? owner._framebufferBindings(sceneLimits.textures) : sceneLimits.textures,
                 owner._shaderEncodedOutput ? texture => owner._programFrame?.passTextureEntries?.get(texture) : null),
@@ -440,6 +443,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._targetLifetime = new AbortController();
       this._targets = createThreeRenderTargets(THREE, {getDevice: () => this._device, flipY: targetTextureFlipY});
       this._passSnapshots = createThreePassSnapshots(THREE, {targets: this._targets});
+      this._passInstances = createThreePassInstances(THREE, {maxBytes: sceneLimits.maxInstanceBytes ?? 128 * 1024 * 1024,
+        maxMeshes: sceneLimits.maxInstanceMeshes ?? Math.min(maxBindings, 4096)});
       this._nodeProgramSupport = null;
       this._nodeBackgrounds = null;
       this._nodeBundles = null;
@@ -668,6 +673,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       dispose(() => this._canvases.dispose());
       this._wanted.clear();
       dispose(() => this._passSnapshots.dispose());
+      dispose(() => this._passInstances.dispose());
       dispose(() => this._nodeBackgrounds?.dispose()); this._nodeBackgrounds = null;
       dispose(() => this._nodeProgramSupport?.dispose());
       this._nodeProgramSupport = null;
@@ -1226,7 +1232,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (passCameraRequired) {
         if (this.shadowMap.enabled || this.sortObjects && (this._opaqueSort || this._transparentSort))
           fail('UNSUPPORTED', 'Pinned pass capture requires a callback-free scene without shadows or custom sorting');
-        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true,
+        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true, allowInstances: true,
           exclusions: getThreePassExcludedObjects(this),
           maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
           maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
@@ -1326,6 +1332,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           webglSourceCamera = camera;
           cameraSource ??= camera;
           camera = captureThreeCamera(THREE, camera);
+          materialFrame.instanceFrame = this._passInstances.capture(scene, camera, materialFrame, {
+            maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues, sortObjects: this.sortObjects, required: passCameraRequired});
+          if (materialFrame.instanceFrame) {
+            materialFrame.values += materialFrame.instanceFrame.values;
+            this._materialCaptureValues += materialFrame.instanceFrame.values;
+          }
         }
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame,
           overrideMaterial: request.overrideSnapshot?.material ?? overrideMaterial, mrt,
@@ -1678,7 +1690,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return captured;
     }
     _captureMaterialFrame({scene, camera, nodeFrame, overrideMaterial, selectionOnly = false}) {
-      const captured = captureThreeMaterialState(THREE, scene, {nodeFrame, overrideMaterial, camera, selectionOnly,
+      const captured = captureThreeMaterialState(THREE, scene, {nodeFrame, overrideMaterial, camera, selectionOnly, allowInstances: selectionOnly,
         maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
         maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
       if (captured) this._materialCaptureValues += captured.values;
@@ -1694,6 +1706,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       request.snapshot?.release();
       request.overrideSnapshot?.release();
       if (request.materialFrame) {
+        request.materialFrame.instanceFrame?.release();
         this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
       }
       if (request.nodeFrame) {
@@ -1705,6 +1718,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       request.releaseDestination?.(); request.releaseDestination = null;
       request.releaseCanvas?.(); request.releaseCanvas = null;
+    }
+    _dropInstanceFrame(materialFrame) {
+      const frame = materialFrame?.instanceFrame;
+      if (!frame) return;
+      frame.release(); materialFrame.instanceFrame = null;
+      materialFrame.values -= frame.values; this._materialCaptureValues -= frame.values;
     }
     _dispatchRequest(request) {
       const {scene, destination, snapshot} = request;
@@ -1742,6 +1761,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // An application may install hooks while preparation is pending. Keep
         // those callbacks on their original camera and live mutation path.
         camera = webglSourceCamera;
+        this._dropInstanceFrame(materialFrame);
       }
       if (initializeOutputDepth) {
         this._targets.assertCurrent(initializeOutputDepth);
@@ -1749,6 +1769,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       snapshot?.install();
       overrideSnapshot?.install();
+      materialFrame?.instanceFrame?.install();
       nodeFrame?.installAttributes?.();
       if (nodeFrame) {
         const entry = destination._dispatcher?.entry(scene);
@@ -2063,6 +2084,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // after acceptance must retain their global shader reads and writes.
         if (request?.programFrame?.toneMappingChunk !== undefined && request.materialFrame && !request.materialFrame.cameraSafe())
           delete request.programFrame.toneMappingChunk;
+        if (request?.materialFrame?.instanceFrame && !request.materialFrame.cameraSafe()) {
+          if (request.passCameraRequired) fail('UNSUPPORTED', 'Pinned pass scene or camera gained callbacks before preparation');
+          this._dropInstanceFrame(request.materialFrame);
+        }
         const previous = this._programFrame, previousRoot = destination._preparationRoot;
         const previousFramebufferFrame = this._programFramebufferFrame;
         this._programFramebufferFrame = request?.programTextures;
@@ -2070,10 +2095,11 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         this._programFrame = request?.programFrame;
         destination._preparationRoot = request?.scene ?? null;
         destination._preparationOptions = request ? {overrideMaterial: request.overrideMaterial, nodeFrame: request.nodeFrame,
-          backgroundState: request.backgroundState, materialFrame: request.materialFrame} : undefined;
+          backgroundState: request.backgroundState, materialFrame: request.materialFrame, privateSnapshot: !!request.snapshot} : undefined;
         try {
           request?.snapshot?.install();
           request?.overrideSnapshot?.install();
+          request?.materialFrame?.instanceFrame?.install();
           const prepare = async () => {
           captured?.installAttributes?.();
           if (destination !== this) {

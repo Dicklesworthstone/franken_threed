@@ -65,6 +65,20 @@ test('Sky uniforms and scene inputs are captured before queued source filtering'
  assert.equal(renderer._passSnapshots.rootCount,0);output.dispose();
 });
 
+test('retired PMREM instance views do not accumulate public instance upload history',async t=>{
+ const {renderer}=fixture(t);await renderer.init();
+ for(let iteration=0;iteration<3;iteration++){
+  const environment=new RoomEnvironment(),generator=new Generator(renderer);
+  const instance=environment.children.find(object=>object.isInstancedMesh);
+  const output=generator.fromScene(environment,0,.1,100,{size:16});
+  t.after(()=>output.dispose());
+  environment.dispose();instance.dispose();environment.clear();generator.dispose();
+  await drain(renderer);
+  assert.equal(renderer._passInstances.history.bytes,0,`retired generator ${iteration+1} leaves no public instance history`);
+  assert.equal(renderer._passSnapshots.rootCount,0);assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ }
+});
+
 test('fromScene before device acquisition captures real targets, sigma and independently queued scenes',async t=>{
  const {renderer,device,release}=fixture(t,{deferred:true}),room=new RoomEnvironment(),generator=new Generator(renderer);
  const instances=room.children.find(object=>object.isInstancedMesh),selected=new T.WebGLRenderTarget(8,8);

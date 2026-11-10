@@ -1095,8 +1095,25 @@ orthographic cameras also retain their accepted matrices. Public reversed-depth
 transitions still update the original camera, including its projection inverse.
 Custom projection methods and callback-bearing scenes keep their established
 ordinary rendering path; required supersampling capture explicitly refuses
-them. Shadows, custom sorting, instancing, skinning and batching remain outside
+them. Shadows, custom sorting, skinning, morphs and batching remain outside
 this supersampling capture profile.
+
+Rigid `InstancedMesh` objects with ordinary Float32 matrix and RGB color streams
+now participate in these captures, including the verified AO and outline scene
+draws. Each accepted call retains its instance count, uploaded streams, object
+world matrix and hierarchy selection through asynchronous preparation. Ordinary
+callback-free instance draws use the same capture boundary, so queuing a later
+pass cannot replace an earlier draw's instance bytes. Source disposal starts a
+new public upload history while already accepted samples keep their private
+data and views.
+
+One renderer-owned instance history connects ordinary GPU residency and captured
+passes. First uploads, increasing versions, partial update ranges and r186's
+range-merging behavior preserve the source-requested bytes; unmarked CPU edits
+remain stale. Default upload callbacks, fixed storage and one instance per
+attribute record are required for captured streams. Recording-facade tests
+exercise actual SSAA samples, queued counts/colors, partial uploads and disposal;
+browser pixels for this extension remain unverified.
 
 The verified `EffectComposer.setSize()` body runs inside the existing target
 owner's resize scope. Queued fullscreen draws retain their sampled target
@@ -1137,8 +1154,9 @@ display and sampled normal-buffer values together.
 Both source passes temporarily hide points and lines for their normal/depth
 draw, then restore the public objects. The private verified-pass scope now
 retains that exact exclusion list and its descendants through deferred
-preparation and drawing. It neither rewrites public visibility during
-submission nor freezes ordinary scene visibility or LOD selection. Exclusions
+preparation and drawing. It does not rewrite public visibility during
+submission. Scenes without captured instances retain their existing ordinary
+visibility and LOD selection behavior. Exclusions
 use the existing material capture limits and release with the accepted request.
 The required capture profile remains ordinary callback-free scenes/cameras
 without shadows or custom sorting; unsupported capture fails before retaining

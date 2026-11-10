@@ -249,7 +249,7 @@ export function bufferGeometrySnapshot(handle, device) {
 
 function createResidency(device, geometry, {
   maxBytes = 64 * 1024 * 1024, maxInitialBytes = maxBytes, maxAttributes = 128, label = 'f3d-buffer-geometry',
-  sourceAttributeCallbacks = true,
+  sourceAttributeCallbacks = true, instanceHistory = null,
 } = {}, describeSource = describe, sourceRange = range, registry = states) {
   integer(maxBytes, 1, Number.MAX_SAFE_INTEGER, 'byte budget');
   integer(maxInitialBytes, 0, maxBytes, 'initial allocation budget');
@@ -369,6 +369,8 @@ function createResidency(device, geometry, {
           addedCount++; addedBytes += size;
         }
       }
+      if (sourceAttributeCallbacks && instanceHistory)
+        instanceHistory.prepareRaw(shape.owners.values());
       if (addedBytes > maxAdditionalBytes || allocatedBytes + addedBytes > maxBytes || records.size + addedCount > maxAttributes) fail('LIMIT', 'Geometry residency budget exceeded');
       native(() => { device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory'); }); scoped = true;
       for (const entry of shape.owners.values()) {
@@ -394,7 +396,8 @@ function createResidency(device, geometry, {
         integer(owner.version, 0, Number.MAX_SAFE_INTEGER, 'upload version');
         let record = records.get(owner);
         if (record && record.version !== -1 && record.version < owner.version) checkRanges(owner, array.length, sourceAttributeCallbacks);
-        if (!record) {
+        const fresh = !record;
+        if (fresh) {
           const divisor = entry.divisor ?? 1;
           const size = Math.max(4, align4(divisor > 1 ? Math.ceil(array.length / entry.stride) * entry.stride * divisor * 4
             : entry.conversion ? array.length * 4 : array.byteLength));
@@ -406,6 +409,13 @@ function createResidency(device, geometry, {
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
           if (sourceAttributeCallbacks) webglHistory(device, owner).residents++;
+        }
+        if (sourceAttributeCallbacks && instanceHistory?.eligible(entry)) {
+          const state = instanceHistory.upload(owner, accepted => write(record, accepted, 0, accepted.length), () => {
+            remember(owner, array); owner.onUploadCallback();
+          }, record.historyRevision);
+          record.version = state.version; record.historyRevision = state.revision;
+        } else if (fresh) {
           write(record, array, 0, array.length);
           remember(owner, array);
           if (sourceAttributeCallbacks) owner.onUploadCallback();
@@ -462,7 +472,10 @@ function createResidency(device, geometry, {
   }
   const onDispose = () => {
     if (busy) fail('REENTRANT', 'Cannot release geometry from an upload callback');
-    if (!disposed && !terminal) release();
+    if (!disposed && !terminal) {
+      for (const owner of records.keys()) instanceHistory?.forget(owner);
+      release();
+    }
   };
   const handle = Object.freeze({
     update,
@@ -636,19 +649,18 @@ function describeInstances(source, device) {
     if (!owner?.isInstancedBufferAttribute || owner.isInterleavedBufferAttribute ||
         owner.meshPerAttribute !== 1 || (owner.itemSize !== width && !(shared && width === 3 && stride === 4)) || owner.normalized)
       fail('SHAPE', `Expected an ordinary ${name} InstancedBufferAttribute`);
-    const array = owner.array;
-    storage(array);
-    if (!(array instanceof Float32Array) || owner.isFloat16BufferAttribute)
+    const storageSource = sourceArray(owner), array = storageSource.array;
+    if (!(storageSource.kind instanceof Float32Array) || owner.isFloat16BufferAttribute)
       fail('FORMAT', 'Instance streams require non-normalized Float32 attributes');
     const borrowed = shared && device ? computeAttributeSnapshot(device, owner) : null;
     const count = integer(owner.count, 0, 0xffffffff, 'instance attribute count');
-    if (count * stride !== array.length) fail('SHAPE', 'Instance count does not match storage');
+    if (count * stride !== storageSource.length) fail('SHAPE', 'Instance count does not match storage');
     capacity = Math.min(capacity, count);
     const attributes = width === 16
       ? [0,1,2,3].map(i => ({shaderLocation: location+i, offset: i*16, format: 'float32x4'}))
       : [{shaderLocation: location, offset: 0, format: 'float32x3'}];
-    const entry = {owner, array, source: {array, kind: array, length: array.length, byteLength: array.byteLength, elementType: array.constructor},
-      stride, requiredBytes: array.byteLength, attributes, borrowed};
+    const entry = {owner, array, source: storageSource,
+      stride, requiredBytes: storageSource.byteLength, attributes, borrowed};
     owners.set(owner, entry); streams.push(entry);
   }
   integer(source.count, 0, capacity, 'active instance count');

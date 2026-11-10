@@ -80,7 +80,7 @@ export async function createGpuThreeScene(device,scene,{
   maxInstanceMeshes=256,maxInstanceBytes=128*1024*1024,
   deformation:deformationOptions={},maxDeformedMeshes=256,maxDeformationBytes=128*1024*1024,shadow=null,environment=null,background=null,fog=null,clipping=null,textureTransforms=false,alphaMaps=false,signal,
   program:programSupport=null,overrideMaterial:initialOverride=undefined,nodeFrame:initialNodeFrame=null,backgroundState:initialBackgroundState=undefined,
-  materialFrame:initialMaterialFrame=null,sourceAttributeCallbacks=true,
+  materialFrame:initialMaterialFrame=null,sourceAttributeCallbacks=true,instanceHistory=null,
 }={}) {
   if(three?.REVISION!=='186'||typeof three.Matrix4!=='function'||typeof three.Frustum!=='function'||
       typeof three.Mesh!=='function'||!(scene instanceof three.Object3D))fail('SOURCE','Supply the pinned r186 module and an Object3D root');
@@ -106,6 +106,7 @@ export async function createGpuThreeScene(device,scene,{
   // Fixed materials use per-request value views, while caches, disposal and
   // source-visible draw identities continue to use the original materials.
   let passMaterialFrame=initialMaterialFrame;
+  const capturedInstance=o=>passMaterialFrame?.instanceFrame?.objects.get(o)??o;
   const materialState=m=>passMaterialFrame?.materials.get(m)??m;
   const sourceMaterial=o=>passMaterialFrame?.objects.has(o)?passMaterialFrame.objects.get(o):o.material;
   const sourceMaterials=o=>{const m=sourceMaterial(o);return Array.isArray(m)?m:[m];};
@@ -128,11 +129,12 @@ export async function createGpuThreeScene(device,scene,{
   // captured view. A null selection was culled or excluded at source capture.
   const fixedGeometry=o=>passNodeFrame?.fixedGeometries?.get(o);
   const fixedObject=o=>fixedGeometry(o)?.object??o;
-  const sourceChildren=o=>passNodeFrame?.sceneHierarchy?.get(o)??passNodeFrame?.fixedScene?.hierarchy.get(o)??o.children;
-  const sourceOrder=o=>passNodeFrame?.fixedScene?.states.get(o)?.renderOrder??o.renderOrder;
+  const sourceChildren=o=>passNodeFrame?.sceneHierarchy?.get(o)??passNodeFrame?.fixedScene?.hierarchy.get(o)??passMaterialFrame?.instanceFrame?.hierarchy.get(o)??o.children;
+  const sourceOrder=o=>passNodeFrame?.fixedScene?.states.get(o)?.renderOrder??passMaterialFrame?.instanceFrame?.orders.get(o)??o.renderOrder;
   const sourceLayers=(o,camera)=>{
     const state=passNodeFrame?.fixedScene?.states.get(o);
-    return state?(state.layers&camera.layers.mask)!==0:o.layers.test(camera.layers);
+    const mask=state?.layers??passMaterialFrame?.instanceFrame?.layers.get(o);
+    return mask!==undefined?(mask&camera.layers.mask)!==0:o.layers.test(camera.layers);
   };
   const spriteCount=o=>threeSpriteCount(fixedObject(o));
   const sourceGeometry=o=>fixedGeometry(o)?.source??o.geometry;
@@ -335,7 +337,7 @@ export async function createGpuThreeScene(device,scene,{
     if(fogEnabled)fogApi.inspectThreeFog(sourceFog(),three);
     const nodes=[],seen=new Set(),stack=[root];
     while(stack.length){
-      const object=stack.pop();
+      const object=capturedInstance(stack.pop());
       if(!(object instanceof three.Object3D)||seen.has(object)||!Array.isArray(object.children))fail('GRAPH','Expected an acyclic source hierarchy');
       seen.add(object);nodes.push(object);if(nodes.length>maxNodes)fail('LIMIT','Source node capacity exceeded');
       // Accepted bundle packets own this entire subtree, including children
@@ -1299,6 +1301,7 @@ export async function createGpuThreeScene(device,scene,{
           gpu=byKey.get(compiled.attributesKey);
           if(!gpu){
             gpu=(native?createGpuProgramGeometry:programSupport.createGeometry)(device,item.programSource,native?compiled.attributes:compiled.program.reflection.attributes,{...geometryOptions,maxBytes:maxGeometryBytes,
+              instanceHistory,
               ...(native?{attributeTypes:'webgpu'}:{}),
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});
             byKey.set(compiled.attributesKey,gpu);
@@ -1357,7 +1360,7 @@ export async function createGpuThreeScene(device,scene,{
         if(item.instanceSource){
           instanceGpu=instances.get(item.instanceSource);
           if(!instanceGpu){
-            instanceGpu=createGpuInstanceAttributes(device,item.instanceSource,{maxBytes:maxInstanceBytes,sourceAttributeCallbacks,
+            instanceGpu=createGpuInstanceAttributes(device,item.instanceSource,{maxBytes:maxInstanceBytes,sourceAttributeCallbacks,instanceHistory,
               maxInitialBytes:Math.max(0,maxInstanceBytes-instanceBytes()),label:'f3d-source-instances'});
             instances.set(item.instanceSource,instanceGpu);addedInstances.push(item.instanceSource);
           }else instanceGpu.update({maxAdditionalBytes:Math.max(0,maxInstanceBytes-instanceBytes())});
@@ -1714,10 +1717,10 @@ export async function createGpuThreeScene(device,scene,{
       }
       let visited=0;
       while(stack.length){
-        const item=stack.pop(),object=item.object;let groupOrder=item.groupOrder;
+        const item=stack.pop(),object=capturedInstance(item.object);let groupOrder=item.groupOrder;
         if(++visited>maxNodes)fail('LIMIT','Source traversal capacity exceeded');
         projectionOrder.set(object,visited);
-        if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??object.visible!==false)===false)continue;
+        if(excludedNodeObject(object)||bundledNodeObject(object)||(passNodeFrame?.visibility?.get(object)??passMaterialFrame?.instanceFrame?.visibility.get(object)??object.visible!==false)===false)continue;
         if(fixedGeometry(object)!==null&&sourceLayers(object,camera)){
           if(object.isGroup)groupOrder=sourceOrder(object);
           else if(object.isLOD){if(object.autoUpdate&&!passNodeFrame?.visibility?.has(object))object.update(camera);}

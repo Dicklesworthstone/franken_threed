@@ -37,8 +37,8 @@ const selectorArray = (array, limit) => {
  * uniforms stay live. Hooks that could change selection during projection keep
  * their existing live-source path instead of being moved ahead of source work.
  */
-function captureSelections(three, root, {camera, overrideMaterial, exclusions, maxNodes, maxMaterials, maxValues}) {
-  const materials = new Map(), objects = new Map(), seen = new Set(), stack = [root];
+function captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, maxNodes, maxMaterials, maxValues}) {
+  const materials = new Map(), objects = new Map(), seen = new Set(), instances = new Set(), stack = [root];
   let values = 0;
   const claim = count => {
     if (count > maxValues - values) fail('LIMIT', 'Pending material snapshot value capacity exceeded');
@@ -59,6 +59,37 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, m
   if (exclusions !== null && (!excluded || excluded.some(object => !(object instanceof three.Object3D)))) return null;
   const excludedObjects = excluded ? new Set(excluded) : null;
   if (excludedObjects) claim(excludedObjects.size);
+  const ordinaryInstances = object => {
+    if (!allowInstances || !(object instanceof three.InstancedMesh) || data(object, 'morphTexture') !== null ||
+        data(object, 'computeBoundingSphere') !== three.InstancedMesh.prototype.computeBoundingSphere ||
+        data(object, 'getMatrixAt') !== three.InstancedMesh.prototype.getMatrixAt) return false;
+    const sphere = data(object, 'boundingSphere');
+    if (sphere !== null && (!(sphere instanceof three.Sphere) || !dataOnly(sphere) ||
+        !(data(sphere, 'center') instanceof three.Vector3) || !dataOnly(data(sphere, 'center')))) return false;
+    const count = data(object, 'count');
+    if (!Number.isSafeInteger(count) || count < 0) return false;
+    for (const [key, width] of [['instanceMatrix', 16], ['instanceColor', 3]]) {
+      const attribute = data(object, key);
+      if (key === 'instanceColor' && attribute === null) continue;
+      if (!(attribute instanceof three.InstancedBufferAttribute) || !dataOnly(attribute) ||
+          data(attribute, 'itemSize') !== width || data(attribute, 'normalized') !== false || data(attribute, 'meshPerAttribute') !== 1 ||
+          data(attribute, 'isStorageInstancedBufferAttribute') ||
+          data(attribute, 'onUploadCallback') !== three.BufferAttribute.prototype.onUploadCallback ||
+          data(attribute, 'clearUpdateRanges') !== three.BufferAttribute.prototype.clearUpdateRanges) return false;
+      const array = data(attribute, 'array'), capacity = data(attribute, 'count'), version = data(attribute, 'version');
+      if (!(array instanceof Float32Array) || Object.getPrototypeOf(array) !== Float32Array.prototype ||
+          ['buffer', 'byteOffset', 'byteLength', 'length', 'constructor', 'slice', 'subarray'].some(key => Object.hasOwn(array, key)) ||
+          !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+          !Number.isSafeInteger(capacity) || capacity < count || capacity * width !== array.length ||
+          !Number.isSafeInteger(version) || version < 0) return false;
+      const ranges = selectorArray(data(attribute, 'updateRanges'), maxValues);
+      if (!ranges || ranges.some(range => !range || Object.getPrototypeOf(range) !== Object.prototype || !dataOnly(range) ||
+          !Number.isSafeInteger(data(range, 'start')) || !Number.isSafeInteger(data(range, 'count')) ||
+          data(range, 'start') < 0 || data(range, 'count') < 0 || data(range, 'start') + data(range, 'count') > array.length)) return false;
+    }
+    const morphs = data(data(object, 'geometry'), 'morphAttributes');
+    return morphs && dataOnly(morphs) && Object.values(morphs).every(value => Array.isArray(value) && value.length === 0);
+  };
   const ordinaryObject = object => {
     if (!(object instanceof three.Object3D) || !dataOnly(object)) return false;
     const prototype = object instanceof three.Camera ? three.Camera.prototype : three.Object3D.prototype;
@@ -66,14 +97,15 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, m
         data(object, 'updateMatrix') !== three.Object3D.prototype.updateMatrix ||
         data(object, 'onBeforeRender') !== three.Object3D.prototype.onBeforeRender ||
         data(object, 'onAfterRender') !== three.Object3D.prototype.onAfterRender ||
-        data(object, 'isSkinnedMesh') || data(object, 'isInstancedMesh') || data(object, 'isBatchedMesh')) return false;
+        data(object, 'isSkinnedMesh') || data(object, 'isBatchedMesh') ||
+        data(object, 'isInstancedMesh') && !ordinaryInstances(object)) return false;
     if (data(object, 'isLOD') && data(object, 'update') !== three.LOD?.prototype.update) return false;
     const type = [three.Mesh, three.Line, three.Points, three.Sprite].find(Type => Type && object instanceof Type);
     if (type && data(object, 'intersectsFrustum') !== type.prototype.intersectsFrustum) return false;
     const layers = data(object, 'layers');
     if (!(layers instanceof three.Layers) || !dataOnly(layers) || data(layers, 'test') !== three.Layers.prototype.test ||
         data(layers, 'mask') === accessor ||
-        data(object, 'boundingSphere') !== undefined || data(object, 'computeBoundingSphere') !== undefined) return false;
+        !data(object, 'isInstancedMesh') && (data(object, 'boundingSphere') !== undefined || data(object, 'computeBoundingSphere') !== undefined)) return false;
     return true;
   };
   const ordinaryGeometry = geometry => {
@@ -123,6 +155,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, m
     if (!ordinaryObject(object)) return null;
     if (seen.has(object)) fail('GRAPH', 'Expected an acyclic source hierarchy');
     seen.add(object);
+    if (data(object, 'isInstancedMesh')) instances.add(object);
     const children = selectorArray(data(object, 'children'), maxNodes);
     if (!children) return null;
     if (seen.size + stack.length + children.length > maxNodes) fail('LIMIT', 'Material snapshot node capacity exceeded');
@@ -155,14 +188,18 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, m
     for (const material of materials.keys()) if (!ordinaryMaterial(material)) return false;
     return true;
   };
-  return objects.size ? {materials, objects, values, cameraSafe, excludedObjects} : null;
+  // Automatic LOD projection still follows the original live scene path. The
+  // required pass scope rejects it before destination retention; ordinary
+  // rendering must not newly fail because optional instance capture is enabled.
+  if (instances.size && [...seen].some(object => data(object, 'isLOD') && data(object, 'autoUpdate'))) return null;
+  return objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances} : null;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,
-  selectionOnly = false, camera = null, exclusions = null, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
+  selectionOnly = false, camera = null, exclusions = null, allowInstances = false, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
   if (![maxNodes, maxMaterials, maxValues].every(n => Number.isSafeInteger(n) && n >= 0) || !maxNodes || !maxMaterials)
     fail('LIMIT', 'Invalid material snapshot capacity');
-  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, maxNodes, maxMaterials, maxValues});
+  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, maxNodes, maxMaterials, maxValues});
   const materials = new Map(), objects = new Map(), seen = new Set(), copies = new WeakMap(), stack = [root];
   const valuePrototypes = new Set(['Color', 'Vector2', 'Vector3', 'Vector4', 'Quaternion', 'Euler', 'Matrix3', 'Matrix4', 'Plane']
     .map(name => three[name]?.prototype).filter(Boolean));
