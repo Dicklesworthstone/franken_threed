@@ -67,6 +67,14 @@ remain intact in production emission. Both WebGPU-authored and WebGL-authored
 applications can use this route, including mixed explicit `forceWebGL: true`
 sites that retain their genuine source constructor.
 
+The linked proof also composes with the source-verified controls and
+`RendererInspector` contracts described below. Renderer factories, navigation
+helpers and Inspector attachment helpers may live in separate static modules.
+The analysis retains each verified addon's source and resolved dependency
+identities and tracks named imports, namespace imports and reexports across the
+linked application. Escaped resources, altered addon or base code, prototype
+changes and unknown Inspector owners still select the exact component.
+
 This proof requires one application entry, the exact pinned Three build bytes
 and dependency identities, a closed static graph of at most 128 application
 modules, and at most 2 MiB of application and linked analysis source each.
@@ -131,8 +139,8 @@ retains its separate open-code and backend-mutation boundaries.
 H1 still retains the exact renderer: its Inspector Settings component replaces
 `WebGPURenderer.prototype.init` to select a real WebGL backend from persisted
 settings, and the TSL Graph extension evaluates user-authored code with the full
-Three namespace. Closing ordinary imported helpers does not close those native
-and dynamic ownership boundaries.
+Three namespace. Closing imported helpers and verified RendererInspector
+attachments does not close those native and dynamic ownership boundaries.
 Direct new-backend tests establish renderer functionality separately from
 automatic application routing and do not establish an H1 acceleration claim.
 

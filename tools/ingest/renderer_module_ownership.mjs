@@ -56,8 +56,13 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
   // identities. Import-map redirects of a build's core invalidate this proof.
   for (const id of library) {
     const mod = modules.get(id);
-    if (mod.dynamic_imports.length || mod.static_imports.some(request => !library.has(request.resolved_id) ||
-        new URL(request.specifier, id).href !== request.resolved_id)) return false;
+    if (mod.dynamic_imports.length || mod.static_imports.some(request => {
+      // The pinned TSL build imports its sibling WebGPU build through the
+      // package specifier. Its import map must resolve to that exact instance.
+      const specifier = mod.content_hash === 'sha256:' + BUILDS.get('three.tsl.js') && request.specifier === 'three/webgpu'
+        ? './three.webgpu.js' : request.specifier;
+      return !library.has(request.resolved_id) || new URL(specifier, id).href !== request.resolved_id;
+    })) return false;
   }
   // A source fingerprint does not close an imported dependency. Consumer
   // contracts verify the exact addon and resolved bases; every dependency must

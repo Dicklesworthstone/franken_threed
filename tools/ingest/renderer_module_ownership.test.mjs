@@ -31,7 +31,7 @@ function loadPinned(id) {
   const code = fs.readFileSync(new URL(id), 'utf8');
   const ast = parse(code, {sourceType: 'module', ecmaVersion: 'latest'});
   const requests = ast.body.filter(node => node.source).map(node => ({
-    specifier: node.source.value, resolved_id: new URL(node.source.value, id).href,
+    specifier: node.source.value, resolved_id: resolve(node.source.value, id),
     module_type: 'javascript',
   }));
   pinned.set(id, {id, content_hash: hash(code), static_imports: requests, static_exports: [], dynamic_imports: []});
@@ -299,6 +299,7 @@ test('externalized builds require their real pinned bytes and resolved dependenc
     f => { f.modules.get(webgpu).static_imports[0].resolved_id = entry; },
     f => { f.modules.get(webgpu).static_imports[0].resolved_id = webgpu; },
     f => { f.modules.get(webgpu).dynamic_imports.push({unresolved:true}); },
+    f => { f.modules.get(tsl).static_imports[0].resolved_id = new URL('build/three.core.js', upstream).href; },
   ]) await remainsExact(consumerCase('r.render(scene,camera);'), mutate);
 });
 
