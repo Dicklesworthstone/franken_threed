@@ -76,6 +76,12 @@ export function verifiedRendererConsumerContracts(modules, {externalModules = []
     if (bases.has(renderer) && modules.get(renderer)?.content_hash === WEBGPU && tsl?.content_hash === TSL && tsl.static_imports.length === 1 &&
         tsl.static_imports[0].resolved_id === renderer) inspectors.add(id);
   }
+  // These unchanged modules can also be external boundaries in a linked
+  // application ownership proof. Transformed passes/computations keep their
+  // separate source-analysis requirements and are deliberately not included.
+  contracts.retainedSources = new Map([...controls].map(([id, source]) => [id, {...source}]));
+  for (const id of inspectors)
+    contracts.retainedSources.set(id, {name: 'RendererInspector', role: 'renderer-inspector'});
   if (!controls.size && !passes.size && !computations.size && !inspectors.size) return contracts;
 
   const role = (id, name) => inspectors.has(id) && name === 'RendererInspector' ? 'renderer-inspector' :

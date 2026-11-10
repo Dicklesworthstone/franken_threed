@@ -7,6 +7,7 @@ import {rollup} from 'rollup';
 import {createHash} from 'node:crypto';
 import {analyzeModuleAst} from './ast_analyzer.mjs';
 import {isInternalLibraryModule} from './route_bridge.mjs';
+import {verifiedRendererConsumerContracts} from './renderer_consumer_contracts.mjs';
 
 // Immutable r186 build bytes, also recorded in evidence/01.1/build_sha256.txt.
 // A path or a matching export name cannot establish a library boundary.
@@ -29,6 +30,7 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
   {packageRootUrl, externalModules = []} = {}) {
   if (roots.length !== 1 || externalModules.size || externalModules.length) return false;
   const library = new Set(), application = new Map();
+  const consumers = verifiedRendererConsumerContracts(modules, {externalModules}).retainedSources ?? new Map();
   let sourceBytes = 0, hasBoundary = false;
   for (const [id, mod] of modules) {
     if (isInternalLibraryModule(id, packageRootUrl)) {
@@ -37,6 +39,7 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
       library.add(id);
       continue;
     }
+    if (consumers.has(id)) continue;
     const input = sourceInputs.get(id), facts = mod.routing_facts;
     if (!input || mod.content_hash !== 'sha256:' + createHash('sha256').update(input.code).digest('hex') ||
         mod.analysis_complete === false || mod.module_type !== 'javascript' ||
@@ -56,6 +59,17 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
     if (mod.dynamic_imports.length || mod.static_imports.some(request => !library.has(request.resolved_id) ||
         new URL(request.specifier, id).href !== request.resolved_id)) return false;
   }
+  // A source fingerprint does not close an imported dependency. Consumer
+  // contracts verify the exact addon and resolved bases; every dependency must
+  // also be inside this proof's admitted boundary, never arbitrary app code.
+  for (const id of consumers.keys()) {
+    const mod = modules.get(id), input = sourceInputs.get(id);
+    if (!input || mod.content_hash !== 'sha256:' + createHash('sha256').update(input.code).digest('hex') ||
+        mod.analysis_complete === false || mod.module_type !== 'javascript' ||
+        mod.dynamic_imports.length || mod.postprocessing_transform || mod.gpu_computation_transform ||
+        mod.static_imports.some(request => !library.has(request.resolved_id) && !consumers.has(request.resolved_id))) return false;
+  }
+  const boundary = id => library.has(id) || consumers.has(id);
   const originalSites = [...application.values()].flatMap(mod => mod.renderer_construction_sites);
   if (!originalSites.length) return false;
   const originalProfile = constructionProfile(originalSites);
@@ -76,8 +90,8 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
             .filter(request => request.specifier === specifier) ?? [];
           const target = requests[0]?.resolved_id;
           if (!target || requests.some(request => request.resolved_id !== target || request.module_type !== 'javascript') ||
-              !library.has(target) && !application.has(target)) throw new Error('Unclosed renderer analysis import');
-          return {id: target, external: library.has(target)};
+              !boundary(target) && !application.has(target)) throw new Error('Unclosed renderer analysis import');
+          return {id: target, external: boundary(target)};
         },
         load(id) {
           if (!application.has(id)) throw new Error('Unclosed renderer analysis module');
@@ -85,27 +99,36 @@ export async function closeRendererModuleOwnership(modules, sourceInputs, roots,
         },
       }],
     });
-    const generated = await linked.generate({format: 'es', compact: false});
+    // Keep exact external IDs in this private copy so named and namespace
+    // imports cannot acquire another module's verified consumer role.
+    const generated = await linked.generate({format: 'es', compact: false, paths: id => id});
     if (generated.output.length !== 1 || generated.output[0].type !== 'chunk') return false;
     const chunk = generated.output[0];
     if (Object.keys(chunk.modules).length !== application.size ||
         [...application.keys()].some(id => !Object.hasOwn(chunk.modules, id)) ||
         Buffer.byteLength(chunk.code) > 2 * 1024 * 1024) return false;
     const imports = analyzeModuleAst(chunk.code, roots[0]);
-    const contract = {bindings: new Map(), namespaces: new Map(), reexports: new Set()};
-    const role = name => name === 'WebGPURenderer' ? 'webgpu' : name === 'WebGLRenderer' ? 'webgl' :
-      ['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase'].includes(name) ? 'base' : null;
+    const contract = {bindings: new Map(), namespaces: new Map(), reexports: new Set(),
+      inspectors: [...consumers.values()].some(source => source.role === 'renderer-inspector')};
+    const role = (id, name) => {
+      const source = consumers.get(id);
+      if (source) return source.name === name ? source.role : null;
+      if (!library.has(id)) return null;
+      return name === 'WebGPURenderer' ? 'webgpu' : name === 'WebGLRenderer' ? 'webgl' :
+        ['Controls', 'EventDispatcher', 'Renderer', 'CanvasTarget', 'InspectorBase'].includes(name) ? 'base' : null;
+    };
     for (const request of imports.staticImports) {
-      // Rollup may render external URLs relatively; the resolved external IDs
-      // above, not their spelling here, already establish the pinned boundary.
+      if (!boundary(request.specifier)) return false;
       for (const binding of request.imported_bindings) {
-        if (binding.type === 'namespace') contract.namespaces.set(binding.local, 'base');
-        else if (role(binding.imported)) contract.bindings.set(binding.local, role(binding.imported));
+        if (binding.type === 'namespace') contract.namespaces.set(binding.local, consumers.get(request.specifier)?.role ?? 'base');
+        else if (role(request.specifier, binding.imported)) contract.bindings.set(binding.local, role(request.specifier, binding.imported));
       }
     }
-    for (const exp of imports.staticExports) if (exp.specifier)
-      for (const binding of exp.specifiers ?? []) if (role(binding.local))
+    for (const exp of imports.staticExports) if (exp.specifier) {
+      if (!boundary(exp.specifier)) return false;
+      for (const binding of exp.specifiers ?? []) if (role(exp.specifier, binding.local))
         contract.reexports.add(`${exp.specifier}\0${binding.local}`);
+    }
     // Graph-mode checks also cover indirect canvas observations through DOM
     // callbacks and imported constructor identities. The weaker standalone
     // analyzer mode must never discharge an imported resource boundary.

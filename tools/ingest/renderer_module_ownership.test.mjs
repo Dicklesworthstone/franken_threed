@@ -12,11 +12,14 @@ import {decideRendererRoute} from '../compat/route_decider.mjs';
 
 const upstream = new URL('../../upstream/three.js/', import.meta.url);
 const webgpu = new URL('build/three.webgpu.js', upstream).href;
+const tsl = new URL('build/three.tsl.js', upstream).href;
+const addon = name => new URL(`examples/jsm/controls/${name}.js`, upstream).href;
+const inspector = new URL('examples/jsm/inspector/RendererInspector.js', upstream).href;
 const appRoot = new URL('file:///f3d-module-ownership/');
 const entry = new URL('entry.mjs', appRoot).href;
 const hash = code => 'sha256:' + createHash('sha256').update(code).digest('hex');
 const resolve = (specifier, id) => specifier === 'three/webgpu' || specifier === 'three'
-  ? webgpu : new URL(specifier, id).href;
+  ? webgpu : specifier === 'three/tsl' ? tsl : new URL(specifier, id).href;
 const environment = {generalWebGPUAvailable: true, generalWebGLAvailable: true,
   hostCapabilities: {hasWebGPU: true, hasWebGL: true}};
 
@@ -31,10 +34,11 @@ function loadPinned(id) {
     specifier: node.source.value, resolved_id: new URL(node.source.value, id).href,
     module_type: 'javascript',
   }));
-  pinned.set(id, {id, content_hash: hash(code), static_imports: requests, dynamic_imports: []});
+  pinned.set(id, {id, content_hash: hash(code), static_imports: requests, static_exports: [], dynamic_imports: []});
   for (const request of requests) loadPinned(request.resolved_id);
 }
 loadPinned(webgpu);
+loadPinned(tsl);
 
 function fixture(sources, options = {}) {
   const modules = new Map(structuredClone([...pinned]));
@@ -314,4 +318,84 @@ test('new generic constructor discovery does not invent a source construction si
   await remainsExact({'entry.mjs': `import {make} from './create.mjs'; import {WebGPURenderer} from 'three/webgpu';
     const renderer=make(WebGPURenderer); renderer.render(scene,camera);`,
   'create.mjs': 'export function make(Renderer) { return new Renderer(); }'});
+});
+
+function navigationCase(name = 'OrbitControls', {namespace = false, extra = '', step = 'controls.update(.1);'} = {}) {
+  const sources = {
+    'entry.mjs': `import {create} from './create.mjs'; import {connect,step} from './navigation.mjs';
+      const renderer=create(); const controls=connect(camera,renderer.domElement);
+      step(controls,renderer,scene,camera); ${extra}`,
+    'create.mjs': create,
+    'navigation.mjs': `import ${namespace ? '* as Navigation' : `{${name} as Navigation}`} from '${addon(name)}';
+      export function connect(camera,canvas) { return new Navigation${namespace ? '.' + name : ''}(camera,canvas); }
+      export function step(controls,renderer,scene,camera) { ${step} renderer.render(scene,camera); }`,
+    [addon(name)]: fs.readFileSync(new URL(addon(name)), 'utf8'),
+  };
+  if (name === 'MapControls') sources[addon('OrbitControls')] = fs.readFileSync(new URL(addon('OrbitControls')), 'utf8');
+  return sources;
+}
+
+test('verified retained controls compose with imported renderer and navigation helpers', async () => {
+  for (const name of ['OrbitControls', 'FirstPersonControls', 'MapControls', 'TrackballControls', 'FlyControls']) {
+    const sources = navigationCase(name, {namespace: name === 'MapControls'});
+    const f = await closes(sources);
+    assert.equal(f.sourceInputs.get(addon(name)).code, sources[addon(name)],
+      'the source consumer remains unchanged in the application');
+  }
+  const sources = navigationCase();
+  sources['navigation.mjs'] = sources['navigation.mjs'].replace(
+    `import {OrbitControls as Navigation} from '${addon('OrbitControls')}'`,
+    "import {OrbitControls as Navigation} from './barrel.mjs'");
+  sources['barrel.mjs'] = `export {OrbitControls} from '${addon('OrbitControls')}';`;
+  await closes(sources);
+});
+
+test('linked retained controls preserve canvas escapes, callbacks, constructor mutations and exports', async () => {
+  for (const step of ['plugin(controls.domElement);', 'plugin(controls);',
+    'controls.connect(host.canvas);', "controls.addEventListener('change',plugin);",
+    'Navigation.prototype.update=plugin;', 'controls.update=plugin;'])
+    await remainsExact(navigationCase('OrbitControls', {step}));
+  for (const extra of ['export {controls};', 'plugin(controls.domElement);',
+    `export {OrbitControls} from '${addon('OrbitControls')}';`,
+    "import {Controls} from 'three'; Controls.prototype.connect=plugin;"])
+    await remainsExact(navigationCase('OrbitControls', {extra}));
+});
+
+test('linked consumer boundaries require unchanged bytes and every verified resolved dependency', async () => {
+  const orbit = addon('OrbitControls'), map = addon('MapControls');
+  const changed = navigationCase();
+  changed[orbit] += '\n// changed source is not the audited consumer\n';
+  await remainsExact(changed);
+  for (const mutate of [
+    f => { f.modules.get(orbit).static_imports[0].resolved_id = entry; },
+    f => { f.modules.get(orbit).analysis_complete = false; },
+    f => { f.modules.get(orbit).dynamic_imports.push({unresolved: true}); },
+    f => { f.sourceInputs.get(orbit).code += '\n// changed after analysis'; },
+  ]) await remainsExact(navigationCase(), mutate);
+  await remainsExact(navigationCase('MapControls'), f => {
+    f.modules.get(map).static_imports.find(request => request.specifier === './OrbitControls.js').resolved_id = entry;
+  });
+});
+
+function inspectorCase(extra = '') {
+  return {
+    'entry.mjs': `import {create} from './create.mjs'; import {attach} from './inspector.mjs';
+      const renderer=create(); const inspector=attach(renderer);
+      inspector.getRenderer().render(scene,camera); ${extra}`,
+    'create.mjs': create,
+    'inspector.mjs': `import * as Inspection from '${inspector}';
+      export function attach(renderer) { const inspector=new Inspection.RendererInspector();
+        renderer.inspector=inspector; return inspector; }`,
+    [inspector]: fs.readFileSync(new URL(inspector), 'utf8'),
+  };
+}
+
+test('verified RendererInspector keeps renderer ownership across imported attachment helpers', async () => {
+  await closes(inspectorCase());
+  for (const extra of ['plugin(inspector.getRenderer());', 'export {inspector};',
+    'inspector.setRenderer(host.renderer);', 'inspector.getRenderer().getContext();'])
+    await remainsExact(inspectorCase(extra));
+  await remainsExact(inspectorCase(), f => {
+    f.modules.get(inspector).static_imports.find(request => request.specifier === 'three/tsl').resolved_id = webgpu;
+  });
 });

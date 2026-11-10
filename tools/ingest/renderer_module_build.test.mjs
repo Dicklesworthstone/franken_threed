@@ -20,9 +20,13 @@ function fixture(files) {
 }
 function host(t) {
   const descriptors = new Map(['navigator', 'document'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
-  const canvas = () => ({width: 300, height: 150, style: {}, addEventListener() {}, setAttribute() {}});
+  const document = {addEventListener() {}, removeEventListener() {}};
+  const canvas = () => ({width: 300, height: 150, clientWidth: 300, clientHeight: 150,
+    style: {}, ownerDocument: document, getRootNode: () => document,
+    addEventListener() {}, removeEventListener() {}, setAttribute() {}});
+  document.createElementNS = document.createElement = canvas;
   Object.defineProperty(globalThis, 'navigator', {configurable: true, value: {gpu: {requestAdapter: async () => null}}});
-  Object.defineProperty(globalThis, 'document', {configurable: true, value: {createElementNS: canvas, createElement: canvas}});
+  Object.defineProperty(globalThis, 'document', {configurable: true, value: document});
   t.after(() => {
     for (const [key, descriptor] of descriptors) {
       if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -103,4 +107,45 @@ test('WebGL-authored modular applications retain native-context requirements acr
   const retained = await buildApplication(f.entry, path.join(f.dir, 'exact'), {routeWebGLRenderer: true});
   assert.equal(retained.rendererRoute.routed, false);
   assert.ok(retained.rendererRoute.decisions.every(site => site.route === 'exact-backend'));
+});
+
+test('emitted modular applications keep actual controls and camera behavior with their native renderer', async t => {
+  host(t);
+  const controls = new URL('examples/jsm/controls/OrbitControls.js', upstream).href;
+  const f = fixture({
+    'renderer.mjs': `import {WebGPURenderer} from 'three';
+      export function create(canvas) { return new WebGPURenderer({canvas,antialias:false}); }`,
+    'navigation.mjs': `import {OrbitControls} from '${controls}';
+      export {OrbitControls as Navigation};
+      export function connect(camera,canvas) { return new OrbitControls(camera,canvas); }
+      export function step(controls,renderer) { controls.rotateLeft(.25); controls.update(); renderer.setSize(48,32,false); }`,
+    'main.mjs': `import {WebGPURenderer,PerspectiveCamera} from 'three';
+      import {create} from './renderer.mjs'; import {connect,step,Navigation} from './navigation.mjs';
+      const canvas=document.createElement('canvas'); const renderer=create(canvas);
+      const camera=new PerspectiveCamera(); camera.position.z=5;
+      const controls=connect(camera,renderer.domElement); step(controls,renderer);
+      export const native=renderer.isF3DRenderer===true;
+      export const flags=[renderer instanceof WebGPURenderer,controls instanceof Navigation,
+        controls.object===camera,controls.domElement===canvas,renderer.domElement===canvas];
+      export const cameraPosition=camera.position.toArray();
+      export const disconnect=()=>controls.dispose();
+      export const dispose=()=>{controls.dispose();renderer.dispose();};`,
+  });
+  const source = await buildApplication(f.entry, path.join(f.dir, 'source'));
+  const result = await buildApplication(f.entry, path.join(f.dir, 'candidate'), {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.deepEqual(result.rendererRoute.decisions.map(site => site.route), ['general-webgpu']);
+  const site = result.rendererRoute.decisions[0];
+  assert.ok(site.moduleId.endsWith('/renderer.mjs'));
+  assert.equal(fileslice(f, 'renderer.mjs', site.sourceSpan), 'new WebGPURenderer({canvas,antialias:false})');
+  assert.ok(result.chunks.some(chunk => chunk.modules.includes(controls)), 'the emitted app retains the real source control class');
+  const reference = await import(pathToFileURL(path.join(f.dir, 'source', source.entryFiles[0])).href);
+  const candidate = await import(pathToFileURL(path.join(f.dir, 'candidate', result.entryFiles[0])).href);
+  t.after(() => { reference.disconnect(); candidate.dispose(); });
+  assert.equal(reference.native, false);
+  assert.equal(candidate.native, true);
+  assert.deepEqual(candidate.flags, [true,true,true,true,true]);
+  assert.deepEqual(candidate.flags, reference.flags);
+  assert.deepEqual(candidate.cameraPosition, reference.cameraPosition);
+  assert.ok(Math.abs(candidate.cameraPosition[0]) > .5, 'the retained controls actually rotate the original camera');
 });
