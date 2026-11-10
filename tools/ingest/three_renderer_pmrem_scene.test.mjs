@@ -186,3 +186,145 @@ test('a rejected GPU wait releases queued private retirement without masking the
  assert.equal(disposed,1);assert.equal(renderer._gpuWaiters,0);assert.equal(renderer._pmremIdleReleases,null);
  output.dispose();root.geometry.dispose();root.material.dispose();
 });
+
+function skinnedEnvironment() {
+ const scene=new T.Scene(),geometry=new T.BoxGeometry(1,2,1),indices=[],weights=[];
+ const position=geometry.attributes.position;
+ for(let i=0;i<position.count;i++){
+  const weight=(position.getY(i)+1)/2;
+  indices.push(0,1,0,0);weights.push(1-weight,weight,0,0);
+ }
+ geometry.setAttribute('skinIndex',new T.Uint16BufferAttribute(indices,4));
+ geometry.setAttribute('skinWeight',new T.Float32BufferAttribute(weights,4));
+ const mesh=new T.SkinnedMesh(geometry,new T.MeshNormalMaterial({side:T.DoubleSide}));
+ const root=new T.Bone(),tip=new T.Bone();root.position.y=-1;tip.position.y=2;root.add(tip);
+ mesh.add(root);mesh.bind(new T.Skeleton([root,tip]));mesh.frustumCulled=false;scene.add(mesh);
+ return {scene,mesh,root,tip,skeleton:mesh.skeleton};
+}
+
+test('PMREM skinning captures independent poses and preserves source palette updates once per face',()=>{
+ const f=skinnedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(90,1,.1,20);
+ const sibling=new T.SkinnedMesh(f.mesh.geometry,f.mesh.material);sibling.bind(f.skeleton,new T.Matrix4());
+ sibling.bindMode=T.DetachedBindMode;sibling.frustumCulled=false;f.scene.add(sibling);
+ const capture=()=>owner.capturePMREMScene(f.scene,camera,null,{cube:true,position:new T.Vector3()});
+ try{
+  f.tip.rotation.z=.4;const first=capture(),firstPalette=f.skeleton.boneMatrices.slice();
+  assert.equal(f.skeleton.boneTexture.version,6,'one creation plus five selected-frame updates, shared by both meshes');
+  f.tip.rotation.z=-.8;const second=capture(),secondPalette=f.skeleton.boneMatrices.slice();
+  assert.equal(f.skeleton.boneTexture.version,12);assert.notDeepEqual(firstPalette,secondPalette);
+  f.tip.rotation.z=2;f.skeleton.dispose();f.scene.clear();
+  first.install();const a=first.root.children[0],shared=first.root.children[1];
+  assert.notEqual(a.skeleton,f.skeleton);assert.equal(a.skeleton,shared.skeleton);
+  assert.notEqual(a.skeleton.bones[1],f.tip);a.skeleton.update();a.skeleton.computeBoneTexture();
+  const privateTexture=a.skeleton.boneTexture;
+  assert.deepEqual(a.skeleton.boneMatrices,firstPalette);assert.equal(a.skeleton.bones[1].rotation.z,.4);
+  second.install();const b=second.root.children[0];b.skeleton.update();
+  assert.equal(b.skeleton.boneTexture,privateTexture,'later snapshots reuse the private palette residency');
+  assert.equal(privateTexture.image.data,b.skeleton.boneMatrices);
+  assert.deepEqual(b.skeleton.boneMatrices,secondPalette);assert.equal(b.skeleton.bones[1].rotation.z,-.8);
+  first.release();second.release();
+ }finally{owner.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();}
+});
+
+test('PMREM detached skeletons freeze external bone worlds without capturing unrelated descendants',()=>{
+ const f=skinnedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera();
+ f.mesh.remove(f.root);f.mesh.bindMode=T.DetachedBindMode;f.tip.position.x=3;f.root.updateMatrixWorld(true);
+ const unrelated=new T.Mesh(new T.BoxGeometry(),new T.MeshBasicMaterial());
+ unrelated.onBeforeRender=()=>{throw Error('unrelated callback');};f.tip.add(unrelated);
+ try{
+  const snapshot=owner.capturePMREMScene(f.scene,camera,null),expected=f.skeleton.boneMatrices.slice();
+  f.tip.position.x=99;f.root.updateMatrixWorld(true);snapshot.install();
+  const skeleton=snapshot.root.children[0].skeleton;skeleton.update();
+  assert.deepEqual(skeleton.boneMatrices.subarray(0,expected.length),expected);
+  assert.deepEqual(skeleton.bones[1].children,[]);snapshot.release();
+ }finally{owner.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();unrelated.geometry.dispose();unrelated.material.dispose();}
+});
+
+test('PMREM skeleton acknowledgement follows source visibility, layers and material selection',()=>{
+ const f=skinnedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(90,1,.1,20);
+ const take=()=>{const snapshot=owner.capturePMREMScene(f.scene,camera,null,{cube:true,position:new T.Vector3()});snapshot.release();};
+ try{
+  f.tip.rotation.z=.6;f.mesh.visible=false;take();assert.equal(f.skeleton.boneTexture,null);
+  assert.ok(f.skeleton.boneMatrices.every(value=>value===0));
+  f.mesh.visible=true;f.mesh.layers.set(1);take();assert.ok(f.skeleton.boneMatrices.every(value=>value===0));
+  f.mesh.layers.set(0);f.mesh.material.visible=false;take();
+  assert.equal(f.skeleton.boneTexture,null,'invisible materials do not invoke setProgram');
+  assert.ok(f.skeleton.boneMatrices.some(value=>value!==0),'projected objects still update their skeleton');
+  f.mesh.material.visible=true;take();assert.equal(f.skeleton.boneTexture.version,6);
+ }finally{owner.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();}
+});
+
+test('PMREM refuses custom skeleton execution before queuing or advancing accepted palettes',()=>{
+ const f=skinnedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera();
+ let calls=0;f.skeleton.update=()=>{calls++;};
+ try{
+  assert.throws(()=>owner.capturePMREMScene(f.scene,camera,null),/ordinary bound source skeleton/);
+  assert.equal(calls,0);assert.equal(owner.allocatedBytes,0);assert.equal(f.skeleton.boneTexture,null);
+ }finally{owner.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.skeleton.dispose();}
+});
+
+test('PMREM rejects palette uniform aliases and altered bone texture uploads before source acknowledgement',()=>{
+ for(const change of ['uniform','uniform-view','attribute','map','callback','flipY','dataReady','ranges','internalFormat']){
+  const f=skinnedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera();
+  f.skeleton.update();f.skeleton.computeBoneTexture();const texture=f.skeleton.boneTexture;
+  let calls=0,shader;
+  if(change==='uniform'||change==='uniform-view'){
+   shader=new T.ShaderMaterial({uniforms:{palette:{value:change==='uniform'?f.skeleton.boneMatrices:
+    new Float32Array(f.skeleton.boneMatrices.buffer)}}});f.mesh.material=shader;
+  }else if(change==='attribute')f.mesh.geometry.setAttribute('palette',new T.BufferAttribute(f.skeleton.boneMatrices,4));
+  else if(change==='map')f.mesh.material.map=texture;
+  else if(change==='callback')texture.onUpdate=()=>{calls++;};
+  else if(change==='flipY')texture.flipY=true;
+  else if(change==='ranges')texture.addUpdateRange(0,4);
+  else if(change==='internalFormat')texture.internalFormat='RGBA16F';
+  else texture.source.dataReady=false;
+  const before=f.skeleton.boneMatrices.slice(),version=texture.version;f.tip.rotation.z=.9;
+  try{
+   assert.throws(()=>owner.capturePMREMScene(f.scene,camera,null),error=>error.code==='THREE_PASS_SCENE',change);
+   assert.equal(calls,0);assert.deepEqual(f.skeleton.boneMatrices,before);assert.equal(texture.version,version);
+   assert.equal(owner.allocatedBytes,0);
+  }finally{owner.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();shader?.dispose();f.skeleton.dispose();}
+ }
+});
+
+test('public PMREM queues skinned scene poses before initialization and retains them after source disposal',async t=>{
+ const {renderer,device,release}=fixture(t,{deferred:true}),f=skinnedEnvironment(),generator=new Generator(renderer);
+ f.mesh.position.z=-3;f.tip.rotation.z=.35;
+ const first=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.tip.rotation.z=-.7;const second=generator.fromScene(f.scene,.1,.1,20,{size:16});
+ f.skeleton.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.scene.clear();generator.dispose();
+ release();await drain(renderer);
+ const skinWrites=device.textureWrites.filter(write=>write.texture.width===4&&write.texture.height===4&&write.texture.format==='rgba32float');
+ assert.ok(skinWrites.length>=2,'both source palettes reach the owned ShaderLib draws');
+ assert.ok(skinWrites.some(write=>new Float32Array(write.bytes.buffer)[16]===Math.fround(Math.cos(.35))));
+ assert.ok(skinWrites.some(write=>new Float32Array(write.bytes.buffer)[16]===Math.fround(Math.cos(-.7))));
+ assert.equal(renderer._passSnapshots.rootCount,0);assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ assert.equal(renderer.info.f3d.route,'general-webgpu');first.dispose();second.dispose();
+});
+
+test('ordinary Basic skin captures feed distinct accepted palettes to the existing GPU deformer',async t=>{
+ const {renderer,device}=fixture(t),f=skinnedEnvironment(),generator=new Generator(renderer),palettes=[];
+ f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({color:0x80c0ff,side:T.DoubleSide});
+ Object.assign(device.limits,{maxComputeInvocationsPerWorkgroup:256,maxComputeWorkgroupSizeX:256,maxComputeWorkgroupsPerDimension:65535});
+ device.createComputePipelineAsync=async descriptor=>({...descriptor,getBindGroupLayout:()=>({})});
+ const create=device.createCommandEncoder.bind(device),submit=device.queue.submit;
+ device.createCommandEncoder=()=>{
+  const encoder=create(),passes=[];
+  return {...encoder,beginComputePass(descriptor){
+   const pass={descriptor,draws:[]};passes.push(pass);
+   return {setPipeline(pipeline){pass.pipeline=pipeline;},setBindGroup(_index,group){pass.group=group;},dispatchWorkgroups(){},end(){}};
+  },finish(){return [...encoder.finish(),...passes];}};
+ };
+ device.queue.submit=commands=>{
+  for(const passes of commands)for(const pass of passes)if(pass.pipeline?.compute?.entryPoint==='deform')
+   palettes.push(new Float32Array(pass.group.entries[3].resource.buffer.data).slice());
+  submit(commands);
+ };
+ await renderer.init();f.tip.rotation.z=.3;const first=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.tip.rotation.z=-.6;const second=generator.fromScene(f.scene,.1,.1,20,{size:16});
+ f.skeleton.dispose();f.mesh.geometry.dispose();f.mesh.material.dispose();f.scene.clear();generator.dispose();
+ await drain(renderer);
+ assert.ok(palettes.some(palette=>palette[16]===Math.fround(Math.cos(.3))));
+ assert.ok(palettes.some(palette=>palette[16]===Math.fround(Math.cos(-.6))));
+ assert.equal(renderer._passSnapshots.allocatedBytes,0);first.dispose();second.dispose();
+});

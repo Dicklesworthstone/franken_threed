@@ -441,6 +441,46 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     for (let value = object; value; value = Object.getPrototypeOf(value))
       if (Object.hasOwn(value, key)) return own(value, key);
   };
+  const ordinaryMatrix = matrix => Object.getPrototypeOf(matrix ?? {}) === T.Matrix4.prototype &&
+    Object.values(Object.getOwnPropertyDescriptors(matrix)).every(property => Object.hasOwn(property, 'value')) &&
+    Array.isArray(matrix.elements) && matrix.elements.length === 16;
+  function inspectSkeleton(object) {
+    const skeleton = object.skeleton, attributes = object.geometry.attributes;
+    if (Object.getPrototypeOf(object) !== T.SkinnedMesh.prototype ||
+        Object.getPrototypeOf(skeleton ?? {}) !== T.Skeleton.prototype ||
+        Object.values(Object.getOwnPropertyDescriptors(skeleton)).some(property => !Object.hasOwn(property, 'value')) ||
+        field(skeleton, 'update') !== T.Skeleton.prototype.update ||
+        field(skeleton, 'computeBoneTexture') !== T.Skeleton.prototype.computeBoneTexture ||
+        !Array.isArray(skeleton.bones) || !skeleton.bones.length || skeleton.bones.length > maxValues ||
+        !Array.isArray(skeleton.boneInverses) || skeleton.boneInverses.length !== skeleton.bones.length ||
+        ![T.AttachedBindMode, T.DetachedBindMode].includes(object.bindMode) ||
+        !ordinaryMatrix(object.bindMatrix) || !ordinaryMatrix(object.bindMatrixInverse) ||
+        !attributes.skinIndex || attributes.skinIndex.itemSize !== 4 ||
+        !attributes.skinWeight || attributes.skinWeight.itemSize !== 4 ||
+        field(object, 'getVertexPosition') !== T.SkinnedMesh.prototype.getVertexPosition ||
+        field(object, 'applyBoneTransform') !== T.SkinnedMesh.prototype.applyBoneTransform)
+      fail('SCENE', 'PMREM skinning requires an ordinary bound source skeleton and skin attributes');
+    for (let i = 0; i < skeleton.bones.length; i++) {
+      const bone = skeleton.bones[i];
+      if (Object.getPrototypeOf(bone ?? {}) !== T.Bone.prototype || !ordinaryMatrix(bone.matrixWorld) ||
+          !ordinaryMatrix(skeleton.boneInverses[i]) ||
+          Object.values(Object.getOwnPropertyDescriptors(bone)).some(property => !Object.hasOwn(property, 'value')))
+        fail('SCENE', 'PMREM skeleton bones and inverse binds require ordinary source matrix data');
+    }
+    const palette = skeleton.boneMatrices, texture = skeleton.boneTexture;
+    const size = Math.max(4, Math.ceil(Math.sqrt(skeleton.bones.length * 4) / 4) * 4);
+    if (Object.getPrototypeOf(palette ?? {}) !== Float32Array.prototype ||
+        !(palette.buffer instanceof ArrayBuffer) || palette.buffer.resizable || palette.length < skeleton.bones.length * 16 ||
+        texture !== null && (Object.getPrototypeOf(texture) !== T.DataTexture.prototype ||
+          texture.image.data !== palette || texture.format !== T.RGBAFormat || texture.type !== T.FloatType ||
+          texture.image.width !== size || texture.image.height !== size || palette.length !== size * size * 4 ||
+          texture.internalFormat !== null || texture.updateRanges.length ||
+          texture.onUpdate !== null || texture.source.dataReady !== true || texture.flipY || texture.premultiplyAlpha ||
+          texture.colorSpace !== T.NoColorSpace || texture.generateMipmaps || texture.mipmaps.length ||
+          texture.unpackAlignment !== 1 || texture.minFilter !== T.NearestFilter || texture.magFilter !== T.NearestFilter ||
+          Object.values(Object.getOwnPropertyDescriptors(texture)).some(property => !Object.hasOwn(property, 'value'))))
+      fail('SCENE', 'PMREM skeleton palettes require source-owned fixed floating-point bone data');
+  }
   const live = () => { if (disposed) fail('DISPOSED', 'PMREM scene snapshot owner is disposed'); };
   const releaseHistory = owner => {
     const history = histories.get(owner);
@@ -492,13 +532,14 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         fail('SCENE', 'PMREM capture requires a bounded source hierarchy');
       seen.add(object); nodes.push(object);
       if (field(object, 'onBeforeRender') !== T.Object3D.prototype.onBeforeRender || field(object, 'onAfterRender') !== T.Object3D.prototype.onAfterRender ||
-          field(object, 'updateMatrixWorld') !== T.Object3D.prototype.updateMatrixWorld || field(object, 'updateMatrix') !== T.Object3D.prototype.updateMatrix)
+          field(object, 'updateMatrixWorld') !== (object.isSkinnedMesh ? T.SkinnedMesh.prototype : T.Object3D.prototype).updateMatrixWorld ||
+          field(object, 'updateMatrix') !== T.Object3D.prototype.updateMatrix)
         fail('SCENE', 'PMREM scene callbacks require their source synchronous draw owner');
       if (object.isScene && (object.background && !object.background.isColor || object.environment || object.overrideMaterial))
         fail('SCENE', 'PMREM scene capture currently requires a solid background without an environment or override');
-      if (object.isLOD || object.isSkinnedMesh || object.isBatchedMesh || object.isLine || object.isPoints || object.isSprite ||
+      if (object.isLOD || object.isBatchedMesh || object.isLine || object.isPoints || object.isSprite ||
           object.isLight && object.castShadow || object.isInstancedMesh && object.morphTexture)
-        fail('SCENE', 'PMREM capture requires rigid meshes, CPU instances and unshadowed source lights');
+        fail('SCENE', 'PMREM capture requires rigid/skinned meshes, CPU instances and unshadowed source lights');
       if (object.isMesh) {
         const geometry = object.geometry, materials = Array.isArray(object.material) ? object.material : [object.material];
         if (!(geometry instanceof T.BufferGeometry) || Object.values(geometry.morphAttributes).some(list => list.length))
@@ -509,14 +550,27 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           field(material, 'customProgramCacheKey') !== T.Material.prototype.customProgramCacheKey || material.transmission > 0 || material.wireframe || material.envMap))
           fail('SCENE', 'PMREM scene materials require ordinary source programs without custom hooks, environments or transmission');
         sourceResources.set(geometry, sourceOwners(geometry));
-        if (field(object, 'intersectsFrustum') !== T.Mesh.prototype.intersectsFrustum ||
+        if (object.isSkinnedMesh) inspectSkeleton(object);
+        if (field(object, 'intersectsFrustum') !== (object.isSkinnedMesh ? T.SkinnedMesh.prototype : T.Mesh.prototype).intersectsFrustum ||
             field(geometry, 'computeBoundingSphere') !== T.BufferGeometry.prototype.computeBoundingSphere ||
-            object.isInstancedMesh && field(object, 'computeBoundingSphere') !== T.InstancedMesh.prototype.computeBoundingSphere)
+            object.isInstancedMesh && field(object, 'computeBoundingSphere') !== T.InstancedMesh.prototype.computeBoundingSphere ||
+            object.isSkinnedMesh && field(object, 'computeBoundingSphere') !== T.SkinnedMesh.prototype.computeBoundingSphere)
           fail('SCENE', 'PMREM bounds require ordinary source computation');
         if (object.isInstancedMesh) sourceResources.set(object, [object.instanceMatrix, ...(object.instanceColor ? [object.instanceColor] : [])]);
       }
       stack.push(...object.children);
     }
+    const paletteBuffers = new Map(), paletteTextures = new Set();
+    for (const object of nodes) if (object.isSkinnedMesh) {
+      const skeleton = object.skeleton, buffer = skeleton.boneMatrices.buffer;
+      if (paletteBuffers.has(buffer) && paletteBuffers.get(buffer) !== skeleton)
+        fail('SCENE', 'PMREM skeletons require independent palette arrays or one shared Skeleton');
+      paletteBuffers.set(buffer, skeleton);
+      if (skeleton.boneTexture) paletteTextures.add(skeleton.boneTexture);
+    }
+    for (const owners of sourceResources.values()) for (const owner of owners)
+      if (paletteBuffers.has(own(owner, 'array')?.buffer))
+        fail('SCENE', 'PMREM skeleton palettes cannot also serve as geometry upload inputs');
     if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
     if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
 
@@ -532,6 +586,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         camera.coordinateSystem, camera.reversedDepth));
     }
     const selectedOwners = new Set(), selectedMaterials = new Map(), sceneLights = [], visible = [root];
+    const skeletonUpdates = frusta.map(() => new Set()), skeletonTextures = frusta.map(() => new Set());
     while (visible.length) {
       const object = visible.pop(); if (object.visible === false) continue;
       if (object.isLight && object.layers.test(camera.layers)) sceneLights.push(object);
@@ -542,6 +597,11 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         // WebGLRenderer sets the program (and its sampled uniforms) before
         // checking the draw range, including an otherwise empty draw.
         for (const [material] of materials) if (material?.visible) selectedMaterials.set(material, object);
+        if (object.isSkinnedMesh) for (let face = 0; face < frusta.length; face++) {
+          if (object.frustumCulled && !frusta[face].intersectsObject(object)) continue;
+          skeletonUpdates[face].add(object.skeleton);
+          if (materials.some(([material]) => material?.visible)) skeletonTextures[face].add(object.skeleton);
+        }
         // WebGLObjects uploads vertex/instance data before material selection.
         for (const attribute of Object.values(geometry.attributes))
           selectedOwners.add(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
@@ -608,6 +668,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       if (value == null || ['number', 'boolean', 'string'].includes(typeof value)) { charge(typeof value === 'string' ? value.length * 2 : 8); return value; }
       if (typeof value !== 'object') fail('SCENE', 'PMREM capture requires ordinary data fields');
       if (value instanceof T.Texture) {
+        if (paletteTextures.has(value) || paletteBuffers.has(value.image?.data?.buffer))
+          fail('SCENE', 'PMREM skeleton textures cannot also serve as material map inputs');
         if (!materialOwner || materialOwner.isShaderMaterial)
           fail('SCENE', 'PMREM texture capture requires ordinary material maps; shader samplers and light maps need their source binding selection');
         if (field(value, 'updateMatrix') !== T.Texture.prototype.updateMatrix ||
@@ -622,23 +684,27 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       }
       if (memo.has(value)) return memo.get(value);
       if (ArrayBuffer.isView(value)) {
+        if (paletteBuffers.has(value.buffer))
+          fail('SCENE', 'PMREM skeleton palette aliases require their source per-face uniform owner');
         if (!TYPED_ARRAYS.has(Object.getPrototypeOf(value)) || !(value.buffer instanceof ArrayBuffer) || value.buffer.resizable)
           fail('SCENE', 'PMREM capture requires ordinary fixed typed arrays');
         charge(value.byteLength); const result = duplicate(value); memo.set(value, result); return result;
       }
       const object = value instanceof T.Object3D, geometry = value instanceof T.BufferGeometry, material = value instanceof T.Material;
+      const skeleton = value instanceof T.Skeleton;
       if (material) materialOwner = value;
       else if (object || geometry) materialOwner = null;
       const attribute = attributeOwners.has(value) || value.isInterleavedBufferAttribute === true;
       const prototype = Object.getPrototypeOf(value), array = Array.isArray(value);
-      if (!object && !geometry && !material && !attribute && !array && !math.has(prototype) &&
+      if (!object && !geometry && !material && !skeleton && !attribute && !array && !math.has(prototype) &&
           prototype !== Object.prototype && prototype !== null)
         fail('SCENE', 'Unsupported mutable PMREM scene field');
       charge(128); const result = array ? [] : view(value); memo.set(value, result); sources.set(result, value);
       const upload = attributeOwners.has(value) ? selectedOwners.has(value) ? uploaded(value) : histories.get(value) : null;
       for (const key of Object.getOwnPropertyNames(value)) {
         if (['_listeners', 'userData', '_onChangeCallback'].includes(key) || array && key === 'length' ||
-            object && ['parent', 'children', 'animations', 'shadow'].includes(key)) continue;
+            object && ['parent', 'children', 'animations', 'shadow'].includes(key) ||
+            skeleton && ['boneMatrices', 'boneTexture'].includes(key)) continue;
         let input = own(value, key);
         if (upload && key === 'array') input = upload.array;
         if (upload && key === 'updateRanges') input = [];
@@ -649,8 +715,22 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         put(result, key, copy(input, depth + 1, materialOwner));
       }
       if (array) result.length = value.length;
+      if (skeleton) {
+        // Skeleton.update derives each accepted palette from these frozen bone
+        // worlds and inverse binds. Keep its GPU texture private: later source
+        // animation/disposal must not rewrite an earlier six-face capture.
+        const size = Math.max(4, Math.ceil(Math.sqrt(value.bones.length * 4) / 4) * 4);
+        charge(size * size * 16);
+        const palette = new Float32Array(size * size * 4);
+        palette.set(value.boneMatrices.subarray(0, palette.length));
+        put(result, 'boneMatrices', palette); put(result, 'boneTexture', null);
+      }
       if (object) {
-        put(result, 'parent', null); put(result, 'children', copy(value.children, depth + 1));
+        put(result, 'parent', null);
+        // A detached skeleton may reference bones outside the captured scene.
+        // Source rendering reads their existing world matrices without walking
+        // or drawing their unrelated descendants.
+        put(result, 'children', value.isBone && !seen.has(value) ? [] : copy(value.children, depth + 1));
         put(result, 'animations', []); put(result, 'matrixAutoUpdate', false); put(result, 'matrixWorldAutoUpdate', false);
         put(result, 'matrixWorldNeedsUpdate', false);
         if (value.shadow) put(result, 'shadow', value.shadow); // castShadow was excluded above.
@@ -713,6 +793,14 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         // skipped. A later selected capture restores the actual map normally.
         if (captured[key] instanceof T.Texture) put(captured, key, capturedTextures.get(captured[key]) ?? null);
       }
+      // WebGLObjects updates each selected skeleton once per render, even for
+      // an invisible material. setProgram creates its bone texture only for a
+      // selected draw. Preserve those public CPU effects at acceptance, after
+      // resource admission succeeds, rather than replaying them asynchronously.
+      for (let face = 0; face < frusta.length; face++) {
+        for (const skeleton of skeletonUpdates[face]) skeleton.update();
+        for (const skeleton of skeletonTextures[face]) if (skeleton.boneTexture === null) skeleton.computeBoneTexture();
+      }
       for (const [owner, history] of pending) {
         if (!histories.has(owner)) historyBytes += history.array.byteLength;
         histories.set(owner, history);
@@ -742,8 +830,14 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         let target = state.views.get(source)?.deref();
         if (!target) { target = Array.isArray(value) ? [] : view(value); state.views.set(source, new WeakRef(target)); }
         installed.set(source, target);
+        const boneTexture = source instanceof T.Skeleton ? target.boneTexture : null;
         for (const key of Object.getOwnPropertyNames(target)) if (key !== '_listeners' && !(Array.isArray(target) && key === 'length') && !Object.hasOwn(value, key)) delete target[key];
         for (const key of Object.getOwnPropertyNames(value)) if (!(Array.isArray(value) && key === 'length')) put(target, key, apply(value[key]));
+        if (boneTexture && boneTexture.image.data.length === target.boneMatrices.length) {
+          // Reuse one private palette residency across accepted generations.
+          // The source skeleton update requests its new upload before drawing.
+          boneTexture.image.data = target.boneMatrices; put(target, 'boneTexture', boneTexture);
+        } else if (boneTexture) boneTexture.dispose();
         if (Array.isArray(value)) target.length = value.length;
         return target;
       }

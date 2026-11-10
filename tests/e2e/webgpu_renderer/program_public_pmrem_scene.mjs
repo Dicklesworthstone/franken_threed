@@ -61,6 +61,17 @@ async function capture(mode, preinit = false) {
       materials.forEach((m,i)=>{const mesh=new T.Mesh(new T.SphereGeometry(.65,24,16),m);mesh.position.x=(i-1)*1.5;scene.add(mesh);});
       const gen=new Generator(renderer), room=new RoomEnvironment(), sky=new Sky();
       const instances=room.children.find(object=>object.isInstancedMesh);
+      const skinGeometry=new T.CylinderGeometry(.5,.5,3,12,8),skinIndices=[],skinWeights=[];
+      for(let i=0;i<skinGeometry.attributes.position.count;i++){
+        const weight=(skinGeometry.attributes.position.getY(i)+1.5)/3;
+        skinIndices.push(0,1,0,0);skinWeights.push(1-weight,weight,0,0);
+      }
+      skinGeometry.setAttribute('skinIndex',new T.Uint16BufferAttribute(skinIndices,4));
+      skinGeometry.setAttribute('skinWeight',new T.Float32BufferAttribute(skinWeights,4));
+      const skinMaterial=new T.MeshNormalMaterial({side:T.DoubleSide}),skinScene=new T.Scene();
+      const skin=new T.SkinnedMesh(skinGeometry,skinMaterial),bone=new T.Bone(),tip=new T.Bone();
+      bone.position.y=-1.5;tip.position.y=3;bone.add(tip);skin.add(bone);
+      skin.bind(new T.Skeleton([bone,tip]));skin.position.z=-3;skin.frustumCulled=false;skinScene.add(skin);
       try{
         if(mode==='candidate'&&!preinit){await renderer.init();renderer._device.addEventListener('uncapturederror',e=>errors.push(e.error.message));}
         renderer.setSize(96,64,false);renderer.outputColorSpace=T.LinearSRGBColorSpace;renderer.toneMapping=T.NoToneMapping;
@@ -87,7 +98,11 @@ async function capture(mode, preinit = false) {
         bake(sky,.05);
         sky.material.uniforms.sunPosition.value.set(-1,.2,.2);sky.material.uniforms.rayleigh.value=2;
         sky.material.uniforms.turbidity.value=5;bake(sky,.15);
-        sky.material.uniforms.turbidity.value=999;sky.geometry.dispose();sky.material.dispose();gen.dispose();
+        sky.material.uniforms.turbidity.value=999;sky.geometry.dispose();sky.material.dispose();
+        tip.rotation.z=.35;bake(skinScene,.04);
+        tip.rotation.z=-.8;skin.position.x=.4;bake(skinScene,.08);
+        const skinState={palette:Array.from(skin.skeleton.boneMatrices),version:skin.skeleton.boneTexture.version};
+        tip.rotation.z=2;skin.skeleton.dispose();skinGeometry.dispose();skinMaterial.dispose();skinScene.clear();gen.dispose();
         for(const atlas of targets){
           for(const material of materials)material.envMap=atlas.texture;
           renderer.setRenderTarget(output);renderer.render(scene,camera);
@@ -95,9 +110,10 @@ async function capture(mode, preinit = false) {
           const pixels=new Uint8Array(96*64*4);
           await renderer.readRenderTargetPixelsAsync(output,0,0,96,64,pixels);frames.push(Array.from(pixels));
         }
-        return {frames,errors,route:renderer.info.f3d?.route,draws:renderer.info.f3d?.nativeDrawCalls};
+        return {frames,errors,skinState,route:renderer.info.f3d?.route,draws:renderer.info.f3d?.nativeDrawCalls};
       }finally{
         gen.dispose();room.dispose();instances.dispose();sky.geometry.dispose();sky.material.dispose();
+        skin.skeleton.dispose();skinGeometry.dispose();skinMaterial.dispose();
         for(const target of targets)target.dispose();output.dispose();renderer.dispose();canvas.remove();
       }
 
@@ -111,9 +127,11 @@ try {
   assert.notDeepEqual(source.frames[0], source.frames[1], 'sigma changes the source RoomEnvironment bake');
   assert.notDeepEqual(source.frames[1], source.frames[2], 'source instance, light, material and capture-position edits change the bake');
   assert.notDeepEqual(source.frames[3], source.frames[4], 'source Sky uniforms change the bake');
+  assert.notDeepEqual(source.frames[5], source.frames[6], 'source skeletal poses change the filtered environment');
   for (const preinit of [false, true]) {
   const candidate = await capture('candidate', preinit);
   assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
+  assert.deepEqual(candidate.skinState,source.skinState,'source-visible palette and per-face update versions');
   const results = source.frames.map((reference, frame) => {
     const actual = candidate.frames[frame]; assert.equal(actual.length, reference.length);
     let maxError = 0, differingBytes = 0, over = 0;

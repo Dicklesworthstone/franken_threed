@@ -547,9 +547,17 @@ They enter the renderer's existing FIFO. Geometry histories bind to the real
 device before ordinary renderer uploads; a conflicting batch releases all newly
 acquired claims. Disposal cancels pending work and releases captured payloads.
 
-The admitted scene profile comprises rigid meshes, CPU instances, ordinary
-source materials and texture-free shaders, and unshadowed lights, with a solid
-or absent background. Initialized scene bakes also capture ordinary Basic,
+The admitted scene profile comprises rigid and skinned meshes, CPU instances,
+ordinary source materials and texture-free shaders, and unshadowed lights, with
+a solid or absent background. Skinned captures retain call-time bone worlds,
+inverse binds, bind mode and bind matrices, including shared skeletons and
+detached bones outside the captured hierarchy. Each accepted cube face preserves
+the source's synchronous skeleton update and bone-texture creation behavior;
+queued draws use a private palette through the existing ShaderLib or GPU
+deformation route. Later animation, source disposal and generator retirement do
+not change an accepted pose. Private palette residency is reused across captures
+and participates in the existing capture budgets and retirement lifecycle.
+Initialized scene bakes also capture ordinary Basic,
 Lambert, Phong, Toon, Standard, Normal, Matcap and depth material maps. Source
 shader assembly/reflection and material uniform refresh select the actual
 sampled inputs; hidden draws and inactive map properties cannot establish a
@@ -571,8 +579,12 @@ successive bakes and ordinary consumers share the existing uploaded history;
 simultaneous aliases need per-face upload ordering and remain explicit. Texture
 inputs before device initialization, ShaderMaterial sampler uniforms, Physical
 material accessors, environments/overrides, custom render or shader hooks, custom
-sorting, shadows, transmission, skinned/morphed/batched meshes, LOD, wireframes,
-lines, points and sprites also retain explicit boundaries. These restrictions
+sorting, shadows, transmission, morphed/batched meshes, LOD, wireframes,
+lines, points and sprites also retain explicit boundaries. Skinning requires
+ordinary source skeletons and four-component skin attributes. Custom skeleton
+methods, altered bone-texture uploads, and palettes aliased as material uniforms,
+maps or geometry inputs require per-face source effects and remain explicit
+boundaries. These restrictions
 keep unsupported mutable state from being silently read after acceptance.
 
 Captured geometry follows WebGL first-upload, version and partial-range history.
