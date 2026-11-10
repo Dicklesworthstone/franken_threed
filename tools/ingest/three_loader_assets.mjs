@@ -29,6 +29,7 @@ const SINGLE_FILE_ADDONS = new Map([
   ["RGBELoader", new Set(["setDataType"])],
   ["EXRLoader", new Set(["setDataType", "setOutputFormat", "setPart"])],
   ["UltraHDRLoader", new Set(["setDataType"])],
+  ["IESLoader", new Set()],
   ["FontLoader", new Set()],
   ["STLLoader", new Set()],
   ["PLYLoader", new Set(["setPropertyNameMapping", "setCustomPropertyNameMapping"])],
@@ -55,11 +56,13 @@ const BOOLEAN_OPTIONS = new Map([
   ["GCodeLoader", new Set(["splitLayer"])],
   ["LDrawLoader", new Set(["smoothNormals"])],
 ]);
-const CUBE_URL_LOADERS = new Set(["CubeTextureLoader", "DDSLoader", "KTXLoader"]);
+const CUBE_URL_LOADERS = new Set(["CubeTextureLoader", "HDRCubeTextureLoader", "DDSLoader", "KTXLoader"]);
+const LIGHTING_DATA_TYPES = new Set(["FloatType", "HalfFloatType", "UnsignedByteType"]);
 const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"], ["Rhino3dmLoader", "3DMLoader.js"]]);
 const RHINO_LIBRARIES = ["rhino3dm.js", "rhino3dm.wasm"];
 const ADDON_SETTINGS = new Map([
   ...SINGLE_FILE_ADDONS,
+  ["HDRCubeTextureLoader", new Set(["setDataType"])],
   ["MTLLoader", new Set(["setMaterialOptions"])],
   ["FBXLoader", new Set()],
   ["ColladaLoader", new Set()],
@@ -173,6 +176,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       if (specifier.type === "ImportNamespaceSpecifier" && addons.length) value = { addonNamespace: new Set(addons) };
       if (specifier.type === "ImportSpecifier") {
         const imported = specifier.imported.name ?? specifier.imported.value;
+        if ((core || resolved === root + "src/constants.js") && LIGHTING_DATA_TYPES.has(imported)) value = { lightingDataType: true };
         if (core && imported === "DefaultLoadingManager") value = { manager: true };
         if ((core || managerModule) && imported === "LoadingManager") value = { loader: imported };
         if ((core && CORE_LOADERS.has(imported)) ||
@@ -315,6 +319,19 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       if (name === "LoadingManager" && (binding?.value?.namespace || binding?.value?.managerNamespace)) return name;
     }
     return null;
+  };
+  // IESLoader exposes a data field, not a setDataType() method. Preserve its
+  // live parse-time value without admitting callable fields or opaque aliases.
+  const lightingDataType = (node, active = new Set()) => {
+    if (node?.type === "Literal") return typeof node.value === "number" && Number.isFinite(node.value);
+    if (node?.type === "Identifier") {
+      const binding = lookup(node.name, node);
+      if (binding?.kind === "import") return binding.value?.lightingDataType === true;
+      return binding?.kind === "const" && !active.has(binding) && lightingDataType(binding.init, new Set(active).add(binding));
+    }
+    if (node?.type === "MemberExpression" && node.object.type === "Identifier")
+      return lookup(node.object.name, node.object)?.value?.namespace === true && LIGHTING_DATA_TYPES.has(memberName(node));
+    return node?.type === "ConditionalExpression" && lightingDataType(node.consequent, active) && lightingDataType(node.alternate, active);
   };
   const statementList = (node) => containing(ancestorsByNode.get(node) ?? [], (parent) => parent.type === "BlockStatement" || parent.type === "Program");
   const receiverSetter = (use, call) => {
@@ -511,16 +528,17 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
             value.loader === "KTX2Loader" && attachment === "setKTX2Loader") &&
           instance(attached.callee.object, attached, new Set(active).add(binding))?.loader === "GLTFLoader") continue;
       const member = ref.parent, call = ref.ancestors.at(-3), method = memberName(member);
-      // Only boolean configuration and simple value reads are admitted. An app
+      // Only source-owned data configuration and simple value reads are admitted. An app
       // may replace the field with a method whose `this` can mutate loader paths.
-      if (member?.object === ref.node && BOOLEAN_OPTIONS.get(value.loader)?.has(method)) {
-        const booleanAssignment = call?.type === "AssignmentExpression" && call.left === member && call.operator === "=" &&
-          call.right.type === "Literal" && typeof call.right.value === "boolean";
+      const iesType = value.loader === "IESLoader" && method === "type";
+      if (member?.object === ref.node && (iesType || BOOLEAN_OPTIONS.get(value.loader)?.has(method))) {
+        const dataAssignment = call?.type === "AssignmentExpression" && call.left === member && call.operator === "=" &&
+          (iesType ? lightingDataType(call.right) : call.right.type === "Literal" && typeof call.right.value === "boolean");
         const read = call?.type === "VariableDeclarator" && call.init === member ||
           ["IfStatement", "ConditionalExpression"].includes(call?.type) && call.test === member ||
           call?.type === "UnaryExpression" && call.operator === "!" && call.argument === member ||
           call?.type === "ReturnStatement" && call.argument === member;
-        if (booleanAssignment || read) continue;
+        if (dataAssignment || read) continue;
         return null;
       }
       if (member?.object !== ref.node || call?.type !== "CallExpression" || call.callee !== member ||
@@ -593,7 +611,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     // its original asynchronous parsing and material identity stay untouched.
     if (["load", "loadAsync"].includes(method) || value.loader === "LDrawLoader" && method === "preloadMaterials") {
       const argument = call.arguments[0];
-      const urls = value.loader === "CubeTextureLoader" ? cubeUrls(argument) :
+      const urls = ["CubeTextureLoader", "HDRCubeTextureLoader"].includes(value.loader) ? cubeUrls(argument) :
         finite(argument) ?? (CUBE_URL_LOADERS.has(value.loader) ? cubeUrls(argument) : null);
       let objectGroup;
       if (value.loader === "ObjectLoader") {
