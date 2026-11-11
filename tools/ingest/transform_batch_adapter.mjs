@@ -28,7 +28,8 @@ export function createTransformBatchDispatch(base64,stride,maxMemoryPages){
 export function registerTransformBatchClass(token,name,Class){
   const record=apply(mapGet,dispatches,[token]),proto=data(Class,'prototype');
   record.classes[name]={proto,parent:prototype(proto),updateMatrix:data(proto,'updateMatrix'),
-    updateMatrixWorld:data(proto,'updateMatrixWorld'),compose:data(proto,'compose'),multiplyMatrices:data(proto,'multiplyMatrices')};
+    updateMatrixWorld:data(proto,'updateMatrixWorld'),updateWorldMatrix:data(proto,'updateWorldMatrix'),
+    compose:data(proto,'compose'),multiplyMatrices:data(proto,'multiplyMatrices')};
 }
 function method(object,key,expected,kinds,classes){
   if(typeof expected!=='function')return false;
@@ -53,7 +54,7 @@ function vector(object,keys,state,offset,seen){
   }
   return true;
 }
-function hierarchy(record,owner,children){
+function hierarchy(record,owner,children,methodName){
   const entries=[],nodes=new S(),objectClass=record.classes.Object3D;
   const count=data(children,'length');
   if(!objectClass || count===0 || count>record.maxRows)return null;
@@ -66,7 +67,7 @@ function hierarchy(record,owner,children){
     if(entries.length>=record.maxRows || !apply(weakHas,objects,[child]) ||
       apply(setHas,nodes,[child]) || data(child,'parent')!==frame.owner)return null;
     apply(setAdd,nodes,[child]);
-    if(!method(child,'updateMatrixWorld',objectClass.updateMatrixWorld,nodeKinds,record.classes))return null;
+    if(!method(child,methodName,objectClass[methodName],nodeKinds,record.classes))return null;
     const descendants=data(child,'children');
     if(!apply(weakHas,arrays,[descendants]))return null;
     const row=entries.length,descendantCount=data(descendants,'length');
@@ -77,11 +78,11 @@ function hierarchy(record,owner,children){
   }
   return entries.length>=2?entries:null;
 }
-function input(record,owner,children,force){
+function input(record,owner,children,force,methodName){
   if(!apply(weakHas,arrays,[children]) || data(owner,'children')!==children ||
     (force!==undefined && typeof force!=='boolean'))return null;
   const objectClass=record.classes.Object3D,matrixClass=record.classes.Matrix4;
-  const entries=hierarchy(record,owner,children);
+  const entries=hierarchy(record,owner,children,methodName);
   if(!entries || !matrixClass)return null;
   const count=entries.length;
   const parent=matrixNumericElements(data(owner,'matrixWorld'),false),local=matrixNumericElements(data(owner,'matrix'),false);
@@ -100,8 +101,7 @@ function input(record,owner,children,force){
     const inheritedForce=entry.parent<0?force===true:entries[entry.parent].dirtyWrite;
     const update=automatic || dirty.value || inheritedForce,worldWrite=update && worldAutomatic;
     if(update && !dirty.writable)return null;
-    if(automatic && (data(child,'pivot')!==null ||
-      !method(child,'updateMatrix',objectClass.updateMatrix,nodeKinds,record.classes)))return null;
+    if(automatic && !method(child,'updateMatrix',objectClass.updateMatrix,nodeKinds,record.classes))return null;
     const matrix=data(child,'matrix'),world=data(child,'matrixWorld');
     const elements=matrixNumericElements(matrix,automatic),worldElements=matrixNumericElements(world,worldWrite);
     if(!elements || !worldElements || elements===worldElements ||
@@ -116,6 +116,12 @@ function input(record,owner,children,force){
       if(!vector(data(child,'position'),xyz,state,offset+3,references) ||
         !vector(data(child,'quaternion'),xyzw,state,offset+6,references) ||
         !vector(data(child,'scale'),xyz,state,offset+10,references))return null;
+      const pivot=own(child,'pivot');
+      if(!pivot)return null;
+      if(pivot.value!==null){
+        if(!vector(pivot.value,xyz,state,offset+48,references))return null;
+        state[offset+47]=1;
+      }
     }else{
       for(let j=0;j<fields.length;j++){
         const d=own(child,fields[j]);if(!d || apply(setHas,references,[d.value]))return null;
@@ -140,22 +146,23 @@ function kernel(record){
   }
   return record.kernel;
 }
-export function tryTransformBatch(owner,children,force,token){
+export function tryTransformBatch(owner,children,force,token,methodName='updateMatrixWorld'){
   if(!apply(weakHas,objects,[owner]) || !apply(weakHas,arrays,[children]) || data(children,'length')===0)return false;
   let stats=apply(mapGet,statistics,[owner]);
   if(!stats){stats={wasmCalls:0,objects:0,fallbackCalls:0,lastFailure:null};apply(mapSet,statistics,[owner,stats]);}
   const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;};
   const record=apply(mapGet,dispatches,[token]);
-  if(!record || !matrixNumericPlatformIntact())return fallback('TRANSFORM_BATCH_PLATFORM');
+  if(!record || !matrixNumericPlatformIntact() ||
+    (methodName!=='updateMatrixWorld' && methodName!=='updateWorldMatrix'))return fallback('TRANSFORM_BATCH_PLATFORM');
   let prepared,runtime;
   try{
-    prepared=input(record,owner,children,force);
+    prepared=input(record,owner,children,force,methodName);
     if(!prepared)return fallback('TRANSFORM_BATCH_GUARD');
     const initialized=record.attempted;
     runtime=kernel(record);if(!runtime)return fallback(record.failure);
     // No source snapshots survive potentially reentrant native initialization.
     if(!matrixNumericPlatformIntact())return fallback('TRANSFORM_BATCH_PLATFORM');
-    if(!initialized && !(prepared=input(record,owner,children,force)))return fallback('TRANSFORM_BATCH_GUARD');
+    if(!initialized && !(prepared=input(record,owner,children,force,methodName)))return fallback('TRANSFORM_BATCH_GUARD');
     runtime.run(prepared.state,prepared.parent,prepared.count,prepared.force);
   }catch{return fallback(runtime?.diagnostics.lastGuardFailure??'TRANSFORM_BATCH_EXECUTION');}
   // All writes target proven writable own data properties, with no aliases or

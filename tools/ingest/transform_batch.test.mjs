@@ -6,15 +6,31 @@ import {before,test} from 'node:test';
 import {rollup} from 'rollup';
 import {marchingCubesRollupPlugin} from './marching_cubes_rollup.mjs';
 import {specializeTransformBatch} from './transform_batch_specialization.mjs';
+import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import * as reference from '../../upstream/three.js/build/three.core.js';
 import {BundleGroup as ReferenceBundleGroup} from '../../upstream/three.js/build/three.webgpu.js';
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
-async function fixture(options={}) {
+async function fixture(options={},withBundleGroup=false) {
   const entry='\0transform-batch-fixture',plugin=marchingCubesRollupPlugin(options);
+  const reports=[];
+  // Exercise these two production source transforms directly. Unrelated asset,
+  // geometry and animation compilers do not belong in every matrix fixture;
+  // transform_batch_application.test.mjs still runs the complete production build.
+  plugin.transform=(code,id)=>{
+    if(!code.includes('class Matrix4'))return null;
+    const matrix=specializeMatrixMultiply(code,{...options,runtimeModule:'\0f3d-matrix-multiply-adapter'});
+    const batch=specializeTransformBatch(code,{...options,runtimeModule:'\0f3d-transform-batch-adapter'});
+    if(!matrix.changed && !batch.changed)return null;
+    if(batch.report)reports.push({id,...batch.report});
+    let transformed=code;
+    for(const edit of [...matrix.edits,...batch.edits].sort((a,b)=>b.start-a.start))
+      transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
+    return {code:matrix.header+batch.header+transformed+matrix.tail+batch.tail,map:null};
+  };
   const source='export {Object3D,Group,Scene,Bone,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
-    JSON.stringify(path.join(upstream,'build/three.core.js'))+';export {BundleGroup} from '+
-    JSON.stringify(path.join(upstream,'build/three.webgpu.js'))+';'+
+    JSON.stringify(path.join(upstream,'build/three.core.js'))+';'+
+    (withBundleGroup?'export {BundleGroup} from '+JSON.stringify(path.join(upstream,'build/three.webgpu.js'))+';':'')+
     'export {transformBatchDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-transform-batch-adapter')+';'+
     'export {matrixMultiplyDiagnostics as matrixDiagnostics} from '+JSON.stringify('\0f3d-matrix-multiply-adapter')+';';
   const bundle=await rollup({input:entry,plugins:[{name:'transform-fixture',
@@ -22,7 +38,7 @@ async function fixture(options={}) {
   try{
     const result=await bundle.generate({format:'es'});
     return {api:await import('data:text/javascript;base64,'+Buffer.from(result.output[0].code).toString('base64')),
-      report:plugin.api.getTransformBatchesReport()};
+      report:{compiledModules:reports.length,modules:reports,accelerationClaim:false}};
   }finally{await bundle.close();}
 }
 let native,limited;
@@ -66,6 +82,7 @@ test('only exact pinned built-core source admits the source-derived child transa
   assert.equal(native.report.compiledModules,1);assert.equal(native.report.accelerationClaim,false);
   assert.equal(native.report.modules[0].sourceDerived,true);
   assert.equal(native.report.modules[0].scope,'guarded-ordinary-subtrees');
+  assert.deepEqual(native.report.modules[0].compiledMethods,['Object3D.updateMatrixWorld','Object3D.updateWorldMatrix']);
   assert.ok(native.report.modules[0].wasmBytes>0);
 });
 
@@ -145,8 +162,8 @@ test('a single-child chain is batched and add/remove/reparent edits rebuild sour
   }
 });
 
-test('H1 BundleGroup with 4000 Mesh children and one InstancedMesh updates all 4001 leaves in one Wasm call per frame',()=>{
-  const {api}=native,actual=group(api,4000,api.BundleGroup),expected=group(reference,4000,ReferenceBundleGroup);
+test('H1 BundleGroup with 4000 Mesh children and one InstancedMesh updates all 4001 leaves in one Wasm call per frame',async()=>{
+  const {api}=await fixture({},true),actual=group(api,4000,api.BundleGroup),expected=group(reference,4000,ReferenceBundleGroup);
   const instanced=new api.InstancedMesh(new api.BufferGeometry(),new api.MeshBasicMaterial(),10);
   const refInstanced=new reference.InstancedMesh(new reference.BufferGeometry(),new reference.MeshBasicMaterial(),10);
   actual.add(instanced);expected.add(refInstanced);
@@ -290,7 +307,7 @@ test('deep observable hooks refuse the ancestor transaction before effects and r
   }
 });
 
-test('deep and cross-branch aliases, invalid topology and pivots keep the original subtree execution',()=>{
+test('deep and cross-branch aliases and invalid topology keep the original subtree execution',()=>{
   const {api}=native;
   const cases=[
     root=>{root.children[1].children[0].matrixWorld=root.children[0].children[0].matrixWorld;},
@@ -298,7 +315,6 @@ test('deep and cross-branch aliases, invalid topology and pivots keep the origin
     root=>{Object.defineProperty(root.children[1].children[0],'scale',{value:root.children[0].children[0].scale});},
     root=>{root.children[0].children[1].children[0].parent=null;},
     root=>{root.children[1].children[0]=root.children[0].children[0];},
-    (root,types)=>{root.children[0].children[1].pivot=new types.Vector3(1,2,-3);},
   ];
   for(const prepare of cases){
     const actual=subtree(api),expected=subtree(reference);prepare(actual,api);prepare(expected,reference);
@@ -363,5 +379,144 @@ test('late Error dispatch and inherited error setters cannot run inside a budget
     expected.updateMatrixWorld();same(actual,expected);
     assert.equal(callbacks,0);assert.deepEqual(api.diagnostics(actual),{
       wasmCalls:0,objects:0,fallbackCalls:1,lastFailure:'TRANSFORM_BATCH_PLATFORM'});
+  }
+});
+
+const updateSubtree=(root,method,force)=>method==='updateWorldMatrix'
+  ?root.updateWorldMatrix(false,true,force):root.updateMatrixWorld(force);
+
+test('both public subtree entry points apply live pivots with exact r186 arithmetic and stable public identities',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']){
+    const actual=subtree(api),expected=subtree(reference),identities=[];
+    for(const [root,types]of [[actual,api],[expected,reference]]){
+      let i=0;root.traverse(node=>{node.pivot=new types.Vector3(i/7,-i/11,++i/5);});
+    }
+    actual.traverse(node=>identities.push([node,node.matrix,node.matrix.elements,node.matrixWorld,node.matrixWorld.elements,node.pivot]));
+    for(let frame=0;frame<4;frame++){
+      for(const [root,types]of [[actual,api],[expected,reference]]){
+        root.children[0].rotation.z+=0.3;
+        root.children[0].pivot.y-=1;
+        root.children[1].pivot=frame%2?new types.Vector3(-3,2,0):null;
+        assert.equal(updateSubtree(root,method),undefined);
+      }
+      same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,frame+1);
+      assert.deepEqual(actual.children[0].toJSON().object.matrix,expected.children[0].toJSON().object.matrix);
+      assert.deepEqual(actual.children[0].toJSON().object.pivot,expected.children[0].toJSON().object.pivot);
+      assert.deepEqual(actual.children[0].clone().matrix.elements,expected.children[0].clone().matrix.elements);
+      assert.deepEqual(actual.children[0].getWorldPosition(new api.Vector3()).toArray(),
+        expected.children[0].getWorldPosition(new reference.Vector3()).toArray());
+    }
+    for(const [node,matrix,local,world,elements,pivot]of identities){
+      assert.equal(node.matrix,matrix);assert.equal(matrix.elements,local);
+      assert.equal(node.matrixWorld,world);assert.equal(world.elements,elements);
+      if(node!==actual.children[1])assert.equal(node.pivot,pivot);
+    }
+  }
+});
+
+test('pivot arithmetic preserves signed zeros and exceptional Numbers without adding unused pivot reads',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const value of [-0,0,NaN,Infinity,-Infinity,1e200]){
+    const actual=group(api),expected=group(reference);
+    for(const [root,types]of [[actual,api],[expected,reference]]){
+      root.children[0].pivot=new types.Vector3(value,0,-0);
+      root.children[1].pivot=new types.Vector3(-2,3,4);root.children[1].scale.set(-1,0,2);
+      root.children[2].matrixAutoUpdate=false;
+      Object.defineProperty(root.children[2],'pivot',{get(){throw new Error('unused pivot');}});
+      updateSubtree(root,method,true);
+    }
+    same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,1);
+  }
+});
+
+test('selective updates retain ancestor and owner effects once, without touching unrequested siblings',()=>{
+  const {api}=native;
+  for(const updateParents of [false,true,1])for(const updateChildren of [false,true,1])for(const force of [false,true]){
+    const actual=subtree(api),expected=subtree(reference),traces=[[],[]];
+    for(const [index,root]of [actual,expected].entries()){
+      const branch=root.children[0],updateParent=root.updateMatrix,updateBranch=branch.updateMatrix;
+      root.updateMatrix=function(){traces[index].push('parent');branch.position.x+=2;return updateParent.call(this);};
+      branch.updateMatrix=function(){traces[index].push('branch');branch.children[1].position.y-=3;return updateBranch.call(this);};
+      branch.updateWorldMatrix(updateParents,updateChildren,force);
+    }
+    same(actual,expected);assert.deepEqual(traces[0],traces[1]);
+    assert.deepEqual(traces[0],updateParents===true?['parent','branch']:['branch']);
+    assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.equal(api.diagnostics(actual.children[0]).wasmCalls,updateChildren===true?1:0);
+    assert.deepEqual(actual.children[1].matrixWorld.elements,new api.Matrix4().elements);
+  }
+});
+
+test('selective updates preserve per-branch force, manual matrices and changing parent topology',()=>{
+  const {api}=native;
+  for(let seed=0;seed<8;seed++)for(const force of [undefined,false,true]){
+    const actual=subtree(api),expected=subtree(reference);
+    for(const [root,types]of [[actual,api],[expected,reference]]){
+      configureManual(root);let i=0;
+      root.traverse(node=>{
+        if(node===root)return;const flags=(seed+i++)%8;
+        node.matrixAutoUpdate=!!(flags&1);node.matrixWorldAutoUpdate=!!(flags&2);node.matrixWorldNeedsUpdate=!!(flags&4);
+        node.pivot=new types.Vector3(i,-i/2,i/3);fill(node.matrix,i);fill(node.matrixWorld,11+i);
+      });
+      root.updateWorldMatrix(false,true,force);
+    }
+    same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,1);
+    for(const root of [actual,expected]){
+      root.children[1].add(root.children[0].children[0]);
+      root.children[1].rotation.x+=0.2;root.updateWorldMatrix(true,true,force);
+    }
+    same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,2);
+  }
+});
+
+test('selective descendant methods and pivot hooks fall back before observable source effects',()=>{
+  const {api}=native;
+  const cases=[
+    (root,types,trace)=>{const child=root.children[0],method=child.updateWorldMatrix;
+      Object.defineProperty(child,'updateWorldMatrix',{get(){trace.push('method');return method;}});},
+    (root,types,trace)=>{const child=root.children[0].children[1],method=child.updateWorldMatrix;
+      child.updateWorldMatrix=function(...args){trace.push(['override',...args]);root.children[1].position.x++;return method.apply(this,args);};},
+    (root,types,trace)=>{const child=root.children[0],pivot=new types.Vector3(1,2,3);
+      Object.defineProperty(child,'pivot',{get(){trace.push('pivot');return pivot;}});},
+    (root,types,trace)=>{const pivot=new types.Vector3(1,2,3);Object.defineProperty(pivot,'x',{get(){trace.push('x');return 2;}});
+      root.children[1].pivot=pivot;},
+    (root,types,trace)=>{root.children[1].pivot=new Proxy(new types.Vector3(1,2,3),{
+      get(target,key,receiver){trace.push(String(key));return Reflect.get(target,key,receiver);},
+      getOwnPropertyDescriptor(target,key){trace.push('descriptor:'+String(key));return Reflect.getOwnPropertyDescriptor(target,key);}});},
+    root=>{root.children[0].pivot=root.children[1].position;},
+    root=>{root.children[0].children[0].matrix.elements=root.children[1].matrix.elements;},
+  ];
+  for(const prepare of cases){
+    const actual=subtree(api),expected=subtree(reference),traces=[[],[]];
+    prepare(actual,api,traces[0]);prepare(expected,reference,traces[1]);
+    actual.updateWorldMatrix(true,true);expected.updateWorldMatrix(true,true);
+    assert.deepEqual(traces[0],traces[1]);same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,0);
+  }
+  // Only the selected traversal method matters. An unused hook is not read.
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']){
+    const actual=subtree(api),expected=subtree(reference),unused=method==='updateMatrixWorld'?'updateWorldMatrix':'updateMatrixWorld';
+    for(const root of [actual,expected])Object.defineProperty(root.children[0],unused,{get(){throw new Error('unused traversal');}});
+    updateSubtree(actual,method);updateSubtree(expected,method);same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,1);
+  }
+});
+
+test('selective budget and late pivot failures preserve partial source updates with no replay',()=>{
+  const actual=subtree(limited.api),expected=subtree(reference);
+  actual.updateWorldMatrix(true,true);expected.updateWorldMatrix(true,true);same(actual,expected);
+  assert.equal(limited.api.diagnostics(actual).wasmCalls,0);
+  assert.equal(limited.api.diagnostics(actual).lastFailure,'KERNEL_EXECUTION_FAILED');
+  for(const failure of ['pivot','matrix']){
+    const broken=subtree(native.api),referenceBroken=subtree(reference),traces=[[],[]];
+    for(const [index,root]of [broken,referenceBroken].entries()){
+      const original=root.updateMatrix;
+      root.updateMatrix=function(){traces[index].push('owner');return original.call(this);};
+      const child=root.children[1].children[0];
+      if(failure==='pivot')Object.defineProperty(child,'pivot',{get(){traces[index].push('pivot');throw new Error('pivot failure');}});
+      else Object.defineProperty(child.matrix.elements,'5',{writable:false});
+      assert.throws(()=>root.updateWorldMatrix(true,true),failure==='pivot'?/pivot failure/:TypeError);
+    }
+    assert.deepEqual(traces[0],traces[1]);same(broken,referenceBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
   }
 });

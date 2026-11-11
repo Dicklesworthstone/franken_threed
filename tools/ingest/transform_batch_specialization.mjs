@@ -7,8 +7,9 @@ const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6
 const fresh=(source,name)=>{let value='__f3d_transforms_'+name;while(source.includes(value))value+='_';return value;};
 const slots={matrixAutoUpdate:0,matrixWorldAutoUpdate:1,matrixWorldNeedsUpdate:2};
 // TRS/flags and local/world matrices occupy the first 45 values. The parent
-// row (-1 for the already-updated owner) and outgoing force complete each row.
-export const TRANSFORM_BATCH_STRIDE=47;
+// row (-1 for the already-updated owner) and outgoing force follow. The final
+// four values carry an optional pivot flag and its source-observable XYZ values.
+export const TRANSFORM_BATCH_STRIDE=51;
 
 /** Only the complete pinned core establishes every constructor/method below.
  * Other module arrangements continue through their original source methods. */
@@ -16,7 +17,11 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   if(createHash('sha256').update(source).digest('hex')!==coreHash)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),object=classes.get('Object3D'),matrix=classes.get('Matrix4');
   const update=normalMethod(object,'updateMatrix'),world=normalMethod(object,'updateMatrixWorld');
+  const selective=normalMethod(object,'updateWorldMatrix');
   const loop=world.body.body.find(node=>node.type==='ForStatement');
+  const selectiveChildren=selective.body.body.find(node=>node.type==='IfStatement' &&
+    node.test.left?.name==='updateChildren');
+  const selectiveLoop=selectiveChildren.consequent.body.find(node=>node.type==='ForStatement');
   const compose=normalMethod(matrix,'compose').body.body,multiply=normalMethod(matrix,'multiplyMatrices').body.body;
   const base=fresh(source,'offset'),childForce=fresh(source,'force');
   const parentIndex=fresh(source,'parent'),parentBase=fresh(source,'parent_offset');
@@ -50,6 +55,12 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   })).join('\n');
   const composition=arithmetic(compose.slice(1,-1),{te:['state',13]},
     {position:{x:3,y:4,z:5},quaternion:{_x:6,_y:7,_z:8,_w:9},scale:{x:10,y:11,z:12}});
+  const pivotBody=update.body.body.find(node=>node.type==='IfStatement').consequent.body;
+  // Keep the pinned source's operation ordering (including each += store).
+  // The te binding alone is replaced by the already-borrowed local matrix.
+  const pivot=arithmetic(pivotBody.filter(node=>node.type!=='VariableDeclaration' ||
+    !node.declarations.some(value=>value.id.name==='te')),{te:['state',13]},
+    {pivot:{x:48,y:49,z:50}});
   const multiplication=arithmetic(multiply.slice(3,-1),{
     ae:index=>'('+parentIndex+'<0?parent['+index+']:state['+parentBase+'+'+(29+index)+'])',
     be:['state',13],te:['state',29]},{});
@@ -58,14 +69,14 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   function statement(node) {
     if(node.type==='BlockStatement')return '{'+node.body.map(statement).join('\n')+'}';
     if(node.type==='IfStatement') {
-      // Every admitted descendant has a guarded ordinary parent and no pivot.
+      // Every admitted descendant has a guarded ordinary parent.
       if(node.test.left?.object?.type==='ThisExpression' && node.test.left.property.name==='parent')return statement(node.alternate);
       return 'if('+expression(node.test)+')'+statement(node.consequent)+(node.alternate?'else '+statement(node.alternate):'');
     }
     if(node.type==='ExpressionStatement') {
       const call=node.expression;
       if(call.type==='CallExpression') {
-        if(call.callee.property.name==='updateMatrix')return '{'+composition+'\n'+expression(update.body.body.at(-1))+'}';
+        if(call.callee.property.name==='updateMatrix')return '{'+composition+'\nif('+slot(47)+'){'+pivot+'}\n'+expression(update.body.body.at(-1))+'}';
         if(call.callee.property.name==='multiplyMatrices')return '{'+multiplication+'}';
         throw new TypeError('Unrecognized pinned transform call');
       }
@@ -75,10 +86,16 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
   }
   const index=loop.init.declarations[0].id.name;
   const header=source.slice(loop.start,loop.body.start).replace('children.length','count');
+  const body=world.body.body.slice(0,2).map(statement).join('\n');
+  // Both pinned entry points have the same local/dirty/force propagation after
+  // the selective method has updated its ancestors. Derive and compare that
+  // source instead of implementing a second numerical algorithm.
+  if(selective.body.body.slice(2,4).map(statement).join('\n')!==body)
+    throw new TypeError('Pinned world-update arithmetic differs between entry points');
   const kernelSource='function updateTransformChildren(state,parent,count,force){'+header+'{const '+base+'='+index+'*'+TRANSFORM_BATCH_STRIDE+
     ';const '+parentIndex+'='+slot(45)+';const '+parentBase+'='+parentIndex+'*'+TRANSFORM_BATCH_STRIDE+
     ';let '+childForce+'='+parentIndex+'<0?force:state['+parentBase+'+46];'+
-    world.body.body.slice(0,2).map(statement).join('\n')+'\n'+slot(46)+'='+childForce+';}}';
+    body+'\n'+slot(46)+'='+childForce+';}}';
   const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64[]','f64','f64'],generalControl:true,
     maxMemoryPages,maxIterations,sourceName:'pinned Object3D.updateMatrixWorld subtree batch'});
   const token=fresh(source,'token'),create=fresh(source,'create'),register=fresh(source,'register');
@@ -97,11 +114,13 @@ export function specializeTransformBatch(source,{runtimeModule,maxMemoryPages=20
     edits.push({start:body.start+1,end:body.start+1,text:'\n'+numericAllocation+'(this);\n'});
   }
   edits.push({start:loop.start,end:loop.end,text:'if (!'+attempt+'(this,children,force,'+token+')) {\n'+source.slice(loop.start,loop.end)+'\n}'});
+  edits.push({start:selectiveLoop.start,end:selectiveLoop.end,text:'if (!'+attempt+'(this,children,force,'+token+',"updateWorldMatrix")) {\n'+
+    source.slice(selectiveLoop.start,selectiveLoop.end)+'\n}'});
   return {changed:true,edits,tail:'',header:
     'import {createTransformBatchDispatch as '+create+',registerTransformBatchClass as '+register+
     ',registerTransformObject as '+objectAllocation+',registerTransformNumeric as '+numericAllocation+
     ',registerTransformChildren as '+arrayAllocation+',tryTransformBatch as '+attempt+'} from '+JSON.stringify(runtimeModule)+';\n'+
     'var '+token+'='+create+'('+JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+','+TRANSFORM_BATCH_STRIDE+','+maxMemoryPages+');\n',
     report:{upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',sourceDerived:true,scope:'guarded-ordinary-subtrees',
-      compiledMethods:['Object3D.updateMatrixWorld'],wasmBytes:artifact.wasm.length,accelerationClaim:false}};
+      compiledMethods:['Object3D.updateMatrixWorld','Object3D.updateWorldMatrix'],wasmBytes:artifact.wasm.length,accelerationClaim:false}};
 }
