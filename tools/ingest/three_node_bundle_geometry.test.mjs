@@ -108,6 +108,62 @@ test('vertex-index programs retain source nonindexed draw counts without capturi
   first.release(); selected.release();
 });
 
+test('alternating shader input selections reuse immutable views and share uploaded generations', t => {
+  const owner = histories(t, {maxBytes: 108}), source = geometry(), packets = [];
+  source.setAttribute('normal', new T.Float32BufferAttribute(Array(9).fill(.5), 3));
+  const capture = (renderId, inputs) => { const packet = owner.capture(source, renderId, inputs); packets.push(packet); return packet; };
+  const empty = capture(1, []), positions = capture(2, ['position']), both = capture(3, ['position', 'normal']);
+  assert.equal(capture(4, []).geometry, empty.geometry);
+  assert.equal(capture(5, ['position']).geometry, positions.geometry);
+  assert.equal(capture(6, ['position', 'normal']).geometry, both.geometry);
+  assert.equal(both.geometry.attributes.position.array, positions.geometry.attributes.position.array);
+  assert.equal(owner.diagnostics.allocatedBytes, 72, 'input variants charge their shared uploads once');
+  source.attributes.position.array[0] = 7; source.attributes.position.needsUpdate = true;
+  const next = capture(7, ['position']);
+  assert.notEqual(next.geometry, positions.geometry);
+  assert.equal(next.geometry.attributes.position.array[0], 7);
+  assert.equal(positions.geometry.attributes.position.array[0], 0);
+  assert.equal(capture(8, []).geometry, empty.geometry, 'unused uploads do not invalidate the vertex-index view');
+  const nextBoth = capture(9, ['position', 'normal']);
+  assert.equal(nextBoth.geometry.attributes.position.array, next.geometry.attributes.position.array);
+  assert.equal(both.geometry.attributes.position.array[0], 0);
+  assert.equal(capture(10, ['position']).geometry, next.geometry);
+  for (const packet of packets) packet.release();
+  assert.equal(owner.diagnostics.allocatedBytes, 72, 'retired upload generations leave the byte budget');
+  source.dispose(); assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
+test('layout variant caching stays bounded while accepted views survive eviction and disposal', t => {
+  const owner = histories(t), source = geometry(), first = owner.capture(source, 1);
+  const firstGeometry = first.geometry; first.release();
+  let recent;
+  for (let i = 1; i <= 32; i++) {
+    source.setDrawRange(i, 1);
+    const packet = owner.capture(source, i + 1); recent = packet.geometry; packet.release();
+  }
+  assert.throws(() => first.retain(), {code: 'THREE_NODE_BUNDLE_GEOMETRY_RELEASED'});
+  const kept = owner.capture(source, 34);
+  assert.equal(kept.geometry, recent); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  source.setDrawRange(0, Infinity);
+  const recreated = owner.capture(source, 35); assert.notEqual(recreated.geometry, firstGeometry);
+  owner.dispose(); assert.equal(owner.diagnostics.allocatedBytes, 36);
+  assert.deepEqual(kept.geometry.drawRange, {start: 32, count: 1});
+  kept.release(); recreated.release(); assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
+test('cached layout variants do not pin superseded uploads against the history byte budget', t => {
+  const owner = histories(t, {maxBytes: 72}), source = geometry(), attribute = source.attributes.position;
+  owner.capture(source, 0).release();
+  for (let i = 1; i <= 12; i++) {
+    source.setDrawRange(i, 1); attribute.array[0] = i; attribute.needsUpdate = true;
+    const current = owner.capture(source, i);
+    assert.equal(current.geometry.attributes.position.array[0], i); current.release();
+    owner.capture(source, i, []).release();
+    assert.equal(owner.diagnostics.allocatedBytes, 36, 'only the current upload remains without accepted older leases');
+  }
+  owner.dispose(); assert.equal(owner.diagnostics.allocatedBytes, 0);
+});
+
 test('disposing a geometry invalidates shared attributes that were unused by its own shader', t => {
   const owner = histories(t), a = geometry(), b = geometry();
   const color = new T.Float32BufferAttribute(Array(9).fill(.25), 3);
@@ -206,6 +262,7 @@ test('shared refresh follows uploaded generations while freezing layouts and all
   const owner = histories(t), source = geometry(), attribute = source.attributes.position;
   const alias = new T.BufferGeometry().setAttribute('position', attribute);
   source.setDrawRange(1, 2); const first = owner.capture(source, 1);
+  const empty = owner.capture(source, 1, []);
   attribute.array.fill(7); attribute.addUpdateRange(0, 1); attribute.needsUpdate = true;
   const uploaded = owner.capture(alias, 2);
   source.setDrawRange(0, 1); attribute.itemSize = 1; attribute.count = 9;
@@ -223,7 +280,7 @@ test('shared refresh follows uploaded generations while freezing layouts and all
   assert.deepEqual([...rebound.geometry.attributes.position.array], Array(9).fill(9));
   assert.deepEqual(rebound.geometry.drawRange, {start: 1, count: 2});
   owner.dispose();
-  for (const packet of [first, uploaded, refreshed, reused, replacement, rebound]) packet.release();
+  for (const packet of [first, empty, uploaded, refreshed, reused, replacement, rebound]) packet.release();
   assert.equal(owner.diagnostics.allocatedBytes, 0);
 });
 

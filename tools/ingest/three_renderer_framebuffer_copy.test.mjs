@@ -110,6 +110,31 @@ for (const [type, format] of [[THREE.UnsignedByteType, 'rgba8unorm'], [THREE.Hal
     await renderer.waitForGPU();
   });
 
+test('queued canvas copies retain their working framebuffer generations across resize and output changes', async t => {
+  const f = await fixture(t, {antialias: true}), {renderer, scene, camera, canvas} = f;
+  f.mesh(new THREE.MeshBasicMaterial());
+  const first = new THREE.FramebufferTexture(16, 16), second = new THREE.FramebufferTexture(8, 8);
+  t.after(() => { first.dispose(); second.dispose(); });
+  renderer.render(scene, camera); renderer.copyFramebufferToTexture(first);
+  const firstTarget = renderer._frameBufferTargets.get(renderer.getCanvasTarget());
+  const firstGeneration = renderer._targets.capture(firstTarget);
+  renderer.setSize(8, 8); renderer.toneMapping = THREE.ReinhardToneMapping;
+  renderer.render(scene, camera); renderer.copyFramebufferToTexture(second);
+  const secondGeneration = renderer._targets.capture(firstTarget);
+  assert.notEqual(firstGeneration, secondGeneration);
+  await renderer.waitForGPU();
+  const recorded = copies(f.events); assert.equal(recorded.length, 2);
+  assert.deepEqual(recorded.map(copy => copy.source.texture.width), [16, 8]);
+  assert.ok(recorded.every(copy => copy.source.texture.format === 'rgba16float' && copy.source.texture.sampleCount === 1));
+  for (const copy of recorded) {
+    const producer = f.events.slice(0, f.events.indexOf(copy)).findLast(event => event.draws.some(draw => draw.indexed));
+    assert.equal(copy.source.texture, producer.desc.colorAttachments[0].resolveTarget.texture);
+  }
+  assert.equal(canvas.acquisitions, 2, 'copies of private scene history do not acquire presentation images');
+  assert.equal(firstGeneration.references, 0); assert.equal(secondGeneration.references, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
 test('public copies capture source target and source rectangle before later calls', async t => {
   const f = await fixture(t), {renderer, scene, camera} = f;
   f.mesh(new THREE.MeshBasicMaterial());
@@ -314,6 +339,31 @@ for (const samples of [0, 4]) test(`public depth snapshots preserve private targ
   assert.equal(copy.destination.texture.sampleCount, samples || 1);
   assert.equal(depth.type, THREE.UnsignedIntType, 'depth destination type remains authored');
   assert.ok(meshDraws(f.events.slice(at + 1)).some(draw => sampled(draw).includes(copy.destination.texture)));
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+});
+
+for (const [samples, stencil] of [[0, false], [4, false], [4, true]])
+test(`public converted canvas depth copies retain scene samples and aspects (${samples || 1}, stencil=${stencil})`, async t => {
+  const f = await fixture(t, {samples, stencil}), {renderer, scene, camera, canvas} = f;
+  f.mesh(new THREE.MeshBasicMaterial()); await renderer.renderAsync(scene, camera);
+  const depth = new THREE.DepthTexture(16, 16, stencil ? THREE.UnsignedInt248Type : THREE.UnsignedIntType);
+  if (stencil) depth.format = THREE.DepthStencilFormat;
+  t.after(() => depth.dispose());
+  const acquired = canvas.acquisitions;
+  assert.equal(renderer.getRenderTarget(), null);
+  assert.equal(renderer.currentSamples, 0, 'the presentation uses one sample independently of scene MSAA');
+  renderer.copyFramebufferToTexture(depth);
+  assert.equal(renderer.getRenderTarget(), null);
+  assert.equal(renderer._framebufferCopySamples, undefined);
+  const [copy] = copies(f.events); assert.ok(copy, 'prepared copies submit synchronously');
+  const producer = f.events.find(event => event.draws.some(draw => draw.indexed));
+  assert.equal(copy.source.texture, producer.desc.depthStencilAttachment.view.texture);
+  assert.equal(copy.source.texture.sampleCount, samples || 1);
+  assert.equal(copy.destination.texture.sampleCount, samples || 1);
+  assert.equal(copy.destination.texture.format, stencil ? 'depth24plus-stencil8' : 'depth24plus');
+  assert.equal(depth.type, stencil ? THREE.UnsignedInt248Type : THREE.UnsignedIntType);
+  assert.equal(canvas.acquisitions, acquired, 'scene depth copies never acquire the presentation texture');
+  await renderer.waitForGPU();
   assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
 });
 

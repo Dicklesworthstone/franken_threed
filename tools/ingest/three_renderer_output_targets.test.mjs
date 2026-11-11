@@ -8,7 +8,7 @@ import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const Renderer = createWebGPURendererClass(T);
-function fixture(t) {
+function fixture(t, options = {}) {
   const device = geometryDevice(); device.limits.maxTextureDimension2D = 8192; device.limits.maxBindingsPerBindGroup = 1000;
   device.limits.maxTextureArrayLayers = 256; device.limits.maxTextureDimension3D = 256;
   device.limits.maxColorAttachments = 8; device.limits.maxColorAttachmentBytesPerSample = 32;
@@ -27,9 +27,9 @@ function fixture(t) {
   let configured, acquired = 0;
   const canvas = {width: 64, height: 64, style: {}, getContext: () => ({
     configure(value) { configured = value; }, unconfigure() {},
-    getCurrentTexture() { acquired++; return device.createTexture({size: [64, 64], format: configured.format, usage: 16}); },
+    getCurrentTexture() { acquired++; return device.createTexture({size: [canvas.width, canvas.height], format: configured.format, usage: 16}); },
   })};
-  const renderer = new Renderer({canvas, device}); t.after(() => renderer.dispose());
+  const renderer = new Renderer({canvas, device, ...options}); t.after(() => renderer.dispose());
   const scene = new T.Scene(), camera = new T.PerspectiveCamera(50, 1, .1, 30); camera.position.z = 4;
   const material = new T.MeshBasicNodeMaterial(); material.colorNode = T.TSL.vec3(.125, .375, .625);
   scene.add(new T.Mesh(new T.PlaneGeometry(), material));
@@ -210,22 +210,240 @@ test('RenderPipeline applies a registered operator to canvas after registration 
   assert.equal(f.renderer.toneMapping, T.CustomToneMapping); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('registered native operators never enter the fixed canvas pass, including clear and compile', async t => {
+for (const mapping of [T.CustomToneMapping, 42])
+test(`registered native canvas operator ${mapping} compiles and submits the unchanged source output graph`, async t => {
+  const depth = mapping === T.CustomToneMapping;
+  const f = fixture(t, {antialias: true, depth}); registeredToneMapping(f.renderer, mapping);
+  f.renderer.toneMapping = mapping; await f.renderer.init();
+  f.renderer._frameBufferTargets ??= new Map();
+  const internal = T.Renderer.prototype._getFrameBufferTarget.call(f.renderer);
+  const quad = f.renderer._outputQuad(internal);
+  const warmup = new T.WGSLNodeBuilder(quad, f.renderer);
+  warmup.scene = quad; warmup.camera = quad.camera; warmup.build();
+  await f.renderer.compileAsync(f.scene, f.camera);
+  const source = new T.WGSLNodeBuilder(quad, f.renderer);
+  source.scene = quad; source.camera = quad.camera; source.build();
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.acquired(), 0);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.getOutputRenderTarget(), null);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const draws = nativeDraws(f.device), passes = drawPasses(f.device);
+  assert.equal(draws.length, 2); assert.equal(f.acquired(), 1);
+  assert.equal(draws[1].pipeline.vertex.module.code, source.vertexShader);
+  assert.equal(code(draws[1]), source.fragmentShader);
+  assert.match(code(draws[1]), /registeredToneMapping/); assert.match(code(draws[1]), /sRGBTransferOETF/);
+  assert.equal(draws[1].pipeline.fragment.targets[0].format, 'bgra8unorm');
+  assert.equal(draws[1].pipeline.multisample.count, 1);
+  // Source output is single-sample but retains the optional canvas depth
+  // attachment and NodeMaterial's default depth test/write with autoClear=false.
+  if (depth) {
+    assert.equal(passes[1].desc.depthStencilAttachment.view.texture.sampleCount, 1);
+    assert.equal(passes[1].desc.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(draws[1].pipeline.depthStencil.depthWriteEnabled, true);
+    assert.equal(draws[1].pipeline.depthStencil.depthCompare, 'less-equal');
+  } else {
+    assert.equal(passes[1].desc.depthStencilAttachment, undefined);
+    assert.equal(draws[1].pipeline.depthStencil, undefined);
+  }
+  const resolved = passes[0].desc.colorAttachments[0].resolveTarget ?? passes[0].desc.colorAttachments[0].view;
+  assert.ok([...draws[1].groups.values()].some(({group}) => group.entries.some(entry => entry.resource?.texture === resolved.texture)));
+  assert.equal(f.renderer.toneMapping, mapping); assert.equal(f.renderer.outputColorSpace, T.SRGBColorSpace);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('queued native canvas operators retain their accepted exposures and graph uniforms', async t => {
+  const f = fixture(t), gain = T.TSL.uniform(.25).setName('canvasGain');
+  registeredToneMapping(f.renderer, T.CustomToneMapping, 'canvasFirst', gain);
+  registeredToneMapping(f.renderer, 42, 'canvasSecond', gain);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .625;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  gain.value = .75; f.renderer.toneMapping = 42; f.renderer.toneMappingExposure = 1.375;
+  f.renderer.render(f.scene, f.camera); gain.value = .9375; f.renderer.toneMappingExposure = 3.25;
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, 4); assert.equal(f.acquired(), 2);
+  assert.match(code(draws[1]), /canvasFirst/); assert.match(code(draws[3]), /canvasSecond/);
+  assert.ok(uniformWords(draws[1]).includes(.625)); assert.ok(uniformWords(draws[1]).includes(.25));
+  assert.ok(uniformWords(draws[3]).includes(1.375)); assert.ok(uniformWords(draws[3]).includes(.75));
+  assert.equal(f.renderer.toneMappingExposure, 3.25); assert.equal(gain.value, .9375);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('pre-init native canvas output retains each accepted exposure through asynchronous preparation', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .375;
+  const first = f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.toneMappingExposure = 1.875; const second = f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.toneMappingExposure = 3.5; await Promise.all([first, second]);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, 4); assert.equal(f.acquired(), 2);
+  assert.ok(uniformWords(draws[1]).includes(.375)); assert.ok(uniformWords(draws[3]).includes(1.875));
+  assert.equal(f.renderer.toneMappingExposure, 3.5); assert.equal(f.renderer.getRenderTarget(), null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native canvas transform changes preserve linear color, depth and stencil history plus source graph identity', async t => {
+  const f = fixture(t, {antialias: true, stencil: true}), builds = [];
+  const operator = (name, bias) => T.TSL.Fn(([color, exposure]) => {
+    builds.push(name); return color.mul(exposure).add(bias);
+  }).setLayout({name, type: 'vec3', inputs: [{name: 'color', type: 'vec3'}, {name: 'exposure', type: 'float'}]});
+  f.renderer.library.addToneMapping(operator('canvasOriginal', .125), T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  const internal = f.renderer._frameBufferTargets.get(f.renderer.getCanvasTarget());
+  const cache = f.renderer._outputQuads.get(internal);
+  f.renderer.autoClear = false;
+  f.renderer.library.toneMappingNodes.set(T.CustomToneMapping, operator('canvasReplacement', .875));
+  f.renderer.render(f.scene, f.camera);
+  f.renderer.toneMapping = T.ReinhardToneMapping; f.renderer.render(f.scene, f.camera);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.render(f.scene, f.camera);
+  assert.equal(cache.records.size, 3, 'queued graph generations keep independent leases');
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device), passes = drawPasses(f.device);
+  assert.equal(draws.length, 8); assert.equal(f.acquired(), 4);
+  assert.match(code(draws[1]), /canvasOriginal/); assert.match(code(draws[3]), /canvasOriginal/);
+  assert.match(code(draws[5]), /reinhardToneMapping/); assert.match(code(draws[7]), /canvasReplacement/);
+  assert.deepEqual(builds, ['canvasOriginal', 'canvasReplacement']);
+  const history = passes[0].desc.colorAttachments[0], depth = passes[0].desc.depthStencilAttachment.view.texture;
+  for (const index of [2, 4, 6]) {
+    const pass = passes[index].desc, color = pass.colorAttachments[0];
+    assert.equal(color.view.texture, history.view.texture);
+    assert.equal(color.resolveTarget.texture, history.resolveTarget.texture);
+    assert.equal(pass.depthStencilAttachment.view.texture, depth);
+    assert.equal(color.loadOp, 'load');
+    assert.equal(pass.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(pass.depthStencilAttachment.stencilLoadOp, 'load');
+  }
+  assert.equal(cache.records.size, 1); assert.equal(cache.quads.size, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.renderer.getRenderTarget(), null);
+});
+
+test('temporarily disabling native canvas conversion retains the private target for later accumulated frames', async t => {
   const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
   f.renderer.toneMapping = T.CustomToneMapping; await f.renderer.init();
-  const before = f.device.submissions.length;
-  assert.throws(() => f.renderer.render(f.scene, f.camera), /requires an output render target or a RenderPipeline/);
-  assert.throws(() => f.renderer.clear(), /requires an output render target or a RenderPipeline/);
-  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /requires an output render target or a RenderPipeline/);
-  assert.equal(f.device.submissions.length, before); assert.equal(f.acquired(), 0);
-  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const first = drawPasses(f.device)[0].desc, internal = f.renderer._frameBufferTargets.get(f.renderer.getCanvasTarget());
+  f.renderer.autoClear = false; f.renderer.toneMapping = T.NoToneMapping; f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.notEqual(first.colorAttachments[0].view.texture.destroyed, true);
+  assert.notEqual(first.depthStencilAttachment.view.texture.destroyed, true);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.outputColorSpace = T.SRGBColorSpace;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const passes = drawPasses(f.device), resumed = passes[3].desc;
+  assert.equal(passes.length, 5); assert.equal(f.acquired(), 3);
+  assert.equal(f.renderer._frameBufferTargets.get(f.renderer.getCanvasTarget()), internal);
+  assert.equal(resumed.colorAttachments[0].view.texture, first.colorAttachments[0].view.texture);
+  assert.equal(resumed.depthStencilAttachment.view.texture, first.depthStencilAttachment.view.texture);
+  assert.equal(resumed.colorAttachments[0].loadOp, 'load');
+  assert.equal(resumed.depthStencilAttachment.depthLoadOp, 'load');
+});
+
+test('changing a native output graph retires its owning canvas bridge while another canvas is active', async t => {
+  const f = fixture(t), mainTarget = f.renderer.getCanvasTarget();
+  registeredToneMapping(f.renderer, T.CustomToneMapping, 'canvasOriginal');
+  registeredToneMapping(f.renderer, 42, 'canvasReplacement');
+  f.renderer.toneMapping = T.CustomToneMapping;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const mainDispatcher = f.renderer._dispatcher, mainSession = f.renderer._session;
+  const mainCache = f.renderer._outputQuads.get(f.renderer._frameBufferTargets.get(mainTarget));
+  const original = [...mainCache.records][0];
+  assert.ok(mainDispatcher.entry(original.quad));
+  let configured;
+  const canvas = {width: 32, height: 24, style: {}, getContext: () => ({
+    configure(value) { configured = value; }, unconfigure() {},
+    getCurrentTexture() { return f.device.createTexture({size: [canvas.width, canvas.height], format: configured.format, usage: 16}); },
+  })};
+  const preview = new T.CanvasTarget(canvas); t.after(() => preview.dispose());
+  f.renderer.setCanvasTarget(preview); await f.renderer.renderAsync(f.scene, f.camera);
+  const previewDispatcher = f.renderer._dispatcher;
+  const previewCache = f.renderer._outputQuads.get(f.renderer._frameBufferTargets.get(preview));
+  const previewRecord = [...previewCache.records][0];
+  assert.notEqual(previewDispatcher, mainDispatcher); assert.ok(previewDispatcher.entry(previewRecord.quad));
+  f.renderer.setCanvasTarget(mainTarget);
+  assert.equal(f.renderer._dispatcher, previewDispatcher, 'public canvas selection does not activate a native session');
+  f.renderer.toneMapping = 42; f.renderer.render(f.scene, f.camera);
+  assert.equal(mainDispatcher.entry(original.quad), null, 'capture retires the bridge from its actual owning canvas');
+  assert.ok(previewDispatcher.entry(previewRecord.quad), 'the other canvas keeps its current graph');
+  assert.equal(f.renderer._outputQuadLeases.has(original.quad), false);
+  await drain(f.renderer);
+  assert.equal(f.renderer._dispatcher, mainDispatcher); assert.equal(f.renderer._session, mainSession);
+  assert.equal(mainDispatcher.diagnostics.scenes, 1); assert.equal(previewDispatcher.diagnostics.scenes, 1);
+  assert.equal(mainCache.records.size, 1); assert.equal(previewCache.records.size, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const alpha of [false, true])
+test(`native canvas clear transforms signed linear colors with source alpha semantics (alpha=${alpha})`, async t => {
+  const f = fixture(t, {alpha, stencil: true}); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.setClearColor(new T.Color(-.25, .5, 2), .25);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.acquired(), 0); assert.equal(f.device.submissions.length, 0);
+  f.renderer.clear(); await drain(f.renderer);
+  const clear = f.device.passes[0].desc;
+  assert.deepEqual(clear.colorAttachments[0].clearValue,
+    alpha ? {r: -.0625, g: .125, b: .5, a: .25} : {r: -.25, g: .5, b: 2, a: .25});
+  assert.equal(nativeDraws(f.device).length, 1); assert.equal(f.acquired(), 1);
+  f.renderer.clearDepth(); await drain(f.renderer);
+  const depthOnly = f.device.passes.at(-2).desc;
+  assert.equal(depthOnly.colorAttachments[0].loadOp, 'load');
+  assert.equal(depthOnly.depthStencilAttachment.depthLoadOp, 'clear');
+  assert.equal(depthOnly.depthStencilAttachment.stencilLoadOp, 'load');
+  assert.equal(nativeDraws(f.device).length, 2); assert.equal(f.acquired(), 2);
+  f.renderer.setClearColor(0x13579b, .25);
+  f.renderer.setRenderTarget(f.target); f.renderer.clear(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 2); assert.equal(f.acquired(), 2);
+  assert.equal(f.renderer.getRenderTarget(), f.target); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native canvas source graph and scene callbacks observe truthful output and private target state', async t => {
+  const f = fixture(t, {antialias: true}), graphs = [], callbacks = [];
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .625;
+  const state = () => ({target: f.renderer.getRenderTarget(), output: f.renderer.getOutputRenderTarget(),
+    tone: f.renderer.toneMapping, currentTone: f.renderer.currentToneMapping, exposure: f.renderer.toneMappingExposure,
+    space: f.renderer.outputColorSpace, currentSpace: f.renderer.currentColorSpace, samples: f.renderer.currentSamples});
+  f.renderer.library.addToneMapping(T.TSL.Fn(([color, exposure]) => {
+    graphs.push(state()); return color.mul(exposure);
+  }).setLayout({name: 'canvasTruthfulState', type: 'vec3', inputs: [{name: 'color', type: 'vec3'}, {name: 'exposure', type: 'float'}]}), T.CustomToneMapping);
+  f.scene.onBeforeRender = (renderer, scene, camera, target) => callbacks.push({phase: 'before', argument: target, ...state()});
+  f.scene.onAfterRender = (renderer, scene, camera, target) => callbacks.push({phase: 'after', argument: target, ...state()});
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  const internal = f.renderer._frameBufferTargets.get(f.renderer.getCanvasTarget());
+  assert.deepEqual(graphs, [{target: null, output: null, tone: T.CustomToneMapping,
+    currentTone: T.CustomToneMapping, exposure: .625, space: T.SRGBColorSpace, currentSpace: T.SRGBColorSpace, samples: 0}]);
+  assert.equal(callbacks.length, 1); assert.equal(callbacks[0].phase, 'before');
+  assert.equal(callbacks[0].target, null); assert.equal(callbacks[0].argument, internal);
+  callbacks.length = 0;
+  await f.renderer.renderAsync(f.scene, f.camera);
+  assert.deepEqual(callbacks.map(value => value.phase), ['before', 'after']);
+  assert.equal(callbacks[0].target, internal); assert.equal(callbacks[0].argument, internal);
+  assert.equal(callbacks[0].tone, T.CustomToneMapping); assert.equal(callbacks[0].currentTone, T.NoToneMapping);
+  assert.equal(callbacks[0].space, T.SRGBColorSpace); assert.equal(callbacks[0].currentSpace, T.LinearSRGBColorSpace);
+  assert.equal(callbacks[1].target, null); assert.equal(callbacks[1].argument, internal);
+  assert.equal(callbacks[1].currentTone, T.CustomToneMapping); assert.equal(callbacks[1].currentSpace, T.SRGBColorSpace);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer.toneMappingExposure, .625);
+});
+
+test('accepted native canvas output survives removal of its live registered operator', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .625;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  f.renderer.library.toneMappingNodes.delete(T.CustomToneMapping); f.renderer.toneMappingExposure = 1.875;
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, 2); assert.equal(f.acquired(), 1);
+  assert.match(code(draws[1]), /registeredToneMapping/); assert.ok(uniformWords(draws[1]).includes(.625));
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('unregistered native operators retain explicit refusal without invoking custom library lookups', async t => {
   const f = fixture(t); f.renderer.toneMapping = T.CustomToneMapping;
   let calls = 0;
   f.renderer.library.getToneMappingFunction = () => { calls++; return () => T.TSL.vec3(1); };
-  await assert.rejects(f.renderer.init(), /has no admitted output pass/);
+  // Source initialization acquires the backend; output graphs are built only
+  // when used. Refuse unsupported library overrides at that same boundary.
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /has no admitted output pass/);
+  assert.throws(() => f.renderer.clear(), /has no admitted output pass/);
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /has no admitted output pass/);
   assert.equal(calls, 0); assert.equal(f.device.submissions.length, 0); assert.equal(f.acquired(), 0);
 });
 

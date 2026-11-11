@@ -75,14 +75,63 @@ function registerOutputSpaces(t) {
     T.ColorManagement.enabled = enabled; T.ColorManagement.workingColorSpace = working;
   });
 }
-const outputDraws = device => device.snapshots.flat().filter(draw => draw.pipeline.label?.startsWith('Animation HDR output'));
+const outputDraws = device => {
+  const pipelines = new Set(presented(device).flatMap(pass => pass.draws.map(draw => draw.pipeline)));
+  return device.snapshots.flat().filter(draw => pipelines.has(draw.pipeline));
+};
+function sampledSource(draw) {
+  const textures = [...draw.groups.values()].flatMap(({group}) => group.entries)
+    .map(entry => entry.resource?.texture).filter(Boolean);
+  assert.equal(textures.length, 1, 'the source output graph samples exactly one working image');
+  return textures[0];
+}
+// Reflect the pinned WGSL declaration rather than assuming an exposure buffer
+// binding or offset. Dynamic offsets also belong to the accepted GPU draw.
+function uniformValue(draw, code, owner, field, count = 1) {
+  const declaration = new RegExp(`@binding\\(\\s*(\\d+)\\s*\\)\\s*@group\\(\\s*(\\d+)\\s*\\)\\s*var<uniform> ${owner}\\s*:\\s*(\\w+)`).exec(code);
+  assert.ok(declaration, `source uniform block ${owner} is declared`);
+  const [, binding, groupIndex, type] = declaration;
+  const structure = new RegExp(`struct ${type}\\s*\\{([^}]*)\\}`).exec(code);
+  assert.ok(structure);
+  const layouts = {'f32': [4, 4], 'vec2<f32>': [8, 8], 'vec3<f32>': [16, 12],
+    'vec4<f32>': [16, 16], 'mat3x3<f32>': [16, 48], 'mat4x4<f32>': [16, 64]};
+  let offset = 0, found = false;
+  for (const declaration of structure[1].split(',').map(value => value.trim()).filter(Boolean)) {
+    const [name, memberType] = declaration.split(/\s*:\s*/);
+    assert.ok(layouts[memberType], `known source uniform type ${memberType}`);
+    const [alignment, size] = layouts[memberType];
+    offset = Math.ceil(offset / alignment) * alignment;
+    if (name === field) { assert.equal(size, count * 4); found = true; break; }
+    offset += size;
+  }
+  assert.ok(found, `source uniform field ${owner}.${field} is declared`);
+  const {group, offsets} = draw.groups.get(Number(groupIndex));
+  const resource = group.entries.find(entry => entry.binding === Number(binding)).resource;
+  const dynamic = group.layout.entries.filter(entry => entry.buffer?.hasDynamicOffset)
+    .sort((a, b) => a.binding - b.binding).findIndex(entry => entry.binding === Number(binding));
+  assert.ok(dynamic >= 0); assert.ok(offset + count * 4 <= resource.size);
+  const bytes = draw.contents.get(resource.buffer), data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const values = Array.from({length: count}, (_, i) => data.getFloat32((resource.offset ?? 0) + offsets[dynamic] + offset + i * 4, true));
+  return count === 1 ? values[0] : values;
+}
 function outputPacket(draw) {
   const code = draw.pipeline.fragment.module.code;
-  const resource = draw.groups.get(0).group.entries.find(entry => entry.binding === 1).resource;
-  const bytes = draw.contents.get(resource.buffer), data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const matrix = resource.size === 64 ? Array.from({length: 9}, (_, i) =>
-    data.getFloat32(16 + Math.floor(i / 3) * 16 + i % 3 * 4, true)) : null;
-  return {code, matrix, exposure: data.getFloat32(0, true), transfer: code.includes('color=linear_to_srgb(color);')};
+  assert.match(code, /^\/\/ Three\.js r186 - Node System/);
+  const main = code.slice(code.indexOf('@fragment'));
+  const conversion = /mat3x3<f32>\(\s*([^)]*)\)/.exec(main);
+  const matrix = conversion ? conversion[1].split(',').map(value => Math.fround(Number(value.trim()))) : null;
+  if (matrix) { assert.equal(matrix.length, 9); assert.ok(matrix.every(Number.isFinite)); }
+  const exposure = /reinhardToneMapping\(\s*\w+\.xyz,\s*(\w+)\.(\w+)\s*\)/.exec(main);
+  const resolution = /fragCoord\.xy\s*\/\s*(\w+)\.(\w+)/.exec(main);
+  assert.ok(resolution, 'the source output graph samples screenUV at the accepted output size');
+  return {code, matrix, exposure: exposure ? uniformValue(draw, code, exposure[1], exposure[2]) : null,
+    resolution: uniformValue(draw, code, resolution[1], resolution[2], 2),
+    transfer: /sRGBTransferOETF\(/.test(main)};
+}
+function assertSourceAlpha(code) {
+  assert.match(code, /color\.xyz \/ vec3<f32>\( color\.w \)/, 'source output unpremultiplies before conversion');
+  assert.match(code, /clamp\( \w+\.w, 0\.0, 1\.0 \)/, 'source output clamps alpha independently of signed RGB');
+  assert.match(code, /color\.xyz \* vec3<f32>\( color\.w \)/, 'source output premultiplies after conversion');
 }
 
 for (const [space, matrix, transfer] of [[DisplayP3ColorSpace, true, true],
@@ -93,7 +142,7 @@ test(`registered ${space} output retains the source conversion and default canva
   await r.init(); f.quad.render(r); await r.waitForGPU();
   const output = outputDraws(f.device); assert.equal(output.length, 1);
   const packet = outputPacket(output[0]);
-  assert.equal(packet.transfer, transfer); assert.match(packet.code, /var color=pixel.rgb;/);
+  assert.equal(packet.transfer, transfer); assertSourceAlpha(packet.code);
   assert.deepEqual(packet.matrix, matrix ? T.ColorManagement._getMatrix(new T.Matrix3(), T.LinearSRGBColorSpace, space).elements.map(Math.fround) : null);
   assert.equal(output[0].pipeline.fragment.targets[0].format, 'bgra8unorm');
   assert.equal(f.main.configuration.colorSpace, 'srgb', 'r186 leaves native canvas interpretation at its sRGB default');
@@ -155,22 +204,30 @@ test('registered clears and framebuffer copies keep linear storage across later 
   r.outputColorSpace = DisplayP3ColorSpace; f.quad.render(r); r.outputColorSpace = T.SRGBColorSpace;
   await r.waitForGPU();
   const output = outputDraws(f.device); assert.equal(output.length, 2);
-  const source = output[0].groups.get(0).group.entries.find(entry => entry.binding === 0).resource.texture;
+  const source = sampledSource(output[0]);
   const copy = f.events.find(event => event.copy); assert.equal(copy.source.texture, source);
   assert.equal(source.format, 'rgba16float'); assert.equal(source.canvasName, undefined);
+  const clear = f.device.passes.find(pass => pass.desc.colorAttachments[0].view.texture === source);
+  assert.deepEqual(clear.desc.colorAttachments[0].clearValue, {r: -.25, g: 2, b: .5, a: 1});
   assert.deepEqual(output.map(draw => outputPacket(draw).transfer), [false, true]);
   assert.equal(f.main.counts.acquire, 2, 'copying linear history does not acquire another presentation texture');
   assert.equal(f.main.counts.configure, 1);
 });
 
-test('disabled color management skips registered primary and transfer conversions for its accepted request', async t => {
+test('color management changes retain the pinned output graph until its transform key changes', async t => {
   registerOutputSpaces(t);
   const f = fixture(t), r = f.renderer; r.outputColorSpace = DisplayP3ColorSpace;
   T.ColorManagement.enabled = false; await r.init(); f.quad.render(r);
-  T.ColorManagement.enabled = true; f.quad.render(r); await r.waitForGPU();
-  const packets = outputDraws(f.device).map(outputPacket); assert.equal(packets.length, 2);
-  assert.deepEqual(packets.map(packet => packet.transfer), [false, true]);
-  assert.equal(packets[0].matrix, null); assert.notEqual(packets[1].matrix, null);
+  T.ColorManagement.enabled = true; f.quad.render(r);
+  // r186 NodeManager.getOutputCacheKey includes toneMapping/currentColorSpace,
+  // not ColorManagement.enabled. A changed output transform builds a new graph.
+  r.toneMapping = T.ReinhardToneMapping; f.quad.render(r); await r.waitForGPU();
+  const output = outputDraws(f.device), packets = output.map(outputPacket); assert.equal(packets.length, 3);
+  assert.equal(output[0].pipeline, output[1].pipeline);
+  assert.deepEqual(packets.map(packet => packet.transfer), [false, false, true]);
+  assert.deepEqual(packets.map(packet => packet.matrix !== null), [false, false, true]);
+  assert.deepEqual(packets[2].matrix, T.ColorManagement._getMatrix(new T.Matrix3(),
+    T.LinearSRGBColorSpace, DisplayP3ColorSpace).elements.map(Math.fround));
   assert.equal(f.main.counts.configure, 1);
 });
 
@@ -183,9 +240,17 @@ test('registered transforms remain independent for queued Inspector canvases and
   await r.waitForGPU();
   assert.deepEqual(presented(f.device).filter(pass => pass.draws.length).map(pass => pass.desc.colorAttachments[0].view.texture.canvasName), ['main', 'preview', 'main']);
   assert.deepEqual(outputDraws(f.device).map(draw => outputPacket(draw).transfer), [true, false, true]);
+  assert.deepEqual(outputDraws(f.device).map(draw => outputPacket(draw).resolution), [[64, 48], [32, 24], [64, 48]]);
   assert.equal(f.main.counts.configure, 1); assert.equal(f.preview.counts.configure, 1);
   assert.equal(r.getCanvasTarget(), f.mainTarget);
-  f.quad.render(r); assert.equal(r._drain, null, 'returning to a prepared profile does not rebuild its session');
+  const session = r._session, source = r._frameBufferTargets.get(f.mainTarget), pipelines = f.device.pipelines.length;
+  f.quad.render(r);
+  assert.equal(r._drain, null, 'prepared scene and output input variants submit without another preparation');
+  await r.waitForGPU();
+  assert.equal(r._session, session, 'returning to a prepared profile keeps its canvas session');
+  assert.equal(r._frameBufferTargets.get(f.mainTarget), source);
+  assert.equal(f.device.pipelines.length, pipelines, 'a prepared output graph retains its pipelines');
+  assert.equal(f.main.counts.configure, 1); assert.equal(f.preview.counts.configure, 1);
 });
 
 test('unregistered output and non-linear working spaces fail before native canvas allocation', async t => {
@@ -228,14 +293,17 @@ test('half-float output keeps queued color transfers and independent scene-buffe
   const output = presented(f.device).filter(pass => pass.draws.length);
   assert.equal(output.length, 3);
   assert.ok(output.every(pass => pass.desc.colorAttachments[0].view.texture.format === 'rgba16float'));
-  const shader = pass => pass.draws[0].pipeline.fragment.module.code;
-  assert.deepEqual(output.map(pass => shader(pass).includes('color=linear_to_srgb(color);')), [true, false, true]);
-  for (const pass of output) {
-    assert.match(shader(pass), /var color=pixel.rgb;/);
-    assert.match(shader(pass), /vec3<f32>\(0\.41666\)/);
-    assert.doesNotMatch(shader(pass), /color=srgb_to_linear\(color\);/);
-    const source = [...pass.draws[0].groups.values()].flatMap(({group}) => group.entries)
-      .map(entry => entry.resource?.texture).find(Boolean);
+  const packets = outputDraws(f.device).map(outputPacket);
+  assert.deepEqual(packets.map(packet => packet.transfer), [true, false, true]);
+  for (const [index, pass] of output.entries()) {
+    const packet = packets[index]; assertSourceAlpha(packet.code);
+    if (packet.transfer) {
+      assert.match(packet.code, /pow\( color, vec3<f32>\( 0\.41666 \) \)/);
+      for (const value of ['1.055', '0.055', '12.92', '0.0031308'])
+        assert.ok(packet.code.includes(`vec3<f32>( ${value} )`), `source sRGB transfer retains ${value}`);
+    } else assert.doesNotMatch(packet.code, /sRGBTransferOETF/);
+    assert.doesNotMatch(packet.code, /sRGBTransferEOTF/);
+    const source = sampledSource(pass.draws[0]);
     assert.equal(source.format, 'rgba8unorm', 'outputType does not replace outputBufferType');
     assert.equal(source.sampleCount, 1);
   }
@@ -367,6 +435,41 @@ test('direct CanvasTarget resize updates native storage before its next frame', 
   assert.equal(f.preview.counts.configure, 1); assert.equal(r.domElement, f.main.canvas);
 });
 
+test('queued converted canvas resizes retain accepted images across a zero-width request', async t => {
+  const f = fixture(t), r = f.renderer;
+  r.outputColorSpace = T.SRGBColorSpace; r.toneMapping = T.ReinhardToneMapping;
+  const submit = f.device.queue.submit;
+  let submittedOutputs = 0;
+  f.device.queue.submit = commands => {
+    for (const passes of commands) for (const pass of passes) {
+      if (!pass.desc?.colorAttachments[0].view.texture.canvasName) continue;
+      for (const draw of pass.draws) {
+        assert.notEqual(sampledSource(draw).destroyed, true, 'an accepted private image remains live through submission');
+        submittedOutputs++;
+      }
+    }
+    submit(commands);
+  };
+  await r.init(); f.quad.render(r);
+  r.setSize(0, 24); f.quad.render(r);
+  r.setSize(40, 30); f.quad.render(r);
+  assert.equal(f.main.counts.acquire, 0);
+  await r.waitForGPU();
+  const output = presented(f.device).filter(pass => pass.draws.length);
+  assert.equal(submittedOutputs, 2); assert.equal(f.main.counts.acquire, 2, 'the zero-width output never acquires a swapchain texture');
+  assert.deepEqual(output.map(pass => {
+    const image = pass.desc.colorAttachments[0].view.texture;
+    return [image.width, image.height];
+  }), [[64, 48], [40, 30]]);
+  assert.deepEqual(output.map(pass => {
+    const image = sampledSource(pass.draws[0]); return [image.width, image.height];
+  }), [[64, 48], [40, 30]]);
+  assert.deepEqual(outputDraws(f.device).map(draw => outputPacket(draw).resolution), [[64, 48], [40, 30]]);
+  assert.deepEqual(r.getSize(new T.Vector2()).toArray(), [40, 30]);
+  assert.deepEqual([f.main.canvas.width, f.main.canvas.height], [40, 30]);
+  assert.equal(r._nodeCaptureBytes, 0); assert.equal(r._pending.length, 0);
+});
+
 test('queued framebuffer copies retain each canvas producer after Viewer restores the main target', async t => {
   const f = fixture(t), r = f.renderer;
   await r.init();
@@ -427,7 +530,9 @@ test('failed final destination or canvas retention releases captured resources t
     for (const stage of ['destination', 'canvas']) {
       const rejection = new Error(stage + ' retention rejected');
       r._targets.retainGeneration = entry => {
-        assert.ok(r._nodeCaptureBytes > 0); assert.ok(r._materialCaptureValues > 0);
+        assert.ok(r._nodeCaptureBytes > 0);
+        assert.ok(captured.objects.has(f.quad)); assert.ok(captured.objects.has(fixed));
+        assert.equal(r._materialCaptureValues, 0, 'native packets already own both materials');
         if (stage === 'destination') throw rejection;
         const release = retainTarget(entry); targetLeases++;
         return () => { targetLeases--; release(); };

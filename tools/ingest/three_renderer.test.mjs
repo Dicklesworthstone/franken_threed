@@ -43,7 +43,8 @@ function recordingDevice() {
   d.queue.writeTexture = () => {};
   d.queue.copyExternalImageToTexture = () => {};
   d.createRenderPipeline = desc => ({...desc, getBindGroupLayout: () => ({})});
-  // Full-screen output passes draw without vertex streams; record them apart.
+  // Keep depthless presentation diagnostics separate, while using the real
+  // recording encoder for both vertex-index passes and source QuadMesh streams.
   d.outputPasses = [];
   d.canvasCopies = [];
   const encode = d.createCommandEncoder;
@@ -58,9 +59,18 @@ function recordingDevice() {
         const pass = e.beginRenderPass(desc), record = d.passes.at(-1);
         return {...pass, setViewport(...v) { record.viewport = v; }, setScissorRect(...r) { record.scissor = r; }};
       }
+      const encoded = e.beginRenderPass(desc); d.passes.pop();
       const pass = {desc, draws: []}; d.outputPasses.push(pass);
-      return {setPipeline(pipeline) { pass.pipeline = pipeline; }, setBindGroup(index, group) { pass.group = group; },
-        draw(n) { pass.draws.push(n); }, end() {}};
+      return {...encoded,
+        setPipeline(pipeline) { pass.pipeline = pipeline; encoded.setPipeline(pipeline); },
+        setBindGroup(index, group, offsets) { pass.group = group; encoded.setBindGroup(index, group, offsets); },
+        draw(...args) { pass.draws.push(args[0]); encoded.draw(...args); },
+        drawIndexed(...args) { pass.draws.push(args[0]); encoded.drawIndexed(...args); },
+        executeBundles(bundles) {
+          pass.draws.push(...bundles.flatMap(bundle => bundle.draws.map(draw => draw.args[0])));
+          encoded.executeBundles(bundles);
+        },
+      };
     }};
   };
   return d;
@@ -71,7 +81,8 @@ async function create(parameters = {}) {
   return {renderer, device, ...c};
 }
 const flush = async renderer => { while (renderer._drain) await renderer._drain; };
-const passes = d => d.passes;
+const privatePasses = d => d.passes.filter(pass => !pass.desc.colorAttachments[0]?.view?.texture?.swapchain);
+const canvasPasses = d => d.passes.filter(pass => pass.desc.colorAttachments[0]?.view?.texture?.swapchain);
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -126,7 +137,7 @@ test('ordinary first frame: render defers to preparation without presenting an e
   const f = sceneFixture();
   renderer.render(f.scene, f.camera);
   assert.equal(acquired(), 0, 'no swapchain texture is acquired before the scene is prepared');
-  assert.equal(renderer.info.f3d.deferredRenders, 1);
+  assert.equal(renderer.info.f3d.deferredRenders, 2, 'source scene and output graph prepare independently');
   await flush(renderer);
   assert.equal(acquired(), 1); assert.equal(renderer.info.f3d.presentedRenders, 1);
   assert.equal(device.submissions.length > 0, true);
@@ -136,13 +147,14 @@ test('ordinary first frame: render defers to preparation without presenting an e
     renderer.info.reset(); // These synchronous calls occur in the same host frame.
     renderer.render(f.scene, f.camera);
   }
-  assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 1);
-  assert.equal(renderer.info.render.drawCalls, 1);
-  const pass = passes(device).at(-1).desc;
+  assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 2);
+  assert.equal(renderer.info.render.drawCalls, 2, 'source statistics include the output quad');
+  const pass = privatePasses(device).at(-1).desc;
   // Default alpha:true clears with the premultiplied transparent clear color.
   assert.deepEqual(pass.colorAttachments[0].clearValue, {r: 0, g: 0, b: 0, a: 0});
   assert.equal(pass.colorAttachments[0].loadOp, 'clear');
-  assert.ok(pass.colorAttachments[0].resolveTarget, 'antialias resolves into the presentation view');
+  assert.ok(pass.colorAttachments[0].resolveTarget, 'antialias resolves into the linear input of the output graph');
+  assert.equal(canvasPasses(device).at(-1).desc.colorAttachments[0].loadOp, 'load');
   await renderer.waitForGPU(); renderer.dispose();
   assert.ok(calls.some(c => c[0] === 'unconfigure'));
 });
@@ -373,10 +385,11 @@ test('initialization disposal retires a late owned device once without publishin
 
 test('initialization failure releases its canvas and owned device while preserving a borrowed device', async t => {
   for (const borrowed of [false, true]) {
-    const c = canvasFixture(), device = recordingDevice(), failure = new Error('output pipeline rejected');
+    const c = canvasFixture(), device = recordingDevice(), failure = new Error('canvas configuration rejected');
     let destroyed = 0, requests = 0;
     device.destroy = () => { destroyed++; };
-    device.createRenderPipelineAsync = async () => { throw failure; };
+    const context = c.canvas.getContext(), configure = context.configure;
+    context.configure = descriptor => { configure(descriptor); throw failure; };
     const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: async () => ({
       requestDevice: async () => { requests++; return device; },
     })}});
@@ -398,18 +411,23 @@ test('initialization failure releases its canvas and owned device while preservi
   }
 });
 
-test('initialization disposal aborts pending output preparation and cannot unconfigure a replacement', async t => {
+test('initialization disposal aborts pending canvas validation and cannot unconfigure a replacement', async t => {
   for (const borrowed of [false, true]) {
-    const c = canvasFixture(), device = recordingDevice(), pipeline = deferred(), started = deferred();
+    const c = canvasFixture(), device = recordingDevice(), validation = deferred(), started = deferred();
     let destroyed = 0, rejected;
     device.destroy = () => { destroyed++; };
-    device.createRenderPipelineAsync = descriptor => { started.resolve(descriptor); return pipeline.promise; };
+    const pop = device.popErrorScope.bind(device); let held = false;
+    device.popErrorScope = () => {
+      const result = pop();
+      if (!held) { held = true; started.resolve(); return validation.promise; }
+      return result;
+    };
     const Renderer = createWebGPURendererClass(T, {gpu: {requestAdapter: async () => ({requestDevice: async () => device})}});
     const renderer = new Renderer({canvas: c.canvas, ...(borrowed ? {device} : {})});
     t.after(() => renderer.dispose());
     const init = renderer.init();
     init.catch(error => { rejected = error; });
-    const descriptor = await started.promise;
+    await started.promise;
     renderer.dispose();
     await hostTurn();
     const stopped = rejected, unconfigured = c.calls.filter(call => call[0] === 'unconfigure').length;
@@ -418,10 +436,10 @@ test('initialization disposal aborts pending output preparation and cannot uncon
     let replacementError;
     try { await replacement.init(); }
     catch (error) { replacementError = error; }
-    finally { pipeline.resolve(descriptor); }
+    finally { validation.resolve(null); }
     await assert.rejects(init, {code: 'F3D_RENDERER_DISPOSED'});
     await hostTurn();
-    assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal settles init before native compilation');
+    assert.equal(stopped?.code, 'F3D_RENDERER_DISPOSED', 'disposal settles init before canvas validation');
     assert.equal(unconfigured, 1, 'the pending session relinquishes its canvas promptly');
     assert.equal(destroyed, borrowed ? 0 : 1);
     assert.equal(renderer._session, null);
@@ -429,7 +447,7 @@ test('initialization disposal aborts pending output preparation and cannot uncon
     assert.equal(renderer.info.frame, 0);
     assert.ok(device.textures.every(texture => texture.destroyed));
     assert.ok(device.buffers.every(buffer => buffer.destroyed));
-    assert.equal(replacementError, undefined, 'the new owner initializes before the old pipeline resolves');
+    assert.equal(replacementError, undefined, 'the new owner initializes before the old validation resolves');
     assert.equal(c.calls.filter(call => call[0] === 'unconfigure').length, unconfigured);
     assert.equal(replacement.initialized, true);
     replacement.dispose();
@@ -495,8 +513,12 @@ test('device loss during initialization reaches the application before failed-se
   const native = deviceEventsFixture(), gate = deferred(), started = deferred(), c = canvasFixture();
   const renderer = new WebGPURenderer({canvas: c.canvas, device: native.device}), losses = [];
   renderer.onDeviceLost = info => losses.push(info);
-  const pipeline = native.device.createRenderPipelineAsync.bind(native.device);
-  native.device.createRenderPipelineAsync = async descriptor => { started.resolve(); await gate.promise; return pipeline(descriptor); };
+  const pop = native.device.popErrorScope.bind(native.device); let held = false;
+  native.device.popErrorScope = () => {
+    const result = pop();
+    if (!held) { held = true; started.resolve(); return gate.promise; }
+    return result;
+  };
   t.after(() => { gate.resolve(); renderer.dispose(); });
   const init = renderer.init(); init.catch(() => {}); await started.promise;
   const info = {reason: 'unknown', message: 'GPU reset during initialization'};
@@ -532,14 +554,14 @@ test('clear color state, scene background and autoClear map to source clear sema
   renderer.setClearColor(0xff0000, 0.5);
   renderer.render(f.scene, f.camera);
   const red = new T.Color(0xff0000);
-  assert.deepEqual(passes(device).at(-1).desc.colorAttachments[0].clearValue, {r: red.r, g: red.g, b: red.b, a: 1});
+  assert.deepEqual(privatePasses(device).at(-1).desc.colorAttachments[0].clearValue, {r: red.r, g: red.g, b: red.b, a: .5});
   f.scene.background = new T.Color(0x00ff00);
   renderer.render(f.scene, f.camera);
   const green = new T.Color(0x00ff00);
-  assert.deepEqual(passes(device).at(-1).desc.colorAttachments[0].clearValue, {r: green.r, g: green.g, b: green.b, a: 1});
+  assert.deepEqual(privatePasses(device).at(-1).desc.colorAttachments[0].clearValue, {r: green.r, g: green.g, b: green.b, a: 1});
   f.scene.background = null; renderer.autoClear = false;
   renderer.render(f.scene, f.camera);
-  const last = passes(device).at(-1).desc;
+  const last = privatePasses(device).at(-1).desc;
   assert.equal(last.colorAttachments[0].loadOp, 'load'); assert.equal(last.depthStencilAttachment.depthLoadOp, 'load');
   assert.equal(renderer.info.f3d.deferredRenders, 0, 'compileAsync prepared ahead of the first frame');
   renderer.dispose();
@@ -556,12 +578,12 @@ test('structural edits defer only the affected frames and preserve application c
   renderer.render(f.scene, f.camera);
   assert.equal(acquired(), 1, 'a frame needing preparation does not present');
   renderer.render(f.scene, f.camera); // Both calls remain observable, including callbacks and target dependencies.
-  assert.equal(renderer.info.f3d.deferredRenders, 2);
+  assert.equal(renderer.info.f3d.deferredRenders, 4, 'each accepted frame retains its scene and output requests');
   renderer.info.reset();
   await flush(renderer);
-  assert.equal(acquired(), 3); assert.equal(renderer.info.render.drawCalls, 4);
+  assert.equal(acquired(), 3); assert.equal(renderer.info.render.drawCalls, 6);
   renderer.render(f.scene, f.camera);
-  assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 2);
+  assert.equal(acquired(), 4); assert.equal(renderer.info.f3d.deferredRenders, 4);
   renderer.dispose();
 });
 
@@ -569,12 +591,13 @@ test('feature profile changes rebuild the scene owner at the preparation boundar
   const {renderer, acquired} = await create();
   const f = sceneFixture();
   await renderer.compileAsync(f.scene, f.camera);
-  const before = renderer._dispatcher.entry(f.scene).bridge;
+  const target = renderer._frameBufferTargets.get(renderer.getCanvasTarget()), destination = renderer._targets.capture(target);
+  const before = destination._dispatcher.entry(f.scene).bridge;
   f.scene.fog = new T.Fog(0x000000, 1, 10);
   renderer.render(f.scene, f.camera);
   assert.equal(acquired(), 0);
   await flush(renderer);
-  const after = renderer._dispatcher.entry(f.scene).bridge;
+  const after = destination._dispatcher.entry(f.scene).bridge;
   assert.notEqual(after, before); assert.equal(before.disposed, true); assert.equal(acquired(), 1);
   renderer.dispose();
 });
@@ -594,19 +617,20 @@ test('unsupported source content surfaces as an explicit error instead of a sile
   renderer.dispose();
 });
 
-test('tone mapping selects the HDR output pass at initialization', async () => {
+test('tone mapping compiles the source output graph over the linear scene target', async () => {
   const {renderer, device} = await create();
   renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.5;
   const f = sceneFixture();
   f.scene.background = new T.Color(0x202020);
   await renderer.compileAsync(f.scene, f.camera);
   renderer.render(f.scene, f.camera);
-  assert.equal(device.outputPasses.length, 1, 'whole-image output pass');
-  assert.ok(!device.passes.at(-1).desc.colorAttachments[0].view.texture?.swapchain, 'scene renders offscreen');
+  assert.equal(canvasPasses(device).length, 1, 'whole-image source output pass');
+  assert.match(canvasPasses(device)[0].draws[0].pipeline.fragment.module.code, /acesFilmicToneMapping/);
+  assert.ok(!privatePasses(device).at(-1).desc.colorAttachments[0].view.texture?.swapchain, 'scene renders offscreen');
   // Default alpha:true: the transparent clear reaches a premultiplied output pass.
   f.scene.background = null;
   renderer.render(f.scene, f.camera);
-  assert.deepEqual(device.passes.at(-1).desc.colorAttachments[0].clearValue, {r: 0, g: 0, b: 0, a: 0});
+  assert.deepEqual(privatePasses(device).at(-1).desc.colorAttachments[0].clearValue, {r: 0, g: 0, b: 0, a: 0});
   renderer.dispose();
 });
 
@@ -616,16 +640,17 @@ test('tone mapping can change after init: the output path is rebuilt on the same
   const f = sceneFixture();
   await renderer.compileAsync(f.scene, f.camera);
   renderer.render(f.scene, f.camera);
-  assert.equal(device.outputPasses.length, 0);
+  const outputs = () => canvasPasses(device).filter(pass => pass.draws.some(draw => /agxToneMapping/.test(draw.pipeline.fragment.module.code)));
+  assert.equal(outputs().length, 0);
   renderer.toneMapping = T.AgXToneMapping;
   renderer.render(f.scene, f.camera);
   await flush(renderer);
-  assert.equal(device.outputPasses.length, 1, 'deferred frame presented through the output pass');
+  assert.equal(outputs().length, 1, 'deferred frame presented through the source output pass');
   renderer.toneMapping = T.NoToneMapping;
   renderer.render(f.scene, f.camera);
   await flush(renderer);
   renderer.render(f.scene, f.camera);
-  assert.equal(device.outputPasses.length, 1, 'direct path again');
+  assert.equal(outputs().length, 1, 'direct path again');
   renderer.dispose();
 });
 
@@ -648,7 +673,7 @@ test('viewport, scissor and clear() follow source CanvasTarget semantics', async
   renderer.setClearColor(0x00ff00, 1);
   renderer.clear();
   await flush(renderer);
-  const clearPass = device.passes.at(-1).desc;
+  const clearPass = privatePasses(device).at(-1).desc;
   assert.equal(clearPass.colorAttachments[0].loadOp, 'clear');
   assert.equal(renderer.getMaxAnisotropy(), 16);
   renderer.dispose();
@@ -731,11 +756,11 @@ test('native animation waits for cold submission and resumes before GPU completi
   };
   await renderer.setAnimationLoop(time => { frames.push(time); renderer.render(f.scene, f.camera); });
   host.step(16); await started;
-  assert.equal(renderer._pending.length, 1); assert.equal(acquired(), 0);
+  assert.equal(renderer._pending.length, 2); assert.equal(acquired(), 0);
   host.step(32);
   assert.equal(host.scheduled.size, 0, 'preparation suspends admission of further animation frames');
   assert.deepEqual(frames, [16]); assert.equal(renderer.info.frame, 2);
-  assert.equal(renderer._pending.length, 1, 'the accepted draw remains in its original FIFO slot');
+  assert.equal(renderer._pending.length, 2, 'the accepted scene and output remain in their original FIFO slots');
   await renderer.setAnimationLoop(time => { frames.push(time * 10); renderer.render(f.scene, f.camera); });
   releasePipeline(); await flush(renderer);
   assert.equal(acquired(), 1, 'the accepted cold frame is submitted before resuming');
@@ -1144,19 +1169,19 @@ for (const antialias of [false, true]) test(`canvas stencil supports native mate
   try {
     await renderer.compileAsync(f.scene, f.camera); renderer.setClearStencil(5);
     renderer.render(f.scene, f.camera);
-    const first = device.passes.at(-1);
+    const first = privatePasses(device).at(-1);
     assert.equal(first.desc.depthStencilAttachment.view.attachment.format, 'depth24plus-stencil8');
     assert.equal(first.desc.depthStencilAttachment.view.attachment.sampleCount, antialias ? 4 : 1);
     assert.equal(first.desc.depthStencilAttachment.stencilLoadOp, 'clear');
     assert.equal(first.desc.depthStencilAttachment.stencilClearValue, 5);
     assert.equal(first.draws[0].stencilReference, 5);
     renderer.autoClearStencil = false; renderer.render(f.scene, f.camera);
-    const preserved = device.passes.at(-1).desc;
+    const preserved = privatePasses(device).at(-1).desc;
     assert.equal(preserved.colorAttachments[0].loadOp, 'clear');
     assert.equal(preserved.depthStencilAttachment.depthLoadOp, 'clear');
     assert.equal(preserved.depthStencilAttachment.stencilLoadOp, 'load');
     renderer.autoClear = false; renderer.autoClearStencil = true; renderer.render(f.scene, f.camera);
-    const loaded = device.passes.at(-1).desc;
+    const loaded = privatePasses(device).at(-1).desc;
     assert.equal(loaded.colorAttachments[0].loadOp, 'load');
     assert.equal(loaded.depthStencilAttachment.depthLoadOp, 'load');
     assert.equal(loaded.depthStencilAttachment.stencilLoadOp, 'load');
@@ -1173,13 +1198,13 @@ test('manual clear methods independently preserve color, depth and stencil', asy
       ['clearColorAsync', ['clear', 'load', 'load']], ['clearDepthAsync', ['load', 'clear', 'load']],
       ['clearAsync', ['clear', 'clear', 'clear']]]) {
       await renderer[method](); await flush(renderer);
-      const pass = device.passes.at(-1).desc;
+      const pass = privatePasses(device).at(-1).desc;
       assert.deepEqual([pass.colorAttachments[0].loadOp, pass.depthStencilAttachment.depthLoadOp,
         pass.depthStencilAttachment.stencilLoadOp], expected);
       if (expected[2] === 'clear') assert.equal(pass.depthStencilAttachment.stencilClearValue, 31);
     }
     renderer.clear(true, true, false); await flush(renderer);
-    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilLoadOp, 'load');
+    assert.equal(privatePasses(device).at(-1).desc.depthStencilAttachment.stencilLoadOp, 'load');
     const before = device.submissions.length; renderer.clear(false, false, false);
     assert.equal(device.submissions.length, before);
   } finally { renderer.dispose(); }
@@ -1193,7 +1218,7 @@ for (const method of ['clearStencil', 'clearStencilAsync']) test(`queued ${metho
     renderer.setRenderTarget(b); renderer.setClearStencil(22); const second = renderer[method]();
     renderer.setRenderTarget(null); renderer.setClearStencil(33); const third = renderer[method]();
     renderer.setClearStencil(99); await Promise.all([first, second, third]); await flush(renderer);
-    const calls = device.passes.map(p => p.desc);
+    const calls = privatePasses(device).map(p => p.desc);
     assert.deepEqual(calls.map(p => p.depthStencilAttachment.stencilClearValue), [11, 22, 33]);
     assert.ok(calls.every(p => p.colorAttachments[0].loadOp === 'load' && p.depthStencilAttachment.depthLoadOp === 'load'));
     assert.notEqual(calls[0].depthStencilAttachment.view.attachment, calls[1].depthStencilAttachment.view.attachment);
@@ -1206,7 +1231,7 @@ test('scissored stencil clears use a bounded native clear draw and retain other 
   try {
     renderer.setScissor(4, 5, 20, 10); renderer.setScissorTest(true); renderer.setClearStencil(17);
     renderer.clearStencil(); await flush(renderer);
-    const clear = device.passes.at(-2), main = device.passes.at(-1);
+    const clear = privatePasses(device).at(-2), main = privatePasses(device).at(-1);
     assert.deepEqual(clear.scissor, [4, 5, 20, 10]);
     assert.equal(clear.desc.colorAttachments[0].loadOp, 'load');
     assert.equal(clear.desc.depthStencilAttachment.depthLoadOp, 'load');
@@ -1223,7 +1248,7 @@ test('stencil clear values preserve public state and ignore dormant attachment c
   const {renderer, device} = await create({stencil: true}); await renderer.init();
   try {
     renderer.setClearStencil(300); await renderer.clearStencilAsync();
-    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 44);
+    assert.equal(privatePasses(device).at(-1).desc.depthStencilAttachment.stencilClearValue, 44);
     assert.equal(renderer.getClearStencil(), 300);
     renderer.setClearStencil(-1); const effects = device.submissions.length;
     assert.throws(() => renderer.clearStencil(), {code: 'F3D_RENDERER_MATERIAL'});
@@ -1243,10 +1268,10 @@ test('clear initialization and asynchronous stencil completion follow the source
     assert.throws(() => renderer.clearStencil(), /clear\(\) called before the backend is initialized/);
     await assert.rejects(renderer.clearStencilAsync(), /clear\(\) called before the backend is initialized/);
     await renderer.clearAsync(false, false, true);
-    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilLoadOp, 'clear');
+    assert.equal(privatePasses(device).at(-1).desc.depthStencilAttachment.stencilLoadOp, 'clear');
     assert.equal(renderer._drain, null, 'the async clear resolves after its deferred submission');
     renderer.setClearStencil(12); await renderer.clearStencilAsync();
-    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 12);
+    assert.equal(privatePasses(device).at(-1).desc.depthStencilAttachment.stencilClearValue, 12);
   } finally { renderer.dispose(); }
 });
 
@@ -1259,6 +1284,6 @@ test('an asynchronous clear reports a preceding deferred failure before claiming
     await assert.rejects(renderer.clearStencilAsync(), /Unsupported source material/);
     assert.equal(device.submissions.length, submissions);
     renderer.setClearStencil(19); await renderer.clearStencilAsync();
-    assert.equal(device.passes.at(-1).desc.depthStencilAttachment.stencilClearValue, 19);
+    assert.equal(privatePasses(device).at(-1).desc.depthStencilAttachment.stencilClearValue, 19);
   } finally { renderer.dispose(); }
 });

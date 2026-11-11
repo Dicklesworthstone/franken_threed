@@ -21,6 +21,18 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     if (view.storageView) dropView(view.storageView);
     for (const generation of view.generations) drop(generation);
   };
+  function rememberView(view) {
+    const variants = view.state.variants, previous = variants.get(view.key);
+    if (previous && previous !== view) dropView(previous);
+    variants.delete(view.key); variants.set(view.key, view);
+    // One source geometry can serve several shader input selections, notably
+    // the shared QuadMesh geometry used by scene and output passes. Keep their
+    // immutable views warm without retaining unbounded layout/range variants.
+    while (variants.size > 8) {
+      const [key, oldest] = variants.entries().next().value;
+      variants.delete(key); dropView(oldest);
+    }
+  }
   function lease(view) {
     view.refs++; let released = false;
     return Object.freeze({geometry: view.geometry, bytes: view.bytes,
@@ -35,15 +47,17 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
             ? source : {...source, generation};
         });
         if (selected.every((source, index) => source === view.selected[index])) return null;
-        const latest = view.state.latest;
-        if (latest?.key === view.key && selected.every((source, index) =>
-          source.owner === latest.selected[index].owner && source.generation === latest.selected[index].generation)) return lease(latest);
+        const latest = view.state.variants.get(view.key);
+        if (latest && selected.every((source, index) =>
+          source.owner === latest.selected[index].owner && source.generation === latest.selected[index].generation)) {
+          rememberView(latest); return lease(latest);
+        }
         // Refresh only bytes already uploaded by another source draw. Retain
         // this accepted layout/range, without reading any live CPU attributes.
         const next = makeView(view.state, selected, view.geometry.drawRange,
           view.geometry.vertexCount, view.geometry.isInstancedBufferGeometry, view.key);
-        if (view.state.latest === view) {
-          view.state.latest = next; dropView(view);
+        if (latest === view || !latest && view.state.active) {
+          rememberView(next);
           return lease(next);
         }
         const result = lease(next); dropView(next); return result;
@@ -127,6 +141,14 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
         (record.version < source.owner.version || source.owner.usage === three.DynamicDrawUsage);
       if (source.upload) addedBytes += source.array.byteLength;
     }
+    // Cached alternatives must not pin superseded uploads against the byte
+    // budget. Accepted leases keep their own generations after cache eviction.
+    for (const source of unique.values()) if (source.upload && source.previous?.generation) {
+      for (const state of source.previous.geometries) for (const [key, view] of state.variants) {
+        if (!view.generations.has(source.previous.generation)) continue;
+        state.variants.delete(key); dropView(view);
+      }
+    }
     if (addedBytes > maxBytes - allocatedBytes) reject('LIMIT', 'Bundle geometry histories exceed their byte budget');
     // Validate and reserve the complete selection before consuming any ranges.
     for (const source of unique.values()) {
@@ -153,13 +175,15 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       let source = geometry;
       const seen = new Set();
       while (source.geometry && source.geometry !== source && !seen.has(source.geometry)) { seen.add(source); source = source.geometry; }
-      state = {source, owned: new Set(), latest: null};
+      state = {source, owned: new Set(), variants: new Map(), active: true};
       state.onDispose = () => {
         // r186 Geometries removes its first disposal listener but retains the
         // initialized record. Later uses upload missing residency without
         // rearming disposal, including uses through a newly compiled view.
         disposedSources.add(source);
-        if (state.latest) { dropView(state.latest); state.latest = null; }
+        state.active = false;
+        for (const view of state.variants.values()) dropView(view);
+        state.variants.clear();
         // Source disposal invalidates every current attribute, even one this
         // geometry never uploaded but another geometry shares. Inspect only
         // identities here; unused arrays must not acquire an upload history.
@@ -185,10 +209,13 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     const vertexCount = geometry.attributes.position?.count ?? geometry.vertexCount;
     const key = JSON.stringify([selection.map(source => [source.name, ...source.shape]), range.start, range.count,
       geometry.isInstancedBufferGeometry === true, vertexCount]);
-    if (state.latest?.key === key && selected.every((source, i) => source.owner === state.latest.selected[i].owner &&
-        source.generation === state.latest.selected[i].generation)) return lease(state.latest);
+    const previous = state.variants.get(key);
+    if (previous && selected.every((source, i) => source.owner === previous.selected[i].owner &&
+        source.generation === previous.selected[i].generation)) {
+      rememberView(previous); return lease(previous);
+    }
     const view = makeView(state, selected, range, vertexCount, geometry.isInstancedBufferGeometry === true, key);
-    if (state.latest) dropView(state.latest); state.latest = view;
+    rememberView(view);
     return lease(view);
   }
   function makeView(state, selected, range, vertexCount, instanced, key) {

@@ -793,7 +793,7 @@ export function withThreeCompute(Base, THREE) {
             } else this._enqueue(request);
           }}),
         depthFactory: () => createThreeDepthTextures({three: THREE, device: this._device,
-          getSamples: () => this.currentSamples, signal: this._targetLifetime.signal})});
+          getSamples: () => this._framebufferCopySamples ?? this.currentSamples, signal: this._targetLifetime.signal})});
     }
     /** Graphics leases share compute's authoritative allocation and upload
      * history. Static unchanged versions retain GPU-produced bytes; source

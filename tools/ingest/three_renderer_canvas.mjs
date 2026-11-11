@@ -29,7 +29,7 @@ export function createThreeRendererCanvases(THREE, renderer, canvas, fail) {
   // split target on resize). Its native context still has exactly one owner.
   const entries = new Map();
   let active = null;
-  const fields = ['_session', '_dispatcher', '_hdr', '_srgbView', '_outputProfileKey', '_canvasOutputKey'];
+  const fields = ['_session', '_dispatcher', '_hdr', '_sourceCanvasOutput', '_srgbView', '_outputProfileKey', '_canvasOutputKey'];
   const validate = (target, canvas = target?.domElement) => {
     if ((target !== initial && !(typeof THREE.CanvasTarget === 'function' && target instanceof THREE.CanvasTarget)) ||
         typeof canvas?.getContext !== 'function')
@@ -62,7 +62,8 @@ export function createThreeRendererCanvases(THREE, renderer, canvas, fail) {
     let entry = entries.get(canvas);
     if (!entry) {
       entry = {canvas, targets: new Map(), references: 0, retired: false,
-        _session: null, _dispatcher: null, _hdr: false, _srgbView: true, _outputProfileKey: null, _canvasOutputKey: null};
+        _session: null, _dispatcher: null, _hdr: false, _sourceCanvasOutput: false,
+        _srgbView: true, _outputProfileKey: null, _canvasOutputKey: null};
       entries.set(entry.canvas, entry);
     }
     if (!entry.targets.has(target)) {
@@ -95,6 +96,13 @@ export function createThreeRendererCanvases(THREE, renderer, canvas, fail) {
         canvas.width === width && canvas.height === height;
     },
     save,
+    retireScene(scene) {
+      save();
+      // A graph can retire while another canvas is active. Its prepared
+      // bridges belong to the canvases that accepted it, not the public target
+      // selected at retirement time.
+      for (const entry of entries.values()) entry._dispatcher?.retire(scene);
+    },
     forget,
     resize(target, width, height) {
       save();

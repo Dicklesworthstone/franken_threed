@@ -1277,7 +1277,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function withNativeResize(target, width, height, run) {
     live();
-    if (typeof run !== 'function' || !positive(width) || !positive(height)) fail('OPTIONS', 'Expected a source target resize and synchronous callback');
+    if (typeof run !== 'function' || ![width, height].every(value => Number.isSafeInteger(value) && value >= 0))
+      fail('OPTIONS', 'Expected a nonnegative source target resize and synchronous callback');
     if (!target || target.width === width && target.height === height) return run();
     if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
     inspectThreeRenderTarget(target, three);
