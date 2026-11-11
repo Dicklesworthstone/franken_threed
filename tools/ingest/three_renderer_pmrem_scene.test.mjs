@@ -112,6 +112,8 @@ test('disposing a renderer during pre-init scene baking cancels pending resource
 
 import {createGpuBufferGeometry} from './gpu_buffer_geometry.mjs';
 import {WebGLAttributes} from '../../upstream/three.js/src/renderers/webgl/WebGLAttributes.js';
+import {WebGLMorphtargets} from '../../upstream/three.js/src/renderers/webgl/WebGLMorphtargets.js';
+import {threeMorphTargets, createThreeProgramSupport} from './three_program.mjs';
 function uploadOracle(){
  let bound;return WebGLAttributes({
   createBuffer:()=>({data:null}),bindBuffer(_target,buffer){bound=buffer;},
@@ -331,7 +333,9 @@ function recordDeformations(device) {
  device.queue.submit=commands=>{
   for(const passes of commands)for(const pass of passes)if(pass.pipeline?.compute?.entryPoint==='deform')
    records.push({vertices:new Float32Array(pass.group.entries[0].resource.buffer.data).slice(),
-    palette:new Float32Array(pass.group.entries[3].resource.buffer.data).slice()});
+    palette:new Float32Array(pass.group.entries[3].resource.buffer.data).slice(),
+    morphs:new Float32Array(pass.group.entries[1].resource.buffer.data).slice(),
+    weights:new Float32Array(pass.group.entries[4].resource.buffer.data).slice()});
   submit(commands);
  };
  return records;
@@ -385,4 +389,181 @@ test('PMREM skinning history blocks a separate ordinary GPU owner until source g
  f.mesh.geometry.dispose();renderer.render(f.scene,camera);await drain(renderer);
  assert.ok(records.length>submitted);assert.ok(records.slice(submitted).every(({vertices})=>vertices[0]===23));
  assert.equal(position.version,version);
+});
+
+function morphedEnvironment({relative=false,skinned=false,colors=false}={}) {
+ const f=skinned?skinnedEnvironment():{scene:new T.Scene(),mesh:new T.Mesh(new T.BoxGeometry(1,2,1),new T.MeshNormalMaterial({side:T.DoubleSide}))};
+ const geometry=f.mesh.geometry,position=geometry.attributes.position;
+ geometry.morphTargetsRelative=relative;
+ const target=position.clone();
+ for(let i=0;i<target.count;i++)target.setXYZ(i,relative?.3:position.getX(i)+.3,relative?.1:position.getY(i)+.1,relative?0:position.getZ(i));
+ geometry.morphAttributes.position=[target];
+ geometry.morphAttributes.normal=[geometry.attributes.normal.clone()];
+ if(colors){
+  geometry.setAttribute('color',new T.Float32BufferAttribute(new Float32Array(position.count*3).fill(.5),3));
+  geometry.morphAttributes.color=[new T.Uint8BufferAttribute(new Uint8Array(position.count*4).fill(128),4,true)];
+ }
+ f.mesh.updateMorphTargets();f.mesh.morphTargetInfluences[0]=.25;f.mesh.frustumCulled=false;
+ if(!skinned)f.scene.add(f.mesh);
+ return {...f,geometry,target};
+}
+function morphOracle() {
+ const values=new Map(),owner=WebGLMorphtargets({}, {maxTextureSize:8192}, {});
+ return object=>{values.clear();owner.update(object,object.geometry,{getUniforms:()=>({setValue(_gl,name,value){values.set(name,value);}})});
+  return {pixels:values.get('morphTargetsTexture').image.data.slice(),base:values.get('morphTargetBaseInfluence'),
+   influences:[...values.get('morphTargetInfluences')]};};
+}
+function assertMorphSnapshot(snapshot,expected) {
+ snapshot.install();const mesh=snapshot.root.children[0];
+ assert.deepEqual(threeMorphTargets(T,mesh.geometry).texture.image.data,expected.pixels);
+ assert.deepEqual(mesh.morphTargetInfluences,expected.influences);
+ const base=mesh.geometry.morphTargetsRelative?1:1-mesh.morphTargetInfluences.reduce((sum,value)=>sum+value,0);
+ assert.equal(base,expected.base);return mesh;
+}
+
+for(const relative of [false,true])test(`PMREM ${relative?'relative':'absolute'} morph captures preserve pinned first-use, count-change and disposal histories`,()=>{
+ const f=morphedEnvironment({relative,colors:true}),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(),oracle=morphOracle();
+ const capture=()=>owner.capturePMREMScene(f.scene,camera,null);
+ const influences=f.mesh.morphTargetInfluences,targets=f.geometry.morphAttributes.position;
+ const snapshots=[];
+ try{
+  const first=capture(),a=oracle(f.mesh);snapshots.push(first);
+  f.target.array[0]=77;f.target.needsUpdate=true;influences[0]=.75;
+  const second=capture(),b=oracle(f.mesh);snapshots.push(second);
+  assert.deepEqual(a.pixels,b.pixels,'source morph atlases ignore attribute needsUpdate at an unchanged count');
+  f.geometry.morphAttributes.position=[f.target.clone()];f.geometry.morphAttributes.position[0].array[0]=88;
+  const replaced=capture(),c=oracle(f.mesh);snapshots.push(replaced);
+  assert.deepEqual(c.pixels,a.pixels,'replacing a same-count target does not refresh the source atlas');
+  for(const list of Object.values(f.geometry.morphAttributes))list.push(list[0].clone());
+  f.mesh.updateMorphTargets();f.mesh.morphTargetInfluences.splice(0,2,.125,.875);
+  const expanded=capture(),d=oracle(f.mesh);snapshots.push(expanded);
+  assert.equal(d.pixels[0],88);assert.equal(d.pixels.length,2*a.pixels.length);
+  f.geometry.dispose();f.geometry.morphAttributes.position[0].array[0]=99;
+  const reused=capture(),e=oracle(f.mesh);snapshots.push(reused);
+  assert.equal(e.pixels[0],99);
+  f.geometry.dispose();f.mesh.material.dispose();f.scene.clear();
+  const view=assertMorphSnapshot(first,a);
+  assert.equal(assertMorphSnapshot(second,b),view,'per-mesh identity survives accepted influence changes');
+  assert.equal(assertMorphSnapshot(replaced,c).geometry,view.geometry);
+  assertMorphSnapshot(expanded,d);assertMorphSnapshot(reused,e);
+  assert.equal(influences[0],.75);assert.equal(targets[0],f.target,'public input identities were never replaced');
+ }finally{for(const snapshot of snapshots)snapshot.release();owner.dispose();f.geometry.dispose();f.mesh.material.dispose();}
+ assert.equal(owner.allocatedBytes,0);
+});
+
+test('PMREM morph inputs use source component decoding and keep base-attribute aliases independent',()=>{
+ const f=morphedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(),oracle=morphOracle();
+ const source=f.geometry.attributes.position;
+ f.geometry.morphAttributes.position=[source];
+ const normal=new Int16Array(source.count*4);for(let i=0;i<source.count;i++)normal.set([32767,-32768,0,1234],i*4);
+ f.geometry.morphAttributes.normal=[new T.InterleavedBufferAttribute(new T.InterleavedBuffer(normal,4),3,0,true)];
+ const take=()=>owner.capturePMREMScene(f.scene,camera,null),before=new T.BufferAttribute(new Float32Array(),3).id;
+ const first=take(),a=oracle(f.mesh),after=new T.BufferAttribute(new Float32Array(),3).id;
+ assert.equal(after,before+1,'private morph inputs do not consume source BufferAttribute IDs');
+ source.array[0]=3;source.needsUpdate=true;const second=take(),b=oracle(f.mesh);
+ try{
+  assertMorphSnapshot(first,a);const mesh=assertMorphSnapshot(second,b);
+  assert.equal(mesh.geometry.attributes.position.array[0],3,'ordinary vertex history follows its upload request');
+  assert.equal(mesh.geometry.morphAttributes.position[0].array[0],.5,'the aliased morph target retains its first atlas');
+  assert.equal(mesh.geometry.morphAttributes.normal[0].getY(0),-1,'normalized source components decode before the f32 boundary');
+  assert.equal(f.geometry.morphAttributes.position[0],source);
+ }finally{first.release();second.release();owner.dispose();f.geometry.dispose();f.mesh.material.dispose();}
+});
+
+test('PMREM hidden and rejected scenes do not establish a morph atlas or retain its bytes',()=>{
+ const f=morphedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera(60,1,.1,20),oracle=morphOracle();
+ const take=()=>owner.capturePMREMScene(f.scene,camera,null);
+ try{
+  for(const state of ['hidden','layer','material']){
+   f.mesh.visible=state!=='hidden';f.mesh.layers.set(state==='layer'?1:0);f.mesh.material.visible=state!=='material';
+   const ignored=take();ignored.install();assert.deepEqual(ignored.root.children[0].geometry.morphAttributes,{});ignored.release();
+   f.target.array[0]+=1;
+  }
+  f.mesh.visible=true;f.mesh.layers.set(0);f.mesh.material.visible=true;
+  // The invalid value is encountered after geometry capture. Its failure must
+  // roll back a provisional first-use morph history, just like vertex uploads.
+  f.mesh.material.unowned=new Map();
+  assert.throws(take,/Unsupported mutable PMREM scene field/);delete f.mesh.material.unowned;
+  f.target.array[0]=31;
+  const accepted=take(),expected=oracle(f.mesh);assert.equal(expected.pixels[0],31);
+  assertMorphSnapshot(accepted,expected);accepted.release();
+ }finally{owner.dispose();f.geometry.dispose();f.mesh.material.dispose();}
+ assert.equal(owner.allocatedBytes,0);
+});
+
+test('PMREM rejects custom morph execution and renderer-uniform collisions before retaining a generation',()=>{
+ for(const kind of ['component reader','influences','renderer uniform','instanced morph']){
+  const f=morphedEnvironment(),owner=createThreePassSnapshots(T),camera=new T.PerspectiveCamera();let calls=0;
+  if(kind==='component reader')f.target.getX=()=>{calls++;return 0;};
+  else if(kind==='influences')f.mesh.morphTargetInfluences=[{}];
+  else if(kind==='renderer uniform'){
+   f.mesh.material.dispose();f.mesh.material=new T.ShaderMaterial({uniforms:{morphTargetInfluences:{value:[1]}}});
+  }else{
+   f.scene.remove(f.mesh);const instanced=new T.InstancedMesh(f.geometry,f.mesh.material,1);
+   instanced.setMorphAt(0,f.mesh);f.scene.add(instanced);
+  }
+  try{
+   assert.throws(()=>owner.capturePMREMScene(f.scene,camera,null),error=>error.code==='THREE_PASS_SCENE',kind);
+   assert.equal(calls,0);assert.equal(owner.allocatedBytes,0);
+  }finally{owner.dispose();f.geometry.dispose();f.mesh.material.dispose();f.scene.children[0].morphTexture?.dispose();}
+ }
+});
+
+for(const skinned of [false,true])test(`public PMREM queues ${skinned?'skinned ':''}morph poses before initialization and preserves submitted weights after disposal`,async t=>{
+ const {renderer,device,release}=fixture(t,{deferred:true}),f=morphedEnvironment({skinned}),generator=new Generator(renderer);
+ const program=createThreeProgramSupport({three:T,state:()=>({toneMapping:T.NoToneMapping,outputColorSpace:T.LinearSRGBColorSpace})});
+ const reflection=program.compile(f.mesh.material,f.mesh).program.reflection;
+ const weights=reflection.uniforms.find(uniform=>uniform.name==='morphTargetInfluences');assert.ok(weights);
+ f.mesh.position.z=-3;f.mesh.morphTargetInfluences[0]=.125;
+ if(skinned)f.tip.rotation.z=.35;
+ const first=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.target.array[0]=99;f.target.needsUpdate=true;f.mesh.morphTargetInfluences[0]=.875;
+ if(skinned)f.tip.rotation.z=-.7;
+ const second=generator.fromScene(f.scene,.1,.1,20,{size:16});
+ f.geometry.dispose();f.mesh.material.dispose();f.skeleton?.dispose();f.scene.clear();generator.dispose();program.dispose();
+ release();await drain(renderer);
+ const draws=device.snapshots.flat().filter(draw=>draw.pipeline.vertex.module.code.includes('morphTargetInfluences'));
+ assert.ok(draws.length>=12,'both accepted generations execute their six face draws');
+ const values=draws.map(draw=>{const {group,offsets}=draw.groups.get(0),resource=group.entries[0].resource,bytes=draw.contents.get(resource.buffer);
+  return new DataView(bytes.buffer,bytes.byteOffset).getFloat32((offsets[0]??resource.offset??0)+weights.offset,true);});
+ assert.ok(values.includes(.125));assert.ok(values.includes(.875));
+ const atlases=device.textureWrites.filter(write=>write.texture.format==='rgba32float'&&write.texture.width===f.target.count*2);
+ assert.ok(atlases.length>0);assert.ok(atlases.every(write=>new Float32Array(write.bytes.buffer)[0]===Math.fround(.8)),
+  'later needsUpdate cannot change an earlier first-use morph atlas');
+ assert.equal(renderer.info.f3d.route,'general-webgpu');assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ first.dispose();second.dispose();
+});
+
+test('ordinary Basic morph captures feed accepted target histories and live weights to the GPU deformer',async t=>{
+ const {renderer,device}=fixture(t),f=morphedEnvironment(),generator=new Generator(renderer),records=recordDeformations(device);
+ f.mesh.material.dispose();f.mesh.material=new T.MeshBasicMaterial({side:T.DoubleSide});
+ await renderer.init();f.mesh.morphTargetInfluences[0]=.125;
+ const first=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.target.array[0]=99;f.target.needsUpdate=true;f.mesh.morphTargetInfluences[0]=.875;
+ const second=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.geometry.dispose();f.mesh.morphTargetInfluences[0]=.5;
+ const reused=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.geometry.dispose();f.mesh.material.dispose();generator.dispose();await drain(renderer);
+ for(const weight of [.125,.875,.5])assert.ok(records.some(record=>record.weights[0]===weight),`accepted morph weight ${weight} reaches compute`);
+ assert.ok(records.filter(record=>record.weights[0]!==.5).every(record=>record.morphs[0]===Math.fround(.8)-.5),
+  'same-count target updates remain stale through both queued deformations');
+ assert.ok(records.filter(record=>record.weights[0]===.5).every(record=>record.morphs[0]===98.5),
+  'geometry disposal establishes a fresh same-count morph generation');
+ assert.equal(renderer._passSnapshots.allocatedBytes,0);first.dispose();second.dispose();reused.dispose();
+});
+
+test('ordinary program morph residency cannot be silently replaced by a first PMREM capture',async t=>{
+ const {renderer,device}=fixture(t),f=morphedEnvironment(),generator=new Generator(renderer);
+ const camera=new T.PerspectiveCamera(60,1,.1,20);camera.position.z=5;
+ t.after(()=>{generator.dispose();f.geometry.dispose();f.mesh.material.dispose();});
+ await renderer.init();renderer.render(f.scene,camera);await drain(renderer);
+ assert.ok(device.textureWrites.some(write=>write.texture.format==='rgba32float'&&write.texture.width===f.target.count*2));
+ f.target.array[0]=99;f.target.needsUpdate=true;const submitted=device.submissions.length;
+ assert.throws(()=>generator.fromScene(f.scene,0,.1,20,{size:16}),/separate WebGL geometry owner/);
+ assert.equal(device.submissions.length,submitted);assert.equal(renderer._passSnapshots.allocatedBytes,0);
+ f.geometry.dispose();const previous=device.textureWrites.length,output=generator.fromScene(f.scene,0,.1,20,{size:16});
+ f.geometry.dispose();generator.dispose();await drain(renderer);
+ const atlases=device.textureWrites.slice(previous).filter(write=>write.texture.format==='rgba32float'&&write.texture.width===f.target.count*2);
+ assert.ok(atlases.length>0);assert.ok(atlases.every(write=>new Float32Array(write.bytes.buffer)[0]===99));
+ assert.equal(renderer._passSnapshots.allocatedBytes,0);output.dispose();
 });

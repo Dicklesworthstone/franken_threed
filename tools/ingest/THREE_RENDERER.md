@@ -563,7 +563,7 @@ They enter the renderer's existing FIFO. Geometry histories bind to the real
 device before ordinary renderer uploads; a conflicting batch releases all newly
 acquired claims. Disposal cancels pending work and releases captured payloads.
 
-The admitted scene profile comprises rigid and skinned meshes, CPU instances,
+The admitted scene profile comprises rigid, skinned and morphed meshes, CPU instances,
 ordinary source materials, texture-free and admitted textured shaders, and unshadowed lights, with
 a solid or absent background. Skinned captures retain call-time bone worlds,
 inverse binds, bind mode and bind matrices, including shared skeletons and
@@ -573,6 +573,19 @@ queued draws use a private palette through the existing ShaderLib or GPU
 deformation route. Later animation, source disposal and generator retirement do
 not change an accepted pose. Private palette residency is reused across captures
 and participates in the existing capture budgets and retirement lifecycle.
+
+Ordinary per-mesh morph captures require position targets and admit matching
+normal and RGB/RGBA color targets, including normalized and interleaved inputs.
+Each accepted bake retains its influences independently. Target bytes follow
+the pinned `WebGLMorphtargets` first-use cache: same-count CPU edits, same-layout replacements
+and `needsUpdate` do not refresh the atlas; a changed target count or geometry
+disposal starts a new generation. Queued generations retain their bytes through
+source disposal and share the existing snapshot budget. Private geometry
+residency resets between generations without replacing the public object.
+Skinning composes with these morphs. The existing ordinary-renderer/PMREM
+geometry ownership boundary still requires disposal before transferring a
+previously uploaded geometry; this does not infer an unknown prior morph atlas.
+
 Initialized scene bakes also capture ordinary Basic,
 Lambert, Phong, Toon, Standard, Normal, Matcap and depth material maps. Source
 shader assembly/reflection and material uniform refresh select the actual
@@ -607,11 +620,11 @@ successive bakes and ordinary consumers share the existing uploaded history;
 simultaneous aliases need per-face upload ordering and remain explicit. Texture
 inputs before device initialization, shaders outside this sampler profile, Physical
 material accessors, environments/overrides, custom render or shader hooks, custom
-sorting, shadows, transmission, morphed/batched meshes, LOD, wireframes,
+sorting, shadows, transmission, per-instance morph textures, batched meshes, LOD, wireframes,
 lines, points and sprites also retain explicit boundaries. Skinning requires
 ordinary source skeletons and four-component skin attributes. Custom skeleton
 methods, altered bone-texture uploads, and palettes aliased as material uniforms,
-maps or geometry inputs require per-face source effects and remain explicit
+maps, geometry inputs or morph targets require per-face source effects and remain explicit
 boundaries. These restrictions
 keep unsupported mutable state from being silently read after acceptance.
 

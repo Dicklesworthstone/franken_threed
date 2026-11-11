@@ -533,6 +533,7 @@ function inspectPMREMShaderSamplers(source, reflection, material, skinned) {
  * from ordinary WebGL scene bridges until an explicit disposal boundary. */
 function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxValues, available}) {
   const states = new WeakMap(), retained = new Set(), records = new Set(), histories = new Map(), resources = new Map();
+  const morphHistories = new Map();
   const duplicate = value => new (TYPED_ARRAYS.get(Object.getPrototypeOf(value)))(value);
   const token = {}, math = new Set([...MATH, 'Fog', 'FogExp2'].map(name => T[name]?.prototype).filter(Boolean));
   let bytes = 0, historyBytes = 0, disposed = false, boundDevice = null;
@@ -543,6 +544,47 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
   const ordinaryMatrix = matrix => Object.getPrototypeOf(matrix ?? {}) === T.Matrix4.prototype &&
     Object.values(Object.getOwnPropertyDescriptors(matrix)).every(property => Object.hasOwn(property, 'value')) &&
     Array.isArray(matrix.elements) && matrix.elements.length === 16;
+  function inspectMorphs(object) {
+    const geometry = object.geometry, attributes = geometry.morphAttributes;
+    if (!attributes || ![Object.prototype, null].includes(Object.getPrototypeOf(attributes)))
+      fail('SCENE', 'PMREM morph targets require ordinary source attribute lists');
+    const count = attributes.position?.length ?? attributes.normal?.length ?? attributes.color?.length ?? 0;
+    if (!count) return null;
+    // r186 WebGLMorphtargets reads position.count while packing every target.
+    // Per-instance weights have a different texture/upload lifetime.
+    if (!Array.isArray(attributes.position) || attributes.position.length !== count || object.isInstancedMesh ||
+        !Array.isArray(object.morphTargetInfluences) || object.morphTargetInfluences.length !== count ||
+        object.morphTargetInfluences.some(value => typeof value !== 'number') || count > maxValues ||
+        !positive(geometry.attributes.position?.count))
+      fail('SCENE', 'PMREM morphs require source position targets and ordinary per-mesh influences');
+    const signature = [], vertexCount = geometry.attributes.position.count;
+    if (Object.keys(attributes).some(name => !['position', 'normal', 'color'].includes(name)))
+      fail('SCENE', 'PMREM morph targets require matching position, normal and color lists');
+    for (const name of ['position', 'normal', 'color']) {
+      if (!Object.hasOwn(attributes, name)) continue;
+      const list = attributes[name];
+      if (!Array.isArray(list) || list.length !== count)
+        fail('SCENE', 'PMREM morph targets require matching position, normal and color lists');
+      signature.push(name, list.length);
+      for (const attribute of list) {
+        const interleaved = attribute instanceof T.InterleavedBufferAttribute;
+        const owner = interleaved ? attribute.data : attribute, array = own(owner, 'array');
+        const prototype = interleaved ? T.InterleavedBufferAttribute.prototype :
+          attribute instanceof T.Float16BufferAttribute ? T.Float16BufferAttribute.prototype : T.BufferAttribute.prototype;
+        if (!(attribute instanceof T.BufferAttribute) && !interleaved ||
+            ![3, ...(name === 'color' ? [4] : [])].includes(attribute.itemSize) || attribute.count !== vertexCount ||
+            Object.values(Object.getOwnPropertyDescriptors(attribute)).some(property => !Object.hasOwn(property, 'value')) ||
+            interleaved && (Object.values(Object.getOwnPropertyDescriptors(owner)).some(property => !Object.hasOwn(property, 'value')) ||
+              !Number.isSafeInteger(owner.stride) || owner.stride < attribute.itemSize || !Number.isSafeInteger(attribute.offset) ||
+              attribute.offset < 0 || attribute.offset + attribute.itemSize > owner.stride) ||
+            !TYPED_ARRAYS.has(Object.getPrototypeOf(array ?? {})) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+            ['getX', 'getY', 'getZ', 'getW'].some(key => field(attribute, key) !== prototype[key]))
+          fail('SCENE', 'PMREM morph inputs require fixed CPU attributes and source component reads');
+        signature.push(attribute.itemSize, attribute.count);
+      }
+    }
+    return {count, signature: JSON.stringify(signature), vertexCount};
+  }
   function inspectSkeleton(object) {
     const skeleton = object.skeleton, attributes = object.geometry.attributes;
     if (Object.getPrototypeOf(object) !== T.SkinnedMesh.prototype ||
@@ -585,6 +627,11 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     const history = histories.get(owner);
     if (history) { histories.delete(owner); historyBytes -= history.array.byteLength; history.release?.(); }
   };
+  const releaseMorphHistory = geometry => {
+    const history = morphHistories.get(geometry);
+    if (history) { morphHistories.delete(geometry); history.active = false; collectMorphHistory(history); }
+  };
+  const collectMorphHistory = history => { if (!history.active && !history.references) historyBytes -= history.bytes; };
   function bindDevice(device) {
     live();
     if (!device || boundDevice && boundDevice !== device) fail('SCENE', 'PMREM geometry histories require one renderer device');
@@ -603,6 +650,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       const listener = () => {
         resource.removeEventListener('dispose', listener);
         resources.delete(resource); for (const owner of record.owners) releaseHistory(owner);
+        releaseMorphHistory(resource);
       };
       resources.set(resource, record = {owners: new Set(), listener}); resource.addEventListener('dispose', listener);
     }
@@ -612,7 +660,8 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     if (record.pending || record.installed || !records.delete(record)) return;
     bytes -= record.bytes;
     for (const input of record.textureInputs) input.release();
-    record.textureInputs.length = 0; record.data = record.sources = null;
+    for (const history of record.morphs.values()) { history.references--; collectMorphHistory(history); }
+    record.textureInputs.length = 0; record.data = record.sources = record.morphs = null;
   }
   function capture(root, camera, device, {cube = false, position = null, sortObjects = true, captureTexture = null} = {}) {
     live();
@@ -622,7 +671,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       fail('SCENE', 'PMREM scene capture requires source objects and an ordinary camera');
     let state = states.get(root);
     if (!state && retained.size >= maxRoots) fail('BUDGET', 'Too many PMREM scene roots');
-    const nodes = [], stack = [root], seen = new Set(), sourceResources = new Map();
+    const nodes = [], stack = [root], seen = new Set(), sourceResources = new Map(), morphLayouts = new Map();
     const sourceOwners = geometry => [...Object.values(geometry.attributes), ...(geometry.index ? [geometry.index] : [])]
       .map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
     while (stack.length) {
@@ -641,13 +690,19 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         fail('SCENE', 'PMREM capture requires rigid/skinned meshes, CPU instances and unshadowed source lights');
       if (object.isMesh) {
         const geometry = object.geometry, materials = Array.isArray(object.material) ? object.material : [object.material];
-        if (!(geometry instanceof T.BufferGeometry) || Object.values(geometry.morphAttributes).some(list => list.length))
-          fail('SCENE', 'PMREM scene geometry requires source BufferGeometry without morph targets');
+        if (!(geometry instanceof T.BufferGeometry))
+          fail('SCENE', 'PMREM scene geometry requires source BufferGeometry');
+        const morphs = inspectMorphs(object);
+        if (morphs) morphLayouts.set(geometry, morphs);
         for (const material of materials) if (material && (
           !(material instanceof T.Material) || field(material, 'onBeforeRender') !== T.Material.prototype.onBeforeRender ||
           field(material, 'onBeforeCompile') !== T.Material.prototype.onBeforeCompile ||
           field(material, 'customProgramCacheKey') !== T.Material.prototype.customProgramCacheKey || material.transmission > 0 || material.wireframe || material.envMap))
           fail('SCENE', 'PMREM scene materials require ordinary source programs without custom hooks, environments or transmission');
+        if (morphs) for (const material of materials) if (material?.isShaderMaterial &&
+            ['morphTargetsTexture', 'morphTargetsTextureSize', 'morphTargetBaseInfluence', 'morphTargetInfluences', 'morphTexture']
+              .some(key => Object.hasOwn(material.uniforms, key)))
+          fail('SCENE', 'PMREM shader uniforms cannot replace renderer-owned morph inputs');
         sourceResources.set(geometry, sourceOwners(geometry));
         if (object.isSkinnedMesh) inspectSkeleton(object);
         if (field(object, 'intersectsFrustum') !== (object.isSkinnedMesh ? T.SkinnedMesh.prototype : T.Mesh.prototype).intersectsFrustum ||
@@ -670,6 +725,9 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
     for (const owners of sourceResources.values()) for (const owner of owners)
       if (paletteBuffers.has(own(owner, 'array')?.buffer))
         fail('SCENE', 'PMREM skeleton palettes cannot also serve as geometry upload inputs');
+    for (const geometry of morphLayouts.keys()) for (const attribute of Object.values(geometry.morphAttributes).flat())
+      if (paletteBuffers.has(own(attribute.isInterleavedBufferAttribute ? attribute.data : attribute, 'array')?.buffer))
+        fail('SCENE', 'PMREM skeleton palettes cannot also serve as morph target inputs');
     if (root.matrixWorldAutoUpdate === true) root.updateMatrixWorld();
     if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
 
@@ -684,7 +742,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       frusta.push(new T.Frustum().setFromProjectionMatrix(project.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse),
         camera.coordinateSystem, camera.reversedDepth));
     }
-    const selectedOwners = new Set(), selectedMaterials = new Map(), sceneLights = [], visible = [root];
+    const selectedOwners = new Set(), selectedMaterials = new Map(), selectedMorphs = new Set(), sceneLights = [], visible = [root];
     const skeletonUpdates = frusta.map(() => new Set()), skeletonTextures = frusta.map(() => new Set());
     while (visible.length) {
       const object = visible.pop(); if (object.visible === false) continue;
@@ -699,6 +757,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
           let objects = selectedMaterials.get(material);
           if (!objects) selectedMaterials.set(material, objects = new Set());
           objects.add(object);
+          if (morphLayouts.has(geometry)) selectedMorphs.add(geometry);
         }
         if (object.isSkinnedMesh) for (let face = 0; face < frusta.length; face++) {
           if (object.frustumCulled && !frusta[face].intersectsObject(object)) continue;
@@ -722,13 +781,52 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       visible.push(...object.children);
     }
     let charged = 0, values = 0, addedHistory = 0;
-    const pending = new Map(), sources = new Map(), memo = new Map(), materialTextures = new Map(), textureInputs = [];
+    const pending = new Map(), pendingMorphs = new Map(), capturedMorphs = new Map(), morphOwners = new Set();
+    const sources = new Map(), memo = new Map(), materialTextures = new Map(), textureInputs = [];
     const charge = size => {
       charged += size;
       if (++values > maxValues || charged > maxCaptureBytes || charged + bytes + historyBytes + addedHistory > Math.min(maxBytes, available()))
         fail('BUDGET', 'PMREM scene snapshots exceed their byte/value budget');
     };
     const attributeOwners = new Set([...sourceResources.values()].flat());
+    function morphInputs(geometry) {
+      const layout = morphLayouts.get(geometry);
+      if (!layout) return geometry.morphAttributes;
+      // No source draw observes these targets. Do not establish history or
+      // retain unused mutable arrays for hidden/layer-excluded meshes.
+      if (!selectedMorphs.has(geometry)) return {};
+      let history = pendingMorphs.get(geometry) ?? morphHistories.get(geometry);
+      if (history && history.count === layout.count && history.signature !== layout.signature)
+        fail('SCENE', 'Dispose PMREM geometry before changing a morph target layout without changing its count');
+      if (!history || history.count !== layout.count) {
+        // Like WebGLMorphtargets, neither attribute.version nor a replacement
+        // array republishes targets at an unchanged count. Decode normalized
+        // and interleaved inputs at the first selected draw's f32 boundary.
+        const size = Object.values(geometry.morphAttributes).flat().reduce((sum, attribute) =>
+          sum + attribute.count * attribute.itemSize * 4 + 128, 128);
+        if (!Number.isSafeInteger(size) || size > maxCaptureBytes - charged ||
+            charged + size * 2 + bytes + historyBytes + addedHistory > Math.min(maxBytes, available()))
+          fail('BUDGET', 'PMREM morph history exceeds the remaining snapshot budget');
+        const attributes = {};
+        for (const [name, list] of Object.entries(geometry.morphAttributes)) attributes[name] = list.map(attribute => {
+          const array = new Float32Array(attribute.count * attribute.itemSize);
+          for (let index = 0; index < attribute.count; index++) for (let component = 0; component < attribute.itemSize; component++)
+            array[index * attribute.itemSize + component] = attribute[['getX', 'getY', 'getZ', 'getW'][component]](index);
+          // A private decoded view must not consume the public attribute-ID
+          // sequence merely because a source texture is being captured.
+          const decoded = Object.create(T.BufferAttribute.prototype);
+          for (const [key, value] of Object.entries({isBufferAttribute: true, name: attribute.name ?? '', array,
+            itemSize: attribute.itemSize, count: attribute.count, normalized: false, usage: T.StaticDrawUsage,
+            updateRanges: [], gpuType: T.FloatType, version: 0})) put(decoded, key, value);
+          put(decoded, 'id', own(attribute, 'id'), false); return decoded;
+        });
+        history = {count: layout.count, signature: layout.signature, attributes, bytes: size, generation: {}, references: 0, active: true};
+        pendingMorphs.set(geometry, history); addedHistory += size;
+      }
+      capturedMorphs.set(geometry, history);
+      for (const attribute of Object.values(history.attributes).flat()) morphOwners.add(attribute);
+      return history.attributes;
+    }
     function uploaded(owner) {
       if (pending.has(owner)) return pending.get(owner);
       const previous = histories.get(owner), array = own(owner, 'array'), version = own(owner, 'version');
@@ -797,7 +895,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       const skeleton = value instanceof T.Skeleton;
       if (material) materialOwner = value;
       else if (object || geometry) materialOwner = null;
-      const attribute = attributeOwners.has(value) || value.isInterleavedBufferAttribute === true;
+      const attribute = attributeOwners.has(value) || morphOwners.has(value) || value.isInterleavedBufferAttribute === true;
       const prototype = Object.getPrototypeOf(value), array = Array.isArray(value);
       if (!object && !geometry && !material && !skeleton && !attribute && !array && !math.has(prototype) &&
           prototype !== Object.prototype && prototype !== null)
@@ -810,6 +908,7 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
             object && ['parent', 'children', 'animations', 'shadow'].includes(key) ||
             skeleton && ['boneMatrices', 'boneTexture'].includes(key)) continue;
         let input = own(value, key);
+        if (geometry && key === 'morphAttributes') input = morphInputs(value);
         if (upload && key === 'array') input = upload.array;
         if (upload && key === 'updateRanges') input = [];
         if (typeof input === 'function') {
@@ -931,6 +1030,10 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         if (history.clear) { for (const range of history.ranges) range.source.count = range.count; owner.clearUpdateRanges(); }
         delete history.ranges;
       }
+      for (const [geometry, history] of pendingMorphs) {
+        releaseMorphHistory(geometry); historyBytes += history.bytes;
+        morphHistories.set(geometry, history); observe(geometry, []);
+      }
       for (const [resource, owners] of sourceResources) {
         const selected = owners.filter(owner => pending.has(owner)); if (selected.length) observe(resource, selected);
       }
@@ -939,9 +1042,10 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       for (const [owner, history] of pending) if (!histories.has(owner)) history.release?.();
       throw error;
     }
-    if (!state) { state = {root: view(root), views: new WeakMap(), record: null}; states.set(root, state); retained.add(state); }
+    if (!state) { state = {root: view(root), views: new WeakMap(), morphs: new WeakMap(), record: null}; states.set(root, state); retained.add(state); }
     state.views.set(root, new WeakRef(state.root));
-    const record = {state, data, sources, textureInputs, bytes: charged, pending: 0, installed: false}; records.add(record); bytes += charged;
+    const record = {state, data, sources, textureInputs, morphs: capturedMorphs, bytes: charged, pending: 0, installed: false}; records.add(record); bytes += charged;
+    for (const history of capturedMorphs.values()) history.references++;
     function install() {
       live(); if (!record.pending) fail('RELEASED', 'PMREM scene capture was released');
       if (state.record === record) return;
@@ -954,6 +1058,15 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
         let target = state.views.get(source)?.deref();
         if (!target) { target = Array.isArray(value) ? [] : view(value); state.views.set(source, new WeakRef(target)); }
         installed.set(source, target);
+        const morph = record.morphs.get(source);
+        if (morph) {
+          const previous = state.morphs.get(source);
+          // A public disposal can start a new atlas at the same target count.
+          // Retire only the private geometry residency, preserving identities
+          // and every older capture until its ordered submission completes.
+          if (previous && previous !== morph.generation) target.dispose();
+          state.morphs.set(source, morph.generation);
+        }
         const boneTexture = source instanceof T.Skeleton ? target.boneTexture : null;
         for (const key of Object.getOwnPropertyNames(target)) if (key !== '_listeners' && !(Array.isArray(target) && key === 'length') && !Object.hasOwn(value, key)) delete target[key];
         for (const key of Object.getOwnPropertyNames(value)) if (!(Array.isArray(value) && key === 'length')) put(target, key, apply(value[key]));
@@ -997,13 +1110,14 @@ function createPMREMSceneSnapshots(T, {maxBytes, maxCaptureBytes, maxRoots, maxV
       for (const record of records) if (record.state === state && record.pending) fail('PENDING', 'PMREM scene still has queued captures');
       for (const record of [...records]) if (record.state === state) { record.installed = false; collect(record); }
       for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key];
-      state.views = new WeakMap(); state.record = null; retained.delete(state); states.delete(root);
+      state.views = new WeakMap(); state.morphs = new WeakMap(); state.record = null; retained.delete(state); states.delete(root);
     },
     dispose() {
       disposed = true;
       for (const record of [...records]) { record.pending = record.installed = false; collect(record); }
       for (const [resource, record] of resources) resource.removeEventListener('dispose', record.listener);
       resources.clear(); for (const owner of histories.keys()) releaseHistory(owner);
+      for (const geometry of morphHistories.keys()) releaseMorphHistory(geometry);
       for (const state of retained) { for (const key of Object.getOwnPropertyNames(state.root)) delete state.root[key]; state.record = null; state.views = new WeakMap(); }
       retained.clear();
     }};
