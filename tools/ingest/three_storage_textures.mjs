@@ -5,6 +5,7 @@
 import {submitStorageArrayMips} from './gpu_storage_array_mips.mjs';
 import {submitStorageVolumeMips} from './gpu_storage_volume_mips.mjs';
 import {inspectStorageTextureCopy} from './three_texture_copy_plan.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class ThreeStorageTextureError extends Error {
   constructor(code, message) {
@@ -110,7 +111,7 @@ const MIPS = `
 export function createThreeStorageTextures(three, {getDevice, signal = null, maxTextures = 256, maxBytes = 256 * 1024 * 1024} = {}) {
   if (typeof getDevice !== 'function' || !positive(maxTextures) || !positive(maxBytes)) fail('OPTIONS', 'Expected storage texture owner options');
   const entries = new Map(), mipPipelines = new Map(), pending = new Set(), borrowed = new Set();
-  let allocatedBytes = 0, terminal = null, watchedDevice = null;
+  let allocatedBytes = 0, terminal = null, watchedDevice = null, releaseDeviceLoss = null;
   const stopped = new AbortController();
   const live = () => { if (terminal) throw terminal; };
   function retire(entry) {
@@ -122,6 +123,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
   function stop(error) {
     if (terminal) return;
     terminal = error instanceof Error ? error : new ThreeStorageTextureError('ABORTED', String(error ?? 'Texture execution stopped'));
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     stopped.abort(terminal);
     for (const entry of [...entries.values()]) retire(entry);
     mipPipelines.clear(); signal?.removeEventListener('abort', abort);
@@ -134,7 +136,8 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     if (watchedDevice && watchedDevice !== value) fail('DEVICE', 'Storage textures cannot migrate between devices');
     if (!watchedDevice) {
       watchedDevice = value;
-      value.lost?.then(info => stop(new ThreeStorageTextureError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      if (value.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(value.lost,
+        info => stop(new ThreeStorageTextureError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     }
     return value;
   }

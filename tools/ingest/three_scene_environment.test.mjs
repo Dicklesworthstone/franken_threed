@@ -30,6 +30,7 @@ assert.ok(shadowSource.includes("'./animation_shadow.mjs'"));
 shadowSource=shadowSource.replace("'./animation_shadow.mjs'",JSON.stringify(lower));
 let environmentSource=await readFile(new URL('./three_environment.mjs',import.meta.url),'utf8');
 environmentSource=environmentSource.replace("'./animation_environment.mjs'",JSON.stringify(lower));
+environmentSource=environmentSource.replace("'./gpu_device_loss.mjs'",JSON.stringify(new URL('./gpu_device_loss.mjs',import.meta.url).href));
 let sceneSource=await readFile(new URL('./three_scene.mjs',import.meta.url),'utf8');
 for(const path of ['animation_render','gpu_buffer_geometry','three_textures','three_deformation']){
   assert.ok(sceneSource.includes(`'./${path}.mjs'`));

@@ -30,9 +30,10 @@ async function rewritten(name,imports){
   return url(source);
 }
 const core=new URL('./animation_background.mjs',import.meta.url).href;
-const env=await rewritten('three_environment.mjs',{animation_environment:lower});
+const loss=new URL('./gpu_device_loss.mjs',import.meta.url).href;
+const env=await rewritten('three_environment.mjs',{animation_environment:lower,gpu_device_loss:loss});
 const background=await rewritten('three_background.mjs',{three_environment:env,animation_background:core,
-  three_textures:new URL('./three_textures.mjs',import.meta.url).href});
+  three_textures:new URL('./three_textures.mjs',import.meta.url).href,gpu_device_loss:loss});
 const shadows=await rewritten('three_shadows.mjs',{animation_shadow:lower});
 const sceneURL=await rewritten('three_scene.mjs',{animation_render:lower,gpu_buffer_geometry:lower,
   three_textures:lower,three_deformation:lower,three_shadows:shadows,three_environment:env,three_background:background});

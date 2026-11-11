@@ -16,7 +16,8 @@ export const createGpuAnimationEnvironment=(...args)=>globalThis[Symbol.for('f3d
 `);
 const source = await readFile(new URL('./three_environment.mjs', import.meta.url), 'utf8');
 assert.ok(source.includes("'./animation_environment.mjs'"));
-const api = await import(url(source.replace("'./animation_environment.mjs'", JSON.stringify(lower))));
+const api = await import(url(source.replace("'./animation_environment.mjs'", JSON.stringify(lower))
+  .replace("'./gpu_device_loss.mjs'", JSON.stringify(new URL('./gpu_device_loss.mjs', import.meta.url).href))));
 const {createGpuThreeEnvironment:create, inspectThreeEnvironment:inspect,
   threeEnvironmentDescriptor:descriptor, withThreeEnvironmentReceivers:receivers} = api;
 class DataTexture {

@@ -6,6 +6,7 @@
  */
 import {createGpuCanvasRenderer} from './gpu_canvas_renderer.mjs';
 import {GpuCanvasError} from './gpu_canvas.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 const fail = (code, message) => { throw new GpuCanvasError(code, message); };
 const leases = new WeakMap();
@@ -94,6 +95,7 @@ async function createRecoverableCanvas(createSession, canvas, createRenderer, in
   function retire(record) {
     if (!record || record.retired) return;
     record.retiring = true;
+    record.releaseDeviceLoss?.(); record.releaseDeviceLoss = null;
     // Base owners defer destruction out of synchronous native submission.
     record.abort.abort(record.reason);
     if (busy) return;
@@ -189,24 +191,28 @@ async function createRecoverableCanvas(createSession, canvas, createRenderer, in
       fail('RECOVERY_DEVICE', 'Recovery requires a device with a loss notification');
     if (devices.has(device)) fail('RECOVERY_DEVICE', 'A previous generation device cannot be reused');
     devices.add(device); record.device = device;
-    Promise.resolve(device.lost).then(info => {
+    const observe = operation => {
+      try { operation(); }
+      catch (error) {
+        // A user-supplied device/renderer cannot publish an invalid replacement
+        // when its loss notification or cleanup fails.
+        if (record === active && !disposed) terminate(error);
+      }
+    };
+    record.releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost, info => observe(() => {
       // Owned devices are also destroyed after unrelated terminal errors. Do
       // not mislabel that deliberate teardown as a recoverable native loss.
       if (record.lifetime?.aborted && record.lifetime.reason?.code !== 'GPU_CANVAS_DEVICE_LOST') {
         stopRecord(record, record.lifetime.reason); return;
       }
       stopRecord(record, new GpuCanvasError('DEVICE_LOST', info?.message ?? 'Device lost'), info ?? {});
-    }, error => stopRecord(record, error)).catch(error => {
-      // A user-supplied device/renderer is not allowed to leave a detached
-      // observer rejection or publish an otherwise invalid replacement.
-      if (record === active && !disposed) terminate(error);
-    });
+    }), error => observe(() => stopRecord(record, error)));
   }
   async function open(suppliedDevice, recovering) {
     const record = {generation: generation + 1, attempt: attempts, suppliedDevice,
       abort: new AbortController(), stop: deferred(), loss: deferred(),
       stopped: false, retired: false, retiring: false, published: false, preparing: false,
-      reason: null, session: null, device: null};
+      reason: null, session: null, device: null, releaseDeviceLoss: null};
     active = record;
     state = recovering ? 'recovering' : 'initializing';
     lastFrameRendered = false;

@@ -7,6 +7,8 @@
  * Cubemap face order is WebGPU +X,-X,+Y,-Y,+Z,-Z. Panoramas use atan2(z,x)
  * horizontally and acos(y) vertically, with repeat-U/clamp-V; no guessed flip.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class AnimationEnvironmentError extends Error {
   constructor(code, message) {
     super(`${code}: ${message}`);
@@ -282,12 +284,13 @@ export async function createGpuAnimationEnvironment(device, source, options = {}
   let parameters,
     disposed = false,
     terminal = null;
-  let rejectStop;
+  let rejectStop, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => {
     rejectStop = reject;
   });
   stopped.catch(() => {});
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const t of owned) t.destroy();
     owned.clear();
     parameters?.destroy();
@@ -306,7 +309,7 @@ export async function createGpuAnimationEnvironment(device, source, options = {}
     if (disposed) fail("DISPOSED", "Environment is disposed");
   }
   if (device.lost && typeof device.lost.then === "function")
-    device.lost.then(
+    releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
       (info) =>
         stop(
           new AnimationEnvironmentError(

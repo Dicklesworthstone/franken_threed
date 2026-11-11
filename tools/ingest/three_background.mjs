@@ -8,6 +8,7 @@
 import {inspectThreeEnvironment, captureThreeEnvironmentPixels} from './three_environment.mjs';
 import {inspectThreeTexture, createGpuThreeTextures} from './three_textures.mjs';
 import {createGpuAnimationBackground, packAnimationBackgroundFrame} from './animation_background.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class ThreeBackgroundError extends Error {
   constructor(code, message) {
@@ -152,9 +153,10 @@ export async function createGpuThreeBackground(device, texture, options = {}) {
   const panorama = shape.mapping === 'panorama' && !shape.imagePanorama;
   const pixels = panorama ? captureThreeEnvironmentPixels(texture, three, {maxPixels}) : null;
   const lifetime = new AbortController();
-  let input = null, textureOwner = null, renderer = null, disposed = false, terminal = null, busy = false, rejectStop;
+  let input = null, textureOwner = null, renderer = null, disposed = false, terminal = null, busy = false, rejectStop, releaseDeviceLoss = null;
   const captures = new WeakSet(), stopped = new Promise((_,reject) => {rejectStop=reject;}); stopped.catch(()=>{});
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     texture.removeEventListener('dispose', onSourceDispose); signal?.removeEventListener('abort', onAbort);
     lifetime.abort(); renderer?.dispose(); renderer=null;
     if (textureOwner) textureOwner.dispose(); else input?.destroy();
@@ -172,7 +174,8 @@ export async function createGpuThreeBackground(device, texture, options = {}) {
       fail('PREPARE','Background source changed; prepare its current version before rendering');
   }
   texture.addEventListener('dispose',onSourceDispose);signal?.addEventListener('abort',onAbort,{once:true});
-  device.lost.then(info=>stop(new ThreeBackgroundError('DEVICE',info?.message??'GPU device lost')),stop);
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info=>stop(new ThreeBackgroundError('DEVICE',info?.message??'GPU device lost')),stop);
   try {
     if(signal?.aborted)onAbort();check();
     let sampling = {};

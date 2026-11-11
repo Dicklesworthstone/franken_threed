@@ -124,3 +124,116 @@ test('disposed canvas, target, session and geometry graphs are collectible while
     cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
   });
 });
+
+test('disposed texture, environment and recoverable canvas owners release their live device subscriptions', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import {createGpuThreeTextures} from './three_textures.mjs';
+    import {createGpuThreeEnvironment} from './three_environment.mjs';
+    import {createGpuThreeBackground} from './three_background.mjs';
+    import {createThreeStorageTextures} from './three_storage_textures.mjs';
+    import {createRecoverableGpuCanvasRenderer} from './gpu_canvas_recovery.mjs';
+    import {T} from './fixtures/target_storage_copy_fixture.mjs';
+    class DataTexture extends T.Texture {
+      constructor() {
+        super();
+        Object.assign(this, {image: {data: new Uint16Array(32).fill(0x3c00), width: 4, height: 2},
+          isDataTexture: true, type: T.HalfFloatType, internalFormat: null, mapping: 303,
+          colorSpace: T.LinearSRGBColorSpace, premultiplyAlpha: false, unpackAlignment: 1,
+          onUpdate: null, updateRanges: [], version: 1});
+        this.source = {data: this.image, dataReady: true, version: 1};
+      }
+    }
+    const three = {...T, REVISION: '186', DataTexture, EquirectangularReflectionMapping: 303};
+    let lose, subscriptions = 0;
+    const lost = new Promise(resolve => { lose = resolve; }), then = lost.then.bind(lost);
+    lost.then = (...args) => { subscriptions++; return then(...args); };
+    // Do not keep a test-side allocation log: only production owners may retain
+    // these source graphs. Shader compilation/submission is a recorded boundary.
+    const device = {lost, limits: {maxTextureDimension2D: 4096, maxBufferSize: 65536,
+        minUniformBufferOffsetAlignment: 256},
+      pushErrorScope() {}, popErrorScope: async () => null,
+      queue: {onSubmittedWorkDone: async () => { if (device.failFence) throw new Error('injected completion failure'); },
+        writeBuffer() {}, writeTexture() {}, submit() {}},
+      createBuffer: () => ({destroy() {}}),
+      createTexture: descriptor => {
+        if (device.failTexture) throw new Error('injected allocation failure');
+        return {...descriptor, width: descriptor.size[0], height: descriptor.size[1],
+        depthOrArrayLayers: descriptor.size[2] ?? 1, dimension: descriptor.dimension ?? '2d',
+        sampleCount: descriptor.sampleCount ?? 1, mipLevelCount: descriptor.mipLevelCount ?? 1,
+        createView() { return {texture: this}; }, destroy() {}};
+      },
+      createSampler: () => ({}), createBindGroupLayout: () => ({}), createPipelineLayout: () => ({}),
+      createShaderModule: () => ({}), createRenderPipelineAsync: async () => {
+        if (device.failPipeline) throw new Error('injected compilation failure');
+        return {};
+      }, createBindGroup: () => ({}),
+      createCommandEncoder: () => ({beginRenderPass: () => ({setPipeline() {}, setBindGroup() {}, draw() {}, end() {}}),
+        finish: () => ({})}),
+      destroy() { assert.fail('borrowed device'); }};
+    const canvas = () => ({width: 4, height: 2, getContext: () => ({
+      configure() {}, unconfigure() {}, getCurrentTexture() {}})});
+    const factory = () => ({render() {}, dispose() {}, whenIdle: async () => {}});
+    const environmentOptions = {three, size: 2, diffuseSize: 1, lutSize: 2, samples: 1};
+    const refs = [];
+    async function cycle() {
+      for (let index = 0; index < 20; index++) {
+        const panorama = new DataTexture(), backdrop = new DataTexture();
+        const environment = await createGpuThreeEnvironment(device, panorama, environmentOptions);
+        const background = await createGpuThreeBackground(device, backdrop, {three});
+        const textures = createGpuThreeTextures(device, {three});
+        const storage = createThreeStorageTextures(three, {getDevice: () => device});
+        const texture = new T.StorageTexture(); storage.ensure(storage.capture(texture));
+        await storage.whenIdle();
+        const session = await createRecoverableGpuCanvasRenderer(canvas(), factory, {device});
+        environment.dispose(); background.dispose(); textures.dispose(); storage.dispose(); session.dispose();
+        for (const value of [panorama, backdrop, environment, background, textures, storage, texture, session, session.canvas])
+          refs.push(new WeakRef(value));
+      }
+    }
+    await cycle();
+    async function failedConstruction() {
+      const panorama = new DataTexture(), backdrop = new DataTexture(), surface = canvas();
+      device.failPipeline = true;
+      await assert.rejects(createGpuThreeEnvironment(device, panorama, environmentOptions), /injected compilation failure/);
+      await assert.rejects(createGpuThreeBackground(device, backdrop, {three}), /injected compilation failure/);
+      device.failPipeline = false;
+      const storage = createThreeStorageTextures(three, {getDevice: () => device}), texture = new T.StorageTexture();
+      device.failTexture = true;
+      assert.throws(() => storage.ensure(storage.capture(texture)), /injected allocation failure/);
+      device.failTexture = false;
+      const textures = createGpuThreeTextures(device, {three});
+      device.failFence = true;
+      await assert.rejects(textures.whenIdle(), /injected completion failure/);
+      device.failFence = false;
+      await assert.rejects(createRecoverableGpuCanvasRenderer(surface, () => { throw new Error('injected factory failure'); },
+        {device}), /injected factory failure/);
+      for (const value of [panorama, backdrop, surface, storage, texture, textures]) refs.push(new WeakRef(value));
+    }
+    await failedConstruction();
+    for (let turn = 0; turn < 20; turn++) { await new Promise(setImmediate); global.gc(); }
+    assert.equal(refs.filter(ref => ref.deref()).length, 0, 'disposed texture and canvas graphs must not await device loss');
+    assert.equal(subscriptions, 1, 'texture and recovery churn must share one native loss reaction');
+    const environment = await createGpuThreeEnvironment(device, new DataTexture(), environmentOptions);
+    const background = await createGpuThreeBackground(device, new DataTexture(), {three});
+    const textures = createGpuThreeTextures(device, {three});
+    const sampled = new DataTexture();
+    textures.prepare([sampled]); sampled.dispose(); textures.prepare([sampled]);
+    textures.retain([]); textures.prepare([sampled]);
+    const storage = createThreeStorageTextures(three, {getDevice: () => device});
+    const stored = new T.StorageTexture();
+    storage.ensure(storage.capture(stored)); stored.dispose(); storage.ensure(storage.capture(stored));
+    const session = await createRecoverableGpuCanvasRenderer(canvas(), factory, {device});
+    lose({reason: 'unknown', message: 'device removed'}); await new Promise(setImmediate);
+    assert.equal(environment.failed, true); assert.equal(environment.allocatedBytes, 0);
+    assert.equal(background.failed, true); assert.equal(background.allocatedBytes, 0);
+    assert.equal(textures.failed, true);
+    await assert.rejects(storage.whenIdle(), {code: 'THREE_STORAGE_TEXTURE_DEVICE_LOST'});
+    assert.equal(storage.allocatedBytes, 0);
+    assert.equal(session.state, 'lost'); assert.equal(session.recoverable, true);
+    environment.dispose(); background.dispose(); textures.dispose(); storage.dispose(); session.dispose();
+  `;
+  execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
+    cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
+  });
+});

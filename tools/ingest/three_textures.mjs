@@ -24,6 +24,8 @@
  * errors; applications can keep borrowing bindings for those sources.
  * See THREE_TEXTURES.md for source-state, color, bounds and completion contracts.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class ThreeTextureError extends Error {
   constructor(code,message){super(`THREE_TEXTURE_${code}: ${message}`);this.name='ThreeTextureError';this.code='THREE_TEXTURE_'+code;}
 }
@@ -427,7 +429,7 @@ export function createGpuThreeTextures(device,{
   const describe=textureInspector(T,{maxTextureBytes,maxPixels,imageSnapshots,mediaSnapshots,nativeCube,nativeMedia,features:device?.features??new Set(),float32Filterable:device?.features?.has?.('float32-filterable')===true,
     maxDimension:device?.limits?.maxTextureDimension2D??32768,maxDimension3D:device?.limits?.maxTextureDimension3D??1,maxLayers:device?.limits?.maxTextureArrayLayers??1});
   const records=new Map(),sources=new Map(),pipelines=new Map(),samplers=new Map();
-  let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop;
+  let textureBytes=0,disposed=false,terminal=null,busy=false,pending=Promise.resolve(),mipSampler=null,rejectStop,releaseDeviceLoss=null;
   const stopped=new Promise((_,reject)=>{rejectStop=reject;});stopped.catch(()=>{});
   const stats={allocations:0,uploads:0,writeCalls:0,externalCopies:0,mipPasses:0};
   function inspect(t,options){
@@ -462,7 +464,7 @@ export function createGpuThreeTextures(device,{
     }
     if(--r.resource.refs===0){const a=r.resource;a.texture.destroy();textureBytes-=a.bytes;sources.get(a.source)?.delete(a.key);
       if(sources.get(a.source)?.size===0)sources.delete(a.source);}}
-  function release(){for(const t of [...records.keys()])drop(t);
+  function release(){releaseDeviceLoss?.();releaseDeviceLoss=null;for(const t of [...records.keys()])drop(t);
     for(const variants of sources.values())for(const r of variants.values())r.texture.destroy();
     sources.clear();textureBytes=0;pipelines.clear();samplers.clear();mipSampler=null;}
   function stop(error){if(!terminal){terminal=error;release();rejectStop(error);}return terminal;}
@@ -730,7 +732,8 @@ export function createGpuThreeTextures(device,{
   if(!device?.limits||!Number.isSafeInteger(device.limits.maxTextureDimension2D)||typeof device.createTexture!=='function'||
     typeof device.createSampler!=='function'||typeof device.queue?.writeTexture!=='function'||typeof device.queue.onSubmittedWorkDone!=='function'||
     typeof device.pushErrorScope!=='function'||typeof device.popErrorScope!=='function'||typeof device.lost?.then!=='function')fail('DEVICE','Supply a WebGPU device with texture uploads');
-  device.lost.then(info=>{if(!disposed)stop(new ThreeTextureError('LOST',info?.message||'Device lost'));},e=>{if(!disposed)stop(e);});
+  releaseDeviceLoss=subscribeGpuDeviceLoss(device.lost,
+    info=>{if(!disposed)stop(new ThreeTextureError('LOST',info?.message||'Device lost'));},e=>{if(!disposed)stop(e);});
   return api;
 }
 

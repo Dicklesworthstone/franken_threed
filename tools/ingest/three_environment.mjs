@@ -4,6 +4,7 @@
  * This is the core's explicit GGX/DFG profile, not Three PMREM pixel parity.
  */
 import {createGpuAnimationEnvironment, planAnimationEnvironment} from './animation_environment.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class ThreeEnvironmentError extends Error {
   constructor(code, message) {
@@ -487,9 +488,10 @@ export async function createGpuThreeEnvironment(device, texture, {
     fail('LIMIT', 'Panorama, filter uniforms and output maps exceed the old-plus-new budget');
   if (signal?.aborted) fail('ABORTED', 'Environment preparation was aborted');
   const pixels = shape.capture || shape.imageCube || shape.imagePanorama ? null : shape.cube ? captureCube(shape) : capture(shape), lifetime = new AbortController();
-  let input = null, map = null, terminal = null, disposed = false, rejectStop;
+  let input = null, map = null, terminal = null, disposed = false, rejectStop, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function release() {
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     texture.removeEventListener('dispose', onSourceDispose);
     signal?.removeEventListener('abort', onAbort);
     lifetime.abort(); map?.dispose(); map = null; input?.destroy(); input = null;
@@ -509,7 +511,8 @@ export async function createGpuThreeEnvironment(device, texture, {
   }
   texture.addEventListener('dispose', onSourceDispose);
   signal?.addEventListener('abort', onAbort, {once: true});
-  device.lost.then(info => stop(new ThreeEnvironmentError('DEVICE', info?.message ?? 'GPU device lost')), stop);
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stop(new ThreeEnvironmentError('DEVICE', info?.message ?? 'GPU device lost')), stop);
   try {
     if (signal?.aborted) onAbort(); check();
     let error, errors = [];

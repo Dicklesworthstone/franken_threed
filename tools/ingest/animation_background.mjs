@@ -6,6 +6,8 @@
  * Screen UVs have (0,0) at bottom-left, before the explicit six-value transform.
  * Source texture/device/attachments stay caller-owned and must outlive use.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class AnimationBackgroundError extends Error {
   constructor(code, message) {
     super(`ANIMATION_BACKGROUND_${code}: ${message}`);
@@ -134,9 +136,9 @@ export async function createGpuAnimationBackground(device, source, options = {})
     fail('SOURCE', 'Background view format must be compatible with borrowed storage');
   const levels = source.mipLevelCount;
   let buffer = null, pipeline = null, group = null, disposed = false, terminal = null, busy = false, frames = 0;
-  let pending = Promise.resolve(), rejectStop;
+  let pending = Promise.resolve(), rejectStop, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
-  function release() { signal?.removeEventListener('abort', onAbort); buffer?.destroy(); buffer = null; pipeline = null; group = null; }
+  function release() { releaseDeviceLoss?.(); releaseDeviceLoss = null; signal?.removeEventListener('abort', onAbort); buffer?.destroy(); buffer = null; pipeline = null; group = null; }
   function stop(error) { if (!terminal && !disposed) { terminal = error; rejectStop(error); if (!busy) release(); } }
   function onAbort() { stop(new AnimationBackgroundError('ABORTED', 'Background lifetime was aborted')); }
   function live() { if (disposed) fail('DISPOSED', 'Background is disposed'); if (terminal) throw terminal; }
@@ -157,7 +159,8 @@ export async function createGpuAnimationBackground(device, source, options = {})
     return complete;
   }
   signal?.addEventListener('abort', onAbort, {once: true});
-  device.lost.then(info => stop(new AnimationBackgroundError('DEVICE', info?.message ?? 'GPU device lost')), stop);
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stop(new AnimationBackgroundError('DEVICE', info?.message ?? 'GPU device lost')), stop);
   try {
     if (signal?.aborted) onAbort(); live();
     let layout;
