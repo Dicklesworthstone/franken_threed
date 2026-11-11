@@ -26,7 +26,7 @@
  * - Admission failures discovered during deferred preparation are thrown from
  *   the next `render()`/`compileAsync()` call instead of the original call.
  * - Unsupported source state (advanced render targets, XR presentation, custom tone
- *   mapping on the native output path, unsupported output color spaces,
+ *   mapping in direct native canvas rendering, unsupported output color spaces,
  *   transparent clears with tone mapping) throws `F3DRendererError` rather than
  *   silently rendering something else.
  */
@@ -76,7 +76,7 @@ export class F3DRendererError extends Error {
 const fail = (code, message) => { throw new F3DRendererError(code, message); };
 const NOT_INITIALIZED = 'THREE.Renderer: .render() called before the backend is initialized. Use "await renderer.init();" before rendering.';
 // r186 tone-mapping constants -> explicit output-pass names. CustomToneMapping (5)
-// runs only in the WebGL surface's source shaders, never in a fixed output pass.
+// runs only in a source shader/TSL output graph, never in a fixed output pass.
 const TONE_MAPPINGS = new Map([[0, 'none'], [1, 'linear'], [2, 'reinhard'], [3, 'cineon'], [4, 'aces-filmic'], [6, 'agx'], [7, 'neutral']]);
 const PARAMETERS = new Set(['outputType', 'canvas', 'antialias', 'alpha', 'depth', 'stencil', 'samples', 'forceWebGL',
   'logarithmicDepthBuffer', 'reversedDepthBuffer', 'powerPreference', 'requiredLimits', 'requiredFeatures',
@@ -436,6 +436,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._renderTarget = null;
       this._outputRenderTarget = null;
       this._outputQuads = new Map();
+      this._outputQuadLeases = new WeakMap();
       this._targetDepthInitialized = new WeakSet();
       this._outputBufferType = parameters.outputBufferType ?? parameters.colorBufferType ?? THREE.HalfFloatType;
       this._activeCubeFace = 0;
@@ -688,7 +689,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
      * output) tone-maps inside each material's program instead, unless a scene
      * needed a draw the program route cannot take (sticky fallback). Custom
      * operators require their source program and cannot use that fallback. */
-    _wantsHdr(tone, space = this.outputColorSpace) { return !this._shaderEncodedOutput &&
+    _wantsHdr(tone, space = this.outputColorSpace) { return !this._shaderEncodedOutput && tone !== 'source' &&
       (tone !== 'none' || space !== THREE.LinearSRGBColorSpace) ||
       tone !== 'none' && tone !== 'custom' && this._hdrFallback === true; }
     _outputBufferFormat() {
@@ -756,8 +757,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         return 'custom';
       }
       const name = TONE_MAPPINGS.get(toneMapping);
-      if (name === undefined) fail('UNSUPPORTED', `Tone mapping ${toneMapping} has no admitted output pass`);
-      return name;
+      if (name !== undefined) return name;
+      // Keep registration/source graph construction in the retained library.
+      // A registered operator may prepare before init() without asking the
+      // fixed canvas shader to implement an unknown curve. Only the explicit
+      // output-target and RenderPipeline paths execute that source graph.
+      const library = this.library, mappings = library && Object.getOwnPropertyDescriptor(library, 'toneMappingNodes');
+      if (!this._shaderEncodedOutput && Object.getPrototypeOf(library) === THREE.StandardNodeLibrary.prototype &&
+          library.getToneMappingFunction === THREE.StandardNodeLibrary.prototype.getToneMappingFunction &&
+          mappings && Object.hasOwn(mappings, 'value') && mappings.value instanceof Map &&
+          typeof Map.prototype.get.call(mappings.value, toneMapping) === 'function') return 'source';
+      fail('UNSUPPORTED', `Tone mapping ${toneMapping} has no admitted output pass`);
     }
     _bufferSize() {
       return [Math.floor(this._width * this._pixelRatio), Math.floor(this._height * this._pixelRatio)];
@@ -1075,6 +1085,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         {webgl: this._shaderEncodedOutput, generateMipmaps: target.texture.generateMipmaps}) : null;
       if (this.xr.enabled && this.xr.isPresenting) fail('UNSUPPORTED', 'XR presentation is not admitted');
       const tone = this._toneMapping();
+      if (!target && tone === 'source')
+        fail('UNSUPPORTED', 'Registered native tone mapping requires an output render target or a RenderPipeline output graph');
       // Switching between direct and tone-mapped output rebuilds the canvas
       // session (same device) at the next preparation boundary.
       if (!target) this._rebuild = this._wantsHdr(tone) !== this._hdr ||
@@ -1490,16 +1502,26 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _outputQuad(target, layer = 0) {
       let cache = this._outputQuads.get(target);
       if (!cache) {
-        cache = {quads: new Map(), dispose: () => {
+        cache = {quads: new Map(), records: new Set(), epoch: 0, sourceTransforms: false, transform: null, dispose: () => {
           if (cache.resizing) return;
           target.removeEventListener('dispose', cache.dispose);
-          for (const quad of cache.quads.values()) quad.material.dispose();
+          for (const record of cache.records) { record.retired = true; record.release(); }
           this._outputQuads.delete(target);
         }};
         target.addEventListener('dispose', cache.dispose);
         this._outputQuads.set(target, cache);
       }
-      const key = `${this.toneMapping},${this.currentColorSpace},${layer}`;
+      const transform = `${this.toneMapping},${this.currentColorSpace}`;
+      cache.sourceTransforms ||= this._toneMapping() === 'source';
+      if (cache.sourceTransforms && cache.transform !== transform) {
+        // NodeManager's output key selects one current graph. Switching away
+        // and back reconstructs a registered function, including its effects
+        // and current library entry. Accepted older graphs keep their leases.
+        cache.epoch++;
+        for (const record of cache.records) { record.retired = true; record.release(); }
+      }
+      cache.transform = transform;
+      const key = `${transform},${layer},${cache.epoch}`;
       let quad = cache.quads.get(key);
       if (!quad) {
         quad = new THREE.QuadMesh(new THREE.NodeMaterial());
@@ -1513,8 +1535,23 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // Distinct graph identities keep earlier queued captures valid when a
         // later call changes the renderer's output transform before preparation.
         cache.quads.set(key, quad);
+        const record = {quad, references: 0, retired: false, destinations: new Set(), release: () => {
+          if (!record.retired || record.references !== 0 || !cache.records.delete(record)) return;
+          cache.quads.delete(key); this._outputQuadLeases.delete(quad); quad.material.dispose();
+          for (const destination of record.destinations) {
+            destination._dispatcher?.retire(quad); destination._wanted.delete(quad);
+          }
+          record.destinations.clear();
+        }};
+        cache.records.add(record); this._outputQuadLeases.set(quad, record);
       }
       return quad;
+    }
+    _retainOutputQuad(quad) {
+      const record = this._outputQuadLeases.get(quad);
+      record.references++;
+      let held = true;
+      return () => { if (held) { held = false; record.references--; record.release(); } };
     }
     _makeOutputRequests(scene, camera, clearOnly = null, captureCameras = true, sceneLifecycle = null) {
       if (!this._outputRenderTarget || this._shaderEncodedOutput)
@@ -1591,7 +1628,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             if (captureCameras) {
               this.info.calls++; this.info.render.calls++; this.info.render.frameCalls++;
             }
-            const output = this._makeRequest(quad, quad.camera, null, captureCameras, clearOnly ? previousTarget : outputTarget);
+            const releaseOutputQuad = this._retainOutputQuad(quad);
+            let output;
+            try { output = this._makeRequest(quad, quad.camera, null, captureCameras, clearOnly ? previousTarget : outputTarget); }
+            catch (error) { releaseOutputQuad(); throw error; }
+            output.releaseOutputQuad = releaseOutputQuad;
+            this._outputQuadLeases.get(quad).destinations.add(output.destination);
             output.outputTransform = {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
               outputColorSpace: this.outputColorSpace};
             requests.push(output);
@@ -1718,6 +1760,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       request.releaseDestination?.(); request.releaseDestination = null;
       request.releaseCanvas?.(); request.releaseCanvas = null;
+      request.releaseOutputQuad?.(); request.releaseOutputQuad = null;
     }
     _dropInstanceFrame(materialFrame) {
       const frame = materialFrame?.instanceFrame;

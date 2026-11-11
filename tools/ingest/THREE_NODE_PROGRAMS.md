@@ -2258,6 +2258,53 @@ Chromium 151 software Vulkan, including updates and hide/show transitions,
 with no GPU or browser errors. These results establish rendering correctness
 for those scenes; they do not measure hardware acceleration.
 
+## Registered native tone mapping in output graphs
+
+The native renderer accepts operators registered with the pinned node library's
+`addToneMapping()` API when output uses an explicit `setOutputRenderTarget()` or
+a retained `RenderPipeline` graph. `CustomToneMapping` and application-selected
+numeric IDs use the original registered TSL function, including its exposure,
+uniforms and generated graph. The existing node-program admission rules apply
+to that graph; there is no replacement with a built-in curve.
+
+```js
+const curve = THREE.TSL.Fn(([color, exposure]) => {
+  const scaled = color.mul(exposure);
+  return scaled.div(scaled.add(0.875));
+});
+renderer.library.addToneMapping(curve, THREE.CustomToneMapping);
+renderer.toneMapping = THREE.CustomToneMapping;
+renderer.setOutputRenderTarget(outputTarget);
+await renderer.init();
+renderer.render(scene, camera);
+```
+
+For canvas presentation, a `RenderPipeline` can perform the registered output
+conversion in its source output graph. Registering and selecting the operator
+before `init()` is supported. Ordinary `renderer.render()` or `clear()` directly
+to the canvas still rejects a registered custom operator before drawing: that
+canvas route has a fixed output shader, which cannot execute an arbitrary TSL
+function. An unrelated explicit render target retains its ordinary working-linear
+behavior and does not apply the renderer's output transform.
+
+Each accepted output draw captures exposure and custom graph uniforms before
+asynchronous preparation. Clear and compile operations retain the output target's
+existing selection rules. The source output key controls graph reconstruction:
+an unchanged key keeps its constructed function; changing the tone operator or
+output space and returning builds the current registration. Earlier queued graph
+generations remain alive until submission. Retired quads, their scene preparation
+entries and materials are then released, so repeatedly changing operators does
+not accumulate unused output scenes.
+
+`three_renderer_output_targets.test.mjs` checks full generated WGSL against the
+pinned builder after matching its reference-node initialization, queued cold
+exposures and custom uniforms, registration before initialization, target/clear
+selection, source cache transitions, retired scene cleanup and actual native
+RenderPipeline canvas commands. Browser pixels are not established by those
+recording-device tests. This adds native API execution; it does not broaden the
+compiler's ownership proof for arbitrary access to `renderer.library` or establish
+full tone-mapping compatibility or hardware acceleration.
+
 ## Explicit remaining boundaries
 
 This is a bounded native graphics entrance, not full TSL coverage. Non-atomic

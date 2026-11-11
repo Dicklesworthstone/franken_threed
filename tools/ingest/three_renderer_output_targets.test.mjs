@@ -50,6 +50,185 @@ function uniformWords(draw) {
     }));
 }
 
+function registeredToneMapping(renderer, mapping, name = 'registeredToneMapping', gain = null) {
+  const fn = T.TSL.Fn(([color, exposure]) => {
+    const exposed = color.mul(exposure);
+    const output = exposed.div(exposed.add(.875));
+    return gain ? output.mul(gain) : output;
+  }).setLayout({name, type: 'vec3', inputs: [{name: 'color', type: 'vec3'}, {name: 'exposure', type: 'float'}]});
+  renderer.library.addToneMapping(fn, mapping);
+  return fn;
+}
+
+for (const mapping of [T.CustomToneMapping, 42])
+test(`registered native tone operator ${mapping} compiles the pinned source graph into an output target`, async t => {
+  const f = fixture(t); f.renderer.setOutputRenderTarget(f.target); f.renderer.toneMapping = mapping;
+  registeredToneMapping(f.renderer, mapping);
+  await f.renderer.init();
+  f.renderer._frameBufferTargets ??= new Map();
+  const internal = T.Renderer.prototype._getFrameBufferTarget.call(f.renderer);
+  const quad = f.renderer._outputQuad(internal);
+  // RendererReferenceNode resolves its renderer-owned uniform on first setup.
+  // Warm that source inference on both sides before comparing complete WGSL;
+  // the queued cold tests below separately assert its captured exposure bytes.
+  const warmup = new T.WGSLNodeBuilder(quad, f.renderer);
+  warmup.scene = quad; warmup.camera = quad.camera; warmup.build();
+  await f.renderer.compileAsync(f.scene, f.camera);
+  const source = new T.WGSLNodeBuilder(quad, f.renderer);
+  source.scene = quad; source.camera = quad.camera; source.build();
+  assert.equal(f.device.submissions.length, 0); assert.equal(f.acquired(), 0);
+  assert.equal(f.renderer.getRenderTarget(), null);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const draws = nativeDraws(f.device);
+  assert.equal(draws.length, 2); assert.match(code(draws[1]), /registeredToneMapping/);
+  assert.equal(draws[1].pipeline.vertex.module.code, source.vertexShader);
+  assert.equal(code(draws[1]), source.fragmentShader);
+  assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('registered output operators capture queued exposure and graph uniforms with their own targets', async t => {
+  const f = fixture(t), second = new T.RenderTarget(9, 7); t.after(() => second.dispose());
+  const gain = T.TSL.uniform(.25).setName('registeredGain');
+  registeredToneMapping(f.renderer, T.CustomToneMapping, 'registeredFirst', gain);
+  registeredToneMapping(f.renderer, 42, 'registeredSecond', gain);
+  f.renderer.setOutputRenderTarget(f.target); f.renderer.toneMapping = T.CustomToneMapping;
+  f.renderer.toneMappingExposure = .625; await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); f.renderer.setOutputRenderTarget(second);
+  gain.value = .75; f.renderer.toneMapping = 42; f.renderer.toneMappingExposure = 1.375;
+  f.renderer.render(f.scene, f.camera); gain.value = .9375; f.renderer.toneMappingExposure = 3.25;
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device), passes = drawPasses(f.device);
+  assert.equal(draws.length, 4); assert.equal(f.acquired(), 0);
+  assert.match(code(draws[1]), /registeredFirst/); assert.match(code(draws[3]), /registeredSecond/);
+  assert.ok(uniformWords(draws[1]).includes(.625)); assert.ok(uniformWords(draws[1]).includes(.25));
+  assert.ok(uniformWords(draws[3]).includes(1.375)); assert.ok(uniformWords(draws[3]).includes(.75));
+  assert.equal(passes[1].desc.colorAttachments[0].view.texture.width, 16);
+  assert.equal(passes[3].desc.colorAttachments[0].view.texture.width, 9);
+  assert.equal(f.renderer.toneMappingExposure, 3.25); assert.equal(gain.value, .9375);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('registered output mapping keeps pre-init exposures and clear selection semantics', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.setOutputRenderTarget(f.target); f.renderer.toneMapping = T.CustomToneMapping;
+  f.renderer.toneMappingExposure = .375; const first = f.renderer.renderAsync(f.scene, f.camera);
+  f.renderer.setRenderTarget(null); f.renderer.toneMappingExposure = 1.875;
+  const second = f.renderer.renderAsync(f.scene, f.camera); f.renderer.toneMappingExposure = 3.5;
+  await Promise.all([first, second]);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 4);
+  assert.ok(uniformWords(draws[1]).includes(.375)); assert.ok(uniformWords(draws[3]).includes(1.875));
+  f.renderer.setRenderTarget(null); f.renderer.clear(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 5, 'a default clear runs the registered output transform');
+  assert.equal(f.renderer.getRenderTarget(), null);
+  f.renderer.setRenderTarget(f.target); f.renderer.clear(); await drain(f.renderer);
+  assert.equal(nativeDraws(f.device).length, 5, 'explicit target clears do not run output conversion');
+  assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('registered output graph transitions preserve the source cache and retire accepted older graphs after submission', async t => {
+  const f = fixture(t), builds = [];
+  const operator = (name, bias) => T.TSL.Fn(([color, exposure]) => {
+    builds.push(name); return color.mul(exposure).add(bias);
+  }).setLayout({name, type: 'vec3', inputs: [{name: 'color', type: 'vec3'}, {name: 'exposure', type: 'float'}]});
+  f.renderer.library.addToneMapping(operator('registeredOriginal', .125), T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.setOutputRenderTarget(f.target);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  const internal = f.renderer._frameBufferTargets.get(f.target), cache = f.renderer._outputQuads.get(internal);
+  // The pinned output key excludes the library entry. An unchanged current
+  // graph keeps its first construction; switching the key builds anew.
+  f.renderer.library.toneMappingNodes.set(T.CustomToneMapping, operator('registeredReplacement', .875));
+  f.renderer.render(f.scene, f.camera);
+  f.renderer.toneMapping = T.ReinhardToneMapping; f.renderer.render(f.scene, f.camera);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.render(f.scene, f.camera);
+  assert.equal(cache.records.size, 3, 'all still-queued graph generations retain their materials');
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 8);
+  assert.match(code(draws[1]), /registeredOriginal/); assert.match(code(draws[3]), /registeredOriginal/);
+  assert.match(code(draws[5]), /reinhardToneMapping/); assert.match(code(draws[7]), /registeredReplacement/);
+  assert.deepEqual(builds, ['registeredOriginal', 'registeredReplacement']);
+  assert.equal(cache.records.size, 1); assert.equal(cache.quads.size, 1);
+  const destination = f.renderer._targets.capture(f.target);
+  assert.equal(destination._dispatcher.diagnostics.scenes, 1); assert.equal(destination._wanted.size, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0); assert.equal(f.acquired(), 0);
+});
+
+test('accepted registered output graphs survive removal of their live library entry', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .625;
+  f.renderer.setOutputRenderTarget(f.target); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  assert.equal(f.renderer._pending.length, 2);
+  f.renderer.library.toneMappingNodes.delete(T.CustomToneMapping);
+  f.renderer.toneMappingExposure = 1.875;
+  await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 2);
+  assert.match(code(draws[1]), /registeredToneMapping/);
+  assert.ok(uniformWords(draws[1]).includes(.625));
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.acquired(), 0);
+});
+
+test('a failed registered graph releases its capture and retires when a valid operator replaces it', async t => {
+  const f = fixture(t);
+  f.renderer.library.addToneMapping(T.TSL.Fn(() => { throw new Error('registered graph failed'); }), T.CustomToneMapping);
+  registeredToneMapping(f.renderer, 42);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.setOutputRenderTarget(f.target);
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /registered graph failed/);
+  const internal = f.renderer._frameBufferTargets.get(f.target), cache = f.renderer._outputQuads.get(internal);
+  const failed = [...cache.records][0];
+  assert.equal(failed.references, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.device.submissions.length, 0);
+  f.renderer.toneMapping = 42; await f.renderer.renderAsync(f.scene, f.camera);
+  assert.equal(cache.records.has(failed), false); assert.equal(cache.records.size, 1);
+  assert.equal(f.renderer._outputQuadLeases.has(failed.quad), false);
+  assert.equal(nativeDraws(f.device).length, 2); assert.equal(f.acquired(), 0);
+});
+
+test('disposing queued registered output releases every retained graph and request', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.setOutputRenderTarget(f.target);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  const internal = f.renderer._frameBufferTargets.get(f.target), cache = f.renderer._outputQuads.get(internal);
+  const record = [...cache.records][0]; assert.equal(record.references, 1);
+  f.target.dispose(); await assert.rejects(drain(f.renderer), /disposed|replaced|stale/i);
+  assert.equal(record.references, 0); assert.equal(cache.records.size, 0); assert.equal(cache.quads.size, 0);
+  assert.equal(f.renderer._outputQuadLeases.has(record.quad), false);
+  assert.equal(f.renderer._outputQuads.size, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.acquired(), 0);
+});
+
+test('RenderPipeline applies a registered operator to canvas after registration before initialization', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; f.renderer.toneMappingExposure = .625;
+  const pipeline = new T.RenderPipeline(f.renderer, T.TSL.vec4(.125, .375, .625, 1));
+  t.after(() => pipeline.dispose());
+  await f.renderer.init(); pipeline.render(); await drain(f.renderer);
+  const draws = nativeDraws(f.device); assert.equal(draws.length, 1);
+  assert.match(code(draws[0]), /registeredToneMapping/); assert.match(code(draws[0]), /sRGBTransferOETF/);
+  assert.ok(uniformWords(draws[0]).includes(.625)); assert.equal(f.acquired(), 1);
+  assert.equal(f.renderer.toneMapping, T.CustomToneMapping); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('registered native operators never enter the fixed canvas pass, including clear and compile', async t => {
+  const f = fixture(t); registeredToneMapping(f.renderer, T.CustomToneMapping);
+  f.renderer.toneMapping = T.CustomToneMapping; await f.renderer.init();
+  const before = f.device.submissions.length;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /requires an output render target or a RenderPipeline/);
+  assert.throws(() => f.renderer.clear(), /requires an output render target or a RenderPipeline/);
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /requires an output render target or a RenderPipeline/);
+  assert.equal(f.device.submissions.length, before); assert.equal(f.acquired(), 0);
+  assert.equal(f.renderer._pending.length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('unregistered native operators retain explicit refusal without invoking custom library lookups', async t => {
+  const f = fixture(t); f.renderer.toneMapping = T.CustomToneMapping;
+  let calls = 0;
+  f.renderer.library.getToneMappingFunction = () => { calls++; return () => T.TSL.vec3(1); };
+  await assert.rejects(f.renderer.init(), /has no admitted output pass/);
+  assert.equal(calls, 0); assert.equal(f.device.submissions.length, 0); assert.equal(f.acquired(), 0);
+});
+
 test('working-linear default output renders directly to its physical target without canvas acquisition', async t => {
   const f = fixture(t); f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
   assert.equal(f.renderer.setOutputRenderTarget(f.target), undefined);

@@ -196,6 +196,14 @@ precedence. Queued output passes keep their own target generations, tone operato
 exposure and render-frequency updates; `compileAsync()` prepares the scene and
 output passes.
 
+Registered `renderer.library.addToneMapping()` operators, including
+`CustomToneMapping`, execute their retained TSL function in this output graph
+or a retained `RenderPipeline` output graph. Registration before `init()` and
+queued exposure/uniform captures are supported. Direct native canvas rendering
+still requires a built-in operator. See
+[THREE_NODE_PROGRAMS.md](./THREE_NODE_PROGRAMS.md#registered-native-tone-mapping-in-output-graphs)
+for source graph caching, lifetime and the remaining admission boundaries.
+
 Multiple-color output targets support working-linear rendering with
 `outputColorSpace = LinearSRGBColorSpace` and `toneMapping = NoToneMapping`.
 Their attachments retain the ordinary target owner's formats, independent
@@ -1400,7 +1408,7 @@ unmeasured.
 - Admission errors found during deferred preparation throw from the next
   `render()`/`compileAsync()`.
 - Not admitted (explicit `F3DRendererError`/`ThreeSceneError`):
-  XR, custom tone mapping on the native output path,
+  XR, custom tone mapping in direct native canvas rendering,
   node graphs outside the initial unlit graphics profile, the remaining physical-material extensions,
   MeshDepth materials,
   transparent clears with tone mapping.
