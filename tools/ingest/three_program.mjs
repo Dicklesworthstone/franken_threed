@@ -346,7 +346,10 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     }
     let result = byKey.get(key), publish = null;
     if (!result) {
-      parameters.uniforms = webglMaterialUniforms(T, material);
+      // A cold queued render chooses its accepted source dictionary. Publish
+      // the original only after successful compilation; later queued requests
+      // retain snapshots for every still-possible dictionary identity.
+      parameters.uniforms = state().uniformSnapshots?.sourceFor(material) ?? webglMaterialUniforms(T, material);
       shaderCallback(renderer => material.onBeforeCompile(parameters, renderer));
       result = {vertexShader: parameters.vertexShader, fragmentShader: parameters.fragmentShader};
       // Source getProgram publishes only after acquireProgram has assembled
@@ -382,11 +385,15 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     return entry;
   }
   /** materialProperties.uniforms, or the source getUniforms before first use. */
-  function uniformsFor(material) {
+  function uniformsSourceFor(material) {
     if (clones.has(material)) return clones.get(material);
     if (material.isShaderMaterial) return material.uniforms;
     const u = webglMaterialUniforms(T, material); clones.set(material, u);
     return u;
+  }
+  function uniformsFor(material) {
+    const source = uniformsSourceFor(material);
+    return state().uniformSnapshots?.uniformsFor(material, source) ?? source;
   }
   /** WebGLRenderer.setProgram binds shadow maps from the light state by uniform
    * name for every material that needs lights (not from material uniforms). */
@@ -422,7 +429,7 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
     return uniforms;
   }
   const support = Object.freeze({
-    compile, uniformsFor, refresh, needsLights: materialNeedsLights,
+    compile, uniformsFor, uniformsSourceFor, refresh, needsLights: materialNeedsLights,
     /** r186 PMREM owner (three_program_pmrem.mjs) when injected. */
     createPMREM: pmrem ? (device, bindingOf) => pmrem({three: T, device, bindingOf}) : null,
     /** r186 WebGLShadowMap port (three_program_shadows.mjs) when injected. */
@@ -451,7 +458,7 @@ export function createThreeProgramSupport({three: T, state, maxPrograms = 256, m
       const textures = packThreeProgramUniforms(T, reflection, uniforms, object, camera, bytes, {toneMappingExposure: s.toneMappingExposure ?? 1,
         logarithmicDepthBuffer: s.logarithmicDepthBuffer === true,
         samplers: objectSamplers(material, object), ...options});
-      uniformBlocks.pack(reflection, material, bytes);
+      uniformBlocks.pack(reflection, material, bytes, s.uniformSnapshots?.groupsFor(material));
       return textures;
     },
     /** One renderer.render() call: r186 uploads each UniformsGroup at most once per frame. */
@@ -585,8 +592,7 @@ function createUniformBlocks() {
       }
     }
   }
-  function pack(reflection, material, bytes) {
-    const groups = material?.uniformsGroups ?? [];
+  function pack(reflection, material, bytes, groups = material?.uniformsGroups ?? []) {
     // WebGLRenderer.setProgram updates every group the material lists.
     const updated = new Map(groups.map(g => [g, bytesOf(g)]));
     if (!reflection.blocks?.length) return;

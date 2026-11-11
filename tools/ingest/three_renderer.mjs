@@ -44,6 +44,7 @@ import {threeWebGPUStencilValue} from './three_program_stencil.mjs';
 import {registerThreePassState, captureThreePassState, finishThreePassState, requiresThreePassCamera, getThreePassExcludedObjects} from './three_pass_state.mjs';
 import {registerThreeGpuComputation} from './three_gpu_computation.mjs';
 import {createThreeProgramSupport} from './three_program.mjs';
+import {createThreeProgramUniformSnapshots} from './three_program_uniform_snapshots.mjs';
 import {gpuProgramModule} from './gpu_program_modules.mjs';
 import {createThreeProgramPMREM} from './three_program_pmrem.mjs';
 import {hasThreeWebGLTextureResidency} from './three_textures.mjs';
@@ -445,6 +446,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._passSnapshots = createThreePassSnapshots(THREE, {targets: this._targets});
       this._passInstances = createThreePassInstances(THREE, {maxBytes: sceneLimits.maxInstanceBytes ?? 128 * 1024 * 1024,
         maxMeshes: sceneLimits.maxInstanceMeshes ?? Math.min(maxBindings, 4096)});
+      this._programUniformSnapshots = createThreeProgramUniformSnapshots(THREE, {maxMaterials: maxBindings});
       this._nodeProgramSupport = null;
       this._nodeBackgrounds = null;
       this._nodeBundles = null;
@@ -681,6 +683,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._wanted.clear();
       dispose(() => this._passSnapshots.dispose());
       dispose(() => this._passInstances.dispose());
+      dispose(() => this._programUniformSnapshots.dispose());
       dispose(() => this._nodeBackgrounds?.dispose()); this._nodeBackgrounds = null;
       dispose(() => this._nodeProgramSupport?.dispose());
       this._nodeProgramSupport = null;
@@ -1339,9 +1342,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         try { materialFrame = this._captureMaterialFrame({scene, nodeFrame, overrideMaterial}); }
         catch (error) { this._releaseRequest({nodeFrame}); throw error; }
       } else if (this._shaderEncodedOutput && !clearOnly && !snapshot && !this.shadowMap.enabled) {
-        // UI material changes may arrive while an accepted draw prepares its
-        // pipeline. Keep that draw's selector, without freezing live uniforms or
-        // changing hooked projection/shadow work's established source ordering.
+        // Keep accepted selectors before asynchronous preparation. Ordinary
+        // shader data is captured separately below, preserving source program
+        // identities and hooked projection/shadow work's observation boundaries.
         materialFrame = requiredMaterialFrame ?? this._captureMaterialFrame({scene, camera, overrideMaterial, selectionOnly: true});
         if (requiredMaterialFrame) this._materialCaptureValues += materialFrame.values;
       }
@@ -1372,6 +1375,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             this._materialCaptureValues += materialFrame.instanceFrame.values;
           }
         }
+        if (webglSourceCamera && materialFrame?.cameraSafe()) {
+          request.uniformSnapshots = this._programUniformSnapshots.capture(materialFrame.materials.keys(),
+            material => destination._programSupport?.uniformsSourceFor(material));
+        }
         Object.assign(request, {scene: snapshot?.root ?? scene, camera: snapshot?.camera ?? camera, matricesUpdated, clearOnly, destination, mipLevel, face, frame,
           overrideMaterial: request.overrideSnapshot?.material ?? overrideMaterial, mrt,
           webglSourceCamera, passCameraRequired,
@@ -1388,6 +1395,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           srgbView: target ? false : this._canvasSrgbView(outputProfile?.space ?? this.outputColorSpace,
             !sourceCanvasOutput && this._wantsHdr(this._toneMapping()), outputProfile), outputProfile, key,
           programFrame: {toneMapping: this.toneMapping, toneMappingExposure: this.toneMappingExposure,
+            uniformSnapshots: request.uniformSnapshots,
             passTextureEntries: snapshot?.targetEntries ?? request.overrideSnapshot?.targetEntries,
             outputColorSpace: this.outputColorSpace, pixelRatio: this._pixelRatio, height: this._height,
             logarithmicDepthBuffer: this.logarithmicDepthBuffer === true,
@@ -1775,6 +1783,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       request.snapshot?.release();
       request.overrideSnapshot?.release();
+      request.uniformSnapshots?.release(); request.uniformSnapshots = null;
+      if (request.programFrame) delete request.programFrame.uniformSnapshots;
       if (request.materialFrame) {
         request.materialFrame.instanceFrame?.release();
         this._materialCaptureValues -= request.materialFrame.values; request.materialFrame = null;
@@ -1826,8 +1836,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideSnapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
       webglSourceCamera = null, passCameraRequired = false,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
-      const cameraSafe = webglSourceCamera || programFrame?.toneMappingChunk !== undefined ? materialFrame?.cameraSafe?.() : true;
+      const cameraSafe = webglSourceCamera || programFrame?.toneMappingChunk !== undefined || programFrame?.uniformSnapshots
+        ? materialFrame?.cameraSafe?.() : true;
       if (materialFrame && !cameraSafe && programFrame?.toneMappingChunk !== undefined) delete programFrame.toneMappingChunk;
+      if (!cameraSafe && programFrame?.uniformSnapshots) {
+        programFrame.uniformSnapshots.release(); delete programFrame.uniformSnapshots;
+      }
       if (webglSourceCamera && !cameraSafe) {
         if (passCameraRequired) fail('UNSUPPORTED', 'Pinned pass scene or camera gained callbacks before its captured draw submitted');
         // An application may install hooks while preparation is pending. Keep
@@ -1868,6 +1882,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._programFrame = deferred ? programFrame : this._shaderEncodedOutput ? {
         passState: programFrame.passState, passClear: programFrame.passClear, passBackgroundClear: programFrame.passBackgroundClear,
         passTextureEntries: programFrame.passTextureEntries,
+        uniformSnapshots: programFrame.uniformSnapshots,
         cameraSource: programFrame.cameraSource, cameraSnapshot: programFrame.cameraSnapshot,
       } : undefined;
       try {
@@ -2154,6 +2169,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         // after acceptance must retain their global shader reads and writes.
         if (request?.programFrame?.toneMappingChunk !== undefined && request.materialFrame && !request.materialFrame.cameraSafe())
           delete request.programFrame.toneMappingChunk;
+        if (request?.programFrame?.uniformSnapshots && !request.materialFrame?.cameraSafe?.()) {
+          request.uniformSnapshots.release(); request.uniformSnapshots = null;
+          delete request.programFrame.uniformSnapshots;
+        }
         if (request?.materialFrame?.instanceFrame && !request.materialFrame.cameraSafe()) {
           if (request.passCameraRequired) fail('UNSUPPORTED', 'Pinned pass scene or camera gained callbacks before preparation');
           this._dropInstanceFrame(request.materialFrame);
