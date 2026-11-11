@@ -17,13 +17,15 @@ export function captureTargetColor(renderer, texture, retain) {
     ({entry, colorIndex} = targets.captureNativeTexture(texture, {sampled: false}));
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   retain(entry);
-  const explicitMipmaps = !renderer._shaderEncodedOutput && (entry.historyGroup || entry.shape.textures.length > 1 ||
+  // Both renderer routes capture MRT copy generation independently of the
+  // initialized allocation; WebGL may grow this color after the base write.
+  const explicitMipmaps = entry.shape.textures.length > 1 || !renderer._shaderEncodedOutput && (entry.historyGroup ||
     !entry.shape.cube && !entry.shape.array && !entry.shape.volume);
   // A raw copy addresses cube faces as native array layers. Never introduce
   // a cube sampler, source-face permutation, CPU upload or UV-flipped replica.
   const shape = {...entry.shape.colors[colorIndex], depth: entry.shape.layers ?? 1,
     viewDimension: entry.shape.cube ? '2d-array' : entry.shape.viewDimension,
-    // CubeCamera and native 2D colors can change this flag while retaining
+    // CubeCamera, MRT and native 2D colors can change this flag while retaining
     // their allocation. Capture this call's policy independently of its mips.
     ...(entry.shape.cube || explicitMipmaps
       ? {generateMipmaps: texture.generateMipmaps} : {})};

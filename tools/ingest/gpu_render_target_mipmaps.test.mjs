@@ -219,3 +219,148 @@ test('throwing mip callbacks retain their depth allocation through resize retire
   for (const texture of old) assert.equal(texture.destroyed, 1);
   assert.equal(t.allocatedBytes, 156); t.dispose(); gone(f);
 });
+
+function growthFixture() {
+  const f = gpuTargetMipmapFixture();
+  Object.assign(f.device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32, maxTextureArrayLayers: 256});
+  return f;
+}
+
+for (const sampleCount of [1, 4]) for (const layerCount of [1, 3]) {
+  test(`selected mip growth preserves siblings, depth and samples (${sampleCount} samples, ${layerCount} layers)`, async () => {
+    const f = growthFixture(), oldLevels = sampleCount === 1 ? 2 : 1;
+    const t = createGpuRenderTarget(f.device, {width: 8, height: 4,
+      colorFormats: ['rgba16float', 'rgba8unorm'], colorMipLevelCounts: [oldLevels, oldLevels],
+      depthFormat: 'depth24plus', sampleCount, ...(layerCount > 1 ? {arrayLayers: layerCount, depthArray: true} : {})});
+    const before = new Map();
+    for (let face = 0; face < layerCount; face++) for (let mipLevel = 0; mipLevel < oldLevels; mipLevel++)
+      t.withFrame(frame => before.set(`${mipLevel}/${face}`, frame), {mipLevel, face});
+    t.withFrame(() => f.device.queue.submit([{marker: 'prior draw and resolve'}]));
+    let original;
+    t.withAttachments(colors => { original = colors; });
+    const initialBytes = t.allocatedBytes, textures = f.textures.length, version = t.version;
+    const fullBytes = 43 * 4 * layerCount, oldBytes = (oldLevels === 2 ? 40 : 32) * 4 * layerCount;
+    assert.equal(t.mipmapGrowthBytes([1]), fullBytes);
+    assert.equal(f.textures.length, textures, 'budget inspection allocates nothing');
+    assert.equal(f.submissions.length, 1, 'budget inspection submits nothing');
+    const fence = deferred(); f.controls.completion = fence;
+    assert.equal(t.growMipmaps([1]), true);
+    assert.equal(t.version, version, 'content-preserving growth does not change the logical resize epoch');
+    assert.equal(t.allocatedBytes, initialBytes + fullBytes, 'old and full replacement colors are charged until the fence');
+    assert.deepEqual(t.diagnostics.colorMipLevelCounts, [oldLevels, 4]);
+    assert.equal(f.pipelines.length, 0, 'growth does not generate mip pixels');
+    const copied = f.submissions[1][0].copies;
+    assert.equal(copied.length, oldLevels);
+    const replacement = copied[0].destination.texture;
+    for (let level = 0; level < oldLevels; level++) {
+      assert.equal(copied[level].source.texture, original[1]);
+      assert.equal(copied[level].source.mipLevel, level);
+      assert.equal(copied[level].destination.texture, replacement);
+      assert.equal(copied[level].destination.mipLevel, level);
+      assert.deepEqual(copied[level].size, {width: 8 >> level, height: 4 >> level, depthOrArrayLayers: layerCount});
+    }
+    assert.equal(replacement.mipLevelCount, 4); assert.notEqual(replacement, original[1]);
+    t.withAttachments(colors => { assert.equal(colors[0], original[0]); assert.equal(colors[1], replacement); });
+    for (let face = 0; face < layerCount; face++) for (let mipLevel = 0; mipLevel < oldLevels; mipLevel++) {
+      t.withFrame(frame => {
+        const previous = before.get(`${mipLevel}/${face}`);
+        assert.equal(frame.depthView, previous.depthView);
+        assert.equal(frame.colorViews[0], previous.colorViews[0]);
+        if (sampleCount === 4) {
+          assert.equal(frame.colorViews, previous.colorViews, 'persistent MSAA views keep every sample');
+          assert.equal(frame.resolveTargets[0], previous.resolveTargets[0]);
+          assert.equal(frame.resolveTargets[1].texture, replacement);
+        } else assert.equal(frame.colorViews[1].texture, replacement);
+        const grown = frame.resolveTargets?.[1] ?? frame.colorViews[1];
+        assert.equal(grown.descriptor.baseMipLevel, mipLevel);
+        if (layerCount > 1) assert.equal(grown.descriptor.baseArrayLayer, face);
+      }, {mipLevel, face});
+    }
+    assert.equal(t.mipmapGrowthBytes([1]), 0); assert.equal(t.growMipmaps([1]), false);
+    assert.equal(f.submissions.length, 2);
+    assert.equal(t.generateMipmaps([1]), true);
+    const filtered = f.submissions[2][0].passes;
+    assert.equal(filtered.length, 3 * layerCount);
+    for (const pass of filtered) assert.equal(pass.group.entries[0].resource.texture, replacement);
+    assert.equal(original[1].destroyed, 0);
+    fence.resolve(); await t.whenIdle();
+    assert.equal(original[1].destroyed, 1); assert.equal(original[0].destroyed, 0);
+    assert.equal(t.allocatedBytes, initialBytes + fullBytes - oldBytes);
+    t.dispose(); gone(f);
+  });
+}
+
+test('mip growth budget failure leaves storage, content bindings and admission usable', async () => {
+  const f = growthFixture(), t = createGpuRenderTarget(f.device, {width: 8, height: 4,
+    colorFormats: ['rgba8unorm', 'rgba16float'], depthFormat: null, maxBytes: 384 + 344 - 1});
+  let frame;
+  t.withFrame(value => { frame = value; });
+  assert.equal(t.mipmapGrowthBytes([1]), 344);
+  assert.throws(() => t.growMipmaps([1]), {code: 'GPU_TARGET_BUDGET'});
+  assert.equal(t.failed, false); assert.equal(t.allocatedBytes, 384);
+  assert.equal(f.textures.length, 2); assert.equal(f.submissions.length, 0);
+  t.withFrame(value => assert.equal(value, frame));
+  t.resize(4, 2); await t.whenIdle();
+  assert.equal(t.growMipmaps([1]), true, 'a smaller target can retry after the ordinary resize fence');
+  await t.whenIdle(); t.dispose(); gone(f);
+});
+
+test('grown mip levels participate in transfers and retain full chains after resize', async () => {
+  const f = growthFixture(), t = make(f, {generateMipmaps: false, copyDestination: true});
+  assert.equal(t.growMipmaps([0]), true);
+  const source = make(f, {width: 1, height: 1, generateMipmaps: false});
+  assert.equal(t.copyFrom(source, {destinationMipLevel: 3}), true);
+  assert.equal(f.submissions[1][0].copies[0].destination.mipLevel, 3);
+  t.resize(4, 2); await t.whenIdle();
+  assert.equal(t.mipLevelCount, 3); assert.equal(t.allocatedBytes, 11 * 4);
+  assert.equal(t.mipmapGrowthBytes([0]), 0);
+  t.dispose(); source.dispose(); gone(f);
+});
+
+test('mip growth validates selectors and limits growth to admitted owners without affecting no-ops', () => {
+  const f = growthFixture(), t = make(f, {generateMipmaps: false});
+  for (const colors of [null, [1], [-1], [0, 0], ['0']])
+    assert.throws(() => t.mipmapGrowthBytes(colors), {code: 'GPU_TARGET_ATTACHMENT'});
+  assert.equal(t.growMipmaps([]), false);
+  t.withFrame(() => {
+    assert.equal(t.mipmapGrowthBytes([0]), 172);
+    assert.throws(() => t.growMipmaps([0]), {code: 'GPU_TARGET_REENTRANT'});
+  });
+  t.reserveColorHistory([0]);
+  assert.throws(() => t.mipmapGrowthBytes([0]), {code: 'GPU_TARGET_MIP'});
+  const cube = make(f, {width: 4, height: 4, cube: true, generateMipmaps: false});
+  assert.throws(() => cube.growMipmaps([0]), {code: 'GPU_TARGET_MIP'});
+  const complete = make(f, {width: 4, height: 4, cube: true});
+  assert.equal(complete.mipmapGrowthBytes([0]), 0); assert.equal(complete.growMipmaps([0]), false);
+  const suspended = make(f, {width: 0, generateMipmaps: false});
+  assert.equal(suspended.mipmapGrowthBytes([0]), 0); assert.equal(suspended.growMipmaps([0]), false);
+  t.dispose(); cube.dispose(); complete.dispose(); suspended.dispose(); gone(f);
+});
+
+for (const stage of ['allocation', 'view', 'copy', 'submit', 'validation', 'fence']) {
+  test(`mip growth ${stage} failure releases partial and current allocations exactly once`, async () => {
+    const f = growthFixture(), t = createGpuRenderTarget(f.device, {width: 8, height: 4,
+      colorFormats: ['rgba8unorm', 'rgba16float'], depthFormat: 'depth24plus'});
+    await t.validation;
+    const error = Error(`growth ${stage}`), create = f.device.createTexture;
+    if (stage === 'allocation' || stage === 'view') {
+      let calls = 0;
+      f.device.createTexture = descriptor => {
+        if (stage === 'allocation' && ++calls === 2) throw error;
+        const texture = create(descriptor);
+        if (stage === 'view') texture.createView = () => { throw error; };
+        return texture;
+      };
+    } else if (stage === 'copy') {
+      const encode = f.device.createCommandEncoder;
+      f.device.createCommandEncoder = () => ({...encode(), copyTextureToTexture() { throw error; }});
+    } else if (stage === 'submit') f.controls.submit = error;
+    else if (stage === 'validation') f.controls.validation = {message: error.message};
+    else f.device.queue.onSubmittedWorkDone = () => { throw error; };
+    if (stage === 'validation') assert.equal(t.growMipmaps([0, 1]), true);
+    else assert.throws(() => t.growMipmaps([0, 1]), error);
+    await assert.rejects(t.whenIdle(), new RegExp(`growth ${stage}`));
+    assert.equal(t.failed, true); assert.equal(t.allocatedBytes, 0); assert.deepEqual(f.scopes, []);
+    t.dispose(); gone(f);
+  });
+}

@@ -20,6 +20,20 @@ function fixture(t, samples = 0) {
   };
   device.createSampler = desc => ({...desc});
   device.createRenderPipeline = desc => ({...desc, getBindGroupLayout: () => ({})});
+  device.textureCopies = [];
+  const encode = device.createCommandEncoder;
+  device.createCommandEncoder = (...args) => {
+    const encoder = encode(...args), copies = [];
+    return {...encoder, copyTextureToTexture(source, destination, size) {
+      assert.equal(source.texture.sampleCount, 1); assert.equal(destination.texture.sampleCount, 1);
+      assert.equal(source.texture.format, destination.texture.format);
+      assert.ok(source.texture.usage & 1); assert.ok(destination.texture.usage & 2);
+      assert.ok((source.mipLevel ?? 0) < source.texture.mipLevelCount);
+      assert.ok((destination.mipLevel ?? 0) < destination.texture.mipLevelCount);
+      const copy = {source, destination, size, submission: device.submissions.length};
+      copies.push({draws: [], copy}); device.textureCopies.push(copy);
+    }, finish() { return [...encoder.finish(), ...copies]; }};
+  };
   let configured;
   const canvas = {width: 8, height: 4, style: {}, getContext: () => ({
     configure(value) { configured = value; }, unconfigure() {},
@@ -110,14 +124,58 @@ test('a material-only WebGL MRT hook can enable a previously disabled allocated 
   assert.deepEqual(f.mipPasses(start).map(pass => pass.desc.colorAttachments[0].view.texture.format), Array(3).fill('rgba16float'));
 });
 
-test('WebGL MRT callback generation refuses an unallocated chain without silently keeping stale mips', async t => {
-  const f = fixture(t); f.target.textures[1].generateMipmaps = false;
+for (const deferred of [false, true]) for (const samples of [0, 4])
+test(`WebGL MRT callbacks grow an initialized base-only color after its source draw (${deferred ? 'deferred' : 'warm'}, ${samples} samples)`, async t => {
+  const f = fixture(t, samples); f.target.textures[1].generateMipmaps = false;
   await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
-  f.material.onBeforeRender = () => { f.target.textures[1].generateMipmaps = true; };
+  const entry = f.renderer._targets.capture(f.target);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [4, 1]);
+  const before = f.device.passes.find(pass => pass.desc.colorAttachments.length === 2);
+  const base = before.desc.colorAttachments[1].resolveTarget?.texture ?? before.desc.colorAttachments[1].view.texture;
+  const scene = deferred ? new T.Scene() : f.scene, mesh = deferred ? new T.Mesh(f.geometry, f.material) : f.mesh;
+  if (deferred) { mesh.frustumCulled = false; scene.add(mesh); }
+  f.target.texture.generateMipmaps = false;
+  let calls = 0;
+  f.material.onBeforeRender = () => { calls++; f.target.textures[1].generateMipmaps = true; };
   const start = f.device.passes.length;
-  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'F3D_RENDERER_MIP'});
-  assert.equal(f.mipPasses(start).length, 0, 'a failed generation selection does not filter any sibling');
-  assert.ok(f.device.passes.slice(start).some(pass => pass.desc.colorAttachments.length === 2), 'the issued draw is not rolled back');
+  f.renderer.render(scene, f.camera);
+  assert.equal(calls, deferred ? 0 : 1, 'the existing source callback boundary is preserved');
+  if (deferred) { f.target.textures[1].generateMipmaps = false; await drain(f.renderer); }
+  assert.equal(calls, 1); assert.equal(f.renderer._targets.capture(f.target), entry);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [4, 4]);
+  const generated = f.mipPasses(start), draw = f.device.passes.slice(start).find(pass => pass.desc.colorAttachments.length === 2);
+  assert.equal(generated.length, 3);
+  assert.ok(generated.every(pass => pass.desc.colorAttachments[0].view.texture.format === 'rgba16float'));
+  assert.equal(f.device.textureCopies.length, 1);
+  const copy = f.device.textureCopies[0];
+  assert.equal(copy.source.texture, base);
+  assert.equal(generated[0].desc.colorAttachments[0].view.texture, copy.destination.texture);
+  const drawSubmission = f.device.submissions.findIndex(commands => commands.some(passes => passes.includes(draw)));
+  assert.ok(drawSubmission < copy.submission, 'copying the completed base follows the source draw and resolve');
+  assert.ok(f.device.passes.indexOf(draw) < f.device.passes.indexOf(generated[0]));
+  assert.equal(draw.desc.colorAttachments[0].view.texture, before.desc.colorAttachments[0].view.texture);
+  if (samples === 4) assert.equal(draw.desc.colorAttachments[1].view.texture, before.desc.colorAttachments[1].view.texture);
+});
+
+test('callback-free queued WebGL MRT growth occurs only at the accepted generating draw', async t => {
+  const f = fixture(t);
+  for (const texture of f.target.textures) texture.generateMipmaps = false;
+  await f.renderer.init();
+  const entry = f.renderer._targets.capture(f.target);
+  f.renderer.render(f.scene, f.camera);
+  f.target.textures[1].generateMipmaps = true; f.renderer.render(f.scene, f.camera);
+  f.target.textures[1].generateMipmaps = false; f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [1, 1], 'queued capture has not issued native growth');
+  await drain(f.renderer);
+  assert.deepEqual(entry.shape.colorMipLevelCounts, [1, 4]);
+  const draws = f.device.passes.filter(pass => pass.desc.colorAttachments.length === 2);
+  assert.equal(draws.length, 3); assert.equal(f.device.textureCopies.length, 1);
+  const copy = f.device.textureCopies[0];
+  assert.equal(draws[0].desc.colorAttachments[1].view.texture, copy.source.texture);
+  assert.equal(draws[1].desc.colorAttachments[1].view.texture, copy.source.texture);
+  assert.equal(draws[2].desc.colorAttachments[1].view.texture, copy.destination.texture);
+  assert.equal(f.mipPasses(0).length, 3, 'the later public flag does not erase or duplicate accepted generation');
+  assert.equal(f.renderer._targets.capture(f.target), entry);
 });
 
 test('nested WebGL MRT callbacks update only their own execution masks', async t => {

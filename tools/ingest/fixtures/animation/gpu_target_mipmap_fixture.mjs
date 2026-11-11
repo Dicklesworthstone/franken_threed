@@ -34,8 +34,15 @@ export function gpuTargetMipmapFixture() {
     createSampler(descriptor) { const sampler = {descriptor}; samplers.push(sampler); return sampler; },
     createBindGroup(descriptor) { groups.push(descriptor); return descriptor; },
     createCommandEncoder() {
-      const passes = [];
+      const passes = [], copies = [];
       return {
+        copyTextureToTexture(source, destination, size) {
+          assert.equal(source.texture.destroyed, 0); assert.equal(destination.texture.destroyed, 0);
+          assert.ok(source.texture.usage & 1); assert.ok(destination.texture.usage & 2);
+          assert.equal(source.texture.sampleCount, 1); assert.equal(destination.texture.sampleCount, 1);
+          assert.equal(source.texture.format, destination.texture.format);
+          copies.push({source, destination, size});
+        },
         beginRenderPass(descriptor) {
           const output = descriptor.colorAttachments?.[0]?.view ?? descriptor.depthStencilAttachment?.view;
           assert.ok(output, 'a render pass has a color or depth attachment');
@@ -60,7 +67,7 @@ export function gpuTargetMipmapFixture() {
             end() { pass.ended = true; },
           };
         },
-        finish() { for (const pass of passes) assert.ok(pass.ended); return {passes}; },
+        finish() { for (const pass of passes) assert.ok(pass.ended); return {passes, ...(copies.length ? {copies} : {})}; },
       };
     },
     queue: {

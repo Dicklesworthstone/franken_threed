@@ -218,21 +218,25 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
       } catch (error) { return Promise.reject(error); }
     },
     copyColor(source, destination, supplied = {}) {
-      try {
-        live();
-        const {value, signal} = options(supplied);
-        const from = transferEntry(source), to = transferEntry(destination);
-        const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
-        if (from === to && plan.sourceColorIndex === plan.colorIndex && gpuTargetCopyOverlaps(from.shape, plan))
-          fail('TRANSFER', 'Copies cannot read and write overlapping color subresources');
-        assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
-        const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
-          sourceMipLevel: plan.sourceMipLevel, destinationMipLevel: plan.destinationMipLevel,
-          sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
-        return schedule(from === to ? [from] : [from, to], signal, 0, () => () => renderer._targets.copyColor(from, to, copyOptions));
-      } catch (error) { return Promise.reject(error); }
+      return copyColor(source, destination, supplied);
     },
   });
+  function copyColor(source, destination, supplied = {}, generateMipmaps = null) {
+    try {
+      live();
+      const {value, signal} = options(supplied);
+      const from = transferEntry(source), to = transferEntry(destination);
+      const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
+      if (from === to && plan.sourceColorIndex === plan.colorIndex && gpuTargetCopyOverlaps(from.shape, plan))
+        fail('TRANSFER', 'Copies cannot read and write overlapping color subresources');
+      assertThreeNativeTextureWrite(renderer, (destination.textures ?? [destination.texture])[plan.colorIndex]);
+      const copyOptions = Object.freeze({...value, width: plan.size.width, height: plan.size.height,
+        sourceMipLevel: plan.sourceMipLevel, destinationMipLevel: plan.destinationMipLevel,
+        sourceColorIndex: plan.sourceColorIndex, colorIndex: plan.colorIndex});
+      return schedule(from === to ? [from] : [from, to], signal, 0, () => () =>
+        renderer._targets.copyColor(from, to, copyOptions, {generateMipmaps}));
+    } catch (error) { return Promise.reject(error); }
+  }
   // Keep source APIs next to the transfer owner, not a second submission path.
   // The renderer constructor creates this controller after its target owner and
   // FIFO. WebGL chooses its bottom-left origin later in the subclass constructor,
@@ -300,8 +304,12 @@ export function createThreeRendererTransfers(renderer, ErrorType, {
         {...value, width: plan.width, height: plan.height});
     }
     const plan = inspectGpuTargetCopy(from.shape, to.shape, value);
-    return api.copyColor(source.renderTarget, destination.renderTarget,
-      {...value, width: plan.size.width, height: plan.size.height});
+    // Source WebGL copies filter this color after a base-level write. Capture
+    // its live policy now; explicit target copies keep their allocation policy.
+    const generateMipmaps = renderer._bottomLeftOrigin === true && to.shape.textures?.length > 1 && destinationLevel === 0
+      ? destination.generateMipmaps === true : null;
+    return copyColor(source.renderTarget, destination.renderTarget,
+      {...value, width: plan.size.width, height: plan.size.height}, generateMipmaps);
   }
   function readPixels(target, supplied = {}, mipLevel = 0, depth = false) {
     live();

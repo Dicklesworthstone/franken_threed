@@ -434,6 +434,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       entry.sample?.destroy(); entry.depthSample?.destroy(); entry.depthComparison?.sample?.destroy();
       for (const sample of entry.colorSamples.values()) sample.sample?.destroy();
       entry.colorSamples.clear();
+      for (const sample of entry.retiredSamples) sample.texture.destroy();
+      entry.retiredSamples.clear();
       allocatedBytes -= entry.charged; entry.charged = 0;
       entry.storage = entry.sample = entry.view = entry.group = entry.flipSteps = null;
       entry.depthSample = entry.depthView = entry.depthGroup = entry.depthSampler = entry.depthComparison = null;
@@ -573,8 +575,6 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       // are per-color and run at the captured render/copy boundary instead.
       if (shape.colors.some(color => color.authoredMipLevelCount > 0))
         fail('UNSUPPORTED', 'WebGL MRT requires generated mip pyramids, not authored framebuffer arrays');
-      if (shape.colors.some(color => color.texture.generateMipmaps && color.mipLevelCount < color.maximumMipLevels))
-        fail('MIP', 'Enable WebGL MRT mip generation before initializing that attachment, or recreate the target');
     }
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
       const owner = ownedColorTargets.get(texture);
@@ -623,9 +623,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const depthEntry = shape.sharedDepth ? capture(shape.depthOwner) : null;
     if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
-      references: 0, sourceShape: null, retirement: null, cubeInitialized: false,
+      references: 0, programLeaseEpoch: 0, sourceShape: null, retirement: null, cubeInitialized: false,
       cubeMipReady: !shape.webglCube || shape.mipLevelCount === 1 || shape.generateMipmaps || shape.authoredMipLevelCount === shape.mipLevelCount,
-      dirty: true, copies: 0, colorSamples: new Map(), depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
+      dirty: true, copies: 0, colorSamples: new Map(), retiredSamples: new Set(), depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
     target.addEventListener('dispose', entry.onDispose);
     for (const texture of shape.textures) texture.addEventListener('dispose', entry.onDispose);
@@ -731,6 +731,74 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function budget(bytes) {
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Render targets exceed their shared byte budget');
   }
+  function retireSamples(entry) {
+    // A prepared source program may submit a retained old view after the
+    // growth operation. Fence only after those borrowers release it, so that
+    // their eventual submissions also precede destruction.
+    if (entry.released || entry.programReferences) return;
+    for (const sample of entry.retiredSamples) {
+      if (sample.retirement) continue;
+      let epoch;
+      const task = Promise.resolve().then(() => {
+        epoch = entry.programLeaseEpoch;
+        return getDevice().queue.onSubmittedWorkDone();
+      }).then(() => {
+        if (entry.programReferences || entry.programLeaseEpoch !== epoch) {
+          sample.retirement = null; retireSamples(entry); return;
+        }
+        if (entry.retiredSamples.delete(sample)) {
+          sample.texture.destroy(); entry.charged -= sample.bytes; allocatedBytes -= sample.bytes;
+        }
+      }, error => { terminal ??= error; entry.error = error; retire(entry); })
+        .finally(() => retiring.delete(task));
+      sample.retirement = task; retiring.add(task);
+    }
+  }
+  function growColorMipmaps(entry, indices) {
+    // WebGL's mutable framebuffer images grow on generateMipmap(), after the
+    // accepted render/copy. Native targets retain their source allocation
+    // contract. Never allocate from a later live flag during capture().
+    if (!flipY || entry.shape.textures.length < 2 || entry.shape.cube || entry.shape.volume || entry.historyGroup) return;
+    const selected = indices.filter(index => entry.shape.colors[index].mipLevelCount < entry.shape.colors[index].maximumMipLevels);
+    if (!selected.length) return;
+    budget(entry.storage.mipmapGrowthBytes(selected));
+    const previous = entry.shape;
+    entry.storage.growMipmaps(selected);
+    const colors = previous.colors.map((color, index) => {
+      if (!selected.includes(index)) return color;
+      const mipLevelCount = color.maximumMipLevels;
+      let width = color.width, height = color.height, colorBytes = color.baseColorBytes;
+      const texelBytes = color.baseColorBytes / (width * height * color.layers);
+      for (let level = 1; level < mipLevelCount; level++) {
+        width = Math.max(1, Math.floor(width / 2)); height = Math.max(1, Math.floor(height / 2));
+        colorBytes += width * height * color.layers * texelBytes;
+      }
+      // Ordinary 2D/array color keys end in their allocated level count.
+      // Preserve the frozen setup policy, sampler, and source texture identity.
+      return {...color, mipLevelCount, colorBytes, bytes: color.bytes + colorBytes - color.colorBytes,
+        key: color.key.slice(0, color.key.lastIndexOf('/') + 1) + mipLevelCount};
+    });
+    const added = colors.reduce((sum, color, index) => sum + color.colorBytes - previous.colors[index].colorBytes, 0);
+    entry.shape = {...previous, ...colors[0], colors, bytes: previous.bytes + added,
+      colorMipLevelCounts: colors.map(color => color.mipLevelCount), key: colors.map(color => color.key).join('|')};
+    for (const index of selected) {
+      const sample = index === 0 ? entry : entry.colorSamples.get(index);
+      if (!sample?.sample) continue;
+      entry.retiredSamples.add({texture: sample.sample, bytes: previous.colors[index].colorBytes, retirement: null});
+      sample.sample = sample.view = sample.group = sample.flipSteps = null;
+      sample.samplerKey = null; sample.dirty = true;
+    }
+    retireSamples(entry);
+    // The surrounding submitted operation charges the peak storage delta in
+    // its finally block. Remove the old color charge when its own fence drains.
+    // Other attachments, including MSAA and depth/stencil, never move.
+    const retiredBytes = selected.reduce((sum, index) => sum + previous.colors[index].colorBytes, 0);
+    const task = entry.storage.whenIdle().then(() => {
+      if (!entry.released) { entry.charged -= retiredBytes; allocatedBytes -= retiredBytes; }
+    }, error => { terminal ??= error; entry.error = error; retire(entry); })
+      .finally(() => retiring.delete(task));
+    retiring.add(task);
+  }
   function allocationBytes(entry) {
     const group = entry.historyGroup;
     return group ? entry.shape.bytes + group.pairs.reduce((sum, pair, index) => sum +
@@ -818,7 +886,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // original attachment, not the UV-oriented sampling replica.
     entry.session = {device, get width() { return width; }, get height() { return height; },
       get disposed() { return !entry.alive; }, get failed() { return !!entry.error || !!entry.storage?.failed; },
-      get diagnostics() { return {target: {format, colorFormats, mipLevelCount, colorMipLevelCounts, cube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers}}; },
+      get diagnostics() { return {target: {format, colorFormats, mipLevelCount: entry.shape.mipLevelCount,
+        colorMipLevelCounts: entry.shape.colorMipLevelCounts, cube, array, volume, depth: volume ? layers : 1, layers, depthArray, depthLayers}}; },
       get validation() { assertCurrent(entry); return Promise.all([entry.validation, entry.storage.validation]); },
       withTexture(callback, options) {
         assertCurrent(entry);
@@ -1127,17 +1196,25 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const depth = entry.shape.depthTexture === texture;
         if (!depth && !entry.shape.textures.includes(texture)) fail('STALE', 'Texture no longer belongs to its source target');
         const binding = depth ? depthSampling(entry, texture) : sampling(entry, texture);
+        const image = depth ? null : (entry.shape.texture === texture ? entry :
+          entry.colorSamples.get(entry.shape.textures.indexOf(texture)))?.sample;
         // Asynchronous source program preparation (PMREM) may hold this view
         // across pipeline compilation. The ordinary draw path stays synchronous;
         // the generator explicitly acquires/releases this existing generation.
         return {...binding, retain: () => {
+          if (image && image !== (entry.shape.texture === texture ? entry :
+              entry.colorSamples.get(entry.shape.textures.indexOf(texture)))?.sample &&
+              ![...entry.retiredSamples].some(sample => sample.texture === image))
+            fail('STALE', 'The sampled color image was retired before its program retained it');
           const finish = retainGeneration(entry);
+          entry.programLeaseEpoch++;
           entry.programReferences = (entry.programReferences ?? 0) + 1;
           let held = true;
           return () => {
             if (!held) return;
             held = false; entry.programReferences--; finish();
             if (!entry.alive) release(entry);
+            else retireSamples(entry);
           };
         }, validate: () => assertCurrent(entry)};
       }
@@ -1179,11 +1256,18 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (group) group.busy = true;
     if (depth) { dirtyDepth(destination); if (destination.depthEntry) dirtyDepth(destination.depthEntry); }
     else dirtyColor(destination, plan.colorIndex);
+    const allocatedBefore = destination.storage.allocatedBytes;
     try {
       const result = destination.storage[depth ? 'copyDepthFrom' : 'copyFrom'](source.storage, options);
-      if (!depth && generateMipmaps && plan.destinationMipLevel === 0) destination.storage.generateMipmaps([plan.colorIndex]);
+      if (!depth && generateMipmaps && plan.destinationMipLevel === 0) {
+        growColorMipmaps(destination, [plan.colorIndex]);
+        destination.storage.generateMipmaps([plan.colorIndex]);
+      }
       assertCurrent(source); assertCurrent(destination); return result;
     } finally {
+      const delta = destination.storage.allocatedBytes - allocatedBefore;
+      if (destination.historyGroup) destination.historyGroup.charged += delta; else destination.charged += delta;
+      allocatedBytes += delta;
       source.busy = destination.busy = false;
       if (group) group.busy = false;
       for (const entry of group?.entries ?? new Set([source, destination])) {
@@ -1440,15 +1524,24 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       ensure(entry);
       entry.busy = true;
       dirtyColor(entry, colorIndex);
+      const allocatedBefore = entry.storage.allocatedBytes;
       try {
         const result = entry.storage.withColorDestination(native => {
           const result = callback(native); assertCurrent(entry); return result;
         }, {colorIndex, validation});
         // Pinned copyTextureToTexture filters a generated level-zero destination
         // after the raw copy. Only that selected color becomes a new pyramid.
-        if (generateMipmaps) entry.storage.generateMipmaps([colorIndex]);
+        if (generateMipmaps) {
+          growColorMipmaps(entry, [colorIndex]);
+          entry.storage.generateMipmaps([colorIndex]);
+        }
         return result;
-      } finally { entry.busy = false; if (!entry.alive) release(entry); else collect(entry); }
+      } finally {
+        const delta = entry.storage.allocatedBytes - allocatedBefore;
+        if (entry.historyGroup) entry.historyGroup.charged += delta; else entry.charged += delta;
+        allocatedBytes += delta;
+        entry.busy = false; if (!entry.alive) release(entry); else collect(entry);
+      }
     },
     writePixels(entry, data, options = {}) {
       assertCurrent(entry);
@@ -1521,7 +1614,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         if (entry.shape.cube && generateMipmaps) {
           entry.storage.generateMipmaps(); entry.cubeMipReady = true;
         }
-        if (!borrowed && generateColorMipmaps !== null) entry.storage.generateMipmaps(generateColorMipmaps);
+        if (!borrowed && generateColorMipmaps !== null) {
+          growColorMipmaps(entry, generateColorMipmaps);
+          entry.storage.generateMipmaps(generateColorMipmaps);
+        }
         return result;
       }
       finally {

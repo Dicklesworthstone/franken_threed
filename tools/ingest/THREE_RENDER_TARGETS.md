@@ -503,11 +503,29 @@ flags after the complete draw, before filtering; each nested render has its own
 generation selection. This admits disabling or re-enabling an allocated chain
 inside `onBeforeRender` or object `onAfterRender`, including deferred draws.
 
-For this profile, configure generation before an attachment is first initialized. An initialized
-chain can be disabled and re-enabled without replacing its rendered contents,
-including across `needsUpdate` and sampler edits. Enabling generation on an
-attachment initialized with only a base level currently requires disposing and
-recreating the target in F3D; the pinned WebGL source can grow that chain in place.
+Generation can be enabled after an attachment is initialized with only its base
+level. At that accepted render's completed draw/resolve boundary, the owner
+allocates the selected color's full pyramid, copies every existing level and
+array layer, then generates its mips. Sibling colors, depth/stencil and persistent
+MSAA images keep their contents and identities. The source target and texture
+also keep their identities, and the original setup sampler remains authoritative.
+Disabling and re-enabling generation retains the grown chain, including across
+`needsUpdate` and later public sampler edits.
+
+Callback-free queued calls retain their own generation selections. Object and
+material callbacks can enable a chain after drawing has started; growth follows
+the final callback-adjusted selection. Capture and manual clears do not grow a
+chain merely because a later public flag changed. Source color-copy operations
+use the same post-copy growth boundary.
+
+WebGPU storage growth temporarily owns both old and replacement color images.
+The shared byte budget checks that peak before allocation, and old images retire
+after their submitted work completes. A budget refusal leaves the existing
+attachment usable. Sampling gets a new full-pyramid orientation replica; an old
+replica held by asynchronous program preparation stays alive until its borrowers
+release it and their GPU work completes. This is content-preserving allocation
+growth with an explicit copy cost, not a performance claim.
+
 Authored WebGL MRT framebuffer arrays remain unsupported.
 The existing shared budget charges every color level, multisample base and
 sampling replica, and queued leases retain old generations through retirement.

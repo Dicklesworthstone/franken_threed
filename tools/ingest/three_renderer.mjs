@@ -1862,8 +1862,6 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             const onDrawCallbacks = this._shaderEncodedOutput && colorMipmaps !== null ? () => {
               const selected = [];
               for (const [index, color] of destination.shape.colors.entries()) if (color.texture.generateMipmaps) {
-                if (color.mipLevelCount < color.maximumMipLevels)
-                  fail('MIP', 'Enable WebGL MRT mip generation before initializing that attachment, or recreate the target');
                 selected.push(index);
               }
               colorMipmaps.splice(0, colorMipmaps.length, ...selected);
