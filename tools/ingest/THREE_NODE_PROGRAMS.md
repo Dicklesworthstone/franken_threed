@@ -217,9 +217,11 @@ Native programs preserve ordinary `onBeforeCompile` functions carried by
 materials that also support a WebGL route. Their bodies remain inert on WebGPU,
 as in the pinned source, and the public function identity remains unchanged.
 Replacing the hook alone retains the prepared program; `needsUpdate` keeps its
-normal invalidation behavior. Custom program cache keys, effectful hook
-stringification and opaque callable proxies retain their explicit admission
-boundary. Source-WGSL comparisons cover ordinary and node Basic/Standard
+normal invalidation behavior. Ordinary rigid Standard/Physical materials also
+support custom program cache keys through the source lifecycle described below.
+Other material profiles, effectful legacy-hook stringification and opaque
+legacy-hook proxies retain their explicit admission boundary.
+Source-WGSL comparisons cover ordinary and node Basic/Standard
 materials; this does not add new WebGL shader-hook translation.
 
 Built-in `MeshBasicMaterial`, `MeshToonMaterial`, `MeshLambertMaterial`,
@@ -2038,6 +2040,50 @@ or fog, clipping, shadows, deformation, transmission, wireframes and multiview
 retain their existing preparation paths; their cross-material builder-sharing
 semantics remain incomplete. GPU modules and pipelines keep their separate
 existing owners. This is source graph compatibility, not a measured speedup.
+
+Custom `customProgramCacheKey` functions are supported on this same rigid PBR
+profile, including ordinary materials converted by `StandardNodeLibrary`.
+The original material is the callback receiver. The callback runs once when a
+source render object is constructed, zero times during a warm draw, and once
+when `needsUpdate` or a dynamic source context requests a key comparison. A
+changed key retires that render object before a second callback constructs its
+replacement. A version change with an unchanged complete key preserves the
+existing builder and its captured environment. Changing the callback or its
+return value without source invalidation does not force a rebuild.
+
+For example, changing `material.envMap` and advancing a custom variant key
+together with `material.needsUpdate = true` selects a new environment graph.
+Objects with the same complete source key continue to share builder state.
+Each accepted draw still owns its uniform snapshot, including multiple renders
+queued before GPU preparation completes. Scene/light/shadow key components keep
+the source's once-per-render-call cache; context-node identity and version stay
+live. Callback changes to material version are observed at the same constructor
+and comparison boundaries as the source.
+
+Key callbacks execute during the source draw lifecycle, after that object's
+before hook and before its node updates. Ordinary companions use the same
+ordered capture. Public `compileAsync` retains its separate ordering: object
+selection hooks run before deferred key construction. Deferred GPU preparation
+does not invoke a key again. Errors propagate with their original identity;
+a comparison error preserves the previous owner, while an error in replacement
+construction occurs after its retirement. Material/object disposal clears the
+source key owner; geometry disposal retains it.
+Disposal from inside an unchanged key comparison keeps the source's already
+constructed graph for that one draw, without re-registering the disposed owner.
+The following draw constructs its key again. Earlier and current queued draws
+retain their own captured uniforms through deferred GPU preparation; disposing
+an override's original source material follows the same rule.
+
+The callback must keep the rigid PBR profile above and cannot replace its
+selected geometry. Authored graphs, maps other than the admitted material
+environment, lights, clipping, deformation and other excluded construction
+profiles remain explicitly unsupported for custom keys. Accessor-backed key
+properties are not admitted. A callback that leaves this domain keeps its
+JavaScript effects and fails before publishing a new GPU descriptor.
+Focused comparisons with pinned `RenderObjects`/`NodeManager` and the recording
+GPU test these calls, key coercion/order, variant sharing, errors and queued
+uniforms. They do not establish pixel parity, full dynamic-graph closure or
+hardware performance.
 
 Ten focused tests compare real pinned `RenderObject`, `RenderObjects` and
 `NodeManager` behavior with the candidate, including all four material classes,

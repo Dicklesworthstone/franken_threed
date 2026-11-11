@@ -52,6 +52,20 @@ export class ThreeNodeProgramError extends Error {
 }
 const fail = (code, message) => { throw new ThreeNodeProgramError(code, message); };
 const functionToString = Function.prototype.toString;
+function cacheKeyProperty(material) {
+  for (let owner = material; owner; owner = Object.getPrototypeOf(owner)) {
+    const property = Object.getOwnPropertyDescriptor(owner, 'customProgramCacheKey');
+    if (property) return property;
+  }
+  return null;
+}
+/** Select effectful source cache keys without executing an application getter. */
+export function hasThreeCustomProgramCacheKey(three, material) {
+  if (!material) return false;
+  const property = cacheKeyProperty(material);
+  return !property || !Object.hasOwn(property, 'value') || property.value !==
+    (material.isNodeMaterial === true ? three.NodeMaterial : three.Material).prototype.customProgramCacheKey;
+}
 function inspectLegacyCompileHook(material) {
   const descriptor = (value, key) => {
     for (let owner = value; owner; owner = Object.getPrototypeOf(owner)) {
@@ -184,6 +198,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   // Ordinary rigid PBR materials additionally share source builder state.
   // Other profiles retain their existing per-object construction owners.
   const sharedBuilders = new Map(), builderContexts = new Map();
+  const customKeyCache = new WeakMap(), customKeyRecords = new Set();
+  const builderCallKeys = new WeakMap(), defaultBuilderCallKey = {};
   const emptyLightsKey = three.TSL.lights([]).getCacheKey(true);
   const shaderPairs = new Map();
   let disposed = false, shaderBytes = 0, serial = 0;
@@ -1061,6 +1077,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function inspect(material, object, context = {}) {
     live();
     const sourceMaterial = material;
+    if (hasThreeCustomProgramCacheKey(three, material) && typeof cacheKeyProperty(material)?.value !== 'function')
+      fail('HOOK', 'Native custom program cache keys require an ordinary callable property');
     if (material instanceof three.Material) inspectLegacyCompileHook(material);
     material = prepareMaterial(material);
     const {scene, camera} = context;
@@ -1106,10 +1124,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // The pinned WebGPU renderer does not invoke Material's legacy
     // onBeforeCompile or onBeforeRender hooks. Preserve those source properties
     // without treating them as shader effects. RenderObject does invoke custom
-    // program cache keys, so their existing admission boundary remains separate.
-    if (sourceMaterial.customProgramCacheKey !== (sourceMaterial.isNodeMaterial === true
-          ? three.NodeMaterial.prototype.customProgramCacheKey : three.Material.prototype.customProgramCacheKey))
-      fail('HOOK', 'Custom material program cache keys are not admitted');
+    // program cache keys at its construction/invalidation boundaries. The
+    // shared rigid PBR profile has that complete source cache lifecycle.
+    if (hasThreeCustomProgramCacheKey(three, sourceMaterial) && !sharedConstruction(sourceMaterial, material,
+      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode)))
+      fail('HOOK', 'Native custom program keys require the shared rigid Standard/Physical material profile');
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
@@ -1329,7 +1348,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (![three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(Object.getPrototypeOf(prepared)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
-        prepared.transparent || prepared.wireframe || prepared.useTransmission || prepared.lights !== true ||
+        prepared.transparent || prepared.wireframe || prepared.useTransmission || prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         [...GRAPH_SLOTS, 'contextNode'].some(name => prepared[name] != null) ||
         [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
@@ -1345,8 +1364,18 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
-    const dynamic = hash(hashArray([0, 1, emptyLightsKey, renderer.shadowMap?.enabled ? 1 : 0, renderer.shadowMap?.type]),
-      renderer.contextNode.id, renderer.contextNode.version);
+    let callKey = context.scene && builderCallKeys.get(context.scene);
+    if (!callKey) {
+      callKey = context.scene ? {} : defaultBuilderCallKey;
+      if (context.scene) builderCallKeys.set(context.scene, callKey);
+    }
+    // NodeManager caches scene/light/shadow state once per renderer call.
+    // Context-node identity/version remains a live RenderObject dimension.
+    if (callKey.key === undefined || callKey.call !== renderer.info?.calls) {
+      callKey.call = renderer.info?.calls;
+      callKey.key = hashArray([0, 1, emptyLightsKey, renderer.shadowMap?.enabled ? 1 : 0, renderer.shadowMap?.type]);
+    }
+    const dynamic = hash(callKey.key, renderer.contextNode.id, renderer.contextNode.version);
     return {contextId, dynamic, chain};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
@@ -1402,6 +1431,87 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
   }
   function compile(material, object, context = {}) {
+    const chain = builderScope(context).chain;
+    let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
+    if (!record && !hasThreeCustomProgramCacheKey(three, material)) return compileProgram(material, object, context);
+    const profile = () => {
+      const prepared = inspect(material, object, context);
+      const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
+        inspectThreeLightingContext(three, renderer.contextNode));
+      if (!construction || construction.chain !== chain)
+        fail('HOOK', 'Custom native program keys must retain their shared rigid PBR construction profile');
+      return construction;
+    };
+    let construction = profile();
+    const previous = cache.get(object)?.get(material)?.get(chain);
+    // Installing a key after an ordinary first draw does not itself invalidate
+    // the source RenderObject. Adopt its already accepted source key/version.
+    if (!record && previous?.sharedBuilder) {
+      const state = nodeStates.get(previous.descriptor);
+      record = remember(previous.sharedBuilder.key, state.materialVersion, state.sharedDynamic, previous);
+    }
+    const readKey = () => {
+      const geometry = object.geometry;
+      const key = threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId);
+      // Callback effects are real and are not rolled back on rejection. Never
+      // publish a GPU descriptor for a newly unsupported graph or owner.
+      construction = profile();
+      if (object.geometry !== geometry)
+        fail('HOOK', 'A native cache-key callback cannot replace its selected geometry');
+      return key + construction.dynamic;
+    };
+    if (record && (record.version !== material.version || record.dynamic !== construction.dynamic)) {
+      const key = readKey(); // A throwing comparison leaves the old owner live.
+      if (record.key !== key) {
+        record.dispose(); record = null;
+      } else record.version = material.version;
+    }
+    if (record && !customKeyRecords.has(record) && record.entry) {
+      // dispose() inside an unchanged comparison removes the source render
+      // object from its cache, but get() still returns that local object for
+      // this draw. Its already constructed nodes/bindings remain usable; never
+      // republish them or let the following draw adopt an unowned descriptor.
+      const state = nodeStates.get(record.entry.descriptor), prepared = prepareMaterial(material);
+      const environment = sourceEnvironment(prepared, context);
+      state.materialVersion = material.version; state.geometry = object.geometry;
+      state.environment = environment;
+      state.materialEnvironment = materialEnvironment(prepared, environment);
+      state.environmentGraph = environmentGraphKey(prepared, context);
+      return record.entry.descriptor;
+    }
+    if (!record) {
+      if (customKeyRecords.size >= maxPrograms) fail('LIMIT', 'Native custom program key capacity exceeded');
+      // RenderObject captures these before invoking its key. If the callback
+      // changes a version, the following draw must still observe invalidation.
+      const version = material.version, dynamic = construction.dynamic;
+      const key = readKey(); // Changed keys call again, after old-owner disposal.
+      record = remember(key, version, dynamic, null);
+    }
+    const descriptor = compileProgram(material, object, context, record);
+    const entry = cache.get(object)?.get(material)?.get(chain) ?? null;
+    if (customKeyRecords.has(record)) record.entry = entry;
+    else if (entry) retire(entry);
+    return descriptor;
+
+    function remember(key, version, dynamic, entry) {
+      const sourceMaterial = renderer._currentSourceMaterial ?? null;
+      const next = {key, version, dynamic, entry, dispose() {
+        if (!customKeyRecords.delete(next)) return;
+        if (passes?.get(chain) === next) passes.delete(chain);
+        material.removeEventListener('dispose', next.dispose);
+        object.removeEventListener('dispose', next.dispose);
+        if (sourceMaterial !== material) sourceMaterial?.removeEventListener('dispose', next.dispose);
+        if (next.entry) retire(next.entry);
+      }};
+      if (!materials) customKeyCache.set(object, materials = new Map());
+      if (!passes) materials.set(material, passes = new Map());
+      passes.set(chain, next); customKeyRecords.add(next);
+      material.addEventListener('dispose', next.dispose); object.addEventListener('dispose', next.dispose);
+      if (sourceMaterial !== material) sourceMaterial?.addEventListener('dispose', next.dispose);
+      return next;
+    }
+  }
+  function compileProgram(material, object, context = {}, sourceKey = null) {
     const preparedMaterial = inspect(material, object, context);
     const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
     const lightKey = lightingSignature(preparedMaterial, lights);
@@ -1429,7 +1539,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const passId = construction || passes?.has(chain) ? chain : context.passId ?? null;
     const previous = passes?.get(passId) ?? (construction ? passes?.get(context.passId ?? null) : undefined);
     const previousState = previous && nodeStates.get(previous.descriptor);
-    if (construction) construction.key = previous?.sharedBuilder &&
+    if (construction) construction.key = sourceKey ? sourceKey.key : previous?.sharedBuilder &&
       previousState.materialVersion === material.version && previousState.sharedDynamic === construction.dynamic
       ? previous.sharedBuilder.key
       : threeNodeBuilderMaterialKey(three, renderer, object, material, construction.contextId) + construction.dynamic;
@@ -1437,7 +1547,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // context change. A version-only change with the same source key retains
     // the very same builder nodes, including their captured PMREM texture.
     if (construction && previous?.sharedBuilder && previous.geometry === object.geometry &&
-        previousState.sharedDynamic === construction.dynamic &&
+        (sourceKey || previousState.sharedDynamic === construction.dynamic) &&
         (previousState.materialVersion === material.version || previous.sharedBuilder.key === construction.key)) {
       previousState.materialVersion = material.version;
       previousState.environment = environment;
@@ -1511,7 +1621,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // setup() itself may filter a PMREM source. An existing stale atlas must
     // reach the first draw's ordered preparation boundary through its cached
     // graph, rather than being rewritten while another graph is constructed.
-    const sharedKey = construction && previous?.sharedBuilder && previousState.materialVersion === material.version &&
+    const sharedKey = sourceKey ? sourceKey.key : construction && previous?.sharedBuilder && previousState.materialVersion === material.version &&
       previousState.sharedDynamic === construction.dynamic ? previous.sharedBuilder.key : construction?.key;
     let sharedBuilder = construction ? sharedBuilders.get(sharedKey) : null;
     if (!sharedBuilder) assertEnvironmentVersion(environment);
@@ -2359,6 +2469,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     vertexStorage(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.storage(descriptor) : []; },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
+      for (const record of [...customKeyRecords]) record.dispose();
       for (const record of bundleGeometryRecords) releaseBundleGeometry(record);
       for (const record of fogResourceRecords) releaseFogResources(record);
       generatedAttributes.dispose(); wireframes.dispose(); effects.dispose(); },

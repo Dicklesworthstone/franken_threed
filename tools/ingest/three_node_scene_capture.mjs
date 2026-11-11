@@ -3,7 +3,7 @@
  * Pipeline preparation consumes these packets later and never repeats updates.
  * Geometry bytes still follow the bridge's existing upload/version contract.
  */
-import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, ThreeNodeProgramError} from './three_node_program.mjs';
+import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, hasThreeCustomProgramCacheKey, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
 import {inspectThreeLightingContext, inspectThreeNativeCamera, hasThreeHighPrecisionContext} from './three_node_passes.mjs';
@@ -277,7 +277,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       object !== backgroundMesh && object.isLineLoop !== true &&
       (object.isMesh || object.isSprite || object.isPoints || object.isLine));
   const nativeHookScene = sceneHooks || !!customRenderObject || hookSceneHistory.get(renderer)?.has(root) === true ||
-    hookCandidates.some(object => objectHooks(object) || attributeOwners(object).some(owner => hookAttributeHistory.get(renderer)?.has(owner)));
+    hookCandidates.some(object => objectHooks(object) ||
+      (Array.isArray(object.material) ? object.material : [object.material]).some(material => hasThreeCustomProgramCacheKey(three, material)) ||
+      attributeOwners(object).some(owner => hookAttributeHistory.get(renderer)?.has(owner))) ||
+    hasThreeCustomProgramCacheKey(three, overrideMaterial);
   if (nativeHookScene && hookCandidates.some(object => attributeOwners(object).some(owner => fixedAttributeHistory.get(renderer)?.has(owner))))
     fail('HOOK', 'Object callbacks require native upload history; install them before the geometry attributes reach a fixed owner');
   if (nativeHookScene && renderer) {
@@ -613,7 +616,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // Mixed companions need the same late per-draw geometry/program selection as
   // source callbacks: a preceding node update can replace a later mesh's inputs.
   const nativeHooks = hookedObjects.size > 0,
-    nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject || nativeCompanionScene && root.isScene === true;
+    nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject || (nativeCompanionScene || nativeHookScene) && root.isScene === true;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
   // Source public compilation constructs each geometry graph only after the
   // preceding object's update/pipeline/after sequence has completed.

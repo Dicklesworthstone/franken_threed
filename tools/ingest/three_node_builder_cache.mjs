@@ -5,6 +5,10 @@
 const prototypeKeys = new WeakMap();
 
 export function threeNodeBuilderMaterialKey(three, renderer, object, material, contextId, clippingKey = '') {
+  // RenderObject invokes the hook before snapshotting enumerable properties or
+  // consulting the constructor's getter cache. A hook may change either.
+  let key = material.customProgramCacheKey();
+  const properties = Object.keys(material);
   let getters = prototypeKeys.get(material.constructor);
   if (!getters) {
     getters = [];
@@ -13,8 +17,7 @@ export function threeNodeBuilderMaterialKey(three, renderer, object, material, c
         if (typeof descriptor.get === 'function') getters.push(key);
     prototypeKeys.set(material.constructor, getters);
   }
-  let key = material.customProgramCacheKey();
-  for (const property of [...Object.keys(material), ...getters]) {
+  for (const property of [...properties, ...getters]) {
     if (/^(is[A-Z]|_)|^(visible|version|uuid|name|opacity|userData)$/.test(property)) continue;
     const value = material[property];
     let part;
@@ -23,8 +26,10 @@ export function threeNodeBuilderMaterialKey(three, renderer, object, material, c
       part = '{';
       if (value.isTexture) {
         part += value.mapping;
-        if (renderer.backend.isWebGPUBackend === true)
-          part += '' + value.magFilter + value.minFilter + value.wrapS + value.wrapT + value.wrapR;
+        if (renderer.backend.isWebGPUBackend === true) {
+          part += value.magFilter; part += value.minFilter;
+          part += value.wrapS; part += value.wrapT; part += value.wrapR;
+        }
       }
       part += '}';
     } else part = String(value);

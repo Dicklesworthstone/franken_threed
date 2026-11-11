@@ -56,6 +56,77 @@ function fixture(t, {linear = true} = {}) {
   return {renderer, device, scene, camera, material, mesh, canvas};
 }
 
+test('custom PBR cache keys run at native draw capture and preserve queued uniform versions', async t => {
+  const f = fixture(t), material = new T.MeshStandardMaterial(), events = [];
+  f.mesh.material = material; t.after(() => material.dispose());
+  let selected = 0;
+  const colors = [[.125, .25, .375], [.5, .625, .75]];
+  material.customProgramCacheKey = function () {
+    assert.equal(this, material); events.push(selected);
+    this.color.setRGB(...colors[selected]); return `variant-${selected}`;
+  };
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(events, [0]);
+  selected = 1; material.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(events, [0, 1, 1], 'comparison and replacement construction are separate source calls');
+  await drain(f.renderer);
+  assert.deepEqual(events, [0, 1, 1], 'asynchronous GPU preparation never replays a key');
+  const actual = draws(f.device); assert.equal(actual.length, 2);
+  assert.ok(hasColor(actual[0], colors[0])); assert.ok(hasColor(actual[1], colors[1]));
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(events, [0, 1, 1], 'a warm native render does not invoke the key');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('native compilation invokes custom keys after source object selection hooks', async t => {
+  const f = fixture(t), events = [];
+  const a = new T.MeshStandardMaterial(), b = new T.MeshPhysicalMaterial();
+  f.mesh.material = a; f.mesh.renderOrder = 1;
+  const second = new T.Mesh(f.mesh.geometry, b); second.frustumCulled = false; second.renderOrder = 2; f.scene.add(second);
+  t.after(() => { a.dispose(); b.dispose(); });
+  for (const [object, material, name] of [[f.mesh, a, 'a'], [second, b, 'b']]) {
+    object.onBeforeRender = () => events.push(`before-${name}`);
+    object.onAfterRender = () => events.push(`after-${name}`);
+    material.customProgramCacheKey = () => { events.push(`key-${name}`); return name; };
+  }
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(events, ['before-a', 'after-a', 'before-b', 'after-b', 'key-a', 'key-b']);
+  events.length = 0;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(events, ['before-a', 'after-a', 'before-b', 'after-b']);
+  assert.equal(draws(f.device).length, 2);
+});
+
+for (const owner of ['material', 'object', 'override']) test(`key comparison ${owner} disposal preserves queued native draws without cache resurrection`, async t => {
+  const f = fixture(t), material = owner === 'override' ? new T.MeshStandardNodeMaterial() : new T.MeshStandardMaterial();
+  let calls = 0, disposeNow = false;
+  if (owner === 'override') f.scene.overrideMaterial = material;
+  else f.mesh.material = material;
+  t.after(() => material.dispose());
+  const disposeOwner = owner === 'material' ? material : owner === 'object' ? f.mesh : f.material;
+  material.customProgramCacheKey = function () {
+    calls++;
+    if (disposeNow) { disposeNow = false; disposeOwner.dispatchEvent({type: 'dispose'}); }
+    return 'same';
+  };
+  await f.renderer.init();
+  const colors = [[.125, .25, .375], [.5, .625, .75], [.25, .375, .5]];
+  material.color.setRGB(...colors[0]); f.renderer.render(f.scene, f.camera);
+  assert.equal(calls, 1);
+  disposeNow = true; material.needsUpdate = true; material.color.setRGB(...colors[1]);
+  f.renderer.render(f.scene, f.camera);
+  assert.equal(calls, 2); assert.equal(f.renderer._nodeProgramSupport.diagnostics.programs, 0);
+  material.color.setRGB(...colors[2]); f.renderer.render(f.scene, f.camera);
+  assert.equal(calls, 3); assert.equal(f.renderer._nodeProgramSupport.diagnostics.programs, 1);
+  await drain(f.renderer);
+  assert.equal(calls, 3, 'deferred preparation does not resurrect or replay the disposed key owner');
+  const actual = draws(f.device); assert.equal(actual.length, 3);
+  for (const [index, color] of colors.entries()) assert.ok(hasColor(actual[index], color));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('native Scene callbacks run synchronously around source object hooks and retain accepted state', async t => {
   const f = fixture(t), events = [], replacement = new T.Mesh(new T.PlaneGeometry(), new T.ShaderMaterial());
   t.after(() => { replacement.geometry.dispose(); replacement.material.dispose(); });

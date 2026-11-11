@@ -161,3 +161,211 @@ test('leaving and reentering the shared profile retires its former source builde
   assert.deepEqual(textures.map(texture => texture.id), referenceTextures(nextSource).map(texture => texture.id));
   assert.equal(f.programs.diagnostics.programs, 1);
 });
+
+for (const Material of [T.MeshStandardMaterial, T.MeshPhysicalMaterial, T.MeshStandardNodeMaterial, T.MeshPhysicalNodeMaterial]) {
+  test(`${Material.name} custom keys match source construction and invalidation calls`, t => {
+    const f = fixture(t, Material), source = f.add(0x3800), candidate = f.add(0x3800);
+    const key = function () { this.userData.calls++; return this.userData.variant; };
+    for (const item of [source, candidate]) {
+      item.material.userData = {calls: 0, variant: 'first'};
+      item.material.customProgramCacheKey = key;
+    }
+    let reference, descriptor;
+    for (const [change, calls, rebuilt] of [
+      [() => {}, 1, true], [() => {}, 0, false],
+      [material => { material.needsUpdate = true; }, 1, false],
+      [material => { material.userData.variant = 'second'; material.needsUpdate = true; }, 2, true],
+      [material => { material.userData.variant = 'unmarked'; }, 0, false],
+    ]) {
+      for (const item of [source, candidate]) { item.material.userData.calls = 0; change(item.material); }
+      f.renderer.info.calls++;
+      const nextReference = f.reference(source), nextDescriptor = f.compile(candidate);
+      assert.equal(source.material.userData.calls, calls);
+      assert.equal(candidate.material.userData.calls, calls);
+      assert.equal(nextReference.object !== reference?.object, rebuilt);
+      assert.equal(nextDescriptor !== descriptor, rebuilt);
+      reference = nextReference; descriptor = nextDescriptor;
+    }
+  });
+}
+
+test('custom key comparison errors retain the old source owner and reconstruction errors retire it', t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800), error = new Error('key failure');
+  const key = function () {
+    if (++this.userData.calls === this.userData.throwAt) throw error;
+    return this.userData.variant;
+  };
+  for (const item of [source, candidate]) {
+    item.material.userData = {calls: 0, variant: 'first', throwAt: -1};
+    item.material.customProgramCacheKey = key;
+  }
+  const initial = f.reference(source); f.compile(candidate);
+  for (const [throwAt, alive] of [[1, true], [2, false]]) {
+    for (const item of [source, candidate]) {
+      Object.assign(item.material.userData, {calls: 0, variant: 'replacement', throwAt});
+      item.material.needsUpdate = true;
+    }
+    f.renderer.info.calls++;
+    assert.throws(() => f.reference(source), value => value === error);
+    assert.throws(() => f.compile(candidate), value => value === error);
+    assert.equal(source.material.userData.calls, throwAt); assert.equal(candidate.material.userData.calls, throwAt);
+    assert.equal(f.source._renderObjects.has(initial.object), alive);
+    assert.equal(f.programs.diagnostics.programs, alive ? 1 : 0);
+  }
+  for (const item of [source, candidate]) Object.assign(item.material.userData, {calls: 0, throwAt: -1});
+  f.renderer.info.calls++;
+  f.reference(source); f.compile(candidate);
+  assert.equal(source.material.userData.calls, 1); assert.equal(candidate.material.userData.calls, 1);
+});
+
+test('custom keys choose shared environment builders and isolate newly invalidated variants', t => {
+  const f = fixture(t), a = f.add(0x3800), b = f.add(0x3400);
+  const key = function () { return this.userData.variant; };
+  for (const item of [a, b]) { item.material.customProgramCacheKey = key; item.material.userData.variant = 'shared'; }
+  const sourceA = f.reference(a), sourceB = f.reference(b), first = f.compile(a), second = f.compile(b);
+  assert.equal(sourceA.state, sourceB.state);
+  assert.deepEqual(sampled(f.capture(b, second)), referenceTextures(sourceB));
+  b.material.userData.variant = 'separate'; b.material.needsUpdate = true; f.renderer.info.calls++;
+  const sourceNext = f.reference(b), next = f.compile(b);
+  assert.notEqual(sourceNext.state, sourceA.state); assert.notEqual(next, second);
+  assert.deepEqual(sampled(f.capture(b, next)), referenceTextures(sourceNext));
+  assert.ok(sampled(f.capture(a, first)).includes(a.material.envMap));
+  assert.ok(sampled(f.capture(b, next)).includes(b.material.envMap));
+});
+
+test('custom key callback mutations preserve constructor version and selected environment', t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800), selected = environment(0x3400);
+  const key = function () {
+    if (++this.userData.calls === 1) { this.needsUpdate = true; this.envMap = this.userData.selected; }
+    return 'selected';
+  };
+  for (const item of [source, candidate]) {
+    item.material.userData = {calls: 0, selected}; item.material.customProgramCacheKey = key;
+  }
+  const first = f.reference(source), descriptor = f.compile(candidate);
+  assert.deepEqual(sampled(f.capture(candidate, descriptor)), referenceTextures(first));
+  assert.ok(sampled(f.capture(candidate, descriptor)).includes(selected));
+  for (const expected of [2, 2]) {
+    f.renderer.info.calls++;
+    assert.equal(f.reference(source).object, first.object); assert.equal(f.compile(candidate), descriptor);
+    assert.equal(source.material.userData.calls, expected); assert.equal(candidate.material.userData.calls, expected);
+  }
+});
+
+test('installing a custom key without invalidation retains the accepted source cache', t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800);
+  const initial = f.reference(source), descriptor = f.compile(candidate);
+  const key = function () { this.userData.calls++; return 'changed'; };
+  for (const item of [source, candidate]) { item.material.userData.calls = 0; item.material.customProgramCacheKey = key; }
+  f.renderer.info.calls++;
+  assert.equal(f.reference(source).object, initial.object); assert.equal(f.compile(candidate), descriptor);
+  assert.equal(source.material.userData.calls, 0); assert.equal(candidate.material.userData.calls, 0);
+  for (const item of [source, candidate]) item.material.needsUpdate = true;
+  f.renderer.info.calls++;
+  assert.notEqual(f.reference(source).object, initial.object); assert.notEqual(f.compile(candidate), descriptor);
+  assert.equal(source.material.userData.calls, 2); assert.equal(candidate.material.userData.calls, 2);
+});
+
+test('custom key effects cannot publish a graph outside the admitted material profile', t => {
+  const f = fixture(t), item = f.add(0x3800); let calls = 0;
+  item.material.customProgramCacheKey = function () { calls++; this.colorNode = T.TSL.vec3(1, 0, 0); return 'authored'; };
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(calls, 1); assert.ok(item.material.colorNode, 'callback effects remain visible after rejection');
+  assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+for (const field of ['context', 'shadows']) test(`custom key ${field} mutations use the source dynamic-cache boundary`, t => {
+  const sourceFixture = fixture(t), candidateFixture = fixture(t);
+  const source = sourceFixture.add(0x3800), candidate = candidateFixture.add(0x3800);
+  const key = function () {
+    if (++this.userData.calls === 1) {
+      if (this.userData.field === 'context') this.userData.renderer.contextNode.needsUpdate = true;
+      else this.userData.renderer.shadowMap.enabled = true;
+    }
+    return 'dynamic';
+  };
+  for (const [f, item] of [[sourceFixture, source], [candidateFixture, candidate]]) {
+    item.material.userData = {calls: 0, field, renderer: f.renderer}; item.material.customProgramCacheKey = key;
+  }
+  let previousSource, previousCandidate;
+  for (let turn = 0; turn < 3; turn++) {
+    sourceFixture.renderer.info.calls++; candidateFixture.renderer.info.calls++;
+    const reference = sourceFixture.reference(source), descriptor = candidateFixture.compile(candidate);
+    assert.equal(candidate.material.userData.calls, source.material.userData.calls);
+    assert.equal(descriptor !== previousCandidate, reference.object !== previousSource);
+    previousSource = reference.object; previousCandidate = descriptor;
+  }
+});
+
+test('source key callbacks precede material-key getters and return-value coercion', t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800);
+  const key = function () {
+    this.userData.events.push('key'); this.addedByKey = 1;
+    return { [Symbol.toPrimitive]: hint => { this.userData.events.push(`coerce-${hint}`); return 'value'; } };
+  };
+  for (const item of [source, candidate]) {
+    const events = []; item.material.userData.events = events; item.material.customProgramCacheKey = key;
+    Object.defineProperty(item.material, 'constructor', {get() { events.push('constructor'); return T.MeshStandardNodeMaterial; }});
+  }
+  const reference = SourceRenderObject.prototype.getMaterialCacheKey.call({object: source.object, geometry: source.object.geometry,
+    material: source.material, renderer: f.renderer, context: f.renderContext, clippingContextCacheKey: '',
+    getGeometryCacheKey: SourceRenderObject.prototype.getGeometryCacheKey});
+  const actual = threeNodeBuilderMaterialKey(T, f.renderer, candidate.object, candidate.material, f.renderContext.id);
+  assert.equal(actual, reference); assert.deepEqual(candidate.material.userData.events, source.material.userData.events);
+  assert.equal(candidate.material.userData.events[0], 'key');
+});
+
+test('an override custom-key owner retires when its original source material is disposed', t => {
+  const f = fixture(t), item = f.add(0x3800), original = new T.MeshStandardMaterial(); let calls = 0;
+  item.material.customProgramCacheKey = () => { calls++; return 'override'; };
+  f.renderer._currentSourceMaterial = original;
+  const source = f.reference(item), descriptor = f.compile(item);
+  original.dispose();
+  assert.equal(f.source._renderObjects.has(source.object), false);
+  assert.equal(f.programs.diagnostics.programs, 0);
+  calls = 0; f.renderer.info.calls++;
+  assert.notEqual(f.reference(item).object, source.object); assert.notEqual(f.compile(item), descriptor);
+  assert.equal(calls, 2, 'each replacement source/candidate render object constructs its key once');
+});
+
+for (const owner of ['material', 'object', 'override']) test(`disposing ${owner} during key comparison keeps only the current source draw`, t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800), selected = environment(0x3400);
+  const originals = [new T.MeshStandardMaterial(), new T.MeshStandardMaterial()];
+  candidate.material.envMap = source.material.envMap;
+  const key = function () {
+    this.userData.calls++;
+    if (this.userData.disposeNow) {
+      this.userData.disposeNow = false; this.envMap = selected;
+      this.userData.owner.dispatchEvent({type: 'dispose'});
+    }
+    return 'unchanged';
+  };
+  for (const [index, item] of [source, candidate].entries()) {
+    item.material.userData = {calls: 0, disposeNow: false,
+      owner: owner === 'material' ? item.material : owner === 'object' ? item.object : originals[index]};
+    item.material.customProgramCacheKey = key;
+  }
+  const reference = () => {
+    f.renderer._currentSourceMaterial = owner === 'override' ? originals[0] : null;
+    return f.reference(source);
+  };
+  const compile = () => {
+    f.renderer._currentSourceMaterial = owner === 'override' ? originals[1] : null;
+    return f.compile(candidate);
+  };
+  const initialSource = reference(), initial = compile(), firstEnvironment = source.material.envMap;
+  for (const item of [source, candidate]) { item.material.userData.disposeNow = true; item.material.needsUpdate = true; }
+  f.renderer.info.calls++;
+  const sourceDraw = reference(), draw = compile();
+  assert.equal(sourceDraw.object, initialSource.object); assert.equal(draw, initial);
+  assert.equal(f.source._renderObjects.size, 0); assert.equal(f.programs.diagnostics.programs, 0);
+  assert.deepEqual([source.material.userData.calls, candidate.material.userData.calls], [2, 2]);
+  assert.deepEqual(sampled(f.capture(candidate, draw)), referenceTextures(sourceDraw));
+  assert.ok(referenceTextures(sourceDraw).includes(firstEnvironment));
+  f.renderer.info.calls++;
+  const nextSource = reference(), next = compile();
+  assert.notEqual(nextSource.object, initialSource.object); assert.notEqual(next, initial);
+  assert.deepEqual([source.material.userData.calls, candidate.material.userData.calls], [3, 3]);
+  assert.deepEqual(sampled(f.capture(candidate, next)), referenceTextures(nextSource));
+  assert.ok(sampled(f.capture(candidate, next)).includes(selected));
+});
