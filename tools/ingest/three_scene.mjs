@@ -128,6 +128,7 @@ export async function createGpuThreeScene(device,scene,{
   // queue. Public geometry identities stay intact; only GPU inputs use the
   // captured view. A null selection was culled or excluded at source capture.
   const fixedGeometry=o=>passNodeFrame?.fixedGeometries?.get(o);
+  const executionGeometry=source=>passMaterialFrame?.instanceFrame?.geometryView?.(source)??instanceHistory?.geometryView?.(source)??source;
   const fixedObject=o=>fixedGeometry(o)?.object??o;
   const sourceChildren=o=>passNodeFrame?.sceneHierarchy?.get(o)??passNodeFrame?.fixedScene?.hierarchy.get(o)??passMaterialFrame?.instanceFrame?.hierarchy.get(o)??o.children;
   const sourceOrder=o=>passNodeFrame?.fixedScene?.states.get(o)?.renderOrder??passMaterialFrame?.instanceFrame?.orders.get(o)??o.renderOrder;
@@ -300,7 +301,7 @@ export async function createGpuThreeScene(device,scene,{
   // influences (USE_INSTANCING_MORPH); only the program route draws them.
   const instancedMorph=object=>object.isInstancedMesh===true&&object.morphTexture!=null&&programRoute();
   function geometryAdmission(g,object){
-    const fixed=fixedGeometry(object),view=fixed?.geometry??g,groups=fixed?.groups??g?.groups;
+    const fixed=fixedGeometry(object),view=fixed?.geometry??executionGeometry(g),groups=fixed?.groups??view?.groups;
     const list=colorMaterials(object);
     const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
     if(!(g instanceof three.BufferGeometry)||(view.isInstancedBufferGeometry&&!programs&&!capturedNodeObject(object)))fail('GEOMETRY','Expected source BufferGeometry');
@@ -619,32 +620,32 @@ export async function createGpuThreeScene(device,scene,{
   // Program variants depend on the object (instancing, geometry streams), not
   // only the material: WebGLPrograms.getParameters reads both.
   const programVariant=object=>{
-    const a=object.geometry.attributes;
+    const geometry=executionGeometry(object.geometry),a=geometry.attributes;
     return [object.isInstancedMesh===true,object.isInstancedMesh===true&&object.instanceColor!==null,!!a.normal,a.color?.itemSize??0,!!a.uv1,!!a.uv2,!!a.uv3,
-      object.geometry.index?.array.constructor.name??'',object.isSkinnedMesh===true?'skin:'+object.id:'',
-      ...['position','normal','color'].map(k=>a&&object.geometry.morphAttributes[k]?.length||0)].join(',');
+      geometry.index?.array.constructor.name??'',object.isSkinnedMesh===true?'skin:'+object.id:'',
+      ...['position','normal','color'].map(k=>a&&geometry.morphAttributes[k]?.length||0)].join(',');
   };
   // The attribute source a program reads: the geometry, or for InstancedMesh a
   // per-object view adding instanceMatrix/instanceColor as WebGLRenderer binds them.
   const programSources=new WeakMap(),wireSources=new WeakMap();
   function programSource(object,wire=false){
+    const g=executionGeometry(object.geometry);
     // Wireframe: r186 getWireframeAttribute's edge index over the same streams (gl.LINES).
     if(wire){
-      const base=programSource(object),w=wireframeGeometry(object.geometry);
-      if(base===object.geometry)return w;
+      const base=programSource(object),w=wireframeGeometry(g);
+      if(base===g)return w;
       let view=wireSources.get(object);
       if(!view||view.base!==base||view.wire!==w){
-        view={base,wire:w,geometry:object.geometry,attributes:base.attributes,get index(){return w.index;},get drawRange(){return w.drawRange;},morphAttributes:base.morphAttributes,isInstancedBufferGeometry:false};
+        view={base,wire:w,geometry:g,attributes:base.attributes,get index(){return w.index;},get drawRange(){return w.drawRange;},morphAttributes:base.morphAttributes,isInstancedBufferGeometry:false};
         wireSources.set(object,view);
       }
       return view;
     }
-    if(object.isLineLoop)return loopGeometry(object.geometry);
+    if(object.isLineLoop)return loopGeometry(g);
     // Indexed point programs retain source vertex IDs through the shared
     // point-run lowering; gathering a second CPU geometry loses upload history.
-    if(!object.isInstancedMesh)return object.geometry;
+    if(!object.isInstancedMesh)return g;
     let view=programSources.get(object);
-    const g=object.geometry;
     const attributes={...g.attributes,instanceMatrix:object.instanceMatrix,...(object.instanceColor?{instanceColor:object.instanceColor}:{})};
     if(!view||view.geometry!==g||Object.keys(attributes).some(k=>view.attributes[k]!==attributes[k])||Object.keys(view.attributes).length!==Object.keys(attributes).length){
       view={geometry:g,attributes,get index(){return g.index;},get drawRange(){return g.drawRange;},morphAttributes:g.morphAttributes,isInstancedBufferGeometry:false};
@@ -675,7 +676,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     return view.geometry;
   }
-  const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:object.geometry;
+  const programKeyOf=object=>object.isInstancedMesh||object.isSkinnedMesh?object:executionGeometry(object.geometry);
   const programCapable=m=>m?.isShaderMaterial===true||(programRoute()&&programSupport.shaderLibMaterial(m));
   // Program route on the WebGL surface: ShaderMaterial, and ShaderLib programs
   // for built-in materials (WebGLRenderer's own GLSL) where the core lacks a feature.
@@ -1174,7 +1175,7 @@ export async function createGpuThreeScene(device,scene,{
     for(const object of nodes)if(drawable(object)||loopDrawn(object)){
       if(excludedNodeObject(object)||capturedNodeObject(object)||fixedGeometry(object)===null)continue;
       const topology=topologyOf(object),fixed=fixedGeometry(object);
-      const g=fixed?.geometry??object.geometry,instanceSource=!fixed&&object.isInstancedMesh?object:null;
+      const g=fixed?.geometry??executionGeometry(object.geometry),instanceSource=!fixed&&object.isInstancedMesh?object:null;
       const deformationSource=!fixed&&hasThreeDeformation(object)?object:null,key=deformationSource??instanceSource??g;
       const instanceSignature=instanceSource&&!instancedMorph(instanceSource)?instanceAdmission(instanceSource).signature:null;
       const source=sourceMaterials(object);
@@ -1342,7 +1343,7 @@ export async function createGpuThreeScene(device,scene,{
         }else{
           gpu=geometries.get(item.geometry);
           if(!gpu){
-            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,sourceAttributeCallbacks,
+            try{gpu=createGpuBufferGeometry(device,item.geometry,{...geometryOptions,maxBytes:maxGeometryBytes,sourceAttributeCallbacks,instanceHistory,
               maxInitialBytes:Math.max(0,maxGeometryBytes-geometryBytes())});}
             catch(error){
               // WebGL surface: a geometry layout the core cannot stream (e.g. an
@@ -1683,7 +1684,7 @@ export async function createGpuThreeScene(device,scene,{
               // list, with draw ranges and groups scaled by two.
               const wire=object.isMesh&&materialState(material).wireframe===true;
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
-              const selected=fixed?.geometry??source,g=wire?wireframeGeometry(selected):selected;
+              const selected=fixed?.geometry??executionGeometry(source),g=wire?wireframeGeometry(selected):selected;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
               if(programCapable(material)&&get(material,wire?'lines':topology,object).some(d=>d.program)){
                 if(shadowPass)return;

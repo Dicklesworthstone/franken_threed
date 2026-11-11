@@ -65,6 +65,111 @@ const clipMatrix = (camera, mesh) => {
   return projection.multiply(mesh.matrixWorld).elements.map(Math.fround);
 };
 
+for (const warm of [false, true])
+test(`queued ordinary geometry retains accepted vertex uploads and draw ranges (warm=${warm})`, async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), position = mesh.geometry.attributes.position;
+  const original = [...position.array];
+  if (warm) {
+    let callbacks = 0; mesh.onBeforeRender = () => { callbacks++; };
+    f.renderer.render(f.scene, f.camera); await drain(f.renderer); f.device.snapshots.length = 0;
+    assert.equal(callbacks, 1); mesh.onBeforeRender = T.Object3D.prototype.onBeforeRender;
+    mesh.material.side = T.BackSide;
+  }
+  position.array[0] = .125; mesh.geometry.setDrawRange(0, 3); f.renderer.render(f.scene, f.camera);
+  const first = warm ? original : [...position.array];
+  position.array[0] = .75; position.array[1] = 99;
+  position.addUpdateRange(0, 1); position.needsUpdate = true;
+  mesh.geometry.setDrawRange(3, 3); f.renderer.render(f.scene, f.camera);
+  const second = first.slice(); second[0] = .75;
+  position.array.fill(90); mesh.geometry.setDrawRange(0, 6);
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  const arrays = packets.map(({draw}) => {
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === 0));
+    const bytes = draw.contents.get(draw.streams.get(slot));
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, position.array.length)];
+  });
+  assert.deepEqual(arrays, [first, second]);
+  assert.deepEqual(packets.map(({draw}) => [draw.args[0], draw.args[2]]), [[3, 0], [3, 3]]);
+  assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('queued geometry retains partial index uploads, attribute selection and material groups', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), geometry = mesh.geometry;
+  const red = mesh.material, blue = new T.MeshBasicMaterial({color: new T.Color(.25, .5, .75), transparent: true});
+  red.color.setRGB(.75, .5, .25); red.transparent = true; mesh.material = [red, blue];
+  t.after(() => blue.dispose());
+  geometry.clearGroups(); geometry.addGroup(0, 3, 0); geometry.addGroup(3, 3, 1);
+  const first = [...geometry.index.array], originalPosition = geometry.attributes.position;
+  f.renderer.render(f.scene, f.camera);
+  geometry.index.array[0] = 3; geometry.index.array[3] = 0;
+  geometry.index.addUpdateRange(3, 1); geometry.index.needsUpdate = true;
+  geometry.groups[0].materialIndex = 1; geometry.groups[1].materialIndex = 0;
+  f.renderer.render(f.scene, f.camera);
+  const second = first.slice(); second[3] = 0;
+  geometry.setIndex(null); geometry.clearGroups();
+  geometry.setAttribute('position', new T.BufferAttribute(new Float32Array(12).fill(90), 3));
+  structuredClone(originalPosition.array.buffer, {transfer: [originalPosition.array.buffer]});
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.deepEqual(packets.map(({draw}) => {
+    const bytes = draw.contents.get(draw.index.buffer);
+    return [...new Uint16Array(bytes.buffer, bytes.byteOffset, first.length)];
+  }), [first, first, second, second]);
+  assert.deepEqual(packets.map(({words}) => words.slice(16, 19)),
+    [[.75, .5, .25], [.25, .5, .75], [.25, .5, .75], [.75, .5, .25]]);
+  assert.deepEqual(packets.map(({draw}) => [draw.args[0], draw.args[2]]), [[3, 0], [3, 3], [3, 0], [3, 3]]);
+  assert.equal(geometry.index, null); assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
+
+test('queued interleaved geometry retains one accepted shared stream and source range effects', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), geometry = new T.BufferGeometry();
+  const data = new T.InterleavedBuffer(new Float32Array([-1, -1, 0, .25, .5, .75, 1, -1, 0, .75, .5, .25, 0, 1, 0, 1, 1, 1]), 6);
+  geometry.setAttribute('position', new T.InterleavedBufferAttribute(data, 3, 0));
+  geometry.setAttribute('color', new T.InterleavedBufferAttribute(data, 3, 3));
+  mesh.geometry = geometry; mesh.material.vertexColors = true; t.after(() => geometry.dispose());
+  f.renderer.render(f.scene, f.camera); const first = [...data.array];
+  data.array[1] = -.5; data.array[2] = .125; data.array[3] = .875; data.array[4] = 90;
+  data.addUpdateRange(1, 1); data.addUpdateRange(3, 1); const retainedRange = data.updateRanges[0]; data.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  const second = first.slice(); second.splice(1, 3, -.5, .125, .875);
+  assert.deepEqual(retainedRange, {start: 1, count: 3}); assert.deepEqual(data.updateRanges, []);
+  data.array.fill(99); await drain(f.renderer);
+  assert.deepEqual(rigidPackets(f.device).map(({draw}) => {
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === 0));
+    assert.deepEqual(draw.pipeline.vertex.buffers[slot].attributes.map(attribute => attribute.shaderLocation), [0, 4]);
+    const bytes = draw.contents.get(draw.streams.get(slot));
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, first.length)];
+  }), [first, second]);
+});
+
+test('geometry disposal separates queued generations and admits fresh versionless CPU bytes on reuse', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), position = mesh.geometry.attributes.position;
+  position.array[0] = .25; f.renderer.render(f.scene, f.camera);
+  mesh.geometry.dispose(); position.array[0] = .75; f.renderer.render(f.scene, f.camera);
+  mesh.geometry.dispose(); position.array[0] = 90;
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.deepEqual(packets.map(({draw}) => {
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === 0));
+    return new Float32Array(draw.contents.get(draw.streams.get(slot)).buffer)[0];
+  }), [.25, .75]);
+  assert.notEqual(packets[0].draw.streams.get(0), packets[1].draw.streams.get(0));
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('an upload hook introduced during preparation keeps its original receiver and updated source bytes', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), position = mesh.geometry.attributes.position;
+  f.renderer.render(f.scene, f.camera);
+  let calls = 0; position.array[0] = .75; position.needsUpdate = true;
+  position.onUpload(function () { calls++; assert.equal(this, position); });
+  await drain(f.renderer); assert.equal(calls, 1);
+  const {draw} = rigidPackets(f.device)[0];
+  const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === 0));
+  assert.equal(new Float32Array(draw.contents.get(draw.streams.get(slot)).buffer)[0], .75);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
+
 test('cold ordinary WebGL renders retain each accepted world matrix and geometry selector', async t => {
   const f = await fixture(t), mesh = ordinaryMesh(f), replacement = new T.BoxGeometry();
   t.after(() => replacement.dispose());
@@ -164,12 +269,14 @@ test(`queued ${Type.name} source programs consume the accepted model-view matric
   const object = new Type(f.mesh.geometry, material); object.frustumCulled = false;
   if (Type === T.Points) object.geometry.setIndex(null);
   f.scene.remove(f.mesh); f.scene.add(object); t.after(() => material.dispose());
-  const expected = [];
+  const expected = [], positions = [];
   for (const x of [.25, .75]) {
+    object.geometry.attributes.position.array[0] = x; object.geometry.attributes.position.needsUpdate = true;
     object.position.x = x; f.renderer.render(f.scene, f.camera);
     expected.push(new T.Matrix4().multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld).elements.map(Math.fround));
+    positions.push([...object.geometry.attributes.position.array]);
   }
-  object.position.x = 90; object.updateMatrixWorld();
+  object.position.x = 90; object.updateMatrixWorld(); object.geometry.attributes.position.array.fill(90);
   await drain(f.renderer);
   const {reflection} = f.renderer._programSupport.compile(material, object).program;
   const offset = reflection.uniforms.find(uniform => uniform.name === 'modelViewMatrix').offset;
@@ -180,6 +287,12 @@ test(`queued ${Type.name} source programs consume the accepted model-view matric
       return [...new Float32Array(bytes.buffer, bytes.byteOffset + (resource.offset ?? 0) + (offsets[0] ?? 0) + offset, 16)];
     });
   assert.deepEqual(matrices, expected);
+  assert.deepEqual(f.device.snapshots.flat().filter(draw => draw.streams.size).map(draw => {
+    const location = reflection.attributes.find(attribute => attribute.name === 'position').location;
+    const slot = draw.pipeline.vertex.buffers.findIndex(layout => layout.attributes.some(attribute => attribute.shaderLocation === location));
+    const bytes = draw.contents.get(draw.streams.get(slot));
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, positions[0].length)];
+  }), positions);
   assert.equal(f.renderer._materialCaptureValues, 0);
 });
 function oracle() {

@@ -1,16 +1,19 @@
-/** One WebGL instance upload history per public renderer, shared by its scene
+/** One WebGL upload history per public renderer, shared by its scene
  * bridges and queued pass captures. A new destination must not turn an
  * unversioned CPU edit into an upload. Private pass streams never rejoin this
  * history: they carry the bytes accepted by one render call. */
-export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAttributes = 512} = {}) {
+export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAttributes = 512, geometry = false} = {}) {
   const histories = new Map(), privateAttributes = new WeakSet(), untrackedAttributes = new WeakSet();
   let bytes = 0, revision = 0;
   const fail = message => { throw Object.assign(new Error(`GEOMETRY_GPU_HISTORY: ${message}`), {code: 'GEOMETRY_GPU_HISTORY'}); };
-  const eligible = entry => entry.owner?.isInstancedBufferAttribute === true &&
-    [3, 16].includes(entry.owner.itemSize) && entry.source?.elementType === Float32Array &&
-    !entry.conversion && !entry.borrowed && (entry.divisor ?? 1) === 1 && !privateAttributes.has(entry.owner) && !untrackedAttributes.has(entry.owner);
+  const types = new Set([Float32Array, Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
+    ...(typeof Float16Array === 'function' ? [Float16Array] : [])]);
+  const eligible = entry => !entry.borrowed && !privateAttributes.has(entry.owner) && !untrackedAttributes.has(entry.owner) &&
+    (geometry ? types.has(entry.source?.elementType) : entry.owner?.isInstancedBufferAttribute === true &&
+      [3, 16].includes(entry.owner.itemSize) && entry.source?.elementType === Float32Array &&
+      !entry.conversion && (entry.divisor ?? 1) === 1);
   const copy = source => {
-    const array = new Float32Array(source.length);
+    const array = new source.constructor(source.length);
     new Uint8Array(array.buffer).set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
     return array;
   };
@@ -20,10 +23,11 @@ export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAtt
       if (untrackedAttributes.has(attribute)) fail('This instance stream retains an independent live upload history');
       const array = attribute.array, previous = histories.get(attribute);
       if (array == null && previous && Number.isSafeInteger(attribute.version) && attribute.version >= 0 && previous.version >= attribute.version) continue;
-      if (!(array instanceof Float32Array) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
-          !Number.isSafeInteger(attribute.version) || attribute.version < 0) fail('Expected fixed Float32 instance storage and an upload version');
+      if (!(geometry ? types.has(array?.constructor) : array instanceof Float32Array) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+          !Number.isSafeInteger(attribute.version) || attribute.version < 0) fail('Expected fixed attribute storage and an upload version');
       try { new Uint8Array(array.buffer, 0, 0); } catch { fail('Detached instance storage'); }
-      if (previous && previous.array.length !== array.length) fail('Replace an instance attribute when resizing its storage');
+      if (previous && (previous.array.constructor !== array.constructor || previous.array.length !== array.length))
+        fail('Replace an attribute when resizing or changing its storage type');
       if (!previous) { additions += array.byteLength; count++; }
       if (previous && attribute.version > previous.version) {
         if (!Array.isArray(attribute.updateRanges) || typeof attribute.clearUpdateRanges !== 'function') fail('Expected ordinary instance update ranges');
@@ -58,8 +62,9 @@ export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAtt
       merged.length = last + 1;
       for (let i = 0; i <= last; i++) {
         const range = merged[i], end = range.count === 0 ? source.length : range.start + range.count;
-        new Uint8Array(array.buffer, range.start * 4, (end - range.start) * 4)
-          .set(new Uint8Array(source.buffer, source.byteOffset + range.start * 4, (end - range.start) * 4));
+        const width = source.BYTES_PER_ELEMENT;
+        new Uint8Array(array.buffer, range.start * width, (end - range.start) * width)
+          .set(new Uint8Array(source.buffer, source.byteOffset + range.start * width, (end - range.start) * width));
       }
     }
     sink(array);

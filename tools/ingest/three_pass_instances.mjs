@@ -1,13 +1,16 @@
 import {createWebGLInstanceHistory} from './webgl_instance_history.mjs';
+import {createThreePassGeometry} from './three_pass_geometry.mjs';
 
 /** Callback-free rigid object packets for deferred WebGL scene passes.
  * Source objects stay untouched while preparation awaits. Stable private views
  * reuse the ordinary geometry/program owners; each packet installs only its
- * accepted geometry selector, transform and projection selection. Instance
- * streams keep their shared upload history; ordinary geometry bytes remain
- * with their existing live upload owner. */
+ * accepted geometry selector, transform and projection selection. Ordinary
+ * geometry and instance streams share their source upload history with live
+ * draws, preserving needsUpdate, partial ranges and disposal generations. */
 export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, maxMeshes = 256} = {}) {
-  const history = createWebGLInstanceHistory({maxBytes, maxAttributes: maxMeshes * 2});
+  const history = createWebGLInstanceHistory({maxBytes, maxAttributes: maxMeshes * 16, geometry: true});
+  const geometry = createThreePassGeometry(three, history, {maxGeometries: maxMeshes * 4});
+  history.geometryView = geometry.live;
   const sources = new Map(); let attributes = new WeakMap(), rigidSources = new WeakMap();
   let pendingBytes = 0;
   const fail = message => { throw Object.assign(new Error(`F3D_RENDERER_UNSUPPORTED: ${message}`), {code: 'F3D_RENDERER_UNSUPPORTED'}); };
@@ -60,10 +63,13 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     if (sources.size + [...frame.instances].filter(object => !sources.has(object)).length > maxMeshes)
       return refuse('Pass instance identity capacity exceeded');
     const hierarchy = new Map(), visibility = new Map(), layers = new Map(), orders = new Map(), selected = new Set(), geometries = new Map();
-    const stack = [{object: root, visible: true}], objects = new Map(), packets = [], streams = new Set();
+    const stack = [{object: root, visible: true}], objects = new Map(), packets = [], streams = new Set(), shapes = new Map();
     const vp = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(vp, three.WebGLCoordinateSystem, camera.reversedDepth);
-    let bytes = 0;
+    let bytes = 0, geometryValues = 0;
+    // Wireframe derives topology from CPU indices at its own version boundary.
+    // Keep that established owner until it has a separate accepted edge history.
+    const captureGeometry = ![...frame.materials.keys()].some(material => material.wireframe === true);
     // Validate budgets and projection eligibility before acknowledging a source
     // upload or clearing any update range. Material eligibility was established
     // by captureThreeMaterialState without invoking application accessors.
@@ -88,11 +94,32 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
         if (sortObjects && bounds.boundingSphere === null) bounds.computeBoundingSphere();
       }
     }
-    const values = hierarchy.size * 4 + candidates.size * 40;
+    try {
+      if (captureGeometry) for (const source of selected) {
+        const selectedGeometry = candidates.get(source).geometry;
+        if (!shapes.has(selectedGeometry)) {
+          const shape = geometry.inspect(selectedGeometry, maxValues - geometryValues);
+          shapes.set(selectedGeometry, shape); geometryValues += shape.values;
+        }
+      }
+      geometry.validate(shapes);
+    } catch (error) {
+      if (error.code !== 'GEOMETRY_GPU_HISTORY') throw error;
+      if (required) return refuse(error.message);
+      // An exotic geometry keeps its existing live upload path. Its ordinary
+      // object's already-supported pose and membership capture still applies.
+      shapes.clear(); geometryValues = 0;
+    }
+    // Count each shared geometry storage once per accepted use. Instance
+    // packets above also reserve hidden streams, matching their prior contract.
+    const geometryStreams = new Set([...shapes.values()].flatMap(shape => shape.all.map(entry => entry.owner)));
+    for (const owner of geometryStreams) { bytes += owner.array.byteLength; streams.add(owner); }
+    const values = hierarchy.size * 4 + candidates.size * 40 + geometryValues;
     if (values > maxValues || bytes > maxBytes - pendingBytes) return refuse('Pending instanced pass snapshot capacity exceeded');
     try { history.validate(streams); }
     catch (error) { if (error.code !== 'GEOMETRY_GPU_HISTORY') throw error; return refuse(error.message); }
     const accepted = new Map([...streams].map(attribute => [attribute, history.capture(attribute)]));
+    const geometryPackets = new Map([...shapes].map(([source, shape]) => [source, geometry.capture(shape, accepted)]));
     for (const [source, candidate] of candidates) {
       const state = privateObject(source, candidate.instanced), view = state.view, active = selected.has(source), captured = [];
       for (const key of candidate.instanced ? ['instanceMatrix', 'instanceColor'] : []) {
@@ -107,7 +134,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
       layers.set(view, layers.get(source)); orders.set(view, orders.get(source));
       frame.objects.set(view, active ? frame.objects.get(source) : null);
       const bounds = candidate.instanced ? source : candidate.geometry;
-      packets.push({state, captured, count: source.count, geometry: candidate.geometry,
+      packets.push({state, captured, count: source.count, geometry: geometryPackets.get(candidate.geometry)?.view ?? candidate.geometry,
         matrixWorld: new three.Matrix4().copy(source.matrixWorld), boundingSphere: bounds.boundingSphere
           ? new three.Sphere(new three.Vector3().copy(bounds.boundingSphere.center), bounds.boundingSphere.radius) : null,
         castShadow: source.castShadow, receiveShadow: source.receiveShadow});
@@ -115,8 +142,12 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     pendingBytes += bytes;
     let released = false;
     return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes,
+      geometryView: source => geometryPackets.get(source)?.view,
+      geometrySafe: () => [...geometryPackets.values()].every(packet => packet.safe()) &&
+        (!geometryPackets.size || ![...frame.materials.keys()].some(material => material.wireframe === true)),
       install() {
         if (released) fail('An instanced pass snapshot was released before submission');
+        for (const packet of geometryPackets.values()) packet.install();
         for (const packet of packets) {
           const view = packet.state.view;
           view.count = packet.count; view.geometry = packet.geometry;
@@ -130,11 +161,11 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
           }
         }
       },
-      release() { if (!released) { released = true; pendingBytes -= bytes; } },
+      release() { if (!released) { released = true; pendingBytes -= bytes; for (const packet of geometryPackets.values()) packet.release(); } },
     };
   }
   return {history, capture,
-    dispose() { for (const [source, state] of sources) source.removeEventListener('dispose', state.dispose); sources.clear(); attributes = new WeakMap(); rigidSources = new WeakMap(); history.dispose(); },
+    dispose() { for (const [source, state] of sources) source.removeEventListener('dispose', state.dispose); sources.clear(); attributes = new WeakMap(); rigidSources = new WeakMap(); geometry.dispose(); history.dispose(); },
     get pendingBytes() { return pendingBytes; },
   };
 }

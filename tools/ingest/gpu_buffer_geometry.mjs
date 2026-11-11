@@ -488,7 +488,14 @@ function createResidency(device, geometry, {
   const onDispose = () => {
     if (busy) fail('REENTRANT', 'Cannot release geometry from an upload callback');
     if (!disposed && !terminal) {
-      for (const owner of records.keys()) instanceHistory?.forget(owner);
+      // WebGLGeometries removes the current selectors, not every attribute
+      // formerly used by this residency. A replaced attribute may still be
+      // shared by another geometry and must retain its GPU-visible history.
+      if (sourceAttributeCallbacks && instanceHistory) {
+        const selected = geometry.isInstancedMesh ? [geometry.instanceMatrix, geometry.instanceColor]
+          : [...Object.values(geometry.attributes ?? {}), geometry.index];
+        for (const attribute of selected) if (attribute) instanceHistory.forget(ownerOf(attribute));
+      }
       release();
     }
   };

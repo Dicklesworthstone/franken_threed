@@ -175,6 +175,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
   }
   let selection;
   const cameraSafe = () => {
+    if (selection?.instanceFrame?.geometrySafe?.() === false) return false;
     const perspective = data(camera, 'isPerspectiveCamera') === true;
     if (!camera || !ordinaryObject(camera) || data(camera, 'isArrayCamera') || data(camera, 'isMultiViewCamera') ||
         !perspective && data(camera, 'isOrthographicCamera') !== true || data(camera, 'children')?.length !== 0) return false;
