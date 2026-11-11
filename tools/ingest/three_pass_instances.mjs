@@ -9,8 +9,9 @@ import {createThreePassGeometry} from './three_pass_geometry.mjs';
  * draws, preserving needsUpdate, partial ranges and disposal generations. */
 export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, maxMeshes = 256} = {}) {
   const history = createWebGLInstanceHistory({maxBytes, maxAttributes: maxMeshes * 16, geometry: true});
-  const geometry = createThreePassGeometry(three, history, {maxGeometries: maxMeshes * 4});
+  const geometry = createThreePassGeometry(three, history, {maxGeometries: maxMeshes * 4, maxBytes});
   history.geometryView = geometry.live;
+  history.wireframeGeometry = geometry.wireframeGeometry;
   const sources = new Map(); let attributes = new WeakMap(), rigidSources = new WeakMap();
   let pendingBytes = 0;
   const fail = message => { throw Object.assign(new Error(`F3D_RENDERER_UNSUPPORTED: ${message}`), {code: 'F3D_RENDERER_UNSUPPORTED'}); };
@@ -67,9 +68,7 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     const vp = new three.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new three.Frustum().setFromProjectionMatrix(vp, three.WebGLCoordinateSystem, camera.reversedDepth);
     let bytes = 0, geometryValues = 0;
-    // Wireframe derives topology from CPU indices at its own version boundary.
-    // Keep that established owner until it has a separate accepted edge history.
-    const captureGeometry = ![...frame.materials.keys()].some(material => material.wireframe === true);
+    const wireframes = new Map([...frame.materials.keys()].map(material => [material, material.wireframe === true]));
     // Validate budgets and projection eligibility before acknowledging a source
     // upload or clearing any update range. Material eligibility was established
     // by captureThreeMaterialState without invoking application accessors.
@@ -95,11 +94,25 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
       }
     }
     try {
-      if (captureGeometry) for (const source of selected) {
+      for (const source of selected) {
         const selectedGeometry = candidates.get(source).geometry;
         if (!shapes.has(selectedGeometry)) {
           const shape = geometry.inspect(selectedGeometry, maxValues - geometryValues);
+          shape.uploads = new Set(shape.attributes.map(([, entry]) => entry.owner));
           shapes.set(selectedGeometry, shape); geometryValues += shape.values;
+        }
+        const shape = shapes.get(selectedGeometry), materials = frame.objects.get(source);
+        const selections = Array.isArray(materials)
+          ? shape.groups.map(group => ({material: materials[group.materialIndex], group})) : [{material: materials, group: null}];
+        for (const {material, group} of selections) if (material?.visible) {
+          const effective = frame.overrideMaterial && material.allowOverride === true ? frame.overrideMaterial : material;
+          if (source.isMesh && wireframes.get(effective)) shape.edgePlan ??= geometry.edgePlan(selectedGeometry);
+          else if (shape.index) {
+            const start = Math.max(shape.drawRange.start, group?.start ?? 0);
+            const end = Math.min(shape.drawRange.start + shape.drawRange.count,
+              group ? group.start + group.count : Infinity, shape.index.count);
+            if (end >= start && Number.isFinite(end - start)) shape.uploads.add(shape.index.owner);
+          }
         }
       }
       geometry.validate(shapes);
@@ -112,8 +125,9 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     }
     // Count each shared geometry storage once per accepted use. Instance
     // packets above also reserve hidden streams, matching their prior contract.
-    const geometryStreams = new Set([...shapes.values()].flatMap(shape => shape.all.map(entry => entry.owner)));
+    const geometryStreams = new Set([...shapes.values()].flatMap(shape => [...shape.uploads]));
     for (const owner of geometryStreams) { bytes += owner.array.byteLength; streams.add(owner); }
+    for (const shape of shapes.values()) bytes += shape.edgePlan?.bytes ?? 0;
     const values = hierarchy.size * 4 + candidates.size * 40 + geometryValues;
     if (values > maxValues || bytes > maxBytes - pendingBytes) return refuse('Pending instanced pass snapshot capacity exceeded');
     try { history.validate(streams); }
@@ -141,10 +155,9 @@ export function createThreePassInstances(three, {maxBytes = 128 * 1024 * 1024, m
     }
     pendingBytes += bytes;
     let released = false;
-    return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes,
+    return {objects, hierarchy, visibility, layers, orders, geometries, values, bytes, wireframes,
       geometryView: source => geometryPackets.get(source)?.view,
-      geometrySafe: () => [...geometryPackets.values()].every(packet => packet.safe()) &&
-        (!geometryPackets.size || ![...frame.materials.keys()].some(material => material.wireframe === true)),
+      geometrySafe: () => [...geometryPackets.values()].every(packet => packet.safe()),
       install() {
         if (released) fail('An instanced pass snapshot was released before submission');
         for (const packet of geometryPackets.values()) packet.install();

@@ -199,7 +199,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
   // required pass scope rejects it before destination retention; ordinary
   // rendering must not newly fail because optional instance capture is enabled.
   if (instances.size && [...seen].some(object => data(object, 'isLOD') && data(object, 'autoUpdate'))) return null;
-  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances} : null;
+  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances, overrideMaterial} : null;
   return selection;
 }
 

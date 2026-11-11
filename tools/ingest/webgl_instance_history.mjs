@@ -3,8 +3,8 @@
  * unversioned CPU edit into an upload. Private pass streams never rejoin this
  * history: they carry the bytes accepted by one render call. */
 export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAttributes = 512, geometry = false} = {}) {
-  const histories = new Map(), privateAttributes = new WeakSet(), untrackedAttributes = new WeakSet();
-  let bytes = 0, revision = 0;
+  const histories = new Map(), privateAttributes = new WeakSet(), privateGeometries = new WeakSet(), untrackedAttributes = new WeakSet(), privateRetirements = new WeakMap();
+  let bytes = 0, revision = 0, submissions = 0, deferredReleases = [];
   const fail = message => { throw Object.assign(new Error(`GEOMETRY_GPU_HISTORY: ${message}`), {code: 'GEOMETRY_GPU_HISTORY'}); };
   const types = new Set([Float32Array, Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array,
     ...(typeof Float16Array === 'function' ? [Float16Array] : [])]);
@@ -98,6 +98,32 @@ export function createWebGLInstanceHistory({maxBytes = 128 * 1024 * 1024, maxAtt
     },
     capture(attribute) { return upload(attribute, () => {}, () => attribute.onUploadCallback()).array; },
     markPrivate(attribute) { privateAttributes.add(attribute); },
+    markPrivateGeometry(geometry) { privateGeometries.add(geometry); },
+    isPrivateGeometry(geometry) { return privateGeometries.has(geometry); },
+    onPrivateRetire(attribute, callback) {
+      if (!privateAttributes.has(attribute)) return null;
+      let callbacks = privateRetirements.get(attribute);
+      if (!callbacks) privateRetirements.set(attribute, callbacks = new Set());
+      callbacks.add(callback);
+      return () => { callbacks.delete(callback); if (!callbacks.size && privateRetirements.get(attribute) === callbacks) privateRetirements.delete(attribute); };
+    },
+    retirePrivate(attribute) {
+      const callbacks = privateRetirements.get(attribute);
+      if (!callbacks) return;
+      privateRetirements.delete(attribute);
+      for (const callback of [...callbacks]) callback();
+    },
+    deferPrivateRelease(callback) { if (submissions) deferredReleases.push(callback); else callback(); },
+    beginPrivateSubmission() {
+      submissions++; let finished = false;
+      return () => {
+        if (finished) return; finished = true;
+        if (--submissions === 0) {
+          const callbacks = deferredReleases; deferredReleases = [];
+          for (const callback of callbacks) callback();
+        }
+      };
+    },
     forget(attribute) { untrackedAttributes.delete(attribute); const old = histories.get(attribute); if (old) { bytes -= old.array.byteLength; histories.delete(attribute); } },
     dispose() { histories.clear(); bytes = 0; },
     get bytes() { return bytes; },

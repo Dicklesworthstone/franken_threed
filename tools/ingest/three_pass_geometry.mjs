@@ -2,8 +2,9 @@
  * supplies GPU-visible raw bytes; these views never read later CPU edits and
  * never run application upload callbacks. Public BufferGeometry identities and
  * arrays remain untouched. Disposal retires a generation after its queued uses. */
-export function createThreePassGeometry(three, history, {maxGeometries = 4096} = {}) {
-  const sources = new Map(), states = new Set();
+export function createThreePassGeometry(three, history, {maxGeometries = 4096, maxBytes = 128 * 1024 * 1024} = {}) {
+  const sources = new Map(), states = new Set(), views = new WeakMap();
+  let edgeBytes = 0, previewBytes = 0;
   const fail = message => { throw Object.assign(new Error(`GEOMETRY_GPU_HISTORY: ${message}`), {code: 'GEOMETRY_GPU_HISTORY'}); };
   const data = (object, key) => {
     for (let owner = object; owner; owner = Object.getPrototypeOf(owner)) {
@@ -73,6 +74,10 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
   function validate(shapes) {
     if (sources.size + [...shapes.keys()].filter(source => !sources.has(source)).length > maxGeometries)
       fail('Queued geometry identity capacity exceeded');
+    let selectedBytes = edgeBytes;
+    for (const shape of shapes.values()) if (shape.edgePlan && !shape.edgePlan.cached)
+      selectedBytes += shape.edgePlan.bytes - (sources.get(shape.source)?.edge?.array.byteLength ?? 0);
+    if (selectedBytes > maxBytes) fail('Wireframe edge history capacity exceeded');
   }
   const matches = (a, b) => a.instanced === b.instanced && a.attributes.length === b.attributes.length &&
     a.attributes.every(([name, entry], i) => name === b.attributes[i][0] && sameAttribute(entry, b.attributes[i][1])) &&
@@ -81,7 +86,99 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
   function retire(state, force = false) {
     if (!state || state.closed) return;
     state.retired = true;
-    if (force || !state.refs) { state.closed = true; state.view.dispatchEvent({type: 'dispose'}); states.delete(state); }
+    if (force || !state.refs) {
+      state.closed = true; retireWire(state); state.view.dispatchEvent({type: 'dispose'}); states.delete(state);
+    }
+  }
+  function clearPreview(wire) {
+    if (wire?.preview) { previewBytes -= wire.preview.edge.array.byteLength; wire.preview = null; }
+  }
+  function retireWire(owner) {
+    clearPreview(owner.wire); owner.wire?.geometry.dispose(); owner.wire = null;
+  }
+  function sourceRecord(original) {
+    let source = sources.get(original);
+    if (source) return source;
+    if (sources.size >= maxGeometries) fail('Queued geometry identity capacity exceeded');
+    source = {state: null, edge: null, wire: null, dispose: null};
+    source.dispose = () => {
+      // Pinned WebGLGeometries removes current selectors and the separately
+      // derived edge index; replacing a source attribute does not reset edges.
+      for (const attribute of [...Object.values(original.attributes), original.index]) if (attribute)
+        history.forget(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+      edgeBytes -= source.edge?.array.byteLength ?? 0;
+      retireWire(source); original.removeEventListener('dispose', source.dispose);
+      sources.delete(original); retire(source.state);
+    };
+    original.addEventListener('dispose', source.dispose); sources.set(original, source); return source;
+  }
+  function edgePlan(original) {
+    const cached = sources.get(original)?.edge, index = original.index, position = original.attributes.position;
+    if (cached && (index === null || !(cached.version < index.version)))
+      return {cached, bytes: cached.array.byteLength};
+    if (!position) fail('Wireframe geometry requires positions');
+    const array = index ? index.array : position.array;
+    if (!ArrayBuffer.isView(array) || array instanceof DataView) fail('Wireframe topology requires CPU index or position storage');
+    const Type = position.count >= 65535 ? Uint32Array : Uint16Array;
+    const triangles = index ? Math.ceil(array.length / 3) : Math.max(0, Math.ceil((array.length / 3 - 1) / 3));
+    const length = triangles * 6, bytes = length * Type.BYTES_PER_ELEMENT;
+    if (!Number.isSafeInteger(bytes) || bytes > maxBytes) fail('Wireframe edge history capacity exceeded');
+    return {array, indexed: index !== null, version: index ? index.version : position.version, Type, length, bytes};
+  }
+  function buildEdges(plan) {
+    const array = new plan.Type(plan.length);
+    for (let offset = 0, triangle = 0; offset < array.length; offset += 6, triangle += 3) {
+      const a = plan.indexed ? plan.array[triangle] : triangle;
+      const b = plan.indexed ? plan.array[triangle + 1] : triangle + 1;
+      const c = plan.indexed ? plan.array[triangle + 2] : triangle + 2;
+      array.set([a, b, b, c, c, a], offset);
+    }
+    const attribute = new three.BufferAttribute(array, 1); attribute.version = plan.version;
+    history.markPrivate(attribute); return attribute;
+  }
+  function acceptEdges(original, plan) {
+    if (plan.cached) return plan.cached;
+    const source = sourceRecord(original), bytes = edgeBytes - (source.edge?.array.byteLength ?? 0) + plan.bytes;
+    if (bytes > maxBytes) fail('Wireframe edge history capacity exceeded');
+    source.edge = buildEdges(plan); edgeBytes = bytes; return source.edge;
+  }
+  function wireframeGeometry(input, {accept = true} = {}) {
+    const state = views.get(input), original = state?.original ?? input;
+    const plan = state?.acceptedEdge ? null : edgePlan(original);
+    // A queued generation can outlive public disposal. Its accepted edges are
+    // sufficient; deriving them must not resurrect a source cache/listener.
+    const owner = state ?? sourceRecord(original);
+    const wire = owner.wire ??= {geometry: new three.BufferGeometry(), edge: null, preview: null};
+    history.markPrivateGeometry(wire.geometry);
+    // Compilation may preview layouts, but never establishes the source edge
+    // version. First render still reads CPU edits made after compileAsync().
+    let edge = state?.acceptedEdge ?? plan.cached;
+    if (edge || accept) {
+      edge ??= acceptEdges(original, plan); clearPreview(wire);
+    } else {
+      const previous = wire.preview;
+      if (!previous || previous.plan.array !== plan.array || previous.plan.version !== plan.version ||
+          previous.plan.length !== plan.length || previous.plan.Type !== plan.Type || previous.plan.indexed !== plan.indexed) {
+        const bytes = previewBytes - (previous?.edge.array.byteLength ?? 0) + plan.bytes;
+        if (bytes > maxBytes) fail('Wireframe preparation preview capacity exceeded');
+        edge = buildEdges(plan); previewBytes = bytes; wire.preview = {plan, edge};
+      } else edge = previous.edge;
+    }
+    const derived = wire.geometry;
+    derived.attributes = input.attributes; derived.morphAttributes = input.morphAttributes;
+    if (wire.edge !== edge) {
+      let index = derived.index;
+      // Stable-size updates reuse one private upload identity instead of
+      // retaining another GPU index allocation on every procedural rebuild.
+      if (!index || index.array.constructor !== edge.array.constructor || index.array.length !== edge.array.length) {
+        if (index) history.retirePrivate(index);
+        index = new three.BufferAttribute(edge.array, 1); history.markPrivate(index); derived.setIndex(index);
+      } else { index.array = edge.array; index.count = edge.count; index.needsUpdate = true; }
+      wire.edge = edge;
+    }
+    const range = input.drawRange;
+    derived.setDrawRange(range.start * 2, range.count === Infinity ? Infinity : range.count * 2);
+    return derived;
   }
   function makeState(shape) {
     const owners = new Map(), attributes = {};
@@ -117,22 +214,13 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
     const layout = entry => ({source: entry.source, owner: entry.owner, key: entry.key, array: {constructor: entry.array.constructor}});
     const signature = {instanced: shape.instanced, attributes: shape.attributes.map(([name, entry]) => [name, layout(entry)]),
       index: shape.index ? layout(shape.index) : null};
-    const state = {view: geometry, attributes, index, owners, shape: signature, refs: 0, retired: false, closed: false}; states.add(state); return state;
+    const state = {view: geometry, attributes, index, owners, shape: signature, refs: 0, retired: false, closed: false,
+      original: shape.source, acceptedEdge: null, wire: null};
+    history.markPrivateGeometry(geometry);
+    views.set(geometry, state); states.add(state); return state;
   }
   function capture(shape, accepted) {
-    let source = sources.get(shape.source);
-    if (!source) {
-      const original = shape.source;
-      source = {state: null, dispose: null};
-      source.dispose = () => {
-        // Pinned WebGLGeometries removes the currently selected attributes,
-        // including interleaved storage shared with another geometry.
-        for (const attribute of [...Object.values(original.attributes), original.index]) if (attribute)
-          history.forget(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
-        original.removeEventListener('dispose', source.dispose); sources.delete(original); retire(source.state);
-      };
-      original.addEventListener('dispose', source.dispose); sources.set(original, source);
-    }
+    const source = sourceRecord(shape.source), edge = shape.edgePlan ? acceptEdges(shape.source, shape.edgePlan) : null;
     if (!source.state || !matches(source.state.shape, shape)) {
       retire(source.state); source.state = makeState(shape);
     }
@@ -145,9 +233,10 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
         state.view.attributes = state.attributes; state.view.index = state.index; state.view.morphAttributes = {};
         state.view.groups = shape.groups; state.view.drawRange = shape.drawRange; state.view.instanceCount = shape.instanceCount;
         state.view.isInstancedBufferGeometry = shape.instanced;
+        state.acceptedEdge = edge;
         for (const [owner, {array, count}] of arrays) {
           const view = state.owners.get(owner); view.count = count;
-          if (view.array !== array) { view.array = array; view.needsUpdate = true; }
+          if (array && view.array !== array) { view.array = array; view.needsUpdate = true; }
         }
       },
       safe() {
@@ -157,7 +246,7 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
       release() { if (!released) { released = true; state.refs--; if (state.retired) retire(state); } },
     };
   }
-  return {inspect, validate, capture,
+  return {inspect, validate, capture, edgePlan, wireframeGeometry,
     live(source) {
       const state = sources.get(source)?.state;
       if (!state || state.closed || !dataOnly(source)) return source;
@@ -166,11 +255,12 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096} =
       // versions, and callbacks still receive the original public geometry.
       for (const key of ['attributes', 'index', 'morphAttributes', 'groups', 'drawRange', 'instanceCount']) state.view[key] = source[key];
       state.view.isInstancedBufferGeometry = source.isInstancedBufferGeometry === true;
+      state.acceptedEdge = null;
       return state.view;
     },
     dispose() {
-      for (const [source, state] of sources) source.removeEventListener('dispose', state.dispose);
-      sources.clear(); for (const state of states) retire(state, true);
+      for (const [source, state] of sources) { source.removeEventListener('dispose', state.dispose); retireWire(state); }
+      sources.clear(); edgeBytes = 0; for (const state of states) retire(state, true);
     },
   };
 }

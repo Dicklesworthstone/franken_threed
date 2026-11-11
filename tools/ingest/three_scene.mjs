@@ -108,6 +108,7 @@ export async function createGpuThreeScene(device,scene,{
   let passMaterialFrame=initialMaterialFrame;
   const capturedInstance=o=>passMaterialFrame?.instanceFrame?.objects.get(o)??o;
   const materialState=m=>passMaterialFrame?.materials.get(m)??m;
+  const wireframeMaterial=m=>passMaterialFrame?.instanceFrame?.wireframes?.get(m)??materialState(m)?.wireframe===true;
   const sourceMaterial=o=>passMaterialFrame?.objects.has(o)?passMaterialFrame.objects.get(o):o.material;
   const sourceMaterials=o=>{const m=sourceMaterial(o);return Array.isArray(m)?m:[m];};
   const colorMaterial=m=>m&&materialState(m).allowOverride===true&&passOverride!==null?passOverride:m;
@@ -463,7 +464,7 @@ export async function createGpuThreeScene(device,scene,{
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
     if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programDepthMode()||nodes.some(o=>o.castShadow&&
-      (o.isLine||o.isPoints||o.isBatchedMesh||sourceMaterials(o).some(m=>materialState(m)?.wireframe===true)||
+      (o.isLine||o.isPoints||o.isBatchedMesh||sourceMaterials(o).some(wireframeMaterial)||
         o.customDepthMaterial!=null||o.customDistanceMaterial!=null||
         o.onBeforeShadow!==three.Object3D.prototype.onBeforeShadow||o.onAfterShadow!==three.Object3D.prototype.onAfterShadow)))return true;
     try{shadowApi.inspectThreeShadow(lights[0],three);return false;}
@@ -949,7 +950,7 @@ export async function createGpuThreeScene(device,scene,{
       if(programTransmissionMode)return programDescription(m,topology,object);
       // Shader hooks (onBeforeCompile/onBeforeRender) need the material's own program.
       if(programDeformed.has(object)||programHooked.has(object)||programGeometries_.has(object.geometry)||
-        materialState(m).wireframe===true&&(object.isInstancedMesh||hasThreeDeformation(object))||
+        wireframeMaterial(m)&&(object.isInstancedMesh||hasThreeDeformation(object))||
         m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||m.onBeforeRender!==three.Material.prototype.onBeforeRender)return programDescription(m,topology,object);
       // Program shadow maps are only read by programs: every receiver draws one.
       if(programLightMode&&programSupport.needsLights(m))return programDescription(m,topology,object);
@@ -973,7 +974,7 @@ export async function createGpuThreeScene(device,scene,{
     const primitive=m.isLineBasicMaterial?'line':m.isPointsMaterial?'point':'surface';
     // Wireframe meshes keep their full (lit, textured) material on line lists,
     // as the source WebGPU renderer draws them.
-    const wire=m.wireframe===true&&primitive==='surface'&&topology==='lines';
+    const wire=wireframeMaterial(source)&&primitive==='surface'&&topology==='lines';
     if(topology!=='triangles'&&!wire&&primitive==='surface'&&shading!=='unlit')
       fail('MATERIAL',`Lit ${m.type} on ${topology} primitives is not admitted`);
     if(topology!=='triangles'&&!wire&&(m.map||m.alphaMap))fail('MATERIAL','Textured line/point primitives are not admitted');
@@ -1004,7 +1005,7 @@ export async function createGpuThreeScene(device,scene,{
     }
     if(m.onBeforeRender!==three.Material.prototype.onBeforeRender||m.onBeforeCompile!==three.Material.prototype.onBeforeCompile||
         m.customProgramCacheKey!==(m.isNodeMaterial?three.NodeMaterial:three.Material).prototype.customProgramCacheKey)fail('HOOK','Custom material shader/render hooks require their original component');
-    if((m.wireframe&&topology==='triangles')||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
+    if((wireframeMaterial(source)&&topology==='triangles')||m.alphaHash||m.alphaToCoverage||(!clippingEnabled&&m.clippingPlanes?.length))
       fail('MATERIAL','Wireframe, hashed/coverage alpha and clipping are not admitted');
     const raster=sourceRaster(m,topology);
     if(m.alphaMap&&!alphaMaps)fail('MATERIAL','Enable alphaMaps before drawing source opacity textures');
@@ -1110,6 +1111,7 @@ export async function createGpuThreeScene(device,scene,{
   // changes (r186 Geometries.getWireframeIndex), with drawRange scaled by two.
   const wireframes=new WeakMap();
   function wireframeGeometry(g){
+    if(instanceHistory?.wireframeGeometry)return instanceHistory.wireframeGeometry(g,{accept:busy&&!preparing});
     const position=g.attributes.position,index=g.index;
     if(!position)fail('GEOMETRY','Wireframe geometry requires positions');
     const version=index?index.version:position.version,id=index??position;
@@ -1184,7 +1186,7 @@ export async function createGpuThreeScene(device,scene,{
         // The original controls list admission, not the selected program. Do not
         // compile its shader or upload its maps when an override suppresses them.
         const m=colorMaterial(original);
-        const wire=object.isMesh&&materialState(m).wireframe===true;
+        const wire=object.isMesh&&wireframeMaterial(m);
         const isProgram=programCapable(m)&&get(m,wire?'lines':topology,object).some(d=>d.program);
         if(wire&&!isProgram&&(instanceSource||deformationSource))fail('MATERIAL','Wireframe instanced or deformed meshes are not admitted');
         const t=wire?'lines':topology,geometry=wire?wireframeGeometry(g):g,itemKey=isProgram?programKeyOf(object):wire?geometry:key;
@@ -1600,6 +1602,7 @@ export async function createGpuThreeScene(device,scene,{
     const publicRenderer=programRoute()?shadowRenderer():null;
     const passProgram=programSupport?.state?.(),passState=passProgram?.passState??null;
     const previousDrawContext=publicRenderer?._programDrawContext;
+    const finishGeometrySubmission=instanceHistory?.beginPrivateSubmission?.();
     try{
       if(!frame||typeof frame!=='object')fail('FRAME','Supply borrowed render attachments');
       if(!options||typeof options!=='object'||Array.isArray(options)||Object.keys(options).some(k=>!['overrideMaterial','matricesUpdated','nodeFrame','backgroundState','materialFrame','sortState','framebuffer','depthbuffer','onDrawCallbacks'].includes(k))||
@@ -1682,7 +1685,7 @@ export async function createGpuThreeScene(device,scene,{
               const material=shadowPass?original:colorMaterial(original);
               // Source WebGPU wireframe: a derived edge index drawn as a line
               // list, with draw ranges and groups scaled by two.
-              const wire=object.isMesh&&materialState(material).wireframe===true;
+              const wire=object.isMesh&&wireframeMaterial(material);
               if(wire&&shadowPass)fail('SHADOW','Wireframe shadow casters are not admitted');
               const selected=fixed?.geometry??executionGeometry(source),g=wire?wireframeGeometry(selected):selected;
               const group=wire&&sourceGroup?{start:sourceGroup.start*2,count:sourceGroup.count*2,materialIndex:sourceGroup.materialIndex}:sourceGroup;
@@ -2404,6 +2407,7 @@ export async function createGpuThreeScene(device,scene,{
       return failed(error);
     }finally{
       if(publicRenderer)publicRenderer._programDrawContext=previousDrawContext;
+      finishGeometrySubmission?.();
       busy=false;frameTextures=null;passNodeFrame=null;passBackgroundState=undefined;passMaterialFrame=null;passBatchHistory=null;if(disposed||terminal)release();
     }
   }

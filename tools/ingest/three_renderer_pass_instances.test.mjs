@@ -64,6 +64,115 @@ const clipMatrix = (camera, mesh) => {
     projection.elements[column * 4 + 2] = .5 * (projection.elements[column * 4 + 2] + projection.elements[column * 4 + 3]);
   return projection.multiply(mesh.matrixWorld).elements.map(Math.fround);
 };
+const wireEdges = array => array.flatMap((value, i) => i % 3 ? [] : [value, array[i + 1], array[i + 1], array[i + 2], array[i + 2], value]);
+
+for (const warm of [false, true])
+test(`queued wireframe draws retain accepted CPU edge topology and ranges (warm=${warm})`, async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), geometry = mesh.geometry, index = geometry.index;
+  mesh.material.wireframe = true;
+  const first = [...index.array];
+  if (warm) {
+    mesh.onBeforeRender = () => {};
+    f.renderer.render(f.scene, f.camera); await drain(f.renderer); f.device.snapshots.length = 0;
+    mesh.onBeforeRender = T.Object3D.prototype.onBeforeRender; mesh.material.side = T.BackSide;
+    index.array[0] = 3; // Cached edges ignore versionless CPU index edits.
+  }
+  geometry.setDrawRange(0, 3); f.renderer.render(f.scene, f.camera);
+  index.array[0] = 3; index.addUpdateRange(0, 1); index.needsUpdate = true;
+  geometry.setDrawRange(3, 3); f.renderer.render(f.scene, f.camera); const second = [...index.array];
+  index.array.fill(0); geometry.setDrawRange(0, 6);
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.deepEqual(packets.map(({draw}) => {
+    const bytes = draw.contents.get(draw.index.buffer);
+    return [...new Uint16Array(bytes.buffer, bytes.byteOffset, first.length * 2)];
+  }), [wireEdges(first), wireEdges(second)]);
+  assert.deepEqual(packets.map(({draw}) => [draw.args[0], draw.args[2], draw.pipeline.primitive.topology]),
+    [[6, 0, 'line-list'], [6, 6, 'line-list']]);
+  assert.deepEqual(index.updateRanges, [{start: 0, count: 1}], 'wireframe never uploads the original index');
+  assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
+
+test('mixed solid and wireframe groups retain distinct GPU index and CPU edge histories', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), geometry = mesh.geometry, index = geometry.index;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer); f.device.snapshots.length = 0;
+  const solid = mesh.material, wire = new T.MeshBasicMaterial({wireframe: true}); t.after(() => wire.dispose());
+  const uploaded = [...index.array]; index.array[0] = 3; index.array[3] = 0;
+  index.addUpdateRange(3, 1); index.needsUpdate = true; const cpu = [...index.array]; uploaded[3] = 0;
+  mesh.material = [solid, wire]; geometry.addGroup(0, 3, 0); geometry.addGroup(3, 3, 1);
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(index.updateRanges, [], 'the actual solid group consumes the original index upload');
+  index.array.fill(0); geometry.clearGroups(); solid.wireframe = true; wire.wireframe = false;
+  await drain(f.renderer);
+  const draws = rigidPackets(f.device).map(packet => packet.draw);
+  assert.deepEqual(draws.map(draw => [draw.pipeline.primitive.topology, draw.args[0], draw.args[2]]),
+    [['triangle-list', 3, 0], ['line-list', 6, 6]]);
+  assert.deepEqual(draws.map(draw => {
+    const bytes = draw.contents.get(draw.index.buffer);
+    return [...new Uint16Array(bytes.buffer, bytes.byteOffset, draw.pipeline.primitive.topology === 'line-list' ? 12 : 6)];
+  }), [uploaded, wireEdges(cpu)]);
+});
+
+test('queued override material selection retains wireframe topology and original index upload boundaries', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), index = mesh.geometry.index;
+  const wire = new T.MeshBasicMaterial({wireframe: true}); t.after(() => wire.dispose());
+  index.addUpdateRange(0, 1); index.needsUpdate = true;
+  const first = [...index.array]; f.scene.overrideMaterial = wire; f.renderer.render(f.scene, f.camera);
+  index.array[0] = 3; const second = [...index.array];
+  f.scene.overrideMaterial = mesh.material; f.renderer.render(f.scene, f.camera);
+  f.scene.overrideMaterial = null; wire.wireframe = false; index.array.fill(0);
+  await drain(f.renderer);
+  const draws = rigidPackets(f.device).map(packet => packet.draw);
+  assert.deepEqual(draws.map(draw => draw.pipeline.primitive.topology), ['line-list', 'triangle-list']);
+  assert.deepEqual(draws.map(draw => {
+    const bytes = draw.contents.get(draw.index.buffer);
+    return [...new Uint16Array(bytes.buffer, bytes.byteOffset, draw.pipeline.primitive.topology === 'line-list' ? 12 : 6)];
+  }), [wireEdges(first), second]);
+  assert.deepEqual(index.updateRanges, [{start: 0, count: 1}], 'the first actual solid upload preserves its initial ranges');
+});
+
+test('queued wireframe generations survive public disposal and versionless reuse', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), index = mesh.geometry.index;
+  mesh.material.wireframe = true; const first = [...index.array]; f.renderer.render(f.scene, f.camera);
+  mesh.geometry.dispose(); index.array[0] = 3; const second = [...index.array]; f.renderer.render(f.scene, f.camera);
+  index.array.fill(0); await drain(f.renderer);
+  assert.deepEqual(rigidPackets(f.device).map(({draw}) => {
+    const bytes = draw.contents.get(draw.index.buffer); return [...new Uint16Array(bytes.buffer, bytes.byteOffset, 12)];
+  }), [wireEdges(first), wireEdges(second)]);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
+
+test('wireframe compilation previews do not hide CPU topology edits before the first draw', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), index = mesh.geometry.index;
+  mesh.material.wireframe = true; await f.renderer.compileAsync(f.scene, f.camera);
+  index.array[0] = 3; const expected = wireEdges([...index.array]);
+  f.renderer.render(f.scene, f.camera); index.array.fill(0); await drain(f.renderer);
+  const {draw} = rigidPackets(f.device)[0], bytes = draw.contents.get(draw.index.buffer);
+  assert.deepEqual([...new Uint16Array(bytes.buffer, bytes.byteOffset, 12)], expected);
+});
+
+test('warm wireframe callbacks preserve source identities and repeated rebuilds reuse index residency', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), material = new T.ShaderMaterial({wireframe: true,
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'void main() { gl_FragColor = vec4(1.0); }'});
+  mesh.material = material; t.after(() => material.dispose());
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const buffer = f.device.snapshots.flat().find(draw => draw.streams.size).index.buffer;
+  let calls = 0; mesh.onBeforeRender = function (renderer, scene, camera, geometry) {
+    calls++; assert.equal(this, mesh); assert.equal(renderer, f.renderer); assert.equal(scene, f.scene);
+    assert.equal(camera, f.camera); assert.equal(geometry, mesh.geometry);
+  };
+  f.renderer.render(f.scene, f.camera); assert.equal(calls, 1, 'the warm callback remains synchronous');
+  mesh.onBeforeRender = T.Object3D.prototype.onBeforeRender;
+  for (let i = 0; i < 140; i++) {
+    mesh.geometry.index.array[0] = i % 4; mesh.geometry.index.needsUpdate = true;
+    f.renderer.render(f.scene, f.camera);
+  }
+  await drain(f.renderer);
+  const draws = f.device.snapshots.flat().filter(draw => draw.streams.size);
+  assert.equal(draws.length, 142); assert.ok(draws.every(draw => draw.index.buffer === buffer));
+  assert.equal(f.renderer._passInstances.pendingBytes, 0);
+});
 
 for (const warm of [false, true])
 test(`queued ordinary geometry retains accepted vertex uploads and draw ranges (warm=${warm})`, async t => {

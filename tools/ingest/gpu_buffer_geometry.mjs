@@ -276,17 +276,33 @@ function createResidency(device, geometry, {
     fail('DEVICE', 'Lend a live WebGPU device');
   }
   const maximum = integer(device.limits.maxBufferSize, 4, Number.MAX_SAFE_INTEGER, 'device buffer limit');
-  let records = new Map(), allocatedBytes = 0, disposed = false, terminal = null, busy = false,
+  let records = new Map(), retiredRecords = new Map(), allocatedBytes = 0, disposed = false, terminal = null, busy = false,
     current = null, version = 0, generation = 0, pending = Promise.resolve(), rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const stats = {allocations: 0, uploads: 0, uploadedBytes: 0, updates: 0};
   const worldMatrix = new Float64Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
-  function release() {
-    for (const [owner, record] of records) if (!record.borrowed) {
-      record.buffer.destroy();
+  function destroyRecord(owner, record) {
+    if (record.closed) return;
+    record.closed = true; record.releasePrivate?.(); retiredRecords.delete(owner);
+    if (!record.borrowed) {
+      record.buffer.destroy(); allocatedBytes -= record.shadow.byteLength;
       if (sourceAttributeCallbacks) webglHistory(device, owner).residents--;
     }
+  }
+  function release() {
+    for (const [owner, record] of records) destroyRecord(owner, record);
+    for (const [owner, record] of retiredRecords) destroyRecord(owner, record);
     records = new Map(); allocatedBytes = 0; current = null; generation++;
+  }
+  function retirePrivate(owner, record) {
+    if (busy) fail('REENTRANT', 'Cannot retire private geometry during an upload');
+    if (records.get(owner) !== record) return;
+    records.delete(owner); retiredRecords.set(owner, record); record.releasePrivate?.();
+    current = null; generation++;
+    // Wireframe layout replacement removes only its private edge index. Keep
+    // encoded draws alive until the synchronous scene has submitted them, and
+    // keep those bytes charged until that submission boundary closes.
+    instanceHistory.deferPrivateRelease(() => destroyRecord(owner, record));
   }
   function stop(error) {
     if (!terminal) {
@@ -424,6 +440,7 @@ function createResidency(device, geometry, {
           // initial upload without retaining an orphan native buffer.
           records.set(owner, record); allocatedBytes += size; stats.allocations++;
           if (sourceAttributeCallbacks) webglHistory(device, owner).residents++;
+          record.releasePrivate = instanceHistory?.onPrivateRetire?.(owner, () => retirePrivate(owner, record));
         }
         if (sourceAttributeCallbacks && instanceHistory?.eligible(entry)) {
           const state = instanceHistory.upload(owner, accepted => write(record, accepted, 0, accepted.length), () => {
@@ -491,7 +508,7 @@ function createResidency(device, geometry, {
       // WebGLGeometries removes the current selectors, not every attribute
       // formerly used by this residency. A replaced attribute may still be
       // shared by another geometry and must retain its GPU-visible history.
-      if (sourceAttributeCallbacks && instanceHistory) {
+      if (sourceAttributeCallbacks && instanceHistory && !instanceHistory.isPrivateGeometry?.(geometry)) {
         const selected = geometry.isInstancedMesh ? [geometry.instanceMatrix, geometry.instanceColor]
           : [...Object.values(geometry.attributes ?? {}), geometry.index];
         for (const attribute of selected) if (attribute) instanceHistory.forget(ownerOf(attribute));
