@@ -45,7 +45,7 @@ function loadSource(id) {
   sources.set(id, record);
   for (const request of record.static_imports) loadSource(request.resolved_id);
 }
-for (const name of ['OrbitControls', 'FirstPersonControls', 'MapControls', 'TrackballControls', 'FlyControls']) loadSource(addon(name));
+for (const name of ['OrbitControls', 'FirstPersonControls', 'MapControls', 'TrackballControls', 'FlyControls', 'PointerLockControls']) loadSource(addon(name));
 
 function caller(name, body, {namespace = false, graph = sources, control = addon(name), externalModules = []} = {}) {
   const source = `import * as THREE from 'three'; import ${namespace ? '* as Navigation' : `{${name} as Navigation}`} from 'navigation';
@@ -58,7 +58,7 @@ function caller(name, body, {namespace = false, graph = sources, control = addon
   return {contract, facts, route: decideRendererRoute({...environment, analysis: facts}).route};
 }
 
-for (const name of ['MapControls', 'TrackballControls', 'FlyControls']) {
+for (const name of ['MapControls', 'TrackballControls', 'FlyControls', 'PointerLockControls']) {
   test(`${name}: pinned source permits retained configuration, aliases, factories and lifecycle`, () => {
     assert.ok(caller(name, '').contract);
     for (const body of [
@@ -68,6 +68,7 @@ for (const name of ['MapControls', 'TrackballControls', 'FlyControls']) {
       'function make(camera,canvas){return new Navigation(camera,canvas);} const second=make(camera,renderer.domElement); second.update(.1);',
       name === 'MapControls' ? 'controls.screenSpacePanning=false; controls.target.set(1,2,3); controls.reset();' :
         name === 'TrackballControls' ? 'controls.staticMoving=true; controls.multiTouchRoll=true; controls.noPan=false; controls.handleResize(); const width=controls.screen.width;' :
+          name === 'PointerLockControls' ? 'controls.pointerSpeed=.5; controls.minPolarAngle=.1; controls.maxPolarAngle=2; controls.lock(true); controls.moveForward(2); controls.moveRight(-1); controls.getDirection(new THREE.Vector3()); const locked=controls.isLocked; controls.unlock();' :
           'controls.dragToLook=true; controls.rollSpeed=.2; controls.movementSpeed=5;',
       'controls.keys=["KeyA","KeyS","KeyD"]; controls.mouseButtons.LEFT=THREE.MOUSE.ROTATE;',
     ]) assert.equal(caller(name, body).route, 'general-webgpu', body);
@@ -114,4 +115,82 @@ test('MapControls requires its resolved OrbitControls superclass as well as the 
   graph.set(id, sources.get(id));
   graph.set(orbit, sourceRecord(orbit, fs.readFileSync(new URL(orbit), 'utf8') + '\n// changed superclass\n', resolveSource));
   assert.equal(caller('MapControls', '', {graph}).route, 'exact-backend');
+});
+
+test('PointerLockControls retains source activation while native-host mutation and event escapes stay exact', () => {
+  for (const body of [
+    "document.getElementById('start').addEventListener('click',()=>controls.lock(true));",
+    'function enter(raw){controls.lock(raw);} function leave(){controls.unlock();} enter(true); leave();',
+    'const state={controls}; state.controls.lock(); if(state.controls.isLocked)state.controls.moveForward(1);',
+    "controls.addEventListener('lock',function(){document.getElementById('menu').style.display='none';});",
+    "controls.addEventListener('unlock',()=>{document.getElementById('menu').style.display='block';});",
+    "controls.addEventListener('change',()=>{controls.getDirection(new THREE.Vector3());});",
+    'const config={speed:.5,enabled:true}; const {speed,enabled}=config; controls.enabled=enabled; controls.moveForward(speed);',
+    'const output=TSL.vec3(0); output.assign(TSL.vec3(1));',
+    'const output=TSL.vec3(0); const node=output; node.assign(TSL.vec3(1));',
+    'Object.keys({enabled:true}); Object.values({speed:.5});',
+  ]) assert.equal(caller('PointerLockControls', body).route, 'general-webgpu', body);
+  for (const body of [
+    'document.exitPointerLock=plugin;', 'renderer.domElement.requestPointerLock=plugin;',
+    'document.body.requestPointerLock=plugin;', 'delete document.exitPointerLock;',
+    "controls.addEventListener('lock',plugin);", "controls.addEventListener('unlock',function(){plugin(this.domElement);});",
+    'controls.isLocked=true;', 'controls._onPointerlockChange=plugin;',
+    'controls.getDirection(controls.domElement);', 'const enter=controls.lock; plugin(enter);',
+    "controls.addEventListener('lock',()=>plugin(controls));",
+    "controls.addEventListener('lock',()=>plugin(controls.domElement));",
+    "controls.addEventListener('lock',event=>plugin(event.target));",
+    "controls.addEventListener('lock',function(){plugin(arguments[0].target);});",
+    "controls.addEventListener('lock',function(){return ()=>plugin(this);});",
+    "controls.addEventListener('lock',async()=>{});",
+    "controls.addEventListener('lock',function*(){});",
+    "controls.addEventListener('lock',function saved(){globalThis.callback=saved;});",
+    "controls.addEventListener('lock',function listener(){});",
+    "const listener=()=>{}; controls.addEventListener('lock',listener);",
+    "function listener(){} controls.addEventListener('lock',listener);",
+    "controls.addEventListener=plugin;", 'controls.dispatchEvent=plugin;',
+    "controls.addEventListener('lock',()=>controls.domElement);",
+    "controls.addEventListener(eventName,()=>{});",
+  ]) assert.equal(caller('PointerLockControls', body).route, 'exact-backend', body);
+});
+
+test('retained controls cannot hide host/prototype mutation behind property-copy helpers or destructuring', () => {
+  for (const body of [
+    'Object.assign(document,{exitPointerLock(){plugin(this.pointerLockElement);}}); controls.unlock();',
+    'const mutate=Object.assign; mutate(document,{exitPointerLock(){plugin(this.pointerLockElement);}}); controls.unlock();',
+    'const NativeObject=Object; const mutate=NativeObject.assign; mutate(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const {assign:mutate}=Object; mutate(document,{exitPointerLock(){plugin(this.pointerLockElement);}}); controls.unlock();',
+    'const {["as"+"sign"]:mutate}=Object; mutate(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const {Object:{assign:mutate}}=globalThis; mutate(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const {defineProperty:define}=Object; define(document,"exitPointerLock",{value:plugin}); controls.unlock();',
+    'const {defineProperties:define}=Object; define(document,{exitPointerLock:{value:plugin}}); controls.unlock();',
+    'const {prototype:p}=HTMLCanvasElement; Object.assign(p,{requestPointerLock(){plugin(this);}}); controls.lock();',
+    'let p; ({prototype:p}=HTMLCanvasElement); p.requestPointerLock=plugin; controls.lock();',
+    'const key="prototype"; const {[key]:p}=HTMLCanvasElement; p.requestPointerLock=plugin; controls.lock();',
+    'const {__proto__:p}=()=>{}; p.call=function(receiver,event){plugin(receiver);}; controls.addEventListener("lock",()=>{}); controls.lock();',
+    'const {getPrototypeOf:parent}=Object; parent(()=>{}).call=function(receiver){plugin(receiver);}; controls.addEventListener("lock",()=>{});',
+    'const {Object:NativeObject}=globalThis; NativeObject.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+    'globalThis.Object.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const root=globalThis; root.Object.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const root=window; const native=root.Object; native.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+    'function mutate(native){native.assign(document,{exitPointerLock:plugin});} mutate(Object); controls.unlock();',
+    'function intrinsic(){return Object;} const native=intrinsic(); native.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+    'const native={Object}; native.Object.assign(document,{exitPointerLock:plugin}); controls.unlock();',
+  ]) assert.equal(caller('PointerLockControls', body).route, 'exact-backend', body);
+});
+
+test('intrinsic checks bound shared node alias DAGs and keep global receiver facts separate', () => {
+  // Each conditional revisits the same preceding binding. Expanding every path
+  // would inspect more than 250 million paths for this small ordinary shader.
+  let body = 'const output0=TSL.vec3(0);';
+  for (let index = 1; index <= 28; index++)
+    body += `const output${index}=flag?output${index - 1}:output${index - 1};`;
+  body += 'output28.assign(TSL.vec3(1));';
+  const started = performance.now();
+  assert.equal(caller('PointerLockControls', body).route, 'general-webgpu');
+  assert.ok(performance.now() - started < 5000, 'shared aliases must not expand exponentially');
+  // The first access establishes that the global object is not itself Object;
+  // the second must still recognize its Object field as the intrinsic.
+  assert.equal(caller('PointerLockControls',
+    'const root=globalThis; root.assign; root.Object.assign(document,{exitPointerLock:plugin}); controls.unlock();'
+  ).route, 'exact-backend');
 });

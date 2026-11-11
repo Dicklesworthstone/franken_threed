@@ -21,6 +21,7 @@ const CONTROL_SOURCES = new Map([
   [FIRST_PERSON, {name: 'FirstPersonControls', role: 'first-person'}],
   ['sha256:cce95baddf589c16fea901b70f2038eca4557357937e1b03f8c76fe7ffe7457f', {name: 'TrackballControls', role: 'trackball'}],
   ['sha256:8063858389f2ccd5cd6f0968562752dbab4b21a03c7a6e1dcbb5cc746fc06373', {name: 'FlyControls', role: 'fly'}],
+  ['sha256:40d58db8018b85038939d4d8bff7112d4b8a0ad0367b37ae6f969eeee4310c25', {name: 'PointerLockControls', role: 'pointer-lock'}],
 ]);
 const CORE = 'sha256:9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const WEBGPU = 'sha256:a78400fa1d359e81fcc12b84ed0a89a7fbecb4b8373e28ae8f9d2b11f6ea13bc';

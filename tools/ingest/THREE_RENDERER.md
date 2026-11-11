@@ -100,13 +100,13 @@ native backend method from a private record also retains its existing exact-rout
 requirement; the record does not hide that observation.
 
 The graph can prove bounded retained `OrbitControls`, `FirstPersonControls`,
-`MapControls`, `TrackballControls` and `FlyControls` contracts by verifying the
+`MapControls`, `TrackballControls`, `FlyControls` and `PointerLockControls` contracts by verifying the
 exact addon, resolved Three build and core bytes. `MapControls` also requires its
 actual resolved `OrbitControls` superclass to pass that proof. The returned
 controls instance continues to carry the canvas reference through local aliases and `domElement`;
 it is not an exemption for arbitrary consumers. Closed updates, camera-control
 methods, configuration and disposal remain eligible. Exports, unknown consumers,
-event callbacks, private hooks, method replacement, reflection and unproved
+callbacks that can observe their event or receiver, private hooks, method replacement, reflection and unproved
 constructor/receiver origins retain the upstream owner. Changed source bytes,
 redirected base classes and unresolved code invalidate the proof. The original
 H2 application is consequently eligible with `--route-webgl-renderer`, retaining
@@ -124,6 +124,33 @@ The native DOM comparison is `node tools/ingest/renderer_camera_controls.browser
 builds source and routed applications, applies real pointer/keyboard/wheel input,
 and compares camera state at each lifecycle boundary. This is compatibility and
 new-backend routing validation, not a controls rewrite or a speedup measurement.
+
+`PointerLockControls` preserves its original synchronous `lock()` / `unlock()`
+calls, raw-input option, movement and direction methods, pitch limits and pointer
+sensitivity. A user-input handler calls the original host operation in its source
+turn; routing adds no initialization wait or event replay. The source class,
+camera, DOM element, lock-state publication and connect/disconnect/dispose
+behavior stay intact. Replacing `requestPointerLock`, `exitPointerLock` or an
+inherited control method prevents this ownership proof.
+Property-copy and reflection helpers such as `Object.assign` and
+`Object.defineProperty`, including aliases or destructured selections, retain
+the source renderer. The bounded proof also refuses destructured prototype
+access rather than allowing it to hide a native-host or callback mutation.
+
+Retained controls can use inline, anonymous, synchronous zero-argument event
+listeners for ordinary menu updates and closed rendering callbacks. Such a
+listener cannot read `this`, `arguments` or `super`, including in nested code;
+explicit renderer/control captures still face the existing ownership analysis.
+Event parameters, shared/named callbacks, async/generator listeners and escaping
+resource references retain the exact component. The original EventDispatcher
+still calls the original listener with its source receiver, event and ordering.
+
+`node --max-old-space-size=768 --test tools/ingest/renderer_pointer_lock.test.mjs`
+builds source and routed applications and compares camera state, source event
+ordering, synchronous host calls/errors and listener cleanup with a recording
+DOM. It also builds the complete pinned `misc_controls_pointerlock` example
+through the WebGL-authored native route. This evidence does not establish actual
+browser pointer-lock permission, transient activation or rendered pixels.
 
 Applications using the pinned `RendererInspector` can retain its original class
 while selecting the native WebGPU route. The graph verifies its exact source,

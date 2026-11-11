@@ -607,12 +607,14 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const TRACKBALL_CTOR = 4194304, TRACKBALL_NAMESPACE = 8388608;
   const FLY_CTOR = 16777216, FLY_NAMESPACE = 33554432;
   const INSPECTOR_CTOR = 67108864, INSPECTOR = 134217728, INSPECTOR_NAMESPACE = 268435456;
-  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR | MAP_CTOR | TRACKBALL_CTOR | FLY_CTOR;
+  const POINTER_LOCK_CTOR = 536870912, POINTER_LOCK_NAMESPACE = 1073741824;
+  const CONTROL_CONSTRUCTORS = ORBIT_CTOR | FIRST_PERSON_CTOR | MAP_CTOR | TRACKBALL_CTOR | FLY_CTOR | POINTER_LOCK_CTOR;
   const CONSTRUCTOR = WEBGL | WEBGPU, ALL_CONSTRUCTORS = CONSTRUCTOR | CONTROL_CONSTRUCTORS | BASE_CTOR | COMPOSER_CTOR | PASS_CTOR | GPGPU_CTOR | INSPECTOR_CTOR;
   const RESOURCE = RENDERER | CANVAS | ALL_CONSTRUCTORS | NAMESPACE | CONTROLS | COMPOSER | PASS | GPGPU | INSPECTOR;
   const consumerKind = role => role === "orbit" ? ORBIT_CTOR : role === "base" ? BASE_CTOR :
     role === "first-person" ? FIRST_PERSON_CTOR : role === "gpu-computation" ? GPGPU_CTOR :
     role === "map" ? MAP_CTOR : role === "trackball" ? TRACKBALL_CTOR : role === "fly" ? FLY_CTOR :
+    role === "pointer-lock" ? POINTER_LOCK_CTOR :
     role === "renderer-inspector" ? INSPECTOR_CTOR :
     role === "webgpu" ? WEBGPU : role === "webgl" ? WEBGL : role === "composer" ? COMPOSER_CTOR : role === "pass" ? PASS_CTOR : 0;
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
@@ -664,6 +666,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
           const cell = scopes.get(ast).get(spec.local.name);
           cell.consumerSource = role === "orbit" ? ORBIT_NAMESPACE : role === "first-person" ? FIRST_PERSON_NAMESPACE :
             role === "map" ? MAP_NAMESPACE : role === "trackball" ? TRACKBALL_NAMESPACE : role === "fly" ? FLY_NAMESPACE :
+            role === "pointer-lock" ? POINTER_LOCK_NAMESPACE :
             role === "renderer-inspector" ? INSPECTOR_NAMESPACE :
             role === "gpu-computation" ? GPGPU_NAMESPACE : role === "base" ? BASE_NAMESPACE : 0;
           cell.kind |= NAMESPACE | cell.consumerSource;
@@ -705,6 +708,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     if (object & MAP_NAMESPACE && names.includes("MapControls")) result |= MAP_CTOR;
     if (object & TRACKBALL_NAMESPACE && names.includes("TrackballControls")) result |= TRACKBALL_CTOR;
     if (object & FLY_NAMESPACE && names.includes("FlyControls")) result |= FLY_CTOR;
+    if (object & POINTER_LOCK_NAMESPACE && names.includes("PointerLockControls")) result |= POINTER_LOCK_CTOR;
     if (object & GPGPU_NAMESPACE && names.includes("GPUComputationRenderer")) result |= GPGPU_CTOR;
     if (object & INSPECTOR_NAMESPACE && names.includes("RendererInspector")) result |= INSPECTOR_CTOR;
     if (object & BASE_NAMESPACE && names.some(name =>
@@ -1125,7 +1129,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         names.every(name => name === "FirstPersonControls") && visit(node.object, FIRST_PERSON_NAMESPACE) ||
         names.every(name => name === "MapControls") && visit(node.object, MAP_NAMESPACE) ||
         names.every(name => name === "TrackballControls") && visit(node.object, TRACKBALL_NAMESPACE) ||
-        names.every(name => name === "FlyControls") && visit(node.object, FLY_NAMESPACE);
+        names.every(name => name === "FlyControls") && visit(node.object, FLY_NAMESPACE) ||
+        names.every(name => name === "PointerLockControls") && visit(node.object, POINTER_LOCK_NAMESPACE);
       if (expected === CONSTRUCTOR) return names.every(name => ctorKind(name)) && visit(node.object, BASE_NAMESPACE);
       if (expected === GPGPU_CTOR) return names.every(name => name === "GPUComputationRenderer") && visit(node.object, GPGPU_NAMESPACE);
       if (expected === INSPECTOR_CTOR) return names.every(name => name === "RendererInspector") && visit(node.object, INSPECTOR_NAMESPACE);
@@ -1193,15 +1198,35 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   // These retained methods never hand their receiver to an application callback
   // unless event registration or a hook was changed; those exits stay opaque.
   const controlsMethods = new Set(["connect", "disconnect", "dispose", "update", "saveState", "reset",
-    "getPolarAngle", "getAzimuthalAngle", "getDistance", "pan", "dollyIn", "dollyOut", "rotateLeft", "rotateUp", "lookAt", "handleResize"]);
+    "getPolarAngle", "getAzimuthalAngle", "getDistance", "pan", "dollyIn", "dollyOut", "rotateLeft", "rotateUp", "lookAt", "handleResize",
+    "lock", "unlock", "moveForward", "moveRight", "getDirection"]);
   const controlsSettings = new Set(["enabled", "state", "autoRotate", "autoRotateSpeed", "enableDamping", "dampingFactor",
     "minDistance", "maxDistance", "minZoom", "maxZoom", "minPolarAngle", "maxPolarAngle", "minAzimuthAngle", "maxAzimuthAngle",
     "minTargetRadius", "maxTargetRadius", "enableZoom", "zoomSpeed", "zoomToCursor", "enableRotate", "rotateSpeed",
     "enablePan", "panSpeed", "keyPanSpeed", "keyRotateSpeed", "screenSpacePanning",
     "movementSpeed", "lookSpeed", "lookVertical", "autoForward", "heightSpeed", "heightCoef", "heightMin", "heightMax",
     "constrainVertical", "verticalMin", "verticalMax", "mouseDragOn", "rollSpeed", "dragToLook",
-    "noRotate", "noZoom", "noPan", "multiTouchRoll", "staticMoving", "dynamicDampingFactor", "keys", "mouseButtons", "touches"]);
-  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches", "screen"]);
+    "noRotate", "noZoom", "noPan", "multiTouchRoll", "staticMoving", "dynamicDampingFactor", "keys", "mouseButtons", "touches",
+    "pointerSpeed"]);
+  const controlsViews = new Set(["domElement", "target", "cursor", "object", "keys", "mouseButtons", "touches", "screen", "isLocked"]);
+  // EventDispatcher supplies the controls through both `this` and event.target.
+  // A zero-argument callback without receiver/arguments access cannot acquire
+  // that hidden canvas owner. Explicit captures still go through the ordinary
+  // resource-escape proof below; the original callback and dispatch stay intact.
+  const closedControlsListener = call => {
+    if (call?.type !== "CallExpression" || call.callee.type !== "MemberExpression" ||
+        !staticPropertyNames(call.callee)?.every(name => ["addEventListener", "removeEventListener"].includes(name)) ||
+        call.arguments.length !== 2 || call.arguments[0].type !== "Literal" || typeof call.arguments[0].value !== "string") return false;
+    const callback = call.arguments[1];
+    if (!["FunctionExpression", "ArrowFunctionExpression"].includes(callback.type) ||
+        callback.id || callback.params.length || callback.async || callback.generator) return false;
+    let closed = true;
+    walk.full(callback.body, node => {
+      if (node.type === "ThisExpression" || node.type === "Super" ||
+          node.type === "Identifier" && node.name === "arguments") closed = false;
+    });
+    return closed;
+  };
   const composerMethods = new Set(["render", "addPass", "insertPass", "removePass", "swapBuffers", "reset", "setSize", "setPixelRatio", "dispose", "isLastEnabledPass"]);
   const composerViews = new Set(["renderer", "renderToScreen", "renderTarget1", "renderTarget2", "readBuffer", "writeBuffer"]);
   const passMethods = new Set(["render", "setSize", "dispose", "setGBuffer", "setSceneClipBox", "updateGtaoMaterial", "updatePdMaterial"]);
@@ -1230,7 +1255,52 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const reflection = new Set(["prototype", "__proto__", "constructor", "getPrototypeOf", "setPrototypeOf",
     "defineProperty", "defineProperties", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors",
     "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "eval", "Function", "Reflect"]);
+  // Reuse the lexical origins already collected for renderer ownership. A node
+  // graph's ordinary .assign() is not Object.assign(), but aliases of the
+  // intrinsic must not hide writes to the retained component's host methods.
+  const globalObjects = new Set(["globalThis", "window", "self"]);
+  // Origins and closed helper/record facts are fixed before this walk. Cache
+  // both meanings separately so shared alias DAGs take bounded work; a cycle
+  // or depth limit still conservatively marks an intrinsic boundary.
+  const intrinsicOrigins = [new WeakMap(), new WeakMap()];
+  const objectIntrinsic = (node, visiting = new Set(), depth = 0, globalReceiver = false) => {
+    if (!node) return false;
+    const memo = intrinsicOrigins[globalReceiver ? 1 : 0];
+    if (memo.has(node)) return memo.get(node);
+    if (depth > 64) return true;
+    const result = resolveObjectIntrinsic(node, visiting, depth, globalReceiver);
+    memo.set(node, result);
+    return result;
+  };
+  const resolveObjectIntrinsic = (node, visiting, depth, globalReceiver) => {
+    const visit = value => objectIntrinsic(value, visiting, depth + 1, globalReceiver);
+    const field = recordField(node);
+    if (field) return visit(field);
+    if (node.type === "Identifier") {
+      const cell = binding(node);
+      if (!cell.local && (globalReceiver ? globalObjects.has(node.name) : node.name === "Object")) return true;
+      if (!origins.has(cell)) return false;
+      if (visiting.has(cell)) return true;
+      visiting.add(cell);
+      const result = origins.get(cell).some(visit);
+      visiting.delete(cell);
+      return result;
+    }
+    if (node.type === "MemberExpression") {
+      const names = staticPropertyNames(node);
+      return (!names || names.some(name => globalReceiver ? globalObjects.has(name) : name === "Object")) &&
+        objectIntrinsic(node.object, visiting, depth + 1, true);
+    }
+    if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
+    if (node.type === "ChainExpression") return visit(node.expression);
+    if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
+      return visit(node.consequent ?? node.left) || visit(node.alternate ?? node.right);
+    if (node.type === "CallExpression" && closedHelpers.has(localHelper(node)))
+      return helperReturns.get(localHelper(node)).some(visit);
+    return false;
+  };
   const controlsHostMethods = new Set(["addEventListener", "removeEventListener", "setPointerCapture", "releasePointerCapture",
+    "requestPointerLock", "exitPointerLock",
     "getRootNode", "getBoundingClientRect", "focus", ...hostMethods, "appendChild", "append", "prepend", "insertBefore", "replaceChild"]);
   const isControlsCanvasInput = (call, argument, index) => (kind(argument) & RESOURCE) === CANVAS &&
     !call.arguments.some(value => value.type === "SpreadElement") && closedDomValue(argument) &&
@@ -1302,7 +1372,18 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
     // A retained component contract also depends on its inherited methods and
     // host methods. Keep reflective mutation/code generation outside this slice,
     // including in a different application module from the constructor call.
+    // Object.assign can replace host methods just like defineProperty; selecting
+    // that intrinsic helper is a boundary when an alias invokes it later. Pattern
+    // reads can extract those helpers or native prototypes without producing a
+    // MemberExpression, including nested and computed destructuring.
     if (consumerContract && (node.type === "MemberExpression" && staticPropertyNames(node)?.some(name => reflection.has(name)) ||
+        node.type === "MemberExpression" && (!staticPropertyNames(node) || staticPropertyNames(node).includes("assign")) &&
+          objectIntrinsic(node.object) ||
+        node.type === "ObjectPattern" && node.properties.some(property => {
+          if (property.type !== "Property") return false;
+          const names = staticPropertyNames(property);
+          return !names || names.some(name => reflection.has(name) || name === "assign" || name === "Object");
+        }) ||
         node.type === "Identifier" && ["eval", "Function", "Reflect"].includes(node.name) && !binding(node).local))
       report(node, "controls-contract-reflection");
     if (consumerContract) {
@@ -1348,7 +1429,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         report(node, "opaque-renderer-method");
       if (node.type === "CallExpression" && node.callee.type === "MemberExpression") {
         if (kind(node.callee.object) & CONTROLS && (!closedConsumerValue(node.callee.object, CONTROLS) ||
-            !staticPropertyNames(node.callee)?.every(name => controlsMethods.has(name))))
+            !staticPropertyNames(node.callee)?.every(name => controlsMethods.has(name)) && !closedControlsListener(node)))
           report(node, "opaque-controls-method");
         if (kind(node.callee.object) & (COMPOSER | PASS)) {
           const composer = !!(kind(node.callee.object) & COMPOSER), names = staticPropertyNames(node.callee);
@@ -1451,7 +1532,8 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       else if (kind(node.object) & ALL_CONSTRUCTORS && names.some(name => name === "prototype"))
         report(node, "renderer-prototype-access");
       else if (kind(node.object) & CONTROLS && !names.every(name => controlsSettings.has(name) || controlsViews.has(name) ||
-          controlsMethods.has(name) && parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node))
+          parents.get(node)?.type === "CallExpression" && parents.get(node).callee === node &&
+          (controlsMethods.has(name) || closedControlsListener(parents.get(node)))))
         report(node, "opaque-controls-member");
       else if (kind(node.object) & (COMPOSER | PASS) && !names.every(name =>
           (kind(node.object) & COMPOSER ? composerViews : passSettings).has(name) ||
