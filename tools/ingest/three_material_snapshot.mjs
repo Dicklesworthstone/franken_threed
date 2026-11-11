@@ -173,6 +173,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     objects.set(object, selected);
     for (const source of Array.isArray(selected) ? selected : [selected]) if (!captureMaterial(source)) return null;
   }
+  let selection;
   const cameraSafe = () => {
     const perspective = data(camera, 'isPerspectiveCamera') === true;
     if (!camera || !ordinaryObject(camera) || data(camera, 'isArrayCamera') || data(camera, 'isMultiViewCamera') ||
@@ -181,8 +182,13 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     if (data(camera, 'updateProjectionMatrix') !== prototype.updateProjectionMatrix ||
         perspective && data(camera, 'getFilmWidth') !== prototype.getFilmWidth) return false;
     for (const object of seen) {
-      if (!ordinaryObject(object) || !ordinaryGeometry(data(object, 'geometry'))) return false;
-      const children = selectorArray(data(object, 'children'), maxNodes);
+      // A queued rigid pass owns these selectors already. New children and
+      // geometry replacements belong to the next call, while callbacks on the
+      // original source objects and captured resources remain guarded.
+      const captured = selection?.instanceFrame;
+      const geometry = captured?.geometries.has(object) ? captured.geometries.get(object) : data(object, 'geometry');
+      if (!ordinaryObject(object) || !ordinaryGeometry(geometry)) return false;
+      const children = captured?.hierarchy.get(object) ?? selectorArray(data(object, 'children'), maxNodes);
       if (!children || children.some(child => !seen.has(child))) return false;
     }
     for (const material of materials.keys()) if (!ordinaryMaterial(material)) return false;
@@ -192,7 +198,8 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
   // required pass scope rejects it before destination retention; ordinary
   // rendering must not newly fail because optional instance capture is enabled.
   if (instances.size && [...seen].some(object => data(object, 'isLOD') && data(object, 'autoUpdate'))) return null;
-  return objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances} : null;
+  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances} : null;
+  return selection;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,

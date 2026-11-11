@@ -1337,8 +1337,9 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         if (this._shaderEncodedOutput && captureCameras && !snapshot && materialFrame?.cameraSafe?.() &&
             !(this.sortObjects && (this._opaqueSort || this._transparentSort))) {
           // Keep one camera value per accepted draw, including SSAA's distinct
-          // projections. Default scene transforms still update at submission;
-          // the private camera itself cannot be updated to a later source pose.
+          // projections. Callback-free rigid draws also retain their accepted
+          // geometry selector and world matrix in private views below; live or
+          // deformed paths keep their existing source update order.
           if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
           if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
           webglSourceCamera = camera;

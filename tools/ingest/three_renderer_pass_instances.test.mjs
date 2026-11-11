@@ -40,6 +40,148 @@ function instanceDraws(device) {
     return [{count: draw.args[1], matrix: values(matrix), color: color === -1 ? null : values(color)}];
   });
 }
+function rigidPackets(device) {
+  return device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'vertex_main' && draw.streams.size)
+    .flatMap(draw => {
+      const {group, offsets} = draw.groups.get(0), resource = group.entries.find(entry => entry.binding === 0).resource;
+      const layout = group.layout.entries.find(entry => entry.binding === 0).buffer;
+      const storage = layout.type === 'read-only-storage', stride = layout.minBindingSize;
+      const bytes = draw.contents.get(resource.buffer), first = storage ? draw.args[draw.indexed ? 4 : 3] : 0;
+      return Array.from({length: storage ? draw.args[1] : 1}, (_, index) => {
+        const offset = (resource.offset ?? 0) + (storage ? (first + index) * stride : offsets[0] ?? 0);
+        return {draw, words: [...new Float32Array(bytes.buffer, bytes.byteOffset + offset, stride / 4)]};
+      });
+    });
+}
+function ordinaryMesh(f) {
+  const mesh = new T.Mesh(f.mesh.geometry, f.mesh.material);
+  mesh.frustumCulled = false; f.scene.remove(f.mesh); f.scene.add(mesh);
+  return mesh;
+}
+const clipMatrix = (camera, mesh) => {
+  const projection = new T.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  for (let column = 0; column < 4; column++)
+    projection.elements[column * 4 + 2] = .5 * (projection.elements[column * 4 + 2] + projection.elements[column * 4 + 3]);
+  return projection.multiply(mesh.matrixWorld).elements.map(Math.fround);
+};
+
+test('cold ordinary WebGL renders retain each accepted world matrix and geometry selector', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), replacement = new T.BoxGeometry();
+  t.after(() => replacement.dispose());
+  const expected = [];
+  mesh.position.x = .25; f.renderer.render(f.scene, f.camera); expected.push(clipMatrix(f.camera, mesh));
+  mesh.geometry = replacement; mesh.position.x = .75; mesh.scale.x = -1;
+  f.renderer.render(f.scene, f.camera); expected.push(clipMatrix(f.camera, mesh));
+  mesh.position.x = 90; mesh.scale.x = 3; mesh.updateMatrixWorld(); mesh.geometry = null;
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.equal(packets.length, 2);
+  assert.deepEqual(packets.map(({words}) => words.slice(0, 16)), expected);
+  assert.deepEqual(packets.map(({draw}) => draw.args[0]), [6, 36]);
+  assert.deepEqual(packets.map(({draw}) => draw.pipeline.primitive.frontFace), ['ccw', 'cw']);
+  assert.equal(mesh.geometry, null); assert.equal(mesh.matrixWorld.elements[12], 90);
+  assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('queued rigid scenes preserve membership and material selectors after removal and insertion', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f), blue = new T.MeshBasicMaterial({color: new T.Color(.25, .5, .75)});
+  f.mesh.material.color.setRGB(.75, .5, .25);
+  const next = new T.Mesh(mesh.geometry, blue); next.frustumCulled = false;
+  const unrelated = new T.Mesh(mesh.geometry, new T.ShaderMaterial());
+  t.after(() => { blue.dispose(); unrelated.material.dispose(); });
+  mesh.position.x = .25; f.renderer.render(f.scene, f.camera);
+  f.scene.remove(mesh); next.position.x = .75; f.scene.add(next); f.renderer.render(f.scene, f.camera);
+  f.scene.clear(); f.scene.add(unrelated); mesh.material = blue; next.position.x = 90; next.updateMatrixWorld();
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.equal(packets.length, 2);
+  assert.deepEqual(packets.map(({words}) => words.slice(16, 19)), [[.75, .5, .25], [.25, .5, .75]]);
+  assert.deepEqual(packets.map(({words}) => words[12]), [.25, .75].map(x => Math.fround(x * f.camera.projectionMatrix.elements[0])));
+  assert.deepEqual(f.scene.children, [unrelated]); assert.equal(mesh.material, blue);
+  assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('rigid snapshots preserve parent visibility, layers and group sorting for each accepted call', async t => {
+  const f = await fixture(t), first = ordinaryMesh(f), material = new T.MeshBasicMaterial({color: new T.Color(.25, .5, .75), transparent: true});
+  first.material.color.setRGB(.75, .5, .25); first.material.transparent = true;
+  const second = new T.Mesh(first.geometry, material); second.frustumCulled = false;
+  const a = new T.Group(), b = new T.Group(); a.add(first); b.add(second); f.scene.add(a, b);
+  a.renderOrder = 1; b.renderOrder = 2; first.renderOrder = 20; second.renderOrder = 10;
+  t.after(() => material.dispose());
+  f.renderer.render(f.scene, f.camera);
+  a.renderOrder = 2; b.renderOrder = 1; second.layers.disableAll();
+  f.renderer.render(f.scene, f.camera);
+  a.visible = false; b.visible = false; first.layers.disableAll();
+  await drain(f.renderer);
+  assert.deepEqual(rigidPackets(f.device).map(({words}) => words.slice(16, 19)),
+    [[.75, .5, .25], [.25, .5, .75], [.75, .5, .25]]);
+  assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+test('rigid frustum selection and manual matrixWorld values stay attached to the accepted draw', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f);
+  mesh.matrixAutoUpdate = false; mesh.matrixWorldAutoUpdate = false; mesh.frustumCulled = true;
+  mesh.matrixWorld.makeTranslation(.25, 0, 0); f.renderer.render(f.scene, f.camera);
+  const expected = clipMatrix(f.camera, mesh);
+  mesh.matrixWorld.makeTranslation(100, 0, 0); f.renderer.render(f.scene, f.camera);
+  mesh.matrixWorld.identity(); mesh.geometry.boundingSphere.center.set(99, 99, 99);
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device); assert.equal(packets.length, 1);
+  assert.deepEqual(packets[0].words.slice(0, 16), expected);
+  assert.equal(mesh.matrixWorld.elements[12], 0);
+});
+
+test('mixed ordinary and instanced draws retain their independent accepted transforms', async t => {
+  const f = await fixture(t), ordinary = new T.Mesh(f.mesh.geometry, f.mesh.material);
+  ordinary.frustumCulled = false; f.scene.add(ordinary);
+  ordinary.position.x = .25; f.mesh.position.x = -.25;
+  f.renderer.render(f.scene, f.camera);
+  const expected = clipMatrix(f.camera, ordinary);
+  ordinary.position.x = 90; f.mesh.position.x = 80; f.scene.updateMatrixWorld();
+  await drain(f.renderer);
+  const packets = rigidPackets(f.device);
+  assert.ok(packets.some(({words}) => words.every((value, index) => index >= 16 || value === expected[index])));
+  assert.equal(instanceDraws(f.device).length, 1);
+});
+
+test('hooks introduced after an ordinary capture run on original source objects and camera', async t => {
+  const f = await fixture(t), mesh = ordinaryMesh(f); f.renderer.render(f.scene, f.camera);
+  let calls = 0;
+  mesh.onBeforeRender = function (renderer, scene, camera, geometry) {
+    calls++; assert.equal(this, mesh); assert.equal(renderer, f.renderer);
+    assert.equal(scene, f.scene); assert.equal(camera, f.camera); assert.equal(geometry, mesh.geometry);
+  };
+  await drain(f.renderer); assert.equal(calls, 1);
+  assert.equal(f.renderer._passInstances.pendingBytes, 0); assert.equal(f.renderer._materialCaptureValues, 0);
+});
+
+for (const Type of [T.Mesh, T.LineSegments, T.Points])
+test(`queued ${Type.name} source programs consume the accepted model-view matrices`, async t => {
+  const f = await fixture(t), material = new T.ShaderMaterial({
+    vertexShader: 'void main() { gl_PointSize = 2.0; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'void main() { gl_FragColor = vec4(0.25, 0.5, 0.75, 1.0); }',
+  });
+  const object = new Type(f.mesh.geometry, material); object.frustumCulled = false;
+  if (Type === T.Points) object.geometry.setIndex(null);
+  f.scene.remove(f.mesh); f.scene.add(object); t.after(() => material.dispose());
+  const expected = [];
+  for (const x of [.25, .75]) {
+    object.position.x = x; f.renderer.render(f.scene, f.camera);
+    expected.push(new T.Matrix4().multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld).elements.map(Math.fround));
+  }
+  object.position.x = 90; object.updateMatrixWorld();
+  await drain(f.renderer);
+  const {reflection} = f.renderer._programSupport.compile(material, object).program;
+  const offset = reflection.uniforms.find(uniform => uniform.name === 'modelViewMatrix').offset;
+  const matrices = f.device.snapshots.flat().filter(draw => draw.streams.size)
+    .map(draw => {
+      const {group, offsets} = draw.groups.get(0), resource = group.entries.find(entry => entry.binding === 0).resource;
+      const bytes = draw.contents.get(resource.buffer);
+      return [...new Float32Array(bytes.buffer, bytes.byteOffset + (resource.offset ?? 0) + (offsets[0] ?? 0) + offset, 16)];
+    });
+  assert.deepEqual(matrices, expected);
+  assert.equal(f.renderer._materialCaptureValues, 0);
+});
 function oracle() {
   let bound;
   return WebGLAttributes({createBuffer: () => ({}), bindBuffer(_target, buffer) { bound = buffer; },
