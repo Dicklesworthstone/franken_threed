@@ -34,6 +34,7 @@
  */
 import {AnimationPoseError} from './animation_runtime.mjs';
 import {createAnimationDeformer} from './animation_deformer.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 const fail = (code, message) => { throw new AnimationPoseError(code, message); };
 const F32_BOUND = 3.4028234663852886e38 / 4;
 // WebGPU's stable flag values; no browser globals are needed merely to import.
@@ -381,8 +382,12 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
   let lastPalette = new Uint32Array(skin ? paletteCount : 0), lastMorphs = new Uint32Array(targetCount);
   const worldMatrix = new Float64Array(16), nextWorld = new Float64Array(16), bounds = new Float64Array(3);
   let disposed = false, terminal = null, busy = false, version = -1, poseVersion = -1, completion = Promise.resolve();
+  let releaseDeviceLoss = null;
   const buffers = [];
   const release = () => {
+    // Animation/scene replacement retires meshes while their borrowed device
+    // remains healthy. Release the pose and CPU input graph along with buffers.
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (let i = 0; i < buffers.length; i++) if (!shared || i >= 3) buffers[i].destroy();
     buffers.length = 0; lastPalette = null; lastMorphs = null;
     const entry = shared; shared = null;
@@ -393,10 +398,15 @@ export async function createGpuAnimationDeformer(device, pose, geometry, {
       if (!list.length) cacheState.entries.delete(entry.hash);
     }
   };
-  const lost = device.lost.then(info => {
-    terminal ??= new AnimationPoseError('ANIMATION_GPU_LOST', info?.message || 'WebGPU device lost');
-    release(); throw terminal;
-  });
+  let rejectLost;
+  const lost = new Promise((_, reject) => { rejectLost = reject; });
+  const stopForLoss = error => {
+    terminal ??= error;
+    try { release(); } finally { rejectLost(terminal); }
+  };
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stopForLoss(new AnimationPoseError('ANIMATION_GPU_LOST', info?.message || 'WebGPU device lost')),
+    stopForLoss);
   // Loss is observable through update/whenIdle, never an unhandled rejection.
   lost.catch(() => {});
   function live() {

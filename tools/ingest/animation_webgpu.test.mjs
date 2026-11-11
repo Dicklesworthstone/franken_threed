@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { createAnimationPlayer } from "./animation_runtime.mjs";
 import { ANIMATION_DEFORM_WGSL, createGpuAnimationDeformer, createGpuAnimationDeformerCache } from "./animation_webgpu.mjs";
 
@@ -517,6 +519,103 @@ test("disposal is idempotent and owns neither the pose nor device", async () => 
   pose.dispose();
   assert.throws(() => next.update(), code("ANIMATION_DISPOSED"));
   next.dispose();
+});
+
+for (const fenceFails of [false, true])
+test(`disposing before queued loss preserves the pending GPU fence (rejected=${fenceFails})`, async () => {
+  const device = deviceSpy(), pose = scene(),
+    gpu = await createGpuAnimationDeformer(device, pose, geometry()),
+    reason = new Error("submitted deformation failed");
+  device.destroy = () => assert.fail("The deformer does not own the device");
+  device.completionGate = deferred();
+  gpu.update();
+  let outcome = "pending";
+  const pending = gpu.whenIdle().then(() => { outcome = "completed"; }, error => { outcome = error; });
+  // The native promise is settled, but its notification has not yet run.
+  device.loss.resolve({message: "loss queued before disposal"});
+  gpu.dispose(); gpu.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcome, "pending", "disposal must not manufacture GPU completion");
+  assert.equal(gpu.failed, false);
+  assert.equal(gpu.inputCacheBytes, 0);
+  assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(pose.disposed, false);
+  if (fenceFails) device.completionGate.reject(reason);
+  else device.completionGate.resolve();
+  await pending;
+  if (fenceFails) assert.equal(outcome, reason);
+  else assert.equal(outcome.code, "ANIMATION_GPU_DISPOSED");
+  assert.equal(gpu.failed, fenceFails);
+  assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(pose.disposed, false);
+});
+
+test("rejected native loss releases deformer buffers and preserves the original failure", async () => {
+  const device = deviceSpy(), pose = scene(),
+    gpu = await createGpuAnimationDeformer(device, pose, geometry()),
+    reason = new Error("native loss rejection");
+  device.completionGate = deferred();
+  gpu.update();
+  const pending = gpu.whenIdle();
+  device.loss.reject(reason);
+  await assert.rejects(pending, error => error === reason);
+  assert.equal(gpu.failed, true);
+  assert.equal(gpu.inputCacheBytes, 0);
+  assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+  assert.equal(pose.disposed, false);
+  gpu.dispose();
+  device.completionGate.resolve();
+  assert.ok(device.buffers.every(buffer => buffer.destroyed === 1));
+});
+
+test("disposed and failed deformers release their pose graphs while the borrowed device stays live", () => {
+  // The child collector sees real production deformer owners with packed pose
+  // fixtures and a recording GPU boundary. Test logs are cleared before GC;
+  // neither shader execution nor driver allocation is inferred from this test.
+  const source = `
+    import assert from 'node:assert/strict';
+    import {createGpuAnimationDeformer, createGpuAnimationDeformerCache} from './animation_webgpu.mjs';
+    import {recordingDevice, packedPose, geometry} from './fixtures/animation/gpu_batch_fixture.mjs';
+    const device = recordingDevice(), refs = [], cache = createGpuAnimationDeformerCache(device);
+    const then = device.lost.then.bind(device.lost);
+    let subscriptions = 0;
+    device.lost.then = (...args) => { subscriptions++; return then(...args); };
+    device.destroy = () => assert.fail('borrowed device');
+    async function cycle() {
+      for (let index = 0; index < 20; index++) {
+        const pose = packedPose(1), source = geometry(0),
+          owner = await createGpuAnimationDeformer(device, pose, source, index % 2 ? {cache} : {});
+        owner.dispose(); owner.dispose();
+        assert.equal(pose.disposed, false);
+        assert.equal(cache.entries, 0); assert.equal(cache.bytes, 0);
+        for (const value of [owner, pose, pose.worldMatrices, pose.jointMatrices, pose.morphWeights, source])
+          refs.push(new WeakRef(value));
+      }
+      device.createComputePipelineAsync = async () => { throw new Error('shader compile failure'); };
+      for (let index = 0; index < 20; index++) {
+        const pose = packedPose(1), failedCache = createGpuAnimationDeformerCache(device);
+        await assert.rejects(createGpuAnimationDeformer(device, pose, geometry(0), {cache: failedCache}),
+          /shader compile failure/);
+        assert.equal(pose.disposed, false);
+        assert.equal(failedCache.entries, 0); assert.equal(failedCache.bytes, 0);
+        for (const value of [pose, pose.worldMatrices, pose.jointMatrices, pose.morphWeights, failedCache])
+          refs.push(new WeakRef(value));
+      }
+      for (const buffer of device.buffers) {
+        assert.equal(buffer.destroyed, 1);
+        refs.push(new WeakRef(buffer), new WeakRef(buffer.bytes));
+      }
+      device.buffers.length = 0; device.clear();
+    }
+    await cycle();
+    for (let turn = 0; turn < 20; turn++) { await new Promise(setImmediate); global.gc(); }
+    assert.equal(refs.filter(ref => ref.deref()).length, 0,
+      'disposed and failed animation owners must not retain CPU/GPU graphs until device loss');
+    assert.equal(subscriptions, 1, 'mesh churn shares one removable native loss observer');
+  `;
+  execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
+    cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
+  });
 });
 
 test("compute shader does not use the reserved WGSL target identifier", () => {

@@ -9,7 +9,7 @@ import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {recordingDevice,packedPose,geometry,identity} from './fixtures/animation/gpu_batch_fixture.mjs';
 const dir=await mkdtemp(join(tmpdir(),'f3d-scene-batch-'));after(()=>rm(dir,{recursive:true,force:true}));
-for(const file of ['animation_scene.mjs','animation_webgpu.mjs','animation_deformer.mjs'])await copyFile(new URL(file,import.meta.url),join(dir,file));
+for(const file of ['animation_scene.mjs','animation_webgpu.mjs','animation_deformer.mjs','gpu_device_loss.mjs'])await copyFile(new URL(file,import.meta.url),join(dir,file));
 await writeFile(join(dir,'animation_runtime.mjs'),`export class AnimationPoseError extends Error {constructor(code,message){super(message);this.code=code;}}`);
 await writeFile(join(dir,'animation_controller.mjs'),`
 export function createAnimationController(pose){return {disposed:false,time:0,
