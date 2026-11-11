@@ -473,8 +473,12 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
         encoder.copyBufferToBuffer(source, offset, buffer, 0, size);
         device.queue.submit([encoder.finish()]);
       });
+      // The copy observes only work issued through this submission boundary.
+      // Capture its outstanding validation before mapping yields: later uploads
+      // and dispatches must not hold an already completed readback open.
+      const validations = [...pending];
       await interrupted(request.wait(buffer.mapAsync(MAP_READ, 0, size)));
-      await interrupted(request.wait(Promise.all([...pending])));
+      await interrupted(request.wait(Promise.all(validations)));
       live(); request.check(bytes);
       const mapped = buffer.getMappedRange(0, size);
       let result;

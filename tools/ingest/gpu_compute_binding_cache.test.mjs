@@ -118,6 +118,60 @@ test('cache hits observe new uploads, not bytes captured when the group was crea
   assert.equal(calls.groups.length, 1); owner.dispose();
 });
 
+test('a completed readback does not wait for validation of later uploads', async () => {
+  const {owner, aKey, device, calls} = setup();
+  await owner.validationSnapshot();
+  let finishMapping, finishLaterValidation;
+  const mapping = new Promise(resolve => { finishMapping = resolve; });
+  const laterValidation = new Promise(resolve => { finishLaterValidation = resolve; });
+  const createBuffer = device.createBuffer;
+  device.createBuffer = descriptor => {
+    const buffer = createBuffer(descriptor);
+    if (descriptor.label === 'f3d-compute-readback') buffer.mapAsync = () => mapping;
+    return buffer;
+  };
+  let completed = false, result;
+  const reading = owner.read(aKey).then(value => { completed = true; result = value; });
+  try {
+    device.popErrorScope = () => laterValidation;
+    owner.upload(aKey, new Uint32Array([21, 22, 23, 24]), 1);
+    finishMapping();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(completed, true, 'later GPU validation is outside this readback submission');
+    assert.deepEqual([...new Uint32Array(result)], [1, 2, 3, 4], 'the copy retains its earlier GPU bytes');
+    assert.equal(calls.buffers.at(-1).destroyed, true, 'completed mapping releases its staging allocation');
+    assert.equal(calls.fences, 0, 'mapping completion requires no additional queue fence');
+    await reading;
+  } finally {
+    finishMapping(); finishLaterValidation(null); owner.dispose();
+    await reading.catch(() => {});
+  }
+});
+
+test('readback waits for its own copy validation and never publishes rejected bytes', async () => {
+  const {owner, aKey, device, calls} = setup();
+  await owner.validationSnapshot();
+  let finishValidation, scope = 0;
+  const validation = new Promise(resolve => { finishValidation = resolve; });
+  device.popErrorScope = () => ++scope === 2 ? validation : Promise.resolve(null);
+  const output = new Uint32Array([90, 91, 92, 93]);
+  let settled = false;
+  const reading = owner.read(aKey, output.buffer);
+  reading.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, 'completed mapping is not a validation result');
+    assert.deepEqual([...output], [90, 91, 92, 93]);
+    finishValidation({message: 'copy rejected'});
+    await assert.rejects(reading, {code: 'GPU_COMPUTE_VALIDATION', message: 'GPU_COMPUTE_VALIDATION: copy rejected'});
+    assert.deepEqual([...output], [90, 91, 92, 93], 'failed readbacks leave caller storage untouched');
+    assert.equal(calls.buffers.at(-1).destroyed, true);
+  } finally {
+    finishValidation(null); owner.dispose();
+    await reading.catch(() => {});
+  }
+});
+
 test('GPU ping-pong keeps two groups and consumes evolving native bytes', async () => {
   const {owner, a, b, calls} = setup();
   const pipeline = owner.prepareSync({code: 'increment'});
