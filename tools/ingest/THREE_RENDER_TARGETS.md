@@ -622,10 +622,11 @@ nonzero-mip depth retains its independent 2D or array allocation and byte charge
 Accepted sampling leases and submitted work retain every old color chain across
 resize until their consumers and queue fences finish.
 
-Volume color is single-sample. Automatic 3D mip generation, volume history
-rotation and storage-to-target writes above mip zero remain explicit boundaries.
-Automatic generation is rejected for every volume attachment, including a
-secondary color with only one allocated level. Copies between distinct MRT
+Volume color is single-sample. Native WebGPU automatic 3D mip generation, volume
+history rotation and storage-to-target writes above mip zero remain explicit
+boundaries. The pinned native WebGPU mip utility has no 3D entry point, so that
+route still refuses automatic generation for every volume attachment, including
+a secondary color with only one allocated level. Copies between distinct MRT
 images or distinct mips remain valid when their formats and regions match;
 different Z slices of the same image and mip still share one subresource and
 cannot be copied onto themselves. These additions do not close the full
@@ -637,6 +638,36 @@ They do not execute GPU shaders or establish browser pixel parity or speedups.
 The added volume-MRT tests exercise the production GPU/source owners and compute
 sampling bridge with recording fixtures, including secondary-color readback,
 mip-local slice ranges, typed transfers, allocation limits and resize retirement.
+
+## Generated WebGL volume mipmaps
+
+The WebGL-authored facade admits `WebGL3DRenderTarget` with
+`texture.generateMipmaps = true`. Source `WebGLTextures` generates these pyramids
+with `generateMipmap(TEXTURE_3D)`. The new backend performs the reduction entirely
+on the GPU, shrinking X, Y and Z with eight clamped texel loads per destination.
+Each pass samples exactly the preceding mip and writes a 3D attachment view with
+an explicit `depthSlice`. The operation does not require CPU readback, storage
+texture usage or optional float32 filtering.
+
+Generation flags are captured per accepted render, including single-color
+targets. Disabling generation preserves stale higher levels; sampling and
+manual clear do not refresh them. Enabling generation after initial allocation
+grows the color pyramid after the source draw, copies existing levels, and
+retains old images behind their consumer and queue fences. The initialized
+source sampler and public texture identities survive this growth. The WebGL
+sampling replica flips each mip's rows and visits only that mip's reduced Z
+extent. Authored native volume mips keep their existing behavior.
+
+The volume owner and facade regressions cover command ordering, per-color and
+queued generation flags, odd extents, one-texel axes, sampler retention, growth,
+allocation charges and lifetime boundaries. The source/candidate browser runner
+is `node tests/e2e/webgpu_renderer/program_volume_mipmaps.mjs`; it compares
+explicit LOD and minified sampler3D reads, disabled/re-enabled generation, resize
+and late growth. Browser execution was blocked in the implementation environment
+by Chromium's process-singleton socket permission failure before any page ran.
+The new volume mip shader therefore has no new pixel-equivalence or performance
+result; the checked evidence is recording-device execution and source-contract
+inspection.
 
 ## Remaining gaps and verification
 

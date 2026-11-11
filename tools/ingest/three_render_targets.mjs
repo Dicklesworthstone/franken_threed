@@ -126,8 +126,8 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (volume ? typeof three.Data3DTexture !== 'function' || !(texture instanceof three.Data3DTexture) || texture.isData3DTexture !== true
       : texture?.isData3DTexture)
     fail('SOURCE', 'Volume targets require source Data3DTexture color attachments');
-  if (volume && (![0, 1].includes(target.samples) || texture.generateMipmaps))
-    fail('UNSUPPORTED', 'Source volume targets require one sample and authored mip levels');
+  if (volume && (![0, 1].includes(target.samples) || !webglVolume && texture.generateMipmaps))
+    fail('UNSUPPORTED', 'Volume targets require one sample; native WebGPU volumes require authored mip levels');
   if (cube && target.depth !== 1) fail('UNSUPPORTED', 'Cube targets use six faces, not an array depth');
   if (cube && (typeof three[webglCube ? 'WebGLCubeRenderTarget' : 'CubeRenderTarget'] !== 'function' ||
       !(target instanceof three[webglCube ? 'WebGLCubeRenderTarget' : 'CubeRenderTarget'])))
@@ -526,7 +526,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function retainGeneration(entry) {
     assertCurrent(entry); entry.references++;
     if (entry.shape.cube) entry.cubeInitialized = true;
-    if (!flipY || entry.shape.textures.length > 1) entry.mrtInitialized = true;
+    if (!flipY || entry.shape.textures.length > 1 || entry.shape.webglVolume) entry.mrtInitialized = true;
     if (entry.historyGroup) initializeHistory(entry.historyGroup);
     let held = true;
     return () => {
@@ -541,11 +541,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const frozen = entry?.alive && entry.shape.cube && !entry.shape.webglCube && (entry.cubeInitialized || entry.storage) &&
       entry.shape.texture === target.texture && entry.shape.sourceVersion === target.texture.version;
     const group = entry?.historyGroup ?? historyGroups.get(target);
-    const capturedMips = !nativePasses.has(target) && (target.textures?.length > 1 || !flipY &&
+    const capturedMips = !nativePasses.has(target) && (target.textures?.length > 1 || flipY && target.isWebGL3DRenderTarget === true || !flipY &&
       !target.isCubeRenderTarget && !target.isWebGLCubeRenderTarget && !target.isRenderTarget3D &&
       !target.isWebGL3DRenderTarget && target.depth === 1 && !target.texture?.isDataArrayTexture && !target.texture?.isArrayTexture);
     const frozenMrt = capturedMips && entry?.alive && (entry.mrtInitialized || entry.storage) &&
       entry.shape.width === (target.width || 1) && entry.shape.height === (target.height || 1) &&
+      (!entry.shape.volume || entry.shape.layers === target.depth) &&
       entry.shape.sampleCount === (target.samples === 4 ? 4 : 1) && entry.shape.textures.length === target.textures.length &&
       entry.shape.colors.every((color, index) => color.texture === target.textures[index] &&
         (flipY || color.sourceVersion === color.texture.version));
@@ -555,7 +556,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       target.textures.every(texture => group.mipProfiles.get(texture)?.sourceVersion === texture.version);
     const shape = inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null,
       colorMipProfiles: frozenHistory ? base.colors : frozenMrt ? entry.shape.colors : null});
-    if (flipY && shape.textures.length > 1) for (const color of shape.colors)
+    if (flipY && (shape.textures.length > 1 || shape.webglVolume)) for (const color of shape.colors)
       color.webglSampler ??= captureWebGLTargetSampler(color.texture, color.webglVolume);
     // Native allocation follows the texture version; WebGL MRT allocation
     // follows framebuffer setup. The facade captures per-render generation
@@ -567,6 +568,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function capture(target, {initialize = false} = {}) {
     live();
     const shape = sourceShape(target);
+    // r186's native WebGPU mip utility has no 3D entry point, including when
+    // given a legacy target class. WebGL's generateMipmap(TEXTURE_3D) does.
+    if (!flipY && shape.volume && shape.colorGenerateMipmaps.some(Boolean))
+      fail('UNSUPPORTED', 'Native WebGPU volume targets require authored mip levels');
     if (flipY && shape.colors.some(color => color.integerType !== null))
       fail('UNSUPPORTED', 'Integer targets currently require the native WebGPU renderer surface');
     if (flipY && shape.textures.length > 1) {
@@ -610,12 +615,12 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry && (!sameShape(entry.shape, shape) || entry.depthEntry && !entry.depthEntry.alive)) { retire(entry); entry = null; }
     if (entry) {
       if (initialize && shape.cube) entry.cubeInitialized = true;
-      if (initialize && (!flipY || shape.textures.length > 1)) entry.mrtInitialized = true;
+      if (initialize && (!flipY || shape.textures.length > 1 || shape.webglVolume)) entry.mrtInitialized = true;
       return entry;
     }
     entry = createEntry(target, shape);
     entry.cubeInitialized = initialize && shape.cube;
-    entry.mrtInitialized = initialize && (!flipY || shape.textures.length > 1);
+    entry.mrtInitialized = initialize && (!flipY || shape.textures.length > 1 || shape.webglVolume);
     entries.set(target, entry);
     return entry;
   }
@@ -758,7 +763,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // WebGL's mutable framebuffer images grow on generateMipmap(), after the
     // accepted render/copy. Native targets retain their source allocation
     // contract. Never allocate from a later live flag during capture().
-    if (!flipY || entry.shape.textures.length < 2 || entry.shape.cube || entry.shape.volume || entry.historyGroup) return;
+    if (!flipY || entry.shape.textures.length < 2 && !entry.shape.webglVolume || entry.shape.cube || entry.historyGroup) return;
     const selected = indices.filter(index => entry.shape.colors[index].mipLevelCount < entry.shape.colors[index].maximumMipLevels);
     if (!selected.length) return;
     budget(entry.storage.mipmapGrowthBytes(selected));
@@ -767,13 +772,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const colors = previous.colors.map((color, index) => {
       if (!selected.includes(index)) return color;
       const mipLevelCount = color.maximumMipLevels;
-      let width = color.width, height = color.height, colorBytes = color.baseColorBytes;
+      let width = color.width, height = color.height, depth = color.layers, colorBytes = color.baseColorBytes;
       const texelBytes = color.baseColorBytes / (width * height * color.layers);
       for (let level = 1; level < mipLevelCount; level++) {
         width = Math.max(1, Math.floor(width / 2)); height = Math.max(1, Math.floor(height / 2));
-        colorBytes += width * height * color.layers * texelBytes;
+        if (color.volume) depth = Math.max(1, Math.floor(depth / 2));
+        colorBytes += width * height * depth * texelBytes;
       }
-      // Ordinary 2D/array color keys end in their allocated level count.
+      // Ordinary 2D/array/volume color keys end in their allocated level count.
       // Preserve the frozen setup policy, sampler, and source texture identity.
       return {...color, mipLevelCount, colorBytes, bytes: color.bytes + colorBytes - color.colorBytes,
         key: color.key.slice(0, color.key.lastIndexOf('/') + 1) + mipLevelCount};
@@ -865,7 +871,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (flipY && entry.shape.depthTexture && !depthEntry)
       entry.depthSetupSampler ??= captureDepthSampler(entry.shape.depthTexture);
     const {width, height, format, colorFormats, colorMipLevelCounts, depthFormat, sampleCount, generateMipmaps, mipLevelCount, cube, array, volume, layers, depthArray, depthLayers} = entry.shape;
-    const capturedMips = colorFormats.length > 1 || !flipY && !cube && !array && !volume || !!group;
+    const capturedMips = colorFormats.length > 1 || flipY && entry.shape.webglVolume || !flipY && !cube && !array && !volume || !!group;
     const mipOptions = capturedMips ? {colorMipLevelCounts, colorGenerateMipmaps: colorFormats.map(() => false)} : {};
     const depthOptions = depthEntry ? entry.shape.depthAttachment
       ? {depthSource: depthEntry.storage} : {depthFormat: null, sampleDepth: false} : {};
@@ -958,8 +964,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       fail('UNSUPPORTED', 'Integer target sampling requires native typed texel-load bindings');
     if (shape.cube && !shape.webglCube || shape.array && !shape.webglArray || shape.volume && !shape.webglVolume)
       fail('UNSUPPORTED', 'Native layered target color sampling requires native texture bindings');
-    if (shape.webglVolume && shape.mipLevelCount !== 1)
-      fail('UNSUPPORTED', 'WebGL volume sampling requires a single allocated base level');
+    if (shape.webglVolume && shape.authoredMipLevelCount > 0 && shape.mipLevelCount !== 1)
+      fail('UNSUPPORTED', 'WebGL volume mip sampling requires source-generated levels, not authored framebuffer arrays');
     if (entry.busy) fail('REENTRANT', 'Cannot sample color during a target submission');
     const device = getDevice();
     if (!device) fail('DEVICE', 'Initialize the renderer before sampling target color');
@@ -1007,7 +1013,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
           sample.pipeline = pipeline;
           entry.storage.withTexture(source => {
             sample.flipSteps = [];
-            for (let level = 0; level < mipLevelCount; level++) for (let face = 0; face < layers; face++) {
+            for (let level = 0; level < mipLevelCount; level++) for (let face = 0;
+              face < (volume ? Math.max(1, Math.floor(layers / 2 ** level)) : layers); face++) {
               const settings = {baseMipLevel: level, mipLevelCount: 1,
                 ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : volume ? {dimension} : {})};
               const view = sample.sample.createView(settings);

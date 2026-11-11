@@ -130,6 +130,29 @@ test('WebGL shaders consume rendered volumes with one persistent 3D binding and 
   assert.equal(f.renderer._targets.capture(volume).copies, 2); assert.equal(volume.texture.renderTarget, null);
 });
 
+test('WebGL volume mipmaps retain each queued generation flag and never regenerate on clear', async t => {
+  const f = fixture(t, true), volume = target(t, {depthBuffer: false, generateMipmaps: true}, GL.WebGL3DRenderTarget);
+  await f.renderer.init();
+  for (const [slice, enabled] of [[4, true], [0, false], [2, true]]) {
+    volume.texture.generateMipmaps = enabled;
+    f.renderer.setRenderTarget(volume, slice); f.renderer.render(f.scene, f.camera);
+  }
+  volume.texture.generateMipmaps = false;
+  await f.renderer.waitForGPU();
+  const entry = f.renderer._targets.capture(volume);
+  assert.equal(entry.storage.diagnostics.mipGenerations, 2);
+  assert.equal(entry.storage.mipLevelCount, 4);
+  const generated = f.device.passes.filter(pass => pass.draws.some(draw => /input\.slice/.test(draw.pipeline.fragment.module.code)));
+  assert.deepEqual(generated.map(pass => [pass.desc.colorAttachments[0].view.baseMipLevel,
+    pass.desc.colorAttachments[0].depthSlice]), [[1, 0], [1, 1], [2, 0], [3, 0], [1, 0], [1, 1], [2, 0], [3, 0]]);
+  const image = generated[0].desc.colorAttachments[0].view.texture;
+  assert.ok(generated.every(pass => pass.desc.colorAttachments[0].view.texture === image));
+  volume.texture.generateMipmaps = true; f.renderer.clear(); await f.renderer.waitForGPU();
+  assert.equal(f.renderer._targets.capture(volume), entry);
+  assert.equal(entry.storage.diagnostics.mipGenerations, 2, 'source clear leaves higher levels stale');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('MRT volume output retains the selected slice on every color attachment after renderer state restoration', async t => {
   const f = fixture(t), volume = target(t, {count: 2, type: T.HalfFloatType});
   volume.textures[0].name = 'output'; volume.textures[1].name = 'auxiliary';

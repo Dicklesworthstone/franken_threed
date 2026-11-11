@@ -94,8 +94,11 @@
  * every layer and shares ordinary or per-layer depth across both color images.
  * Sampled array depth currently requires one sample. volumeDepth allocates 3D color;
  * frame.depthSlice selects a mip-local voxel slice through a 3D attachment view.
- * Authored mips halve all three color dimensions. Depth remains independently
- * owned 2D/array storage, including private depth at nonzero color mips.
+ * Authored and generated mips halve all three color dimensions. Volume mip
+ * generation uses eight clamped texel loads per destination and disjoint 3D
+ * mip views, with each destination slice selected through depthSlice. Depth
+ * remains independently owned 2D/array storage, including private depth at
+ * nonzero color mips.
  */
 import {readGpuTargetPixels, readGpuTargetDepth} from './gpu_target_readback.mjs';
 import {inspectGpuTargetWrite, gpuTargetWriteData, inspectGpuTargetCopy, gpuTargetCopyOverlaps} from './gpu_target_transfer.mjs';
@@ -190,6 +193,38 @@ const FLOAT32_MIP_WGSL = `
   return mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y);
 }`;
 
+// Volume reductions use all eight neighbors and shrink X, Y and Z together.
+// A render attachment selects its depthSlice; it is still a 3D view, never an
+// illegal 2D view of volume storage. Explicit loads retain float32 support and
+// allow renderable formats (including sRGB) without requiring storage usage.
+const VOLUME_MIP_WGSL = `
+struct Varys {
+  @builtin(position) position: vec4f,
+  @location(0) @interpolate(flat) slice: u32,
+};
+@group(0) @binding(0) var source: texture_3d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) slice: u32) -> Varys {
+  let p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return Varys(vec4f(p[i], 0, 1), slice);
+}
+@fragment fn fs(input: Varys) -> @location(0) vec4f {
+  let size = textureDimensions(source);
+  let nextSize = max(size / 2u, vec3u(1u));
+  let q = vec3f(input.position.xy, f32(input.slice) + 0.5) * vec3f(size) / vec3f(nextSize) - vec3f(0.5);
+  let lo = vec3i(floor(q)); let hi = vec3i(size) - vec3i(1);
+  let a = textureLoad(source, clamp(lo, vec3i(0), hi), 0);
+  let b = textureLoad(source, clamp(lo + vec3i(1, 0, 0), vec3i(0), hi), 0);
+  let c = textureLoad(source, clamp(lo + vec3i(0, 1, 0), vec3i(0), hi), 0);
+  let d = textureLoad(source, clamp(lo + vec3i(1, 1, 0), vec3i(0), hi), 0);
+  let e = textureLoad(source, clamp(lo + vec3i(0, 0, 1), vec3i(0), hi), 0);
+  let f = textureLoad(source, clamp(lo + vec3i(1, 0, 1), vec3i(0), hi), 0);
+  let g = textureLoad(source, clamp(lo + vec3i(0, 1, 1), vec3i(0), hi), 0);
+  let h = textureLoad(source, clamp(lo + vec3i(1, 1, 1), vec3i(0), hi), 0);
+  let weight = fract(q);
+  return mix(mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y),
+    mix(mix(e, f, weight.x), mix(g, h, weight.x), weight.y), weight.z);
+}`;
+
 // Pinned WebGPUTexturePassUtils cube direction/orientation and implicit-LOD
 // sampling, with its constant no-flip uniform folded into the vertex equation.
 // A complete previous cube level is sampled, preserving cross-face filtering.
@@ -267,8 +302,8 @@ export function createGpuRenderTarget(device, options = {}) {
     fail('OPTIONS', 'Layered targets require positive arrayLayers or volumeDepth and an optional depthArray flag');
   if (Number(cube) + Number(array) + Number(volume) > 1)
     fail('OPTIONS', 'Cube, 2D array and 3D volume dimensions are mutually exclusive');
-  if (volume && (sampleCount !== 1 || generateMipmaps || colorGenerateMipmaps.some(Boolean)))
-    fail('UNSUPPORTED', 'Volume targets require one sample and authored mip levels');
+  if (volume && sampleCount !== 1)
+    fail('UNSUPPORTED', 'Volume targets require one sample');
   if (array && depthArray && sampleDepth && sampleCount !== 1)
     fail('UNSUPPORTED', 'Sampled array depth requires one sample');
   if (multiple && cube)
@@ -321,7 +356,6 @@ export function createGpuRenderTarget(device, options = {}) {
   function requireMipFeatures(colorIndices = [...colorFormats.keys()]) {
     if (colorIndices.some(index => integerColor(colorFormats[index])))
       fail('MIP', 'Integer targets require authored mip levels');
-    if (volume) fail('MIP', 'Automatic volume mip generation is not implemented; render authored mip levels explicitly');
     if (cube && float32 && device.features?.has?.('float32-filterable') !== true)
       fail('FEATURE', 'Float32 cube mip generation requires float32-filterable on the supplied device');
   }
@@ -524,16 +558,16 @@ export function createGpuRenderTarget(device, options = {}) {
       const encoder = suppliedEncoder ?? device.createCommandEncoder({label: label + ' mip chain'});
       for (const index of selected) {
         const texture = colorTexture(pair, index, colorSlots);
-        const attachmentFormat = colorFormats[index], unfilterable = attachmentFormat.includes('32float') && !cube;
+        const attachmentFormat = colorFormats[index], unfilterable = volume || attachmentFormat.includes('32float') && !cube;
         const methods = ['createShaderModule', 'createRenderPipeline', 'createBindGroup', 'createCommandEncoder',
           ...(unfilterable ? ['createBindGroupLayout', 'createPipelineLayout'] : ['createSampler'])];
         if (methods.some(key => typeof device[key] !== 'function') || typeof device.queue.submit !== 'function')
           fail('DEVICE', 'Mip generation requires WebGPU render pipelines and queue submission');
         let program = mipPrograms.get(attachmentFormat);
         if (!program) {
-          const module = device.createShaderModule({label: label + ' mipmap', code: cube ? CUBE_MIP_WGSL : unfilterable ? FLOAT32_MIP_WGSL : MIP_WGSL});
+          const module = device.createShaderModule({label: label + ' mipmap', code: volume ? VOLUME_MIP_WGSL : cube ? CUBE_MIP_WGSL : unfilterable ? FLOAT32_MIP_WGSL : MIP_WGSL});
           const layout = unfilterable ? device.createPipelineLayout({bindGroupLayouts: [device.createBindGroupLayout({entries: [
-            {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: false}},
+            {binding: 0, visibility: 2, texture: {sampleType: 'unfilterable-float', viewDimension: volume ? '3d' : '2d', multisampled: false}},
           ]})]}) : 'auto';
           const pipeline = device.createRenderPipeline({label: label + ' mipmap', layout,
             vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format: attachmentFormat}]},
@@ -545,15 +579,17 @@ export function createGpuRenderTarget(device, options = {}) {
         if (!pair.mipSteps.has(texture)) {
           const steps = [];
           for (let level = 1; level < pair.colorMipLevelCounts[index]; level++) {
-            let cubeGroup;
+            let layeredGroup;
             const sourceGroup = view => device.createBindGroup({layout: program.pipeline.getBindGroupLayout(0), entries: [
               {binding: 0, resource: view}, ...(unfilterable ? [] : [{binding: 1, resource: program.sampler}]),
             ]});
-            if (cube) cubeGroup = sourceGroup(texture.createView({baseMipLevel: level - 1, mipLevelCount: 1,
+            if (cube) layeredGroup = sourceGroup(texture.createView({baseMipLevel: level - 1, mipLevelCount: 1,
               dimension: 'cube', baseArrayLayer: 0, arrayLayerCount: 6}));
-            for (let face = 0; face < layers; face++) {
-              const slice = cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {};
-              const group = cubeGroup ?? sourceGroup(texture.createView({baseMipLevel: level - 1, mipLevelCount: 1, ...slice}));
+            if (volume) layeredGroup = sourceGroup(texture.createView({baseMipLevel: level - 1, mipLevelCount: 1, dimension: '3d'}));
+            const slices = volume ? Math.max(1, Math.floor(layers / 2 ** level)) : layers;
+            for (let face = 0; face < slices; face++) {
+              const slice = volume ? {dimension: '3d'} : cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {};
+              const group = layeredGroup ?? sourceGroup(texture.createView({baseMipLevel: level - 1, mipLevelCount: 1, ...slice}));
               const view = texture.createView({baseMipLevel: level, mipLevelCount: 1, ...slice});
               steps.push({view, group, face});
             }
@@ -561,10 +597,10 @@ export function createGpuRenderTarget(device, options = {}) {
           pair.mipSteps.set(texture, steps);
         }
         for (const {view, group, face} of pair.mipSteps.get(texture)) {
-          const pass = encoder.beginRenderPass({colorAttachments: [{view,
+          const pass = encoder.beginRenderPass({colorAttachments: [{view, ...(volume ? {depthSlice: face} : {}),
             loadOp: 'clear', storeOp: 'store', clearValue: {r: 0, g: 0, b: 0, a: 0}}]});
           pass.setPipeline(program.pipeline); pass.setBindGroup(0, group);
-          if (cube) pass.draw(3, 1, 0, face); else pass.draw(3);
+          if (cube || volume) pass.draw(3, 1, 0, face); else pass.draw(3);
           pass.end();
         }
       }
@@ -592,8 +628,8 @@ export function createGpuRenderTarget(device, options = {}) {
     const requested = selectedMipColors(colorIndices);
     const maximum = 1 + Math.floor(Math.log2(Math.max(width, height, volume ? layers : 1)));
     const colors = current ? requested.filter(index => current.colorMipLevelCounts[index] < maximum) : [];
-    if (colors.length && (cube || volume || historyIndices.size))
-      fail('MIP', 'Growing mipmaps requires 2D or array colors without history alternatives');
+    if (colors.length && (cube || historyIndices.size))
+      fail('MIP', 'Growing mipmaps requires 2D, array or volume colors without history alternatives');
     if (colors.length) requireMipFeatures(colors);
     const bytes = colors.reduce((sum, index) => sum + colorImageCost(width, height, layers, index, maximum), 0);
     const previousBytes = colors.reduce((sum, index) => sum +
@@ -624,11 +660,12 @@ export function createGpuRenderTarget(device, options = {}) {
           const texture = device.createTexture({label: `${label} color ${index} grown mips`,
             size: {width, height, depthOrArrayLayers: layers}, format: attachmentFormat,
             ...(attachmentFormat.endsWith('-srgb') ? {viewFormats: [attachmentFormat.replace(/-srgb$/, '')]} : {}),
-            dimension: '2d', sampleCount: 1, mipLevelCount: plan.maximum, usage: 1 | 2 | 4 | 16});
+            dimension: volume ? '3d' : '2d', sampleCount: 1, mipLevelCount: plan.maximum, usage: 1 | 2 | 4 | 16});
           replacements.set(index, texture);
           for (let level = 0; level < current.colorMipLevelCounts[index]; level++)
             encoder.copyTextureToTexture({texture: current.colors[index], mipLevel: level}, {texture, mipLevel: level},
-              {width: Math.max(1, Math.floor(width / 2 ** level)), height: Math.max(1, Math.floor(height / 2 ** level)), depthOrArrayLayers: layers});
+              {width: Math.max(1, Math.floor(width / 2 ** level)), height: Math.max(1, Math.floor(height / 2 ** level)),
+                depthOrArrayLayers: volume ? Math.max(1, Math.floor(layers / 2 ** level)) : layers});
         }
         // Retain every depth view, sibling view and multisample image. Only
         // resolved references to replaced color images need new views.
@@ -637,12 +674,12 @@ export function createGpuRenderTarget(device, options = {}) {
             const original = frame.resolveTargets ?? (frame.resolveTarget ? [frame.resolveTarget] : frame.colorViews ?? [frame.colorView]);
             const resolved = original.map((view, index) => replacements.has(index)
               ? replacements.get(index).createView({baseMipLevel: level, mipLevelCount: 1,
-                ...(array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})}) : view);
+                ...(volume ? {dimension: '3d'} : array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})}) : view);
             return Object.freeze({...frame, ...(sampleCount === 4
               ? {resolveTarget: resolved[0], ...(multiple ? {resolveTargets: Object.freeze(resolved)} : {})}
               : {colorView: resolved[0], ...(multiple ? {colorViews: Object.freeze(resolved)} : {})})});
           };
-          return [level, array ? Object.freeze(cached.map(rebind)) : rebind(cached, 0)];
+          return [level, array || volume ? Object.freeze(cached.map(rebind)) : rebind(cached, 0)];
         }));
         // Copies follow all prior draw/resolve commands and precede any caller's
         // subsequent generation. Growth itself never synthesizes mip pixels.
@@ -655,7 +692,7 @@ export function createGpuRenderTarget(device, options = {}) {
         current.mipsDirty.add(texture); grownMipColors.add(index);
       }
       current.color = current.colors[0]; current.mipLevelCount = current.colorMipLevelCounts[0];
-      current.frames = frames; current.layerFrames = array ? frames.get(0) : [frames.get(0)];
+      current.frames = frames; current.layerFrames = array || volume ? frames.get(0) : [frames.get(0)];
       current.frame = current.layerFrames[0];
       current.views = current.frame.resolveTargets ?? (current.frame.resolveTarget ? [current.frame.resolveTarget]
         : current.frame.colorViews ?? [current.frame.colorView]);

@@ -14,6 +14,9 @@ function fixture(options = {}) {
   const draws = [], createEncoder = f.device.createCommandEncoder;
   f.device.createCommandEncoder = () => {
     const encoder = createEncoder(), begin = encoder.beginRenderPass;
+    encoder.copyTextureToTexture = (source, destination, size) => {
+      (f.calls.copies ??= []).push({source, destination, size});
+    };
     encoder.beginRenderPass = descriptor => {
       const pass = begin(descriptor);
       return {...pass, draw(...args) { draws.push({descriptor, args}); pass.draw(...args); }};
@@ -130,6 +133,56 @@ test('WebGL volume setup sampler and borrowed generation survive source edits un
   assert.equal(f.owner.allocatedBytes, 0); assert.ok(f.calls.textures.every(value => value.destroyed === 1));
 });
 
+test('WebGL volume generation follows captured render flags and orients each shrinking mip slice', async t => {
+  const f = fixture(), source = new THREE.WebGL3DRenderTarget(8, 4, 5, {depthBuffer: false,
+    generateMipmaps: true, minFilter: THREE.NearestMipmapNearestFilter, magFilter: THREE.NearestFilter});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose());
+  const entry = f.owner.capture(source, {initialize: true}), bindings = f.owner.bindingsFor();
+  f.owner.render(entry, () => {}, {face: 4, generateColorMipmaps: [0]});
+  assert.equal(entry.storage.diagnostics.mipGenerations, 1);
+  const binding = bindings.get(source.texture), native = entry.storage;
+  assert.equal(binding.view.texture.mipLevelCount, 4); assert.equal(binding.sampler.lodMaxClamp, 3);
+  assert.deepEqual(f.calls.submissions.at(-1).passes.map(pass => {
+    const attachment = pass.descriptor.colorAttachments[0];
+    return [attachment.view.descriptor.baseMipLevel, attachment.depthSlice];
+  }), [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [1, 0], [1, 1], [2, 0], [3, 0]]);
+  assert.equal(f.owner.allocatedBytes, 2 * (160 + 16 + 2 + 1) * 4);
+  source.texture.generateMipmaps = false;
+  assert.equal(f.owner.capture(source), entry, 'flag changes retain rendered content and initialized sampler');
+  f.owner.render(entry, () => {}, {face: 1, generateColorMipmaps: []});
+  bindings.get(source.texture);
+  assert.equal(entry.storage, native); assert.equal(native.diagnostics.mipGenerations, 1, 'sampling must not regenerate a stale source pyramid');
+  source.texture.generateMipmaps = true;
+  f.owner.render(entry, () => {}, {face: 2, generateColorMipmaps: [0]});
+  assert.equal(native.diagnostics.mipGenerations, 2);
+  assert.equal(bindings.get(source.texture).view, binding.view); await f.owner.whenIdle();
+});
+
+test('enabling WebGL volume mipmaps grows XYZ storage after the draw without losing base content', async t => {
+  const f = fixture(), source = new THREE.WebGL3DRenderTarget(7, 5, 3, {depthBuffer: false});
+  t.after(() => f.owner.dispose()); t.after(() => source.dispose());
+  const entry = f.owner.capture(source, {initialize: true});
+  f.owner.render(entry, () => {}, {face: 2, generateColorMipmaps: []});
+  const binding = f.owner.bindingsFor().get(source.texture), previous = binding.view.texture;
+  source.texture.generateMipmaps = true;
+  assert.equal(f.owner.capture(source), entry);
+  let base;
+  f.owner.render(entry, (_, color) => { base = color; }, {face: 1, generateColorMipmaps: [0]});
+  assert.equal(entry.shape.mipLevelCount, 3); assert.equal(entry.shape.colorBytes, (105 + 6 + 1) * 4);
+  assert.equal(f.calls.copies.length, 1);
+  assert.equal(f.calls.copies[0].source.texture, base);
+  assert.deepEqual(f.calls.copies[0].size, {width: 7, height: 5, depthOrArrayLayers: 3});
+  const grown = f.calls.copies[0].destination.texture;
+  assert.equal(grown.dimension, '3d'); assert.equal(grown.mipLevelCount, 3);
+  const next = f.owner.bindingsFor().get(source.texture);
+  assert.notEqual(next.view.texture, previous);
+  assert.equal(next.sampler.minFilter, binding.sampler.minFilter, 'the source setup sampler survives storage growth');
+  assert.equal(next.view.texture.mipLevelCount, 3);
+  f.owner.render(entry, frame => { assert.equal(frame.colorView.texture, grown); assert.equal(frame.depthSlice, 2); },
+    {face: 2, generateColorMipmaps: []});
+  await f.owner.whenIdle(); assert.equal(f.owner.allocatedBytes, 2 * 112 * 4);
+});
+
 test('WebGL volume sampling retains source mip, source-kind, precision and replica-budget boundaries', t => {
   for (const [Type, options, mips, code] of [
     [THREE.RenderTarget3D, {}, 0, 'THREE_TARGET_UNSUPPORTED'],
@@ -205,6 +258,10 @@ test('volume source and device admission fail before storage allocation', t => {
   const f = fixture(); t.after(() => f.owner.dispose());
   for (const source of [target({samples: 4}), target({generateMipmaps: true}), target({multiview: true})])
     assert.throws(() => inspectThreeRenderTarget(source, THREE), {code: 'THREE_TARGET_UNSUPPORTED'});
+  const native = fixture({flipY: false}), legacy = new THREE.WebGL3DRenderTarget(8, 4, 5, {generateMipmaps: true});
+  t.after(() => { native.owner.dispose(); legacy.dispose(); });
+  assert.throws(() => native.owner.capture(legacy), {code: 'THREE_TARGET_UNSUPPORTED'});
+  assert.equal(native.calls.textures.length, 0);
   const mismatch = target(); mismatch.texture.image.depth = 4;
   assert.throws(() => inspectThreeRenderTarget(mismatch, THREE), {code: 'THREE_TARGET_SIZE'});
   const large = new THREE.RenderTarget3D(4, 2, 257), input = f.owner.captureNativeTexture(large.texture);

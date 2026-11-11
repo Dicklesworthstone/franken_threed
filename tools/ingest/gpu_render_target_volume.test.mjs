@@ -8,6 +8,8 @@ function fixture() {
   const f = targetDevice();
   Object.assign(f.device.limits, {maxTextureDimension3D: 256, maxTextureArrayLayers: 256,
     maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  f.device.createBindGroupLayout = descriptor => descriptor;
+  f.device.createPipelineLayout = descriptor => descriptor;
   return f;
 }
 const make = (f, options = {}) => createGpuRenderTarget(f.device,
@@ -53,8 +55,9 @@ test('authored volume mips shrink XYZ while private depth arrays keep their inde
     assert.throws(() => target.withFrame(() => assert.fail('invalid slice'), {mipLevel, face}), {code: 'GPU_TARGET_FACE'});
   target.withFrame(frame => assert.equal(frame.depthSlice, 0), {mipLevel: 3});
   target.withTexture(texture => assert.equal(texture.mipLevelCount, 4));
-  assert.throws(() => target.generateMipmaps(), {code: 'GPU_TARGET_MIP'});
-  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 0);
+  assert.equal(target.diagnostics.mipGenerations, 0, 'authored mips remain untouched without an explicit generation');
+  assert.equal(target.generateMipmaps(), true);
+  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 1);
   await target.whenIdle();
 });
 
@@ -99,7 +102,7 @@ test('volume uploads and cross-dimension copies retain explicit mip-local slice 
 
 test('volume admission validates all three dimensions and rejects incompatible modes before allocation', () => {
   for (const options of [{volumeDepth: 0}, {volumeDepth: 257}, {width: 257}, {height: 257}, {volumeDepth: 1.5},
-    {arrayLayers: 2}, {cube: true}, {sampleCount: 4}, {generateMipmaps: true}, {maxBytes: 8 * 4 * (5 * 4 + 4) - 1}]) {
+    {arrayLayers: 2}, {cube: true}, {sampleCount: 4}, {maxBytes: 8 * 4 * (5 * 4 + 4) - 1}]) {
     const f = fixture(); assert.throws(() => make(f, options), error => /^GPU_TARGET_/.test(error.code));
     assert.equal(f.calls.textures.length, 0);
   }
@@ -276,25 +279,58 @@ test('volume MRT resize retires all authored chains and private mip depth behind
   target.dispose(); assert.ok(f.calls.textures.every(texture => texture.destroyed === 1));
 });
 
-test('volume MRT refuses automatic mips on every color before allocation and keeps authored owners usable', async t => {
-  for (const options of [
-    {colorMipLevelCounts: [4, 2], colorGenerateMipmaps: [false, true]},
-    {width: 1, height: 1, volumeDepth: 1, colorMipLevelCounts: [1, 1], colorGenerateMipmaps: [false, true]},
-    {generateMipmaps: true, colorGenerateMipmaps: [false, false]},
-    {sampleCount: 4, colorMipLevelCounts: [4, 2]},
-  ]) {
-    const f = fixture();
-    assert.throws(() => make(f, {colorFormats: ['rgba8unorm', 'rgba16float'], ...options}),
-      {code: 'GPU_TARGET_UNSUPPORTED'});
-    assert.equal(f.calls.textures.length, 0);
-  }
-  const f = fixture(), target = make(f, {colorFormats: ['rgba8unorm', 'rgba16float'], colorMipLevelCounts: [4, 2]});
+test('volume MRT generates only selected color mips and leaves authored neighbors intact', async t => {
+  const f = fixture(), target = make(f, {colorFormats: ['rgba8unorm', 'rgba16float'],
+    colorMipLevelCounts: [4, 2], colorGenerateMipmaps: [false, true]});
   t.after(() => target.dispose());
-  assert.throws(() => target.generateMipmaps([1]), {code: 'GPU_TARGET_MIP'});
+  const [color, secondary] = f.calls.textures;
+  target.withAttachments(() => {});
+  assert.equal(target.diagnostics.mipGenerations, 1);
+  assert.ok(f.calls.submissions.flatMap(command => command.passes).every(pass =>
+    pass.descriptor.colorAttachments[0].view.texture === secondary));
+  assert.equal(target.generateMipmaps([1]), false, 'warm generated image is reused');
+  assert.equal(target.generateMipmaps([0]), true, 'authored color needs an explicit request');
+  assert.ok(f.calls.submissions.at(-1).passes.every(pass => pass.descriptor.colorAttachments[0].view.texture === color));
   assert.throws(() => target.reserveColorHistory([1]), {code: 'GPU_TARGET_UNSUPPORTED'});
   target.withFrame(frame => assert.equal(frame.depthSlice, 1), {mipLevel: 1, face: 1});
-  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 0);
+  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 2);
   await target.whenIdle();
+});
+
+for (const [width, height, volumeDepth] of [[8, 4, 5], [7, 5, 3], [1, 1, 9]])
+for (const format of ['rgba8unorm', 'rgba8unorm-srgb', 'rgba16float', 'rgba32float'])
+test(`volume ${width}x${height}x${volumeDepth} ${format} generates disjoint XYZ mips without storage or filtering requirements`, async t => {
+  const f = fixture(), target = make(f, {width, height, volumeDepth, format, depthFormat: null, generateMipmaps: true});
+  t.after(() => target.dispose());
+  const expected = [], shapes = [[width, height, volumeDepth]];
+  for (let level = 1; level < target.mipLevelCount; level++) {
+    const shape = [width, height, volumeDepth].map(value => Math.max(1, Math.floor(value / 2 ** level)));
+    shapes.push(shape);
+    for (let face = 0; face < shape[2]; face++) expected.push([level, face]);
+  }
+  const bytes = format === 'rgba32float' ? 16 : format === 'rgba16float' ? 8 : 4;
+  assert.equal(target.allocatedBytes, shapes.reduce((sum, [w, h, d]) => sum + w * h * d * bytes, 0));
+  assert.equal(f.calls.submissions.length, 0);
+  target.withTexture(() => {});
+  const passes = f.calls.submissions[0].passes;
+  assert.deepEqual(passes.map(pass => [pass.descriptor.colorAttachments[0].view.descriptor.baseMipLevel,
+    pass.descriptor.colorAttachments[0].depthSlice]), expected);
+  for (const pass of passes) {
+    const output = pass.descriptor.colorAttachments[0].view, input = pass.group.entries[0].resource;
+    assert.equal(output.texture, input.texture);
+    assert.equal(input.descriptor.baseMipLevel + 1, output.descriptor.baseMipLevel);
+    assert.equal(input.descriptor.mipLevelCount, 1); assert.equal(output.descriptor.mipLevelCount, 1);
+    assert.equal(input.descriptor.dimension, '3d'); assert.equal(output.descriptor.dimension, '3d');
+    assert.equal(pass.pipeline.layout.bindGroupLayouts[0].entries[0].texture.sampleType, 'unfilterable-float');
+    assert.equal(pass.group.entries.length, 1, 'eight loads need no filtering sampler');
+    assert.equal(output.texture.usage & 8, 0, 'renderable formats need no storage binding usage');
+  }
+  const groups = f.calls.groups.length; target.withTexture(() => {});
+  assert.equal(target.diagnostics.mipGenerations, 1);
+  target.withFrame(() => {}, {face: volumeDepth - 1}); target.withTexture(() => {});
+  assert.equal(target.diagnostics.mipGenerations, 2); assert.equal(f.calls.groups.length, groups);
+  assert.equal(f.calls.pipelines.length, 1); assert.equal(f.calls.samplers.length, 0);
+  await target.whenIdle(); assert.deepEqual(f.calls.scopes, []);
 });
 
 test('volume MRT self-copies distinguish color images and mip subresources from slices', async t => {

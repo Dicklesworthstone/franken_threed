@@ -1387,7 +1387,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           generateCubeMipmaps: !clearOnly && (this._shaderEncodedOutput
             ? target?.isWebGLCubeRenderTarget === true && mipLevel === 0
             : target?.isCubeRenderTarget === true) && target.texture.generateMipmaps,
-          generateColorMipmaps: !clearOnly && target && (target.textures.length > 1 || !this._shaderEncodedOutput &&
+          generateColorMipmaps: !clearOnly && target && (target.textures.length > 1 ||
+            this._shaderEncodedOutput && target.isWebGL3DRenderTarget === true || !this._shaderEncodedOutput &&
             (destination.historyGroup || !destination.shape.cube && !destination.shape.array && !destination.shape.volume))
             ? target.textures.flatMap((texture, index) => texture.generateMipmaps ? [index] : []) : null,
           linearClearColor: this.alpha ? [c.r * a, c.g * a, c.b * a, a] : [c.r, c.g, c.b, 1],
