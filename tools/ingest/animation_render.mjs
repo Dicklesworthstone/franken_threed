@@ -237,6 +237,7 @@ import {animationClippingBytes, animationClippingFields, animationClippingWgsl,
 import {createAnimationRenderBundleCache, encodeAnimationRenderSpans} from "./animation_render_bundles.mjs";
 import {createProgramMeshes} from "./animation_program_mesh.mjs";
 import {createThreeNodeProgramMeshes} from "./three_node_program_gpu.mjs";
+import {subscribeGpuDeviceLoss} from "./gpu_device_loss.mjs";
 import {createAnimationColorTargetProfile} from "./animation_color_target.mjs";
 import {inspectGpuRenderTargetColors} from "./gpu_render_target.mjs";
 import {snapshotAnimationRaster, snapshotAnimationRasterUse, hasAnimationStencil,
@@ -1243,6 +1244,7 @@ export async function createGpuAnimationRenderer(
     terminal = null,
     busy = false;
   let drawCallCount = 0, bundleCache = null;
+  let releaseDeviceLoss = null;
   let version = 0,
     drawCount = 0,
     completion = Promise.resolve(),
@@ -1405,6 +1407,9 @@ export async function createGpuAnimationRenderer(
     }
   }
   function release() {
+    // Scene/target rebuilds may retire this owner while its borrowed device
+    // remains healthy. Do not retain its CPU arenas until GPUDevice.lost.
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     bundleCache?.dispose();
     programs?.dispose();
     nodePrograms?.dispose();
@@ -1423,14 +1428,15 @@ export async function createGpuAnimationRenderer(
     sharedBuffers?.clear();
     sharedGroups?.clear();
   }
-  const lost = device.lost.then((info) => {
-    terminal ??= new AnimationRenderError(
-      "ANIMATION_RENDER_LOST",
-      info?.message || "WebGPU device lost",
-    );
-    release();
-    throw terminal;
-  });
+  let rejectLost;
+  const lost = new Promise((_, reject) => { rejectLost = reject; });
+  const stopForLoss = error => {
+    terminal ??= error;
+    try { release(); } finally { rejectLost(terminal); }
+  };
+  releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stopForLoss(new AnimationRenderError("ANIMATION_RENDER_LOST", info?.message || "WebGPU device lost")),
+    stopForLoss);
   lost.catch(() => {});
   // Cancelling a host wait must not settle the native submission completion.
   // Keep `lost` for fence/error tracking and use `stopped` at publication waits.

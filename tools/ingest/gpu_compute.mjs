@@ -6,6 +6,7 @@
  * upload version. External/unknown texture resources are never cached.
  * General WebGPU execution, not a Rust specialization or a speedup claim. */
 import {createComputeAttributeOwner} from './gpu_compute_attributes.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class GpuComputeError extends Error {
   constructor(code, message) {
@@ -90,11 +91,12 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   let bindingIds = new WeakMap(), bindingUsers = new WeakMap(), bindingLayouts = new WeakMap(), nextBindingId = 0;
   const lifetime = new AbortController();
   const attributeOwner = createComputeAttributeOwner(device);
-  let terminal = null, allocatedBytes = 0, readbackBytes = 0;
+  let terminal = null, allocatedBytes = 0, readbackBytes = 0, releaseDeviceLoss = null;
   const live = () => { if (terminal) throw terminal; };
   function stop(error) {
     if (terminal) return;
     terminal = error instanceof Error ? error : new GpuComputeError('ABORTED', String(error ?? 'Compute execution aborted'));
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     lifetime.abort(terminal);
     attributeOwner.dispose();
     bindGroups.clear();
@@ -108,8 +110,9 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   const onAbort = () => stop(signal.reason);
   if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, {once: true});
   // A borrowed device is never destroyed by this owner.
-  device.lost?.then(info => stop(new GpuComputeError('DEVICE_LOST', info?.message ?? 'WebGPU device lost')),
-    error => stop(error));
+  if (!terminal && typeof device.lost?.then === 'function')
+    releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+      info => stop(new GpuComputeError('DEVICE_LOST', info?.message ?? 'WebGPU device lost')), stop);
   function interrupted(promise) {
     live();
     return new Promise((resolve, reject) => {

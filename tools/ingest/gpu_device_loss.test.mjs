@@ -237,3 +237,94 @@ test('disposed texture, environment and recoverable canvas owners release their 
     cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
   });
 });
+
+test('renderer, program and compute churn releases CPU arenas while the borrowed device stays live', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import {createGpuAnimationRenderer} from './animation_render.mjs';
+    import {createProgramUniformArena} from './animation_program_uniforms.mjs';
+    import {createThreeNodeProgramMeshes} from './three_node_program_gpu.mjs';
+    import {createGpuCompute} from './gpu_compute.mjs';
+    let lose, subscriptions = 0, liveBuffers = 0;
+    const lost = new Promise(resolve => { lose = resolve; }), then = lost.then.bind(lost);
+    lost.then = (...args) => { subscriptions++; return then(...args); };
+    const refs = [];
+    // No allocation log retains a disposed owner or its CPU shadow. This tests
+    // production resource owners at a recording boundary, not GPU driver memory.
+    const device = {lost, features: new Set(), limits: {
+        minUniformBufferOffsetAlignment: 256, maxBufferSize: 2**26,
+        maxUniformBufferBindingSize: 65536, maxDynamicUniformBuffersPerPipelineLayout: 8,
+        maxBindGroups: 4, maxUniformBuffersPerShaderStage: 12, maxVertexBuffers: 8,
+        maxVertexAttributes: 16, maxVertexBufferArrayStride: 2048,
+        maxSamplersPerShaderStage: 16, maxSampledTexturesPerShaderStage: 16},
+      pushErrorScope() {}, popErrorScope: async () => null,
+      createBuffer(descriptor) {
+        const bytes = new ArrayBuffer(descriptor.size); let destroyed = false;
+        const buffer = {...descriptor, getMappedRange: () => bytes, unmap() {}, destroy() {
+          if (!destroyed) { destroyed = true; liveBuffers--; }
+        }};
+        liveBuffers++; refs.push(new WeakRef(buffer)); return buffer;
+      },
+      createBindGroupLayout: descriptor => descriptor,
+      createPipelineLayout: descriptor => descriptor, createBindGroup: descriptor => descriptor,
+      createShaderModule: descriptor => descriptor,
+      createRenderPipelineAsync: async descriptor => {
+        if (device.failPipeline) throw new Error('injected initialization failure');
+        return descriptor;
+      },
+      createCommandEncoder: () => ({}),
+      queue: {onSubmittedWorkDone: async () => {}, writeBuffer() {}, submit() {}},
+      destroy() { assert.fail('borrowed device'); }};
+    const fail = (code, message) => { throw Object.assign(new Error(message), {code}); };
+    const scoped = (_device, run) => {
+      let value, error; try { value = run(); } catch (reason) { error = reason; }
+      const errors = error ? Promise.reject(error) : Promise.resolve(); errors.catch(() => {});
+      return {value, error, errors};
+    };
+    const programOptions = {device, maxDraws: 4, label: 'lifetime', fail, scoped};
+    const nodeOptions = {...programOptions, format: 'rgba8unorm', depthFormat: null, sampleCount: 1};
+    async function cycle() {
+      for (let index = 0; index < 20; index++) {
+        const renderer = await createGpuAnimationRenderer(device, {maxDraws: 4});
+        const arena = createProgramUniformArena(device, programOptions);
+        await arena.register(4096);
+        const nodes = createThreeNodeProgramMeshes(nodeOptions);
+        const compute = createGpuCompute(device), key = {}, data = new Float32Array(1024);
+        compute.upload(key, data); await compute.whenIdle();
+        renderer.dispose(); arena.dispose(); nodes.dispose(); compute.dispose();
+        renderer.dispose(); arena.dispose(); nodes.dispose(); compute.dispose();
+        for (const value of [renderer, arena, nodes, compute, key, data]) refs.push(new WeakRef(value));
+      }
+      // Failed initialization has no returned owner for the caller to dispose.
+      device.failPipeline = true;
+      await assert.rejects(createGpuAnimationRenderer(device, {maxDraws: 4}), /injected initialization failure/);
+      device.failPipeline = false;
+      const cancellation = new AbortController(), reason = new Error('already cancelled');
+      cancellation.abort(reason);
+      const cancelled = createGpuCompute(device, {signal: cancellation.signal});
+      await assert.rejects(cancelled.whenIdle(), error => error === reason);
+      refs.push(new WeakRef(cancelled));
+    }
+    await cycle();
+    assert.equal(liveBuffers, 0, 'retired owners release every owned GPU allocation');
+    for (let turn = 0; turn < 20; turn++) { await new Promise(setImmediate); global.gc(); }
+    assert.equal(refs.filter(ref => ref.deref()).length, 0, 'retired CPU arenas must not wait for a healthy device to be lost');
+    assert.equal(subscriptions, 1, 'renderer and compute churn share one native loss observer');
+    const renderer = await createGpuAnimationRenderer(device, {maxDraws: 4});
+    const arena = createProgramUniformArena(device, programOptions);
+    await arena.register(4096);
+    const nodes = createThreeNodeProgramMeshes(nodeOptions), compute = createGpuCompute(device);
+    compute.upload({}, new Float32Array(16)); await compute.whenIdle();
+    assert.ok(liveBuffers > 0);
+    lose({reason: 'unknown', message: 'device removed'}); await new Promise(setImmediate);
+    await assert.rejects(renderer.whenIdle(), {code: 'ANIMATION_RENDER_LOST'});
+    await assert.rejects(arena.whenIdle(), {code: 'ANIMATION_RENDER_LOST'});
+    assert.throws(() => nodes.begin(), {code: 'ANIMATION_RENDER_LOST'});
+    await assert.rejects(compute.whenIdle(), {code: 'GPU_COMPUTE_DEVICE_LOST'});
+    assert.equal(liveBuffers, 0, 'live owners still drain their allocations on real device loss');
+    renderer.dispose(); arena.dispose(); nodes.dispose(); compute.dispose();
+  `;
+  execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
+    cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
+  });
+});

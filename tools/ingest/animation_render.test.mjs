@@ -744,6 +744,52 @@ test("dispose cancels whenIdle without completing submitted work or owning borro
   assert.equal(borrowed.disposed, false);
 });
 
+for (const rejected of [false, true])
+test(`dispose cancels queued device loss without settling submitted work (rejected=${rejected})`, async (t) => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d), borrowed = gpu(),
+    mesh = await r.addMesh(borrowed), fence = deferred();
+  t.after(() => fence.resolve());
+  let fenceOutcome = "pending", outcome;
+  fence.promise.then(() => { fenceOutcome = "completed"; }, () => { fenceOutcome = "rejected"; });
+  d.queue.onSubmittedWorkDone = () => fence.promise;
+  d.destroy = () => assert.fail("The animation renderer does not own the device");
+  r.render(frame([mesh]));
+  const pending = r.whenIdle().catch(error => { outcome = error; });
+  // Settle the native loss promise but retire its owner before the queued
+  // notification runs. Neither event can declare the submitted work complete.
+  if (rejected) d.loss.reject(new Error("queued native loss rejection"));
+  else d.loss.resolve({message: "queued device loss"});
+  r.dispose(); r.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcome?.code, "ANIMATION_RENDER_DISPOSED");
+  assert.equal(fenceOutcome, "pending");
+  assert.equal(r.failed, false);
+  assert.equal(r.allocatedBytes, 0);
+  assert.ok(d.buffers.every(buffer => buffer.destroyed));
+  assert.equal(d.submissions.length, 1);
+  assert.equal(borrowed.disposed, false);
+  fence.reject(new Error("submitted work failed after disposal"));
+  await pending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fenceOutcome, "rejected");
+  assert.equal(r.failed, true, "a real GPU completion failure remains observable after disposal");
+  assert.equal(borrowed.disposed, false);
+});
+
+test("rejected native loss retains its reason and releases all owned storage", async () => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d), borrowed = gpu(),
+    reason = new Error("native loss rejection");
+  await r.addMesh(borrowed, {indices: [0, 1, 2]});
+  d.loss.reject(reason);
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(r.whenIdle(), error => error === reason);
+  assert.equal(r.failed, true);
+  assert.equal(r.allocatedBytes, 0);
+  assert.ok(d.buffers.every(buffer => buffer.destroyed));
+  assert.equal(borrowed.disposed, false);
+  r.dispose();
+});
+
 test("capabilities and initial uniform budget fail before allocating", async () => {
   for (const [options, change] of [
     [{ maxDraws: 0 }, () => {}],

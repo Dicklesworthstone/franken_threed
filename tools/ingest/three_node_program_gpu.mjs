@@ -18,6 +18,7 @@ import {createAnimationColorTargetProfile} from './animation_color_target.mjs';
 import {hasAnimationStencil, snapshotAnimationRaster, snapshotAnimationBlendConstant} from './animation_raster.mjs';
 import {inspectGpuRenderTargetColors} from './gpu_render_target.mjs';
 import {gpuProgramModule} from './gpu_program_modules.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export function createThreeNodeProgramMeshes({device, format, colorFormats = format === null ? [] : [format], depthFormat, sampleCount, maxDraws,
   label, fail, scoped, lost = device.lost, maxUniformBytes = 64 * 1024 * 1024, maxBindGroups = 4}) {
@@ -40,18 +41,20 @@ export function createThreeNodeProgramMeshes({device, format, colorFormats = for
   if (colorFormats.length > 1) inspectGpuRenderTargetColors(device, colorFormats);
   const colorTargets = colorFormats.map(format => createAnimationColorTargetProfile(device, {format, sampleCount},
     message => fail('ANIMATION_RENDER_OPTIONS', message)));
-  let stoppedError = null, rejectStopped;
+  let stoppedError = null, rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   function error(code, message) { try { fail(code, message); } catch (value) { return value; } }
   function stop(reason) {
     if (stoppedError) return;
     stoppedError = reason; rejectStopped(reason);
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const record of records) record.disposed = true;
     pendingGroups = []; resourceGroups.clear(); pipelineEntries.clear(); bufferUsages.clear();
     records.clear(); for (const arena of arenas.values()) arena.dispose(); arenas.clear();
   }
   function live() { if (stoppedError) throw stoppedError; }
-  lost.then(info => stop(error('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost')), stop).catch(() => {});
+  releaseDeviceLoss = subscribeGpuDeviceLoss(lost,
+    info => stop(error('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost')), stop);
   function arenaAt(index) {
     live();
     let arena = arenas.get(index);

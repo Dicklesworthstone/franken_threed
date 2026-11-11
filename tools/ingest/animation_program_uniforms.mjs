@@ -9,6 +9,8 @@
  * frame's submission. Stable page/group/offset choices remain bundle-cacheable.
  * A tight byte budget may admit fewer than maxDraws; stage fails, never truncates.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export function createProgramUniformArena(device, {maxDraws, label, fail, scoped, lost = device.lost, maxBytes = 64 * 1024 * 1024}) {
   const limit = message => fail('ANIMATION_RENDER_LIMIT', message);
   const alignment = device.limits.minUniformBufferOffsetAlignment ?? 256;
@@ -22,7 +24,7 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
     limit('Invalid program uniform arena capacity or alignment');
   const pages = [], resources = new Set(), bindings = new Map();
   let allocatedBytes = 0, draws = 0, stoppedError = null, serial = Promise.resolve(), rejectStopped;
-  let registering = 0, validation = Promise.resolve();
+  let registering = 0, validation = Promise.resolve(), releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   function error(code, message) { try { fail(code, message); } catch (e) { return e; } }
   function live() { if (stoppedError) throw stoppedError; }
@@ -34,11 +36,13 @@ export function createProgramUniformArena(device, {maxDraws, label, fail, scoped
   function stop(reason) {
     if (stoppedError) return;
     stoppedError = reason;
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     rejectStopped(reason);
     pages.length = 0; bindings.clear();
     for (const page of resources) destroy(page);
   }
-  lost.then(info => stop(error('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost')), stop).catch(() => {});
+  releaseDeviceLoss = subscribeGpuDeviceLoss(lost,
+    info => stop(error('ANIMATION_RENDER_LOST', info?.message || 'WebGPU device lost')), stop);
   function checkPacketSize(size) {
     live();
     if (!Number.isSafeInteger(size) || size < 4 || size % 4 || size > maximum)
