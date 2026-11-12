@@ -1323,8 +1323,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Before initialization, the source renderer prepares at its asynchronous
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
+      const request = {resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape?.sampleCount > 1)};
+      if (target && !this._shaderEncodedOutput && captureCameras) {
+        // Freeze the source descriptor at beginRender, not during compilation
+        // or after queued object/node updates. A clear establishes the same
+        // per-view policy without executing the scene lifecycle.
+        request.onBeginRender = () => {
+          request.resolveColor = this._targets.captureResolvePolicy(destination, {mipLevel, face});
+        };
+        if (clearOnly) request.onBeginRender();
+      }
       const nodeFrame = native && !nodeCaptureDeferred
-        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face, sortState, sceneLifecycle, canvasTarget, sourceCanvasOutput}) : null;
+        ? this._captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt, renderId, sourceTarget, mipLevel, face, sortState, sceneLifecycle, canvasTarget, sourceCanvasOutput, onBeginRender: request.onBeginRender}) : null;
       if (nodeFrame) matricesUpdated = true;
       if (nodeFrame?.sceneHierarchy) backgroundState = Object.freeze({...backgroundState,
         nativeSceneProfile: Object.freeze({key, shadows: this.shadowMap.enabled})});
@@ -1350,7 +1360,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       }
       // Captures already own source resource leases. Publish each additional
       // lease immediately so a later acquisition failure can release all of it.
-      const request = {snapshot, nodeFrame, materialFrame, pmremInput: pmremDraw ? pmremScope.input : null};
+      Object.assign(request, {snapshot, nodeFrame, materialFrame, pmremInput: pmremDraw ? pmremScope.input : null});
       try {
         if (passCameraRequired && overrideMaterial?.isShaderMaterial) {
           request.overrideSnapshot = this._passSnapshots.captureMaterial(overrideMaterial);
@@ -1698,7 +1708,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     }
     _captureNodeFrame({scene, camera, destination, overrideMaterial, captureCameras, mrt = this._mrt, outputTransform = null, renderId, sortState = null, sceneLifecycle = null,
       canvasTarget = this.getCanvasTarget(), sourceTarget = destination === this ? null : destination.target,
-      mipLevel = 0, face = 0, sourceFace = face, sourceCanvasOutput = false}) {
+      mipLevel = 0, face = 0, sourceFace = face, sourceCanvasOutput = false, onBeginRender = null}) {
       const target = destination === this ? null : destination.target;
       const stencilAttachment = target ? destination.shape.depthAttachment && destination.shape.depthFormat?.endsWith('-stencil8') === true : this.stencil;
       let sourceRaster = this._nodeRaster.get(stencilAttachment);
@@ -1740,7 +1750,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           clippingView: sceneLifecycle?.clippingView, renderRoot: scene, extraLights: sceneLifecycle?.extraLights,
           renderObjectFunction: sceneLifecycle?.begun ? sceneLifecycle.renderObjectFunction : undefined,
           bundles: this._nodeBundles ??= createThreeNodeBundles(THREE, {maxEntries: maxDraws, fail}),
-          bundleDepth,
+          bundleDepth, onBeginRender,
           getPrograms: () => this._nodeProgramSupport ??= createThreeNodePrograms({three: THREE, renderer: this, maxPrograms: maxBindings}),
           getTextures: () => this._getSampledTextureInputs(), getStorage: () => this._getStorageInputs(), destination: target,
           withFramebufferCopies: (record, run) => {
@@ -1835,7 +1845,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       return request.frame.operations ? request.frame.operations.run(() => this._submitFrame(request)) : this._submitFrame(request);
     }
     _submitFrame({scene, camera, frame, destination, mipLevel = 0, face = 0, generateCubeMipmaps = false, generateColorMipmaps = null, programFrame, programTextures, snapshot, overrideSnapshot, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, clearOnly, outputPass = false, initializeOutputDepth = null, canvasFrameToken = null,
-      webglSourceCamera = null, passCameraRequired = false,
+      webglSourceCamera = null, passCameraRequired = false, resolveColor = true,
       sourceTarget = destination === this ? null : destination.target, deferred = false}) {
       const cameraSafe = webglSourceCamera || programFrame?.toneMappingChunk !== undefined || programFrame?.uniformSnapshots
         ? materialFrame?.cameraSafe?.() : true;
@@ -1913,7 +1923,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             } : undefined;
             this._targets.render(destination, (attachments, framebuffer, depthbuffer) => destination._dispatcher.render({scene, camera, overrideMaterial, matricesUpdated, nodeFrame, backgroundState, materialFrame, sortState, onDrawCallbacks}, {...targetFrame, ...attachments}, framebuffer, depthbuffer),
               {mipLevel, face, generateMipmaps: generateCubeMipmaps, generateColorMipmaps: colorMipmaps,
-                resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape.sampleCount > 1)});
+                resolveColor});
             // Pinned Renderer tracks this per target, including color-only
             // manual clears; selecting another mip does not reset the flag.
             if (!this._shaderEncodedOutput && sourceDepth && (!destination.shape.sharedDepth || !clearOnly))

@@ -41,6 +41,10 @@ export async function createGpuThreeScene(device, scene, options) {
   await prepare();
   return {
     get disposed() { return disposed; }, failed: false, prepare,
+    assertNativePrepared(captured) {
+      if (disposed) throw Error('disposed bridge');
+      if (captured.draws.length) throw Error('target recorder requires an empty native draw capture');
+    },
     diagnostics: {sourceDraws: 1, drawCalls: 1, geometryCount: 1, geometryBytes: 12, instanceBytes: 0, deformationBytes: 0, rendererBytes: 16},
     render(camera, frame) {
       if (disposed) throw Error('disposed bridge');

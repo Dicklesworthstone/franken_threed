@@ -1311,6 +1311,29 @@ this run required none of that allowance. Six source-proof and ownership test
 groups also pass. These checks establish this addon execution path, not full
 simulation-family closure or hardware performance.
 
+## Multisampled target color resolution
+
+Native four-sample targets support `resolveColorBuffer = false`. Rendering and
+depth/stencil updates still use the multisampled attachments, while sampling,
+copies and readbacks retain the last resolved color image. Single-sample targets
+continue writing their color image directly. MRT applies the same selection to
+every color attachment; array layers retain independent selections.
+
+This follows pinned r186's descriptor cache: the first render or clear of a
+target view records whether the flag is exactly `true`. Changing it afterward
+does not alter that view until its residency is replaced by disposal or resize.
+A previously unused array layer establishes its own decision. Compilation and
+allocation alone do not select a policy. Scene-before hooks and sorting run
+before selection; object/node updates and deferred preparation cannot change
+an already accepted decision. Requested mip generation continues using the
+resolved color image, including when the current draw leaves it unchanged.
+
+The WebGL-authored route follows its separate source behavior: rendering resolves
+color regardless of this property, while manual clears keep the resolved image.
+Focused owner, scene-capture and public-facade tests cover descriptors, lifecycle,
+callback ordering, queued reads and actual pinned WebGPU descriptor comparisons.
+These recording-device checks do not establish browser pixels or performance.
+
 ## Native multiple-render-target mip chains
 
 Native 2D targets can render and sample mip chains on multiple

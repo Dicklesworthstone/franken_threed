@@ -164,3 +164,81 @@ test('target bindings retain externally owned ordinary texture bindings', () => 
   assert.equal(external.size, 1); external.delete(texture); assert.equal(bindings.has(texture), false);
   owner.dispose();
 });
+
+for (const resolveColorBuffer of [false, true, undefined, 0]) test(`native multisample color resolve uses the source strict flag: ${String(resolveColorBuffer)}`, async () => {
+  const {owner, target, calls} = fixture({flipY: false}); target.samples = 4; target.resolveColorBuffer = resolveColorBuffer;
+  const entry = owner.capture(target), bytes = owner.allocatedBytes;
+  assert.equal(bytes, 0, 'selection does not allocate or establish a pass');
+  owner.render(entry, frame => {
+    assert.equal(frame.colorView.texture.sampleCount, 4);
+    assert.equal(!!frame.resolveTarget, resolveColorBuffer === true);
+    assert.ok(frame.depthView, 'depth stays attached when color is unresolved');
+  });
+  assert.equal(calls.textures.length, 3, 'resolved, multisample and depth storage remain independently owned');
+  await owner.whenIdle(); owner.dispose();
+});
+
+test('native resolve decisions belong to initialized views and reset with target residency', () => {
+  const {owner, target, calls} = fixture({flipY: false}); target.samples = 4;
+  const entry = owner.capture(target); owner.ensure(entry);
+  target.resolveColorBuffer = false;
+  assert.equal(owner.captureResolvePolicy(entry), false, 'allocation alone does not freeze the flag');
+  target.resolveColorBuffer = true;
+  assert.equal(owner.capture(target), entry, 'the flag does not replace or invalidate color storage');
+  owner.render(entry, frame => assert.equal(frame.resolveTarget, undefined));
+  const old = calls.textures.slice(); target.dispose();
+  assert.ok(old.every(texture => texture.destroyed === 1));
+  const next = owner.capture(target);
+  owner.render(next, frame => assert.ok(frame.resolveTarget));
+  target.resolveColorBuffer = false;
+  owner.render(next, frame => assert.ok(frame.resolveTarget, 'a warm true descriptor remains resolved'));
+  target.setSize(8, 4);
+  owner.render(owner.capture(target), frame => assert.equal(frame.resolveTarget, undefined));
+  owner.dispose();
+});
+
+test('native array layers retain independent first-use resolve policies without replacing attachments', () => {
+  const {owner, target, calls, device} = fixture({flipY: false});
+  device.limits.maxTextureArrayLayers = 16;
+  target.samples = 4; target.depth = 3;
+  target.texture.image = {width: target.width, height: target.height, depth: 3};
+  const entry = owner.capture(target);
+  target.resolveColorBuffer = false;
+  owner.render(entry, frame => assert.equal(frame.resolveTarget, undefined), {face: 0});
+  target.resolveColorBuffer = true;
+  owner.render(entry, frame => assert.ok(frame.resolveTarget), {face: 1});
+  const count = calls.textures.length;
+  owner.render(entry, frame => assert.equal(frame.resolveTarget, undefined), {face: 0});
+  owner.render(entry, frame => assert.ok(frame.resolveTarget), {face: 1});
+  assert.equal(calls.textures.length, count, 'revisiting a layer preserves native storage');
+  owner.dispose();
+});
+
+test('unresolved native MRT renders omit every color resolve and retain all MSAA attachments', () => {
+  const {owner, target, device} = fixture({flipY: false}); target.samples = 4; target.resolveColorBuffer = false;
+  Object.assign(device.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  const second = new T.Texture(); second.isRenderTargetTexture = true; second.renderTarget = target;
+  target.textures.push(second);
+  const entry = owner.capture(target);
+  owner.render(entry, frame => {
+    assert.equal(frame.colorViews.length, 2);
+    assert.ok(frame.colorViews.every(view => view.texture.sampleCount === 4));
+    assert.equal(frame.resolveTarget, undefined); assert.equal(frame.resolveTargets, undefined);
+    assert.ok(frame.depthView);
+  });
+  owner.dispose();
+});
+
+test('WebGL ignores resolveColorBuffer while explicit clear-only suppression preserves sampled color', () => {
+  const {owner, target, calls} = fixture(); target.samples = 4; target.resolveColorBuffer = false;
+  const entry = owner.capture(target), bindings = owner.bindingsFor();
+  owner.render(entry, frame => assert.ok(frame.resolveTarget));
+  bindings.get(target.texture); const copies = entry.copies, submissions = calls.submissions.length;
+  owner.render(entry, frame => assert.equal(frame.resolveTarget, undefined), {resolveColor: false});
+  bindings.get(target.texture);
+  assert.equal(entry.copies, copies, 'an unresolved multisample clear leaves the resolved sampling image current');
+  assert.equal(calls.submissions.length, submissions);
+  owner.render(entry, frame => assert.ok(frame.resolveTarget));
+  bindings.get(target.texture); assert.equal(entry.copies, copies + 1);
+  owner.dispose();
+});

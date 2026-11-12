@@ -157,7 +157,6 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   if (target.stencilBuffer && !target.depthBuffer)
     fail('UNSUPPORTED', 'Source stencil targets require depthBuffer');
   if (![0, 1, 4].includes(target.samples)) fail('UNSUPPORTED', 'Target samples must be zero, one or four');
-  if (target.samples === 4 && target.resolveColorBuffer === false) fail('UNSUPPORTED', 'MSAA targets must resolve their color');
   const float32 = three.FloatType !== undefined && texture.type === three.FloatType;
   const halfFloat = three.HalfFloatType !== undefined && texture.type === three.HalfFloatType;
   const floatChannels = texture.format === three.RGBAFormat ? 'rgba'
@@ -628,7 +627,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const depthEntry = shape.sharedDepth ? capture(shape.depthOwner) : null;
     if (allEntries().size >= maxTargets) fail('BUDGET', 'Render target count exceeds maxTargets');
     const entry = {target, shape, alive: true, released: false, busy: false, charged: 0, storage: null, sample: null,
-      references: 0, programLeaseEpoch: 0, sourceShape: null, retirement: null, cubeInitialized: false,
+      references: 0, programLeaseEpoch: 0, sourceShape: null, retirement: null, cubeInitialized: false, resolvePolicies: new Map(),
       cubeMipReady: !shape.webglCube || shape.mipLevelCount === 1 || shape.generateMipmaps || shape.authoredMipLevelCount === shape.mipLevelCount,
       dirty: true, copies: 0, colorSamples: new Map(), retiredSamples: new Set(), depthDirty: true, depthCopies: 0, depthSample: null, error: null, lifetime: new AbortController(), validation: Promise.resolve(), _wanted: new Map(), _dispatcher: null};
     entry.onDispose = event => sourceDisposed(entry, event);
@@ -732,6 +731,19 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     if (entry.storage?.failed) fail('GPU', 'Native target storage failed');
     if (entry.depthEntry) assertCurrent(entry.depthEntry);
     return entry;
+  }
+  // Native WebGPU caches a render-pass descriptor per target color selection,
+  // face/layer and mip. Its resolve flag is read at first beginRender/clear,
+  // after scene sorting and before object/node hooks. Allocation or compilation
+  // does not initialize that decision. Each history entry already identifies
+  // one ordered physical color selection; residency replacement resets its map.
+  // The classic WebGL renderer instead always resolves its render() colors.
+  function captureResolvePolicy(entry, {mipLevel = 0, face = 0} = {}) {
+    assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
+    if (flipY || entry.shape.sampleCount === 1) return true;
+    const key = `${face}/${mipLevel}`;
+    if (!entry.resolvePolicies.has(key)) entry.resolvePolicies.set(key, entry.target.resolveColorBuffer === true);
+    return entry.resolvePolicies.get(key);
   }
   function budget(bytes) {
     if (bytes > maxBytes - allocatedBytes) fail('BUDGET', 'Render targets exceed their shared byte budget');
@@ -1332,7 +1344,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     }
   }
   return {
-    capture, ensure, assertCurrent, bindingsFor, retainGeneration, registerNativePass,
+    capture, ensure, assertCurrent, bindingsFor, retainGeneration, registerNativePass, captureResolvePolicy,
     // Raw transfers need ownership without admitting a sampled/filtering use.
     // This also resolves constructors that leave the public owner pointer null.
     getTextureTarget(texture) { live(); return textureTarget(texture); },
@@ -1567,7 +1579,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     },
     copyDepth(source, destination, options = {}) { return copyTarget(source, destination, options, true); },
     get allocatedBytes() { return allocatedBytes; }, get size() { return allEntries().size; },
-    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null, resolveColor = true} = {}) {
+    render(entry, callback, {mipLevel = 0, face = 0, generateMipmaps = false, generateColorMipmaps = null, resolveColor = captureResolvePolicy(entry, {mipLevel, face})} = {}) {
       assertCurrent(entry); inspectThreeRenderTargetMip(entry.shape, mipLevel, face);
       if (typeof resolveColor !== 'boolean') fail('OPTIONS', 'Color resolution requires a captured boolean');
       if (generateColorMipmaps !== null && (!Array.isArray(generateColorMipmaps) ||
@@ -1601,8 +1613,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         const result = withFrame((frame, texture, handles) => {
           if (group) group.frame = {handles, writes: new Set(entry.shape.textures), depthAttachment: entry.shape.depthAttachment};
           try {
-            // WebGL clear() changes its multisample renderbuffers, but only a
-            // render() resolves them. Leave the last sampled colors intact.
+            // Native source descriptors can retain unresolved MSAA colors;
+            // WebGL clear() also leaves the last resolved colors intact.
             if (!resolveColor) {
               const {resolveTarget, resolveTargets, ...unresolved} = frame;
               frame = unresolved;

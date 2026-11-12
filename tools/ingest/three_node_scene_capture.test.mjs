@@ -945,3 +945,44 @@ test('ordinary Physical sheen and AO compose on the native route without authore
   assert.match(captured.bindings[0].nodeProgram.fragment, /AmbientOcclusion/);
   assert.equal(material.colorNode, undefined); assert.equal(material.aoNode, undefined);
 });
+
+test('native pass attachments are selected after sorting and before object and node updates', t => {
+  const f = rig(t), events = [], material = f.material();
+  let resolveColor = true, capturedResolve;
+  material.colorNode = N.uniform(.25).onObjectUpdate(() => { events.push('node'); return .25; });
+  const a = f.mesh(material), b = f.mesh(material);
+  for (const object of [a, b]) object.onBeforeRender = () => { events.push('object'); resolveColor = true; };
+  f.renderer._opaqueSort = (a, b) => { events.push('sort'); resolveColor = false; return a.id - b.id; };
+  const captured = f.capture({bundles: f.bundles, onBeginRender() {
+    events.push('begin'); capturedResolve = resolveColor;
+  }});
+  const begin = events.indexOf('begin');
+  assert.ok(begin > 0 && events.slice(0, begin).every(event => event === 'sort'));
+  assert.deepEqual(events.slice(begin), ['begin', 'object', 'node', 'object', 'node']);
+  assert.equal(capturedResolve, false); assert.equal(resolveColor, true);
+  assert.deepEqual(captured.draws.map(draw => draw.object), [a, b]);
+  for (const lease of captured.bundleGeometries) lease.release();
+});
+
+test('empty, hidden, fixed and disabled native passes begin once after matrix updates', t => {
+  for (const mode of ['empty', 'hidden', 'fixed', 'disabled']) {
+    const f = rig(t); let calls = 0;
+    if (mode === 'hidden') f.mesh().visible = false;
+    else if (mode === 'fixed') f.mesh(new THREE.MeshBasicMaterial());
+    else if (mode === 'disabled') f.mesh();
+    const captured = f.capture({bundles: f.bundles,
+      ...(mode === 'disabled' ? {renderLists: {opaque: false, transparent: false}} : {}),
+      onBeginRender() { calls++; assert.equal(f.camera.matrixWorld.elements[14], 5); }});
+    assert.equal(calls, 1); assert.equal(captured.draws.length, 0);
+    for (const lease of captured.bundleGeometries) lease.release();
+  }
+});
+
+test('compile-only native preparation leaves pass attachment selection uninitialized', t => {
+  for (const fixed of [false, true]) {
+    const f = rig(t); f.mesh(fixed ? new THREE.MeshBasicMaterial() : f.material());
+    const captured = f.capture({bundles: f.bundles, uniforms: false,
+      onBeginRender() { assert.fail('compilation must not create a render-pass descriptor'); }});
+    for (const lease of captured?.bundleGeometries ?? []) lease.release();
+  }
+});

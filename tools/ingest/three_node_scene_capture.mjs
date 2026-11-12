@@ -53,7 +53,7 @@ const litMaterial = material => material?.isMaterial === true && material.lights
 export function captureThreeNodeScene(three, root, camera, {getPrograms, renderer,
   overrideMaterial = null, maxNodes = 16384, maxDraws = 16384, uniforms = true,
   maxUniformBytes = 64 * 1024 * 1024, raster, getTextures, getStorage, destination = null, backgroundMesh = null,
-  withFramebufferCopies = null, renderLists = null, renderId = renderer?.info?.calls,
+  withFramebufferCopies = null, onBeginRender = null, renderLists = null, renderId = renderer?.info?.calls,
   bundles = null, bundleDepth = 0, sortState = null, matricesUpdated: sourceMatricesUpdated = false,
   sceneHooks = false, clippingView = null, renderRoot = root, extraLights = [],
   renderObjectFunction: selectedRenderObject = renderer?.getRenderObjectFunction?.() ?? null} = {}) {
@@ -624,7 +624,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {
-    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null) {
+    if (!objects.size && !nativeLights.size && !shadowPass && !lodCaptured && !sceneEnvironmentNode && !sceneFogNode && renderLists === null && (!uniforms || onBeginRender === null)) {
       rememberFixedAttributes(); return null;
     }
     phases.opaque = listEnabled('opaque'); phases.transparent = listEnabled('transparent'); phases.output = phases.opaque;
@@ -632,6 +632,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // including an empty pass. Hidden skins still participate in CPU animation.
     updateMatrices();
     if (!sourceMatricesUpdated) updateThreeCameraProjection(three, renderer, camera);
+    if (uniforms) onBeginRender?.();
     // An exclusion-only capture still owns its source visibility. In particular,
     // a later visible=true cannot send an accepted hidden mesh to the fixed path.
     if (uniforms) for (const selection of bundleSelections) if (!selection.warm) bundles.commit(selection, []);
@@ -1327,6 +1328,8 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   const capturedBundles = [];
   const capture = () => {
+    // The backend fixes pass attachments after sorting, before any draw updates.
+    if (uniforms) onBeginRender?.();
     // Source bundles update before the ordinary lists, while the backend
     // executes their recorded GPU commands after the ordinary scene draws.
     // Warm records retain physical draw order and ignore current list flags.
