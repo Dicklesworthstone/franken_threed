@@ -26,6 +26,10 @@
  * A draw may override uvTransform; baseColor * vertexColor * sampledColor is
  * evaluated BEFORE alpha masking/blending. Plain meshes need no texture.
  * renderer.render({colorView, depthView, viewProjection, draws: [mesh, ...]});
+ * Frame storeOp/depthStoreOp/stencilStoreOp independently accept 'store'
+ * (default) or 'discard'; multisample color resolves still run when discarded.
+ * clearAttachmentsBeforeScissor:true uses full-attachment load-op clears.
+ * The default uses GL-style scissored clears when a rectangle is supplied.
  * With format:null the same draw/index/alpha-mask path writes only depth. A
  * depth attachment is required, color/resolve attachments are forbidden, and
  * materials must be unlit OPAQUE or MASK (no guessed BLEND shadow policy).
@@ -2590,11 +2594,14 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
           "viewProjection",
           "draws",
           "loadOp",
+          "storeOp",
           "depthLoadOp",
+          "depthStoreOp",
           "clearColor",
           "clearColors",
           "clearDepth",
-          "stencilLoadOp", "clearStencil",
+          "stencilLoadOp", "stencilStoreOp", "clearStencil",
+          "clearAttachmentsBeforeScissor",
           "viewport",
           "scissor",
           "lighting",
@@ -2620,11 +2627,15 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
         viewProjection,
         draws,
         loadOp = "clear",
+        storeOp = "store",
         depthLoadOp = "clear",
+        depthStoreOp = "store",
         clearColor = [0, 0, 0, 0],
         clearDepth = 1,
         stencilLoadOp = depthLoadOp,
+        stencilStoreOp = "store",
         clearStencil = 0,
+        clearAttachmentsBeforeScissor = false,
         viewport = null,
         scissor = null,
         lighting = null,
@@ -2656,10 +2667,15 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
         fail("ANIMATION_RENDER_ATTACHMENT", "Attachment configuration differs from pipeline");
       if (!["clear", "load"].includes(loadOp) || !["clear", "load"].includes(depthLoadOp))
         fail("ANIMATION_RENDER_ATTACHMENT", "Invalid load operation");
-      if (!stencilAttachment && (frame.stencilLoadOp !== undefined || frame.clearStencil !== undefined))
+      if (!["store", "discard"].includes(storeOp) || !["store", "discard"].includes(depthStoreOp))
+        fail("ANIMATION_RENDER_ATTACHMENT", "Invalid store operation");
+      if (typeof clearAttachmentsBeforeScissor !== "boolean")
+        fail("ANIMATION_RENDER_ATTACHMENT", "clearAttachmentsBeforeScissor must be boolean");
+      if (!stencilAttachment && (frame.stencilLoadOp !== undefined || frame.stencilStoreOp !== undefined || frame.clearStencil !== undefined))
         fail("ANIMATION_RENDER_ATTACHMENT", "Stencil controls require a depth-stencil attachment");
       if (stencilAttachment) {
         if (!["clear", "load"].includes(stencilLoadOp)) fail("ANIMATION_RENDER_ATTACHMENT", "Invalid stencil load operation");
+        if (!["store", "discard"].includes(stencilStoreOp)) fail("ANIMATION_RENDER_ATTACHMENT", "Invalid stencil store operation");
         integer(clearStencil, 0, 255, "clear stencil");
       }
       if (!colorTarget.integer) color(clearColor, format?.endsWith('float') === true);
@@ -3021,9 +3037,9 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
           frameLightGroup = cached.group;
         }
         const encoder = device.createCommandEncoder({ label });
-        // GL clears honor the scissor test; a WebGPU load-op clear covers the whole
-        // attachment. With a scissor, load and clear the rectangle with a draw.
-        const scissoredClear = scissor !== null &&
+        // GL clears honor the scissor test; native WebGPU load-op clears cover
+        // the whole attachment, even when later draws use a scissor rectangle.
+        const scissoredClear = !clearAttachmentsBeforeScissor && scissor !== null &&
           ((format !== null && loadOp === "clear") || (depthFormat && depthLoadOp === "clear") || (stencilAttachment && stencilLoadOp === "clear"));
         if (scissoredClear) {
           // Its own pass, ahead of the frame's, so no pass state leaks into draws.
@@ -3048,7 +3064,7 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
           colorAttachments: colorViews.map((view, index) => ({view,
             ...(depthSlice === undefined ? {} : {depthSlice}),
             ...(resolveTargets[index] ? {resolveTarget: resolveTargets[index]} : {}),
-            loadOp: scissoredClear ? "load" : loadOp, storeOp: "store",
+            loadOp: scissoredClear ? "load" : loadOp, storeOp,
             clearValue: {r: clearColors[index][0], g: clearColors[index][1], b: clearColors[index][2], a: clearColors[index][3]},
           })),
           ...(depthFormat
@@ -3056,9 +3072,9 @@ struct Out { ${[...colorTargets.map((target, index) => `@location(${index}) colo
                 depthStencilAttachment: {
                   view: depthView,
                   depthLoadOp: scissoredClear ? "load" : depthLoadOp,
-                  depthStoreOp: "store",
+                  depthStoreOp,
                   depthClearValue: clearDepth,
-                  ...(stencilAttachment ? {stencilLoadOp: scissoredClear ? "load" : stencilLoadOp, stencilStoreOp: "store", stencilClearValue: clearStencil} : {}),
+                  ...(stencilAttachment ? {stencilLoadOp: scissoredClear ? "load" : stencilLoadOp, stencilStoreOp, stencilClearValue: clearStencil} : {}),
                 },
               }
             : {}),

@@ -1323,15 +1323,51 @@ This follows pinned r186's descriptor cache: the first render or clear of a
 target view records whether the flag is exactly `true`. Changing it afterward
 does not alter that view until its residency is replaced by disposal or resize.
 A previously unused array layer establishes its own decision. Compilation and
-allocation alone do not select a policy. Scene-before hooks and sorting run
-before selection; object/node updates and deferred preparation cannot change
-an already accepted decision. Requested mip generation continues using the
+allocation alone do not select a policy. Ordinarily, scene-before hooks and sorting
+precede selection. A fresh depth-bearing target with automatic depth clearing
+disabled first selects its descriptor during the source's implicit depth clear,
+before scene hooks. Accepted initialization follows the target's disposal epoch,
+including queued array layers and sample-count changes. Object/node updates and
+deferred preparation cannot change an already accepted decision. Requested mip generation continues using the
 resolved color image, including when the current draw leaves it unchanged.
 
 The WebGL-authored route follows its separate source behavior: rendering resolves
 color regardless of this property, while manual clears keep the resolved image.
-Focused owner, scene-capture and public-facade tests cover descriptors, lifecycle,
-callback ordering, queued reads and actual pinned WebGPU descriptor comparisons.
+Native MSAA manual clears still begin and end a pass when no buffers are requested
+or the requested depth/stencil buffer is absent; they can resolve color and
+establish that view's descriptor.
+
+### Native multisample storage
+
+Native four-sample target renders honor the source's independent storage controls:
+
+| Source property set to exactly `false` | Attachment behavior |
+| --- | --- |
+| `storeMultisampledColorBuffer` | Clear every color attachment, resolve when selected, then discard multisample color |
+| `storeMultisampledDepthBuffer` | Clear and discard multisample depth |
+| `storeMultisampledStencilBuffer` | Clear and discard multisample stencil |
+
+The flags are read at each source begin-render boundary and captured with that
+accepted request, independently of the cached resolve selection. Returning a flag
+to its default resumes ordinary load/clear and store behavior without reallocating
+the target. Single-sample targets and the WebGL-authored route keep their existing
+policies. Manual native clears always store and ignore these render-only controls.
+
+Discard forces the corresponding clear even with `autoClear = false`. Its color
+value follows pinned Background/RenderContexts history: contexts share color by
+attachment layout, MRT identity and nested call depth, while manual clears have
+a separate context. Depth and stencil values retain their pre-scene-hook selection.
+Authored MRT clear colors remain per attachment. Native attachment clears cover
+the full attachment; the scissor rectangle constrains subsequent geometry.
+
+ArrayCamera view spans retain all attachments across implementation-only pass
+boundaries, then apply requested discards after the last view. Ordinary source
+framebuffer-copy boundaries still end and resume the source pass with its requested
+storage policy. Default-store frames gain no extra closing passes.
+
+Focused target-owner, scene-capture, facade, draw-encoder and native ArrayCamera
+tests cover lifecycle, callback ordering, queued reads, attachment operations and
+the actual pinned WebGPU backend, Background and RenderContexts implementations.
 These recording-device checks do not establish browser pixels or performance.
 
 ## Native multiple-render-target mip chains

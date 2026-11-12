@@ -451,6 +451,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._nodeBackgrounds = null;
       this._nodeBundles = null;
       this._nodeCaptureDepth = 0;
+      this._nativeRenderDepth = 0;
+      this._nativeClearColors = new Map();
       this._occlusionContext = null;
       this._occlusionContexts = new WeakMap();
       this._occlusionObjects = new WeakSet();
@@ -685,6 +687,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       dispose(() => this._passInstances.dispose());
       dispose(() => this._programUniformSnapshots.dispose());
       dispose(() => this._nodeBackgrounds?.dispose()); this._nodeBackgrounds = null;
+      this._nativeClearColors.clear();
       dispose(() => this._nodeProgramSupport?.dispose());
       this._nodeProgramSupport = null;
       dispose(() => this._programSupport?.dispose()); this._programSupport = null;
@@ -838,7 +841,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       const targetShape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
       const hasDepth = targetShape ? targetShape.depthAttachment && targetShape.depthFormat !== null : this.depth;
       const hasStencil = targetShape ? targetShape.depthAttachment && targetShape.depthFormat?.endsWith('-stencil8') : this.stencil;
-      if (!color && !(depth && hasDepth) && !(stencil && hasStencil)) return;
+      // Native MSAA clear still begins/ends a pass with no effective clears:
+      // it resolves the stored samples and establishes the descriptor policy.
+      if (!color && !(depth && hasDepth) && !(stencil && hasStencil) &&
+          (this._shaderEncodedOutput || !(targetShape?.sampleCount > 1))) return;
       this._clearScene ??= new THREE.Scene();
       this._clearCamera ??= new THREE.PerspectiveCamera();
       this._renderFrame(this._clearScene, this._clearCamera, {color, depth, stencil});
@@ -1096,6 +1102,35 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     getContext() { return this._initialized ? this.domElement.getContext('webgpu') : null; }
 
     // ---- frames ----
+    _captureNativeDepthInitialization(target, mipLevel, face, clearOnly) {
+      if (!target || target.depthBuffer !== true) return;
+      const entry = this._targets.capture(target), first = this._targets.markDepthInitialized(entry);
+      if (first && !clearOnly && (this.autoClear === false || this.autoClear === true && this.autoClearDepth === false)) {
+        // Source's first implicit clearDepth precedes scene hooks. Its empty
+        // pass already selects a resolve descriptor, even while GPU work queues.
+        this._targets.captureResolvePolicy(entry, {mipLevel, face});
+      }
+    }
+    _captureNativeClearColor(key, scene) {
+      let color = this._nativeClearColors.get(key);
+      if (!color) {
+        if (this._nativeClearColors.size >= maxBindings)
+          fail('LIMIT', 'Native clear-context capacity exceeded');
+        color = [0, 0, 0, 1];
+        this._nativeClearColors.set(key, color);
+      }
+      const background = scene.isScene === true && !scene.backgroundNode?.isNode &&
+        scene.background?.isColor ? scene.background : null;
+      // Source Background retains its render context's previous color when
+      // autoClear is off. A discard still clears to that retained value.
+      if (this.autoClear === true || background) {
+        const rgb = (background ?? this._clearColor).getRGB({});
+        const alpha = background ? 1 : this._clearAlpha, scale = this.alpha === true ? alpha : 1;
+        color = [rgb.r * scale, rgb.g * scale, rgb.b * scale, alpha];
+        this._nativeClearColors.set(key, color);
+      }
+      return color;
+    }
     _frame(scene, clearOnly = null, target = this._renderTarget, mipLevel = this._activeMipmapLevel,
       outputProfile = target ? null : this._captureOutputProfile(), rasterState = null) {
       const targetShape = target ? this._targets.capture(target).shape : null;
@@ -1188,6 +1223,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // private floating-point framebuffer immediately preceding this pass.
       if (outputProfile?.sourceCanvasOutput && frame.loadOp === 'load') frame.clearColor = [0, 0, 0, 0];
       if (target && !this._shaderEncodedOutput) {
+        frame.clearAttachmentsBeforeScissor = true;
         const context = inspectThreeMRT(THREE, this);
         // The source background overrides the ordinary primary clear before
         // MRT defaults are selected. Capture it now, before queued preparation
@@ -1254,8 +1290,17 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       sceneLifecycle = null, sourceCanvasOutput = false) {
       const target = this._renderTarget, mipLevel = this._activeMipmapLevel, face = this._activeCubeFace, mrt = this._mrt;
       const renderId = this.info.calls;
-      if (sceneLifecycle && this._initialized) this._beginSceneLifecycle(sceneLifecycle, {target, sourceTarget, renderId, sourceFace: face, sourceMip: mipLevel});
+      const previousNativeRenderDepth = this._nativeRenderDepth;
+      const nativeRender = !this._shaderEncodedOutput && !clearOnly && captureCameras;
+      const nativeRenderDepth = previousNativeRenderDepth + Number(nativeRender);
+      const nativeClearContextKey = nativeRender && target
+        ? `${target.textures.length}:${target.texture.format}:${target.texture.type}:${target.samples}:${target.depthBuffer}:${target.stencilBuffer}-${mrt?.id ?? 'default'}-${nativeRenderDepth}` : null;
+      const depthClearValue = this.getClearDepth(), stencilClearValue = this._clearStencil;
+      this._nativeRenderDepth = nativeRenderDepth;
       try {
+      if (!this._shaderEncodedOutput && captureCameras && this._initialized)
+        this._captureNativeDepthInitialization(target, mipLevel, face, clearOnly);
+      if (sceneLifecycle && this._initialized) this._beginSceneLifecycle(sceneLifecycle, {target, sourceTarget, renderId, sourceFace: face, sourceMip: mipLevel});
       const sceneReference = sceneLifecycle?.scene ?? scene;
       const overrideMaterial = sceneReference.isScene === true ? sceneReference.overrideMaterial : null;
       const passCameraRequired = this._shaderEncodedOutput && !clearOnly && captureCameras && requiresThreePassCamera(this);
@@ -1323,13 +1368,47 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Before initialization, the source renderer prepares at its asynchronous
       // boundary. Texture feature/layout admission needs the actual device.
       const nodeCaptureDeferred = native && !this._initialized;
-      const request = {resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape?.sampleCount > 1)};
+      const request = {frame, nativeRenderDepth, depthClearValue, stencilClearValue,
+        resolveColor: !(this._shaderEncodedOutput && clearOnly && destination.shape?.sampleCount > 1)};
       if (target && !this._shaderEncodedOutput && captureCameras) {
         // Freeze the source descriptor at beginRender, not during compilation
         // or after queued object/node updates. A clear establishes the same
         // per-view policy without executing the scene lifecycle.
         request.onBeginRender = () => {
           request.resolveColor = this._targets.captureResolvePolicy(destination, {mipLevel, face});
+          if (clearOnly || destination.shape.sampleCount === 1) return;
+          // Unlike the cached resolve descriptor, source store flags are live
+          // on every beginRender. Freeze them before object/node callbacks and
+          // deferred preparation; each discarded aspect starts with a clear.
+          const frame = request.frame;
+          const clearColor = this._captureNativeClearColor(nativeClearContextKey, sceneLifecycle?.backgroundScene ?? scene);
+          const discardColor = target.storeMultisampledColorBuffer === false;
+          frame.storeOp = discardColor ? 'discard' : 'store';
+          if (discardColor) {
+            frame.loadOp = 'clear';
+            frame.clearColor = clearColor.slice();
+            if (frame.clearColors) frame.clearColors = target.textures.map((texture, index) => {
+              const authored = mrt?.getClearColor(texture.name);
+              return authored ? [authored.r, authored.g, authored.b, authored.a]
+                : index === 0 ? clearColor.slice() : [0, 0, 0, 1];
+            });
+          }
+          if (destination.shape.depthAttachment && destination.shape.depthFormat !== null) {
+            const discardDepth = target.storeMultisampledDepthBuffer === false;
+            frame.depthStoreOp = discardDepth ? 'discard' : 'store';
+            if (discardDepth) {
+              frame.depthLoadOp = 'clear';
+              frame.clearDepth = request.depthClearValue;
+            }
+          }
+          if (frame.stencilLoadOp !== undefined) {
+            const discardStencil = target.storeMultisampledStencilBuffer === false;
+            frame.stencilStoreOp = discardStencil ? 'discard' : 'store';
+            if (discardStencil) {
+              frame.stencilLoadOp = 'clear';
+              frame.clearStencil = threeWebGPUStencilValue(request.stencilClearValue, fail) & 0xff;
+            }
+          }
         };
         if (clearOnly) request.onBeginRender();
       }
@@ -1442,7 +1521,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         }
         return request;
       } catch (error) { this._releaseRequest(request); throw error; }
-      } finally { this._restoreSceneLifecycle(sceneLifecycle); }
+      } finally {
+        this._restoreSceneLifecycle(sceneLifecycle);
+        this._nativeRenderDepth = previousNativeRenderDepth;
+      }
     }
     _updateNativeMatrices(scene, camera) {
       if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
@@ -2095,7 +2177,12 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           // ownership and native sky packets describe that same accepted frame.
           const pendingBefore = this._pending.length;
           let pendingAfterCapture = null;
+          const previousNativeRenderDepth = this._nativeRenderDepth;
+          this._nativeRenderDepth = request.nativeRenderDepth;
+          request.depthClearValue = this.getClearDepth(); request.stencilClearValue = this._clearStencil;
           try {
+            if (request.captureCameras)
+              this._captureNativeDepthInitialization(destination === this ? null : destination.target, request.mipLevel, request.face, request.clearOnly);
             if (request.sceneLifecycle) this._beginSceneLifecycle(request.sceneLifecycle, {
               target: destination === this ? null : destination.target,
               sourceTarget: request.sourceTarget, renderId: request.renderId,
@@ -2136,6 +2223,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             }
             request.materialFrame = this._captureMaterialFrame(request);
             this._restoreSceneLifecycle(request.sceneLifecycle);
+            this._nativeRenderDepth = previousNativeRenderDepth;
             pendingAfterCapture = this._pending.length;
             try { this._finishSceneLifecycle(request.sceneLifecycle); }
             catch (error) { this._pending.push({sceneHookFailure: error}); }
@@ -2143,6 +2231,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             request.nodeCaptureFailure = {error};
           } finally {
             this._restoreSceneLifecycle(request.sceneLifecycle);
+            this._nativeRenderDepth = previousNativeRenderDepth;
             request.nodeCaptureDeferred = false;
             const parent = this._pending.indexOf(request);
             if (parent !== -1 && this._pending.length > pendingBefore) {

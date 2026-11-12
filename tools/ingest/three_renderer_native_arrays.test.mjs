@@ -105,7 +105,7 @@ test('native views preserve source side-major order and parent callback/NodeFram
   assert.equal(f.renderer.info.render.drawCalls, 4); assert.equal(f.acquired(), 1);
 });
 
-test('native and fixed objects share parent-layer sorting and union culling before child filtering', async t => {
+test('node and built-in materials share parent-layer sorting and union culling before child filtering', async t => {
   const f = fixture(t); f.camera.position.x = 1000; f.camera.layers.enable(1); f.camera.layers.enable(2);
   for (const [index, child] of f.camera.cameras.entries()) {
     child.position.set(index ? 8 : -8, 0, 4); child.lookAt(index ? 8 : -8, 0, 0); child.updateMatrixWorld(); child.layers.set(1);
@@ -115,9 +115,11 @@ test('native and fixed objects share parent-layer sorting and union culling befo
   const right = f.mesh('fixed', new T.MeshBasicMaterial({color: 0xff0000})); right.position.x = 8; right.layers.set(2); right.renderOrder = 2;
   const excluded = f.mesh('parent excluded'); excluded.position.x = 8; excluded.layers.set(3);
   f.mesh('culled').position.x = 100;
+  // Ordinary built-in materials now use the pinned node-library conversion.
+  assert.equal(f.renderer.library.getMaterialNodeClass(right.material.type), T.MeshBasicNodeMaterial);
   await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
-  assert.deepEqual(indices(f.device), [0, 1]);
-  assert.deepEqual(draws(f.device).map(draw => draw.pipeline.vertex.entryPoint), ['main', 'main', 'vertex_main']);
+  assert.deepEqual(indices(f.device), [0, 1, 1]);
+  assert.deepEqual(draws(f.device).map(draw => draw.pipeline.vertex.entryPoint), ['main', 'main', 'main']);
   assert.deepEqual(viewports(f.device), [[0, 0, 30, 40, 0, 1], [30, 0, 30, 40, 0, 1], [30, 0, 30, 40, 0, 1]]);
 });
 
@@ -230,4 +232,97 @@ test('XR, multiview, nested arrays and cold bundle child viewports keep explicit
     assert.equal(updates, kind === 'bundle' ? 1 : 0);
     assert.equal(f.acquired(), 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
   }
+});
+
+test('native array views retain multisample attachments until the source pass finishes', async t => {
+  const f = fixture(t), target = new T.RenderTarget(60, 40, {samples: 4, stencilBuffer: true});
+  t.after(() => target.dispose());
+  target.storeMultisampledColorBuffer = target.storeMultisampledDepthBuffer = target.storeMultisampledStencilBuffer = false;
+  f.renderer.setRenderTarget(target); f.renderer.autoClear = false;
+  f.renderer.setClearDepth(.25); f.renderer.setClearStencil(5);
+  f.scene.background = new T.Color(.125, .25, .5); f.mesh();
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const passes = f.device.passes;
+  assert.equal(passes.length, 4, 'one clear, two view draws, and the final discard');
+  assert.deepEqual(passes.map(pass => pass.draws.filter(draw => draw.streams.has(0)).length), [0, 1, 1, 0]);
+  const stores = pass => [pass.desc.colorAttachments[0].storeOp,
+    pass.desc.depthStencilAttachment.depthStoreOp, pass.desc.depthStencilAttachment.stencilStoreOp];
+  assert.deepEqual(passes.map(stores), [
+    ['store', 'store', 'store'], ['store', 'store', 'store'], ['store', 'store', 'store'],
+    ['discard', 'discard', 'discard'],
+  ]);
+  const first = passes[0].desc;
+  assert.equal(first.colorAttachments[0].loadOp, 'clear');
+  assert.deepEqual(first.colorAttachments[0].clearValue, {r: .125, g: .25, b: .5, a: 1});
+  assert.equal(first.depthStencilAttachment.depthLoadOp, 'clear');
+  assert.equal(first.depthStencilAttachment.depthClearValue, .25);
+  assert.equal(first.depthStencilAttachment.stencilLoadOp, 'clear');
+  assert.equal(first.depthStencilAttachment.stencilClearValue, 5);
+  for (const pass of passes.slice(1)) {
+    assert.equal(pass.desc.colorAttachments[0].loadOp, 'load');
+    assert.equal(pass.desc.depthStencilAttachment.depthLoadOp, 'load');
+    assert.equal(pass.desc.depthStencilAttachment.stencilLoadOp, 'load');
+  }
+  assert.ok(first.colorAttachments[0].resolveTarget);
+  assert.ok(passes.every(pass => pass.desc.colorAttachments[0].resolveTarget === first.colorAttachments[0].resolveTarget));
+  assert.deepEqual(indices(f.device), [0, 1]);
+  assert.equal(f.renderer.info.render.drawCalls, 2);
+});
+
+test('fully filtered native arrays discard once and default stores add no final pass', async t => {
+  const f = fixture(t), target = new T.RenderTarget(60, 40, {samples: 4, stencilBuffer: true});
+  t.after(() => target.dispose());
+  target.storeMultisampledColorBuffer = false;
+  f.renderer.setRenderTarget(target); f.renderer.autoClear = false;
+  f.mesh().frustumCulled = false;
+  for (const child of f.camera.cameras) child.layers.set(7);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(f.device.passes.length, 2);
+  assert.deepEqual(f.device.passes.map(pass => pass.desc.colorAttachments[0].storeOp), ['store', 'discard']);
+  assert.ok(f.device.passes.every(pass => pass.desc.depthStencilAttachment.depthStoreOp === 'store' &&
+    pass.desc.depthStencilAttachment.stencilStoreOp === 'store'));
+  assert.equal(native(f.device).length, 0);
+  target.storeMultisampledColorBuffer = true;
+  const before = f.device.passes.length;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const resumed = f.device.passes.slice(before);
+  assert.equal(resumed.length, 1, 'default-store empty views retain the existing single clear/load pass');
+  assert.equal(resumed[0].desc.colorAttachments[0].loadOp, 'load');
+  assert.equal(resumed[0].desc.colorAttachments[0].storeOp, 'store');
+  assert.equal(f.renderer.info.render.drawCalls, 0);
+});
+
+test('array view retention respects every ordinary source framebuffer-copy discard boundary', async t => {
+  const f = fixture(t), target = new T.RenderTarget(60, 40, {samples: 4, stencilBuffer: true});
+  t.after(() => target.dispose());
+  target.storeMultisampledColorBuffer = target.storeMultisampledDepthBuffer = target.storeMultisampledStencilBuffer = false;
+  f.renderer.setRenderTarget(target); f.renderer.autoClear = false;
+  const first = f.mesh('prefix'), second = f.mesh('copy consumer');
+  first.renderOrder = 1; second.renderOrder = 2;
+  const textures = [new T.FramebufferTexture(60, 40), new T.FramebufferTexture(60, 40)];
+  t.after(() => { for (const texture of textures) texture.dispose(); });
+  second.material.colorNode = N.uniform(.5).onObjectUpdate(({renderer}) => {
+    for (const texture of textures) renderer.copyFramebufferToTexture(texture);
+    return .5;
+  });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(f.events.filter(event => event.copy || event.draw.streams.has(0)).map(event => event.copy ? 'copy' : 'draw'),
+    ['draw', 'draw', 'copy', 'copy', 'draw', 'draw']);
+  assert.deepEqual(indices(f.device), [0, 1, 0, 1]);
+  assert.equal(f.device.passes.length, 8);
+  assert.deepEqual(f.device.passes.map(pass => pass.desc.colorAttachments[0].storeOp),
+    ['store', 'store', 'store', 'discard', 'discard', 'store', 'store', 'discard']);
+  for (const pass of f.device.passes) {
+    assert.equal(pass.desc.depthStencilAttachment.depthStoreOp, pass.desc.colorAttachments[0].storeOp);
+    assert.equal(pass.desc.depthStencilAttachment.stencilStoreOp, pass.desc.colorAttachments[0].storeOp);
+  }
+  assert.ok(f.device.passes.slice(1).every(pass => pass.desc.colorAttachments[0].loadOp === 'load' &&
+    pass.desc.depthStencilAttachment.depthLoadOp === 'load' && pass.desc.depthStencilAttachment.stencilLoadOp === 'load'));
+  target.storeMultisampledColorBuffer = target.storeMultisampledDepthBuffer = target.storeMultisampledStencilBuffer = true;
+  const before = f.device.passes.length;
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const resumed = f.device.passes.slice(before);
+  assert.equal(resumed.length, 5, 'default-store source copies add no closing passes between views');
+  assert.ok(resumed.every(pass => pass.desc.colorAttachments[0].storeOp === 'store' &&
+    pass.desc.depthStencilAttachment.depthStoreOp === 'store' && pass.desc.depthStencilAttachment.stencilStoreOp === 'store'));
 });

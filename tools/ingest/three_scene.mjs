@@ -2291,9 +2291,20 @@ export async function createGpuThreeScene(device,scene,{
         // One attachment clear precedes every view. A pass per ordered view span
         // keeps camera/lighting uniforms immutable until its immediate submit,
         // including overlapping viewports and transparent double-sided draws.
-        renderer.render({...prepared,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});backgroundSubmitted=true;live();
-        const loaded={...prepared,loadOp:'load',depthLoadOp:'load',...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})};
+        // These artificial boundaries share one source pass: retain multisample
+        // attachments until its final resolve, even if the source discards them.
+        const discardStores={},retainStores={};
+        for(const key of ['storeOp','depthStoreOp','stencilStoreOp'])if(prepared[key]==='discard'){
+          discardStores[key]='discard';retainStores[key]='store';
+        }
+        const discards=Object.keys(discardStores).length!==0;
+        renderer.render({...prepared,...retainStores,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});backgroundSubmitted=true;live();
+        const loaded={...prepared,...retainStores,loadOp:'load',depthLoadOp:'load',...(prepared.stencilLoadOp!==undefined?{stencilLoadOp:'load'}:{})};
         let activeViewport=frame.viewport??null,passes=renderer.colorPassCount??1,logical=0,calls=0,backgrounds=0,geometrySubmitted=false;
+        const finishPass=()=>{
+          renderer.render({...loaded,...discardStores,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});
+          passes+=renderer.colorPassCount??1;live();
+        };
         for(const view of arrayViews)if(view.background){
           activeViewport=view.viewport??activeViewport;
           if(activeViewport&&(activeViewport[2]===0||activeViewport[3]===0))continue;
@@ -2306,10 +2317,16 @@ export async function createGpuThreeScene(device,scene,{
           while(framebufferCopies[nextCopy]?.index===index){
             const source=typeof options.framebuffer==='function'?options.framebuffer():options.framebuffer;
             if(!source)fail('FRAME','Native framebuffer copies require the borrowed resolved color texture');
-            const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
-            for(const marker of framebufferCopies[nextCopy++].copies)
-              passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source,options.depthbuffer);
-            device.queue.submit([encoder.finish()]);live();
+            const copies=framebufferCopies[nextCopy++].copies;
+            const copy=markers=>{
+              const encoder=device.createCommandEncoder({label:'f3d-native-framebuffer-copy'});
+              for(const marker of markers)passNodeFrame.textureOwner.encodeFramebufferCopy(marker.lease,encoder,source,options.depthbuffer);
+              device.queue.submit([encoder.finish()]);live();
+            };
+            // Unlike the artificial view boundaries, each ordinary source copy
+            // ends its pass with the requested stores, then resumes with loads.
+            if(discards)for(const marker of copies){finishPass();copy([marker]);}
+            else copy(copies);
           }
         };
         for(let i=0;i<draws.length;){
@@ -2339,11 +2356,10 @@ export async function createGpuThreeScene(device,scene,{
           i+=repetitions;
         }
         copyAt(draws.length);
-        // The initial clear resolves before the background writes. If no view
-        // submits geometry afterwards, publish the final multisample image now.
-        if(backgrounds&&!geometrySubmitted&&prepared.resolveTarget){
-          renderer.render({...loaded,draws:[],...(occlusion?{occlusion:{session:occlusion,objects:[]}}:{})});passes+=renderer.colorPassCount??1;live();
-        }
+        // Apply source discards once all artificial view spans have finished.
+        // The initial clear resolves before background writes, so background-only
+        // frames still need the existing final resolve even without a discard.
+        if(discards||backgrounds&&!geometrySubmitted&&prepared.resolveTarget)finishPass();
         logicalDraws=logical;drawCalls=calls;sourceDraws=items.reduce((n,item)=>n+(item.nodeProgram?
           item.instanceCount===0||item.nodeIndirect?.skip?0:item.nodeViews?.length??1:arrayViews.filter(v=>sourceLayers(item.object,v.camera)).length),0);
         backgroundPasses=backgrounds;backgroundColorPasses=passes+backgrounds;

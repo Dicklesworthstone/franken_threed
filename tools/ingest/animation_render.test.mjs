@@ -157,6 +157,9 @@ function deviceSpy() {
             setScissorRect(...values) {
               pass.scissor = values;
             },
+            setStencilReference(value) {
+              (pass.stencilReferences ??= []).push(value);
+            },
             end() {
               pass.ended = true;
             },
@@ -1312,4 +1315,112 @@ test("lighting buffers count toward budgets and insufficient lighting capabiliti
   );
   assert.equal(limited.buffers.length, 1);
   other.dispose();
+});
+
+test("attachment store operations select independent aspects and retain MSAA resolves", async () => {
+  const d = deviceSpy(); Object.assign(d.limits, {maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32});
+  const r = await createGpuAnimationRenderer(d, {
+    colorFormats: ["rgba8unorm", "rgba16float"], depthFormat: "depth24plus-stencil8", sampleCount: 4,
+  });
+  const colorViews = [{color: 0}, {color: 1}], resolveTargets = [{resolve: 0}, {resolve: 1}];
+  const policies = [{}, {storeOp: "discard"}, {depthStoreOp: "discard"}, {stencilStoreOp: "discard"},
+    {storeOp: "discard", depthStoreOp: "discard", stencilStoreOp: "discard"}, {}];
+  for (const policy of policies) {
+    r.render(frame([], {colorView: colorViews[0], colorViews, resolveTarget: resolveTargets[0], resolveTargets,
+      loadOp: "load", depthLoadOp: "load", stencilLoadOp: "load", ...policy}));
+    const descriptor = d.passes.at(-1).descriptor;
+    assert.deepEqual(descriptor.colorAttachments.map(attachment => attachment.storeOp),
+      Array(2).fill(policy.storeOp ?? "store"));
+    assert.deepEqual(descriptor.colorAttachments.map(attachment => attachment.resolveTarget), resolveTargets);
+    assert.ok(descriptor.colorAttachments.every(attachment => attachment.loadOp === "load"));
+    assert.equal(descriptor.depthStencilAttachment.depthStoreOp, policy.depthStoreOp ?? "store");
+    assert.equal(descriptor.depthStencilAttachment.stencilStoreOp, policy.stencilStoreOp ?? "store");
+    assert.equal(descriptor.depthStencilAttachment.depthLoadOp, "load");
+    assert.equal(descriptor.depthStencilAttachment.stencilLoadOp, "load");
+  }
+  assert.equal(d.passes.length, policies.length);
+  await r.whenIdle(); r.dispose();
+});
+
+test("native attachment clears cover the attachment while geometry retains its scissor", async () => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d, {depthFormat: "depth24plus-stencil8", sampleCount: 4});
+  const mesh = await r.addMesh(gpu()), resolveTarget = {};
+  const viewport = [1, 2, 30, 40, 0, 1], scissor = [4, 5, 6, 7];
+  const policies = [
+    {loadOp: "clear", depthLoadOp: "load", stencilLoadOp: "clear"},
+    {loadOp: "load", depthLoadOp: "clear", stencilLoadOp: "load"},
+  ];
+  for (const policy of policies) r.render(frame([mesh], {
+    ...policy, resolveTarget, viewport, scissor, clearAttachmentsBeforeScissor: true,
+    clearColor: [.1, .2, .3, 1], clearDepth: .25, clearStencil: 5,
+    storeOp: "discard", depthStoreOp: "discard", stencilStoreOp: "discard",
+  }));
+  assert.equal(d.passes.length, policies.length, "native clears require no rectangle-clear pass");
+  for (const [index, pass] of d.passes.entries()) {
+    const color = pass.descriptor.colorAttachments[0], depth = pass.descriptor.depthStencilAttachment;
+    assert.equal(color.loadOp, policies[index].loadOp);
+    assert.equal(depth.depthLoadOp, policies[index].depthLoadOp);
+    assert.equal(depth.stencilLoadOp, policies[index].stencilLoadOp);
+    assert.equal(color.storeOp, "discard");
+    assert.equal(depth.depthStoreOp, "discard");
+    assert.equal(depth.stencilStoreOp, "discard");
+    assert.deepEqual(color.clearValue, {r: .1, g: .2, b: .3, a: 1});
+    assert.equal(depth.depthClearValue, .25);
+    assert.equal(depth.stencilClearValue, 5);
+    assert.equal(color.resolveTarget, resolveTarget);
+    assert.deepEqual(pass.viewport, viewport);
+    assert.deepEqual(pass.scissor, scissor);
+    assert.equal(pass.draws.length, 1, "only the requested geometry is drawn");
+  }
+  assert.ok(d.buffers.every(buffer => !buffer.label?.endsWith("/scissor-clear")));
+  await r.whenIdle(); r.dispose();
+});
+
+test("scissor-clear prefixes store every attachment before the final pass discards it", async () => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d, {depthFormat: "depth24plus-stencil8", sampleCount: 4});
+  const resolveTarget = {};
+  r.render(frame([], {resolveTarget, scissor: [4, 5, 6, 7], clearStencil: 5,
+    storeOp: "discard", depthStoreOp: "discard", stencilStoreOp: "discard"}));
+  assert.equal(d.passes.length, 2);
+  const [clearPass, main] = d.passes;
+  assert.equal(clearPass.descriptor.colorAttachments[0].storeOp, "store");
+  assert.equal(clearPass.descriptor.depthStencilAttachment.depthStoreOp, "store");
+  assert.equal(clearPass.descriptor.depthStencilAttachment.stencilStoreOp, "store");
+  assert.equal(clearPass.descriptor.colorAttachments[0].resolveTarget, undefined);
+  assert.deepEqual(clearPass.scissor, [4, 5, 6, 7]);
+  assert.deepEqual(clearPass.stencilReferences, [5, 0]);
+  assert.equal(clearPass.draws.length, 1);
+  assert.equal(main.descriptor.colorAttachments[0].loadOp, "load");
+  assert.equal(main.descriptor.depthStencilAttachment.depthLoadOp, "load");
+  assert.equal(main.descriptor.depthStencilAttachment.stencilLoadOp, "load");
+  assert.equal(main.descriptor.colorAttachments[0].storeOp, "discard");
+  assert.equal(main.descriptor.depthStencilAttachment.depthStoreOp, "discard");
+  assert.equal(main.descriptor.depthStencilAttachment.stencilStoreOp, "discard");
+  assert.equal(main.descriptor.colorAttachments[0].resolveTarget, resolveTarget);
+  await r.whenIdle(); r.dispose();
+});
+
+test("invalid attachment store and scissor-clear controls fail before GPU effects", async () => {
+  const d = deviceSpy(), r = await createGpuAnimationRenderer(d, {depthFormat: "depth24plus-stencil8"});
+  const effects = () => [d.buffers.length, d.pipelines.length, d.writes.length, d.passes.length, d.submissions.length, r.version];
+  const before = effects();
+  for (const field of ["storeOp", "depthStoreOp", "stencilStoreOp"])
+    for (const value of [null, true, 1, "keep", ["discard"], {}]) {
+      assert.throws(() => r.render(frame([], {[field]: value})), code("ANIMATION_RENDER_ATTACHMENT"));
+      assert.deepEqual(effects(), before);
+    }
+  for (const value of [null, 1, "true", {}]) {
+    assert.throws(() => r.render(frame([], {clearAttachmentsBeforeScissor: value})), code("ANIMATION_RENDER_ATTACHMENT"));
+    assert.deepEqual(effects(), before);
+  }
+  r.render(frame([]));
+  assert.equal(r.version, 1);
+  await r.whenIdle(); r.dispose();
+  const depthOnly = deviceSpy(), renderer = await createGpuAnimationRenderer(depthOnly);
+  for (const stencilStoreOp of ["store", "discard"])
+    assert.throws(() => renderer.render(frame([], {stencilStoreOp})), code("ANIMATION_RENDER_ATTACHMENT"));
+  assert.equal(depthOnly.passes.length, 0);
+  assert.equal(depthOnly.writes.length, 0);
+  assert.equal(depthOnly.submissions.length, 0);
+  renderer.dispose();
 });

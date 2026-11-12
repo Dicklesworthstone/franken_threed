@@ -405,6 +405,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     fail('OPTIONS', 'Invalid target owner options');
   const entries = new Map(), pipelines = new Map(), preserved = new Set(), retiring = new Set(), nativeResizes = new WeakMap();
   const historyGroups = new Map(), historyEntries = new Set(), nativePasses = new WeakMap();
+  const depthInitialized = new WeakSet();
   // r186 cube and WebGL array target constructors replace their color texture
   // without assigning its renderTarget pointer. Register the exact identities
   // privately; native sampling must not patch that public ownership pointer or
@@ -486,6 +487,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   function retireHistory(group) { for (const entry of [...group.entries]) retire(entry); }
   function sourceDisposed(entry, event) {
+    if (event?.target === entry.target) depthInitialized.delete(entry.target);
     const resize = nativeResizes.get(entry.target);
     const matchesSize = resize && (resize.dynamic
       ? extent(entry.target.width) && extent(entry.target.height) &&
@@ -1345,6 +1347,14 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   }
   return {
     capture, ensure, assertCurrent, bindingsFor, retainGeneration, registerNativePass, captureResolvePolicy,
+    markDepthInitialized(entry) {
+      assertCurrent(entry);
+      // Source depth initialization belongs to the target's dispose epoch,
+      // independent of attachment replacements, queued draws and array layers.
+      const first = !depthInitialized.has(entry.target);
+      depthInitialized.add(entry.target);
+      return first;
+    },
     // Raw transfers need ownership without admitting a sampled/filtering use.
     // This also resolves constructors that leave the public owner pointer null.
     getTextureTarget(texture) { live(); return textureTarget(texture); },
