@@ -106,6 +106,93 @@ function recordCompute(device) {
   };
 }
 
+function materialExtension(t, f, family, registered) {
+  let setups = 0;
+  class NativeMaterial extends T[`Mesh${family}NodeMaterial`] {
+    setupDiffuseColor(builder) { setups++; super.setupDiffuseColor(builder); N.diffuseColor.rgb.mulAssign(.5); }
+  }
+  class SourceMaterial extends T[`Mesh${family}Material`] {
+    constructor() { super(); this.type = `RegisteredShadow${family}`; }
+  }
+  const material = registered ? new SourceMaterial() : new NativeMaterial();
+  if (registered) f.renderer.library.addMaterial(NativeMaterial, material.type);
+  material.colorNode = f.material.colorNode; f.receiver.material = material;
+  f.receiver.frustumCulled = false; f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  t.after(() => material.dispose());
+  return {material, setups: () => setups};
+}
+
+for (const family of ['Standard', 'Physical']) for (const registered of [false, true])
+test(`${family} shadow receiver extension keeps queued generations and caster identity (registered=${registered})`, async t => {
+  const f = fixture(t), extension = materialExtension(t, f, family, registered), events = [];
+  f.receiver.castShadow = true;
+  for (const kind of ['before', 'after']) f.receiver[kind === 'before' ? 'onBeforeShadow' : 'onAfterShadow'] = function(...args) {
+    assert.equal(this, f.receiver); assert.equal(args[0], f.renderer); assert.equal(args[1], f.receiver);
+    assert.equal(args[2], f.light.shadow.camera); assert.equal(args[3], f.light.shadow.camera);
+    assert.equal(args[4], f.receiver.geometry); assert.equal(args[5].isShadowPassMaterial, true);
+    events.push(kind);
+  };
+  await f.renderer.init();
+  f.camera.coordinateSystem = T.WebGPUCoordinateSystem; f.camera.updateProjectionMatrix();
+  f.camera.updateMatrixWorld(); f.scene.updateMatrixWorld();
+  const reference = () => {
+    const builder = new T.WGSLNodeBuilder(f.receiver, f.renderer);
+    builder.scene = f.scene; builder.camera = f.camera; builder.lightsNode = N.lights(f.scene.children.filter(object => object.isLight));
+    builder.build(); return builder;
+  };
+  // Source ShadowNode retains its expression after the first construction.
+  // Compare fresh builders that both consume that same retained graph.
+  reference(); const source = reference(); assert.match(source.fragmentShader, /texture_depth_2d/);
+  const sourceSetups = extension.setups(), colors = [[.5, .375, .25], [.625, .5, .375], [.75, .625, .5], [.875, .75, .625]];
+  for (let index = 0; index < 4; index++) {
+    f.light.shadow.mapSize.set(index === 0 ? 32 : 64, 16);
+    f.receiver.receiveShadow = index !== 2; extension.material.colorNode.value.setRGB(...colors[index]);
+    f.renderer._nodes.nodeFrame.frameId++; f.renderer.render(f.scene, f.camera);
+  }
+  extension.material.colorNode.value.setRGB(1, 0, 0); f.light.shadow.mapSize.set(128, 32);
+  await drain(f.renderer);
+  // The same custom material also participates in the depth pass. Its PBR
+  // shader distinguishes visible receivers from that source shadow override.
+  const receivers = receiverDraws(f.device).filter(draw => /fn D_GGX/.test(shader(draw)));
+  assert.equal(receivers.length, 4);
+  assert.equal(receivers[0].pipeline.vertex.module.code, source.vertexShader);
+  assert.equal(shader(receivers[0]), source.fragmentShader);
+  assert.deepEqual(receivers.map(draw => textureResources(draw).filter(view => view.texture.format?.startsWith('depth'))
+    .map(view => view.texture.width)), [[32], [64], [], [64]]);
+  assert.deepEqual(receivers.map(draw => /texture_depth_2d/.test(shader(draw))), [true, true, false, true]);
+  for (const [index, draw] of receivers.entries()) {
+    const values = uniformValues(draw);
+    assert.ok(values.some((_value, offset) => colors[index].every((value, component) => values[offset + component] === value)));
+  }
+  const shadows = [...targetPasses(f.device), ...targetPasses(f.device, 64, 16)].filter(pass => pass.draws.length);
+  assert.equal(shadows.length, 3); assert.ok(shadows.every(pass => pass.draws.length === 2),
+    'the custom receiver and its ordinary companion each cast into the shared source shadow map');
+  assert.deepEqual(events, ['before', 'after', 'before', 'after', 'before', 'after']);
+  assert.equal(extension.setups(), sourceSetups + 3, 'resizing keeps the graph; receiver-flag transitions reconstruct it');
+  assert.equal(f.receiver.material, extension.material); assert.equal(f.scene.overrideMaterial, null);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const registered of [false, true])
+test(`shadow extension compilation runs node callbacks without rendering shadow maps (registered=${registered})`, async t => {
+  const f = fixture(t), extension = materialExtension(t, f, 'Physical', registered), updates = [];
+  let casters = 0;
+  extension.material.colorNode.onObjectUpdate(frame => {
+    assert.equal(frame.renderer, f.renderer); assert.equal(frame.object, f.receiver);
+    assert.equal(frame.material, extension.material); assert.equal(frame.camera, f.camera);
+    updates.push(frame.renderer._isPreCompiling === true);
+  });
+  f.caster.onBeforeShadow = () => casters++;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(updates, [true]); assert.equal(casters, 0); assert.equal(targetPasses(f.device).length, 0);
+  assert.equal(f.device.submissions.length, 0); assert.equal(extension.setups(), 1);
+  f.renderer._nodes.nodeFrame.frameId++; f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(updates, [true, false]); assert.equal(casters, 1);
+  assert.equal(targetPasses(f.device).filter(pass => pass.draws.length).length, 1);
+  assert.equal(receiverDraws(f.device).length, 1); assert.equal(extension.setups(), 1);
+  assert.notEqual(f.renderer._isPreCompiling, true); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('pinned CSM renders source virtual cascade casters before their native receiver', async t => {
   const f = fixture(t), csm = new CSMShadowNode(f.light, {cascades: 3, maxFar: 20, lightMargin: 2});
   f.light.shadow.shadowNode = csm;

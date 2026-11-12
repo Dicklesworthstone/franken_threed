@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import * as SourceThree from '../../upstream/three.js/src/Three.WebGPU.js';
 import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
 import SourceRenderer from '../../upstream/three.js/src/renderers/common/Renderer.js';
 import {createThreeNodePrograms, hasThreeNativeMaterialExtension, threeNativeMaterialExtensionKey} from './three_node_program.mjs';
 
 const N = T.TSL;
-function fixture(t, options = {}) {
+function fixture(t, options = {}, Three = T) {
+  const T = Three, N = Three.TSL;
   const renderer = {library: new T.StandardNodeLibrary(), contextNode: N.context(),
     debug: {diagnostics: {keywords: false}, onNodeBuilderCreated: null}, depth: true, lighting: {enabled: true},
     shadowMap: {enabled: false, type: T.PCFShadowMap}, _currentSourceMaterial: null,
@@ -465,4 +467,68 @@ test(`${registered ? 'registered' : 'inherited'} transparent DoubleSide extensio
   material.forceSinglePass = false; material.dispose(); f.renderer.info.calls++;
   assert.equal(f.programs.diagnostics.programs, 0);
   assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, 2);
+});
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const enabled of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} extensions retain source ordinary scene fog with material.fog=${enabled}`, t => {
+  // Fog references and camera uniforms must share one source renderGroup. Use
+  // the actual source module graph throughout, including NodeManager's fog
+  // factory, so independent build/source singleton identities cannot reorder
+  // the reference layout and conceal a binding mismatch.
+  const T = SourceThree, f = fixture(t, {}, T), trace = [];
+  const Native = T[`Mesh${family}NodeMaterial`], Ordinary = T[`Mesh${family}Material`];
+  class Extension extends Native {
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push(['setup', this.fog, !!builder.fogNode]);
+      // Custom setup can consume the scene fog even when the ordinary output
+      // composition is disabled. NodeManager always supplies this entrance.
+      return super.setupOutput(builder, this.fog ? output : this.setupFog(builder, output));
+    }
+  }
+  class Application extends Ordinary {
+    constructor() { super(); this.type = 'FogApplication'; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'FogApplication');
+  const material = new (registered ? Application : Extension)(); material.fog = enabled;
+  const item = f.add(material), fog = new T.Fog(new T.Color(.125, .25, .5), 1.5, 8.5);
+  // Projection validation precedes the actual scene/light call-key snapshot.
+  f.programs.inspect(material, item.object, f.context(item)); f.scene.fog = fog;
+  const phase = label => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, `${label}: key and setup effects match source`);
+    equalShaders(descriptor, reference);
+    const sourcePacket = f.referenceDraw(item), packet = f.capture(item, descriptor);
+    assert.deepEqual(packet.uniforms, sourcePacket.uniforms, `${label}: exact source uniform bytes`);
+    return {reference, descriptor, packet, trace: expected};
+  };
+  const first = phase('cold'), saved = first.packet.uniforms.map(bytes => bytes.slice());
+  assert.ok(first.trace.some(event => Array.isArray(event) && event[0] === 'setup' && event[2] === true));
+  assert.match(first.descriptor.fragment, /smoothstep/);
+  assert.equal(phase('warm').descriptor, first.descriptor);
+  fog.color.setRGB(.75, .625, .875); fog.near = 2.5; fog.far = 10.5; f.renderer.info.calls++;
+  assert.equal(phase('live values').descriptor, first.descriptor);
+  assert.deepEqual(first.packet.uniforms, saved, 'accepted draws retain their earlier fog bytes');
+  f.scene.fog = new T.FogExp2(new T.Color(.25, .75, .5), .125);
+  assert.equal(phase('same-call replacement').descriptor, first.descriptor,
+    'the source scene/light call key retains its previously selected fog graph');
+  f.renderer.info.calls++;
+  const exponential = phase('next-call replacement');
+  assert.notEqual(exponential.descriptor, first.descriptor); assert.match(exponential.descriptor.fragment, /exp\(/);
+  f.renderer.lighting.enabled = false; f.renderer.info.calls++;
+  const unlit = phase('lighting disabled');
+  f.scene.fog = fog; f.renderer.info.calls++;
+  const unlitLinear = phase('fog change with lighting disabled');
+  assert.notEqual(unlitLinear.descriptor, unlit.descriptor, 'fog participates outside the source lighting branch');
+  material.fog = !enabled; f.renderer.info.calls++;
+  assert.equal(phase('material flag without invalidation').descriptor, unlitLinear.descriptor,
+    'a live material flag cannot replace its retained source construction');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const invalidated = phase('material flag invalidation'); assert.notEqual(invalidated.descriptor, unlitLinear.descriptor);
+  material.dispose(); f.renderer.info.calls++;
+  assert.notEqual(phase('disposed construction').descriptor, invalidated.descriptor);
+  f.scene.fog = null; f.renderer.info.calls++;
+  const removed = phase('removed fog'); assert.doesNotMatch(removed.descriptor.fragment, /smoothstep/);
+  assert.ok(removed.trace.some(event => Array.isArray(event) && event[0] === 'setup' && event[2] === false));
 });

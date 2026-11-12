@@ -82,6 +82,57 @@ test('custom node-material subclasses select source graphs without authored slot
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const registered of [false, true])
+test(`transparent lit material extensions retain queued source fog transitions (registered=${registered})`, async t => {
+  const f = fixture(t), materialColors = [[.25, .5, .75], [.625, .375, .125], [.75, .25, .5], [.5, .75, .25]],
+    fogColors = [[.1875, .3125, .4375], [.6875, .8125, .9375], [.125, .375, .625], [.875, .625, .375]],
+    opacity = [.3125, .5625, .8125, .4375];
+  let constructions = 0, setups = 0;
+  class NativeFogMaterial extends T.MeshStandardNodeMaterial {
+    constructor() { super(); constructions++; }
+    setupDiffuseColor(builder) { setups++; super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.mulAssign(.5); }
+  }
+  class SourceFogMaterial extends T.MeshStandardMaterial { constructor() { super(); this.type = 'SourceFogMaterial'; } }
+  const material = registered ? new SourceFogMaterial() : new NativeFogMaterial(), light = new T.AmbientLight(0xffffff, .375);
+  if (registered) f.renderer.library.addMaterial(NativeFogMaterial, 'SourceFogMaterial');
+  material.transparent = true; material.depthWrite = false; f.mesh.material = material; f.scene.add(light);
+  t.after(() => { material.dispose(); light.dispose(); });
+  const linear = new T.Fog(new T.Color(...fogColors[0]), 1.5, 8.5);
+  const exponential = new T.FogExp2(new T.Color(...fogColors[2]), .09375);
+  f.scene.fog = linear;
+  await f.renderer.init();
+  for (let index = 0; index < 4; index++) {
+    material.color.setRGB(...materialColors[index]); material.opacity = opacity[index];
+    if (index === 1) { linear.color.setRGB(...fogColors[1]); linear.near = 2.5; linear.far = 10.5; }
+    if (index === 2) f.scene.fog = exponential;
+    if (index === 3) { exponential.color.setRGB(...fogColors[3]); exponential.density = .21875; }
+    f.renderer.render(f.scene, f.camera);
+    assert.equal(setups, index < 2 ? 1 : 2,
+      'source fog values remain live; the new fog graph reconstructs the material on the next render call');
+    assert.equal(constructions, registered && index >= 2 ? 2 : 1,
+      'source conversion is retained until the fog graph changes, while a NodeMaterial keeps its own instance');
+  }
+  linear.color.setRGB(99, 99, 99); linear.near = linear.far = 99;
+  exponential.color.setRGB(99, 99, 99); exponential.density = 99;
+  material.color.setRGB(99, 99, 99); material.opacity = .0625;
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 4);
+  const fragments = actual.map(draw => draw.pipeline.fragment.module.code);
+  assert.equal(fragments[0], fragments[1]); assert.equal(fragments[2], fragments[3]);
+  assert.notEqual(fragments[0], fragments[2]);
+  for (const index of [0, 1]) assert.match(fragments[index], /smoothstep\(/);
+  for (const index of [2, 3]) assert.match(fragments[index], /exp\(/);
+  for (const [index, draw] of actual.entries()) {
+    assert.ok(hasColor(draw, materialColors[index])); assert.ok(hasColor(draw, fogColors[index]));
+    const values = blocks(draw).flat(); assert.ok(values.includes(opacity[index]));
+    for (const value of [[1.5, 8.5], [2.5, 10.5], [.09375], [.21875]][index]) assert.ok(values.includes(value));
+    assert.ok(draw.pipeline.fragment.targets[0].blend);
+    assert.equal(draw.pipeline.depthStencil.depthWriteEnabled, false);
+  }
+  assert.equal(setups, 2); assert.equal(constructions, registered ? 2 : 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('registered ordinary material extensions preserve conversion construction and original frame identity', async t => {
   const f = fixture(t), colors = [[.25, .5, .75], [.625, .375, .125]], updates = [];
   let constructions = 0, setups = 0;

@@ -1187,6 +1187,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     fogNodes.set(fog, {exponential, node});
     return node;
   }
+  function sceneFogNode(context) {
+    // NodeManager supplies the scene entrance to custom setup independently
+    // of the ordinary material.fog output switch and renderer lighting.
+    const material = {fog: true};
+    return fogGraph(material, context) || fogNodeFor(sourceFog(material, context));
+  }
   function inspect(material, object, context = {}, preparedPrototype = undefined) {
     live();
     const sourceMaterial = material;
@@ -1491,7 +1497,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
-        Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
+        Object.keys(object.geometry.morphAttributes).length || !extension && object.receiveShadow ||
         !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (geometrySetup ? ['lightsNode', 'contextNode'] : extension ? ['geometryNode', 'lightsNode', 'contextNode']
@@ -1500,7 +1506,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
           attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute || attribute.isStorageBufferAttribute) ||
-        !extension && context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode ||
+        !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
@@ -1534,9 +1540,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         const environmentNode = extension ? sceneEnvironmentNode(context.scene) : null;
         if (environmentNode) values.push(environmentNode.getCacheKey());
       }
+      const fogNode = extension ? sceneFogNode(context) : null;
+      if (fogNode) values.push(fogNode.getCacheKey());
       callKey.key = hashArray(values);
     }
-    const dynamic = hash(callKey.key, renderer.contextNode.id, renderer.contextNode.version);
+    const dynamic = hash(object.receiveShadow ? hash(callKey.key, 1) : callKey.key,
+      renderer.contextNode.id, renderer.contextNode.version);
     return {contextId, dynamic, chain, lightsNode, geometrySetup};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
@@ -1818,7 +1827,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       else if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
         ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
       if (environmentNode) builder.environmentNode = environmentNode;
-      builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
+      builder.fogNode = extension ? sceneFogNode(context)
+        : fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
       // Compute setup writes do not become graphics bindings.
       const computeChildren = new Set(), graphicsNodes = new Set(), generatedNodes = new Set(), addChain = builder.addChain;
       builder.addChain = function (node) {
@@ -2402,6 +2412,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
   }
   function checkFog(state, context) {
+    // Shared source render-object invalidation owns extension fog selection.
+    // Its retained builder still reads the previous fog within the same call,
+    // and material.fog changes require the source material invalidation.
+    if (state.sharedBuilder && materialExtension(state.material)) return;
     if (fogSignature(prepareMaterial(state.material, state.preparedPrototype), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, graph, kind or material enable flag changed; compile the graph again');
   }

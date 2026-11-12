@@ -36,9 +36,9 @@ select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
 profile covers rigid, opaque or transparent, single-output meshes with float attributes,
 ordinary material maps, analytic scene lights and ready material/scene
-environments. Standard and Physical subclasses retain inherited material
+environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
-Fog, shadow receivers, authored scene environment nodes, material lighting/context
+Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
 
@@ -67,6 +67,20 @@ Distinct material maps retain their own bindings while compatible shader builder
 can share source state. Material environments keep precedence over scene
 environments, and source PMREM selection and lifetime stay attached to their
 constructed graph. This adds no independent texture, light or environment owner.
+
+Ordinary scene fog reaches custom setup even when `material.fog` is false, and
+its source key participates when lighting is disabled. Live fog values update
+the source reference uniforms; same-call fog replacement and uninvalidated
+material flags retain the constructed graph until the source cache boundary.
+Queued draws preserve their accepted fog values.
+
+Custom Standard and Physical materials can both cast and receive source
+shadows. Receiver-flag changes participate in the dynamic construction key,
+while shadow-map resize retains the material graph and captures the correct
+image generation for each queued draw. The existing shadow owner preserves
+caster callbacks, source depth overrides and shared map lifetime. Compilation
+runs ordinary node callbacks while source shadow nodes skip rendering their
+maps; the following render reuses the prepared material graph.
 
 Transparent extensions use the existing source draw sorting, blending and queued
 uniform snapshots, including ordinary opaque companions. Double-sided materials
