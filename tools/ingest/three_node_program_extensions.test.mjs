@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
+import SourceRenderer from '../../upstream/three.js/src/renderers/common/Renderer.js';
 import {createThreeNodePrograms, hasThreeNativeMaterialExtension, threeNativeMaterialExtensionKey} from './three_node_program.mjs';
 
 const N = T.TSL;
@@ -29,24 +30,43 @@ function fixture(t, options = {}) {
     object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
     return {object, material};
   };
-  const context = item => ({...item, scene, camera, lights: lights.getLights(), sourceLightsNode: lights,
-    renderId: renderer.info.calls, frameId: renderer.info.calls});
-  const compile = item => programs.compile(item.material, item.object, context(item));
-  const capture = (item, descriptor = compile(item)) => programs.captureDraw(descriptor, context(item));
-  const referenceObject = item => source.get(item.object, item.material, scene, camera, lights, renderContext, null);
-  const reference = item => referenceObject(item).getNodeBuilderState();
-  const referenceDraw = item => {
-    const object = referenceObject(item);
+  const context = (item, options = {}) => ({...item, scene, camera, lights: lights.getLights(), sourceLightsNode: lights,
+    renderId: renderer.info.calls, frameId: renderer.info.calls, ...options});
+  const compile = (item, options) => programs.compile(item.material, item.object, context(item, options));
+  const capture = (item, descriptor = compile(item), options) => programs.captureDraw(descriptor, context(item, options));
+  const referenceObject = (item, options = {}) => source.get(item.object, item.material, scene, camera, lights, renderContext, null, options.passId);
+  const reference = (item, options) => referenceObject(item, options).getNodeBuilderState();
+  const referenceDraw = (item, options = {}) => {
+    const object = referenceObject(item, options);
     nodes.nodeFrame.frameId = nodes.nodeFrame.renderId = renderer.info.calls;
+    if (options.fullLifecycle) nodes.updateBefore(object);
     nodes.updateForRender(object);
     const bindings = object.getBindings().flatMap(group => group.bindings);
     const textures = bindings.filter(binding => binding.isSampledTexture).map(binding => binding.textureNode.value);
     const uniforms = bindings.filter(binding => binding.isUniformsGroup).map(binding => {
       binding.update(); return new Uint8Array(binding.buffer.buffer, binding.buffer.byteOffset, binding.buffer.byteLength).slice();
     });
+    if (options.fullLifecycle) nodes.updateAfter(object);
     return {textures, uniforms};
   };
-  return {renderer, programs, source, scene, camera, lights, add, context, compile, capture, reference, referenceDraw};
+  const passes = (item, run, compilation = false) => {
+    const previous = [renderer._handleObjectFunction, renderer._compilationPromises, renderer._currentRenderContext];
+    const results = [], queue = [], sidePass = item.material.transparent && item.material.side === T.DoubleSide && !item.material.forceSinglePass;
+    const invoke = work => run({object: work.object, material: work.material},
+      {passId: work.passId, sidePass, compilation, fullLifecycle: true});
+    renderer._currentRenderContext = renderContext;
+    renderer._compilationPromises = compilation ? queue : null;
+    renderer._handleObjectFunction = compilation ? SourceRenderer.prototype._createObjectPipeline :
+      (object, material, scene, camera, lightsNode, group, clippingContext, passId) => results.push(invoke({object, material, passId}));
+    try {
+      SourceRenderer.prototype.renderObject.call(renderer, item.object, scene, camera, item.object.geometry, item.material, null, lights);
+      if (compilation) for (const work of queue) results.push(invoke(work));
+      return results;
+    } finally {
+      [renderer._handleObjectFunction, renderer._compilationPromises, renderer._currentRenderContext] = previous;
+    }
+  };
+  return {renderer, programs, source, scene, camera, lights, add, context, compile, capture, reference, referenceDraw, passes};
 }
 const values = packet => packet.uniforms.flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
 function equalShaders(descriptor, reference) {
@@ -357,4 +377,92 @@ test('an existing per-object native graph refuses registration migration before 
   assert.deepEqual(trace.splice(0), expected); equalShaders(next, nextSource);
   assert.notEqual(next, descriptor); assert.notEqual(nextSource, source);
   assert.equal(f.programs.diagnostics.programs, 1);
+});
+
+for (const registered of [false, true]) for (const precompile of [false, true])
+test(`${registered ? 'registered' : 'inherited'} transparent DoubleSide extensions retain source pass construction with precompile=${precompile}`, t => {
+  const f = fixture(t), trace = [];
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor() {
+      super(); trace.push(['constructor']); this.applicationVariant = 0;
+      this.opacityNode = N.uniform(.375).setName('extensionAlpha').onObjectUpdate(frame => {
+        trace.push(['update', frame.material.side, frame.object === item.object, frame.material === item.material]);
+        return frame.material.opacity;
+      });
+      this.opacityNode.updateBeforeType = this.opacityNode.updateAfterType = T.NodeUpdateType.OBJECT;
+      this.opacityNode.updateBefore = frame => { trace.push(['before', frame.material.side]); };
+      this.opacityNode.updateAfter = frame => { trace.push(['after', frame.material.side]); };
+      this.applicationGain = N.uniform(.75).setName('extensionGain').onRenderUpdate(frame => {
+        trace.push(['render-update', frame.material.side]); return .75;
+      });
+    }
+    customProgramCacheKey() { trace.push(['key', this.side]); return `${super.customProgramCacheKey()}:${this.applicationVariant}`; }
+    setupOutput(builder, output) {
+      trace.push(['setup', this.side, builder.material.side, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(this.applicationGain), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'TransparentApplication'; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push(['key', this.side]); return `${super.customProgramCacheKey()}:${this.applicationVariant}`; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'TransparentApplication');
+  const material = new (registered ? Application : Extension)();
+  material.transparent = true; material.side = T.DoubleSide; material.opacity = .375;
+  material.color.setRGB(.25, .5, .75);
+  const item = f.add(material); trace.length = 0;
+  const phase = compilation => {
+    const reference = f.passes(item, (selected, options) => ({state: f.reference(selected, options), packet: f.referenceDraw(selected, options)}), compilation);
+    const expected = trace.splice(0);
+    const candidate = f.passes(item, (selected, options) => {
+      const descriptor = f.compile(selected, options), context = f.context(selected, options);
+      f.programs.before(descriptor, context);
+      const packet = f.capture(selected, descriptor, {...options, beforeDone: true});
+      f.programs.after(descriptor, context);
+      return {descriptor, packet};
+    }, compilation);
+    assert.deepEqual(trace.splice(0), expected, 'cache keys, constructors, setup and NodeFrame effects match source order');
+    assert.equal(candidate.length, reference.length);
+    candidate.forEach(({descriptor, packet}, index) => {
+      equalShaders(descriptor, reference[index].state);
+      assert.deepEqual(packet.uniforms, reference[index].packet.uniforms);
+    });
+    assert.equal(material.side, T.DoubleSide);
+    return {reference, candidate, trace: expected};
+  };
+  const first = phase(precompile), saved = first.candidate.map(({packet}) => packet.uniforms.map(bytes => bytes.slice()));
+  assert.equal(first.trace.filter(event => event[0] === 'setup').length, precompile ? 1 : 2);
+  assert.deepEqual(first.trace.filter(event => event[0] === 'key').map(event => event[1]),
+    precompile ? [T.DoubleSide, T.DoubleSide] : [T.BackSide, T.FrontSide]);
+  assert.equal(first.reference[0].state === first.reference[1].state, precompile);
+  assert.notEqual(first.candidate[0].descriptor, first.candidate[1].descriptor, 'each pass retains independent binding ownership');
+  material.opacity = .8125; material.color.setRGB(.75, .25, .5); f.renderer.info.calls++;
+  const warm = phase(false);
+  assert.equal(warm.trace.some(event => event[0] === 'setup' || event[0] === 'key'), false);
+  for (let index = 0; index < 2; index++) {
+    assert.equal(warm.reference[index].state, first.reference[index].state);
+    assert.equal(warm.candidate[index].descriptor, first.candidate[index].descriptor);
+    assert.ok(values(warm.candidate[index].packet).includes(.8125));
+    assert.deepEqual(first.candidate[index].packet.uniforms, saved[index]);
+  }
+  f.renderer.info.calls++;
+  const compiledAfterDraw = phase(true);
+  assert.equal(compiledAfterDraw.trace.some(event => event[0] === 'setup' || event[0] === 'key'), false);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const invalidated = phase(false);
+  assert.equal(invalidated.trace.filter(event => event[0] === 'setup').length, precompile ? 2 : 0);
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const rebuilt = phase(true);
+  assert.equal(rebuilt.trace.filter(event => event[0] === 'setup').length, 1);
+  assert.equal(rebuilt.reference[0].state, rebuilt.reference[1].state);
+  material.forceSinglePass = true; f.renderer.info.calls++;
+  const single = phase(false);
+  assert.equal(single.candidate.length, 1);
+  assert.equal(single.candidate[0].descriptor, rebuilt.candidate[1].descriptor);
+  assert.equal(single.trace.some(event => event[0] === 'setup' || event[0] === 'key'), false);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, 1);
+  material.forceSinglePass = false; material.dispose(); f.renderer.info.calls++;
+  assert.equal(f.programs.diagnostics.programs, 0);
+  assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, 2);
 });

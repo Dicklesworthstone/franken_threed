@@ -1471,13 +1471,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // NodeFrame, but retain their construction-time environment selection.
     const extension = materialExtension(material);
     const prototype = materialPrototype(prepared);
+    // Transparent side passes retain separate render-object bindings. Their
+    // builders share only when the source material/dynamic keys are identical,
+    // including restored DoubleSide construction during compileAsync.
     if (!(extension
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
-        prepared.transparent || prepared.wireframe || prepared.useTransmission || !extension && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
+        !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission || !extension && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (extension ? ['geometryNode', 'lightsNode', 'contextNode'] : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
         !extension && [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
@@ -2614,7 +2617,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const api = Object.freeze({inspect, compile, preparePMREM, refresh, before, capture, captureDraw, after, retainFogResources,
     hasCompilationUpdates(descriptor) {
       const state = stateOf(descriptor);
-      return state.builder.updateBeforeNodes.some(node => node.isComputeNode ||
+      // Extension setup can create any ordinary source update phase. Public
+      // precompilation runs them around each pipeline, even without compute.
+      return materialExtension(state.material) || state.builder.updateBeforeNodes.some(node => node.isComputeNode ||
         state.shadowGraphs.roots.has(node) && !(node instanceof three.ShadowNode));
     },
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)

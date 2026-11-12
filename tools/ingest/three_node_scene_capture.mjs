@@ -679,9 +679,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const nativeHooks = hookedObjects.size > 0,
     nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject || (nativeCompanionScene || nativeHookScene) && root.isScene === true;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
-  // Source public compilation constructs each geometry graph only after the
+  // Source public compilation constructs each observable graph only after the
   // preceding object's update/pipeline/after sequence has completed.
-  const deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null);
+  const deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null ||
+    nativeMaterialExtension(binding.material));
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {

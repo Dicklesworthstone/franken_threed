@@ -311,6 +311,66 @@ export const load = () => import('./lazy.js');
   }
 });
 
+test('an emitted registered transparent material compiles and renders through the native owner', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+const host = globalThis.__f3d_transparent_application;
+const renderer = new THREE.WebGPURenderer({device: host.device});
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+const setupSides = [];
+class ApplicationNodeMaterial extends THREE.MeshBasicNodeMaterial {
+  setupOutput(builder, output) {
+    setupSides.push(builder.material.side);
+    return super.setupOutput(builder, output);
+  }
+}
+class ApplicationMaterial extends THREE.MeshBasicMaterial {
+  constructor() {
+    super({color: 0xff0000, transparent: true, opacity: .25, side: THREE.DoubleSide});
+    this.type = 'ApplicationMaterial';
+  }
+}
+renderer.library.addMaterial(ApplicationNodeMaterial, 'ApplicationMaterial');
+const material = new ApplicationMaterial(), scene = new THREE.Scene();
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(), material));
+const companion = new THREE.Mesh(new THREE.PlaneGeometry(), new THREE.MeshBasicMaterial({color: 0x00ff00}));
+companion.position.z = -.5; scene.add(companion);
+const camera = new THREE.PerspectiveCamera(60, 1, .1, 10); camera.position.z = 2;
+await renderer.compileAsync(scene, camera);
+await renderer.renderAsync(scene, camera);
+material.opacity = .75; material.color.set(0x0000ff);
+await renderer.renderAsync(scene, camera);
+export const observed = {native: renderer.isF3DRenderer === true, route: renderer.info.f3d?.route,
+  drawCalls: renderer.info.render.drawCalls, setupSides, side: material.side};
+export const dispose = () => renderer.dispose();
+`);
+  const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
+  assert.equal(result.rendererRoute.routed, true);
+  assert.deepEqual(result.rendererRoute.decisions.map(site => site.route), ['general-webgpu']);
+  const device = geometryDevice(); device.features = new Set(); device.limits.maxTextureDimension2D = 8192;
+  device.createSampler = descriptor => descriptor;
+  device.createTexture = descriptor => ({...descriptor, dimension: '2d', sampleCount: 1, depthOrArrayLayers: 1,
+    width: descriptor.size.width ?? descriptor.size[0], height: descriptor.size.height ?? descriptor.size[1],
+    createView(options = {}) {return {texture: this, ...options};}, destroy() {}});
+  let configuration;
+  const canvas = {width: 16, height: 16, style: {}, getContext: () => ({
+    configure(value) {configuration = value;}, unconfigure() {},
+    getCurrentTexture: () => device.createTexture({size: [16, 16], format: configuration.format, usage: 16}),
+  })};
+  const previousDocument = globalThis.document, previousHost = globalThis.__f3d_transparent_application;
+  globalThis.document = {createElementNS: () => canvas}; globalThis.__f3d_transparent_application = {device};
+  let emitted;
+  try {
+    emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
+    assert.deepEqual(emitted.observed, {native: true, route: 'general-webgpu', drawCalls: 6, setupSides: [2], side: 2});
+    assert.equal(device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'main').length, 6);
+    assert.ok(device.submissions.length >= 2);
+  } finally {
+    await emitted?.dispose(); globalThis.document = previousDocument;
+    if (previousHost === undefined) delete globalThis.__f3d_transparent_application;
+    else globalThis.__f3d_transparent_application = previousHost;
+  }
+});
+
 test("default builds are unchanged and exact-backend applications are never substituted", async () => {
   const plain = app(PROGRAM);
   const unrouted = await buildApplication(plain.entry, plain.out);

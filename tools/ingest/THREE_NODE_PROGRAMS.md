@@ -34,7 +34,7 @@ Custom subclasses of supported node-material families and ordinary materials
 registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
-profile covers rigid, opaque, single-output meshes with float attributes,
+profile covers rigid, opaque or transparent, single-output meshes with float attributes,
 ordinary material maps, analytic scene lights and ready material/scene
 environments. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
@@ -67,6 +67,23 @@ Distinct material maps retain their own bindings while compatible shader builder
 can share source state. Material environments keep precedence over scene
 environments, and source PMREM selection and lifetime stay attached to their
 constructed graph. This adds no independent texture, light or environment owner.
+
+Transparent extensions use the existing source draw sorting, blending and queued
+uniform snapshots, including ordinary opaque companions. Double-sided materials
+retain separate back/front render objects: a first render constructs each side,
+while `compileAsync()` constructs after the original DoubleSide value has been
+restored and shares that source graph across the two passes. Later rendering
+retains the constructed graph while selecting each pass's culling and callback
+context. Opacity and color changes update the accepted draws without repeating
+setup; `forceSinglePass`, invalidation and disposal keep source cache lifetimes.
+
+Public `compileAsync()` executes extension-created before/current/after node
+callbacks in source order, including graphs with no compute node. Each selected
+object finishes its construction, before updates, geometry capture, current
+updates, pipeline preparation and after updates before the next graph is built.
+The precompilation flag is restored before each asynchronous wait. A later
+constructor observes earlier callback effects, and a failed pipeline leaves
+later constructors inactive.
 
 Registered analytic lights can inherit through custom light and node classes,
 including the built-in analytic node families. Their source before/current/after

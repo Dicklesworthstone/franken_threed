@@ -122,6 +122,169 @@ test('registered ordinary material extensions preserve conversion construction a
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const registered of [false, true])
+test(`transparent material extensions retain source sorting and queued color/opacity (registered=${registered})`, async t => {
+  const f = fixture(t), order = []; let setups = 0;
+  class HalfColorMaterial extends T.MeshBasicNodeMaterial {
+    setupDiffuseColor(builder) {
+      setups++; super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.mulAssign(.5);
+    }
+  }
+  class SourceMaterial extends T.MeshBasicMaterial { constructor() { super(); this.type = 'TransparentSourceMaterial'; } }
+  if (registered) f.renderer.library.addMaterial(HalfColorMaterial, 'TransparentSourceMaterial');
+  const make = (color, opacity) => {
+    const material = registered ? new SourceMaterial() : new HalfColorMaterial();
+    material.transparent = true; material.depthWrite = false; material.opacity = opacity; material.color.setRGB(...color);
+    t.after(() => material.dispose()); return material;
+  };
+  const nearColors = [[.25, .5, .75], [.625, .375, .125]], farColors = [[.125, .625, .375], [.75, .25, .5]];
+  const nearOpacity = [.3125, .8125], farOpacity = [.4375, .6875];
+  const near = f.mesh, far = new T.Mesh(f.mesh.geometry, make(farColors[0], farOpacity[0]));
+  near.material = make(nearColors[0], nearOpacity[0]); near.position.z = 1; near.name = 'near';
+  far.position.z = -1; far.name = 'far'; far.frustumCulled = false;
+  const opaque = new T.Mesh(f.mesh.geometry, f.material); opaque.name = 'opaque'; opaque.renderOrder = 100;
+  opaque.frustumCulled = false; f.scene.add(far, opaque);
+  for (const object of [near, far, opaque]) object.onBeforeRender = () => order.push(object.name);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  near.material.color.setRGB(...nearColors[1]); near.material.opacity = nearOpacity[1]; near.position.z = -2;
+  far.material.color.setRGB(...farColors[1]); far.material.opacity = farOpacity[1]; far.position.z = 2;
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(order, ['opaque', 'far', 'near', 'opaque', 'near', 'far'],
+    'opaque objects precede transparent depth sorting, including when their renderOrder is larger');
+  assert.equal(setups, 1, 'source material references let compatible transparent instances share construction');
+  near.material.color.setRGB(1, 0, 0); far.material.color.setRGB(0, 1, 0);
+  near.material.opacity = far.material.opacity = .0625;
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 6);
+  for (const index of [0, 3]) {
+    assert.ok(hasColor(actual[index], [.125, .375, .625]));
+    assert.equal(actual[index].pipeline.fragment.targets[0].blend, undefined);
+  }
+  for (const [index, color, opacity] of [[1, farColors[0], farOpacity[0]], [2, nearColors[0], nearOpacity[0]],
+    [4, nearColors[1], nearOpacity[1]], [5, farColors[1], farOpacity[1]]]) {
+    assert.ok(hasColor(actual[index], color)); assert.ok(blocks(actual[index]).flat().includes(opacity));
+    assert.ok(actual[index].pipeline.fragment.targets[0].blend);
+    assert.equal(actual[index].pipeline.depthStencil.depthWriteEnabled, false);
+  }
+  assert.equal(setups, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const precompile of [false, true])
+test(`transparent custom DoubleSide retains per-draw node lifecycle and source compilation sides (precompile=${precompile})`, async t => {
+  const f = fixture(t), events = [], setupSides = [], colors = [[.1875, .4375, .6875], [.75, .5, .25]], opacity = [.3125, .8125];
+  const observe = (phase, frame) => {
+    assert.equal(frame.renderer, f.renderer); assert.equal(frame.scene, f.scene); assert.equal(frame.camera, f.camera);
+    assert.equal(frame.object, f.mesh); assert.equal(frame.material, material);
+    events.push([phase, frame.material.side, frame.renderer._isPreCompiling === true]);
+  };
+  class TransparentMaterial extends T.MeshBasicNodeMaterial {
+    constructor() {
+      super(); this.transparent = true; this.side = T.DoubleSide; this.opacity = opacity[0]; this.color.setRGB(...colors[0]);
+      this.phase = T.TSL.uniform(.5).setName('transparentPhase').onObjectUpdate(frame => { observe('update', frame); return .5; });
+      this.phase.updateBeforeType = this.phase.updateAfterType = 'object';
+      this.phase.updateBefore = frame => observe('before', frame);
+      this.phase.updateAfter = frame => observe('after', frame);
+    }
+    setupDiffuseColor(builder) {
+      setupSides.push(builder.material.side); super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.mulAssign(this.phase);
+    }
+  }
+  const material = new TransparentMaterial(); f.mesh.material = material; t.after(() => material.dispose());
+  f.mesh.onBeforeRender = () => events.push(['object-before', material.side]);
+  f.mesh.onAfterRender = () => events.push(['object-after', material.side]);
+  const phases = (side, compiling) => ['before', 'update', 'after'].map(phase => [phase, side, compiling]);
+  if (precompile) {
+    await f.renderer.compileAsync(f.scene, f.camera);
+    assert.deepEqual(events, [['object-before', T.DoubleSide], ['object-after', T.DoubleSide],
+      ...phases(T.DoubleSide, true), ...phases(T.DoubleSide, true)],
+    'source compilation selects both passes first, then prepares them with the restored public side');
+    assert.deepEqual(setupSides, [T.DoubleSide], 'both queued passes share the source DoubleSide builder');
+    assert.equal(f.device.submissions.length, 0); events.length = 0;
+  } else await f.renderer.init();
+  const expected = [['object-before', T.DoubleSide], ...phases(T.BackSide, false),
+    ...phases(T.FrontSide, false), ['object-after', T.DoubleSide]];
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(events, expected, 'one object hook pair surrounds two physical draw lifecycle sequences');
+  assert.equal(material.side, T.DoubleSide);
+  material.color.setRGB(...colors[1]); material.opacity = opacity[1];
+  f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(events, [...expected, ...expected]);
+  assert.deepEqual(setupSides, precompile ? [T.DoubleSide] : [T.BackSide, T.FrontSide],
+    'warm side passes retain their original source construction');
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 4);
+  assert.deepEqual(actual.map(draw => [draw.pipeline.primitive.cullMode, draw.pipeline.primitive.frontFace]),
+    [['back', 'cw'], ['back', 'ccw'], ['back', 'cw'], ['back', 'ccw']]);
+  for (const [index, draw] of actual.entries()) {
+    assert.ok(hasColor(draw, colors[Math.floor(index / 2)]));
+    assert.ok(blocks(draw).flat().includes(opacity[Math.floor(index / 2)]));
+  }
+  assert.deepEqual(events, [...expected, ...expected], 'deferred GPU preparation does not repeat application callbacks');
+  assert.equal(material.side, T.DoubleSide); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const rejectPipeline of [false, true])
+test(`custom material compilation prepares each graph after earlier pipeline effects (rejectPipeline=${rejectPipeline})`, async t => {
+  const f = fixture(t), events = [], constructed = []; let stage = 0;
+  class OrderedMaterial extends T.MeshBasicNodeMaterial {
+    constructor(variant) {
+      super(); this.variant = variant; this.transparent = true;
+      this.phase = T.TSL.uniform(.5).onObjectUpdate(() => {
+        events.push(`${variant}:update`); if (variant === 'first') stage = 2; return .5;
+      });
+      this.phase.updateBeforeType = this.phase.updateAfterType = 'object';
+      this.phase.updateBefore = frame => {
+        assert.equal(frame.renderer._isPreCompiling, true);
+        events.push(`${variant}:before`); if (variant === 'first') stage = 1;
+      };
+      this.phase.updateAfter = frame => {
+        assert.equal(frame.renderer._isPreCompiling, true);
+        events.push(`${variant}:after`); if (variant === 'first') stage = 3;
+      };
+    }
+    customProgramCacheKey() { return `ordered-material:${this.variant}`; }
+    setupDiffuseColor(builder) {
+      constructed.push([this.variant, stage]); events.push(`${this.variant}:setup`);
+      super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.mulAssign(this.phase.mul(this.variant === 'first' ? .25 : .75));
+    }
+  }
+  const first = new OrderedMaterial('first'), second = new OrderedMaterial('second');
+  f.mesh.material = first; f.mesh.renderOrder = 0;
+  const object = new T.Mesh(f.mesh.geometry, second); object.renderOrder = 1; object.frustumCulled = false; f.scene.add(object);
+  t.after(() => { first.dispose(); second.dispose(); });
+  for (const [mesh, name] of [[f.mesh, 'first'], [object, 'second']]) {
+    mesh.onBeforeRender = () => events.push(`${name}:object-before`);
+    mesh.onAfterRender = () => events.push(`${name}:object-after`);
+  }
+  await f.renderer.init();
+  const createPipeline = f.device.createRenderPipeline;
+  f.device.createRenderPipelineAsync = async descriptor => {
+    assert.notEqual(f.renderer._isPreCompiling, true);
+    // Native preparation may create several raster variants at this one
+    // pipeline boundary; every variant must precede the object's after hook.
+    if (events.at(-1) !== 'pipeline') events.push('pipeline');
+    if (rejectPipeline) throw Error('custom material pipeline rejected');
+    return createPipeline(descriptor);
+  };
+  const selection = ['first:object-before', 'first:object-after', 'second:object-before', 'second:object-after'];
+  const firstPreparation = ['first:setup', 'first:before', 'first:update', 'pipeline'];
+  if (rejectPipeline) {
+    await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), /custom material pipeline rejected/);
+    assert.deepEqual(events, [...selection, ...firstPreparation]);
+    assert.deepEqual(constructed, [['first', 0]], 'a failed earlier pipeline leaves the later graph constructor inactive');
+    assert.equal(stage, 2, 'completed source updates remain, but after callbacks have not run');
+  } else {
+    await f.renderer.compileAsync(f.scene, f.camera);
+    assert.deepEqual(events, [...selection, ...firstPreparation, 'first:after',
+      'second:setup', 'second:before', 'second:update', 'pipeline', 'second:after']);
+    assert.deepEqual(constructed, [['first', 0], ['second', 3]],
+      'the second source constructor observes the first completed after callback');
+  }
+  assert.equal(f.device.submissions.length, 0); assert.equal(draws(f.device).length, 0);
+  assert.notEqual(f.renderer._isPreCompiling, true); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('a registered replacement for an ordinary built-in material selects the native source converter', async t => {
   const f = fixture(t), color = [.625, .125, .875];
   let constructions = 0;
