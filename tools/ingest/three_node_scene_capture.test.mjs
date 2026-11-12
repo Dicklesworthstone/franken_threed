@@ -434,6 +434,7 @@ test(`transparent DoubleSide precompilation retains restored source normals with
   });
   const options = hooked ? {bundles: f.bundles} : {};
   const prepared = f.capture({...options, uniforms: false});
+  prepared.prepareAttributes();
   assert.deepEqual(prepared.bindings.map(binding => ({vertex: binding.nodeProgram.vertex, fragment: binding.nodeProgram.fragment})), expected);
   assert.ok(prepared.bindings.every(binding => binding.raster.side === THREE.DoubleSide));
   assert.ok(prepared.bindings.every(binding => binding.nodeProgram.fragment.includes('@builtin( front_facing )')));
@@ -450,10 +451,13 @@ test(`transparent DoubleSide precompilation retains restored source normals with
     'material invalidation reconstructs under the live per-draw side');
   const renderedDescriptors = changed.draws.map(draw => draw.binding.nodeProgram);
   const laterCompilation = f.capture({...options, uniforms: false});
+  laterCompilation.prepareAttributes();
   assert.deepEqual(laterCompilation.bindings.map(binding => binding.nodeProgram), renderedDescriptors,
     'compileAsync after a direct render also retains the original source construction side');
   material.dispose();
-  assert.ok(f.capture({...options, uniforms: false}).bindings.every(binding =>
+  const disposed = f.capture({...options, uniforms: false}); disposed.prepareAttributes();
+  assert.equal(disposed.bindings.length, 2);
+  assert.ok(disposed.bindings.every(binding =>
     binding.nodeProgram.fragment.includes('@builtin( front_facing )')), 'disposal releases both side pass caches');
 });
 test('native transparent variants respect forceSinglePass, opacity and expanded capacity before updates', t => {
@@ -616,8 +620,10 @@ test('compile-only native callbacks retain source order without running node upd
   }
   const prepared = f.capture({bundles: f.bundles, uniforms: false});
   assert.deepEqual(events, [['before', a], ['after', a], ['before', b], ['after', b]]);
-  assert.equal(updates, 0); assert.equal(prepared.draws.length, 0); assert.equal(prepared.bindings.length, 2);
-  prepared.prepareAttributes(); assert.equal(events.length, 4); assert.equal(updates, 0);
+  assert.equal(updates, 0); assert.equal(prepared.draws.length, 0);
+  assert.equal(prepared.bindings.length, 0, 'selection defers source construction until preparation');
+  prepared.prepareAttributes(); assert.equal(prepared.bindings.length, 2);
+  assert.equal(events.length, 4); assert.equal(updates, 0);
 });
 
 test('native callbacks capture live draw ranges and preserve requested attribute histories through after edits', t => {

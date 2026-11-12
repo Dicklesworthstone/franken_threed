@@ -5,6 +5,7 @@ import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
 import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
+import SourceAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -166,9 +167,9 @@ function sourceGeometryPrograms(t, f) {
   const objects = new SourceRenderObjects(f.renderer, nodes, {}, {delete() {}}, {deleteForRender() {}}, {});
   const lights = N.lights([]), context = {id: 0};
   t.after(() => objects.dispose());
-  return {nodes, use(object = f.object) {
+  return {nodes, use(object = f.object, selectAttributes = true) {
     const owner = objects.get(object, object.material, f.scene, f.camera, lights, context, null);
-    return {owner, state: owner.getNodeBuilderState(), attributes: owner.getAttributes()};
+    return {owner, state: owner.getNodeBuilderState(), attributes: selectAttributes ? owner.getAttributes() : null};
   }};
 }
 function compileGeometry(f, object = f.object) {
@@ -199,7 +200,8 @@ test('custom geometry setup follows source shared keys, final-owner release and 
   }
   assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A']);
   for (const {f} of groups) { f.material.needsUpdate = true; f.object.geometry.dispose(); f.renderer.info.calls++; }
-  assert.equal(source.use().state, first.state); assert.equal(compileGeometry(candidate), firstCandidate);
+  assert.equal(source.use().state, first.state);
+  assert.equal(compileGeometry(candidate).vertex, firstCandidate.vertex);
   for (const group of groups) {
     group.a.dispatchEvent({type: 'dispose'});
     group.c = new T.Mesh(group.a.geometry, group.f.material); group.c.name = 'C'; group.f.scene.add(group.c);
@@ -253,7 +255,8 @@ test('lazy float attributes retain pre-setup keys and refresh source geometry wi
   const changed = source.use(), changedCandidate = compileGeometry(candidate);
   assert.equal(changed.state, second.state);
   assert.ok(changed.attributes.includes(reference.object.geometry.attributes.setupOffset));
-  assert.equal(candidate.renderer._nodeProgramSupport.geometry(changedCandidate), candidate.object.geometry);
+  assert.equal(candidate.renderer._nodeProgramSupport.geometry(changedCandidate).attributes.setupOffset,
+    candidate.object.geometry.attributes.setupOffset);
   assert.equal(canonical(changedCandidate.vertex), canonical(changed.state.vertexShader));
   assert.equal(canonical(changedCandidate.fragment), canonical(changed.state.fragmentShader));
   assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A', 'B']);
@@ -299,15 +302,44 @@ test('custom setup separates source graphics and compute versions through public
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('custom setup refuses newly added storage vertex attributes before dispatch', async t => {
-  const f = fixture(t, {background: false});
-  customSetupKernel(f, builder => {
-    if (builder.object) builder.geometry.setAttribute('storagePosition',
-      new T.StorageBufferAttribute(builder.geometry.attributes.position.count, 3));
+test('custom ComputeNode subclasses add source named storage attributes and dispatch once across owners', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const authored = [reference, candidate].map(f => {
+    const count = f.object.geometry.attributes.position.count, attribute = new T.StorageBufferAttribute(count, 3);
+    const values = N.storage(attribute, 'vec3', count), setups = [];
+    class GeometryStep extends T.ComputeNode {
+      setup(builder) {
+        if (builder.object) { setups.push(builder.object.name); builder.geometry.setAttribute('storagePosition', attribute); }
+        return super.setup(builder);
+      }
+    }
+    const kernel = new GeometryStep(N.Fn(() => { values.element(N.instanceIndex).addAssign(N.vec3(.125, 0, 0)); })(), [64]);
+    kernel.count = count; kernel.name = 'class-geometry-step';
+    f.object.name = 'A'; f.material.geometryNode = kernel; f.material.positionNode = N.attribute('storagePosition');
+    const other = new T.Mesh(f.object.geometry, f.material); other.name = 'B'; other.frustumCulled = false; f.scene.add(other);
+    return {kernel, attribute, setups, other};
   });
-  await f.renderer.init();
-  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
-  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference), first = source.use().state;
+  const compute = source.nodes.getForCompute(authored[0].kernel), records = new WeakMap();
+  new SourceAttributeUtils({device: reference.device, get(attribute) {
+    let record = records.get(attribute); if (!record) records.set(attribute, record = {}); return record;
+  }}).createAttribute(authored[0].attribute, 160);
+  const second = source.use(authored[0].other).state;
+  candidate.device.onCompute = pass => new Float32Array(storage(pass)[0].data).fill(.375);
+  candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+  assert.deepEqual(authored[1].setups, authored[0].setups); assert.deepEqual(authored[1].setups, ['A', 'B']);
+  assert.equal(candidate.computes.length, 1);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  const programs = candidate.captures.flatMap(frame => frame.draws).map(draw => draw.binding.nodeProgram);
+  for (const [program, expected] of [[programs[0], first], [programs[1], second]]) {
+    assert.equal(canonical(program.vertex), canonical(expected.vertexShader));
+    assert.equal(canonical(program.fragment), canonical(expected.fragmentShader));
+  }
+  assert.equal(canonical(candidate.computes[0].pipeline.compute.module.code), canonical(compute.computeShader));
+  const gpu = storage(candidate.computes[0])[0];
+  assert.ok(draws(candidate).every(draw => [...draw.streams.values()].includes(gpu)));
+  assert.deepEqual(draws(candidate).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.375, .375]);
 });
 
 test('adding custom setup to an existing per-object graph waits for source material disposal', async t => {
@@ -332,6 +364,168 @@ test('adding custom setup to an existing per-object graph waits for source mater
   const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
   assert.equal(canonical(program.vertex), canonical(rebuilt.vertexShader));
   assert.equal(canonical(program.fragment), canonical(rebuilt.fragmentShader));
+});
+
+test('lazy jelly constructors share post-padding source keys and refresh named attributes without setup replay', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const expected = jelly(reference), actual = jelly(candidate);
+  await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference), records = new WeakMap();
+  const upload = new SourceAttributeUtils({device: reference.device, get(attribute) {
+    let record = records.get(attribute); if (!record) records.set(attribute, record = {}); return record;
+  }});
+  const owners = [reference, candidate].map(f => [f.object, ...['B', 'C'].map(name => {
+    const object = new T.Mesh(f.object.geometry, f.material); object.name = name; f.scene.add(object); return object;
+  })]);
+  const states = [], programs = [];
+  for (let index = 0; index < 3; index++) {
+    states.push(source.use(owners[0][index]));
+    upload.createAttribute(reference.object.geometry.attributes.storagePosition, 160);
+    programs.push(compileGeometry(candidate, owners[1][index]));
+    // Use the same pinned upload operation between owners: source vec3 storage
+    // padding changes the next RenderObject key without rebuilding the first.
+    upload.createAttribute(candidate.object.geometry.attributes.storagePosition, 160);
+  }
+  assert.notEqual(states[0].owner.initialCacheKey, states[1].owner.initialCacheKey);
+  assert.equal(states[1].owner.initialCacheKey, states[2].owner.initialCacheKey);
+  assert.notEqual(states[0].state, states[1].state); assert.equal(states[1].state, states[2].state);
+  assert.equal(actual.builds, expected.builds); assert.equal(actual.builds, 2);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  for (let index = 0; index < 3; index++) {
+    assert.equal(canonical(programs[index].vertex), canonical(states[index].state.vertexShader));
+    assert.equal(canonical(programs[index].fragment), canonical(states[index].state.fragmentShader));
+  }
+  const oldView = candidate.renderer._nodeProgramSupport.geometry(programs[0]);
+  assert.equal(oldView.attributes.storagePosition.id, actual.attributes[0].id);
+  for (const f of [reference, candidate]) f.renderer.info.calls++;
+  const changed = source.use(), changedProgram = compileGeometry(candidate);
+  assert.equal(changed.state, states[0].state); assert.notEqual(changedProgram, programs[0]);
+  assert.ok(changed.attributes.includes(expected.attributes[1]));
+  assert.equal(candidate.renderer._nodeProgramSupport.geometry(changedProgram).attributes.storagePosition.id,
+    actual.attributes[1].id);
+  assert.equal(oldView.attributes.storagePosition.id, actual.attributes[0].id, 'accepted metadata keeps the original named buffer');
+  for (const f of [reference, candidate]) { f.object.geometry.dispose(); f.renderer.info.calls++; }
+  assert.equal(source.use().state, states[0].state); compileGeometry(candidate);
+  assert.equal(actual.builds, expected.builds); assert.equal(actual.builds, 2);
+});
+
+test('shared lazy jelly draws retain queued named-storage selections through later owner refresh', async t => {
+  const f = fixture(t, {background: false}), state = jelly(f);
+  const others = ['B', 'C'].map(name => {
+    const object = new T.Mesh(f.object.geometry, f.material); object.name = name; object.frustumCulled = false;
+    f.scene.add(object); return object;
+  });
+  let steps = 0;
+  f.device.onCompute = pass => {
+    if (pass.pipeline.compute.module.label === 'geometry-step') new Float32Array(storage(pass)[0].data).fill(++steps * .25);
+  };
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera);
+  for (const object of others) object.visible = false;
+  const replacement = new T.StorageBufferAttribute(f.object.geometry.attributes.position.count, 3);
+  replacement.array.fill(.875); f.object.geometry.setAttribute('storagePosition', replacement);
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  replacement.array.fill(99); await drain(f.renderer);
+  assert.equal(state.builds, 2); assert.equal(state.initializations, 2);
+  assert.equal(steps, 3); assert.equal(f.computes.length, 5);
+  const first = packets(f)[0].binding.nodeProgram, next = packets(f)[1].binding.nodeProgram;
+  assert.notEqual(first, next); assert.equal(first.vertex, next.vertex);
+  const gpu = f.computes.filter(pass => pass.pipeline.compute.module.label === 'geometry-step').map(pass => storage(pass)[0]);
+  const location = next.attributes.find(attribute => attribute.name === 'storagePosition').location;
+  const selected = draws(f).map(draw => draw.streams.get(draw.pipeline.vertex.buffers.findIndex(layout =>
+    layout.attributes.some(attribute => attribute.shaderLocation === location))));
+  assert.deepEqual(selected.slice(0, 3), [gpu[1], gpu[1], gpu[1]]);
+  assert.notEqual(selected[3], gpu[0]); assert.notEqual(selected[3], gpu[1]);
+  assert.deepEqual(draws(f).map((draw, index) => new Float32Array(draw.contents.get(selected[index]).buffer)[0]),
+    [.5, .5, .5, .875]);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const gpu of [false, true])
+test(`shared ${gpu ? 'storage' : 'Float32'} geometry selects named inputs at source cold, warm and disposal before-update boundaries`, async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const cases = [reference, candidate].map(f => {
+    const kernel = inheritedKernel(f, 'object'), geometry = f.object.geometry, count = geometry.attributes.position.count;
+    const named = Array.from({length: 8}, (_, index) => {
+      const attribute = gpu ? new T.StorageBufferAttribute(count, 3) : new T.Float32BufferAttribute(new Float32Array(count * 3), 3);
+      attribute.array.fill((index + 1) * .125); return attribute;
+    });
+    const pinned = new T.StorageBufferAttribute(count, 3); pinned.array.fill(.0625);
+    geometry.setAttribute('selectedPosition', named[0]);
+    f.material.geometryNode = N.Fn(() => kernel.kernel)();
+    f.material.positionNode = N.attribute('selectedPosition', 'vec3').add(N.bufferAttribute(pinned, 'vec3'));
+    const replacement = new T.BoxGeometry(); replacement.setAttribute('selectedPosition', named[5]);
+    t.after(() => replacement.dispose());
+    const state = {f, geometry, replacement, named, pinned, before: () => {}};
+    kernel.observe = stage => { if (stage === 'before') state.before(); };
+    return state;
+  });
+  await reference.renderer.init(); await candidate.renderer.init();
+  reference.renderer.compute = () => {};
+  const source = sourceGeometryPrograms(t, reference), selected = [], states = [], pinnedSelections = [];
+  const actions = [
+    item => () => item.geometry.setAttribute('selectedPosition', item.named[1]),
+    item => () => item.geometry.setAttribute('selectedPosition', item.named[2]),
+    item => () => item.geometry.setAttribute('selectedPosition', item.named[3]),
+    item => () => item.geometry.setAttribute('selectedPosition', item.named[4]),
+    item => () => { item.f.object.geometry = item.replacement; },
+    () => () => {},
+    item => () => item.replacement.setAttribute('selectedPosition', item.named[6]),
+    () => () => {},
+  ];
+  for (let index = 0; index < actions.length; index++) {
+    for (const item of cases) {
+      if (index === 3) item.geometry.dispose();
+      if (index === 6) item.replacement.dispose();
+      item.before = actions[index](item);
+    }
+    reference.renderer.info.calls++;
+    const current = source.use(reference.object, false); states.push(current.state);
+    source.nodes.updateBefore(current.owner);
+    const attributes = current.owner.getAttributes();
+    selected.push(cases[0].named.findIndex(attribute => attributes.includes(attribute)));
+    assert.ok(attributes.includes(cases[0].pinned));
+    candidate.renderer._nodes.nodeFrame.update(); candidate.renderer.render(candidate.scene, candidate.camera);
+    await drain(candidate.renderer);
+    const packet = packets(candidate).at(-1), view = packet.binding.programGeometry;
+    assert.equal(candidate.renderer._nodeProgramSupport.geometry(packet.binding.nodeProgram).attributes.selectedPosition.id,
+      cases[1].named[selected.at(-1)].id);
+    assert.equal(view.attributes.selectedPosition.array[0], cases[1].named[selected.at(-1)].array[0]);
+    const namedNode = packet.binding.nodeProgram.attributes.find(attribute => attribute.name !== 'position' && attribute.name !== 'selectedPosition');
+    pinnedSelections.push(view.attributes[namedNode.name].id);
+    const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+    assert.equal(canonical(packet.binding.nodeProgram.vertex), canonical(current.state.vertexShader));
+    assert.equal(canonical(packet.binding.nodeProgram.fragment), canonical(current.state.fragmentShader));
+  }
+  assert.deepEqual(selected, [1, 1, 3, 4, 4, 5, 5, 6]);
+  assert.ok(states.every(state => state === states[0]));
+  assert.ok(pinnedSelections.every(id => id === cases[1].pinned.id));
+  assert.equal(candidate.renderer._nodeCaptureBytes, 0);
+});
+
+test('a cold before update can promote a named Float32 input to native storage', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const attributes = [reference, candidate].map(f => {
+    const geometry = f.object.geometry, count = geometry.attributes.position.count;
+    geometry.setAttribute('selectedPosition', new T.Float32BufferAttribute(new Float32Array(count * 3), 3));
+    const attribute = new T.StorageBufferAttribute(count, 3); attribute.array.fill(.375);
+    const kernel = N.Fn(() => {})().compute(1);
+    kernel.updateBeforeType = 'object'; kernel.updateBefore = () => geometry.setAttribute('selectedPosition', attribute);
+    f.material.geometryNode = N.Fn(() => kernel)(); f.material.positionNode = N.attribute('selectedPosition');
+    return attribute;
+  });
+  await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference); reference.renderer.info.calls++;
+  const expected = source.use(reference.object, false); source.nodes.updateBefore(expected.owner);
+  assert.ok(expected.owner.getAttributes().includes(attributes[0]));
+  candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+  const program = packets(candidate)[0].binding.nodeProgram;
+  assert.equal(program.vertex, expected.state.vertexShader); assert.equal(program.fragment, expected.state.fragmentShader);
+  const draw = draws(candidate)[0], location = program.attributes.find(attribute => attribute.name === 'selectedPosition').location;
+  const gpu = draw.streams.get(draw.pipeline.vertex.buffers.findIndex(layout =>
+    layout.attributes.some(attribute => attribute.shaderLocation === location)));
+  assert.ok(gpu.usage & 128); assert.equal(new Float32Array(draw.contents.get(gpu).buffer)[0], .375);
+  assert.equal(candidate.computes.length, 0); assert.equal(candidate.renderer._nodeCaptureBytes, 0);
 });
 
 test('inherited compute callbacks compile, share dispatches, and retain source shaders and native storage', async t => {
@@ -535,8 +729,8 @@ test('accepted geometry initialization survives a later draw callback failure', 
   assert.equal(draws(f).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-test('geometry graph replacement rejects stale descriptors before dispatch and rebuilds the source variant', async t => {
-  const f = fixture(t, {background: false}); jelly(f); await f.renderer.init();
+test('nonshared geometry graph replacement rejects stale descriptors before dispatch', async t => {
+  const f = fixture(t, {background: false}); f.material.transparent = true; jelly(f); await f.renderer.init();
   f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   const before = packets(f)[0].binding.nodeProgram, count = f.computes.length;
   f.material.geometryNode = N.Fn(() => {})();
@@ -545,6 +739,46 @@ test('geometry graph replacement rejects stale descriptors before dispatch and r
   assert.equal(f.computes.length, count);
   f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
   assert.notEqual(packets(f)[1].binding.nodeProgram, before); assert.equal(f.computes.length, count);
+});
+
+for (const removal of [false, true])
+test(`shared geometry graph ${removal ? 'removal' : 'replacement'} waits for source material invalidation`, async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const expected = jelly(reference); jelly(candidate); await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference), first = source.use().state, records = new WeakMap();
+  const upload = new SourceAttributeUtils({device: reference.device, get(attribute) {
+    let record = records.get(attribute); if (!record) records.set(attribute, record = {}); return record;
+  }});
+  reference.renderer.compute = kernel => {
+    for (const group of source.nodes.getForCompute(kernel).bindings) for (const binding of group.bindings)
+      if (binding.isStorageBuffer) upload.createAttribute(binding.attribute, 160);
+  };
+  expected.kernels[0].onInitFunction();
+  candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+  const before = packets(candidate)[0].binding.nodeProgram, count = candidate.computes.length;
+  const originalGraphs = [reference.material.geometryNode, candidate.material.geometryNode];
+  for (const f of [reference, candidate]) f.material.geometryNode = removal ? null : N.Fn(() => {})();
+  reference.renderer.info.calls++; assert.equal(source.use().state, first);
+  candidate.renderer._nodes.nodeFrame.update(); candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+  assert.equal(packets(candidate)[1].binding.nodeProgram, before); assert.equal(candidate.computes.length, count + 1);
+  for (const f of [reference, candidate]) f.material.needsUpdate = true;
+  reference.renderer.info.calls++; const changed = source.use().state; assert.notEqual(changed, first);
+  candidate.renderer._nodes.nodeFrame.update(); candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+  const next = packets(candidate)[2].binding.nodeProgram;
+  assert.notEqual(next, before); assert.equal(candidate.computes.length, count + 1);
+  assert.equal(next.vertex, changed.vertexShader); assert.equal(next.fragment, changed.fragmentShader);
+  if (removal) {
+    reference.material.geometryNode = originalGraphs[0]; candidate.material.geometryNode = originalGraphs[1];
+    reference.renderer.info.calls++; assert.equal(source.use().state, changed);
+    candidate.renderer._nodes.nodeFrame.update(); candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+    assert.equal(packets(candidate).at(-1).binding.nodeProgram, next); assert.equal(candidate.computes.length, count + 1);
+    for (const f of [reference, candidate]) f.material.needsUpdate = true;
+    reference.renderer.info.calls++; const restored = source.use().state; assert.notEqual(restored, changed);
+    candidate.renderer._nodes.nodeFrame.update(); candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+    const program = packets(candidate).at(-1).binding.nodeProgram;
+    assert.notEqual(program, next); assert.equal(candidate.computes.length, count + 3);
+    assert.equal(program.vertex, restored.vertexShader); assert.equal(program.fragment, restored.fragmentShader);
+  }
 });
 
 test('hidden geometry constructors stay inert until selected for a source render', async t => {

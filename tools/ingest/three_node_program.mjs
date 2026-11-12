@@ -398,6 +398,57 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         owner.isInstancedInterleavedBuffer, owner.usage];
     }));
   }
+  function geometryMetadata(builder, geometry, object, pinNamed = false) {
+    const generated = [], named = [];
+    const attributes = builder.getAttributesArray().map((attribute, location) => {
+      const vector = /^(?:(u|i)?vec([234])|(float|int|uint))$/.exec(attribute.type);
+      const components = vector ? Number(vector[2] ?? 1) : 0;
+      const scalar = vector?.[1] === 'u' || vector?.[3] === 'uint' ? 'uint'
+        : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
+      const node = attribute.node, source = node?.attribute ?? geometry.attributes[attribute.name];
+      const storage = source?.isStorageBufferAttribute || source?.isStorageInstancedBufferAttribute;
+      const padded = storage && source.itemSize === 4 && components === 3;
+      if (!components || !source || source.itemSize !== components && !padded ||
+          node && !(node instanceof three.BufferAttributeNode))
+        fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
+      const inputArray = ArrayBuffer.isView(node?.value) ? node.value : node?.value?.array;
+      if (inputArray && !storage) {
+        // Preserve the source scalar type even when the general uploader could
+        // convert it to the type requested by the authored shader.
+        const expected = inputArray instanceof Uint32Array ? 'uint' : inputArray instanceof Int32Array ? 'int' : 'float';
+        if (scalar !== expected)
+          fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
+      }
+      if (!node?.attribute) {
+        named.push([attribute.name, source.id]);
+        if (pinNamed && (source.array?.constructor !== Float32Array || source.isInterleavedBufferAttribute ||
+            source.isInstancedBufferAttribute || source.normalized))
+          fail('ATTRIBUTE', 'Shared native geometry requires rigid Float32 named attributes');
+      }
+      if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source,
+        shared: node ? inspectAttributeInput(node, object) === true : !storage});
+      return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
+    });
+    return {attributes, generated, named};
+  }
+  const sharedAttributeOwners = generated => [...new Set(generated.filter(source => source.shared).map(({attribute}) =>
+    attribute.isInterleavedBufferAttribute ? attribute.data : attribute))];
+  function namedAttributesMatch(state) {
+    return !state.namedAttributes || state.namedAttributes.every(([name, id]) => state.geometry.attributes[name]?.id === id);
+  }
+  function selectGeometryAttributes(state) {
+    if (!state.namedSelectionPending) return;
+    if (!namedAttributesMatch(state)) {
+      const {generated, named} = geometryMetadata(state.builder, state.geometry, state.object, true);
+      const token = {};
+      generatedAttributes.register(token, state.geometry, generated);
+      state.attributeOwner = token; state.generated = generated.length > 0;
+      state.namedAttributes = named; state.sharedAttributes = sharedAttributeOwners(generated);
+    }
+    // This is the source's first getAttributes after updateBefore. A warm
+    // selection stays fixed until the next RenderObjects.get entrance.
+    state.namedSelectionPending = false; state.namedGeometryDisposed = false;
+  }
   function inspectUniformArray(node) {
     const array = node.array, type = node.elementType;
     if (!managedUniformBuffer(node) ||
@@ -1102,6 +1153,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     return material instanceof three.NodeMaterial && node instanceof three.ComputeNode &&
       materialDataProperty(node, 'setup') !== three.ComputeNode.prototype.setup;
   }
+  function lazyGeometrySetup(material) {
+    if (!(material instanceof three.NodeMaterial)) return false;
+    let node = materialDataProperty(material, 'geometryNode');
+    if (node instanceof three.VarNode && Object.getPrototypeOf(node) === three.VarNode.prototype)
+      node = materialDataProperty(node, 'node');
+    return materialDataProperty(node, 'isShaderCallNodeInternal') === true;
+  }
   function inspectCompute(node, sharedSetup = false) {
     const source = three.ComputeNode?.prototype;
     const callbacks = ['updateBefore', 'update', 'updateAfter'],
@@ -1283,7 +1341,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     const mrt = inspectThreeMRT(three, renderer, material);
-    const sharedSetup = customGeometrySetup(sourceMaterial) && sharedConstruction(sourceMaterial, material,
+    const sharedSetup = (customGeometrySetup(sourceMaterial) || lazyGeometrySetup(sourceMaterial)) && sharedConstruction(sourceMaterial, material,
       object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true)?.geometrySetup === true;
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
       ...(extension ? Object.values(material).filter(value => value?.isNode === true) : []),
@@ -1479,12 +1537,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           .some(name => materialDataProperty(node, name) !== three.LightsNode.prototype[name]))
       fail('LIGHTS', 'Shared native material construction requires the selected source LightsNode');
   }
-  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature, validationOnly = false) {
-    // Source builder sharing is first admitted for callback-free, rigid PBR
-    // material graphs. These nodes read live object/material uniforms through
-    // NodeFrame, but retain their construction-time environment selection.
+  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature, validationOnly = false, retainGeometry = false) {
+    // Source sharing retains construction effects while each render object
+    // captures its own uniforms and selected geometry attributes.
     const extension = materialExtension(material);
-    const geometrySetup = !extension && customGeometrySetup(material);
+    const lazyGeometry = !extension && lazyGeometrySetup(material);
+    const geometrySetup = !extension && (retainGeometry || customGeometrySetup(material) || lazyGeometry);
     const prototype = materialPrototype(prepared);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
@@ -1505,7 +1563,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         !extension && [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
-          attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute || attribute.isStorageBufferAttribute) ||
+          attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute ||
+          attribute.isStorageBufferAttribute && !geometrySetup) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
@@ -1591,6 +1650,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (entry.sharedBuilder && --entry.sharedBuilder.references === 0) sharedBuilders.delete(entry.sharedBuilder.key);
     entry.material.removeEventListener('dispose', entry.onDispose);
     entry.geometry.removeEventListener('dispose', entry.onDispose);
+    if (entry.onGeometryDispose) entry.sourceGeometry.removeEventListener('dispose', entry.onGeometryDispose);
     entry.object.removeEventListener('dispose', entry.onDispose);
     if (entry.attributeNodes.length) generatedAttributes.release(entry.descriptor);
     if (entry.descriptor.wireframe) wireframes.release(entry.descriptor);
@@ -1604,20 +1664,26 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const chain = builderScope(context).chain;
     let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
     if (!record && !hasThreeCustomProgramCacheKey(three, material) &&
-        !materialExtension(material) && !customGeometrySetup(material)) return compileProgram(material, object, context);
+        !materialExtension(material) && !customGeometrySetup(material)) {
+      if (!lazyGeometrySetup(material)) return compileProgram(material, object, context);
+      const prepared = inspect(material, object, context);
+      if (!sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
+          inspectThreeLightingContext(three, renderer.contextNode), true)) return compileProgram(material, object, context);
+    }
     const priorPasses = cache.get(object)?.get(material);
     const previous = priorPasses?.get(chain) ?? priorPasses?.get(context.passId ?? null);
+    const geometryProfile = record?.geometrySetup || previous?.sharedBuilder?.geometrySetup || false;
     // A per-object graph has no retained source builder key to adopt. Changing
     // its converter family must not replay setup or cache-key callbacks before
     // the application releases that previous material construction.
     if (!record && materialExtension(material) && previous && !previous.sharedBuilder)
       fail('MATERIAL_CACHE', 'Changing an existing native material to a registered extension requires material.dispose()');
-    if (!record && customGeometrySetup(material) && previous && !previous.sharedBuilder)
-      fail('MATERIAL_CACHE', 'Adding custom geometry setup to an existing native material requires material.dispose()');
+    if (!record && (customGeometrySetup(material) || lazyGeometrySetup(material)) && previous && !previous.sharedBuilder)
+      fail('MATERIAL_CACHE', 'Adding shared geometry setup to an existing native material requires material.dispose()');
     const profile = () => {
       const prepared = inspect(material, object, context);
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
-        inspectThreeLightingContext(three, renderer.contextNode));
+        inspectThreeLightingContext(three, renderer.contextNode), false, geometryProfile);
       if (!construction || construction.chain !== chain)
         fail('HOOK', 'Custom native material construction must retain its shared rigid profile');
       return construction;
@@ -1674,7 +1740,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
 
     function remember(key, version, dynamic, entry) {
       const sourceMaterial = renderer._currentSourceMaterial ?? null;
-      const next = {key, version, dynamic, entry, dispose() {
+      const next = {key, version, dynamic, entry, geometrySetup: construction.geometrySetup, dispose() {
         if (!customKeyRecords.delete(next)) return;
         if (passes?.get(chain) === next) passes.delete(chain);
         material.removeEventListener('dispose', next.dispose);
@@ -1702,7 +1768,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const morphSignature = inspectMorphs(object), pipelineSignature = inspectThreePipelineContext(three, renderer, material, object, effects);
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
-    const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature);
+    const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature,
+      false, sourceKey?.geometrySetup === true);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
     const backdropKey = backdropSignature(preparedMaterial);
@@ -1728,6 +1795,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // context change. A version-only change with the same source key retains
     // the very same builder nodes, including their captured PMREM texture.
     if (construction && previous?.sharedBuilder && previous.geometry === object.geometry &&
+        !previousState.namedGeometryDisposed && namedAttributesMatch(previousState) &&
         (sourceKey || previousState.sharedDynamic === construction.dynamic) &&
         (previousState.materialVersion === material.version || previous.sharedBuilder.key === construction.key)) {
       previousState.materialVersion = material.version;
@@ -1842,7 +1910,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
       } finally { builder.addChain = addChain; }
       if (construction?.geometrySetup && (object.geometry !== constructionGeometry ||
-          !sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature, true)?.geometrySetup))
+          !sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature, true, true)?.geometrySetup))
         fail('STORAGE', 'Custom geometry setup must retain its selected rigid Float32 geometry');
       graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
       if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode,
@@ -1974,31 +2042,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
-    const nodeAttributes = builder.getAttributesArray(), generated = [];
-    const attributes = nodeAttributes.map((attribute, location) => {
-      const vector = /^(?:(u|i)?vec([234])|(float|int|uint))$/.exec(attribute.type);
-      const components = vector ? Number(vector[2] ?? 1) : 0;
-      const scalar = vector?.[1] === 'u' || vector?.[3] === 'uint' ? 'uint'
-        : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
-      const node = attribute.node, source = node?.attribute ?? object.geometry.attributes[attribute.name];
-      const storage = source?.isStorageBufferAttribute || source?.isStorageInstancedBufferAttribute;
-      const padded = storage && source.itemSize === 4 && components === 3;
-      if (!components || !source || source.itemSize !== components && !padded ||
-          node && !(node instanceof three.BufferAttributeNode))
-        fail('ATTRIBUTE', `Native node attribute ${attribute.name} requires a matching scalar/vector geometry attribute`);
-      const inputArray = ArrayBuffer.isView(node?.value) ? node.value : node?.value?.array;
-      if (inputArray && !storage) {
-        // r186 derives the vertex format from the source array. A differently
-        // signed or floating shader input is invalid even if our general
-        // geometry uploader could convert its elements to that requested type.
-        const expected = inputArray instanceof Uint32Array ? 'uint' : inputArray instanceof Int32Array ? 'int' : 'float';
-        if (scalar !== expected)
-          fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
-      }
-      if (node || storage) generated.push({name: attribute.name, attribute: source,
-        shared: node ? inspectAttributeInput(node, object) === true : false});
-      return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
-    });
+    const {attributes, generated, named} = geometryMetadata(builder, object.geometry, object, sharedBuilder?.geometrySetup === true);
     const vertex = builder.vertexShader, fragment = builder.fragmentShader;
     const shared = shaderPairs.get(vertex)?.get(fragment);
     const shaders = shared ?? {vertex, fragment, bytes: 2 * (vertex.length + fragment.length), references: 0};
@@ -2095,8 +2139,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0,
-      sharedAttributes: [...new Set(generated.filter(source => source.shared).map(({attribute}) =>
-        attribute.isInterleavedBufferAttribute ? attribute.data : attribute))]});
+      attributeOwner: descriptor, namedAttributes: sharedBuilder?.geometrySetup ? named : null,
+      sourceGeometry: previousState?.sourceGeometry ?? object.geometry,
+      namedSelectionPending: sharedBuilder?.geometrySetup === true, namedGeometryDisposed: false,
+      sharedAttributes: sharedAttributeOwners(generated)});
     // Source geometry constructors may add named storage attributes. Adopt
     // their accepted layout now, including the canonical vec3 padding above,
     // instead of rebuilding that constructor and repeating onInit next frame.
@@ -2107,6 +2153,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
+    if (sharedBuilder?.geometrySetup) {
+      const state = nodeStates.get(descriptor);
+      entry.sourceGeometry = state.sourceGeometry;
+      entry.onGeometryDispose = () => { state.namedSelectionPending = true; state.namedGeometryDisposed = true; };
+      entry.sourceGeometry.addEventListener('dispose', entry.onGeometryDispose);
+    }
     // Source shared UniformArray bindings survive graph reconstruction, notably
     // an ArrayCamera view-count change. A newly validated layout owns a fresh
     // allocation; accepted older draws already retain their immutable packets.
@@ -2374,7 +2426,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function checkAttributes(state, context = null) {
     if (attributeSignature(state.attributeNodes, state.object) !== state.attributeSignature)
       fail('CHANGED', 'Native source attribute identity, backing array or layout changed; compile the graph again');
-    if (state.generated) generatedAttributes.validate(state.descriptor);
+    if (state.generated) generatedAttributes.validate(state.attributeOwner);
     if (state.sharedAttributes.length) context?.validateAttributeOwners?.(state.sharedAttributes);
   }
   function readUniformBuffer(binding, byteLength) {
@@ -2470,7 +2522,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native primitive topology or strip index format changed; compile the graph again');
   }
   function captureGeometry(state, renderId, captureVertexAttribute) {
-    const generated = state.generated ? generatedAttributes.capture(state.descriptor, renderId, captureVertexAttribute) : null;
+    selectGeometryAttributes(state);
+    const generated = state.generated ? {...generatedAttributes.capture(state.attributeOwner, renderId, captureVertexAttribute),
+      geometry: generatedAttributes.geometry(state.attributeOwner)} : null;
     const wireframe = state.descriptor.wireframe ? wireframes.capture(state.descriptor, renderId) : null;
     if (!wireframe) return generated;
     return Object.freeze({bytes: wireframe.bytes + (generated?.bytes ?? 0), indexCount: wireframe.indexCount,
@@ -2589,6 +2643,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       checkSSS(state);
       checkGeometry(state);
       checkBackdrop(state);
+      selectGeometryAttributes(state);
       checkAttributes(state, context);
       checkWireframe(state);
       // Match Renderer._renderObjectDirect: source geometry uploads occur after
@@ -2598,7 +2653,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // subsequently mutates the source geometry. The scene owner owns the
       // geometry/lease snapshot; compilation and shared refresh never invoke it.
       bundleGeometry = context.captureGeometry?.(attributes?.geometry ??
-        (state.generated ? generatedAttributes.geometry(descriptor) : state.geometry), attributes, descriptor.attributes);
+        (state.generated ? generatedAttributes.geometry(state.attributeOwner) : state.geometry), attributes, descriptor.attributes);
       const indirect = context.captureIndirect?.() ?? null;
       for (const node of state.builder.updateNodes) {
         frame.updateNode(node);
@@ -2638,6 +2693,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const packet = {uniforms, textures, storage, attributes, indirect,
         ...(record ? {refreshType: kind} : {}),
         ...(context.captureGeometry ? {bundleGeometry} : {}),
+        ...(state.generated ? {programGeometry: generatedAttributes.geometry(state.attributeOwner)} : {}),
         ...(descriptor.wireframe ? {wireframeIndexCount: attributes.indexCount, programGeometry: attributes.geometry} : {})};
       if (record) storeBundlePacket(state, record, packet);
       return packet;
@@ -2662,8 +2718,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         state.shadowGraphs.roots.has(node) && !(node instanceof three.ShadowNode));
     },
     geometry(descriptor) { const state = stateOf(descriptor); return descriptor.wireframe ? wireframes.geometry(descriptor)
-      : state.generated ? generatedAttributes.geometry(descriptor) : state.geometry; },
-    attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(descriptor) : 0)
+      : state.generated ? generatedAttributes.geometry(state.attributeOwner) : state.geometry; },
+    attributeBytes(descriptor) { const state = stateOf(descriptor); return (state.generated ? generatedAttributes.byteLength(state.attributeOwner) : 0)
       + (descriptor.wireframe ? wireframes.byteLength(descriptor) : 0); },
     captureAttributes(descriptor, context = {}) {
       const state = stateOf(descriptor); assertInstances(context.object ?? state.object, state.instanceSignature); checkAttributes(state, context);
@@ -2672,7 +2728,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     },
     textures(descriptor) { return readTextures(stateOf(descriptor), true); },
     storage(descriptor) { return readStorage(stateOf(descriptor)); },
-    vertexStorage(descriptor) { return stateOf(descriptor).generated ? generatedAttributes.storage(descriptor) : []; },
+    vertexStorage(descriptor) { const state = stateOf(descriptor); return state.generated ? generatedAttributes.storage(state.attributeOwner) : []; },
     release(descriptor) { for (const entry of entries) if (entry.descriptor === descriptor) { retire(entry); break; } },
     dispose() { if (disposed) return; disposed = true; for (const entry of [...entries]) retire(entry);
       for (const record of [...customKeyRecords]) record.dispose();

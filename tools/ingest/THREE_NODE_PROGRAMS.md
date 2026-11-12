@@ -140,17 +140,35 @@ snapshots.
 
 Direct compute nodes can override `setup()` in the shared rigid, opaque
 Basic/Standard/Physical node-material profile, with ordinary Float32 geometry
-attributes and storage reads through `positionNode`. Equivalent source keys
+attributes, named storage vertex inputs and storage reads through `positionNode`. Equivalent source keys
 share one graphics construction while each object keeps its own bindings.
 Setup can add ordinary attributes: the first owner retains its pre-setup key,
 and later owners observe the changed layout. Geometry disposal preserves the
 constructed graph; final-owner disposal releases it. A kernel's `needsUpdate`
 rebuilds compute without replaying graphics setup, while material invalidation
-rechecks the source graphics key. Maps, lights, fog, shadow receivers,
-instanced/skinned/morphed meshes and named storage vertex attributes remain outside this custom
-setup profile; existing pinned-setup and lazy Fn profiles are unchanged. Custom
-generation, scheduling overrides and lifecycle property accessors remain
-unsupported.
+rechecks the source graphics key. Maps, lights, fog, shadow receivers and
+instanced/skinned/morphed meshes remain outside this shared geometry profile.
+Existing broader pinned-setup paths remain available outside it. Custom
+generation, scheduling overrides and lifecycle property accessors remain unsupported.
+
+Lazy geometry `Fn` graphs use the same shared source ownership. Ordinary rendering
+constructs each graph after the preceding object's node updates, so earlier
+initialization and vec3 storage padding participate in later source keys. The
+first owner keeps its pre-setup key; equivalent later owners share construction
+without creating another kernel or replaying initialization. Disabling and
+re-enabling `geometryNode` follows material invalidation, including retention of
+the old graph when the material has not been invalidated.
+
+Each render object caches its named vertex selection separately from the shared
+shader and compute graph. Cold or cleared selections resolve after before
+updates; warm selections retain their prior attributes through a callback
+replacement and refresh at the next source entrance. Geometry disposal clears
+the selection without rebuilding the shader. Replacing `object.geometry` during
+a before update keeps the entrance geometry for that draw. Metadata views pin
+both ordinary and storage inputs while earlier queued draws retain their
+accepted views; node-owned attributes and compute/storage bindings keep their
+original identities. A cold callback can promote an ordinary Float32 input to
+storage through the existing storage owner.
 
 The original `NodeFrame` drives before/current/after callbacks. A shared kernel
 with the default `FRAME` frequency runs once across multiple objects and repeated

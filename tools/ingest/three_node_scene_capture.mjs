@@ -424,7 +424,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   }
   // Source node callbacks and later application code can replace geometry or
   // edit membership before deferred preparation. Never traverse that newer tree.
-  const sceneHierarchy = nativeCompanionScene || nativeHookScene && root.isScene === true ? hierarchy : null;
+  const sceneHierarchy = nativeCompanionScene || (nativeHookScene || nativeGeometryScene) && root.isScene === true ? hierarchy : null;
   if (sceneHierarchy && renderRoot.isScene === true) objects.add(renderRoot);
   for (const object of hierarchy.keys()) {
     if (!visibility.get(object)) continue;
@@ -674,15 +674,16 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       throw error;
     }
   };
-  // Mixed companions need the same late per-draw geometry/program selection as
-  // source callbacks: a preceding node update can replace a later mesh's inputs.
+  // Mixed companions and geometry compute need late per-draw construction:
+  // earlier setup/dispatch can add or pad attributes used by the next source key.
   const nativeHooks = hookedObjects.size > 0,
-    nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject || (nativeCompanionScene || nativeHookScene) && root.isScene === true;
+    nativeLifecycle = nativeHooks || nativeOverrides || !!customRenderObject ||
+      (nativeCompanionScene || nativeHookScene || nativeGeometryScene) && root.isScene === true;
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
   // Source public compilation constructs each observable graph only after the
   // preceding object's update/pipeline/after sequence has completed.
-  let deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null ||
-    nativeMaterialExtension(binding.material));
+  let deferredCompilation = !uniforms && (nativeLifecycle || bindings.some(binding => binding.material.geometryNode != null ||
+    nativeMaterialExtension(binding.material)));
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
   if (!bindings.length) {
@@ -963,6 +964,10 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const textureUses = [], storageUses = [], vertexStorageUses = [], bundleGeometries = [], chargedGeometry = new Set(), deferredHookBindings = [];
   const vertexUploads = new Map();
   const captureVertexAttribute = (attribute, view) => {
+    // A cold source selection runs after updateBefore, which can promote an
+    // ordinary named input to storage after the initial binding inspection.
+    if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage vertex streams require the renderer storage owner');
+    storageOwner ??= storageInputs();
     recordBuffer(attribute);
     // Geometries.updateAttribute admits only the first vertex upload in this
     // source render. Later shader bindings may independently update the same
@@ -1612,7 +1617,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!scenes) highPrecisionSceneHistory.set(renderer, scenes = new WeakSet());
     scenes.add(renderRoot);
   }
-  if (nativeCompanionScene) {
+  if (nativeCompanionScene || nativeGeometryScene) {
     let scenes = nativeSceneHistory.get(renderer);
     if (!scenes) nativeSceneHistory.set(renderer, scenes = new WeakSet());
     scenes.add(renderRoot);
