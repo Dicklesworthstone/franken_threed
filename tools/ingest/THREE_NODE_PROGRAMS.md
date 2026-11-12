@@ -83,8 +83,14 @@ Compute-only setup nodes are checked by the compute owner, so legal kernel
 assignments do not become rejected graphics writes. Nodes generated into the
 vertex or fragment shader still receive full graphics validation; returning or
 sharing a write into an actual graphics flow does not bypass that boundary.
-Custom ComputeNode subclasses or replaced construction/update methods remain
-outside this profile.
+`ComputeNode` subclasses can retain the pinned setup, generation and scheduling
+methods while supplying ordinary before/current/after callbacks at NONE, FRAME,
+RENDER or OBJECT frequency. The existing source `NodeFrame` owns callback
+receivers, context restoration, false-return retry and shared-object scheduling;
+the compute owner retains initialization, dispatches, storage and queued uniform
+snapshots. Custom setup/generation, scheduling overrides and lifecycle property
+accessors remain outside this profile. In particular, custom setup needs source
+shared graphics-builder ownership before its observable effects can be admitted.
 
 The original `NodeFrame` drives before/current/after callbacks. A shared kernel
 with the default `FRAME` frequency runs once across multiple objects and repeated

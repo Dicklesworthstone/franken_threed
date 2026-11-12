@@ -1067,12 +1067,28 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function inspectCompute(node) {
     const source = three.ComputeNode?.prototype;
-    if (!source || Object.getPrototypeOf(node) !== source ||
-        ['setup', 'generate', 'updateBefore', 'getUpdateBeforeType'].some(key => node[key] !== source[key]) ||
+    const callbacks = ['updateBefore', 'update', 'updateAfter'],
+      frequencies = ['updateBeforeType', 'updateType', 'updateAfterType'],
+      methods = ['setup', 'generate', 'getUpdateBeforeType', 'getUpdateType', 'getUpdateAfterType', 'updateReference'];
+    if (!source || !(node instanceof three.ComputeNode))
+      fail('STORAGE', 'Render-triggered compute requires a source ComputeNode');
+    // Admission must not evaluate an application's lifecycle getters before
+    // NodeFrame reaches its update boundary. Inherited ordinary methods retain
+    // their original receiver and run through the same compute/storage owner.
+    for (let owner = node; owner && owner !== source; owner = Object.getPrototypeOf(owner))
+      for (const key of [...callbacks, ...frequencies, ...methods]) {
+        const property = Object.getOwnPropertyDescriptor(owner, key);
+        if (property && !Object.hasOwn(property, 'value'))
+          fail('STORAGE', 'Render-triggered compute requires ordinary lifecycle properties');
+      }
+    // Custom setup requires source shared graphics-builder ownership before its
+    // effects can be admitted. Pinned generation also keeps compute writes out
+    // of graphics, and getUpdateBeforeType prevents recursive self-dispatch.
+    if (['setup', 'generate', 'getUpdateBeforeType'].some(key => node[key] !== source[key]) ||
         ['getUpdateType', 'getUpdateAfterType', 'updateReference'].some(key => node[key] !== three.Node.prototype[key]) ||
-        !['none', 'frame', 'render', 'object'].includes(node.updateBeforeType) ||
-        node.updateType !== 'none' || node.updateAfterType !== 'none')
-      fail('STORAGE', 'Render-triggered compute requires the pinned ComputeNode construction and update lifecycle');
+        frequencies.some(key => !['none', 'frame', 'render', 'object'].includes(node[key])) ||
+        callbacks.some(key => typeof node[key] !== 'function'))
+      fail('STORAGE', 'Render-triggered compute requires pinned construction and scheduling with ordinary update callbacks');
   }
   function sssSignature(material) {
     if (materialPrototype(material) !== three.MeshSSSNodeMaterial?.prototype) return null;

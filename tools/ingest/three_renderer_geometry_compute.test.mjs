@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
@@ -123,6 +124,148 @@ function sharedKernel(f, name = 'shared-geometry') {
   return {attribute, values, kernel};
 }
 
+function inheritedKernel(f, frequency = 'frame') {
+  const attribute = new T.StorageBufferAttribute(1, 4), values = N.storage(attribute, 'vec4', 1);
+  const state = {attribute, values, step: N.uniform(.125), nextStep: .125, initializations: 0, observe: () => {}};
+  class SimulationStep extends T.ComputeNode {
+    constructor() {
+      super(N.Fn(() => { values.element(0).addAssign(N.vec4(state.step, 0, 0, 0)); })(), [1]);
+      this.count = 1; this.name = 'inherited-geometry-step';
+      this.updateBeforeType = this.updateType = this.updateAfterType = frequency;
+      this.onInit(() => { state.initializations++; });
+    }
+    updateBefore(frame) {
+      state.observe('before', frame);
+      if (state.retryBefore) { state.retryBefore = false; return false; }
+      return super.updateBefore(frame);
+    }
+    update(frame) { state.observe('current', frame); state.step.value = state.nextStep; }
+    updateAfter(frame) { state.observe('after', frame); }
+  }
+  class ApplicationStep extends SimulationStep {}
+  state.kernel = new ApplicationStep();
+  f.material.geometryNode = state.kernel; f.material.positionNode = N.positionLocal.add(values.element(0).xyz);
+  return state;
+}
+
+test('inherited compute callbacks compile, share dispatches, and retain source shaders and native storage', async t => {
+  const reference = fixture(t, {background: false}), expectedState = inheritedKernel(reference);
+  await reference.renderer.init();
+  const graphics = sourceCode(reference), compute = new T.WGSLNodeBuilder(null, reference.renderer);
+  compute.compute = expectedState.kernel; compute.build();
+  const f = fixture(t, {background: false}), state = inheritedKernel(f), other = new T.Mesh(f.object.geometry, f.material);
+  other.frustumCulled = false; other.position.x = 1; f.scene.add(other);
+  let dispatches = 0;
+  f.device.onCompute = pass => new Float32Array(storage(pass)[0].data).fill(++dispatches * .25);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(f.computes.length, 1); assert.equal(state.initializations, 1); assert.equal(draws(f).length, 0);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(f.computes[0].pipeline.compute.module.code), canonical(compute.computeShader));
+  f.renderer.render(f.scene, f.camera); f.renderer.render(f.scene, f.camera);
+  state.nextStep = .625; f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  state.nextStep = 99; await drain(f.renderer);
+  assert.equal(canonical(packets(f)[0].binding.nodeProgram.vertex), canonical(graphics.vertexShader));
+  assert.equal(canonical(packets(f)[0].binding.nodeProgram.fragment), canonical(graphics.fragmentShader));
+  assert.equal(f.computes.length, 2, 'one shared kernel runs once per source frame across objects and renders');
+  assert.equal(state.initializations, 1);
+  const uniforms = pass => pass.bytes.flatMap(bytes => [...new Float32Array(bytes.buffer)]);
+  assert.ok(uniforms(f.computes[0]).includes(.125)); assert.ok(uniforms(f.computes[1]).includes(.625));
+  assert.ok(!uniforms(f.computes[1]).includes(99));
+  const gpu = storage(f.computes[0])[0], submitted = draws(f);
+  assert.equal(submitted.length, 6);
+  assert.deepEqual(submitted.map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.25, .25, .25, .25, .5, .5]);
+  assert.ok(state.attribute.array.every(value => value === 0));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const frequency of ['frame', 'render', 'object'])
+test(`inherited compute ${frequency} callbacks match source NodeManager contexts and update markers`, async t => {
+  const candidate = fixture(t, {background: false}), reference = fixture(t, {background: false});
+  const actual = inheritedKernel(candidate, frequency), expected = inheritedKernel(reference, frequency);
+  await candidate.renderer.init(); await reference.renderer.init();
+  const traces = [[], []];
+  for (const [index, f, state] of [[0, candidate, actual], [1, reference, expected]]) state.observe = (stage, frame) => {
+    assert.equal(frame.renderer, f.renderer);
+    if (frame.object !== null) {
+      assert.equal(frame.object, f.object); assert.equal(frame.scene, f.scene);
+      assert.equal(frame.camera, f.camera); assert.equal(frame.material, f.material); assert.equal(frame.compute, null);
+    } else {
+      assert.equal(frame.scene, null); assert.equal(frame.camera, null); assert.equal(frame.material, null);
+      assert.equal(frame.compute, stage === 'current' ? null : state.kernel);
+    }
+    traces[index].push([stage, frame.object === null ? 'compute' : 'draw']);
+  };
+  reference.renderer.debug.onNodeBuilderCreated = null;
+  const nodes = new SourceNodeManager(reference.renderer,
+    {createNodeBuilder: object => new T.WGSLNodeBuilder(object, reference.renderer)});
+  nodes.nodeFrame = reference.renderer._nodes.nodeFrame;
+  const graphics = sourceCode(reference), renderObject = {...reference, getNodeBuilderState: () => graphics};
+  // Use the pinned NodeManager for all callback ordering and frame contexts;
+  // this source side needs no command submission to observe its node lifecycle.
+  reference.renderer.compute = node => {
+    const frame = nodes.nodeFrame, previous = frame.renderId;
+    frame.renderId = ++reference.renderer.info.calls;
+    try { nodes.updateBeforeForCompute(node); nodes.updateForCompute(node); nodes.updateAfterForCompute(node); }
+    finally { frame.renderId = previous; }
+  };
+  for (const nextFrame of [false, false, true]) {
+    if (nextFrame) { candidate.renderer._nodes.nodeFrame.update(); nodes.nodeFrame.update(); }
+    candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+    nodes.nodeFrame.renderId = ++reference.renderer.info.calls;
+    nodes.updateBefore(renderObject); nodes.updateForRender(renderObject); nodes.updateAfter(renderObject);
+  }
+  assert.deepEqual(traces[0], traces[1]);
+  assert.equal(candidate.computes.length, frequency === 'frame' ? 2 : 3);
+  assert.equal(candidate.renderer._nodeCaptureBytes, 0);
+});
+
+test('inherited compute false before callbacks retry within the same source frame', async t => {
+  const f = fixture(t, {background: false}), state = inheritedKernel(f), stages = [];
+  state.retryBefore = true; state.observe = stage => stages.push(stage);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(f.computes.length, 0); assert.equal(state.initializations, 0);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(f.computes.length, 1); assert.equal(state.initializations, 1);
+  assert.deepEqual(stages, ['before', 'current', 'after', 'before']);
+});
+
+for (const method of ['setup', 'generate'])
+test(`render-triggered compute retains its pinned ${method} boundary`, async t => {
+  const f = fixture(t, {background: false}), state = inheritedKernel(f);
+  state.kernel[method] = function (...args) { return T.ComputeNode.prototype[method].apply(this, args); };
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+});
+
+test('compute lifecycle accessor rejection does not invoke application getters', async t => {
+  const f = fixture(t, {background: false}), state = inheritedKernel(f); let reads = 0;
+  Object.defineProperty(Object.getPrototypeOf(state.kernel), 'update', {
+    get() { reads++; return () => {}; },
+  });
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(reads, 0); assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+});
+
+for (const attachment of [false, true])
+test(`inherited compute refuses ${attachment ? 'the pending parent attachment' : 'earlier draw storage aliases'}`, async t => {
+  const f = fixture(t, {background: false}), state = inheritedKernel(f);
+  if (attachment) {
+    const target = new T.RenderTarget(16, 16); t.after(() => target.dispose());
+    state.kernel.computeNode = N.Fn(() => { state.values.element(0).assign(N.textureLoad(target.texture, N.ivec2(0))); })();
+    f.renderer.setRenderTarget(target);
+  } else {
+    const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
+    material.colorNode = state.values.element(0).xyz; reader.renderOrder = -1; reader.frustumCulled = false; f.scene.add(reader);
+    t.after(() => material.dispose());
+  }
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('a shared ComputeNode updates once per source frame across objects and repeated renders', async t => {
   const f = fixture(t), {kernel} = sharedKernel(f); let initializations = 0;
   kernel.onInit(() => { initializations++; });
@@ -225,13 +368,20 @@ test('hidden geometry constructors stay inert until selected for a source render
   assert.equal(state.builds, 1); assert.equal(state.initializations, 1); assert.equal(f.computes.length, 2);
 });
 
-test('compute-only assignment exemption cannot admit a generated graphics storage write', async t => {
+for (const inherited of [false, true])
+test(`${inherited ? 'inherited' : 'ordinary'} compute cannot admit a generated graphics storage write`, async t => {
   const f = fixture(t, {background: false}), output = N.instancedArray(1, 'float');
   f.material.geometryNode = N.Fn(() => { output.element(0).assign(1); })().compute(1);
+  let updates = 0;
+  if (inherited) {
+    class CustomStep extends T.ComputeNode { update() { updates++; } }
+    f.material.geometryNode = new CustomStep(f.material.geometryNode.computeNode, [1]);
+    f.material.geometryNode.count = 1; f.material.geometryNode.updateType = 'object';
+  }
   f.material.colorNode = N.Fn(() => { output.element(0).assign(2); return N.vec3(output.element(0)); })();
   await f.renderer.init();
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
-  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(updates, 0);
 });
 
 
