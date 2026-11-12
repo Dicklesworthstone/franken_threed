@@ -856,6 +856,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // its shared LightsNode/NodeFrame own light uniforms and update frequencies.
   context.lights = Object.freeze(lights);
   const lighting = renderer.lighting, lightsNode = lighting?.getNode?.(root) ?? null;
+  if (lightsNode instanceof three.LightsNode) context.sourceLightsNode = lightsNode;
   if (customRenderObject && !(lightsNode instanceof three.LightsNode))
     fail('LIGHTS', 'Custom object dispatch requires the source Lighting owner');
   // A custom dispatcher can change this live list between its material passes.

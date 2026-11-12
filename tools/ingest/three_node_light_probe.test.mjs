@@ -103,13 +103,17 @@ test('inactive probes keep ArrayCamera scenes on fixed shaders without construct
   }
 });
 
-test('unlit scenes do not compile probe graphs and material extensions retain the scene-light profile boundary', t => {
+test('unlit scenes leave probes inert while inherited Standard materials retain the source probe graph', t => {
   const f = sourceRig(t, THREE.MeshBasicMaterial);
   const captured = f.capture({getPrograms() { assert.fail('Basic has no probe lighting'); }});
   assert.equal(captured.bindings.length, 0); assert.equal(captured.objects.has(f.object), false);
   class CustomStandard extends THREE.MeshStandardMaterial {}
-  f.object.material = new CustomStandard();
-  assert.throws(() => f.capture(), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  const g = sourceRig(t, CustomStandard), reference = new THREE.WGSLNodeBuilder(g.object, g.renderer);
+  reference.scene = g.scene; reference.camera = g.camera; reference.lightsNode = N.lights([g.probe]); reference.build();
+  const descriptor = g.compile(), packet = g.programs.captureDraw(descriptor, g.context);
+  assert.equal(descriptor.vertex, reference.vertexShader); assert.equal(descriptor.fragment, reference.fragmentShader);
+  assert.deepEqual(uniformSH(descriptor, packet), expectedSH(g.probe));
+  assert.ok(g.capture().objects.has(g.object));
 });
 
 function recording(t) {

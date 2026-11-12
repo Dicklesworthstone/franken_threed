@@ -244,6 +244,55 @@ test('a registered built-in light replacement retains object-frequency updates t
   assert.ok(hasColor(draws(next.device)[0], color.map(value => value * 3)));
 });
 
+for (const Material of [T.MeshStandardNodeMaterial, T.MeshPhysicalNodeMaterial])
+test(`custom ${Material.name} combines scene lighting and maps with queued texture and uniform versions`, async t => {
+  const f = fixture(t), colors = [[.125, .375, .625], [.75, .5, .25]], pixels = [[32, 96, 192, 255], [224, 160, 64, 255]];
+  let setups = 0;
+  class TintPBRMaterial extends Material {
+    constructor() { super(); this.tint = T.TSL.uniform(new T.Color(...colors[0])); }
+    setupDiffuseColor(builder) { setups++; super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.mulAssign(this.tint); }
+  }
+  const material = new TintPBRMaterial(), map = new T.DataTexture(new Uint8Array(pixels[0]), 1, 1);
+  const light = new T.AmbientLight(new T.Color(.25, .5, .75));
+  material.map = map; map.needsUpdate = true; f.mesh.material = material; f.scene.add(light);
+  t.after(() => { material.dispose(); map.dispose(); light.dispose(); });
+  f.device.queue.writeTexture = (destination, data) => f.device.textureWrites.push({destination,
+    bytes: new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength).slice()});
+  await f.renderer.init();
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  material.tint.value.setRGB(...colors[1]); map.image.data.set(pixels[1]); map.needsUpdate = true; light.intensity = 2;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.equal(setups, 1, 'uniform and map upload versions do not reconstruct the source shader');
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 2);
+  assert.ok(hasColor(actual[0], colors[0])); assert.ok(hasColor(actual[1], colors[1]));
+  assert.ok(hasColor(actual[0], [.25, .5, .75])); assert.ok(hasColor(actual[1], [.5, 1, 1.5]));
+  const sampled = draw => [...draw.groups.values()].flatMap(({group}) => group.entries)
+    .find(entry => entry.resource?.texture)?.resource.texture;
+  const textures = actual.map(sampled); assert.ok(textures.every(Boolean));
+  const writes = f.device.textureWrites.filter(write => textures.includes(write.destination.texture));
+  assert.deepEqual(writes.map(write => [...write.bytes]), pixels);
+  for (const [index, write] of writes.entries()) assert.equal(write.destination.texture, textures[index]);
+  assert.equal(setups, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('unlit material subclasses observe the complete scene light list at source reconstruction boundaries', async t => {
+  const f = fixture(t), selections = [];
+  class SceneAwareBasicMaterial extends T.MeshBasicNodeMaterial {
+    setup(builder) { selections.push(builder.lightsNode.getLights().map(light => light.id)); return super.setup(builder); }
+  }
+  const material = new SceneAwareBasicMaterial(), ambient = new T.AmbientLight(), directional = new T.DirectionalLight();
+  f.mesh.material = material; f.scene.add(ambient);
+  t.after(() => { material.dispose(); ambient.dispose(); directional.dispose(); });
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); f.renderer.render(f.scene, f.camera);
+  f.scene.add(directional); f.renderer.render(f.scene, f.camera);
+  f.scene.remove(ambient); f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(selections, [[ambient.id], [ambient.id, directional.id], [directional.id]]);
+  await drain(f.renderer); assert.equal(draws(f.device).length, 4);
+  assert.equal(selections.length, 3, 'pipeline preparation does not repeat scene-sensitive setup');
+});
+
 test('custom PBR cache keys run at native draw capture and preserve queued uniform versions', async t => {
   const f = fixture(t), material = new T.MeshStandardMaterial(), events = [];
   f.mesh.material = material; t.after(() => material.dispose());

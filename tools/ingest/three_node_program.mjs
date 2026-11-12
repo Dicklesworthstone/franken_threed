@@ -224,7 +224,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const spotLightClasses = new Set([three.SpotLight, three.IESSpotLight, three.ProjectorLight].filter(Boolean));
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
-  const environmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
+  const environmentNodes = new WeakMap(), sceneEnvironmentNodes = new WeakMap(), environmentVersions = new WeakMap(), uniformBuffers = new WeakMap(), fogNodes = new WeakMap();
   const generatedAttributes = createThreeNodeAttributes(three, {maxBytes: maxAttributeBytes, fail});
   const wireframes = createThreeNodeWireframes(three, {maxBytes: maxAttributeBytes, fail});
   const bundleGeometryRecords = new Set();
@@ -234,6 +234,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const families = nodeMaterialFamilies(three);
   const sourceMaterialPrototypes = new Set([three.Material.prototype, ...families.keys(),
     ...[...MATERIAL_CONVERSIONS.keys()].map(name => three[name]?.prototype).filter(Boolean)]);
+  const sourceMaterialAccessors = new Map();
+  for (const prototype of sourceMaterialPrototypes)
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(prototype)))
+      if (!Object.hasOwn(descriptor, 'value')) {
+        let accessors = sourceMaterialAccessors.get(name);
+        if (!accessors) sourceMaterialAccessors.set(name, accessors = []);
+        accessors.push(descriptor);
+      }
   const materialPrototype = material => {
     for (let prototype = Object.getPrototypeOf(material); prototype; prototype = Object.getPrototypeOf(prototype))
       if (families.has(prototype)) return prototype;
@@ -243,8 +251,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   // Other profiles retain their existing per-object construction owners.
   const sharedBuilders = new Map(), builderContexts = new Map();
   const customKeyCache = new WeakMap(), customKeyRecords = new Set();
-  const builderCallKeys = new WeakMap(), defaultBuilderCallKey = {};
-  const emptyLightsKey = three.TSL.lights([]).getCacheKey(true);
+  const builderCallKeys = new WeakMap(), defaultBuilderCallKeys = new WeakMap(), builderLightNodes = new WeakMap();
+  const defaultBuilderLights = three.TSL.lights([]);
   const shaderPairs = new Map();
   let disposed = false, shaderBytes = 0, serial = 0;
   function retainShaders(pair) {
@@ -268,8 +276,16 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     materialPrototype(material) === three.MeshBasicNodeMaterial.prototype;
   function inspectMaterialAccessors(material) {
     for (let owner = material; owner && !sourceMaterialPrototypes.has(owner); owner = Object.getPrototypeOf(owner))
-      if (Object.values(Object.getOwnPropertyDescriptors(owner)).some(property => !Object.hasOwn(property, 'value')))
+      for (const [name, property] of Object.entries(Object.getOwnPropertyDescriptors(owner))) {
+        if (Object.hasOwn(property, 'value')) continue;
+        // setDefaultValues copies these exact source accessors onto the
+        // application's subclass prototype. They remain ordinary source data.
+        if (sourceMaterialAccessors.get(name)?.some(source => source.get === property.get && source.set === property.set)) continue;
+        // Physical's constructor defines this nonenumerable instance accessor.
+        // Neither conversion, preflight nor the source material key reads it.
+        if (owner === material && name === 'reflectivity' && !property.enumerable) continue;
         fail('HOOK', 'Native material extensions require ordinary data properties and methods, not application accessors');
+      }
     const type = materialProperty(materialDataProperty(material, 'constructor'), 'type');
     if (type?.get && ![...families.values()].some(Native => Object.getOwnPropertyDescriptor(Native, 'type')?.get === type.get))
       fail('HOOK', 'Native material extensions require a data-valued or inherited source static type');
@@ -723,9 +739,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       node.getBuiltinLights().map(input => input.isNode === true
         ? [sourceId(input), input.getCacheKey()] : input.id)] : null]);
   }
-  function sourceLights(material, {lights = [], lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}) {
+  function sourceLights(material, {lights = [], lightsNode = null, sourceLightsNode = null,
+    lightingEnabled = renderer.lighting?.enabled !== false} = {}, forceScene = false) {
     const authored = authoredLightsNode(material);
-    if (!authored && ((!litMaterial(material) && !(lightsNode && lightingMaterial(material))) ||
+    if (!forceScene && !authored && ((!litMaterial(material) && !(lightsNode && lightingMaterial(material))) ||
         material.lights !== true || material.fragmentNode != null)) return [];
     if (typeof lightingEnabled !== 'boolean' || !lightsNode && lightingEnabled !== (renderer.lighting?.enabled !== false))
       fail('LIGHTS', 'Captured lighting enablement must match the source renderer during construction');
@@ -734,6 +751,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (authored) lights = authored.getBuiltinLights().flatMap(input => input instanceof three.Light
       ? [input] : input.isAnalyticLightNode === true ? [input.light] : []);
     else if (!lightingEnabled && !lightsNode) return [];
+    else if (forceScene && sourceLightsNode) {
+      inspectSceneLightsNode(sourceLightsNode);
+      lights = sourceLightsNode.getLights();
+    }
     if (!Array.isArray(lights)) fail('LIGHTS', 'Supply the selected source scene lights');
     // The source forward graph includes every selected light. Its generated
     // node, shader and device-binding budgets below bound the actual work;
@@ -831,6 +852,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!texture) return null;
     let node = environmentNodes.get(texture);
     if (!node) { node = three.TSL.texture(texture); environmentNodes.set(texture, node); }
+    return node;
+  }
+  function sceneEnvironmentNode(scene) {
+    if (renderer.lighting?.enabled === false) return null;
+    const texture = scene?.environment;
+    if (!texture) return null;
+    let node = sceneEnvironmentNodes.get(texture);
+    if (!node) {
+      node = texture.isCubeTexture ? three.TSL.cubeTexture(texture) : three.TSL.texture(texture);
+      sceneEnvironmentNodes.set(texture, node);
+    }
     return node;
   }
   const integerTextureType = texture => texture?.isDepthTexture === true ? null : three.IntType !== undefined && texture?.type === three.IntType ? 'sint'
@@ -1174,7 +1206,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       volume = prototype === three.VolumeNodeMaterial?.prototype;
     if (!lit && !material.isMeshBasicNodeMaterial && material.lights !== false)
       fail('LIGHTS', 'Base NodeMaterial graphs must be unlit');
-    const lights = sourceLights(material, context), lightsNode = authoredLightsNode(material);
+    const lights = sourceLights(material, context, extension), lightsNode = authoredLightsNode(material);
     const authoredNodes = new Set(authoredLightings(lightsNode));
     if (physical && material.useTransmission && (typeof renderer.copyFramebufferToTexture !== 'function' ||
         typeof renderer.getCanvasTarget !== 'function' || typeof renderer._getSampledTextureInputs !== 'function'))
@@ -1207,7 +1239,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // program cache keys at its construction/invalidation boundaries. The
     // shared rigid PBR profile has that complete source cache lifecycle.
     if ((extension || hasThreeCustomProgramCacheKey(three, sourceMaterial)) && !sharedConstruction(sourceMaterial, material,
-      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode)))
+      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true))
       fail('HOOK', 'Native material extensions and custom program keys require their shared rigid construction profile');
     for (const key of Object.keys(material)) {
       const value = material[key];
@@ -1427,7 +1459,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       [target.textures.length, target.texture.format, target.texture.type, target.samples, target.depthBuffer, target.stencilBuffer].join(':')}-default-0`;
     return {attachment, chain: JSON.stringify([context.passId ?? null, attachment, sourceId(context.scene ?? null)])};
   }
-  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature) {
+  function inspectSceneLightsNode(node) {
+    if (!(node instanceof three.LightsNode) || Object.getPrototypeOf(node) !== three.LightsNode.prototype ||
+        ['getLights', 'getBuiltinLights', 'getCacheKey', 'customCacheKey', 'setup', 'setupLightsNode']
+          .some(name => materialDataProperty(node, name) !== three.LightsNode.prototype[name]))
+      fail('LIGHTS', 'Shared native material construction requires the selected source LightsNode');
+  }
+  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature, validationOnly = false) {
     // Source builder sharing is first admitted for callback-free, rigid PBR
     // material graphs. These nodes read live object/material uniforms through
     // NodeFrame, but retain their construction-time environment selection.
@@ -1441,33 +1479,48 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
         prepared.transparent || prepared.wireframe || prepared.useTransmission || !extension && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (extension ? ['geometryNode', 'lightsNode', 'contextNode'] : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
-        [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
+        !extension && [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
           attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute || attribute.isStorageBufferAttribute) ||
-        context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode ||
-        context.camera?.isArrayCamera || context.lightsNode || context.lights?.length || lights.length || context.lightingEnabled === false ||
-        renderer.lighting?.enabled === false || rendererContextSignature !== null ||
+        !extension && context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode ||
+        context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
+          context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
     const {attachment, chain} = builderScope(context);
+    // Admission runs during projection, before the source light list is ready.
+    // Only actual program construction may initialize NodeManager's call key.
+    if (validationOnly) return {chain};
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
-    let callKey = context.scene && builderCallKeys.get(context.scene);
-    if (!callKey) {
-      callKey = context.scene ? {} : defaultBuilderCallKey;
-      if (context.scene) builderCallKeys.set(context.scene, callKey);
+    let lightsNode = context.sourceLightsNode;
+    if (lightsNode) inspectSceneLightsNode(lightsNode);
+    else {
+      lightsNode = context.scene ? builderLightNodes.get(context.scene) : defaultBuilderLights;
+      if (!lightsNode) builderLightNodes.set(context.scene, lightsNode = three.TSL.lights([]));
+      lightsNode.setLights(renderer.lighting?.enabled === false ? [] : (context.lights ?? lights).slice());
     }
+    let callKeys = context.scene ? builderCallKeys.get(context.scene) : defaultBuilderCallKeys;
+    if (!callKeys) builderCallKeys.set(context.scene, callKeys = new WeakMap());
+    let callKey = callKeys.get(lightsNode);
+    if (!callKey) callKeys.set(lightsNode, callKey = {});
     // NodeManager caches scene/light/shadow state once per renderer call.
     // Context-node identity/version remains a live RenderObject dimension.
     if (callKey.key === undefined || callKey.call !== renderer.info?.calls) {
       callKey.call = renderer.info?.calls;
-      callKey.key = hashArray([0, 1, emptyLightsKey, renderer.shadowMap?.enabled ? 1 : 0, renderer.shadowMap?.type]);
+      const enabled = renderer.lighting?.enabled !== false, values = [0, enabled ? 1 : 0];
+      if (enabled) {
+        values.push(lightsNode.getCacheKey(true), renderer.shadowMap?.enabled ? 1 : 0, renderer.shadowMap?.type);
+        const environmentNode = extension ? sceneEnvironmentNode(context.scene) : null;
+        if (environmentNode) values.push(environmentNode.getCacheKey());
+      }
+      callKey.key = hashArray(values);
     }
     const dynamic = hash(callKey.key, renderer.contextNode.id, renderer.contextNode.version);
-    return {contextId, dynamic, chain};
+    return {contextId, dynamic, chain, lightsNode};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -1526,16 +1579,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
     if (!record && !hasThreeCustomProgramCacheKey(three, material) &&
         !materialExtension(material)) return compileProgram(material, object, context);
+    const priorPasses = cache.get(object)?.get(material);
+    const previous = priorPasses?.get(chain) ?? priorPasses?.get(context.passId ?? null);
+    // A per-object graph has no retained source builder key to adopt. Changing
+    // its converter family must not replay setup or cache-key callbacks before
+    // the application releases that previous material construction.
+    if (!record && materialExtension(material) && previous && !previous.sharedBuilder)
+      fail('MATERIAL_CACHE', 'Changing an existing native material to a registered extension requires material.dispose()');
     const profile = () => {
       const prepared = inspect(material, object, context);
-      const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
+      const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
         inspectThreeLightingContext(three, renderer.contextNode));
       if (!construction || construction.chain !== chain)
         fail('HOOK', 'Custom native material construction must retain its shared rigid profile');
       return construction;
     };
     let construction = profile();
-    const previous = cache.get(object)?.get(material)?.get(chain);
     // Installing a key after an ordinary first draw does not itself invalidate
     // the source RenderObject. Adopt its already accepted source key/version.
     if (!record && previous?.sharedBuilder) {
@@ -1607,7 +1666,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const extension = materialExtension(material);
     const retainedBuilder = sourceKey && (sourceKey.entry?.sharedBuilder ?? sharedBuilders.get(sourceKey.key));
     const preparedMaterial = inspect(material, object, context, retainedBuilder?.preparedPrototype ?? null);
-    const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
+    const lights = sourceLights(preparedMaterial, context, extension), environment = sourceEnvironment(preparedMaterial, context);
     const lightKey = lightingSignature(preparedMaterial, lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
@@ -1723,7 +1782,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const builder = sharedBuilder?.builder ?? new three.WGSLNodeBuilder(object, renderer);
     const captureShadowGraphs = sharedBuilder?.captureShadowGraphs ?? captureThreeNativeShadowGraphs(three, builder);
     const authored = authoredLightsNode(preparedMaterial);
-    const environmentNode = sharedBuilder?.environmentNode ?? (environmentGraph(preparedMaterial, context) || environmentNodeFor(environment));
+    const environmentNode = sharedBuilder ? sharedBuilder.environmentNode : extension ? sceneEnvironmentNode(context.scene)
+      : environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     let graphicsNode = sharedBuilder?.graphicsNode;
     if (!sharedBuilder) {
       effects.installBuilder(builder);
@@ -1734,7 +1794,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
       // Keep the scene entrance distinct from material.lightsNode, just as the
       // pinned NodeManager does. NodeMaterial selects the authored graph itself.
-      if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
+      if (extension) builder.lightsNode = construction.lightsNode;
+      else if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
         ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
       if (environmentNode) builder.environmentNode = environmentNode;
       builder.fogNode = fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
@@ -1776,7 +1837,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native backdrop graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
-    if (lightingSignature(currentPrepared, sourceLights(currentPrepared, context)) !== lightKey)
+    if (lightingSignature(currentPrepared, sourceLights(currentPrepared, context, extension)) !== lightKey)
       fail('CHANGED', 'Native light selection or registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.

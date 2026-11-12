@@ -29,11 +29,24 @@ function fixture(t, options = {}) {
     object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
     return {object, material};
   };
-  const context = item => ({...item, scene, camera, lights: [], renderId: renderer.info.calls, frameId: 1});
+  const context = item => ({...item, scene, camera, lights: lights.getLights(), sourceLightsNode: lights,
+    renderId: renderer.info.calls, frameId: renderer.info.calls});
   const compile = item => programs.compile(item.material, item.object, context(item));
   const capture = (item, descriptor = compile(item)) => programs.captureDraw(descriptor, context(item));
-  const reference = item => source.get(item.object, item.material, scene, camera, lights, renderContext, null).getNodeBuilderState();
-  return {renderer, programs, source, scene, camera, add, context, compile, capture, reference};
+  const referenceObject = item => source.get(item.object, item.material, scene, camera, lights, renderContext, null);
+  const reference = item => referenceObject(item).getNodeBuilderState();
+  const referenceDraw = item => {
+    const object = referenceObject(item);
+    nodes.nodeFrame.frameId = nodes.nodeFrame.renderId = renderer.info.calls;
+    nodes.updateForRender(object);
+    const bindings = object.getBindings().flatMap(group => group.bindings);
+    const textures = bindings.filter(binding => binding.isSampledTexture).map(binding => binding.textureNode.value);
+    const uniforms = bindings.filter(binding => binding.isUniformsGroup).map(binding => {
+      binding.update(); return new Uint8Array(binding.buffer.buffer, binding.buffer.byteOffset, binding.buffer.byteLength).slice();
+    });
+    return {textures, uniforms};
+  };
+  return {renderer, programs, source, scene, camera, lights, add, context, compile, capture, reference, referenceDraw};
 }
 const values = packet => packet.uniforms.flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
 function equalShaders(descriptor, reference) {
@@ -184,4 +197,164 @@ test('generated extension resources and node budgets refuse before publishing a 
   class Application extends T.MeshBasicNodeMaterial {}
   assert.throws(() => bounded.compile(bounded.add(new Application())), {code: 'THREE_NODE_PROGRAM_LIMIT'});
   assert.equal(bounded.programs.diagnostics.programs, 0);
+});
+
+function mapTexture(value) {
+  const texture = new T.DataTexture(new Uint8Array([value, 128, 255, 255]), 1, 1);
+  texture.needsUpdate = true;
+  return texture;
+}
+function environmentTexture(value) {
+  const texture = new T.DataTexture(new Uint16Array(336 * 64 * 4).fill(value), 336, 64, T.RGBAFormat, T.HalfFloatType);
+  texture.mapping = T.CubeUVReflectionMapping; texture.minFilter = texture.magFilter = T.LinearFilter;
+  texture.colorSpace = T.LinearSRGBColorSpace; texture.needsUpdate = true;
+  return texture;
+}
+const sampled = packet => packet.textures.filter(binding => binding.isSampledTexture).map(binding => binding.texture);
+
+for (const physical of [false, true]) for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${physical ? 'Physical' : 'Standard'} extensions share source lit map graphs and capture live inputs`, t => {
+  const f = fixture(t), trace = [];
+  const Native = physical ? T.MeshPhysicalNodeMaterial : T.MeshStandardNodeMaterial;
+  const Ordinary = physical ? T.MeshPhysicalMaterial : T.MeshStandardMaterial;
+  class Extension extends Native {
+    constructor() { super(); this.applicationGain = .375; }
+    setupOutput(builder, output) {
+      trace.push('setup');
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends Ordinary {
+    constructor() { super(); this.type = 'ApplicationPBRMaterial'; this.applicationGain = .375; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'ApplicationPBRMaterial');
+  const create = (gain, pixel) => {
+    const material = new (registered ? Application : Extension)();
+    material.applicationGain = gain; material.roughness = .5; material.metalness = .25;
+    material.map = mapTexture(pixel); material.normalMap = mapTexture(128); material.roughnessMap = mapTexture(192);
+    if (physical) { material.clearcoat = .5; material.clearcoatMap = mapTexture(128); }
+    return f.add(material);
+  };
+  const ambient = new T.AmbientLight(0xffffff, .125), directional = new T.DirectionalLight(0xffffff, 2);
+  directional.position.set(1, 2, 3); f.scene.add(ambient, directional, directional.target); f.scene.updateMatrixWorld();
+  f.lights.setLights([directional, ambient]);
+  const a = create(.375, 64), b = create(.875, 192);
+  const sourceA = f.reference(a), sourceTrace = trace.splice(0), descriptorA = f.compile(a);
+  assert.deepEqual(trace.splice(0), sourceTrace); equalShaders(descriptorA, sourceA);
+  const sourceB = f.reference(b), descriptorB = f.compile(b);
+  assert.equal(sourceB, sourceA); equalShaders(descriptorB, sourceB); assert.deepEqual(trace, []);
+  const first = f.capture(a, descriptorA), saved = first.uniforms.map(bytes => bytes.slice());
+  const referenceB = f.referenceDraw(b), second = f.capture(b, descriptorB);
+  assert.deepEqual(sampled(second), referenceB.textures);
+  assert.ok(sampled(second).includes(b.material.map)); assert.ok(!sampled(second).includes(a.material.map));
+  assert.ok(values(first).includes(.375)); assert.ok(values(second).includes(.875));
+  ambient.intensity = .625; directional.intensity = .75; b.material.applicationGain = .4375;
+  b.material.map = mapTexture(32); f.renderer.info.calls++;
+  assert.equal(f.reference(b), sourceB); assert.equal(f.compile(b), descriptorB);
+  const nextSource = f.referenceDraw(b), next = f.capture(b, descriptorB);
+  assert.deepEqual(sampled(next), nextSource.textures); assert.ok(values(next).includes(.4375));
+  assert.deepEqual(next.uniforms, nextSource.uniforms);
+  assert.deepEqual(first.uniforms, saved); assert.deepEqual(trace, []);
+});
+
+test('scene lighting keys preserve source membership, projection timing and call-level invalidation for unlit extensions', t => {
+  const f = fixture(t), trace = [];
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { trace.push('setup'); return super.setupOutput(builder, output); }
+  }
+  const item = f.add(new Extension()), ambient = new T.AmbientLight(), directional = new T.DirectionalLight();
+  f.programs.inspect(item.material, item.object, f.context(item));
+  f.lights.setLights([ambient]);
+  const compare = () => {
+    const source = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected); equalShaders(descriptor, source); return descriptor;
+  };
+  const first = compare();
+  f.lights.setLights([ambient, directional]);
+  assert.equal(compare(), first, 'source call cache keeps a changed light list until the next renderer call');
+  f.renderer.info.calls++;
+  const second = compare(); assert.notEqual(second, first, 'unlit setup still observes source scene-light cache invalidation');
+  f.lights.setLights([directional, ambient]); f.renderer.info.calls++;
+  const reordered = compare(); assert.notEqual(reordered, second, 'projected list order participates in the exact source key');
+  f.lights.setLights([]); f.renderer.info.calls++;
+  assert.notEqual(compare(), reordered);
+});
+
+test('custom PBR builders retain scene and material environment precedence with source cache lifetimes', t => {
+  const f = fixture(t), seen = [], trace = [];
+  class Extension extends T.MeshStandardNodeMaterial {
+    setupOutput(builder, output) {
+      trace.push('setup'); seen.push(builder.environmentNode?.value ?? null);
+      return super.setupOutput(builder, output);
+    }
+  }
+  const sceneEnvironment = environmentTexture(0x3800), materialEnvironment = environmentTexture(0x3400);
+  f.scene.environment = sceneEnvironment;
+  const a = f.add(new Extension()), b = f.add(new Extension()); b.material.envMap = materialEnvironment;
+  const sourceA = f.reference(a), sourceTrace = trace.splice(0), descriptorA = f.compile(a);
+  assert.deepEqual(trace.splice(0), sourceTrace); equalShaders(descriptorA, sourceA);
+  const sourceB = f.reference(b), sourceBTrace = trace.splice(0), descriptorB = f.compile(b);
+  assert.deepEqual(trace.splice(0), sourceBTrace); equalShaders(descriptorB, sourceB);
+  assert.deepEqual(seen, [sceneEnvironment, sceneEnvironment, sceneEnvironment, sceneEnvironment]);
+  assert.ok(sampled(f.capture(a, descriptorA)).includes(sceneEnvironment));
+  assert.ok(sampled(f.capture(b, descriptorB)).includes(materialEnvironment));
+  b.material.envMap = environmentTexture(0x3000); b.material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(f.reference(b), sourceB); assert.equal(f.compile(b), descriptorB);
+  assert.ok(sampled(f.capture(b, descriptorB)).includes(materialEnvironment));
+  const nextSceneEnvironment = environmentTexture(0x3a00); f.scene.environment = nextSceneEnvironment; f.renderer.info.calls++;
+  const replacementSource = f.reference(b), expected = trace.splice(0), replacement = f.compile(b);
+  assert.deepEqual(trace.splice(0), expected); equalShaders(replacement, replacementSource);
+  assert.notEqual(replacement, descriptorB);
+  assert.deepEqual(seen.slice(-2), [nextSceneEnvironment, nextSceneEnvironment]);
+  assert.ok(sampled(f.capture(b, replacement)).includes(b.material.envMap));
+});
+
+test('custom PBR lighting enablement retains the source environment and setup lifecycle', t => {
+  const f = fixture(t), trace = [], environments = [];
+  class Extension extends T.MeshPhysicalNodeMaterial {
+    setupOutput(builder, output) {
+      trace.push('setup'); environments.push(builder.environmentNode?.value ?? null);
+      return super.setupOutput(builder, output);
+    }
+  }
+  f.scene.environment = environmentTexture(0x3800);
+  const light = new T.AmbientLight(0xffffff, .375), item = f.add(new Extension());
+  f.scene.add(light); f.lights.setLights([light]);
+  const compare = () => {
+    const source = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected); equalShaders(descriptor, source); return descriptor;
+  };
+  const lit = compare();
+  f.renderer.lighting.enabled = false; f.lights.setLights([]); f.renderer.info.calls++;
+  const unlit = compare(); assert.notEqual(unlit, lit);
+  assert.deepEqual(environments.slice(-2), [null, null]);
+  assert.equal(sampled(f.capture(item, unlit)).length, 0);
+  assert.equal(compare(), unlit);
+  f.renderer.lighting.enabled = true; f.lights.setLights([light]); f.renderer.info.calls++;
+  const relit = compare(); assert.notEqual(relit, unlit);
+  assert.deepEqual(environments.slice(-2), [f.scene.environment, f.scene.environment]);
+  assert.ok(sampled(f.capture(item, relit)).includes(f.scene.environment));
+});
+
+test('an existing per-object native graph refuses registration migration before key and constructor effects', t => {
+  const f = fixture(t), trace = [], material = new T.MeshBasicMaterial();
+  material.colorNode = N.vec3(.25, .5, .75);
+  const item = f.add(material), source = f.reference(item), descriptor = f.compile(item);
+  equalShaders(descriptor, source); assert.equal(f.compile(item), descriptor);
+  class Replacement extends T.MeshStandardNodeMaterial {
+    constructor() { super(); trace.push('constructor'); this.fragmentNode = N.vec4(.75, .25, .5, 1); }
+    setupOutput(builder, output) { trace.push('setup'); return super.setupOutput(builder, output); }
+  }
+  f.renderer.library.materialNodes.set('MeshBasicMaterial', Replacement);
+  material.customProgramCacheKey = () => { trace.push('key'); return 'replacement'; };
+  f.renderer.info.calls++;
+  assert.equal(f.reference(item), source, 'source registration edits retain the existing render object and graph');
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_MATERIAL_CACHE'});
+  assert.deepEqual(trace, []); assert.equal(f.programs.diagnostics.programs, 1);
+  material.dispose(); f.renderer.info.calls++;
+  const nextSource = f.reference(item), expected = trace.splice(0), next = f.compile(item);
+  assert.deepEqual(trace.splice(0), expected); equalShaders(next, nextSource);
+  assert.notEqual(next, descriptor); assert.notEqual(nextSource, source);
+  assert.equal(f.programs.diagnostics.programs, 1);
 });

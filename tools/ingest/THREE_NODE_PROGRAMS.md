@@ -33,11 +33,14 @@ the existing 4,000-record sharing and queued-disposal cases.
 Custom subclasses of supported node-material families and ordinary materials
 registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
-Replacing a built-in material mapping also selects that path. The initial
-extension profile covers rigid, opaque, single-output meshes with float
-attributes; scene lights, maps, environments, fog, shadows, material context and
-geometry nodes remain outside this material-extension profile. Existing built-in
-material profiles retain their broader supported features.
+Replacing a built-in material mapping also selects that path. The extension
+profile covers rigid, opaque, single-output meshes with float attributes,
+ordinary material maps, analytic scene lights and ready material/scene
+environments. Standard and Physical subclasses retain inherited material
+properties, including the pinned accessors installed by Physical construction.
+Fog, shadow receivers, authored scene environment nodes, material lighting/context
+and geometry nodes remain outside this material-extension profile. Existing
+built-in material profiles retain their broader supported features.
 
 Admission uses the nearest pinned material-family defaults without running a
 custom conversion constructor. The actual source builder performs conversion
@@ -47,9 +50,23 @@ disposal govern subsequent draws. Restoring a default registration keeps the
 already constructed graph and native owner until source reconstruction. Custom
 node fields and generated resource bindings still pass graph, layout and budget
 validation; arbitrary converter overrides and application property accessors are
-not admitted. A material already used by the fixed shader owner must be disposed
-before switching its registration to a custom native conversion; this explicit
-boundary prevents replaying construction under a warm source program.
+not admitted. A material already used by the fixed shader owner or an earlier
+native per-object program must be disposed before migrating that program to a
+custom registered conversion. This explicit boundary prevents replaying
+construction under a warm source program.
+
+The selected source scene `LightsNode` reaches the builder unchanged. Dynamic
+program keys observe its complete light list, including for unlit subclasses
+whose setup methods inspect scene inputs. Inspection does not freeze this key
+before projection has finished. Membership and lighting enablement changes
+reconstruct at source boundaries; radiance, transforms and uniform values stay
+live. Reordering a source-equivalent list retains its existing graph.
+
+Material maps use the existing source texture upload and queued-version owners.
+Distinct material maps retain their own bindings while compatible shader builders
+can share source state. Material environments keep precedence over scene
+environments, and source PMREM selection and lifetime stay attached to their
+constructed graph. This adds no independent texture, light or environment owner.
 
 Registered analytic lights can inherit through custom light and node classes,
 including the built-in analytic node families. Their source before/current/after
