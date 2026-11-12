@@ -117,14 +117,26 @@ Compute-only setup nodes are checked by the compute owner, so legal kernel
 assignments do not become rejected graphics writes. Nodes generated into the
 vertex or fragment shader still receive full graphics validation; returning or
 sharing a write into an actual graphics flow does not bypass that boundary.
-`ComputeNode` subclasses can retain the pinned setup, generation and scheduling
+`ComputeNode` subclasses can retain the pinned generation and scheduling
 methods while supplying ordinary before/current/after callbacks at NONE, FRAME,
 RENDER or OBJECT frequency. The existing source `NodeFrame` owns callback
 receivers, context restoration, false-return retry and shared-object scheduling;
 the compute owner retains initialization, dispatches, storage and queued uniform
-snapshots. Custom setup/generation, scheduling overrides and lifecycle property
-accessors remain outside this profile. In particular, custom setup needs source
-shared graphics-builder ownership before its observable effects can be admitted.
+snapshots.
+
+Direct compute nodes can override `setup()` in the shared rigid, opaque
+Basic/Standard/Physical node-material profile, with ordinary Float32 geometry
+attributes and storage reads through `positionNode`. Equivalent source keys
+share one graphics construction while each object keeps its own bindings.
+Setup can add ordinary attributes: the first owner retains its pre-setup key,
+and later owners observe the changed layout. Geometry disposal preserves the
+constructed graph; final-owner disposal releases it. A kernel's `needsUpdate`
+rebuilds compute without replaying graphics setup, while material invalidation
+rechecks the source graphics key. Maps, lights, fog, shadow receivers,
+instanced/skinned/morphed meshes and named storage vertex attributes remain outside this custom
+setup profile; existing pinned-setup and lazy Fn profiles are unchanged. Custom
+generation, scheduling overrides and lifecycle property accessors remain
+unsupported.
 
 The original `NodeFrame` drives before/current/after callbacks. A shared kernel
 with the default `FRAME` frequency runs once across multiple objects and repeated

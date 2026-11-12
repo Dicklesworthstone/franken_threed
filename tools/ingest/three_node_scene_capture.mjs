@@ -681,7 +681,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   const lifecycleDraw = draw => nativeLifecycle && (!draw.background || customRenderObject);
   // Source public compilation constructs each observable graph only after the
   // preceding object's update/pipeline/after sequence has completed.
-  const deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null ||
+  let deferredCompilation = !uniforms && bindings.some(binding => binding.material.geometryNode != null ||
     nativeMaterialExtension(binding.material));
   if (nativeLifecycle && (root.isScene !== true || !bundles))
     fail('HOOK', 'Native object callbacks and overrides require a source Scene and its immutable geometry owner');
@@ -1312,6 +1312,9 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
           if (!uniforms) {
             // Source compileAsync first queues every render-object selection,
             // including before/after callbacks, then constructs the pipelines.
+            // An object hook can select an extension or geometry override that
+            // was absent from the initial projected material list.
+            deferredCompilation ||= material.geometryNode != null || nativeMaterialExtension(material);
             deferredHookBindings.push(binding); preparationBindings.add(binding); return;
           }
           const current = {...draw, geometry, material};

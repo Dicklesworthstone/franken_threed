@@ -224,8 +224,8 @@ test(`transparent custom DoubleSide retains per-draw node lifecycle and source c
   assert.equal(material.side, T.DoubleSide); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
-for (const rejectPipeline of [false, true])
-test(`custom material compilation prepares each graph after earlier pipeline effects (rejectPipeline=${rejectPipeline})`, async t => {
+for (const override of [false, true]) for (const rejectPipeline of [false, true])
+test(`custom material compilation prepares each graph after earlier pipeline effects (override=${override}, rejectPipeline=${rejectPipeline})`, async t => {
   const f = fixture(t), events = [], constructed = []; let stage = 0;
   class OrderedMaterial extends T.MeshBasicNodeMaterial {
     constructor(variant) {
@@ -250,11 +250,15 @@ test(`custom material compilation prepares each graph after earlier pipeline eff
     }
   }
   const first = new OrderedMaterial('first'), second = new OrderedMaterial('second');
-  f.mesh.material = first; f.mesh.renderOrder = 0;
-  const object = new T.Mesh(f.mesh.geometry, second); object.renderOrder = 1; object.frustumCulled = false; f.scene.add(object);
+  f.mesh.material = override ? f.material : first; f.mesh.renderOrder = 0;
+  const object = new T.Mesh(f.mesh.geometry, override ? f.material : second);
+  object.renderOrder = 1; object.frustumCulled = false; f.scene.add(object);
   t.after(() => { first.dispose(); second.dispose(); });
-  for (const [mesh, name] of [[f.mesh, 'first'], [object, 'second']]) {
-    mesh.onBeforeRender = () => events.push(`${name}:object-before`);
+  for (const [mesh, name, material] of [[f.mesh, 'first', first], [object, 'second', second]]) {
+    mesh.onBeforeRender = () => {
+      events.push(`${name}:object-before`);
+      if (override) f.scene.overrideMaterial = material;
+    };
     mesh.onAfterRender = () => events.push(`${name}:object-after`);
   }
   await f.renderer.init();

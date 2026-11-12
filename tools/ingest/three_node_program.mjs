@@ -1097,7 +1097,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
     }));
   }
-  function inspectCompute(node) {
+  function customGeometrySetup(material) {
+    const node = materialDataProperty(material, 'geometryNode');
+    return material instanceof three.NodeMaterial && node instanceof three.ComputeNode &&
+      materialDataProperty(node, 'setup') !== three.ComputeNode.prototype.setup;
+  }
+  function inspectCompute(node, sharedSetup = false) {
     const source = three.ComputeNode?.prototype;
     const callbacks = ['updateBefore', 'update', 'updateAfter'],
       frequencies = ['updateBeforeType', 'updateType', 'updateAfterType'],
@@ -1113,10 +1118,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (property && !Object.hasOwn(property, 'value'))
           fail('STORAGE', 'Render-triggered compute requires ordinary lifecycle properties');
       }
-    // Custom setup requires source shared graphics-builder ownership before its
-    // effects can be admitted. Pinned generation also keeps compute writes out
-    // of graphics, and getUpdateBeforeType prevents recursive self-dispatch.
-    if (['setup', 'generate', 'getUpdateBeforeType'].some(key => node[key] !== source[key]) ||
+    // Custom setup runs only under source shared graphics-builder ownership.
+    // Pinned generation keeps compute writes out of graphics, while the pinned
+    // update selector prevents recursive self-dispatch from the compute pass.
+    if ((!sharedSetup && node.setup !== source.setup) || typeof node.setup !== 'function' ||
+        ['generate', 'getUpdateBeforeType'].some(key => node[key] !== source[key]) ||
         ['getUpdateType', 'getUpdateAfterType', 'updateReference'].some(key => node[key] !== three.Node.prototype[key]) ||
         frequencies.some(key => !['none', 'frame', 'render', 'object'].includes(node[key])) ||
         callbacks.some(key => typeof node[key] !== 'function'))
@@ -1271,6 +1277,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     const mrt = inspectThreeMRT(three, renderer, material);
+    const sharedSetup = customGeometrySetup(sourceMaterial) && sharedConstruction(sourceMaterial, material,
+      object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true)?.geometrySetup === true;
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
       ...(extension ? Object.values(material).filter(value => value?.isNode === true) : []),
       ...(volume ? [...VOLUME_FUNCTION_SLOTS].map(key => material[key]).filter(node => typeof node === 'function' && node.isNode === true) : []),
@@ -1281,7 +1289,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (seen.has(node)) continue;
       seen.add(node);
       if (seen.size > maxNodes) fail('LIMIT', 'Native node graph exceeds its node budget');
-      checkNode(node, lightsNode, lights, null, null, material, authoredNodes);
+      checkNode(node, lightsNode, lights, null, null, material, authoredNodes, null, sharedSetup);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
       // A compute body has its own writable-resource validation at dispatch.
       // Its generated graphics output is checked after source construction.
@@ -1309,11 +1317,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? prototype === three.BasicLightMapNode.prototype && node.lightMapNode === three.TSL.materialLightMap
       : prototype === three.IrradianceNode.prototype && node.node === three.TSL.materialLightMap;
   }
-  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null, shadowGraphs = null) {
+  function checkNode(node, lightsNode = null, lights = [], environmentNode = null, boundTextures = null, material = null, contextLightings = null, shadowGraphs = null, sharedSetup = false) {
     if (!node?.isNode) fail('GRAPH', 'Expected source TSL nodes');
     if (node.isStorageArrayElementNode && node.node?.structTypeNode && node.node.isAtomic === true)
       fail('STORAGE', 'Native atomic structs use direct source member access, not array indexing');
-    if (node.isComputeNode) { inspectCompute(node); return; }
+    if (node.isComputeNode) { inspectCompute(node, sharedSetup); return; }
     if (node.isPassNode === true) inspectThreeNativePass(three, renderer, node);
     if (node.isPassTextureNode === true) {
       if (node.passNode?.isPassNode === true) inspectThreeNativePass(three, renderer, node.passNode);
@@ -1470,18 +1478,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // material graphs. These nodes read live object/material uniforms through
     // NodeFrame, but retain their construction-time environment selection.
     const extension = materialExtension(material);
+    const geometrySetup = !extension && customGeometrySetup(material);
     const prototype = materialPrototype(prepared);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
-    if (!(extension
+    if (!(geometrySetup
+      ? [three.MeshBasicNodeMaterial.prototype, three.MeshStandardNodeMaterial.prototype,
+        three.MeshPhysicalNodeMaterial.prototype].includes(prototype)
+      : extension
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
-        !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission || !extension && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
-        (extension ? ['geometryNode', 'lightsNode', 'contextNode'] : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
+        !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
+        !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
+        (geometrySetup ? ['lightsNode', 'contextNode'] : extension ? ['geometryNode', 'lightsNode', 'contextNode']
+          : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
         !extension && [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
@@ -1495,7 +1509,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {attachment, chain} = builderScope(context);
     // Admission runs during projection, before the source light list is ready.
     // Only actual program construction may initialize NodeManager's call key.
-    if (validationOnly) return {chain};
+    if (validationOnly) return {chain, geometrySetup};
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
@@ -1523,7 +1537,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       callKey.key = hashArray(values);
     }
     const dynamic = hash(callKey.key, renderer.contextNode.id, renderer.contextNode.version);
-    return {contextId, dynamic, chain, lightsNode};
+    return {contextId, dynamic, chain, lightsNode, geometrySetup};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -1581,7 +1595,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const chain = builderScope(context).chain;
     let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
     if (!record && !hasThreeCustomProgramCacheKey(three, material) &&
-        !materialExtension(material)) return compileProgram(material, object, context);
+        !materialExtension(material) && !customGeometrySetup(material)) return compileProgram(material, object, context);
     const priorPasses = cache.get(object)?.get(material);
     const previous = priorPasses?.get(chain) ?? priorPasses?.get(context.passId ?? null);
     // A per-object graph has no retained source builder key to adopt. Changing
@@ -1589,6 +1603,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // the application releases that previous material construction.
     if (!record && materialExtension(material) && previous && !previous.sharedBuilder)
       fail('MATERIAL_CACHE', 'Changing an existing native material to a registered extension requires material.dispose()');
+    if (!record && customGeometrySetup(material) && previous && !previous.sharedBuilder)
+      fail('MATERIAL_CACHE', 'Adding custom geometry setup to an existing native material requires material.dispose()');
     const profile = () => {
       const prepared = inspect(material, object, context);
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
@@ -1789,6 +1805,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       : environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     let graphicsNode = sharedBuilder?.graphicsNode;
     if (!sharedBuilder) {
+      const constructionGeometry = object.geometry;
       effects.installBuilder(builder);
       installThreeNativeShadowTargets(renderer, builder);
       builder.material = material; builder.context.material = material;
@@ -1814,9 +1831,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         if (cause instanceof ThreeNodeProgramError) throw cause;
         throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
       } finally { builder.addChain = addChain; }
+      if (construction?.geometrySetup && (object.geometry !== constructionGeometry ||
+          !sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature, true)?.geometrySetup))
+        fail('STORAGE', 'Custom geometry setup must retain its selected rigid Float32 geometry');
       graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
       if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode,
-        preparedPrototype: materialPrototype(preparedMaterial), references: 0};
+        preparedPrototype: materialPrototype(preparedMaterial), geometrySetup: construction.geometrySetup, references: 0};
     }
     const lightsNode = authored ?? builder.lightsNode;
     assertInstances(object, instanceSignature);
@@ -1867,7 +1887,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     for (const node of builder.nodes) {
       if (!graphicsNode(node)) continue;
-      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings, shadowGraphs);
+      checkNode(node, lightsNode, lights, environmentNode, boundTextures, preparedMaterial, contextLightings, shadowGraphs,
+        sharedBuilder?.geometrySetup === true);
       if (node instanceof three.BufferAttributeNode) inspectAttributeInput(node, object);
     }
     // Producer inspection above registers source-owned pipeline state created
@@ -2401,6 +2422,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native volume scattering, emission, offset or depth graphs changed; compile the volume graph again');
   }
   function checkGeometry(state) {
+    // RenderObject invalidation owns the shared graphics graph. A kernel's
+    // version alone rebuilds its compute program, not its retained graphics
+    // setup; queued draws still use the graph selected by their source owner.
+    if (state.sharedBuilder?.geometrySetup) return;
     if (geometrySignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.geometrySignature)
       fail('CHANGED', 'Native geometry graph changed; compile the source geometry constructor again');
   }
@@ -2486,7 +2511,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         updateThreeNativeShadow(three, renderer, node, frame);
       } else if (node.isPassNode === true) updateThreeNativePass(three, renderer, node, frame);
       else if (node.isComputeNode) {
-        inspectCompute(node);
+        inspectCompute(node, state.sharedBuilder?.geometrySetup === true);
         withThreeNativeComputePrerequisites(renderer, () => frame.updateBeforeNode(node), true);
       } else if (effects.owns(node)) effects.update(node, frame);
       else frame.updateBeforeNode(node);

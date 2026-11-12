@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
+import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
+import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
@@ -148,6 +150,190 @@ function inheritedKernel(f, frequency = 'frame') {
   return state;
 }
 
+function customSetupKernel(f, setup = () => {}) {
+  const state = inheritedKernel(f); state.setups = [];
+  state.kernel.setup = function (builder) {
+    state.setups.push(builder.compute === this ? 'compute' : builder.object.name);
+    setup(builder, state);
+    return T.ComputeNode.prototype.setup.call(this, builder);
+  };
+  return state;
+}
+function sourceGeometryPrograms(t, f) {
+  f.renderer.debug.onNodeBuilderCreated = null;
+  const nodes = new SourceNodeManager(f.renderer,
+    {createNodeBuilder: object => new T.WGSLNodeBuilder(object, f.renderer)});
+  const objects = new SourceRenderObjects(f.renderer, nodes, {}, {delete() {}}, {deleteForRender() {}}, {});
+  const lights = N.lights([]), context = {id: 0};
+  t.after(() => objects.dispose());
+  return {nodes, use(object = f.object) {
+    const owner = objects.get(object, object.material, f.scene, f.camera, lights, context, null);
+    return {owner, state: owner.getNodeBuilderState(), attributes: owner.getAttributes()};
+  }};
+}
+function compileGeometry(f, object = f.object) {
+  f.scene.updateMatrixWorld(); f.camera.updateMatrixWorld();
+  const programs = f.renderer._nodeProgramSupport ??= createThreeNodePrograms({three: T, renderer: f.renderer});
+  return programs.compile(object.material, object,
+    {object, material: object.material, scene: f.scene, camera: f.camera, lights: [],
+      frameId: f.renderer._nodes.nodeFrame.frameId, renderId: f.renderer.info.calls});
+}
+
+test('custom geometry setup follows source shared keys, final-owner release and geometry disposal', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const expected = customSetupKernel(reference), actual = customSetupKernel(candidate);
+  await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference);
+  const groups = [reference, candidate].map(f => {
+    f.object.name = 'A';
+    const other = new T.Mesh(f.object.geometry, f.material); other.name = 'B'; f.scene.add(other);
+    return {f, a: f.object, b: other};
+  });
+  const first = source.use(groups[0].a), next = source.use(groups[0].b);
+  const firstCandidate = compileGeometry(candidate, groups[1].a), secondCandidate = compileGeometry(candidate, groups[1].b);
+  assert.equal(first.state, next.state); assert.notEqual(firstCandidate, secondCandidate);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  for (const program of [firstCandidate, secondCandidate]) {
+    assert.equal(canonical(program.vertex), canonical(first.state.vertexShader));
+    assert.equal(canonical(program.fragment), canonical(first.state.fragmentShader));
+  }
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A']);
+  for (const {f} of groups) { f.material.needsUpdate = true; f.object.geometry.dispose(); f.renderer.info.calls++; }
+  assert.equal(source.use().state, first.state); assert.equal(compileGeometry(candidate), firstCandidate);
+  for (const group of groups) {
+    group.a.dispatchEvent({type: 'dispose'});
+    group.c = new T.Mesh(group.a.geometry, group.f.material); group.c.name = 'C'; group.f.scene.add(group.c);
+  }
+  assert.equal(source.use(groups[0].c).state, first.state); compileGeometry(candidate, groups[1].c);
+  assert.deepEqual(actual.setups, ['A']);
+  for (const group of groups) {
+    group.b.dispatchEvent({type: 'dispose'}); group.c.dispatchEvent({type: 'dispose'});
+    group.d = new T.Mesh(group.a.geometry, group.f.material); group.d.name = 'D'; group.f.scene.add(group.d);
+  }
+  const finalSource = source.use(groups[0].d).state, finalCandidate = compileGeometry(candidate, groups[1].d);
+  assert.notEqual(finalSource, first.state);
+  assert.equal(canonical(finalCandidate.vertex), canonical(finalSource.vertexShader));
+  assert.equal(canonical(finalCandidate.fragment), canonical(finalSource.fragmentShader));
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A', 'D']);
+});
+
+test('lazy float attributes retain pre-setup keys and refresh source geometry without setup replay', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const setup = builder => {
+    if (builder.object && !builder.geometry.hasAttribute('setupOffset')) builder.geometry.setAttribute('setupOffset',
+      new T.Float32BufferAttribute(new Float32Array(builder.geometry.attributes.position.count * 3), 3));
+  };
+  const expected = customSetupKernel(reference, setup), actual = customSetupKernel(candidate, setup);
+  for (const [f, state] of [[reference, expected], [candidate, actual]]) {
+    f.object.name = 'A'; f.material.positionNode = N.attribute('setupOffset').add(state.values.element(0).xyz);
+    await f.renderer.init();
+  }
+  const source = sourceGeometryPrograms(t, reference), first = source.use(), firstCandidate = compileGeometry(candidate);
+  const others = [reference, candidate].map(f => ['B', 'C'].map(name => {
+    const object = new T.Mesh(f.object.geometry, f.material); object.name = name; f.scene.add(object); return object;
+  }));
+  const second = source.use(others[0][0]), third = source.use(others[0][1]);
+  const secondCandidate = compileGeometry(candidate, others[1][0]), thirdCandidate = compileGeometry(candidate, others[1][1]);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  for (const [actual, expected] of [[firstCandidate, first], [secondCandidate, second], [thirdCandidate, third]]) {
+    assert.equal(canonical(actual.vertex), canonical(expected.state.vertexShader));
+    assert.equal(canonical(actual.fragment), canonical(expected.state.fragmentShader));
+  }
+  assert.notEqual(first.owner.initialCacheKey, second.owner.initialCacheKey);
+  assert.notEqual(first.state, second.state); assert.equal(second.state, third.state);
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A', 'B']);
+  for (const f of [reference, candidate]) { f.material.needsUpdate = true; f.renderer.info.calls++; }
+  assert.equal(source.use().state, second.state);
+  const moved = compileGeometry(candidate); assert.notEqual(moved, firstCandidate);
+  for (const f of [reference, candidate]) {
+    f.object.geometry.setAttribute('setupOffset', new T.Float32BufferAttribute(
+      new Float32Array(f.object.geometry.attributes.position.count * 3).fill(.125), 3));
+    const geometry = f.object.geometry.clone(); t.after(() => geometry.dispose()); f.object.geometry = geometry;
+  }
+  const changed = source.use(), changedCandidate = compileGeometry(candidate);
+  assert.equal(changed.state, second.state);
+  assert.ok(changed.attributes.includes(reference.object.geometry.attributes.setupOffset));
+  assert.equal(candidate.renderer._nodeProgramSupport.geometry(changedCandidate), candidate.object.geometry);
+  assert.equal(canonical(changedCandidate.vertex), canonical(changed.state.vertexShader));
+  assert.equal(canonical(changedCandidate.fragment), canonical(changed.state.fragmentShader));
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A', 'B']);
+});
+
+test('custom setup separates source graphics and compute versions through public compilation and queued draws', async t => {
+  const f = fixture(t, {background: false}), state = customSetupKernel(f);
+  const reference = fixture(t, {background: false}), expected = customSetupKernel(reference);
+  reference.object.name = 'A'; await reference.renderer.init();
+  const source = sourceGeometryPrograms(t, reference), sourceGraphics = source.use().state,
+    sourceCompute = source.nodes.getForCompute(expected.kernel);
+  f.object.name = 'A';
+  const other = new T.Mesh(f.object.geometry, f.material); other.name = 'B'; other.frustumCulled = false; f.scene.add(other);
+  let dispatches = 0;
+  f.device.onCompute = pass => new Float32Array(storage(pass)[0].data).fill(++dispatches * .25);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(state.setups, expected.setups); assert.deepEqual(state.setups, ['A', 'compute']);
+  assert.equal(state.initializations, 1);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const first = packets(f)[0].binding.nodeProgram;
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(first.vertex), canonical(sourceGraphics.vertexShader));
+  assert.equal(canonical(first.fragment), canonical(sourceGraphics.fragmentShader));
+  assert.equal(canonical(f.computes[0].pipeline.compute.module.code), canonical(sourceCompute.computeShader));
+  state.kernel.needsUpdate = true; state.nextStep = .625;
+  expected.kernel.needsUpdate = true; reference.renderer.info.calls++;
+  assert.equal(source.use().state, sourceGraphics);
+  assert.notEqual(source.nodes.getForCompute(expected.kernel), sourceCompute);
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  state.nextStep = 99; await drain(f.renderer);
+  assert.deepEqual(state.setups, expected.setups); assert.deepEqual(state.setups, ['A', 'compute', 'compute']);
+  assert.equal(packets(f)[1].binding.nodeProgram, first, 'kernel invalidation retains the graphics builder');
+  assert.equal(state.initializations, 1); assert.equal(f.computes.length, 2);
+  const values = pass => pass.bytes.flatMap(bytes => [...new Float32Array(bytes.buffer)]);
+  assert.ok(values(f.computes[1]).includes(.625)); assert.ok(!values(f.computes[1]).includes(99));
+  const gpu = storage(f.computes[0])[0];
+  assert.deepEqual(draws(f).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.25, .25, .5, .5]);
+  reference.material.needsUpdate = true; reference.renderer.info.calls++;
+  assert.notEqual(source.use().state, sourceGraphics);
+  f.material.needsUpdate = true; f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(state.setups, expected.setups); assert.deepEqual(state.setups, ['A', 'compute', 'compute', 'A']);
+  assert.notEqual(packets(f)[2].binding.nodeProgram, first); assert.equal(state.initializations, 1);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('custom setup refuses newly added storage vertex attributes before dispatch', async t => {
+  const f = fixture(t, {background: false});
+  customSetupKernel(f, builder => {
+    if (builder.object) builder.geometry.setAttribute('storagePosition',
+      new T.StorageBufferAttribute(builder.geometry.attributes.position.count, 3));
+  });
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+});
+
+test('adding custom setup to an existing per-object graph waits for source material disposal', async t => {
+  const reference = fixture(t, {background: false}), candidate = fixture(t, {background: false});
+  const expected = inheritedKernel(reference), actual = inheritedKernel(candidate);
+  await reference.renderer.init(); await candidate.renderer.init();
+  const source = sourceGeometryPrograms(t, reference), first = source.use().state;
+  compileGeometry(candidate);
+  for (const [f, state] of [[reference, expected], [candidate, actual]]) {
+    f.object.name = 'A'; state.setups = [];
+    state.kernel.setup = function (builder) {
+      state.setups.push(builder.object.name); return T.ComputeNode.prototype.setup.call(this, builder);
+    };
+  }
+  assert.equal(source.use().state, first);
+  assert.throws(() => compileGeometry(candidate), {code: 'THREE_NODE_PROGRAM_MATERIAL_CACHE'});
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, []);
+  for (const f of [reference, candidate]) f.material.dispose();
+  const rebuilt = source.use().state, program = compileGeometry(candidate);
+  assert.notEqual(rebuilt, first);
+  assert.deepEqual(actual.setups, expected.setups); assert.deepEqual(actual.setups, ['A']);
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(program.vertex), canonical(rebuilt.vertexShader));
+  assert.equal(canonical(program.fragment), canonical(rebuilt.fragmentShader));
+});
+
 test('inherited compute callbacks compile, share dispatches, and retain source shaders and native storage', async t => {
   const reference = fixture(t, {background: false}), expectedState = inheritedKernel(reference);
   await reference.renderer.init();
@@ -230,9 +416,10 @@ test('inherited compute false before callbacks retry within the same source fram
 });
 
 for (const method of ['setup', 'generate'])
-test(`render-triggered compute retains its pinned ${method} boundary`, async t => {
+test(`render-triggered compute retains its ${method === 'setup' ? 'shared setup profile' : 'pinned generate'} boundary`, async t => {
   const f = fixture(t, {background: false}), state = inheritedKernel(f);
   state.kernel[method] = function (...args) { return T.ComputeNode.prototype[method].apply(this, args); };
+  if (method === 'setup') f.material.transparent = true;
   await f.renderer.init();
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_STORAGE'});
   assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
