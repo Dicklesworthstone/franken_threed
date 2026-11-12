@@ -2274,7 +2274,7 @@ test('opaque callable legacy hooks refuse without probing Proxy traps', t => {
 test('source material conversion refuses unregistered classes, custom program keys and incompatible map inputs', t => {
   const f = pbrRig(t, THREE.MeshStandardMaterial), material = f.material;
   const Custom = class extends THREE.MeshStandardMaterial {};
-  const custom = new Custom(); custom.positionNode = N.positionLocal;
+  const custom = new Custom(); custom.type = 'UnregisteredApplicationMaterial'; custom.positionNode = N.positionLocal;
   assert.throws(() => f.owner.compile(custom, f.object, {...f.context, material: custom}), {code: 'THREE_NODE_PROGRAM_MATERIAL'});
   const originalConversion = f.renderer.library.fromMaterial;
   f.renderer.library.fromMaterial = () => new THREE.MeshStandardNodeMaterial();
@@ -2367,36 +2367,55 @@ test('registered SunLight uses the source shared identity across renderer owners
   assert.ok(hasVector(b.owner.capture(second, context), [.5, 1, 2]));
   assert.equal(a.sun._listeners.dispose.length, 1, 'a second renderer must not instantiate a duplicate source light node');
 });
-test('registered direct-light graph and constructor edits invalidate cached programs', t => {
-  const f = pbrRig(t, THREE.MeshLambertMaterial);
+test('registered direct-light method and constructor edits retain source cache until graph replacement', t => {
+  const f = pbrRig(t, THREE.MeshLambertMaterial); let setups = 0;
   class CustomLight extends THREE.Light {}
   class OtherLight extends THREE.Light {}
   class CustomNode extends THREE.AnalyticLightNode {
-    setupDirect() { return {lightDirection: N.vec3(1, 0, 0), lightColor: this.colorNode}; }
+    setupDirect() { setups++; return {lightDirection: N.vec3(1, 0, 0), lightColor: this.colorNode}; }
   }
   const light = new CustomLight(); f.scene.add(light);
   f.renderer.library.addLight(CustomNode, CustomLight); f.renderer.library.addLight(CustomNode, OtherLight);
   const context = {...f.context, lights: [light]}, first = f.owner.compile(f.material, f.object, context);
-  CustomNode.prototype.setupDirect = function() { return {lightDirection: N.vec3(0, 1, 0), lightColor: this.colorNode}; };
-  assert.throws(() => f.owner.capture(first, context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  const sourceLights = N.lights([light]), sourceKey = sourceLights.customCacheKey(), setupCount = setups;
+  CustomNode.prototype.setupDirect = function() { setups++; return {lightDirection: N.vec3(0, 1, 0), lightColor: this.colorNode}; };
+  assert.equal(sourceLights.customCacheKey(), sourceKey);
+  assert.equal(f.owner.compile(f.material, f.object, context), first);
+  assert.doesNotThrow(() => f.owner.capture(first, context));
+  Object.setPrototypeOf(light, OtherLight.prototype);
+  assert.equal(sourceLights.customCacheKey(), sourceKey, 'the pinned light key retains this source identity');
+  assert.equal(f.owner.compile(f.material, f.object, context), first);
+  assert.doesNotThrow(() => f.owner.capture(first, {...context, renderId: 2}));
+  assert.equal(setups, setupCount, 'warm method and registry-constructor edits cannot replay source setup');
+  f.material.colorNode = N.vec3(.625);
   const changed = f.owner.compile(f.material, f.object, context); assert.notEqual(changed, first);
   assert.notEqual(changed.fragment, first.fragment);
-  Object.setPrototypeOf(light, OtherLight.prototype);
-  assert.throws(() => f.owner.capture(changed, context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
-  const other = f.owner.compile(f.material, f.object, context); assert.notEqual(other, changed);
-  assert.doesNotThrow(() => f.owner.capture(other, context));
+  const source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.lightsNode = sourceLights; source.build();
+  assert.equal(changed.vertex, source.vertexShader); assert.equal(changed.fragment, source.fragmentShader);
+  assert.doesNotThrow(() => f.owner.capture(changed, {...context, renderId: 3}));
 });
-test('registered light remapping refuses the source cached node instead of silently reusing its old class', t => {
-  const f = sunRig(t), first = f.compile(); let updates = 0;
+test('registered light remapping retains the source cached node across graph rebuilds', t => {
+  const f = sunRig(t), first = f.compile(); let updates = 0, replacements = 0;
   f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
   class ReplacementNode extends THREE.AnalyticLightNode {
+    constructor(light) { super(light); replacements++; }
     setupDirect() { return {lightDirection: N.vec3(0, 0, 1), lightColor: this.colorNode}; }
   }
   f.renderer.library.lightNodes.set(SunLight, ReplacementNode);
-  assert.throws(() => f.owner.capture(first, f.context), {code: 'THREE_NODE_PROGRAM_CHANGED'});
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'}); assert.equal(updates, 0);
+  const changed = f.compile(), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  assert.notEqual(changed, first, 'the material graph edit requests fresh construction');
+  source.scene = f.scene; source.camera = f.camera; source.lightsNode = N.lights([f.sun]); source.build();
+  assert.equal(changed.vertex, source.vertexShader); assert.equal(changed.fragment, source.fragmentShader);
+  assert.equal(replacements, 0, 'both new builders retain the original source light node');
+  assert.equal(updates, 0, 'construction does not execute update callbacks');
+  f.owner.capture(changed, f.context); assert.equal(updates, 1);
   const fresh = new SunLight(), context = {...f.context, lights: [fresh]};
-  assert.doesNotThrow(() => f.owner.compile(f.material, f.object, context), 'a fresh light identity uses the newly registered class');
+  const replacement = f.owner.compile(f.material, f.object, context);
+  assert.equal(replacements, 1, 'a fresh light identity uses the newly registered class');
+  const freshSource = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+  freshSource.scene = f.scene; freshSource.camera = f.camera; freshSource.lightsNode = N.lights([fresh]); freshSource.build();
+  assert.equal(replacement.fragment, freshSource.fragmentShader); assert.notEqual(replacement.fragment, changed.fragment);
 });
 test('registered SunLight respects disabled shadows and refuses unsupported active shadow effects before updates', t => {
   const f = sunRig(t); let updates = 0;
@@ -2420,7 +2439,7 @@ test('registered SunLight respects disabled shadows and refuses unsupported acti
 });
 test('registered direct analytic nodes retain source lifecycle and native graph resource admission', t => {
   for (const kind of ['prototype lifecycle', 'instance lifecycle', 'storage write']) {
-    const f = pbrRig(t, THREE.MeshLambertMaterial); let updates = 0;
+    const f = pbrRig(t, THREE.MeshLambertMaterial), lifecycle = []; let updates = 0;
     f.material.colorNode = N.uniform(new THREE.Color(.5, .5, .5)).onObjectUpdate(() => { updates++; });
     class CustomLight extends THREE.Light {}
     class CustomNode extends THREE.AnalyticLightNode {
@@ -2431,12 +2450,33 @@ test('registered direct analytic nodes retain source lifecycle and native graph 
         })() : this.colorNode;
         return {lightDirection: N.vec3(0, 1, 0), lightColor};
       }
+      update(frame) { lifecycle.push([frame.renderer, frame.object, frame.frameId, frame.renderId]); super.update(frame); }
     }
-    if (kind === 'prototype lifecycle') CustomNode.prototype.update = () => {};
+    if (kind === 'prototype lifecycle') CustomNode.prototype.update = function(frame) {
+      lifecycle.push([frame.renderer, frame.object, frame.frameId, frame.renderId]);
+      THREE.AnalyticLightNode.prototype.update.call(this, frame);
+    };
     const light = new CustomLight(); f.scene.add(light); f.renderer.library.addLight(CustomNode, CustomLight);
-    assert.throws(() => f.owner.compile(f.material, f.object, {...f.context, lights: [light]}),
-      {code: kind === 'storage write' ? 'THREE_NODE_PROGRAM_STORAGE' : 'THREE_NODE_PROGRAM_LIGHTS'});
-    assert.equal(updates, 0); assert.equal(f.owner.diagnostics.programs, 0);
+    const context = {...f.context, lights: [light]};
+    if (kind === 'storage write') {
+      assert.throws(() => f.owner.compile(f.material, f.object, context), {code: 'THREE_NODE_PROGRAM_STORAGE'});
+      assert.equal(updates, 0); assert.deepEqual(lifecycle, []); assert.equal(f.owner.diagnostics.programs, 0);
+      continue;
+    }
+    const descriptor = f.owner.compile(f.material, f.object, context), source = new THREE.WGSLNodeBuilder(f.object, f.renderer);
+    source.scene = f.scene; source.camera = f.camera; source.lightsNode = N.lights([light]); source.build();
+    assert.equal(descriptor.vertex, source.vertexShader); assert.equal(descriptor.fragment, source.fragmentShader);
+    assert.equal(updates, 0); assert.deepEqual(lifecycle, []);
+    const contexts = [context, {...context, renderId: 2}], sourceFrame = new THREE.NodeFrame();
+    for (const call of contexts) {
+      Object.assign(sourceFrame, call, {renderer: f.renderer});
+      for (const node of source.updateNodes) sourceFrame.updateNode(node);
+    }
+    const expected = lifecycle.splice(0); updates = 0;
+    for (const call of contexts) f.owner.capture(descriptor, call);
+    assert.deepEqual(lifecycle, expected, 'the original NodeFrame controls authored analytic update frequency');
+    assert.equal(lifecycle.length, kind === 'instance lifecycle' ? 2 : 1);
+    assert.equal(updates, 2);
   }
 });
 

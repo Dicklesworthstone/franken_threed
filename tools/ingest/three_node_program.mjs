@@ -129,6 +129,56 @@ const TYPES = new Set(['float', 'int', 'uint', 'bool', 'color', 'vec2', 'vec3', 
   'uvec2', 'uvec3', 'uvec4', 'bvec2', 'bvec3', 'bvec4', 'mat2', 'mat3', 'mat4']);
 const FRAME_FIELDS = ['renderer', 'scene', 'camera', 'object', 'material', 'compute', 'frameId', 'renderId', 'time', 'deltaTime'];
 const nodeStates = new WeakMap();
+const NODE_MATERIAL_CLASSES = ['NodeMaterial', 'MeshBasicNodeMaterial', 'MeshNormalNodeMaterial', 'MeshMatcapNodeMaterial',
+  'MeshToonNodeMaterial', 'MeshLambertNodeMaterial', 'MeshPhongNodeMaterial', 'MeshStandardNodeMaterial',
+  'MeshPhysicalNodeMaterial', 'MeshSSSNodeMaterial', 'ShadowNodeMaterial', 'SpriteNodeMaterial', 'PointsNodeMaterial',
+  'LineBasicNodeMaterial', 'LineDashedNodeMaterial', 'Line2NodeMaterial', 'VolumeNodeMaterial'];
+const MATERIAL_CONVERSIONS = new Map(['MeshBasic', 'MeshNormal', 'MeshMatcap', 'MeshToon', 'MeshLambert', 'MeshPhong',
+  'MeshStandard', 'MeshPhysical', 'Shadow', 'Sprite', 'Points', 'LineBasic', 'LineDashed']
+  .map(name => [`${name}Material`, `${name}NodeMaterial`]));
+const materialFamilies = new WeakMap();
+function nodeMaterialFamilies(three) {
+  let families = materialFamilies.get(three);
+  if (!families) {
+    families = new Map(NODE_MATERIAL_CLASSES.filter(name => three[name]).map(name => [three[name].prototype, three[name]]));
+    materialFamilies.set(three, families);
+  }
+  return families;
+}
+function materialProperty(object, name) {
+  for (let owner = object; owner; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+    if (descriptor) return descriptor;
+  }
+}
+function materialDataProperty(object, name) {
+  return materialProperty(object, name)?.value;
+}
+/** A source type key for retained routing, without invoking application getters. */
+export function threeNativeMaterialExtensionKey(three, material) {
+  const descriptor = materialProperty(material, 'type');
+  if (descriptor && Object.hasOwn(descriptor, 'value')) return descriptor.value;
+  if (descriptor?.get !== Object.getOwnPropertyDescriptor(three.NodeMaterial.prototype, 'type')?.get) return undefined;
+  const type = materialProperty(materialDataProperty(material, 'constructor'), 'type');
+  if (type && Object.hasOwn(type, 'value')) return type.value;
+  if (typeof type?.get !== 'function') return undefined;
+  for (const Native of nodeMaterialFamilies(three).values())
+    if (type?.get === Object.getOwnPropertyDescriptor(Native, 'type')?.get) return type.get.call(Native);
+}
+/** Select source material extensions without constructing a converter or
+ * invoking application cache keys, methods or property getters. */
+export function hasThreeNativeMaterialExtension(three, material, library) {
+  if (!three.Material || !(material instanceof three.Material)) return false;
+  if (three.NodeMaterial && material instanceof three.NodeMaterial)
+    return !nodeMaterialFamilies(three).has(Object.getPrototypeOf(material));
+  const type = materialDataProperty(material, 'type'), source = three[type];
+  if (!MATERIAL_CONVERSIONS.has(type) || Object.getPrototypeOf(material) !== source?.prototype) return true;
+  const registry = materialDataProperty(library, 'materialNodes');
+  if (!(registry instanceof Map)) return true;
+  return Map.prototype.get.call(registry, type) !== three[MATERIAL_CONVERSIONS.get(type)] ||
+    materialDataProperty(library, 'fromMaterial') !== three.StandardNodeLibrary.prototype.fromMaterial ||
+    materialDataProperty(library, 'getMaterialNodeClass') !== three.StandardNodeLibrary.prototype.getMaterialNodeClass;
+}
 
 /** True only for materials with an authored graphics slot. Default built-ins
  * continue through the existing fixed shader path. Admission is separate. */
@@ -171,11 +221,6 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes,
     ...(three.VolumeNodeMaterial ? [three.VolumeNodeMaterial.prototype] : [])];
-  const lightClasses = new Map([[three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
-    [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode], [three.SpotLight, three.SpotLightNode],
-    [three.LightProbe, three.LightProbeNode], [three.RectAreaLight, three.RectAreaLightNode],
-    [three.IESSpotLight, three.IESSpotLightNode], [three.ProjectorLight, three.ProjectorLightNode]]
-    .filter(([Source, Native]) => Source && Native));
   const spotLightClasses = new Set([three.SpotLight, three.IESSpotLight, three.ProjectorLight].filter(Boolean));
   const lightClassIds = new WeakMap();
   let lightClassSerial = 0;
@@ -185,16 +230,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const bundleGeometryRecords = new Set();
   const fogResourceRecords = new Set();
   const instanceArrays = new WeakMap(), sourceIds = new WeakMap(); let sourceSerial = 0;
-  const materialViews = new WeakMap();
-  const sourceMaterialClasses = new Map([
-    [three.MeshBasicMaterial, three.MeshBasicNodeMaterial], [three.MeshToonMaterial, three.MeshToonNodeMaterial],
-    [three.MeshLambertMaterial, three.MeshLambertNodeMaterial], [three.MeshPhongMaterial, three.MeshPhongNodeMaterial],
-    [three.MeshStandardMaterial, three.MeshStandardNodeMaterial], [three.MeshPhysicalMaterial, three.MeshPhysicalNodeMaterial],
-    [three.MeshNormalMaterial, three.MeshNormalNodeMaterial], [three.MeshMatcapMaterial, three.MeshMatcapNodeMaterial],
-    [three.ShadowMaterial, three.ShadowNodeMaterial], [three.SpriteMaterial, three.SpriteNodeMaterial],
-    [three.PointsMaterial, three.PointsNodeMaterial], [three.LineBasicMaterial, three.LineBasicNodeMaterial],
-    [three.LineDashedMaterial, three.LineDashedNodeMaterial]
-  ].filter(([Source, Native]) => Source && Native).map(([Source, Native]) => [Source.prototype, {Source, Native}]));
+  const materialViews = new WeakMap(), materialExtensions = new WeakSet(), extensionMaterialTypes = new Set();
+  const families = nodeMaterialFamilies(three);
+  const sourceMaterialPrototypes = new Set([three.Material.prototype, ...families.keys(),
+    ...[...MATERIAL_CONVERSIONS.keys()].map(name => three[name]?.prototype).filter(Boolean)]);
+  const materialPrototype = material => {
+    for (let prototype = Object.getPrototypeOf(material); prototype; prototype = Object.getPrototypeOf(prototype))
+      if (families.has(prototype)) return prototype;
+    return null;
+  };
   // Ordinary rigid PBR materials additionally share source builder state.
   // Other profiles retain their existing per-object construction owners.
   const sharedBuilders = new Map(), builderContexts = new Map();
@@ -217,23 +261,51 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     shaderBytes -= pair.bytes;
   }
   const live = () => { if (disposed) fail('DISPOSED', 'Native node program preparation is disposed'); };
-  const litMaterial = material => litPrototypes.includes(Object.getPrototypeOf(material));
+  const litMaterial = material => litPrototypes.includes(materialPrototype(material));
   // Basic uses an empty source lighting context for AO and its PI-scaled light
   // map, while remaining independent of the scene's analytic lights.
   const lightingMaterial = material => litMaterial(material) ||
-    Object.getPrototypeOf(material) === three.MeshBasicNodeMaterial.prototype;
-  function prepareMaterial(material) {
+    materialPrototype(material) === three.MeshBasicNodeMaterial.prototype;
+  function inspectMaterialAccessors(material) {
+    for (let owner = material; owner && !sourceMaterialPrototypes.has(owner); owner = Object.getPrototypeOf(owner))
+      if (Object.values(Object.getOwnPropertyDescriptors(owner)).some(property => !Object.hasOwn(property, 'value')))
+        fail('HOOK', 'Native material extensions require ordinary data properties and methods, not application accessors');
+    const type = materialProperty(materialDataProperty(material, 'constructor'), 'type');
+    if (type?.get && ![...families.values()].some(Native => Object.getOwnPropertyDescriptor(Native, 'type')?.get === type.get))
+      fail('HOOK', 'Native material extensions require a data-valued or inherited source static type');
+  }
+  function retainedMaterialPrototype(material, object, context) {
+    const passes = cache.get(object)?.get(material), chain = builderScope(context).chain;
+    const entry = passes?.get(chain) ?? passes?.get(context.passId ?? null);
+    return entry && nodeStates.get(entry.descriptor)?.preparedPrototype;
+  }
+  function materialExtension(material) {
+    return materialExtensions.has(material) || extensionMaterialTypes.has(threeNativeMaterialExtensionKey(three, material)) ||
+      hasThreeNativeMaterialExtension(three, material, renderer.library);
+  }
+  function prepareMaterial(material, preparedPrototype = null) {
     if (material instanceof three.NodeMaterial) return material;
-    const classes = material instanceof three.Material && sourceMaterialClasses.get(Object.getPrototypeOf(material));
-    if (!classes || material.type !== classes.Source.name ||
-        renderer.library.getMaterialNodeClass(material.type) !== classes.Native ||
-        renderer.library.fromMaterial !== three.StandardNodeLibrary.prototype.fromMaterial)
-      fail('MATERIAL', 'Native source materials require an ordinary built-in class and its pinned node-library conversion');
-    let record = materialViews.get(material);
+    if (!(material instanceof three.Material) ||
+        renderer.library.fromMaterial !== three.StandardNodeLibrary.prototype.fromMaterial ||
+        renderer.library.getMaterialNodeClass !== three.StandardNodeLibrary.prototype.getMaterialNodeClass)
+      fail('MATERIAL', 'Native source materials require the pinned node-library conversion and class lookup');
+    let prototype = preparedPrototype;
+    if (!prototype) {
+      const Native = renderer.library.getMaterialNodeClass(material.type);
+      prototype = Native?.prototype;
+      if (prototype) inspectMaterialAccessors(prototype);
+      while (prototype && !families.has(prototype)) prototype = Object.getPrototypeOf(prototype);
+    }
+    if (!prototype) fail('MATERIAL', 'Native source materials require a registered NodeMaterial class');
+    let views = materialViews.get(material), record = views?.get(prototype);
     if (!record) {
-      const view = new classes.Native();
-      record = {view, defaults: new Map(Object.entries(view)), keys: new Set()};
-      materialViews.set(material, record);
+      // Admission needs inherited family defaults, never the observable custom
+      // constructor. The retained builder creates the actual registered class
+      // at its source construction boundary and validates its generated graph.
+      const view = new (families.get(prototype))();
+      record = {view, prototype, defaults: new Map(Object.entries(view)), keys: new Set()};
+      if (!views) materialViews.set(material, views = new Map());
+      views.set(prototype, record);
     }
     // Match NodeLibrary.fromMaterial's enumerable-property copy without making
     // a new material on every admission/cache lookup. Reset removed properties
@@ -547,26 +619,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!(light instanceof three.Light) || typeof Source !== 'function' ||
         Object.getPrototypeOf(light) !== Source.prototype || light.isLight !== true)
       fail('LIGHTS', 'Native lights require exact source Light instances');
-    const Native = renderer.library.getLightNodeClass(Source), builtin = lightClasses.get(Source);
-    if (builtin) {
-      if (Native !== builtin) fail('LIGHTS', 'Native built-in lights require their pinned node-library mappings');
-      return Native;
-    }
-    // SunLight contributes through setupDirect; LightProbeGrid contributes
-    // irradiance from its atlas through setup and updates its own uniforms.
-    // Both use the source cached AnalyticLightNode and its FRAME scheduling.
+    // The source library selects by the concrete light constructor, including
+    // inherited light and analytic-node classes registered by applications.
+    // Keep its lookup ordinary; graph construction and resource admission below
+    // inspect the resulting node rather than restricting authored methods.
+    const Native = renderer.library.getLightNodeClass(Source);
     const prototype = Native?.prototype;
-    const direct = prototype && Object.getOwnPropertyDescriptor(prototype, 'setupDirect');
     const grid = light.isLightProbeGrid === true;
-    const methods = grid ? ['constructor', 'setup', 'update'] : ['constructor', 'setupDirect', 'setupShadowNode'];
     if (renderer.library.getLightNodeClass !== three.StandardNodeLibrary.prototype.getLightNodeClass ||
-        Object.getPrototypeOf(Source.prototype) !== three.Light.prototype ||
-        !prototype || Object.getPrototypeOf(prototype) !== three.AnalyticLightNode.prototype ||
-        prototype.constructor !== Native || (grid
-          ? ['setup', 'update'].some(key => typeof Object.getOwnPropertyDescriptor(prototype, key)?.value !== 'function')
-          : typeof direct?.value !== 'function') ||
-        Object.getOwnPropertyNames(prototype).some(key => !methods.includes(key)))
-      fail('LIGHTS', 'Registered native lights require a direct analytic node with the pinned source lifecycle');
+        typeof Native !== 'function' || !prototype ||
+        !(prototype instanceof three.AnalyticLightNode || prototype === three.AnalyticLightNode.prototype))
+      fail('LIGHTS', 'Registered native lights require an analytic node class and the pinned source library lookup');
     if (grid && (!(light.boundingBox instanceof three.Box3) || !(light.resolution instanceof three.Vector3) ||
         light.texture !== null && (inspectTexture(light.texture).viewDimension !== '3d' || integerTextureType(light.texture))))
       fail('LIGHTS', 'Native probe grids require source bounds, resolution and a floating-point 3D SH atlas');
@@ -582,7 +645,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // SpotLightNode calls its authored color with projected coordinates;
       // other analytic nodes consume an authored color graph directly. Keep
       // those source entrances distinct and let the pinned builder call Fn.
-      const spot = spotLightClasses.has(light.constructor), color = light.colorNode || null;
+      const spot = Native === three.SpotLightNode || Native.prototype instanceof three.SpotLightNode,
+        color = light.colorNode || null;
       if (light.map != null && !spot)
         fail('LIGHTS', 'Native projected maps require the source SpotLightNode');
       if (color && (spot ? typeof color !== 'function' || typeof color.getCacheKey !== 'function' : !(color instanceof three.Node)))
@@ -595,7 +659,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // light cache does not include iesMap: compatible replacement, removal,
       // and adding a map to an already built ordinary cone must retain that
       // lifecycle rather than forcing a new graph from the public map slot.
-      const iesMap = Native === three.IESSpotLightNode && light.iesMap?.isTexture === true ? light.iesMap : null;
+      const iesMap = (Native === three.IESSpotLightNode || three.IESSpotLightNode && Native.prototype instanceof three.IESSpotLightNode) &&
+        light.iesMap?.isTexture === true ? light.iesMap : null;
       if (iesMap && (inspectTexture(iesMap).viewDimension !== '2d' || integerTextureType(iesMap)))
         fail('LIGHTS', 'IES attenuation maps require floating-point source 2D textures');
       // A projected map is a render-update TextureNode inside the source
@@ -615,28 +680,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // Bounds, resolution, positive falloff and intensity remain live uniforms.
       const grid = light.isLightProbeGrid === true ? [light.texture ?
         [sourceId(light.texture), textureSignature([{value: light.texture}])] : null, light.falloff > 0] : null;
-      return [light.id, id(light.constructor), id(Native), id(Native.prototype.setup), id(Native.prototype.update), id(Native.prototype.setupDirect),
-        id(Native.prototype.setupDirectRectArea), id(Native.prototype.setupShadowNode), spot ? id(Native.prototype.getSpotAttenuation) : null,
-        light.castShadow === true, shadow ? id(shadow) : null,
+      // The source light cache is keyed by light identity, not its current
+      // registry mapping or analytic class methods. A mapping edit must not
+      // rebuild a warm graph and replay setup on its cached original node.
+      return [light.id, light.castShadow === true, shadow ? id(shadow) : null,
         renderer.shadowMap?.enabled === true, renderer.shadowMap?.type, renderer.shadowMap?.transmitted === true,
         filter ? [sourceId(filter), filter.isFn === true ? filter.getCacheKey() : null] : null,
         shadowGraph ? [sourceId(shadowGraph), shadowGraph.getCacheKey()] : null, projected, authored, grid];
     }));
   }
   function checkAnalyticLight(node, lights) {
-    if (!node.isAnalyticLightNode || !lights.includes(node.light)) return false;
-    const Native = sourceLightClass(node.light);
-    if (Object.getPrototypeOf(node) !== Native.prototype) return false;
-    if (!lightClasses.has(node.light.constructor)) {
-      const source = three.AnalyticLightNode.prototype;
-      const grid = node.light.isLightProbeGrid === true;
-      if (node.updateType !== 'frame' || node.updateBeforeType !== 'none' || node.updateAfterType !== 'none' ||
-          node.setupDirect !== Native.prototype.setupDirect ||
-          ['build', 'setup', 'analyze', 'generate', 'getHash', 'updateReference', 'getUpdateType',
-            'getUpdateBeforeType', 'getUpdateAfterType', 'update', 'updateBefore', 'updateAfter']
-            .some(key => node[key] !== (grid && (key === 'setup' || key === 'update') ? Native.prototype[key] : source[key])))
-        fail('LIGHTS', 'Registered analytic nodes must retain the pinned source setup and update lifecycle');
-    }
+    if (!(node instanceof three.AnalyticLightNode) || !node.isAnalyticLightNode || !lights.includes(node.light)) return false;
+    sourceLightClass(node.light);
+    // LightsNode retains one analytic node per source light across builders and
+    // renderer owners. A registry replacement affects fresh light identities;
+    // it does not replace an already cached node. Its original NodeFrame owns
+    // authored before/current/after callbacks at their source frequencies.
     return true;
   }
   function authoredLightsNode(material) {
@@ -686,8 +745,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // nodes: that would repeat FRAME updates across objects and recompiles.
     return lights.slice().sort((a, b) => a.id - b.id);
   }
-  const basicEnvironmentMaterial = material => basicEnvironmentPrototypes.includes(Object.getPrototypeOf(material));
-  const environmentEnabled = material => (standardPrototypes.includes(Object.getPrototypeOf(material)) || basicEnvironmentMaterial(material)) &&
+  const basicEnvironmentMaterial = material => basicEnvironmentPrototypes.includes(materialPrototype(material));
+  const environmentEnabled = material => (standardPrototypes.includes(materialPrototype(material)) || basicEnvironmentMaterial(material)) &&
     material.lights === true && material.fragmentNode == null && renderer.lighting?.enabled !== false;
   const environmentGraph = (material, {scene} = {}) => environmentEnabled(material)
     ? material.envNode || (!basicEnvironmentMaterial(material) && !material.envMap && scene?.environmentNode?.isNode ? scene.environmentNode : null) : null;
@@ -972,13 +1031,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   // Sprite shader construction branches on attenuation and the presence of
   // an anchor reference. Values of center/rotation/scale stay live uniforms.
   function spriteSignature(material, object) {
-    if (Object.getPrototypeOf(material) === three.PointsNodeMaterial?.prototype)
+    if (materialPrototype(material) === three.PointsNodeMaterial?.prototype)
       return JSON.stringify([material.sizeAttenuation, object.isPoints === true]);
-    return Object.getPrototypeOf(material) === three.SpriteNodeMaterial.prototype
+    return materialPrototype(material) === three.SpriteNodeMaterial.prototype
       ? JSON.stringify([material.sizeAttenuation, object.center?.isVector2 === true]) : null;
   }
   function wideLineSignature(material) {
-    if (Object.getPrototypeOf(material) !== three.Line2NodeMaterial?.prototype) return null;
+    if (materialPrototype(material) !== three.Line2NodeMaterial?.prototype) return null;
     // Width, dash sizes and offset values are live uniforms. These controls
     // instead change expansion, attributes, fragment coverage or framebuffer
     // dependencies, so an already captured program cannot accept a new shape.
@@ -986,7 +1045,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ...[...DASH_SLOTS].map(key => sourceId(material[key]))]);
   }
   function volumeSignature(material) {
-    if (Object.getPrototypeOf(material) !== three.VolumeNodeMaterial?.prototype) return null;
+    if (materialPrototype(material) !== three.VolumeNodeMaterial?.prototype) return null;
     // The source calls these graph constructors with positionRay while building
     // its loop. Keep their identities/graphs structural; steps and captured
     // uniforms remain live values at the source RENDER/OBJECT frequencies.
@@ -1016,7 +1075,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('STORAGE', 'Render-triggered compute requires the pinned ComputeNode construction and update lifecycle');
   }
   function sssSignature(material) {
-    if (Object.getPrototypeOf(material) !== three.MeshSSSNodeMaterial?.prototype) return null;
+    if (materialPrototype(material) !== three.MeshSSSNodeMaterial?.prototype) return null;
     // The retained SSS model consumes these graphs during construction. Slot
     // replacement (including disabling thicknessColorNode) needs a new graph;
     // node uniform values remain live at their source update frequencies.
@@ -1025,10 +1084,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return [sourceId(node), node?.isNode === true ? node.getCacheKey() : null];
     }));
   }
-  const wideLineCoverage = material => Object.getPrototypeOf(material) === three.Line2NodeMaterial?.prototype &&
+  const wideLineCoverage = material => materialPrototype(material) === three.Line2NodeMaterial?.prototype &&
     material.alphaToCoverage && renderer.currentSamples > 0;
   function transmissionSignature(material) {
-    if (!physicalPrototypes.includes(Object.getPrototypeOf(material))) return null;
+    if (!physicalPrototypes.includes(materialPrototype(material))) return null;
     return JSON.stringify([material.useTransmission, material.useDispersion, material.useTransmission ? material.side : null,
       ...['transmissionNode', 'thicknessNode', 'attenuationDistanceNode', 'attenuationColorNode', 'dispersionNode']
         .map(key => sourceId(material[key]))]);
@@ -1074,18 +1133,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     fogNodes.set(fog, {exponential, node});
     return node;
   }
-  function inspect(material, object, context = {}) {
+  function inspect(material, object, context = {}, preparedPrototype = undefined) {
     live();
     const sourceMaterial = material;
+    const extension = materialExtension(material);
+    if (extension) inspectMaterialAccessors(material);
     if (hasThreeCustomProgramCacheKey(three, material) && typeof cacheKeyProperty(material)?.value !== 'function')
       fail('HOOK', 'Native custom program cache keys require an ordinary callable property');
     if (material instanceof three.Material) inspectLegacyCompileHook(material);
-    material = prepareMaterial(material);
+    material = prepareMaterial(material, preparedPrototype === undefined
+      ? retainedMaterialPrototype(material, object, context) : preparedPrototype);
     const {scene, camera} = context;
-    if (!(material instanceof three.NodeMaterial) ||
-        ![three.MeshBasicNodeMaterial.prototype, three.SpriteNodeMaterial.prototype, three.NodeMaterial.prototype, ...primitivePrototypes, ...normalPrototypes, ...litPrototypes].includes(Object.getPrototypeOf(material)))
+    if (!(material instanceof three.NodeMaterial) || materialPrototype(material) === null)
       fail('MATERIAL', 'Native node graphs require Basic, Normal, Matcap, Toon, Lambert, Phong, Standard, Physical, SSS, Shadow, Sprite, Points, LineBasic, LineDashed, Line2, Volume or unlit base NodeMaterial');
-    const prototype = Object.getPrototypeOf(material), lit = litMaterial(material),
+    if (extension && (renderer.library.fromMaterial !== three.StandardNodeLibrary.prototype.fromMaterial ||
+        renderer.library.getMaterialNodeClass !== three.StandardNodeLibrary.prototype.getMaterialNodeClass))
+      fail('MATERIAL', 'Native material extensions require the pinned node-library conversion and class lookup');
+    const prototype = materialPrototype(material), lit = litMaterial(material),
       phong = prototype === three.MeshPhongNodeMaterial.prototype, standard = standardPrototypes.includes(prototype),
       physical = physicalPrototypes.includes(prototype), sss = prototype === three.MeshSSSNodeMaterial?.prototype,
       points = prototype === three.PointsNodeMaterial?.prototype,
@@ -1126,16 +1190,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // without treating them as shader effects. RenderObject does invoke custom
     // program cache keys at its construction/invalidation boundaries. The
     // shared rigid PBR profile has that complete source cache lifecycle.
-    if (hasThreeCustomProgramCacheKey(three, sourceMaterial) && !sharedConstruction(sourceMaterial, material,
+    if ((extension || hasThreeCustomProgramCacheKey(three, sourceMaterial)) && !sharedConstruction(sourceMaterial, material,
       object, context, lights, inspectThreeLightingContext(three, renderer.contextNode)))
-      fail('HOOK', 'Native custom program keys require the shared rigid Standard/Physical material profile');
+      fail('HOOK', 'Native material extensions and custom program keys require their shared rigid construction profile');
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
         // sourceEnvironment validates only the selected, active input. An
         // envNode or disabled lighting leaves an unused map unobserved.
         if (key === 'envMap' && (standard || basicEnvironmentMaterial(material))) continue;
-        if (!MATERIAL_MAPS.has(key)) fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
+        if (!MATERIAL_MAPS.has(key)) {
+          // A custom setup method decides whether an application-owned texture
+          // participates. Validate consumed bindings after source construction.
+          if (extension) continue;
+          fail('TEXTURE', `Native node graph material texture ${key} is not admitted`);
+        }
         if (integerTextureType(value))
           fail('TEXTURE', 'Native integer inputs require authored texel loads, not floating-point material map slots');
         if (value.isCubeTexture || value.is3DTexture || value.isData3DTexture || value.isStorageTexture && value.isArrayTexture)
@@ -1150,11 +1219,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           !(key === 'envNode' && basicEnvironmentMaterial(material)) && !(physical && PHYSICAL_SLOTS.has(key)) &&
           !(sss && SSS_SLOTS.has(key)) &&
           !SHADOW_SLOTS.has(key) &&
-          !(key === 'contextNode' && pipelineContext !== null))
+          !(key === 'contextNode' && pipelineContext !== null) && !(extension && value?.isNode === true))
         fail('GRAPH', `Native node graph slot ${key} is not admitted`);
     }
     const mrt = inspectThreeMRT(three, renderer, material);
     const seen = new Set(), stack = [...GRAPH_SLOTS.map(key => key === 'lightsNode' ? lightsNode : material[key]).filter(Boolean),
+      ...(extension ? Object.values(material).filter(value => value?.isNode === true) : []),
       ...(volume ? [...VOLUME_FUNCTION_SLOTS].map(key => material[key]).filter(node => typeof node === 'function' && node.isNode === true) : []),
       ...authoredNodes,
       ...[environmentGraph(material, context), fogGraph(material, context)].filter(Boolean), ...(mrt?.nodes ?? [])];
@@ -1174,7 +1244,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function sourceMaterialLighting(node, material) {
     if (!material || material.lights !== true || material.fragmentNode != null) return false;
     const prototype = Object.getPrototypeOf(node);
-    if (prototype === three.EnvironmentNode.prototype && standardPrototypes.includes(Object.getPrototypeOf(material)) ||
+    if (prototype === three.EnvironmentNode.prototype && standardPrototypes.includes(materialPrototype(material)) ||
         prototype === three.BasicEnvironmentNode?.prototype && basicEnvironmentMaterial(material)) {
       const reference = node.envNode;
       if (material.envNode) return reference === material.envNode;
@@ -1345,17 +1415,22 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Source builder sharing is first admitted for callback-free, rigid PBR
     // material graphs. These nodes read live object/material uniforms through
     // NodeFrame, but retain their construction-time environment selection.
-    if (![three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(Object.getPrototypeOf(prepared)) ||
+    const extension = materialExtension(material);
+    const prototype = materialPrototype(prepared);
+    if (!(extension
+      ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
+        three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
+      : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || object.receiveShadow ||
-        prepared.transparent || prepared.wireframe || prepared.useTransmission || prepared.lights !== true || prepared.isShadowPassMaterial === true ||
-        [...GRAPH_SLOTS, 'contextNode'].some(name => prepared[name] != null) ||
+        prepared.transparent || prepared.wireframe || prepared.useTransmission || !extension && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
+        (extension ? ['geometryNode', 'lightsNode', 'contextNode'] : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
         [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
           attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute || attribute.isStorageBufferAttribute) ||
         context.scene?.environment || context.scene?.environmentNode || context.scene?.fog || context.scene?.fogNode ||
-        context.camera?.isArrayCamera || context.lightsNode || lights.length || context.lightingEnabled === false ||
+        context.camera?.isArrayCamera || context.lightsNode || context.lights?.length || lights.length || context.lightingEnabled === false ||
         renderer.lighting?.enabled === false || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
@@ -1408,7 +1483,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         a.isInstancedBufferAttribute === true, a.data?.isInstancedInterleavedBuffer === true]),
       renderer.logarithmicDepthBuffer, renderer.reversedDepthBuffer,
       lightingMaterial(material) && material.fragmentNode == null ? [lightingEnabled, lightsNode && sourceId(lightsNode), lightingSignature(material, lights)] : null,
-      physicalPrototypes.includes(Object.getPrototypeOf(material)) ?
+      physicalPrototypes.includes(materialPrototype(material)) ?
         [material.useClearcoat, material.useSheen, material.useIridescence, material.useAnisotropy, material.useRetroreflection,
           material.useTransmission, material.useDispersion] : null]);
   }
@@ -1433,13 +1508,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function compile(material, object, context = {}) {
     const chain = builderScope(context).chain;
     let materials = customKeyCache.get(object), passes = materials?.get(material), record = passes?.get(chain);
-    if (!record && !hasThreeCustomProgramCacheKey(three, material)) return compileProgram(material, object, context);
+    if (!record && !hasThreeCustomProgramCacheKey(three, material) &&
+        !materialExtension(material)) return compileProgram(material, object, context);
     const profile = () => {
       const prepared = inspect(material, object, context);
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context),
         inspectThreeLightingContext(three, renderer.contextNode));
       if (!construction || construction.chain !== chain)
-        fail('HOOK', 'Custom native program keys must retain their shared rigid PBR construction profile');
+        fail('HOOK', 'Custom native material construction must retain its shared rigid profile');
       return construction;
     };
     let construction = profile();
@@ -1471,7 +1547,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       // object from its cache, but get() still returns that local object for
       // this draw. Its already constructed nodes/bindings remain usable; never
       // republish them or let the following draw adopt an unowned descriptor.
-      const state = nodeStates.get(record.entry.descriptor), prepared = prepareMaterial(material);
+      const state = nodeStates.get(record.entry.descriptor), prepared = prepareMaterial(material, state.preparedPrototype);
       const environment = sourceEnvironment(prepared, context);
       state.materialVersion = material.version; state.geometry = object.geometry;
       state.environment = environment;
@@ -1512,7 +1588,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
   }
   function compileProgram(material, object, context = {}, sourceKey = null) {
-    const preparedMaterial = inspect(material, object, context);
+    const extension = materialExtension(material);
+    const retainedBuilder = sourceKey && (sourceKey.entry?.sharedBuilder ?? sharedBuilders.get(sourceKey.key));
+    const preparedMaterial = inspect(material, object, context, retainedBuilder?.preparedPrototype ?? null);
     const lights = sourceLights(preparedMaterial, context), environment = sourceEnvironment(preparedMaterial, context);
     const lightKey = lightingSignature(preparedMaterial, lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
@@ -1657,7 +1735,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         throw new ThreeNodeProgramError('BUILD', `Pinned node construction failed: ${cause?.message ?? cause}`, {cause});
       } finally { builder.addChain = addChain; }
       graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
-      if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode, references: 0};
+      if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode,
+        preparedPrototype: materialPrototype(preparedMaterial), references: 0};
     }
     const lightsNode = authored ?? builder.lightsNode;
     assertInstances(object, instanceSignature);
@@ -1668,19 +1747,20 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native lighting context changed during source graph construction');
     if ((inspectThreeMRT(three, renderer, material)?.key ?? null) !== mrtKey)
       fail('CHANGED', 'Native MRT context changed during source graph construction');
-    if (fogSignature(prepareMaterial(material), context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
+    const currentPrepared = prepareMaterial(material, materialPrototype(preparedMaterial));
+    if (fogSignature(currentPrepared, context) !== fogKey) fail('CHANGED', 'Native scene fog changed during source graph construction');
     if ((material.alphaHash === true) !== alphaHash) fail('CHANGED', 'Native alpha hashing changed during source graph construction');
-    if (volumeSignature(prepareMaterial(material)) !== volumeKey)
+    if (volumeSignature(currentPrepared) !== volumeKey)
       fail('CHANGED', 'Native volume graphs changed during source construction');
-    if (sssSignature(prepareMaterial(material)) !== sssKey)
+    if (sssSignature(currentPrepared) !== sssKey)
       fail('CHANGED', 'Native subsurface scattering graphs changed during source construction');
-    if (geometrySignature(prepareMaterial(material)) !== geometryKey)
+    if (geometrySignature(currentPrepared) !== geometryKey)
       fail('CHANGED', 'Native geometry graph changed during source construction');
-    if (backdropSignature(prepareMaterial(material)) !== backdropKey)
+    if (backdropSignature(currentPrepared) !== backdropKey)
       fail('CHANGED', 'Native backdrop graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
-    if (lightingSignature(prepareMaterial(material), sourceLights(prepareMaterial(material), context)) !== lightKey)
+    if (lightingSignature(currentPrepared, sourceLights(currentPrepared, context)) !== lightKey)
       fail('CHANGED', 'Native light selection or registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.
@@ -1885,7 +1965,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       generated.length ? generatedAttributes.geometry(descriptor) : object.geometry);
     for (const attribute of instances?.cpu ?? []) instanceArrays.set(attribute, attribute.array);
     nodeStates.set(descriptor, {owner: api, descriptor, builder, bindings, material, object, lights, lightSignature: lightKey, analyticLightNodes, shadowGraphs,
-      sharedBuilder, sharedDynamic: construction?.dynamic,
+      sharedBuilder, sharedDynamic: construction?.dynamic, preparedPrototype: materialPrototype(preparedMaterial),
       environment, materialEnvironment: materialEnvironment(preparedMaterial, environment), environmentGraph: environmentGraphKey(preparedMaterial, context),
       basicEnvironmentSignature: basicEnvironmentSignature(preparedMaterial, environment),
       transmissionSignature: transmissionSignature(preparedMaterial),
@@ -1933,6 +2013,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const next = byMaterial ?? new Map(), nextPasses = passes ?? new Map();
     nextPasses.set(passId, entry); next.set(material, nextPasses); cache.set(object, next);
     entries.add(entry);
+    if (extension) {
+      materialExtensions.add(material);
+      const type = threeNativeMaterialExtensionKey(three, material);
+      if (type !== undefined) extensionMaterialTypes.add(type);
+    }
     material.addEventListener('dispose', entry.onDispose);
     // Source geometry disposal clears attribute residency without retiring a
     // RenderObject's compiled morph graph or its captured target texture.
@@ -2122,7 +2207,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     for (const state of states) checkPMREM(state);
   }
   function checkLights(state) {
-    if (lightingSignature(prepareMaterial(state.material), state.lights) !== state.lightSignature)
+    if (lightingSignature(prepareMaterial(state.material, state.preparedPrototype), state.lights) !== state.lightSignature)
       fail('CHANGED', 'Native light selection, registrations or authored lighting graphs changed; compile the graph again');
     for (const node of state.analyticLightNodes) if (!checkAnalyticLight(node, state.lights))
       fail('LIGHTS', 'Native analytic light identity changed after source construction');
@@ -2216,11 +2301,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native MRT graph or attachment layout changed; compile its output graph again');
   }
   function checkFog(state, context) {
-    if (fogSignature(prepareMaterial(state.material), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
+    if (fogSignature(prepareMaterial(state.material, state.preparedPrototype), {scene: context.scene ?? state.builder.scene}) !== state.fogSignature)
       fail('CHANGED', 'Native scene fog identity, graph, kind or material enable flag changed; compile the graph again');
   }
   function checkEnvironment(state, context) {
-    const material = prepareMaterial(state.material), environmentContext = {scene: context.scene ?? state.builder.scene};
+    const material = prepareMaterial(state.material, state.preparedPrototype), environmentContext = {scene: context.scene ?? state.builder.scene};
     const environment = sourceEnvironment(material, environmentContext);
     if (environment !== state.environment || materialEnvironment(material, environment) !== state.materialEnvironment ||
         environmentGraphKey(material, environmentContext) !== state.environmentGraph ||
@@ -2228,23 +2313,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native material or scene environment changed; compile the graph again');
   }
   function checkTransmission(state) {
-    if (transmissionSignature(prepareMaterial(state.material)) !== state.transmissionSignature)
+    if (transmissionSignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.transmissionSignature)
       fail('CHANGED', 'Native transmission or dispersion graph changed; compile the physical draw variant again');
   }
   function checkVolume(state) {
-    if (volumeSignature(prepareMaterial(state.material)) !== state.volumeSignature)
+    if (volumeSignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.volumeSignature)
       fail('CHANGED', 'Native volume scattering, emission, offset or depth graphs changed; compile the volume graph again');
   }
   function checkGeometry(state) {
-    if (geometrySignature(prepareMaterial(state.material)) !== state.geometrySignature)
+    if (geometrySignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.geometrySignature)
       fail('CHANGED', 'Native geometry graph changed; compile the source geometry constructor again');
   }
   function checkBackdrop(state) {
-    if (backdropSignature(prepareMaterial(state.material)) !== state.backdropSignature)
+    if (backdropSignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.backdropSignature)
       fail('CHANGED', 'Native backdrop or alpha graph changed; compile the material graph again');
   }
   function checkSSS(state) {
-    if (sssSignature(prepareMaterial(state.material)) !== state.sssSignature)
+    if (sssSignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.sssSignature)
       fail('CHANGED', 'Native subsurface thickness graphs changed; compile the SSS graph again');
   }
   function checkClipping(state, context) {
@@ -2278,9 +2363,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('ATTRIBUTE', 'Native public attribute inputs require the shared source geometry capture owner');
     const object = context.object ?? state.object;
     checkWireframe(state, object);
-    if (spriteSignature(prepareMaterial(state.material), object) !== state.spriteSignature)
+    if (spriteSignature(prepareMaterial(state.material, state.preparedPrototype), object) !== state.spriteSignature)
       fail('CHANGED', 'Native sprite attenuation or center reference changed; compile the billboard graph again');
-    if (wideLineSignature(prepareMaterial(state.material)) !== state.wideLineSignature)
+    if (wideLineSignature(prepareMaterial(state.material, state.preparedPrototype)) !== state.wideLineSignature)
       fail('CHANGED', 'Native wide-line expansion, dashes, colors or transparency changed; compile the line graph again');
     checkVolume(state);
     checkSSS(state);

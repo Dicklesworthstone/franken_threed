@@ -56,6 +56,194 @@ function fixture(t, {linear = true} = {}) {
   return {renderer, device, scene, camera, material, mesh, canvas};
 }
 
+test('custom node-material subclasses select source graphs without authored slots and freeze queued uniforms', async t => {
+  const f = fixture(t), colors = [[.25, .5, .75], [.625, .375, .125]];
+  let setups = 0;
+  class TintMaterial extends T.MeshBasicNodeMaterial {
+    constructor() { super(); this.tint = T.TSL.uniform(new T.Color(...colors[0])); }
+    setupDiffuseColor(builder) {
+      setups++; assert.equal(builder.material, this);
+      super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.assign(this.tint);
+    }
+  }
+  class InheritedTintMaterial extends TintMaterial {}
+  const material = new InheritedTintMaterial(); f.mesh.material = material;
+  t.after(() => material.dispose());
+  assert.equal(Object.keys(material).some(key => key.endsWith('Node') && material[key] != null), false);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  material.tint.value.setRGB(...colors[1]);
+  f.renderer.render(f.scene, f.camera);
+  assert.equal(setups, 1, 'a warm graph retains the source material setup');
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 2);
+  for (const [index, color] of colors.entries()) assert.ok(hasColor(actual[index], color));
+  assert.equal(setups, 1, 'deferred preparation does not replay setup');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('registered ordinary material extensions preserve conversion construction and original frame identity', async t => {
+  const f = fixture(t), colors = [[.25, .5, .75], [.625, .375, .125]], updates = [];
+  let constructions = 0, setups = 0;
+  class SourceTintMaterial extends T.MeshBasicMaterial {
+    constructor() {
+      super(); this.type = 'SourceTintMaterial';
+      this.tint = T.TSL.uniform(new T.Color(...colors[0])).onObjectUpdate(frame => {
+        updates.push([frame.renderer, frame.scene, frame.camera, frame.object, frame.material]);
+      });
+    }
+  }
+  class NativeTintMaterial extends T.MeshBasicNodeMaterial {
+    constructor() { super(); constructions++; }
+    setupDiffuseColor(builder) {
+      setups++; assert.equal(builder.material, material);
+      super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.assign(this.tint);
+    }
+  }
+  const material = new SourceTintMaterial(); f.mesh.material = material;
+  t.after(() => material.dispose());
+  f.renderer.library.addMaterial(NativeTintMaterial, 'SourceTintMaterial');
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  material.tint.value.setRGB(...colors[1]); f.renderer.render(f.scene, f.camera);
+  material.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  assert.equal(constructions, 1, 'unchanged source program keys retain the conversion instance');
+  assert.equal(setups, 1);
+  material.dispose(); f.renderer.render(f.scene, f.camera);
+  assert.equal(constructions, 2, 'disposal reconstructs through the source converter');
+  assert.equal(setups, 2);
+  assert.equal(updates.length, 4);
+  for (const frame of updates) assert.deepEqual(frame, [f.renderer, f.scene, f.camera, f.mesh, material]);
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 4);
+  assert.ok(hasColor(actual[0], colors[0]));
+  for (const draw of actual.slice(1)) assert.ok(hasColor(draw, colors[1]));
+  assert.equal(constructions, 2); assert.equal(updates.length, 4);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a registered replacement for an ordinary built-in material selects the native source converter', async t => {
+  const f = fixture(t), color = [.625, .125, .875];
+  let constructions = 0;
+  class RegisteredBasicMaterial extends T.MeshBasicNodeMaterial {
+    constructor() { super(); constructions++; this.tint = T.TSL.uniform(new T.Color(...color)); }
+    setupDiffuseColor(builder) {
+      assert.equal(builder.material, f.material);
+      super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.assign(this.tint);
+    }
+  }
+  f.renderer.library.materialNodes.delete('MeshBasicMaterial');
+  f.renderer.library.addMaterial(RegisteredBasicMaterial, 'MeshBasicMaterial');
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(constructions, 1); assert.ok(hasColor(draws(f.device)[0], color));
+  f.renderer.library.materialNodes.set('MeshBasicMaterial', T.MeshBasicNodeMaterial);
+  f.renderer.render(f.scene, f.camera);
+  f.material.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  assert.equal(constructions, 1, 'restoring a mapping retains the original source builder');
+  f.material.dispose(); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 4);
+  for (const draw of actual.slice(0, 3)) assert.ok(hasColor(draw, color));
+  assert.ok(hasColor(actual[3], [.125, .375, .625]), 'disposal selects the restored source conversion');
+});
+
+test('new default-material owners retain a shared custom builder after registration restoration', async t => {
+  const f = fixture(t), color = [.625, .125, .875];
+  let constructions = 0;
+  class RegisteredBasicMaterial extends T.MeshBasicNodeMaterial {
+    constructor() { super(); constructions++; this.tint = T.TSL.uniform(new T.Color(...color)); }
+    setupDiffuseColor(builder) { super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.assign(this.tint); }
+  }
+  f.renderer.library.materialNodes.set('MeshBasicMaterial', RegisteredBasicMaterial);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  f.renderer.library.materialNodes.set('MeshBasicMaterial', T.MeshBasicNodeMaterial);
+  const material = new T.MeshBasicMaterial({color: new T.Color(.5, .375, .25)});
+  const scene = new T.Scene(), object = new T.Mesh(f.mesh.geometry, material); object.frustumCulled = false; scene.add(object);
+  t.after(() => material.dispose());
+  f.renderer.render(scene, f.camera);
+  assert.equal(constructions, 1, 'the new owner shares the still-live source builder');
+  f.material.dispose(); material.dispose();
+  f.renderer.render(scene, f.camera); await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 3);
+  assert.ok(hasColor(actual[0], color)); assert.ok(hasColor(actual[1], color));
+  assert.ok(hasColor(actual[2], [.5, .375, .25]), 'retiring the final owner releases the old registered graph');
+});
+
+test('changing a previously fixed material registration requires retiring its original program', async t => {
+  const f = fixture(t), color = [.625, .125, .875]; let constructions = 0;
+  class RegisteredBasicMaterial extends T.MeshBasicNodeMaterial {
+    constructor() { super(); constructions++; this.tint = T.TSL.uniform(new T.Color(...color)); }
+    setupDiffuseColor(builder) { super.setupDiffuseColor(builder); T.TSL.diffuseColor.rgb.assign(this.tint); }
+  }
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  f.renderer.library.materialNodes.set('MeshBasicMaterial', RegisteredBasicMaterial);
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_MATERIAL_CACHE'});
+  assert.equal(constructions, 0, 'unsupported fixed-program migration must not execute the new converter');
+  f.material.dispose(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(constructions, 1); assert.ok(hasColor(draws(f.device).at(-1), color));
+});
+
+test('registered inherited light nodes select native ordinary materials and capture each render once', async t => {
+  const f = fixture(t), updates = [], color = [.25, .5, .75];
+  class SourceAmbient extends T.AmbientLight {}
+  class CameraAmbient extends T.AmbientLightNode {
+    constructor(light) { super(light); this.updateType = 'render'; }
+    update(frame) {
+      super.update(frame); this.color.multiplyScalar(frame.camera.userData.gain);
+      updates.push([frame.renderer, frame.scene, frame.camera, frame.material, frame.camera.userData.gain]);
+    }
+  }
+  const material = new T.MeshLambertMaterial(), light = new SourceAmbient(new T.Color(...color));
+  const second = new T.Mesh(f.mesh.geometry, material); second.frustumCulled = false;
+  f.mesh.material = material; f.scene.add(second, light);
+  t.after(() => { material.dispose(); light.dispose(); });
+  f.renderer.library.addLight(CameraAmbient, SourceAmbient);
+  await f.renderer.init();
+  f.camera.userData.gain = 1; f.renderer.render(f.scene, f.camera);
+  f.camera.userData.gain = 2; f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(updates, [
+    [f.renderer, f.scene, f.camera, material, 1],
+    [f.renderer, f.scene, f.camera, material, 2]
+  ]);
+  await drain(f.renderer);
+  const actual = draws(f.device); assert.equal(actual.length, 4);
+  for (const draw of actual.slice(0, 2)) assert.ok(hasColor(draw, color));
+  for (const draw of actual.slice(2)) assert.ok(hasColor(draw, color.map(value => value * 2)));
+  assert.equal(updates.length, 2, 'asynchronous preparation never replays light updates');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a registered built-in light replacement retains object-frequency updates through ordinary materials', async t => {
+  const f = fixture(t), objects = [], color = [.125, .25, .375];
+  class ObjectAmbient extends T.AmbientLightNode {
+    constructor(light) { super(light); this.updateType = 'object'; this.colorNode.setGroup(T.TSL.objectGroup); }
+    update(frame) {
+      super.update(frame); this.color.multiplyScalar(frame.object.userData.gain); objects.push(frame.object);
+    }
+  }
+  const material = new T.MeshLambertMaterial(), light = new T.AmbientLight(new T.Color(...color));
+  f.mesh.material = material; f.mesh.userData.gain = 1; f.mesh.renderOrder = 0;
+  const second = new T.Mesh(f.mesh.geometry, material); second.frustumCulled = false;
+  second.userData.gain = 2; second.renderOrder = 1; f.scene.add(second, light);
+  t.after(() => { material.dispose(); light.dispose(); });
+  f.renderer.library.lightNodes.delete(T.AmbientLight);
+  f.renderer.library.addLight(ObjectAmbient, T.AmbientLight);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(objects, [f.mesh, second]);
+  const actual = draws(f.device); assert.equal(actual.length, 2);
+  assert.ok(hasColor(actual[0], color)); assert.ok(hasColor(actual[1], color.map(value => value * 2)));
+  f.renderer.library.lightNodes.set(T.AmbientLight, T.AmbientLightNode);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(objects, [f.mesh, second, f.mesh, second]);
+  assert.ok(hasColor(draws(f.device)[3], color.map(value => value * 2)));
+  const next = fixture(t); next.mesh.material = material; next.mesh.userData.gain = 3; next.scene.add(light);
+  await next.renderer.init(); next.renderer.render(next.scene, next.camera); await drain(next.renderer);
+  assert.equal(objects.at(-1), next.mesh, 'another renderer retains the source light-identity cache');
+  assert.ok(hasColor(draws(next.device)[0], color.map(value => value * 3)));
+});
+
 test('custom PBR cache keys run at native draw capture and preserve queued uniform versions', async t => {
   const f = fixture(t), material = new T.MeshStandardMaterial(), events = [];
   f.mesh.material = material; t.after(() => material.dispose());

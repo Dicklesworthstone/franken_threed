@@ -28,6 +28,45 @@ the existing 4,000-record sharing and queued-disposal cases.
 
 ## Implemented graph surface
 
+### Registered material and light extensions
+
+Custom subclasses of supported node-material families and ordinary materials
+registered with `renderer.library.addMaterial(NodeClass, materialType)` now
+select the native source-builder path without a dummy authored node slot.
+Replacing a built-in material mapping also selects that path. The initial
+extension profile covers rigid, opaque, single-output meshes with float
+attributes; scene lights, maps, environments, fog, shadows, material context and
+geometry nodes remain outside this material-extension profile. Existing built-in
+material profiles retain their broader supported features.
+
+Admission uses the nearest pinned material-family defaults without running a
+custom conversion constructor. The actual source builder performs conversion
+and setup at its normal construction boundary. Source program keys, observer
+updates, original `NodeFrame.material` identity, version-only cache reuse and
+disposal govern subsequent draws. Restoring a default registration keeps the
+already constructed graph and native owner until source reconstruction. Custom
+node fields and generated resource bindings still pass graph, layout and budget
+validation; arbitrary converter overrides and application property accessors are
+not admitted. A material already used by the fixed shader owner must be disposed
+before switching its registration to a custom native conversion; this explicit
+boundary prevents replaying construction under a warm source program.
+
+Registered analytic lights can inherit through custom light and node classes,
+including the built-in analytic node families. Their source before/current/after
+callbacks retain FRAME, RENDER and OBJECT scheduling. Uniform groups keep their
+own source frequency: an object-frequency light that needs a different color per
+object must also place that color uniform in `objectGroup`. Capture does not
+silently turn a render-group uniform into an object-group uniform.
+
+The source light-identity cache survives registry changes and renderer changes.
+Existing lights retain their constructed analytic node; fresh lights observe the
+current registration. Ordinary lit materials automatically select the native
+owner for these lights, and queued draws retain their accepted radiance and
+uniforms. Generated unsupported graphics storage writes remain rejected before
+update callbacks. The source builder and JavaScript lifecycle remain retained;
+these changes do not establish Rust node evaluation, pixel parity or hardware
+acceleration.
+
 ### Render-triggered geometry compute
 
 `NodeMaterial.geometryNode` now admits the pinned `ComputeNode` lifecycle,
@@ -238,8 +277,8 @@ application rewrite. Other materials keep their existing fixed rendering path
 unless they are companions in a mixed native scene, as described below.
 When one material group on a mesh needs native shading, its other groups use the
 same source library conversion and geometry owner. All selected groups must pass
-admission before any node update runs. Custom material subclasses and overridden
-conversion methods remain outside this entrance.
+admission before any node update runs. Custom material subclasses use the
+extension profile above; overridden conversion methods remain outside it.
 
 Native `PointsNodeMaterial`, `LineBasicNodeMaterial` and
 `LineDashedNodeMaterial` retain their source graphs and object-selected WebGPU
@@ -483,8 +522,9 @@ unversioned CPU edits do not alter an already captured image.
 
 Both families compose with native Basic, PCF and VSM shadows, retaining caster
 callbacks, map dimensions, `autoUpdate` and `needsUpdate`. Inactive lights do not
-read their map slots. Unknown subclasses and altered library mappings keep the
-existing admission boundaries. The new `three_node_spot_lights.test.mjs` and
+read their map slots. Registered analytic subclasses use the extension path
+above while keeping the existing shadow and resource boundaries. The
+`three_node_spot_lights.test.mjs` and
 `three_renderer_spot_lights.test.mjs` provide 25 source-WGSL and actual-facade
 regressions; together with existing projection/shadow-filter checks, 45 tests
 pass. Fresh browser pixels and hardware performance remain unverified.
@@ -508,17 +548,17 @@ not browser pixel or performance measurements.
 
 Explicit `renderer.library.addLight(NodeClass, LightClass)` registrations can
 supply direct analytic illumination, including the pinned H7 `SunLight` and
-`SunLightNode` addons. The light must directly extend the source `Light`, and
-its registered node must directly extend `AnalyticLightNode` while retaining
-the source setup/build/update lifecycle. The source node computes SunLight's
+`SunLightNode` addons. Lights and registered nodes may inherit through source
+`Light` and `AnalyticLightNode` subclasses, with the pinned library lookup and
+source graph/resource validation. The source node computes SunLight's
 world-position-to-origin direction and color/intensity; FRAME updates stay
 shared across objects and recompilations. Queued draws retain their captured
 direction and radiance.
 
-Constructor, registration and direct-light graph changes participate in program
-selection. Changing the registered node class of a previously used light is
-refused because the source retains its analytic node by light identity; a fresh
-light can use the new registration. Projected maps require the source
+Constructor, registration and method edits alone do not rebuild a warm light
+graph. The source retains its analytic node by light identity; a fresh light
+can use a new registration. Explicit source graph invalidation reconstructs the
+shader with the cached node's current setup method. Projected maps require the source
 `SpotLightNode`; registered analytic lights can use source color graphs.
 The registered SunLight also retains its source
 two-cascade shadow atlas through the native shadow owner described below.

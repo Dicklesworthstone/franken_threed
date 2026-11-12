@@ -102,11 +102,21 @@ test('projector aspect and penumbra retain the actual source per-frame update', 
 });
 
 for (const Light of [T.IESSpotLight, T.ProjectorLight])
-test(`${Light.name} support preserves exact library mappings and the custom subclass guard`, t => {
+test(`${Light.name} registrations and inherited subclasses retain exact source shaders and warm caches`, t => {
   const f = fixture(t, Light);
   f.renderer.library.lightNodes.set(Light, T.SpotLightNode);
-  assert.throws(f.compile, {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  const replacement = f.compile(); assertSource(f, replacement);
+  assert.equal(f.compile(), replacement, 'a source-valid builtin replacement retains its warm program');
+  assert.doesNotThrow(() => f.capture(replacement));
   class CustomLight extends Light {}
-  const custom = new CustomLight(); f.renderer.library.addLight(T.SpotLightNode, CustomLight);
-  assert.throws(() => f.owner.compile(f.material, f.object, {...f.context, lights: [custom]}), {code: 'THREE_NODE_PROGRAM_LIGHTS'});
+  class CustomNode extends T[`${Light.name}Node`] {}
+  const custom = new CustomLight(), texture = map(t);
+  t.after(() => custom.dispose());
+  custom[Light === T.IESSpotLight ? 'iesMap' : 'map'] = texture;
+  f.renderer.library.addLight(CustomNode, CustomLight);
+  f.scene.add(custom, custom.target); f.scene.updateMatrixWorld();
+  const context = {...f.context, lights: [custom]}, descriptor = f.owner.compile(f.material, f.object, context);
+  assertSource({...f, light: custom}, descriptor);
+  assert.equal(f.owner.compile(f.material, f.object, context), descriptor);
+  assert.ok(sampled(f.owner.captureDraw(descriptor, context)).includes(texture));
 });

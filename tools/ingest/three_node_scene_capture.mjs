@@ -3,7 +3,8 @@
  * Pipeline preparation consumes these packets later and never repeats updates.
  * Geometry bytes still follow the bridge's existing upload/version contract.
  */
-import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, hasThreeCustomProgramCacheKey, ThreeNodeProgramError} from './three_node_program.mjs';
+import {hasThreeNodeProgram, hasThreeNativeMedia, hasThreeNativeTexture, hasThreeNativeMaterialExtension,
+  threeNativeMaterialExtensionKey, hasThreeCustomProgramCacheKey, ThreeNodeProgramError} from './three_node_program.mjs';
 import {getThreeNativeShadowPass, withThreeShadowMaterial, captureThreeShadowMaterialState,
   withThreeNativeCapture, markThreeNativeDrawCaptured, withThreeNativeObjectHooks} from './three_node_shadows.mjs';
 import {inspectThreeLightingContext, inspectThreeNativeCamera, hasThreeHighPrecisionContext} from './three_node_passes.mjs';
@@ -17,6 +18,10 @@ const transmissive = material => material.transmission > 0 || material.transmiss
 const transparent = material => material.transparent === true || transmissive(material) || material.backdropNode?.isNode === true;
 const environmentMaterialHistory = new WeakMap();
 const sampledTextureMaterialHistory = new WeakMap();
+const extensionMaterialHistory = new WeakMap();
+const extensionMaterialTypeHistory = new WeakMap();
+// Source LightsNode caches analytic nodes by light identity across renderers.
+const extensionLightHistory = new WeakSet();
 const sampledTextureSceneHistory = new WeakMap();
 const highPrecisionSceneHistory = new WeakMap();
 const fixedPrecisionContexts = new WeakMap();
@@ -24,8 +29,15 @@ const nativeSceneHistory = new WeakMap();
 const hookSceneHistory = new WeakMap();
 const hookAttributeHistory = new WeakMap();
 const fixedAttributeHistory = new WeakMap();
+const fixedMaterialHistory = new WeakMap();
 const attributeOwners = object => [...Object.values(object.geometry?.attributes ?? {}), object.geometry?.index,
   object.instanceMatrix, object.instanceColor].filter(Boolean).map(attribute => attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+const dataProperty = (object, key) => {
+  for (let current = object; current; current = Object.getPrototypeOf(current)) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor) return descriptor.value;
+  }
+};
 
 // Additional source material features use the retained native shader builder.
 // Users must not add a dummy TSL slot to reach an existing implementation.
@@ -88,7 +100,26 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   };
   // Removing an admitted environment must keep the same source lighting and
   // deformation path. The fixed shader has different rounding/normal behavior.
-  const nativeMaterialFeatures = material => nativeFeatures(material) ||
+  const nativeMaterialExtension = material => {
+    const type = threeNativeMaterialExtensionKey(three, material);
+    if (!extensionMaterialHistory.get(renderer)?.has(material) &&
+        !extensionMaterialTypeHistory.get(renderer)?.has(type) &&
+        !hasThreeNativeMaterialExtension(three, material, renderer?.library)) return false;
+    if (fixedMaterialHistory.get(renderer)?.has(material))
+      fail('MATERIAL_CACHE', 'Changing a fixed material to a registered native conversion requires disposing its previous material program');
+    if (!renderer) return true;
+    // Restoring a default mapping does not replace a source renderer's cached
+    // custom graph. Keep its native owner even when the material changes scene.
+    let retained = extensionMaterialHistory.get(renderer);
+    if (!retained) extensionMaterialHistory.set(renderer, retained = new WeakSet());
+    if (typeof type === 'string') {
+      let types = extensionMaterialTypeHistory.get(renderer);
+      if (!types) extensionMaterialTypeHistory.set(renderer, types = new Set());
+      types.add(type);
+    }
+    retained.add(material); return true;
+  };
+  const nativeMaterialFeatures = material => nativeFeatures(material) || nativeMaterialExtension(material) ||
     environmentMaterialHistory.get(renderer)?.has(material) || sampledMaterialFeatures(material);
   // The facade supplies its source controls. Standalone capture callers retain
   // the complete-list default; each control is observed at its source phase.
@@ -182,8 +213,26 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
   // These exact source spot families have attenuation beyond the fixed cone,
   // even before an IES/projected image is assigned. Keep their first graph on
   // the native owner so later FRAME updates preserve the source cache history.
-  const authoredLight = object => object.isLight === true && (object.constructor === three.IESSpotLight ||
-    object.constructor === three.ProjectorLight || object.colorNode || object.isSpotLight === true && object.map);
+  const fixedLightClasses = new Map([
+    [three.AmbientLight, three.AmbientLightNode], [three.DirectionalLight, three.DirectionalLightNode],
+    [three.HemisphereLight, three.HemisphereLightNode], [three.PointLight, three.PointLightNode],
+    [three.SpotLight, three.SpotLightNode]
+  ].map(([Source, Native]) => [Source.prototype, {Source, Native}]));
+  const lightLibrary = renderer?.library, lightRegistry = dataProperty(lightLibrary, 'lightNodes');
+  const pinnedLightLookup = dataProperty(lightLibrary, 'getLightNodeClass') === three.StandardNodeLibrary.prototype.getLightNodeClass;
+  // Registry selection must not execute user constructors, getters or lookup
+  // callbacks before the source builder reaches its actual light-node cache.
+  const nativeLightRegistration = object => {
+    if (extensionLightHistory.has(object)) return true;
+    const classes = fixedLightClasses.get(Object.getPrototypeOf(object));
+    const native = !classes || Object.hasOwn(object, 'constructor') || !pinnedLightLookup ||
+      !(lightRegistry instanceof WeakMap) || Object.getPrototypeOf(lightRegistry) !== WeakMap.prototype ||
+      WeakMap.prototype.get.call(lightRegistry, classes.Source) !== classes.Native;
+    if (native) extensionLightHistory.add(object);
+    return native;
+  };
+  const authoredLight = object => object.isLight === true && (nativeLightRegistration(object) ||
+    object.colorNode || object.isSpotLight === true && object.map);
   const projectedLights = new Set([...hierarchy.keys()].filter(object => object.isLight === true &&
     visibility.get(object) && !bundleMembers.has(object) && object.layers.test(camera.layers)));
   for (const object of extraLights) projectedLights.add(object);
@@ -398,6 +447,7 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       fail('SHADOW', 'Native shadow casters currently require the source shadow override material');
     const effective = originals.map(original => object !== backgroundMesh && original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original);
     if (!(nativeCompanionScene && renderable(object)) && !nativeSelection(object, effective)) continue;
+    for (const material of effective) nativeMaterialExtension(material);
     if (!shadowPass && effective.some((material, index) => material !== originals[index])) nativeOverrides = true;
     // A mesh's material groups share one geometry owner. Admit all its groups
     // through the source library conversion when any group needs native shading;
@@ -476,14 +526,25 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     if (!renderer || nativeHookScene) return;
     // Legacy preparation uploads off-layer and invisible materials too; source
     // visibility and disabled phases still exclude their complete subtrees/work.
-    const fixed = [...hierarchy.keys()].filter(object => visibility.get(object) && !excludedObjects.has(object) && !objects.has(object) && !captured?.has(object) &&
+    const fixed = [...hierarchy.keys()].filter(object => visibility.get(object) && !excludedObjects.has(object) && !objects.has(object) &&
         object.isLineLoop !== true && (object.isMesh || object.isSprite || object.isPoints || object.isLine) &&
         (Array.isArray(object.material) ? object.material : [object.material]).some(material => selected(material, object)));
-    if (inspect) { for (const object of fixed) assertFixedHistory(attributeOwners(object)); return; }
+    if (inspect) { for (const object of fixed) if (!captured?.has(object)) assertFixedHistory(attributeOwners(object)); return; }
     if (!fixed.length) return;
     let attributes = fixedAttributeHistory.get(renderer);
     if (!attributes) fixedAttributeHistory.set(renderer, attributes = new WeakSet());
-    for (const object of fixed) for (const owner of attributeOwners(object)) attributes.add(owner);
+    let materials = fixedMaterialHistory.get(renderer);
+    if (!materials) fixedMaterialHistory.set(renderer, materials = new WeakSet());
+    for (const object of fixed) {
+      if (!captured?.has(object)) for (const owner of attributeOwners(object)) attributes.add(owner);
+      for (const original of Array.isArray(object.material) ? object.material : [object.material]) {
+        const material = original?.allowOverride === true && overrideMaterial !== null ? overrideMaterial : original;
+        if (!(material instanceof three.Material) || !selected(material, object) || materials.has(material)) continue;
+        materials.add(material);
+        const dispose = () => { materials.delete(material); material.removeEventListener('dispose', dispose); };
+        material.addEventListener('dispose', dispose);
+      }
+    }
   };
   const captureFixedGeometry = () => {
     const fixedGeometries = new Map(), bundleGeometries = [], captured = new Map();
