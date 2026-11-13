@@ -495,8 +495,8 @@ resource resolver. Archive Blob URLs and manager-provided data URLs stay intact;
 fallback images use the embedded map only when that logical resource is already
 declared. Missing USD layers retain the source's empty-reference behavior.
 Unknown or external image URLs retain their host route and source error timing.
-This supports self-contained archives; it does not automatically discover loose
-USDA/USDC companions or make an incomplete archive self-contained.
+This archive path does not discover external USD layers or USDC companions, or
+make an incomplete archive self-contained. Standalone USDA images are covered below.
 
 Packed tests execute after source and build directories become unavailable. They
 check referenced geometry, transforms, physical materials, texture transforms,
@@ -505,6 +505,33 @@ edited geometry/material/transform export through the original `USDZExporter`
 followed by reimport. Native parser errors and the source color-space conversion
 remain unchanged. The recording image host verifies original PNG bytes and
 completion; browser image decoding and rendering are separate claims.
+
+## Standalone USDA texture sidecars
+
+Finite pinned `USDLoader` and compatibility `USDZLoader` text loads include local
+image sidecars declared by `UsdUVTexture`, MaterialX `ND_image_*`, and Arnold
+image nodes. Build-time discovery uses the exact pinned, import-free
+`USDAParser`; it verifies the loader, composer and parser source identities
+before importing the parser. Applications without USD loads do not acquire this
+preparation step. Modified or unavailable USD source reports an explicit
+unsupported-source error for a requested standalone text build.
+
+Image discovery follows the pinned composer's attribute connections, default
+values and time-zero (or first-sample) selection. Duplicate declarations,
+comments and quoted asset names retain the source parser's rules. Original
+USDA and image bytes are copied unchanged. The runtime loader and composer
+continue to own scene construction, texture setup and callback completion.
+
+Sidecar URLs use the path captured when `load()` starts, including a missing
+trailing slash and encoded names with query/fragment suffixes. Later
+`setPath()` changes and `resourcePath` do not redirect that captured base.
+The existing document-root confinement and embedded-resource resolver apply.
+External image URLs remain on their original host route.
+
+This is a finite image-field closure for standalone USDA. It does not fetch
+external USD layers or inspect binary USDC, and it leaves self-contained USDZ
+archives on their existing path. Runtime image decoding and rendered pixels
+remain separate from the packed-loader recording-host checks.
 
 ## 3MF manufacturing models
 

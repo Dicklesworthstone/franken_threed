@@ -12,6 +12,7 @@ import { packHtml } from "./pack_html.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
 import { colladaAssetUris } from "./pack_collada.mjs";
+import { prepareUsdAssetUris } from "./pack_usd.mjs";
 
 const rootUrl = new URL("../../upstream/three.js/", import.meta.url).href;
 const coreUrl = rootUrl + "build/three.core.js";
@@ -1235,4 +1236,49 @@ test("compressed texture discovery preserves mutable faces, foreign loaders and 
     const owned = new DDSLoader(manager); owned.load('managed.dds');
     new DDSLoader().setPath('safe/').load('known.dds');`);
   assert.deepEqual(requests.map(({url}) => url), ['safe/known.dds']);
+});
+
+test("loose USDA sidecars use the captured source base, ignoring resourcePath and later path changes", async () => {
+  const usdUrl = rootUrl + "examples/jsm/loaders/USDLoader.js";
+  const model = Buffer.from('#usda 1.0\ndef Material "Paint" {\n def Shader "Image" {\n' +
+    '  uniform token info:id = "UsdUVTexture"\n  asset inputs:file = @"./paint%20%23.png?edition=2#map"@\n }\n}');
+  const root = fixture({"index.html": "", "site/models/nested/scene.usda": model,
+    "site/flatmodel.usda": model, "site/models/paint #.png": fbxPixel,
+    "site/models/nested/paint #.png": fbxPixel, "site/flat/paint #.png": fbxPixel,
+    "site/ignored/paint #.png": fbxPixel, "site/later/paint #.png": fbxPixel});
+  const requests = discover('import {USDLoader} from ' + JSON.stringify(usdUrl) + ';' +
+    "const pending = new USDLoader().setPath('models/').setResourcePath('ignored/');" +
+    "pending.load('nested/scene.usda'); pending.setPath('later/');" +
+    "new USDLoader().loadAsync('models/nested/scene.usda');" +
+    "new USDLoader().setPath('flat').load('model.usda');");
+  const logical = [], assets = collectThreeLoaderAssets(requests, {
+    documentUrl: pathToFileURL(path.join(root, "index.html")).href,
+    documentBaseUrl: pathToFileURL(root + "/site/").href,
+    usdAssetUris: await prepareUsdAssetUris(requests, {strict: true}),
+    onResource: (_name, url) => logical.push(url),
+  });
+  assert.deepEqual([...assets.keys()].sort(), [
+    "site/flatmodel.usda", "site/flat/paint #.png", "site/models/nested/scene.usda",
+    "site/models/paint #.png", "site/models/nested/paint #.png",
+  ].sort());
+  assert.ok(logical.some(url => url.endsWith("models/paint%20%23.png?edition=2#map")));
+  assert.ok(logical.some(url => url.endsWith("flat/paint%20%23.png?edition=2#map")));
+  assert.deepEqual(assets.get("site/models/nested/scene.usda").source, model);
+});
+
+test("loose USDA images keep LoaderUtils root-relative concatenation and external host URLs", async () => {
+  const model = Buffer.from('#usda 1.0\ndef Shader "Image" {\n token info:id = "UsdUVTexture"\n' +
+    ' asset inputs:file = @/paint.png@\n}\ndef Shader "Remote" {\n token info:id = "arnold:image"\n' +
+    ' string inputs:filename = "https://images.example/remote.png"\n}');
+  const root = fixture({"pages/demo.html": "", "models/scene.usda": model, "models/paint.png": fbxPixel,
+    "paint.png": fbxPixel});
+  const requests = discover('import {USDLoader} from ' + JSON.stringify(rootUrl + "examples/jsm/loaders/USDLoader.js") + ';' +
+    "new USDLoader().setPath('/models/').loadAsync('scene.usda');");
+  const logical = [], assets = collectThreeLoaderAssets(requests, {
+    documentRoot: root, documentUrl: pathToFileURL(path.join(root, "pages/demo.html")).href,
+    usdAssetUris: await prepareUsdAssetUris(requests, {strict: true}),
+    onResource: (_name, url) => logical.push(url),
+  });
+  assert.deepEqual([...assets.keys()].sort(), ["models/paint.png", "models/scene.usda"]);
+  assert.ok(logical.some(url => url.endsWith("/models//paint.png")));
 });

@@ -25,6 +25,7 @@ import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { collectThreeLoaderAssets, findThreeLoaderRequests } from "./three_loader_assets.mjs";
+import { prepareUsdAssetUris } from "./pack_usd.mjs";
 import {
   LOADER_RESOURCES_IMPORT, LOADER_RESOURCES_FILE,
   threeLoaderResourceEdits, createThreeLoaderResourceModule,
@@ -224,10 +225,14 @@ export function f3dRollupPlugin(options = {}) {
   return {
     name: "f3d-ingest-resolver",
 
-    generateBundle(_outputOptions, bundle) {
+    async generateBundle(_outputOptions, bundle) {
       for (const { requests, id } of defaultManagerExposed ? [] : documentRequests) {
         const admitted = managerConstructorExposed ? requests.filter(request => !request.localManager) : requests;
+        const usdAssetUris = await prepareUsdAssetUris(admitted, {
+          packageRootUrl: options.packageRootUrl, strict: options.prepareStandaloneLoaders === true,
+        });
         for (const [fileName, asset] of collectThreeLoaderAssets(admitted, {
+          usdAssetUris,
           documentUrl: options.documentUrl,
           documentBaseUrl: mapBaseUrl,
           documentRoot,

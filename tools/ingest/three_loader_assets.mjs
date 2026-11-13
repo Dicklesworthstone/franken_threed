@@ -734,7 +734,7 @@ function mtlTextureUris(text) {
 }
 
 /** Copies the finite local closure without changing the loader's original URL strings. */
-export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl = documentUrl, documentRoot, fail, onResource }) {
+export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUrl = documentUrl, documentRoot, fail, onResource, usdAssetUris = null }) {
   documentRoot = normalizeDocumentRoot(documentRoot);
   const result = new Map(), entryDir = documentRoot ?? path.dirname(fileURLToPath(documentUrl));
   const add = (uri) => {
@@ -763,6 +763,19 @@ export function collectThreeLoaderAssets(requests, { documentUrl, documentBaseUr
   for (const request of requests) {
     const asset = add(request.url);
     if (!asset) continue;
+    if ((request.loader === "USDLoader" || request.loader === "USDZLoader") && usdAssetUris) {
+      // USDLoader captures this base when load starts; resourcePath and later
+      // setPath calls do not alter it. USDComposer adds a trailing separator.
+      let base = request.path || extractUrlBase(request.originalUrl);
+      if (base && !base.endsWith("/")) base += "/";
+      for (const uri of usdAssetUris(asset.source)) {
+        // LoaderUtils.resolveURL bypasses the prefix for these host URLs, but
+        // concatenates a single leading '/' when the base is document-relative.
+        if (/^(https?:)?\/\//i.test(uri) || /^data:.*,.*$/i.test(uri) || /^blob:.*$/i.test(uri)) continue;
+        add(base + uri);
+      }
+      continue;
+    }
     if (request.loader === "ColladaLoader") {
       if (!request.texturePaths) continue;
       let uris;

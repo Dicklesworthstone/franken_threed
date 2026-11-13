@@ -1138,3 +1138,63 @@ test("packed DDS, KTX and TGA retain compressed mips, cube faces and decoded pix
   assert.equal(result.requests.length, 19, 'each file and the independent DDS reload use the embedded resource host');
   assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
 });
+
+test("packed standalone USDA retains sidecar images, captured bases and native callback completion", async () => {
+  const model = Buffer.from("#usda 1.0\n(\n  upAxis = \"Y\"\n  metersPerUnit = 1\n)\ndef Mesh \"Triangle\" {\n  int[] faceVertexCounts = [3]\n  int[] faceVertexIndices = [0, 1, 2]\n  point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]\n  texCoord2f[] primvars:st = [(0, 0), (1, 0), (0, 1)] (\n    interpolation = \"vertex\"\n  )\n  rel material:binding = </Materials/Paint>\n}\ndef Scope \"Materials\" {\n  def Material \"Paint\" {\n    token outputs:surface.connect = </Materials/Paint/Surface.outputs:surface>\n    asset inputs:image = @\"./paint%20%23.png?edition=2#surface\"@\n    def Shader \"Surface\" {\n      uniform token info:id = \"UsdPreviewSurface\"\n      color3f inputs:diffuseColor.connect = </Materials/Paint/Image.outputs:rgb>\n      float inputs:roughness = 0.25\n      token outputs:surface\n    }\n    def Shader \"Image\" {\n      uniform token info:id = \"UsdUVTexture\"\n      asset inputs:file.connect = </Materials/Paint.inputs:image>\n      token inputs:wrapS = \"clamp\"\n      token inputs:wrapT = \"mirror\"\n      float3 outputs:rgb\n    }\n  }\n}\n");
+  const usd = new URL("../../upstream/three.js/examples/jsm/loaders/USDLoader.js", import.meta.url).href;
+  const legacy = new URL("../../upstream/three.js/examples/jsm/loaders/USDZLoader.js", import.meta.url).href;
+  const f = fixture({"index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      import {USDLoader} from ${JSON.stringify(usd)};
+      import {USDZLoader} from ${JSON.stringify(legacy)};
+      export async function run() {
+        const sequence=[], loader=new USDLoader().setPath('models/').setResourcePath('ignored/');
+        let returned;
+        const pending=new Promise((resolve,reject)=>{
+          returned=loader.load('nested/scene%20%23.usda?edition=2#root',group=>{
+            sequence.push('loaded'); resolve(group);
+          },undefined,reject);
+          sequence.push('returned');
+        });
+        loader.setPath('later/');
+        const first=await pending;
+        const second=await new USDLoader().loadAsync('models/nested/scene%20%23.usda?edition=2#root');
+        const compatibility=await new USDZLoader().setPath('models/').loadAsync('nested/scene%20%23.usda?edition=2#root');
+        const noSlash=await new USDLoader().setPath('flat').loadAsync('scene.usda');
+        const raw=await new THREE.FileLoader().setResponseType('arraybuffer').loadAsync('models/nested/scene%20%23.usda?edition=2#root');
+        let immediate,callbackIdentity=false,readyAtCallback=false;
+        const parsed=await new Promise((resolve,reject)=>{
+          immediate=loader.parse(raw,'models/',group=>{
+            callbackIdentity=immediate===group;readyAtCallback=group.getObjectByName('Triangle').material.map.image.complete;
+            resolve(group);
+          },reject);
+        });
+        const a=first.getObjectByName('Triangle'),b=second.getObjectByName('Triangle');
+        const states=[first,second,compatibility,noSlash,parsed].map(group=>{
+          const mesh=group.getObjectByName('Triangle'),texture=mesh.material.map;
+          return {vertices:mesh.geometry.attributes.position.count,complete:texture.image.complete,
+            embedded:texture.image.src.startsWith('data:image/png;'),wrap:[texture.wrapS,texture.wrapT]};
+        });
+        return {sequence,undefinedReturn:returned===undefined,callbackIdentity,readyAtCallback,states,
+          independent:first!==second&&a.geometry!==b.geometry&&a.material!==b.material&&a.material.map!==b.material.map};
+      }`,
+    "models/nested/scene #.usda": model, "flatscene.usda": model,
+    "models/paint #.png": pixel, "models/nested/paint #.png": pixel, "flat/paint #.png": pixel,
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const name of ["models/paint #.png", "models/nested/paint #.png", "flat/paint #.png"])
+    assert.deepEqual(fs.readFileSync(path.join(f.out, name)), pixel);
+  assert.equal(fs.existsSync(path.join(f.out, "ignored")), false);
+  assert.deepEqual(fs.readFileSync(path.join(f.out, "models/nested/scene #.usda")), model);
+  packHtml(path.join(f.out, "index.html"), f.packed);
+  const html=fs.readFileSync(f.packed, "utf8");
+  fs.renameSync(path.join(f.root, "source"), path.join(f.root, "source-unavailable"));
+  fs.renameSync(f.out, path.join(f.root, "build-unavailable"));
+  const result=await execute(html);
+  assert.equal(result.ok, true, result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g, "<packed module>"));
+  assert.deepEqual(result.result, {sequence:["returned","loaded"],undefinedReturn:true,callbackIdentity:true,readyAtCallback:true,
+    independent:true,states:Array.from({length:5},()=>({vertices:3,complete:true,embedded:true,wrap:[1001,1002]}))});
+  assert.equal(result.images.length,5);
+  assert.ok(result.images.every(url=>url.startsWith("data:image/png;")));
+  assert.ok(result.requests.every(({url})=>url.startsWith("data:")));
+});
