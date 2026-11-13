@@ -33,6 +33,8 @@
  * reserveColorHistory adds one persistent alternate image for selected colors;
  * captured colorSlots choose their resolved and MSAA images independently.
  * Each physical color retains its own complete pyramid and generation state.
+ * Cube histories retain all six faces in each image; selecting a face or mip
+ * never changes which complete cube is borrowed for sampling or copies.
  * Non-history colors and depth keep one shared identity across those selections.
  * readPixels/writePixels also accept colorIndex. copyFrom selects independent
  * sourceColorIndex/colorIndex attachments; all default to zero and preserve
@@ -520,7 +522,7 @@ export function createGpuRenderTarget(device, options = {}) {
       dimension: '2d', sampleCount: 1, mipLevelCount: pair.colorMipLevelCounts[index], usage: 1 | 4 | 16 | (copyDestination ? 2 : 0)});
     pair.historyColors.set(index, color); pair.mipsDirty.add(color);
     pair.historyViews.set(index, Array.from({length: layerCount}, (_, layer) => color.createView({baseMipLevel: 0, mipLevelCount: 1,
-      ...(array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})})));
+      ...(cube || array ? {dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1} : {})})));
     if (sampleCount === 4) for (let layer = 0; layer < layerCount; layer++) {
       const key = index * layerCount + layer;
       const multisample = device.createTexture({label: `${label} history MSAA ${index}/${layer}`,
@@ -533,8 +535,8 @@ export function createGpuRenderTarget(device, options = {}) {
     exclusive();
     if (!Array.isArray(indices) || indices.some(index => !Number.isSafeInteger(index) || index < 0 || index >= colorFormats.length))
       fail('ATTACHMENT', 'History requires allocated color attachment indices');
-    if (cube || volume)
-      fail('UNSUPPORTED', 'History colors require ordinary 2D or 2D-array targets');
+    if (volume)
+      fail('UNSUPPORTED', 'History colors require ordinary 2D, 2D-array or cube targets');
     const additions = [...new Set(indices)].filter(index => !historyIndices.has(index));
     if (!additions.length) return api;
     const bytes = additions.reduce((sum, index) => sum + colorCost(width, height, layers, index), 0);
@@ -775,7 +777,7 @@ export function createGpuRenderTarget(device, options = {}) {
         const base = frame.resolveTargets ?? (frame.resolveTarget ? [frame.resolveTarget] : frame.colorViews ?? [frame.colorView]);
         const resolved = base.map((view, index) => !slots[index] ? view : mipLevel === 0 ? current.historyViews.get(index)[face]
           : current.historyColors.get(index).createView({baseMipLevel: mipLevel, mipLevelCount: 1,
-            ...(array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})}));
+            ...(cube || array ? {dimension: '2d', baseArrayLayer: face, arrayLayerCount: 1} : {})}));
         const views = sampleCount === 4 ? (frame.colorViews ?? [frame.colorView]).map((view, index) =>
           slots[index] ? current.historyMultisampleViews.get(index * layers + face) : view) : resolved;
         return Object.freeze({...frame, colorView: views[0],
@@ -812,7 +814,7 @@ export function createGpuRenderTarget(device, options = {}) {
       // source owner verifies disjoint read/write selections before using it.
       const nestedFrame = (run, {colorSlots: selected = null, mipLevel = 0, face = 0, generateColorMipmaps = null} = {}) => {
         if (!active) fail('BORROW', 'The attachment borrow has ended');
-        if (!historyIndices.size || cube || volume || typeof run !== 'function') fail('CALLBACK', 'Expected a synchronous history frame callback');
+        if (!historyIndices.size || volume || typeof run !== 'function') fail('CALLBACK', 'Expected a synchronous history frame callback');
         const choice = selectedSlots(selected);
         const generate = generateColorMipmaps === null ? null : selectedMipColors(generateColorMipmaps);
         const bytes = mipFrameBytes(mipLevel, face);

@@ -373,6 +373,33 @@ Their recognized source resize preserves earlier queued six-face generations and
 charges each until its final consumer completes. Public `setSize()` and
 `dispose()` still invalidate pending uses of their replaced residency.
 
+### Native cube temporal histories
+
+A registered native `PassNode` can retain current and previous cube color images.
+Each history image owns all six faces and its complete authored or generated mip
+pyramid. Selecting a face or mip for a draw, copy or readback preserves that
+selection across a history swap. Depth remains shared between the two color
+histories, with matching face and mip attachments. Each color image keeps its own
+mipmap generation state and cached sampling views.
+
+The retained source's cloned `CubeTexture` has an independent version and a null
+`renderTarget` pointer. Private ownership follows both members of the history
+pair without changing those source fields. Another target cannot adopt either
+member while the history owns it. Sampling the previous cube while rendering the
+current cube is allowed; sampling any face of the active physical cube retains
+the existing feedback rejection.
+
+History allocation charges two complete six-face color pyramids. Budget failure
+leaves the current image intact. Recognized source resize keeps queued generations
+alive until their readers and submitted GPU work complete; disposal still
+invalidates later uses. This support covers native single-color cube histories.
+Cube sampling continues to require a cube-compatible source node.
+
+`three_render_target_cube_history.test.mjs` exercises the retained r186 source
+classes with recording devices, covering face/mip selection, swaps, independent
+mip generation, copies, budgets, queued retirement and ownership. These checks
+do not execute GPU shaders or establish rendered pixel parity.
+
 ### Automatic cube mip generation
 
 Native cube rendering now applies the pinned cube filtering shader to every face

@@ -275,6 +275,12 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
   const bytes = colorBytes + (sampleCount === 4 ? baseColorBytes * 4 : 0) +
     (depthFormat && !sharedDepth ? width * height * (depthFormat.endsWith('-stencil8') ? 8 : depthFormat === 'depth16unorm' ? 2 : 4) * sampleCount * depthLayers : 0);
   if (!Number.isSafeInteger(bytes)) fail('BUDGET', 'Target byte size exceeds safe integer precision');
+  const layoutKey = `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${webglVolume}/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}`;
+  const mipKey = `${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`;
+  const key = `${layoutKey}/${cube ? texture.version : generateMipmaps}/${mipKey}`;
+  // CubeTexture.clone() advances its own version. History layout equality must
+  // not equate those independent counters; mipProfiles tracks each one instead.
+  const historyKey = cube ? `${layoutKey}/${mipKey}` : key;
   return {width, height, format, depthFormat, depthAttachment, sampleCount, bytes, colorBytes, baseColorBytes, texture, generateMipmaps,
     mipLevelCount, authoredMipLevelCount, maximumMipLevels, float32, integerType,
     ...(webglArray || webglVolume ? {webglSampler: captureWebGLTargetSampler(texture, webglVolume)} : {}),
@@ -282,7 +288,7 @@ function inspectThreeRenderTargetColor(target, three, texture, cubeMipLevelCount
     depthViewDimension: cube ? 'cube' : depthArray ? '2d-array' : '2d',
     sourceVersion: texture.version,
     depthTexture, depthOwner, sharedDepth, depthSampleBytes: depthTexture ? width * height * 4 * depthLayers : 0,
-    key: `${cube ? `cube/${webglCube}/${width}/${height}/` : volume ? `volume/${webglVolume}/${layers}/${depthArray}/` : array ? `array/${webglArray}/${layers}/${depthArray}/` : ''}${target.width}/${target.height}/${format}/${depthFormat}/${depthAttachment}/${sampleCount}/${cube ? texture.version : generateMipmaps}/${mipLevelCount}${webglCube ? `/authored/${authoredMipLevelCount}` : ''}`};
+    key, historyKey};
 }
 
 export function inspectThreeRenderTarget(target, three, {cubeMipLevelCount = null, colorMipProfiles = null} = {}) {
@@ -564,6 +570,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // flags separately so editing a flag cannot replace rendered contents.
     if (capturedMips && !flipY && shape.colors.some(color => color.mipLevelCount > 1))
       shape.key += `/mipVersions/${shape.colors.map(color => color.sourceVersion).join(',')}`;
+    if (nativePasses.has(target)) shape.key = shape.colors.map(color => color.historyKey).join('|');
     return shape;
   }
   function capture(target, {initialize = false} = {}) {
@@ -584,7 +591,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     }
     if (shape.cube || shape.array || shape.volume) for (const texture of shape.textures) {
       const owner = ownedColorTargets.get(texture);
-      if (owner && owner !== target && owner.textures.includes(texture))
+      if (owner && owner !== target && (owner.textures.includes(texture) ||
+          Object.values(nativePasses.get(owner)?._previousTextures ?? {}).includes(texture)))
         fail('SOURCE', 'A color texture cannot belong to two registered render targets');
       ownedColorTargets.set(texture, target);
     }
@@ -674,11 +682,11 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // previous-frame image is added later. History versions are tracked by
     // physical source texture, independently of the current attachment order.
     const inspected = sourceShape(target, existing);
-    const shape = {...inspected, key: inspected.colors.map(color => color.key).join('|')};
+    const shape = {...inspected, key: inspected.colors.map(color => color.historyKey).join('|')};
     const names = Object.keys(node._previousTextures ?? {});
     if (!names.length) return;
-    if (shape.cube || shape.volume)
-      fail('UNSUPPORTED', 'Native pass histories require ordinary 2D or 2D-array color attachments');
+    if (shape.volume || shape.webglCube)
+      fail('UNSUPPORTED', 'Native pass histories require ordinary 2D, 2D-array or native cube color attachments');
     nativePasses.set(target, node);
     let group = historyGroups.get(target);
     if (group && (!historyShape(group, shape) || group.node !== node)) {
@@ -708,15 +716,24 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       const profile = group.mipInitialized && group.mipProfiles.get(previous)?.sourceVersion === previous.version
         ? shape.colors[index] : null;
       const color = inspectThreeRenderTargetColor(target, three, previous, null, profile);
-      if (color.key !== shape.colors[index].key)
+      if (color.historyKey !== shape.colors[index].historyKey)
         fail('SOURCE', 'Current and previous pass color formats must match');
       const pair = group.pairs[index];
       if (pair.length === 1) pair.push(previous);
       else if (!pair.includes(previous) || !pair.includes(current))
         fail('STALE', 'Pass history texture identity changed outside its source swap');
       if (!group.mipInitialized || !group.mipProfiles.has(previous)) group.mipProfiles.set(previous, color);
-      for (const texture of pair) if (!group.watched.has(texture)) {
-        group.watched.add(texture); texture.addEventListener('dispose', group.onDispose);
+      for (const texture of pair) {
+        if (shape.cube) {
+          const owner = ownedColorTargets.get(texture);
+          if (owner && owner !== target && (owner.textures.includes(texture) ||
+              Object.values(nativePasses.get(owner)?._previousTextures ?? {}).includes(texture)))
+            fail('SOURCE', 'A history color texture cannot belong to two registered render targets');
+          ownedColorTargets.set(texture, target);
+        }
+        if (!group.watched.has(texture)) {
+          group.watched.add(texture); texture.addEventListener('dispose', group.onDispose);
+        }
       }
     }
     capture(target);
@@ -1318,9 +1335,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // an actual size change can preserve their attachments and formats.
     const scopes = [...new Set(targets)].map(target => {
       if (!(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
-      if (target.isCubeRenderTarget || target.isWebGLCubeRenderTarget || target.isRenderTarget3D ||
-          target.isWebGL3DRenderTarget || target.texture?.isData3DTexture)
-        fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D or 2D-array targets');
+      if (target.isWebGLCubeRenderTarget || target.isRenderTarget3D || target.isWebGL3DRenderTarget || target.texture?.isData3DTexture)
+        fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D, 2D-array or native cube targets');
       if (entries.has(target)) inspectThreeRenderTarget(target, three);
       if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
       const scope = {width: target.width, height: target.height, depth: target.depth,

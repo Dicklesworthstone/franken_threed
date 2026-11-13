@@ -201,7 +201,9 @@ export function inspectThreeNativePass(three, renderer, node) {
     // references together. A cloned depth image is not a previous depth
     // attachment: PassNode.toggleTexture does not swap renderTarget.depthTexture.
     if (!node.renderTarget.textures.includes(current) || !(previous instanceof three.Texture) ||
-        previous.isDepthTexture || previous.isRenderTargetTexture !== true || previous.renderTarget !== node.renderTarget ||
+        previous.isDepthTexture || previous.isRenderTargetTexture !== true ||
+        previous.renderTarget !== node.renderTarget && !(node.renderTarget instanceof three.CubeRenderTarget &&
+          previous instanceof three.CubeTexture && previous.renderTarget === null) ||
         textures.has(previous) || currentNode?.isPassMultipleTextureNode !== true ||
         previousNode?.isPassMultipleTextureNode !== true || currentNode.passNode !== node || previousNode.passNode !== node ||
         currentNode.textureName !== name || previousNode.textureName !== name ||
