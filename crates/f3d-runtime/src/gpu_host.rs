@@ -1903,11 +1903,6 @@ pub enum PlanLoweringError {
         /// Diagnostic name of the pass segment.
         segment_name: String,
     },
-    /// Render segment configures render bundle draws with a depth attachment (bundle depth not yet supported by bridge lowering).
-    UnsupportedBundleDepthAttachment {
-        /// Diagnostic name of the pass segment.
-        segment_name: String,
-    },
     /// Render segment configures an invalid or malformed depth attachment.
     InvalidDepthAttachment {
         /// Diagnostic name of the pass segment.
@@ -2026,12 +2021,6 @@ impl core::fmt::Display for PlanLoweringError {
                 write!(
                     f,
                     "Render segment '{segment_name}' configures a stencil operation; stencil is not supported by bridge lowering"
-                )
-            }
-            Self::UnsupportedBundleDepthAttachment { segment_name } => {
-                write!(
-                    f,
-                    "Render segment '{segment_name}' configures render bundle draws with a depth attachment; bundle depth is not supported by bridge lowering"
                 )
             }
             Self::InvalidDepthAttachment { segment_name, reason } => {
@@ -2194,11 +2183,6 @@ pub fn lower_plan(plan: &ExecutionPlan) -> Result<Vec<GpuCommand>, PlanLoweringE
                         || dsa.stencil_clear_value != 0
                     {
                         return Err(PlanLoweringError::UnsupportedStencilAttachment {
-                            segment_name: segment.name().to_string(),
-                        });
-                    }
-                    if segment.draws().iter().any(|d| matches!(d.kind(), DrawKind::Bundle { .. })) {
-                        return Err(PlanLoweringError::UnsupportedBundleDepthAttachment {
                             segment_name: segment.name().to_string(),
                         });
                     }
@@ -10921,37 +10905,91 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_plan_rejects_bundle_depth_attachment() {
+    fn lower_plan_depth_bundles_preserve_pass_state_and_wire_layout() {
         use f3d_graph::{
             pass::{ColorAttachment, DepthStencilAttachment, Draw, Pass, PassId},
             plan::{ExecutionPlan, PlanSegment},
             resource::ResourceId,
         };
 
-        let mut p = Pass::new_render(PassId::new(1), "bundle_depth_pass");
-        p.color_attachments.push(ColorAttachment::new_clear(
-            ResourceId::new(10),
-            [0.0, 0.0, 0.0, 1.0],
-        ));
-        p.depth_stencil_attachment = Some(DepthStencilAttachment::new_depth_clear(
-            ResourceId::new(99),
-            1.0,
-        ));
-        p.draws.push(Draw::new_bundle(1, 42, 100, Vec::new()));
+        for read_only in [false, true] {
+            for bundle_first in [false, true] {
+                let mut pass = Pass::new_render(PassId::new(1), "depth_bundle_pass");
+                pass.color_attachments
+                    .push(ColorAttachment::new_load(ResourceId::new(10)));
+                let mut depth =
+                    DepthStencilAttachment::new_depth_clear(ResourceId::new(99), 0.5);
+                if read_only {
+                    depth.depth_read_only = true;
+                    depth.depth_load_op = None;
+                    depth.depth_store_op = None;
+                }
+                pass.depth_stencil_attachment = Some(depth);
+                if !bundle_first {
+                    pass.draws.push(Draw::new(0, 100, 3, 256, Vec::new()));
+                }
+                pass.draws.push(Draw::new_bundle(1, 42, 100, Vec::new()));
+                pass.draws
+                    .push(Draw::new(2, 100, 3, 256, Vec::new()).with_rebind_required(true));
 
-        let plan = ExecutionPlan {
-            segments: vec![PlanSegment::from_pass(&p)],
-            canvas_epoch: None,
-            pass_count: 1,
-            split_count: 0,
-            split_reasons: Vec::new(),
-        };
+                let plan = ExecutionPlan {
+                    segments: vec![PlanSegment::from_pass(&pass)],
+                    canvas_epoch: None,
+                    pass_count: 1,
+                    split_count: 0,
+                    split_reasons: Vec::new(),
+                };
+                let commands = lower_plan(&plan).expect("depth bundle lowering");
+                let expected_pass = |vertex_count, pass_flags| GpuCommand::RenderPassDepth {
+                    target_type: TARGET_OFFSCREEN,
+                    target_id: 10,
+                    clear_color: [0.0, 0.0, 0.0, 1.0],
+                    pipeline_id: if vertex_count == 0 { 0 } else { 100 },
+                    vertex_buffer_id: 0,
+                    vertex_count,
+                    uniform_dynamic_offset: if vertex_count == 0 { 0 } else { 256 },
+                    uniform_buffer_id: if vertex_count == 0 { 0 } else { 1 },
+                    load_op: LOAD_OP_LOAD,
+                    store_op: STORE_OP_STORE,
+                    pass_flags,
+                    depth_target_id: 99,
+                    depth_load_op: if read_only { LOAD_OP_LOAD } else { LOAD_OP_CLEAR },
+                    depth_store_op: STORE_OP_STORE,
+                    depth_clear_value: 0.5,
+                    depth_read_only: read_only,
+                };
+                // The bundle shares the explicit depth pass with the direct draw.
+                // Only the opener starts a pass; the tail must not clear depth again.
+                assert_eq!(
+                    commands,
+                    vec![
+                        expected_pass(if bundle_first { 0 } else { 3 }, PASS_FLAG_NEW_PASS),
+                        GpuCommand::ExecuteBundles { bundle_ids: vec![42] },
+                        expected_pass(3, PASS_FLAG_NONE),
+                    ]
+                );
 
-        match lower_plan(&plan) {
-            Err(PlanLoweringError::UnsupportedBundleDepthAttachment { segment_name }) => {
-                assert_eq!(segment_name, "bundle_depth_pass");
+                let bytes = GpuSubmissionPacket::from_commands(commands)
+                    .encode()
+                    .expect("encode depth bundle sequence");
+                assert_eq!(bytes.len(), 16 + 58 + 10 + 58);
+                for (offset, opcode) in [
+                    (16, OPCODE_RENDER_PASS_DEPTH),
+                    (74, OPCODE_EXECUTE_BUNDLES),
+                    (84, OPCODE_RENDER_PASS_DEPTH),
+                ] {
+                    assert_eq!(
+                        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()),
+                        opcode
+                    );
+                }
+                let packed_depth = u32::from_le_bytes(bytes[66..70].try_into().unwrap());
+                assert_eq!(unpack_depth_read_only(packed_depth), read_only);
+                assert_eq!(
+                    unpack_depth_load_op(packed_depth),
+                    if read_only { LOAD_OP_LOAD } else { LOAD_OP_CLEAR }
+                );
             }
-            other => panic!("Expected UnsupportedBundleDepthAttachment error, got {other:?}"),
         }
     }
 

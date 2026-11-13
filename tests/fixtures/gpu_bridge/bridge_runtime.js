@@ -464,7 +464,6 @@ export class WebGpuBridgeHost {
         let cursor = headerLen;
         let currentPassEncoder = null;
         let currentPassTargetKey = null;
-        let currentPassHasDepth = false;
         let currentPassSampleCount = 1;
         let frameCanvasView = null;
         let pendingDrawParameters = null;
@@ -491,7 +490,6 @@ export class WebGpuBridgeHost {
             currentPassEncoder.end();
             currentPassEncoder = null;
             currentPassTargetKey = null;
-            currentPassHasDepth = false;
             currentPassSampleCount = 1;
             passState = {
               pipelineId: null,
@@ -1289,7 +1287,6 @@ export class WebGpuBridgeHost {
                   colorAttachments: [colorAttachmentDesc],
                 });
                 currentPassTargetKey = targetKey;
-                currentPassHasDepth = false;
                 currentPassSampleCount = sourceTexture?.sampleCount ?? 1;
                 passState = {
                   pipelineId: null,
@@ -1545,7 +1542,6 @@ export class WebGpuBridgeHost {
                   depthStencilAttachment: depthAttachmentDesc,
                 });
                 currentPassTargetKey = targetKey;
-                currentPassHasDepth = true;
                 passState = {
                   pipelineId: null,
                   uniformBufferId: null,
@@ -1840,11 +1836,6 @@ export class WebGpuBridgeHost {
               if (!pipelineRecord) {
                 throw new Error(`RecordBundle: unknown pipelineId ${pipelineId}`);
               }
-              if (pipelineRecord.hasDepth) {
-                throw new Error(
-                  "RecordBundle: bundles with depth attachments are not yet implemented",
-                );
-              }
               if ((pipelineRecord.sampleCount ?? 1) !== 1) {
                 throw new Error("RecordBundle: multisampled bundles are not implemented");
               }
@@ -1869,9 +1860,16 @@ export class WebGpuBridgeHost {
                 }
               }
 
-              const bundleEncoder = this.device.createRenderBundleEncoder({
-                colorFormats: [format],
-              });
+              const bundleDescriptor = { colorFormats: [format] };
+              if (pipelineRecord.hasDepth) {
+                // Bundle layout must match the depth attachment. A bundle whose
+                // pipeline never writes depth may execute in either a read-only
+                // or writable pass; a depth-writing bundle requires the latter.
+                bundleDescriptor.depthStencilFormat = pipelineRecord.depthFormat;
+                bundleDescriptor.depthReadOnly = !pipelineRecord.depthWriteEnabled;
+                bundleDescriptor.stencilReadOnly = true;
+              }
+              const bundleEncoder = this.device.createRenderBundleEncoder(bundleDescriptor);
 
               bundleEncoder.setPipeline(pipelineRecord.pipeline);
 
@@ -1936,11 +1934,6 @@ export class WebGpuBridgeHost {
             }
 
             case OPCODE_EXECUTE_BUNDLES: {
-              if (currentPassHasDepth) {
-                throw new Error(
-                  "ExecuteBundles: bundles in passes with depth attachments are not yet implemented",
-                );
-              }
               if (currentPassSampleCount !== 1) {
                 throw new Error("ExecuteBundles: multisampled bundles are not implemented");
               }
@@ -1984,7 +1977,7 @@ export class WebGpuBridgeHost {
                     break;
                   } else if (nextOp === OPCODE_RENDER_PASS_DEPTH) {
                     throw new Error(
-                      "ExecuteBundles: bundles in passes with depth attachments are not yet implemented",
+                      "ExecuteBundles: depth bundles require an explicit RenderPassDepth opener",
                     );
                   } else if (nextOp === OPCODE_RENDER_PASS_RESOLVE) {
                     throw new Error(
@@ -2097,7 +2090,6 @@ export class WebGpuBridgeHost {
                   ],
                 });
                 currentPassTargetKey = `${targetType}:${targetId}:none`;
-                currentPassHasDepth = false;
                 passState = {
                   pipelineId: null,
                   uniformBufferId: null,
