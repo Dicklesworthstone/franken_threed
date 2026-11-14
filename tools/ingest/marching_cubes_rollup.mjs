@@ -11,7 +11,7 @@ import {specializeQuaternionFlat} from './quaternion_flat_specialization.mjs';
 import {geometryBoundsSourceRole,specializeGeometryBounds} from './geometry_bounds_specialization.mjs';
 import {specializeGeometryTangents} from './geometry_tangents_specialization.mjs';
 import {specializeAnimationInterpolants} from './animation_interpolants_specialization.mjs';
-import {specializePropertyMixer} from './property_mixer_specialization.mjs';
+import {propertyMixerSourceRole,specializePropertyMixer} from './property_mixer_specialization.mjs';
 import {skeletonUpdateSourceRole,specializeSkeletonUpdate,specializeSkeletonArrayWitnesses} from './skeleton_update_specialization.mjs';
 const ADAPTER='\0f3d-marching-cubes-adapter',RUNTIME='\0f3d-marching-cubes-runtime';
 const NORMALS='\0f3d-geometry-normals-adapter',OBJECTS='\0f3d-numeric-objects';
@@ -52,6 +52,7 @@ export function marchingCubesRollupPlugin(options={}) {
       if ([TRANSFORMS,ATTRIBUTE_TRANSFORMS,EULER_UPDATES,INSTANCE_UPDATES,QUATERNIONS,BOUNDS,TANGENTS,INTERPOLANTS,PROPERTY_MIXER,SKELETON].includes(importer) && source==='./matrix_multiply_adapter.mjs') return MATRICES;
       if (importer===EULER_UPDATES && source==='./transform_batch_adapter.mjs') return TRANSFORMS;
       if (importer===INSTANCE_UPDATES && source==='./euler_update_adapter.mjs') return EULER_UPDATES;
+      if (importer===PROPERTY_MIXER && source==='./quaternion_flat_adapter.mjs') return QUATERNIONS;
       if ([ADAPTER,NORMALS,ATTRIBUTE_TRANSFORMS,INSTANCE_UPDATES,BOUNDS,TANGENTS].includes(importer) && source==='./numeric_objects.mjs') return OBJECTS;
       return null;
     },
@@ -125,7 +126,7 @@ export function marchingCubesRollupPlugin(options={}) {
           if(interpolants.changed){edits.push(...interpolants.edits);headers.push(interpolants.header);tail+=interpolants.tail;}
         }
         if(code.includes('class PropertyMixer')) {
-          const propertyMixer=specializePropertyMixer(code,{runtimeModule:PROPERTY_MIXER,maxMemoryPages,maxIterations});
+          const propertyMixer=specializePropertyMixer(code,{...sources,runtimeModule:PROPERTY_MIXER,maxMemoryPages,maxIterations});
           if(propertyMixer.report)propertyMixerReports.push({id,...propertyMixer.report});
           if(propertyMixer.changed){edits.push(...propertyMixer.edits);headers.push(propertyMixer.header);tail+=propertyMixer.tail;}
         }
@@ -170,6 +171,15 @@ export function marchingCubesRollupPlugin(options={}) {
             matrixSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
           }catch{/* Modified or unavailable dependencies retain the source loop. */}
           return finish({matrixSource});
+        });
+      }
+      if(code.includes('class PropertyMixer')&&propertyMixerSourceRole(code)==='property-mixer') {
+        return this.resolve('../math/Quaternion.js',id,{skipSelf:true}).then(resolved=>{
+          let quaternionSource;
+          if(resolved&&!resolved.external)try {
+            quaternionSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
+          }catch{/* Numeric mixing remains available when quaternion source is not pinned. */}
+          return finish({quaternionSource});
         });
       }
       if(normalCandidate && geometryNormalSourceRole(code)==='geometry') {

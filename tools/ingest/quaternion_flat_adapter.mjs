@@ -25,9 +25,18 @@ const stats=()=>({wasmCalls:0,fallbackCalls:0,lastFailure:null});
 export function createQuaternionFlatDispatch(Class,variants,prepare,resolveMath) {
   const token=freeze({});
   const record={variants,prepare,resolveMath,kernels:{},attempted:{},failures:{},
+    methods:{slerpFlat:data(Class,'slerpFlat'),multiplyQuaternionsFlat:data(Class,'multiplyQuaternionsFlat')},
     output:new F64(4),left:new F64(4),right:new F64(4),mathValues:new F64(4),
     statistics:{slerpFlat:stats(),multiplyQuaternionsFlat:stats()}};
   apply(set,records,[token,record]);apply(set,classes,[Class,record]);return token;
+}
+/** A pinned source registration authorizes the descriptor reads. This also
+ * accepts its source-derived wrappers, but never a redirected class or a later
+ * static-method replacement/getter. No unknown receiver is inspected. */
+export function quaternionFlatMethodsIntact(Class) {
+  const record=apply(get,classes,[Class]);
+  return !!record && data(Class,'slerpFlat')===record.methods.slerpFlat &&
+    data(Class,'multiplyQuaternionsFlat')===record.methods.multiplyQuaternionsFlat;
 }
 function platform(record,slerp) {
   if(!nativeWasm || !matrixNumericPlatformIntact())return false;

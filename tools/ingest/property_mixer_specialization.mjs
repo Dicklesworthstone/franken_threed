@@ -5,18 +5,27 @@ import * as walk from 'acorn-walk';
 import {sourceBlob} from './marching_cubes_specialization.mjs';
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
+import {deriveQuaternionFlatKernels} from './quaternion_flat_specialization.mjs';
 
 const propertyBlob='e591f50e17e6f869b17ad1822b537b741e3bb2fd';
+const quaternionBlob='c9faca31665218cee87a7110e2badc7ba868beca';
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const fresh=(source,name)=>{let value='__f3d_property_mixer_'+name;while(source.includes(value))value+='_';return value;};
 const fields={buffer:'values',valueSize:'valueSize',_origIndex:'origIndex',_addIndex:'addIndex',
+  _workIndex:'workIndex',
   cumulativeWeight:'state[0]',cumulativeWeightAdditive:'state[1]',
   _mixBufferRegion:'lerp',_mixBufferRegionAdditive:'lerpAdditive'};
 
-export function specializePropertyMixer(source,{runtimeModule,maxMemoryPages=2048,maxIterations=100000000}={}) {
-  const role=sourceBlob(source)===propertyBlob?'property-mixer':
+export function propertyMixerSourceRole(source) {
+  return sourceBlob(source)===propertyBlob?'property-mixer':
     createHash('sha256').update(source).digest('hex')===coreHash?'core':null;
+}
+
+export function specializePropertyMixer(source,{runtimeModule,quaternionSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const role=propertyMixerSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
+  if(role==='core')quaternionSource=source;
+  const quaternion=role==='core'||sourceBlob(quaternionSource??'')===quaternionBlob;
   const cls=normalClasses(source).get('PropertyMixer'),ctor=normalMethod(cls,'constructor');
   function rewrite(node,extra=[]) {
     const changes=[...extra];
@@ -24,10 +33,17 @@ export function specializePropertyMixer(source,{runtimeModule,maxMemoryPages=204
       MemberExpression(value) {
         if(value.object.type==='ThisExpression' && Object.hasOwn(fields,value.property.name))
           changes.push({start:value.start,end:value.end,text:fields[value.property.name]});
+        if(value.object.name==='Quaternion' && ['slerpFlat','multiplyQuaternionsFlat'].includes(value.property.name))
+          changes.push({start:value.start,end:value.end,text:value.property.name});
       },
       CallExpression(value) {
         if(value.callee.object?.type==='ThisExpression' && value.callee.property.name==='_setIdentity')
           changes.push({start:value.start,end:value.end,text:'identity(values,valueSize,addIndex)'});
+        if(value.callee.object?.type==='ThisExpression' && value.callee.property.name==='_setAdditiveIdentityNumeric')
+          changes.push({start:value.start,end:value.end,text:'numericIdentity(values,valueSize,addIndex)'});
+        if(value.callee.object?.type==='ThisExpression' &&
+            ['_mixBufferRegion','_mixBufferRegionAdditive'].includes(value.callee.property.name))
+          changes.push({start:value.end-1,end:value.end-1,text:',workIndex'});
       },
     });
     let text=source.slice(node.start,node.end);
@@ -37,8 +53,21 @@ export function specializePropertyMixer(source,{runtimeModule,maxMemoryPages=204
   }
   const helpers=new Map();
   for(const [method,name]of [['_lerp','lerp'],['_lerpAdditive','lerpAdditive'],['_setAdditiveIdentityNumeric','identity']]) {
-    const value=normalMethod(cls,method),parameters=name==='identity'?['values','valueSize','addIndex']:value.params.map(x=>x.name);
+    const value=normalMethod(cls,method),parameters=name==='identity'?['values','valueSize','addIndex']:[...value.params.map(x=>x.name),'workIndex'];
     helpers.set(name,`function ${name}(${parameters.join(',')})${rewrite(value.body)}`);
+  }
+  const quaternionHelpers=new Map();
+  if(quaternion) {
+    const derived=deriveQuaternionFlatKernels(quaternionSource);
+    quaternionHelpers.set('slerpFlat',`function slerpFlat(${derived.slerp.params.map(x=>x.name).join(',')})`+
+      quaternionSource.slice(derived.slerp.body.start,derived.slerp.body.end));
+    quaternionHelpers.set('multiplyQuaternionsFlat',derived.multiplySource);
+    quaternionHelpers.set('numericIdentity',helpers.get('identity').replace('function identity(','function numericIdentity('));
+    for(const [method,name]of [['_slerp','lerp'],['_slerpAdditive','lerpAdditive'],['_setAdditiveIdentityQuaternion','identity']]) {
+      const value=normalMethod(cls,method),parameters=name==='identity'?['values','valueSize','addIndex']:
+        ['buffer','dstOffset','srcOffset','t','stride','workIndex'];
+      quaternionHelpers.set(name,`function ${name}(${parameters.join(',')})${rewrite(value.body)}`);
+    }
   }
   const create=fresh(source,'create'),register=fresh(source,'register'),attempt=fresh(source,'try'),token=fresh(source,'token');
   const edits=[{start:ctor.body.start+1,end:ctor.body.start+1,text:`\n${register}(this);\n`}],variants={};
@@ -57,11 +86,14 @@ export function specializePropertyMixer(source,{runtimeModule,maxMemoryPages=204
       extra.push({start:branch.consequent.start,end:branch.consequent.end,text:'{return 1;}'},
         {start:method.body.end-1,end:method.body.end-1,text:'\nreturn 0;\n'});
     }
-    const parameters=['values','state','valueSize','origIndex','addIndex',...method.params.map(x=>x.name)];
-    const artifact=compileNumericKernel(`function ${name}(${parameters.join(',')})${rewrite(method.body,extra)}`,{
-      parameterTypes:['f64[]','f64[]',...parameters.slice(2).map(()=>'f64')],helperSources:helpers,
-      generalControl:true,maxMemoryPages,maxIterations,sourceName:'pinned PropertyMixer.'+name});
-    variants[name]=Buffer.from(artifact.wasm).toString('base64');wasmBytes+=artifact.wasm.length;
+    const parameters=['values','state','valueSize','origIndex','addIndex','workIndex',...method.params.map(x=>x.name)];
+    for(const profile of quaternion?['numeric','quaternion']:['numeric']) {
+      const artifact=compileNumericKernel(`function ${name}(${parameters.join(',')})${rewrite(method.body,extra)}`,{
+        parameterTypes:['f64[]','f64[]',...parameters.slice(2).map(()=>'f64')],
+        helperSources:profile==='quaternion'?quaternionHelpers:helpers,
+        generalControl:true,allowMath:profile==='quaternion',maxMemoryPages,maxIterations,sourceName:'pinned PropertyMixer.'+name});
+      variants[profile==='numeric'?name:'quaternion:'+name]=Buffer.from(artifact.wasm).toString('base64');wasmBytes+=artifact.wasm.length;
+    }
     const result=fresh(source,name+'_result');
     const publication=name==='apply'?`if(${result}) {const binding=${result}.binding,buffer=${result}.buffer,offset=${result}.offset;${bindingCall}}`:'';
     edits.push({start:method.body.start+1,end:method.body.start+1,text:
@@ -70,8 +102,10 @@ export function specializePropertyMixer(source,{runtimeModule,maxMemoryPages=204
   }
   return {changed:true,edits,
     header:`import {createPropertyMixerDispatch as ${create},registerPropertyMixer as ${register},tryPropertyMixer as ${attempt}} from ${JSON.stringify(runtimeModule)};var ${token};\n`,
-    tail:`\n${token}=${create}(PropertyMixer,${JSON.stringify(variants)},${maxMemoryPages*65536});\n`,
+    tail:`\n${token}=${create}(PropertyMixer,${JSON.stringify(variants)},${maxMemoryPages*65536},${quaternion?'Quaternion,()=>Math':'null,null'});\n`,
     report:{sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,
-      compiledMethods:Object.keys(variants).map(name=>'PropertyMixer.'+name),sourceDerived:true,
-      scope:'numeric-property-accumulation-and-application',wasmBytes,accelerationClaim:false}};
+      compiledMethods:['accumulate','accumulateAdditive','apply'].map(name=>'PropertyMixer.'+name),sourceDerived:true,
+      quaternionMethods:quaternion?['accumulate','accumulateAdditive','apply']:[],
+      scope:quaternion?'numeric-and-quaternion-property-accumulation-and-application':'numeric-property-accumulation-and-application',
+      wasmBytes,accelerationClaim:false}};
 }

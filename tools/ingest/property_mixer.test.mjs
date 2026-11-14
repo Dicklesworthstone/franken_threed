@@ -15,7 +15,7 @@ const exports={PropertyMixer:'animation/PropertyMixer.js',AnimationMixer:'animat
   AnimationClip:'animation/AnimationClip.js',AnimationObjectGroup:'animation/AnimationObjectGroup.js',
   VectorKeyframeTrack:'animation/tracks/VectorKeyframeTrack.js',NumberKeyframeTrack:'animation/tracks/NumberKeyframeTrack.js',
   QuaternionKeyframeTrack:'animation/tracks/QuaternionKeyframeTrack.js',BooleanKeyframeTrack:'animation/tracks/BooleanKeyframeTrack.js',
-  StringKeyframeTrack:'animation/tracks/StringKeyframeTrack.js',Object3D:'core/Object3D.js'};
+  StringKeyframeTrack:'animation/tracks/StringKeyframeTrack.js',Object3D:'core/Object3D.js',Quaternion:'math/Quaternion.js'};
 const constants=['InterpolateSmooth','LoopOnce','AdditiveAnimationBlendMode'];
 async function fixture(core=false,options={}) {
   const entry='\0property-mixer-fixture',plugin=marchingCubesRollupPlugin(options);
@@ -82,6 +82,106 @@ test('normal, additive and original-weight blending materialize exact buffers an
     const after=api.diagnostics(api.PropertyMixer);
     assert.equal(after.wasmCalls-before.wasmCalls,60);
     for(const name of ['accumulate','accumulateAdditive','apply'])assert.ok(after.operations[name]>before.operations[name]);
+  }
+});
+
+test('quaternion mixing compiles whole operations and publishes identical products, weights and callbacks',()=>{
+  for(const {api,report}of fixtures) {
+    assert.deepEqual(report.modules[0].quaternionMethods,['accumulate','accumulateAdditive','apply']);
+    const pair=[direct(api,4,'quaternion'),direct(reference,4,'quaternion')];
+    const identities=pair.map(value=>value.mixer.buffer),before=api.diagnostics(api.PropertyMixer);
+    for(const value of pair)value.binding.getValue=(buffer,offset)=>buffer.set([0,0,0,1],offset);
+    callBoth(pair,'saveOriginalState');
+    for(let frame=0;frame<16;frame++) {
+      const index=frame%2,angle=frame===0?1e-5:frame/7;
+      for(const value of pair)value.mixer.buffer.set([Math.sin(angle),0,0,Math.cos(angle)]);
+      callBoth(pair,'accumulate',index,.2);
+      for(const value of pair)value.mixer.buffer.set([0,Math.sin(angle/3),0,Math.cos(angle/3)]);
+      callBoth(pair,'accumulate',index,.3);
+      for(const value of pair)value.mixer.buffer.set([0,0,-Math.sin(angle/4),-Math.cos(angle/4)]);
+      callBoth(pair,'accumulateAdditive',.125);callBoth(pair,'accumulateAdditive',-.025);
+      callBoth(pair,'apply',index);
+    }
+    assert.equal(pair[0].mixer.buffer,identities[0]);assert.equal(pair[1].mixer.buffer,identities[1]);
+    const after=api.diagnostics(api.PropertyMixer);
+    assert.equal(after.quaternionCalls-before.quaternionCalls,80);
+    assert.equal(after.wasmCalls-before.wasmCalls,80);
+    assert.equal(after.fallbackCalls,before.fallbackCalls);
+    assert.ok(pair[0].writes.length>0);
+  }
+});
+
+test('quaternion additive scratch aliases preserve the complete source-visible buffer',()=>{
+  for(const {api}of fixtures)for(const name of ['accumulateAdditive','apply'])
+    for(const workIndex of [0,.25,1,2,3,4,5])for(const addIndex of [.25,4]) {
+      const pair=[direct(api,4,'quaternion'),direct(reference,4,'quaternion')];
+      const before=api.diagnostics(api.PropertyMixer).quaternionCalls;
+      for(const value of pair) {
+        const mixer=value.mixer;
+        for(let i=0;i<mixer.buffer.length;i++)mixer.buffer[i]=i%4===3?.8:(i%3+1)/10;
+        mixer._workIndex=workIndex;mixer._addIndex=addIndex;mixer._origIndex=.5;
+        mixer.cumulativeWeight=.4;mixer.cumulativeWeightAdditive=name==='accumulateAdditive'?0:.2;
+      }
+      if(name==='apply')callBoth(pair,name,.25);else callBoth(pair,name,.3);
+      assert.equal(api.diagnostics(api.PropertyMixer).quaternionCalls,before+1);
+    }
+});
+
+test('quaternion source hooks and native Math replacements keep their exact original effects',()=>{
+  for(const {api}of fixtures)for(const mode of ['slerp','multiply','identity','work-index','throwing-work-index','math']) {
+    const pair=[direct(api,4,'quaternion'),direct(reference,4,'quaternion')],logs=[[],[]],errors=[];
+    const before=api.diagnostics(api.PropertyMixer).quaternionCalls;
+    for(let index=0;index<2;index++) {
+      const {mixer}=pair[index],Q=index===0?api.Quaternion:reference.Quaternion;
+      mixer.buffer.set([.6,0,0,.8]);
+      const field=mode==='slerp'?'slerpFlat':'multiplyQuaternionsFlat';
+      const original=Object.getOwnPropertyDescriptor(Q,field),sin=Object.getOwnPropertyDescriptor(Math,'sin');
+      if(mode==='slerp'||mode==='multiply')Object.defineProperty(Q,field,{configurable:true,get(){
+        logs[index].push(field);return original.value;
+      }});
+      if(mode==='identity')mixer._setAdditiveIdentityNumeric=function(){
+        logs[index].push('identity');this.buffer.fill(0,this._addIndex*this.valueSize,(this._addIndex+1)*this.valueSize);
+      };
+      if(mode==='work-index'||mode==='throwing-work-index')Object.defineProperty(mixer,'_workIndex',{configurable:true,get(){
+        logs[index].push(['work',Array.from(mixer.buffer)]);
+        if(mode==='throwing-work-index')throw new RangeError('work index');
+        return 5;
+      }});
+      if(mode==='math')Object.defineProperty(Math,'sin',{...sin,value(value){logs[index].push(value);return sin.value(value);}});
+      try {mixer.accumulateAdditive(.3);}catch(error){errors[index]=[error.name,error.message];}
+      finally {Object.defineProperty(Q,field,original);Object.defineProperty(Math,'sin',sin);}
+    }
+    same(...pair);assert.deepEqual(logs[0],logs[1]);assert.deepEqual(errors[0],errors[1]);assert.ok(logs[0].length>0);
+    assert.equal(api.diagnostics(api.PropertyMixer).quaternionCalls,before);
+  }
+});
+
+test('quaternion publication completes before a binding getter, reentry or thrown callback',()=>{
+  for(const {api}of fixtures)for(const throwing of [false,true]) {
+    const pair=[direct(api,4,'quaternion'),direct(reference,4,'quaternion')],logs=[[],[]],errors=[];
+    for(let index=0;index<2;index++) {
+      const {mixer,binding}=pair[index];
+      mixer.buffer.set([.6,0,0,.8]);mixer.accumulate(0,.5);mixer.accumulateAdditive(.2);
+      Object.defineProperty(binding,'setValue',{get(){
+        logs[index].push(['get',mixer.cumulativeWeight,mixer.cumulativeWeightAdditive,Array.from(mixer.buffer)]);
+        return function(buffer,offset){
+          logs[index].push(['call',this===binding,buffer===mixer.buffer,offset]);
+          buffer.set([0,.6,0,.8]);mixer.accumulateAdditive(.1);
+          if(throwing)throw new RangeError('quaternion binding');
+        };
+      }});
+      try{mixer.apply(0);}catch(error){errors[index]=[error.name,error.message];}
+    }
+    same(...pair);assert.deepEqual(logs[0],logs[1]);assert.deepEqual(errors[0],errors[1]);
+  }
+});
+
+test('unproved quaternion dependency source keeps numeric kernels without admitting quaternion helpers',()=>{
+  const source=fs.readFileSync(path.join(upstream,'src/animation/PropertyMixer.js'),'utf8');
+  const quaternionSource=fs.readFileSync(path.join(upstream,'src/math/Quaternion.js'),'utf8');
+  for(const dependency of [undefined,quaternionSource+'\n// changed']) {
+    const result=specializePropertyMixer(source,{quaternionSource:dependency,runtimeModule:'./runtime.mjs'});
+    assert.equal(result.changed,true);assert.deepEqual(result.report.quaternionMethods,[]);
   }
 });
 
@@ -200,9 +300,11 @@ function animation(api) {
     new api.QuaternionKeyframeTrack('.quaternion',times,[0,0,0,1,0,0,.6,.8,0,.8,0,.6]),
     new api.BooleanKeyframeTrack('.visible',times,[true,false,true]),new api.StringKeyframeTrack('.name',times,['a','b','c'])]);
   const b=new api.AnimationClip('run',1,[new api.VectorKeyframeTrack('.position',times,[2,1,0,-1,4,2,1,-3,4]),
+    new api.QuaternionKeyframeTrack('.quaternion',times,[0,0,0,1,.6,0,0,.8,0,0,.8,.6]),
     new api.VectorKeyframeTrack('.scale',times,[1,1,1,2,.5,1.5,1.2,1.3,.8],api.InterpolateSmooth),
     new api.NumberKeyframeTrack('.morphTargetInfluences',times,[.3,.4,.1,.8,.9,.2])]);
-  const add=new api.AnimationClip('add',1,[new api.VectorKeyframeTrack('.position',times,[.1,.2,.3,.4,.1,.2,.3,.4,.1])],api.AdditiveAnimationBlendMode);
+  const add=new api.AnimationClip('add',1,[new api.VectorKeyframeTrack('.position',times,[.1,.2,.3,.4,.1,.2,.3,.4,.1]),
+    new api.QuaternionKeyframeTrack('.quaternion',times,[0,0,0,1,0,.6,0,.8,0,0,.8,.6])],api.AdditiveAnimationBlendMode);
   const actions=[mixer.clipAction(a).play(),mixer.clipAction(b).play(),mixer.clipAction(add).play()];
   actions[1].setEffectiveWeight(.35).setLoop(api.LoopOnce,1);actions[1].clampWhenFinished=true;
   actions[2].setEffectiveWeight(.2).setLoop(api.LoopOnce,1);actions[2].clampWhenFinished=true;
@@ -237,6 +339,7 @@ test('real grouped mixers preserve crossfades, additive and discrete tracks, liv
     assert.notDeepEqual(actual[0].objects[0].morph,[.1,.2]);
     const after=api.diagnostics(api.PropertyMixer);
     for(const name of ['accumulate','accumulateAdditive','apply'])assert.ok(after.operations[name]>before.operations[name]);
+    assert.ok(after.quaternionCalls>before.quaternionCalls);
   }
 });
 
@@ -268,10 +371,12 @@ test('application builds report all three kernels and remain executable without 
   const original=Object.getOwnPropertyDescriptor(globalThis,'WebAssembly');
   try{Object.defineProperty(globalThis,'WebAssembly',{configurable:true,writable:true,value:undefined});
     const api=await import('data:text/javascript;base64,'+Buffer.from(fixtures[1].code+'\n// without Wasm').toString('base64'));
-    const pair=[direct(api),direct(reference)];
-    for(const value of pair)value.mixer.buffer.set([2,4,6]);
-    callBoth(pair,'accumulate',0,.5);callBoth(pair,'accumulateAdditive',.25);callBoth(pair,'apply',0);
+    for(const type of ['number','quaternion']) {
+      const pair=[direct(api,4,type),direct(reference,4,type)];
+      for(const value of pair)value.mixer.buffer.set([.6,0,0,.8]);
+      callBoth(pair,'accumulate',0,.5);callBoth(pair,'accumulateAdditive',.25);callBoth(pair,'apply',0);
+    }
     assert.equal(api.diagnostics(api.PropertyMixer).wasmCalls,0);
-    assert.equal(api.diagnostics(api.PropertyMixer).fallbackCalls,3);
+    assert.equal(api.diagnostics(api.PropertyMixer).fallbackCalls,6);
   }finally{Object.defineProperty(globalThis,'WebAssembly',original);}
 });

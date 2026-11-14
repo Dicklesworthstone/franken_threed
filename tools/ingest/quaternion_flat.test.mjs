@@ -14,14 +14,16 @@ import * as reference from '../../upstream/three.js/build/three.core.js';
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 const exports={Quaternion:'math/Quaternion.js',QuaternionLinearInterpolant:'math/interpolants/QuaternionLinearInterpolant.js',
   QuaternionKeyframeTrack:'animation/tracks/QuaternionKeyframeTrack.js',VectorKeyframeTrack:'animation/tracks/VectorKeyframeTrack.js',
-  AnimationClip:'animation/AnimationClip.js',AnimationMixer:'animation/AnimationMixer.js',Object3D:'core/Object3D.js'};
+  AnimationClip:'animation/AnimationClip.js',AnimationMixer:'animation/AnimationMixer.js',Object3D:'core/Object3D.js',
+  PropertyMixer:'animation/PropertyMixer.js'};
 const constants=['LoopOnce','LoopRepeat','LoopPingPong','AdditiveAnimationBlendMode'];
 async function fixture(core) {
   const entry='\0quaternion-flat-fixture',plugin=marchingCubesRollupPlugin();
   const source=(core?'export {'+[...Object.keys(exports),...constants].join(',')+'} from '+JSON.stringify(path.join(upstream,'build/three.core.js'))+';':
     Object.entries(exports).map(([name,file])=>'export {'+name+'} from '+JSON.stringify(path.join(upstream,'src',file))+';').join('\n')+
       'export {'+constants.join(',')+'} from '+JSON.stringify(path.join(upstream,'src/constants.js'))+';')+
-    'export {quaternionFlatDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-quaternion-flat-adapter')+';';
+    'export {quaternionFlatDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-quaternion-flat-adapter')+';'+
+    'export {propertyMixerDiagnostics} from '+JSON.stringify('\0f3d-property-mixer-adapter')+';';
   const bundle=await rollup({input:entry,plugins:[{name:'quaternion-flat-fixture',
     resolveId(id){return id===entry?id:null;},load(id){return id===entry?source:null;}},plugin]});
   try {
@@ -145,7 +147,7 @@ function snapshot(value) {
 test('real mixers retain synchronous bindings, crossfade/additive accumulation and action/event order',()=>{
   for(const {api}of fixtures)for(const eventMutation of [false,true]) {
     const actual=scene(api,{events:eventMutation}),expected=scene(reference,{events:eventMutation});
-    const before=observed(api);
+    const before=observed(api),beforeProperty=api.propertyMixerDiagnostics(api.PropertyMixer);
     const steps=[0.1,0.2,0.3,0.5,0.15,0.8,0.6,0.7,-0.2];
     for(let i=0;i<steps.length;i++) {
       if(i===2)for(const value of [actual,expected])value.actions[0].crossFadeTo(value.actions[1],0.3,true);
@@ -157,7 +159,7 @@ test('real mixers retain synchronous bindings, crossfade/additive accumulation a
     assert.ok(actual.trace.some(event=>event[0]==='finished'));
     assert.ok(actual.trace.some(event=>event[0]==='binding'));
     const after=observed(api);assert.ok(after.slerpFlat.wasmCalls>before.slerpFlat.wasmCalls);
-    assert.ok(after.multiplyQuaternionsFlat.wasmCalls>before.multiplyQuaternionsFlat.wasmCalls);
+    assert.ok(api.propertyMixerDiagnostics(api.PropertyMixer).quaternionCalls>beforeProperty.quaternionCalls);
   }
 });
 
