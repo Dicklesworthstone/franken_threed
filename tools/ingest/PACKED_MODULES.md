@@ -607,8 +607,8 @@ resource resolver. Archive Blob URLs and manager-provided data URLs stay intact;
 fallback images use the embedded map only when that logical resource is already
 declared. Missing USD layers retain the source's empty-reference behavior.
 Unknown or external image URLs retain their host route and source error timing.
-This archive path does not discover external USD layers or USDC companions, or
-make an incomplete archive self-contained. Standalone USDA images are covered below.
+This archive path does not discover external USD layers or make an incomplete
+archive self-contained. Standalone USDA and USDC images are covered below.
 
 Packed tests execute after source and build directories become unavailable. They
 check referenced geometry, transforms, physical materials, texture transforms,
@@ -618,20 +618,20 @@ followed by reimport. Native parser errors and the source color-space conversion
 remain unchanged. The recording image host verifies original PNG bytes and
 completion; browser image decoding and rendering are separate claims.
 
-## Standalone USDA texture sidecars
+## Standalone USDA and USDC texture sidecars
 
-Finite pinned `USDLoader` and compatibility `USDZLoader` text loads include local
+Finite pinned `USDLoader` and compatibility `USDZLoader` text and binary loads include local
 image sidecars declared by `UsdUVTexture`, MaterialX `ND_image_*`, and Arnold
 image nodes. Build-time discovery uses the exact pinned, import-free
-`USDAParser`; it verifies the loader, composer and parser source identities
-before importing the parser. Applications without USD loads do not acquire this
-preparation step. Modified or unavailable USD source reports an explicit
-unsupported-source error for a requested standalone text build.
+`USDAParser` or `USDCParser`; it verifies the loader, composer and parser source
+identities before importing them. Applications without USD loads do not acquire
+this preparation step. Modified or unavailable USD source reports an explicit
+unsupported-source error for the corresponding standalone layer format.
 
 Image discovery follows the pinned composer's attribute connections, default
 values and time-zero (or first-sample) selection. Duplicate declarations,
 comments and quoted asset names retain the source parser's rules. Original
-USDA and image bytes are copied unchanged. The runtime loader and composer
+USD and image bytes are copied unchanged. The runtime loader and composer
 continue to own scene construction, texture setup and callback completion.
 
 Sidecar URLs use the path captured when `load()` starts, including a missing
@@ -640,10 +640,24 @@ trailing slash and encoded names with query/fragment suffixes. Later
 The existing document-root confinement and embedded-resource resolver apply.
 External image URLs remain on their original host route.
 
-This is a finite image-field closure for standalone USDA. It does not fetch
-external USD layers or inspect binary USDC, and it leaves self-contained USDZ
-archives on their existing path. Runtime image decoding and rendered pixels
-remain separate from the packed-loader recording-host checks.
+Binary discovery covers the pinned parser's compressed and legacy uncompressed
+USDC tables and string identities. Instance-local build guards bound table sizes,
+decompressed metadata, path expansion, recursive values and work before native
+decoding; unrelated geometry values are not decoded for image discovery. The
+64 MiB source/metadata limits, one-million-operation limit and depth-128 limit
+are build admission bounds, not changes to the deployed USD parser. An unproved
+binary metadata layout produces an explicit standalone error; ordinary builds
+retain the host route for unresolved sidecars.
+
+The binary packed regression loads both USDC table forms through the original
+`USDLoader` and legacy `USDZLoader`, checks native geometry/material/texture
+state, exact model and PNG bytes, independent reloads, pending path changes,
+runtime `parse()` completion and a native malformed-file error. It moves the
+build before packing and executes with both original trees unavailable and all
+external resource requests rejected. This is finite standalone image closure;
+it does not fetch external USD layers or change the existing USDZ archive path.
+Runtime image decoding and rendered pixels remain separate from these
+recording-host checks.
 
 ## 3MF manufacturing models
 

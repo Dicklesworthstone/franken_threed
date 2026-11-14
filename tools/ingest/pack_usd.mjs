@@ -1,13 +1,14 @@
 /**
- * Build-only image discovery for standalone USDA layers. The retained USDLoader
+ * Build-only image discovery for standalone USDA/USDC layers. The retained USDLoader
  * and USDComposer still parse, compose, load images and publish source callbacks.
- * External USD references are not fetched by r186's standalone loader. USDZ and
- * USDC keep their existing paths; neither is decoded by this metadata pass.
+ * External USD references are not fetched by r186's standalone loader. USDZ
+ * archives keep their existing path and are not decoded by this metadata pass.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { parseUsdcImageData } from "./pack_usdc.mjs";
 
 const PINNED_ROOT = new URL("../../upstream/three.js/", import.meta.url);
 const PINNED_SOURCES = new Map([
@@ -18,6 +19,8 @@ const PINNED_SOURCES = new Map([
 const error = (code, message) => { throw Object.assign(new Error(code + ": " + message), {code}); };
 const isUsd = request => request.loader === "USDLoader" || request.loader === "USDZLoader";
 const MAX_BYTES = 64 * 1024 * 1024;
+const USDC_SOURCE = "examples/jsm/loaders/usd/USDCParser.js";
+const USDC_HASH = "47f2eb8599c2db7fc285e87f8f5d5f1d2303e509";
 
 /**
  * Import the audited, import-free source parser only for actual USD consumers.
@@ -25,12 +28,12 @@ const MAX_BYTES = 64 * 1024 * 1024;
  * synchronous. Dynamic import preserves the tools' Node 20.18 minimum.
  *
  * A modified/missing source keeps the ordinary networked host path. A requested
- * standalone build fails explicitly for loose text instead of claiming closure.
- * Archive/binary payloads do not acquire a new parser-identity requirement.
+ * standalone build fails explicitly for loose layers instead of claiming closure.
+ * Archives do not acquire a new parser-identity requirement.
  */
 export async function prepareUsdAssetUris(requests, {packageRootUrl, strict = false} = {}) {
   if (!requests.some(isUsd)) return null;
-  let Parser = null, unavailable = "Pinned USDA image discovery is unavailable";
+  let Parser = null, BinaryParser = null, unavailable = "Pinned USD image discovery is unavailable";
   try {
     const root = packageRootUrl
       ? (String(packageRootUrl).startsWith("file:") ? new URL(packageRootUrl) : pathToFileURL(path.resolve(packageRootUrl)))
@@ -45,39 +48,52 @@ export async function prepareUsdAssetUris(requests, {packageRootUrl, strict = fa
     const parserUrl = new URL("examples/jsm/loaders/usd/USDAParser.js", root);
     ({USDAParser: Parser} = await import(parserUrl.href));
     if (typeof Parser !== "function") throw new Error("Missing USDAParser export");
+    // Keep ASCII admission independent of the additional binary parser pin.
+    const bytes = fs.readFileSync(new URL(USDC_SOURCE, root));
+    const actual = createHash("sha1").update("blob " + bytes.length + "\0").update(bytes).digest("hex");
+    if (actual !== USDC_HASH) throw new Error("Modified USD source: " + USDC_SOURCE);
+    ({USDCParser: BinaryParser} = await import(new URL(USDC_SOURCE, root).href));
+    if (typeof BinaryParser !== "function") throw new Error("Missing USDCParser export");
   } catch (cause) {
-    Parser = null;
     unavailable = cause.message;
   }
   return bytes => {
     // These are the same content signatures USDLoader checks before USDA text.
-    if (bytes[0] === 0x50 && bytes[1] === 0x4b ||
-        bytes.length >= 8 && [0x50,0x58,0x52,0x2d,0x55,0x53,0x44,0x43].every((byte, i) => bytes[i] === byte)) return [];
-    if (!Parser) {
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return [];
+    const binary = bytes.length >= 8 && [0x50,0x58,0x52,0x2d,0x55,0x53,0x44,0x43].every((byte, i) => bytes[i] === byte);
+    if (binary ? !BinaryParser : !Parser) {
       if (strict) error("USD_SOURCE_UNSUPPORTED", unavailable);
       return [];
     }
-    if (bytes.length > MAX_BYTES) error("USD_BUDGET", "USDA image discovery exceeds 64 MiB");
-    const text = new TextDecoder().decode(bytes);
-    const parser = new Parser();
-    // The upstream parser reuses plain-object dictionary entries. Prevent an
-    // input dictionary from selecting an inherited object in the build realm.
-    // Preprocessing is source-owned and has no dictionary or code evaluation.
-    const inherited = new Set(Object.getOwnPropertyNames(Object.prototype));
-    let depth = 0;
-    for (const line of parser._preprocess(text).split("\n")) {
-      const key = line.endsWith("{") ? line.slice(0, -1).trim() : line;
-      if (inherited.has(key)) {
-        if (strict) error("USD_SOURCE_UNSUPPORTED", "USDA dictionary key cannot be inspected in the build realm");
-        return [];
-      }
-      if (line.endsWith("{") || line.endsWith("(")) depth++;
-      else if (line.endsWith("}") || line.endsWith(")")) depth--;
-      if (depth > 128) error("USD_BUDGET", "USDA metadata exceeds the depth work bound");
-    }
+    if (bytes.length > MAX_BYTES) error("USD_BUDGET", "USD image discovery exceeds 64 MiB");
     let data;
-    try { data = parser.parseData(text); }
-    catch { return []; } // Keep malformed bytes and the retained parser's error.
+    if (binary) {
+      try { data = parseUsdcImageData(BinaryParser, bytes, MAX_BYTES); }
+      catch (cause) {
+        if (cause.code === "USD_BUDGET" || strict && cause.code === "USD_SOURCE_UNSUPPORTED") throw cause;
+        return []; // Retain malformed bytes and the runtime parser's failure.
+      }
+    } else {
+      const text = new TextDecoder().decode(bytes);
+      const parser = new Parser();
+      // The upstream parser reuses plain-object dictionary entries. Prevent an
+      // input dictionary from selecting an inherited object in the build realm.
+      // Preprocessing is source-owned and has no dictionary or code evaluation.
+      const inherited = new Set(Object.getOwnPropertyNames(Object.prototype));
+      let depth = 0;
+      for (const line of parser._preprocess(text).split("\n")) {
+        const key = line.endsWith("{") ? line.slice(0, -1).trim() : line;
+        if (inherited.has(key)) {
+          if (strict) error("USD_SOURCE_UNSUPPORTED", "USDA dictionary key cannot be inspected in the build realm");
+          return [];
+        }
+        if (line.endsWith("{") || line.endsWith("(")) depth++;
+        else if (line.endsWith("}") || line.endsWith(")")) depth--;
+        if (depth > 128) error("USD_BUDGET", "USDA metadata exceeds the depth work bound");
+      }
+      try { data = parser.parseData(text); }
+      catch { return []; } // Keep malformed bytes and the retained parser's error.
+    }
     // USDComposer follows connection paths before a default and uses time zero
     // (or the first sample) for a time-sampled rest-pose attribute.
     const resolve = (name, seen = new Set()) => {
@@ -85,7 +101,7 @@ export async function prepareUsdAssetUris(requests, {packageRootUrl, strict = fa
       if (seen.has(key)) return undefined;
       const fields = data.specsByPath[key]?.fields;
       if (!fields) return undefined;
-      if (seen.size >= 128) error("USD_BUDGET", "USDA image attribute chain exceeds the depth work bound");
+      if (seen.size >= 128) error("USD_BUDGET", "USD image attribute chain exceeds the depth work bound");
       const next = new Set(seen).add(key);
       for (const connection of fields.connectionPaths ?? []) {
         const value = resolve(connection, next);

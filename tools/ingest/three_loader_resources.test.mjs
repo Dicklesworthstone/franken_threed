@@ -12,6 +12,7 @@ import { packHtml } from "./pack_html.mjs";
 import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
 import { vertex, vertexExpected } from "../../tests/fixtures/meshopt/vectors.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
+import { usdcBytes, usdcImageSpecs } from "./fixtures/usdc_resources.mjs";
 import { gzipSync, zipSync, strToU8 } from "../../upstream/three.js/examples/jsm/libs/fflate.module.js";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
@@ -1393,4 +1394,82 @@ test("packed standalone USDA retains sidecar images, captured bases and native c
   assert.equal(result.images.length,5);
   assert.ok(result.images.every(url=>url.startsWith("data:image/png;")));
   assert.ok(result.requests.every(({url})=>url.startsWith("data:")));
+});
+
+test("relocated and packed USDC scenes retain native materials, sidecars, independent reloads and parse errors", async () => {
+  const binary = usdcBytes(usdcImageSpecs()), legacy = usdcBytes(usdcImageSpecs(), {compressed: false});
+  const usd = new URL("../../upstream/three.js/examples/jsm/loaders/USDLoader.js", import.meta.url).href;
+  const compatibility = new URL("../../upstream/three.js/examples/jsm/loaders/USDZLoader.js", import.meta.url).href;
+  const f = fixture({"index.html": '<script type="module" src="app.mjs"></script>',
+    "app.mjs": `import * as THREE from ${JSON.stringify(core.href)}; export {THREE};
+      import {USDLoader} from ${JSON.stringify(usd)};
+      import {USDZLoader} from ${JSON.stringify(compatibility)};
+      export async function run() {
+        const sequence=[],loader=new USDLoader().setPath('models/').setResourcePath('ignored/');
+        let returned;
+        const pending=new Promise((resolve,reject)=>{
+          returned=loader.load('nested/scene%20%23.usdc?edition=2#root',group=>{
+            sequence.push('loaded');resolve(group);
+          },undefined,reject);sequence.push('returned');
+        });
+        loader.setPath('later/');
+        const first=await pending;
+        const second=await new USDLoader().loadAsync('models/nested/scene%20%23.usdc?edition=2#root');
+        const old=await new USDZLoader().setPath('models/').loadAsync('legacy.usd');
+        const raw=await new THREE.FileLoader().setResponseType('arraybuffer').loadAsync('models/nested/scene%20%23.usdc?edition=2#root');
+        let immediate,callbackIdentity=false,completeAtCallback=false;
+        const parsed=await new Promise((resolve,reject)=>{
+          immediate=loader.parse(raw,'models/',group=>{
+            callbackIdentity=immediate===group;completeAtCallback=group.getObjectByName('Box').material.map.image.complete;
+            resolve(group);
+          },reject);
+        });
+        const snapshot=group=>{
+          const mesh=group.getObjectByName('Box'),texture=mesh.material.map;
+          mesh.geometry.computeBoundingBox();
+          return {vertices:mesh.geometry.attributes.position.count,min:mesh.geometry.boundingBox.min.toArray(),
+            max:mesh.geometry.boundingBox.max.toArray(),roughness:mesh.material.roughness,
+            complete:texture.image.complete,wrap:[texture.wrapS,texture.wrapT],colorSpace:texture.colorSpace};
+        };
+        const states=[first,second,old,parsed].map(snapshot);
+        const a=first.getObjectByName('Box'),b=second.getObjectByName('Box');
+        a.geometry.attributes.position.array[0]=77;a.material.roughness=0.75;a.material.map.offset.x=0.5;
+        const independent=first!==second&&a.geometry!==b.geometry&&a.material!==b.material&&a.material.map!==b.material.map&&
+          b.geometry.attributes.position.array[0]!==77&&b.material.roughness===0.25&&b.material.map.offset.x===0;
+        let failure;
+        try {await new USDLoader().setPath('models/').loadAsync('invalid.usdc');}
+        catch(error){failure={name:error.name,message:error.message};}
+        return {sequence,undefinedReturn:returned===undefined,callbackIdentity,completeAtCallback,states,independent,
+          byteLength:raw.byteLength,failure};
+      }`,
+    "models/nested/scene #.usdc": binary, "models/legacy.usd": legacy, "models/invalid.usdc": Buffer.from("PXR-USDC"),
+    "models/paint #.png": pixel, "models/nested/paint #.png": pixel,
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  const deployed = path.join(f.root, "relocated");
+  fs.renameSync(f.out, deployed);
+  fs.renameSync(path.join(f.root, "source"), path.join(f.root, "source-unavailable"));
+  for (const [name, expected] of [["models/nested/scene #.usdc", binary], ["models/legacy.usd", legacy],
+    ["models/paint #.png", pixel], ["models/nested/paint #.png", pixel]])
+    assert.deepEqual(fs.readFileSync(path.join(deployed, name)), expected, name + " is relocated unchanged");
+  assert.equal(fs.existsSync(path.join(deployed, "ignored")), false);
+  packHtml(path.join(deployed, "index.html"), f.packed);
+  const html = fs.readFileSync(f.packed, "utf8");
+  fs.renameSync(deployed, path.join(f.root, "build-unavailable"));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error?.replace(/data:text\/javascript;base64,[A-Za-z0-9+/=]+(?:#[a-f0-9]+)?/g, "<packed module>"));
+  assert.deepEqual(result.result, {
+    sequence: ["returned", "loaded"], undefinedReturn: true, callbackIdentity: true, completeAtCallback: true,
+    independent: true, byteLength: binary.length,
+    failure: {name: "RangeError", message: "Offset is outside the bounds of the DataView"},
+    states: Array.from({length: 4}, () => ({vertices: 24, min: [-1.5, -1.5, -1.5], max: [1.5, 1.5, 1.5],
+      roughness: 0.25, complete: true, wrap: [1001, 1002], colorSpace: "srgb"})),
+  });
+  assert.equal(result.images.length, 4);
+  for (const url of result.images) {
+    assert.ok(url.startsWith("data:image/png;"));
+    assert.deepEqual(Buffer.from(await (await fetch(url)).arrayBuffer()), pixel);
+  }
+  assert.ok(result.requests.every(({url}) => url.startsWith("data:")));
+  assert.ok(result.events.some(([event, url]) => event === "start" && url === "models/nested/scene%20%23.usdc?edition=2#root"));
 });
