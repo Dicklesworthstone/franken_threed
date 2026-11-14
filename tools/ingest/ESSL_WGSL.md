@@ -162,6 +162,19 @@ admitted. The source rules are in the
   as typed std140 data, including conversion from 16-byte source columns to
   8-byte WGSL columns. Pinned r186 `WebGLUniforms` only supplies ordinary
   material upload setters for square matrix types.
+- ESSL 3.00 uniform interface block arrays use distinct source `UniformsGroup`
+  bindings named `Block[0]`, `Block[1]`, and so on. Block elements require
+  constant integral selectors, including named constants and `.length()`;
+  arrays inside a selected block retain ordinary dynamic indexing. Both stages
+  share a block by its name, array length and ordered member types, while keeping
+  their own instance names; matched stages must both name an instance or both
+  leave it unnamed. Private member identities keep blocks distinct from
+  each other and from default uniforms with matching flattened names. Reflection
+  retains each source block and member name; the existing group owner supplies
+  std140 data, frame updates, queued snapshots and disposal. The compiler bounds
+  expanded block members to 4,096 before allocating element tables. Focused
+  compiler and group-packing regressions pass. The added block-array cases in
+  `program_matrix_arrays.mjs` still require browser pixel validation.
 - Global stage I/O becomes private variables copied by the entry points.
 - Assignment and increment destinations capture every dynamic subscript once,
   before the right-hand expression. Their expression results read the same

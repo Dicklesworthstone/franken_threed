@@ -420,6 +420,57 @@ test('UniformsGroup converts source std140 rectangular matrix arrays into compac
   support.beginFrame(); pack(); assert.equal(valueAt(11), 23);
 });
 
+test('uniform block arrays pack independent named source groups shared by both stages', t => {
+  const arrays = [new Float32Array(32), new Float32Array(32)];
+  arrays.forEach((data, i) => { data[0] = 17 + i; data[28] = 37 + i;
+    for (let matrix = 0; matrix < 2; matrix++) for (let c = 0; c < 3; c++) for (let r = 0; r < 2; r++)
+      data[4 + matrix * 12 + c * 4 + r] = i * 100 + matrix * 6 + c * 2 + r; });
+  const groups = arrays.map((data, i) => new T.UniformsGroup().setName(`Frames[${i}]`).add(new T.Uniform(data)));
+  const declaration = name => `layout(std140) uniform Frames { float lead; mat3x2 matrices[2]; float tail; } ${name}[2];`;
+  const material = new T.RawShaderMaterial({glslVersion: T.GLSL3, uniformsGroups: groups,
+    vertexShader: 'precision highp float; in vec3 position;' + declaration('vertexFrames') +
+      'void main(){gl_Position=vec4(position * vertexFrames[0].lead, 1.);}',
+    fragmentShader: 'precision highp float;out vec4 color;' + declaration('fragmentFrames') +
+      'void main(){color=vec4(fragmentFrames[1].matrices[1][2],fragmentFrames[0].tail,1.);}'});
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  t.after(() => { support.dispose(); groups.forEach(g => g.dispose()); material.dispose(); mesh.geometry.dispose(); });
+  const {program: {reflection}} = support.compile(material, mesh);
+  assert.deepEqual(reflection.blocks.map(b => b.name), ['Frames[0]', 'Frames[1]']);
+  const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
+  const pack = () => support.pack(reflection, support.refresh(material), mesh, camera, bytes, {material});
+  const matrixAt = i => view.getFloat32(reflection.blocks[i].members[1].offset + 32 + 5 * 4, true);
+  pack(); assert.deepEqual([matrixAt(0), matrixAt(1)], [11, 111]);
+  assert.deepEqual(groups.map(g => g.__size), [128, 128]);
+  arrays[1][25] = 149; pack(); assert.equal(matrixAt(1), 111);
+  support.beginFrame(); pack(); assert.deepEqual([matrixAt(0), matrixAt(1)], [11, 149]);
+  groups[0].dispose(); arrays[0][25] = 151; support.beginFrame(); pack();
+  assert.deepEqual([matrixAt(0), matrixAt(1)], [151, 149]);
+  material.uniformsGroups = [groups[0]];
+  assert.throws(pack, /Uniform block Frames\[1\] has no uniforms group/);
+});
+
+test('uniform blocks do not alias or read the material default-uniform namespace', t => {
+  const group = new T.UniformsGroup().setName('Controls').add(new T.Uniform(17));
+  const uniforms = {controls_value: new T.Uniform(29)};
+  Object.defineProperty(uniforms, 'controls_unused', {get() { throw Error('block-only names must not read default uniforms'); }});
+  group.add(new T.Uniform(31));
+  const material = new T.RawShaderMaterial({glslVersion: T.GLSL3, uniforms, uniformsGroups: [group],
+    vertexShader: 'precision highp float;in vec3 position;void main(){gl_Position=vec4(position,1.);}',
+    fragmentShader: 'precision highp float;out vec4 color;uniform float controls_value;' +
+      'layout(std140) uniform Controls { float value; float unused; } controls;' +
+      'void main(){color=vec4(controls.value,controls_value,controls.unused,1.);}'});
+  const mesh = new T.Mesh(new T.BoxGeometry(), material), camera = new T.PerspectiveCamera();
+  const support = createThreeProgramSupport({three: T, state: () => state});
+  t.after(() => { support.dispose(); group.dispose(); material.dispose(); mesh.geometry.dispose(); });
+  const {program: {reflection}} = support.compile(material, mesh);
+  const bytes = new Uint8Array(reflection.uniformBufferSize), view = new DataView(bytes.buffer);
+  support.pack(reflection, support.refresh(material), mesh, camera, bytes, {material});
+  const first = reflection.blocks[0].members[0], second = reflection.blocks[0].members[1];
+  const ordinary = reflection.uniforms.find(u => u.name === 'controls_value' && !u.blockName);
+  assert.deepEqual([first, ordinary, second].map(u => view.getFloat32(u.offset, true)), [17, 29, 31]);
+});
+
 test('PMREM: r186 PMREMGenerator passes record against the host and compile with GL rows', async () => {
   const {createThreeProgramPMREM, pmremSourceComplete, pmremSourceKind} = await import('./three_program_pmrem.mjs');
   const cube = new T.CubeTexture([0, 1, 2, 3, 4].map(() => ({width: 32, height: 32})));

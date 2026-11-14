@@ -267,7 +267,7 @@ export function parse(tokens) {
     if (at('precision')) { next(); qualifiers(); typeSpecifier(); expect(';'); continue; }
     if (at('invariant') && peek(1)?.t === 'id' && at(';', 2)) { next(); next(); next(); continue; }
     const q = qualifiers();
-    // Uniform interface block: uniform Name { ... } [instance];
+    // Uniform interface block: uniform Name { ... } [instance[arraySize]];
     if (q.storage === 'uniform' && peek()?.t === 'id' && !isTypeName(peek()) && at('{', 1)) {
       const blockName = ident(); expect('{'); const fields = [];
       while (!at('}')) {
@@ -282,9 +282,10 @@ export function parse(tokens) {
       }
       expect('}');
       const instance = peek()?.t === 'id' ? ident() : null;
-      if (instance && at('[')) essError('Arrays of uniform blocks are not supported', line());
+      let array = null;
+      if (instance && at('[')) { next(); array = at(']') ? 'unsized' : expression(); expect(']'); }
       expect(';');
-      decls.push({k: 'ublock', name: blockName, instance, fields, line: l});
+      decls.push({k: 'ublock', name: blockName, instance, array, fields, line: l});
       continue;
     }
     if (at(';')) { next(); continue; }

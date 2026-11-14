@@ -50,6 +50,9 @@ export {EsslError};
 // Types
 const S = s => ({k: 's', s}), V = (s, n) => ({k: 'v', s, n}), M = (c, r) => ({k: 'm', c, r});
 const VOID = {k: 'void'}, FLOAT = S('float'), INT = S('int'), UINT = S('uint'), BOOL = S('bool');
+// Blocks flatten into distinct reflected fields. Bound this expansion before
+// allocating element tables; ordinary uniform arrays stay compact in the IR.
+const MAX_UNIFORM_BLOCK_MEMBERS = 4096;
 const SCALAR_PREFIX = {float: '', int: 'i', uint: 'u', bool: 'b'};
 const WGSL_SCALAR = {float: 'f32', int: 'i32', uint: 'u32', bool: 'bool'};
 const SAMPLERS = {
@@ -238,12 +241,15 @@ const TEXTURE_SAMPLE_FORMS = new Set(['texture', 'textureLod', 'textureGrad', 't
 function reflect(shared, units, varyings) {
   // Layout must match Unit.uniformStruct(); computed once here.
   const fields = [];
+  const fieldsByKey = new Map();
   let offset = 0, align = 16;
   for (const name of shared.uniformOrder) {
     const u = shared.uniforms.get(name);
     const lay = layoutOf(u.repr, shared);
     offset = roundUp(lay.align, offset);
-    fields.push({name, glslType: glslName(u.type), offset, size: lay.size, node: describe(u.type, u.repr, offset, shared)});
+    const field = {name: u.reflectionName ?? name, glslType: glslName(u.type), offset, size: lay.size,
+      node: describe(u.type, u.repr, offset, shared), ...(u.blockName ? {blockName: u.blockName, memberName: u.memberName} : {})};
+    fields.push(field); fieldsByKey.set(name, field);
     offset += lay.size; align = Math.max(align, lay.align);
   }
   const samplingOffsets = new Map(), depthReferenceClampOffsets = new Map();
@@ -266,7 +272,7 @@ function reflect(shared, units, varyings) {
     ...(depthReferenceClampOffsets.has(binding) ? {depthReferenceClampOffset: depthReferenceClampOffsets.get(binding)} : {})}));
   return {
     uniformBufferSize: size, uniforms: fields, targetOffset, integerSampling: shared.integerSampling === true,
-    blocks: [...shared.blocks].map(([name, members]) => ({name, members: members.map(m => fields.find(f => f.name === m))})),
+    blocks: [...shared.blocks].map(([name, members]) => ({name, members: members.map(m => fieldsByKey.get(m))})),
     textures,
     attributes: units.vertex.inputs.filter(i => !i.builtin).map(i => ({name: i.name, glslType: glslName(i.type), location: i.location,
       locations: i.type.k === 'm' ? i.type.c : 1, components: i.type.k === 'm' ? i.type.r : comps(i.type), scalar: scalarOf(i.type)})),
@@ -412,20 +418,74 @@ class Unit {
     if (typeof v !== 'number' || !Number.isFinite(v)) essError('Expected a constant integer expression', e.line);
     return Math.trunc(v);
   }
+  constScalarType(e, scope) {
+    switch (e.k) {
+      case 'num': return parseNumber(e.v).type.s;
+      case 'bool': return 'bool';
+      case 'paren': return this.constScalarType(e.e, scope);
+      case 'id': { const t = this.lookup(e.name, scope)?.type; return t?.k === 's' ? t.s : undefined; }
+      case 'ctor': return ['int', 'uint', 'float', 'bool'].includes(e.type.name) ? e.type.name : undefined;
+      case 'unary': return e.op === '!' ? 'bool' : this.constScalarType(e.a, scope);
+      case 'bin': return ['==', '!=', '<', '>', '<=', '>=', '&&', '||', '^^'].includes(e.op)
+        ? 'bool' : this.constScalarType(e.a, scope);
+      case 'cond': return this.constScalarType(e.a, scope);
+      case 'method': return e.name === 'length' ? 'int' : undefined;
+      default: return undefined;
+    }
+  }
   constValue(e, scope) {
+    const numeric = value => {
+      if (!Number.isFinite(value)) return undefined;
+      const type = this.constScalarType(e, scope);
+      return type === 'uint' ? value >>> 0 : type === 'int' ? value | 0 : type === 'float' ? value : undefined;
+    };
     switch (e.k) {
       case 'num': return parseNumber(e.v).value;
       case 'bool': return e.v;
       case 'paren': return this.constValue(e.e, scope);
       case 'id': { const s = this.lookup(e.name, scope); if (s?.constValue !== undefined) return s.constValue; return undefined; }
-      case 'unary': { const a = this.constValue(e.a, scope); if (typeof a !== 'number') return undefined; return e.op === '-' ? -a : e.op === '+' ? a : e.op === '~' ? ~a : undefined; }
+      case 'unary': {
+        const a = this.constValue(e.a, scope);
+        if (e.op === '!') return typeof a === 'boolean' ? !a : undefined;
+        if (typeof a !== 'number') return undefined;
+        return e.op === '-' ? numeric(-a) : e.op === '+' ? a : e.op === '~' ? numeric(~a) : undefined;
+      }
       case 'bin': {
         const a = this.constValue(e.a, scope), b = this.constValue(e.b, scope);
+        if (a === undefined || b === undefined) return undefined;
+        if (e.op === '==' || e.op === '!=') return e.op === '==' ? a === b : a !== b;
+        if (typeof a === 'boolean' && typeof b === 'boolean') {
+          return e.op === '&&' ? a && b : e.op === '||' ? a || b : e.op === '^^' ? a !== b : undefined;
+        }
         if (typeof a !== 'number' || typeof b !== 'number') return undefined;
-        switch (e.op) { case '+': return a + b; case '-': return a - b; case '*': return a * b; case '/': return Number.isInteger(a) && Number.isInteger(b) ? Math.trunc(a / b) : a / b; case '%': return a % b; case '<<': return a << b; case '>>': return a >> b; }
+        switch (e.op) {
+          case '+': return numeric(a + b); case '-': return numeric(a - b);
+          case '*': return numeric(this.constScalarType(e, scope) === 'float' ? a * b : Math.imul(a, b));
+          case '/': return numeric(a / b); case '%': return numeric(a % b);
+          case '&': return numeric(a & b); case '|': return numeric(a | b); case '^': return numeric(a ^ b);
+          case '<<': return b < 0 || b >= 32 ? undefined : numeric(a << b);
+          case '>>': return b < 0 || b >= 32 ? undefined : numeric(this.constScalarType(e, scope) === 'uint' ? a >>> b : a >> b);
+          case '<': return a < b; case '>': return a > b; case '<=': return a <= b; case '>=': return a >= b;
+        }
         return undefined;
       }
-      case 'ctor': if (e.args.length === 1 && ['int', 'uint', 'float'].includes(e.type.name)) { const a = this.constValue(e.args[0], scope); return typeof a === 'number' ? (e.type.name === 'float' ? a : Math.trunc(a)) : undefined; } return undefined;
+      case 'cond': {
+        const c = this.constValue(e.c, scope), a = this.constValue(e.a, scope), b = this.constValue(e.b, scope);
+        // Every operand must be constant, including an unselected branch.
+        return typeof c === 'boolean' && a !== undefined && b !== undefined ? c ? a : b : undefined;
+      }
+      case 'ctor': {
+        if (e.args.length !== 1 || !['int', 'uint', 'float', 'bool'].includes(e.type.name)) return undefined;
+        const a = this.constValue(e.args[0], scope);
+        if (typeof a !== 'number' && typeof a !== 'boolean') return undefined;
+        return e.type.name === 'bool' ? Boolean(a) : numeric(Number(a));
+      }
+      case 'method': {
+        let receiver = e.a; while (receiver.k === 'paren') receiver = receiver.e;
+        if (e.name === 'length' && e.args.length === 0 && receiver.k === 'id')
+          return this.lookup(receiver.name, scope)?.elements?.length;
+        return undefined;
+      }
       default: return undefined;
     }
   }
@@ -455,22 +515,50 @@ class Unit {
   }
   declareBlock(d) {
     // Block members flatten into the default uniform buffer; the reflection keeps
-    // each block's member order so a caller can fill them from std140 bytes.
-    const members = d.fields.map(f => d.instance ? `${d.instance}_${f.name}` : f.name);
-    const known = this.shared.blocks.get(d.name);
-    if (known && known.join() !== members.join()) essError(`Uniform block ${d.name} differs between stages`, d.line);
-    this.shared.blocks.set(d.name, members);
-    if (this.stage && d.instance) {
-      const sym = {kind: 'ublock', fields: new Map()};
-      for (const f of d.fields) {
-        const t = this.resolveType(f.type, f.array), name = `${d.instance}_${f.name}`;
-        this.addUniform(name, t, d.line); sym.fields.set(f.name, name);
-      }
-      this.globals.set(d.instance, sym);
-    } else for (const f of d.fields) {
-      const t = this.resolveType(f.type, f.array);
-      this.addUniform(f.name, t, d.line);
-      this.globals.set(f.name, {kind: 'uniform', type: t, name: f.name});
+    // each block's member order so a caller can fill it from its std140 group.
+    // Link by the source block name and ordered member types. Instance names
+    // are stage-local and need not match between vertex and fragment shaders.
+    if (this.version !== 300) essError('Uniform blocks require ESSL 3.00', d.line);
+    if (d.array === 'unsized') essError('Uniform block arrays require an explicit size', d.line);
+    const count = d.array === null ? null : this.constValue(d.array, null);
+    if (d.array !== null) {
+      const type = this.expr(d.array, {scope: null, pre: []}).t;
+      if (!Number.isSafeInteger(count) || count <= 0 || type.k !== 's' || !['int', 'uint'].includes(type.s))
+        essError('Uniform block array size must be a positive constant integer', d.line);
+    }
+    const fields = d.fields.map(f => ({name: f.name, type: this.resolveType(f.type, f.array)}));
+    if (fields.length === 0) essError('Uniform blocks need at least one member', d.line);
+    const declarations = this.shared.blockDeclarations ??= new Map();
+    let known = declarations.get(d.name);
+    if (known && (known.count !== count || known.hasInstance !== Boolean(d.instance) || known.fields.length !== fields.length ||
+        fields.some((f, i) => f.name !== known.fields[i].name || !same(f.type, known.fields[i].type))))
+      essError(`Uniform block ${d.name} differs between stages`, d.line);
+    if (!known) {
+      const memberCount = (count ?? 1) * fields.length, previousCount = this.shared.blockMemberCount ?? 0;
+      if (!Number.isSafeInteger(memberCount) || memberCount > MAX_UNIFORM_BLOCK_MEMBERS - previousCount)
+        essError(`Uniform block expansion exceeds ${MAX_UNIFORM_BLOCK_MEMBERS} members`, d.line);
+      this.shared.blockMemberCount = previousCount + memberCount;
+      const elements = Array.from({length: count ?? 1}, (_, i) => {
+        // Punctuation keeps these private keys outside the source identifier
+        // namespace, including implementation-reserved spellings. Preserve
+        // the source block/member names separately in reflection diagnostics.
+        const blockName = count === null ? d.name : `${d.name}[${i}]`;
+        const members = fields.map((_, j) => `@f3d:block:${declarations.size}:${i}:${j}`);
+        fields.forEach((f, j) => {
+          this.addUniform(members[j], f.type, d.line);
+          Object.assign(this.shared.uniforms.get(members[j]), {field: `f3d_block${declarations.size}_${i}_${j}`,
+            blockName, memberName: f.name, reflectionName: count === null ? d.instance ? `${d.instance}_${f.name}` : f.name
+              : `${blockName}.${f.name}`});
+        });
+        this.shared.blocks.set(blockName, members);
+        return {fields: new Map(fields.map((f, j) => [f.name, members[j]]))};
+      });
+      known = {count, fields, elements, hasInstance: Boolean(d.instance)}; declarations.set(d.name, known);
+    }
+    if (d.instance) this.globals.set(d.instance, {kind: 'ublock',
+      ...(count === null ? known.elements[0] : {elements: known.elements})});
+    else for (const f of fields) {
+      this.globals.set(f.name, {kind: 'uniform', type: f.type, name: known.elements[0].fields.get(f.name)});
     }
   }
   addUniform(name, type, line) {
@@ -530,7 +618,7 @@ class Unit {
       if (storage === 'const') {
         if (!v.init) essError('const needs an initializer', v.line);
         const value = this.constValue(v.init, null);
-        const sym = {kind: 'global', type, w, constValue: typeof value === 'number' ? value : undefined, isConst: true,
+        const sym = {kind: 'global', type, w, constValue: value, isConst: true,
           textureBiasRange: this.textureBiasRange(v.init, null)};
         this.globals.set(v.name, sym);
         sym.pendingInit = {decl: v, type, w};
@@ -1132,7 +1220,7 @@ class Unit {
     switch (e.k) {
       case 'num': { const n = parseNumber(e.v); return {c: n.code, t: n.type}; }
       case 'bool': return {c: String(e.v), t: BOOL};
-      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u ? r : {c: `(${r.c})`, t: r.t, smp: r.smp, ref: r.ref}; }
+      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u || r.block ? r : {c: `(${r.c})`, t: r.t, smp: r.smp, ref: r.ref}; }
       case 'id': return this.identifier(e, ctx);
       case 'seq': {
         for (const x of e.list.slice(0, -1)) ctx.pre.push(...this.exprStatement(x, ctx));
@@ -1170,6 +1258,7 @@ class Unit {
       case 'method': {
         if (e.name !== 'length' || e.args.length) essError(`Unsupported method .${e.name}()`, e.line);
         const a = this.exprRaw(e.a, ctx);
+        if (a.block?.elements) return {c: String(a.block.elements.length), t: INT};
         if (a.t.k === 'a') return {c: String(a.t.n), t: INT};
         if (a.t.k === 'v') return {c: String(a.t.n), t: INT};
         if (a.t.k === 'm') return {c: String(a.t.c), t: INT};
@@ -1218,6 +1307,13 @@ class Unit {
   }
   index(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
+    if (a.block?.elements) {
+      const index = this.expr(e.index, ctx), k = this.constValue(e.index, ctx.scope);
+      if (!['int', 'uint'].includes(index.t.s) || index.t.k !== 's' || !Number.isSafeInteger(k))
+        essError('Uniform block array index must be a constant integer expression', e.line);
+      if (k < 0 || k >= a.block.elements.length) essError('Uniform block array index out of range', e.line);
+      return {c: null, t: {k: 'ublock'}, block: a.block.elements[k]};
+    }
     if (a.smp) {
       const k = this.constValue(e.index, ctx.scope);
       if (typeof k !== 'number') essError('Sampler array index must be a constant expression', e.line);
@@ -1248,6 +1344,7 @@ class Unit {
   field(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
     if (a.block) {
+      if (a.block.elements) essError('Uniform block arrays must be indexed before selecting a member', e.line);
       const name = a.block.fields.get(e.name);
       if (!name) essError(`No block member ${e.name}`, e.line);
       const u = this.shared.uniforms.get(name);

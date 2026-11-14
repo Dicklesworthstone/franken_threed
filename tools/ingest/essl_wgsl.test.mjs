@@ -207,6 +207,94 @@ test('nested uniform structs convert matrix arrays while retaining independent p
   assert.match(r.fragment, /var copy: Payload = f3d_from_u_Payload\(f3d_u\.payload\);/);
 });
 
+test('uniform block arrays link source block names while keeping stage-local instance names', () => {
+  const block = instance => `layout(std140) uniform Frames { vec4 tint; mat3x2 frames[2]; bool active; } ${instance}[2];`;
+  const r = program(V('gl_Position = vec4(position * vert[0].tint.x, 1.0);', block('vert')),
+    F('mat3x2 values[2] = frag[1].frames; color = frag[0].active ? vec4(values[1][2], frag[1].tint.xy) : frag[0].tint;', block('frag')));
+  assert.deepEqual(r.reflection.blocks.map(b => b.name), ['Frames[0]', 'Frames[1]']);
+  assert.equal(r.reflection.uniforms.length, 7, 'mvp plus three shared members for each block element');
+  const [a, b] = r.reflection.blocks;
+  assert.equal(a.members.length, 3); assert.equal(b.members.length, 3);
+  assert.deepEqual(a.members.map(m => [m.blockName, m.memberName]), [['Frames[0]', 'tint'], ['Frames[0]', 'frames'], ['Frames[0]', 'active']]);
+  assert.notEqual(a.members[0].offset, b.members[0].offset);
+  assert.equal(a.members[1].node.stride, 32);
+  assert.match(r.vertex, /f3d_u\.f3d_block0_0_0\.x/);
+  assert.match(r.fragment, /f3d_from_u_mat3x2_2_\(f3d_u\.f3d_block0_1_1\)/);
+  assert.match(r.fragment, /f3d_u\.f3d_block0_0_2 != 0u/);
+});
+
+test('uniform block arrays use constant integer selectors and retain dynamic member indexing', () => {
+  const r = program(minimalVS, F(`const int pick = 1; int member = int(gl_FragCoord.x) % 2;
+    color = blocks[pick].values[member] + blocks[(blocks).length() - 1].values[0];`,
+    'const uint count = 2u; layout(std140) uniform Block { vec4 values[2]; } blocks[count];'));
+  assert.match(r.fragment, /f3d_u\.f3d_block0_1_0\[f3d_t\d+\]/);
+  assert.equal(r.reflection.blocks.length, 2);
+  assert.match(compileEsslStage('fragment', F('color = vec4(float(blocks.length()));',
+    'layout(std140) uniform Block { vec4 value; } blocks[2];')), /f32\(2\)/);
+  for (const index of ['1 & 1', '1 | 0', '1 ^ 0', 'true ? 1 : 0', 'second ? 1 : 0', 'int(true)',
+    'int(!false && bool(1))', '(1 < 2 && 2 == 2) ? 1 : 0', '0x80000000u >> 31u',
+    '(0x80000000u | 1u) > 0u ? 1 : 0', '~0xfffffffeu', '0xffffffffu + 2u']) {
+    const selected = program(minimalVS, F(`color = blocks[${index}].value;`,
+      'const bool second = true; layout(std140) uniform Block { vec4 value; } blocks[2];'));
+    assert.match(selected.fragment, /color = f3d_u\.f3d_block0_1_0;/, index);
+  }
+  assert.match(program(minimalVS, F('color = blocks[int(3.0 / 2.0 * 2.0)].value;',
+    'layout(std140) uniform Block { vec4 value; } blocks[4];')).fragment, /color = f3d_u\.f3d_block0_3_0;/);
+  for (const index of ['-1', '2', '0.0', 'true', 'int(gl_FragCoord.x)', 'next()',
+    'true ? 1 : int(gl_FragCoord.x)', '(true || gl_FragCoord.x > 0.0) ? 1 : 0'])
+    assert.throws(() => program(minimalVS, F(`color = blocks[${index}].value;`,
+      'layout(std140) uniform Block { vec4 value; } blocks[2]; int next(){return 0;}')), /block array index/i, index);
+  for (const size of ['', '0', '-1', '2.0', 'true', 'n'])
+    assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+      `uniform int n; layout(std140) uniform Block { vec4 value; } blocks[${size}];`)), /block array/i, size);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+    'layout(std140) uniform Huge { vec4 value; } blocks[2147483647];')), /block expansion exceeds 4096 members/i);
+  assert.throws(() => program(minimalVS, F('color = blocks.value;',
+    'layout(std140) uniform Block { vec4 value; } blocks[2];')), /must be indexed/);
+  assert.throws(() => program(minimalVS, F('blocks[0].value = vec4(1.); color = blocks[0].value;',
+    'layout(std140) uniform Block { vec4 value; } blocks[2];')), /not assignable/);
+});
+
+test('uniform interface matching rejects block shape changes, but accepts different single-instance names', () => {
+  const vertex = V('gl_Position = vec4(position * vert.value.x, 1.0);',
+    'layout(std140) uniform Shared { vec4 value; float weight; } vert;');
+  const r = program(vertex, F('color = frag.value * frag.weight;',
+    'layout(std140) uniform Shared { vec4 value; float weight; } frag;'));
+  assert.equal(r.reflection.blocks.length, 1);
+  assert.match(r.fragment, /f3d_u\.f3d_block0_0_0 \* f3d_u\.f3d_block0_0_1/);
+  const unnamed = 'layout(std140) uniform Shared { vec4 value; float weight; };';
+  assert.throws(() => program(vertex, F('color = value * weight;', unnamed)), /Uniform block Shared differs between stages/);
+  const bareVertex = V('gl_Position = vec4(position * value.x, 1.);', unnamed);
+  assert.throws(() => program(bareVertex, F('color = frag.value * frag.weight;',
+    'layout(std140) uniform Shared { vec4 value; float weight; } frag;')), /Uniform block Shared differs between stages/);
+  const bare = program(bareVertex, F('color = value * weight;', unnamed));
+  assert.equal(bare.reflection.blocks.length, 1);
+  assert.match(bare.fragment, /f3d_u\.f3d_block0_0_0 \* f3d_u\.f3d_block0_0_1/);
+  const arrayVertex = V('gl_Position = vec4(position, 1.0);',
+    'layout(std140) uniform Shared { vec4 value; float weight; } vert[2];');
+  for (const declaration of ['vec4 value; float weight; } frag[3]', 'vec4 value; float weight; } frag',
+    'vec3 value; float weight; } frag[2]', 'float weight; vec4 value; } frag[2]', 'vec4 value; } frag[2]'])
+    assert.throws(() => program(arrayVertex, F('color = vec4(1.);',
+      `layout(std140) uniform Shared { ${declaration};`)), /Uniform block Shared differs between stages/);
+});
+
+test('uniform blocks keep separate identities from default uniforms and other stage blocks', () => {
+  const r = program(V('gl_Position = vec4(position * data.value.x, 1.0);',
+    'layout(std140) uniform VertexBlock { vec4 value; } data;'),
+    F('color = data.value + other.value + data_value + __f3d_block0_0_0;',
+      'layout(std140) uniform FragmentBlock { vec4 value; } data;' +
+      'layout(std140) uniform VertexBlock { vec4 value; } other; uniform vec4 data_value, __f3d_block0_0_0;'));
+  assert.deepEqual(r.reflection.blocks.map(b => b.name), ['VertexBlock', 'FragmentBlock']);
+  const a = r.reflection.blocks[0].members[0], b = r.reflection.blocks[1].members[0];
+  const c = r.reflection.uniforms.find(u => u.name === 'data_value' && !u.blockName);
+  // Reserved source spellings also retain independent reflection identities;
+  // this assertion does not extend the existing WGSL identifier escaping profile.
+  const d = r.reflection.uniforms.find(u => u.name === '__f3d_block0_0_0' && !u.blockName);
+  assert.equal(new Set([a.offset, b.offset, c.offset, d.offset]).size, 4);
+  assert.match(r.fragment, /f3d_u\.f3d_block1_0_0 \+ f3d_u\.f3d_block0_0_0/);
+  assert.match(r.fragment, /f3d_u\.data_value/);
+});
+
 test('aggregate equality enforces matching types and the ESSL 1.00 array boundary', () => {
   assert.throws(() => compileEsslStage('fragment', F('color = vec4(1.0);',
     'bool probe(float a[2], float b[3]) { return a == b; }')), /Cannot compare float\[2\] with float\[3\]/);

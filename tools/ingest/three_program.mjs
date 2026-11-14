@@ -204,6 +204,7 @@ export function packThreeProgramUniforms(T, reflection, uniforms, object, camera
     builtin.morphTargetsTextureSize = threeMorphTargets(T, geometry).size;
   }
   for (const u of reflection.uniforms) {
+    if (u.blockName !== undefined) continue; // UniformsGroup owns this namespace, even if a default uniform has the same name.
     // Consecutive renderBufferDirect calls retain custom uniform uploads until
     // uniformsNeedUpdate or a source program/material/camera switch. Common
     // object matrices and deformation inputs still upload on every call.

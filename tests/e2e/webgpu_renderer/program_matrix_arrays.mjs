@@ -72,6 +72,22 @@ async function capture(mode, rootKind) {
           layout(std140) uniform Frames { float lead; mat3x2 matrices[2]; float tail; } frames;
           out vec4 color; void main() {
             int x = int(gl_FragCoord.x); color = vec4(frames.matrices[x % 2][(x / 2) % 3], frames.lead, frames.tail) / 255.0; }`});
+      const arrayData = [0, 1].map(i => {
+        const values = new Float32Array(32); values[0] = 19 + i * 40; values[28] = 23 + i * 40;
+        for (let matrix = 0; matrix < 2; matrix++) for (let column = 0; column < 3; column++) for (let row = 0; row < 2; row++)
+          values[4 + matrix * 12 + column * 4 + row] = 29 + i * 60 + matrix * 12 + column * 4 + row;
+        return values;
+      });
+      const arrayGroups = arrayData.map((values, i) => new T.UniformsGroup().setName(`Blocks[${i}]`).add(new T.Uniform(values)));
+      const blockArray = name => `layout(std140) uniform Blocks { float lead; mat3x2 matrices[2]; float tail; } ${name}[2];`;
+      const arrayMaterial = new T.RawShaderMaterial({glslVersion: T.GLSL3, uniformsGroups: arrayGroups.slice(),
+        depthTest: false, depthWrite: false, blending: T.NoBlending,
+        vertexShader: 'precision highp float;in vec3 position;out vec2 vertexColor;' + blockArray('vertexBlocks') +
+          'void main(){vertexColor=vec2(vertexBlocks[0].lead,vertexBlocks[1].tail);gl_Position=vec4(position.xy,0.,1.);}',
+        fragmentShader: 'precision highp float;precision highp int;in vec2 vertexColor;out vec4 color;' + blockArray('fragmentBlocks') +
+          `void main(){const int last=fragmentBlocks.length()-1;int x=int(gl_FragCoord.x);
+            vec2 value=x<6?fragmentBlocks[0].matrices[x%2][(x/2)%3]:fragmentBlocks[last].matrices[x%2][(x/2)%3];
+            color=vec4(vertexColor,value)/255.;}`});
       const mesh = new T.Mesh(geometry, material), scene = new T.Scene(); mesh.frustumCulled = false; scene.add(mesh);
       const draw = async (name, afterRender = null) => {
         renderer.render(rootKind === 'mesh' ? mesh : scene, camera);
@@ -108,9 +124,22 @@ async function capture(mode, rootKind) {
           data.fill(255);
         });
         await draw('mat3x2-ubo-reused');
+        mesh.material = arrayMaterial; await draw('ubo-array-initial');
+        arrayData[0][0] = 71; arrayData[0][4] = 73; arrayData[1][28] = 79; arrayData[1][25] = 83;
+        await draw('ubo-array-edited');
+        arrayMaterial.uniformsGroups.reverse(); await draw('ubo-array-reordered');
+        arrayMaterial.fragmentShader = arrayMaterial.fragmentShader.replaceAll('fragmentBlocks', 'renamedBlocks');
+        arrayMaterial.needsUpdate = true; await draw('ubo-array-stage-renamed');
+        await draw('ubo-array-before-dispose', () => {
+          arrayGroups[1].dispose();
+          const next = arrayData[1].slice(); next[28] = 109; next[4] = 113;
+          arrayGroups[1].uniforms = [new T.Uniform(next)]; arrayData[1].fill(255);
+        });
+        await draw('ubo-array-reused');
         return {frames, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
       } finally {
-        target.dispose(); geometry.dispose(); material.dispose(); blockMaterial.dispose(); group.dispose(); renderer.dispose();
+        target.dispose(); geometry.dispose(); material.dispose(); blockMaterial.dispose(); group.dispose();
+        arrayMaterial.dispose(); arrayGroups.forEach(g => g.dispose()); renderer.dispose();
       }
     }, {mode, rootKind});
     assert.deepEqual(browserErrors, [], `${mode} browser errors`);
@@ -125,6 +154,12 @@ try {
   assert.equal(candidate.frames.length, source.frames.length);
   for (const index of [1, 2, 4, 5, 7])
     assert.notDeepEqual(source.frames[index].pixels, source.frames[index - 1].pixels, 'source uniform changes affect the output');
+  const frame = name => source.frames.find(item => item.name === name).pixels;
+  assert.notDeepEqual(frame('ubo-array-initial'), frame('ubo-array-edited'));
+  assert.deepEqual(frame('ubo-array-edited'), frame('ubo-array-reordered'));
+  assert.deepEqual(frame('ubo-array-reordered'), frame('ubo-array-stage-renamed'));
+  assert.deepEqual(frame('ubo-array-stage-renamed'), frame('ubo-array-before-dispose'));
+  assert.notDeepEqual(frame('ubo-array-before-dispose'), frame('ubo-array-reused'));
   for (const [index, expected] of source.frames.entries()) {
     const actual = candidate.frames[index]; assert.equal(actual.name, expected.name);
     assert.deepEqual(actual.pixels, expected.pixels, `${expected.name}: source/candidate storage differs`);
