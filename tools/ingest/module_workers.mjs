@@ -16,6 +16,7 @@ import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 import {moduleSourcesFor} from './module_sources.mjs';
 import {assertUnbundledModule} from './commonjs_modules.mjs';
+import {createDynamicImportClassifier} from './ast_analyzer.mjs';
 import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
 
 export class ModuleWorkerBuildError extends Error {
@@ -61,23 +62,49 @@ function literalChoices(node, result = [], depth = 0) {
   return literalChoices(node.consequent, result, depth + 1) && literalChoices(node.alternate, result, depth + 1);
 }
 
-function urlChoices(node, changed, relative = true, result = [], depth = 0) {
+// Immutable strings can have several runtime values. Map the actual operand,
+// never its declaration: other reads and initialization/TDZ effects are source-owned.
+function workerStringChoices(node, classify, result = [], depth = 0) {
+  if (!node || depth > 64) return null;
+  if (text(node) !== null) {
+    if (result.length >= 128) return null;
+    result.push({argument: node, specifier: text(node)}); return result;
+  }
+  if (node.type === 'SequenceExpression')
+    return workerStringChoices(node.expressions.at(-1), classify, result, depth + 1);
+  if (node.type === 'ConditionalExpression')
+    return workerStringChoices(node.consequent, classify, result, depth + 1) &&
+      workerStringChoices(node.alternate, classify, result, depth + 1);
+  const classified = classify(node);
+  if (classified.classification !== 'finite_set' || result.length + classified.candidates.length > 128) return null;
+  for (const specifier of classified.candidates)
+    result.push({argument: node, specifier, selector: specifier});
+  return result;
+}
+
+function urlChoices(node, changed, relative = true, result = [], depth = 0, classify = null) {
   if (!node || depth > 64) return null;
   const operand = !changed.has('URL') && urlOperand(node);
   if (operand) {
-    const choices = literalChoices(operand);
+    const choices = classify ? workerStringChoices(operand, classify)
+      : literalChoices(operand)?.map(argument => ({argument}));
     if (!choices || result.length + choices.length > 128) return null;
-    for (const argument of choices) result.push({urlNode: node, argument, base: 'module'});
+    for (const choice of choices) result.push({urlNode: node, ...choice, base: 'module'});
     return result;
   }
   if (relative && text(node) !== null) {
     if (result.length >= 128) return null;
     result.push({urlNode: node, argument: node, base: 'realm'}); return result;
   }
-  if (node.type === 'SequenceExpression') return urlChoices(node.expressions.at(-1), changed, relative, result, depth + 1);
-  if (node.type !== 'ConditionalExpression') return null;
-  return urlChoices(node.consequent, changed, relative, result, depth + 1) &&
-    urlChoices(node.alternate, changed, relative, result, depth + 1);
+  if (node.type === 'SequenceExpression') return urlChoices(node.expressions.at(-1), changed, relative, result, depth + 1, classify);
+  if (node.type === 'ConditionalExpression')
+    return urlChoices(node.consequent, changed, relative, result, depth + 1, classify) &&
+      urlChoices(node.alternate, changed, relative, result, depth + 1, classify);
+  if (!relative || !classify) return null;
+  const choices = workerStringChoices(node, classify);
+  if (!choices || result.length + choices.length > 128) return null;
+  for (const choice of choices) result.push({urlNode: node, ...choice, base: 'realm'});
+  return result;
 }
 
 // Conservative admission: a binding or write anywhere in the module prevents
@@ -184,14 +211,14 @@ function scopedGlobals(ast) {
   };
 }
 function sitesIn(ast, changed, {classic = false, relative = false, withConstructors = false} = {}) {
-  const sites = [];
+  const sites = [], classify = createDynamicImportClassifier(ast);
   walk.simple(ast, {NewExpression(node) {
     const unavailable = typeof changed === 'function' ? changed(node) : changed;
     const kind = node.callee.type === 'Identifier' ? node.callee.name : null;
     if (!['Worker', 'SharedWorker'].includes(kind) || unavailable.has(kind) ||
         node.arguments.length < 1 || node.arguments.length > 2) return;
     const urlNode = node.arguments[0], options = node.arguments[1];
-    const choices = urlChoices(urlNode, unavailable, relative);
+    const choices = urlChoices(urlNode, unavailable, relative, [], 0, classify);
     if (!choices) return;
     let workerType = 'classic';
     if (options && !(options.type === 'Literal' && options.value === null)) {
@@ -207,7 +234,7 @@ function sitesIn(ast, changed, {classic = false, relative = false, withConstruct
     }
     if (!['classic', 'module'].includes(workerType) || (!classic && workerType !== 'module')) return;
     for (const choice of choices)
-      sites.push({kind, workerType, ...(withConstructors ? {constructorNode: node} : {}), ...choice, specifier: text(choice.argument)});
+      sites.push({kind, workerType, ...(withConstructors ? {constructorNode: node} : {}), ...choice, specifier: choice.specifier ?? text(choice.argument)});
   }});
   return sites;
 }
@@ -253,6 +280,38 @@ export function workerGlobalBindings(source, {sourceType = 'script'} = {}) {
 }
 
 const realmKey = (url, workerType) => JSON.stringify([workerType, url]);
+
+// All alternatives for one expression share one dispatch. Insertion edits keep
+// nested URL/import/worker transformations inside its original evaluation.
+function workerEdit(edits, site, value) {
+  const {start, end} = site.argument;
+  if (site.selector === undefined) { edits.push({start, end, ...value}); return; }
+  let group = edits.find(edit => edit.start === start && edit.end === end && edit.choices);
+  if (!group) { group = {start, end, choices: []}; edits.push(group); }
+  group.choices.push({selector: site.selector, ...value});
+}
+function workerReplacements(edits, render) {
+  const result = [];
+  for (const edit of edits) {
+    if (!edit.choices) { result.push({...edit, value: render(edit)}); continue; }
+    const chain = edit.choices.map(choice =>
+      `v === ${JSON.stringify(choice.selector)} ? ${render(choice)} : `).join('');
+    const span = edit.end - edit.start;
+    result.push({start: edit.start, end: edit.start, side: 1, span, value: `((v) => ${chain}v)(`});
+    result.push({start: edit.end, end: edit.end, side: -1, span, value: ')'});
+  }
+  return result;
+}
+function applyWorkerEdits(source, replacements, url) {
+  replacements.sort((a, b) => a.start - b.start || a.end - b.end ||
+    (a.side ?? 0) - (b.side ?? 0) || (a.side === -1 ? a.span - b.span : b.span - a.span));
+  const parts = []; let offset = 0;
+  for (const edit of replacements) {
+    if (edit.start < offset) fail('TRANSFORM', 'Overlapping worker source rewrites', url);
+    parts.push(source.slice(offset, edit.start), edit.value); offset = edit.end;
+  }
+  parts.push(source.slice(offset)); return parts.join('');
+}
 
 // Import attributes choose the host's module goal, not the file's spelling.
 // Inspect only plain dictionaries; keep their original expressions so option
@@ -498,7 +557,9 @@ export function buildWorkerGraph(entryUrl, {
       const url = resolveDocumentUrl(site.specifier, site.base === 'realm' ? root.url : record.url, documentRoot);
       if (new URL(url).protocol !== 'file:') continue;
       if (documentRoot && isRootRelativeDocumentUrl(site.specifier) && !localFileExists(url)) continue;
-      replace(site.argument, worker(url, site.workerType), site.base === 'realm');
+      const target = worker(url, site.workerType);
+      record.edges.add(target);
+      workerEdit(edits, site, {target, suffix: suffix(url), fetch: site.base === 'realm'});
       uses(site.kind); if (site.base === 'module') uses('URL');
     }
     walk.simple(ast, {
@@ -580,8 +641,9 @@ export function buildWorkerGraph(entryUrl, {
     // Hash symbolic links, not final output URLs, so mutually spawning workers
     // have a finite content address and SharedWorker URLs don't depend on who
     // happened to discover their graph first.
+    const link = e => [e.target.external ?? e.target.key, e.suffix, e.fetch];
     record.signature = digest(JSON.stringify([record.key, source, record.edits.map(e =>
-      [e.start, e.end, e.target.external ?? e.target.key, e.suffix, e.fetch])]));
+      [e.start, e.end, ...(e.choices ? [e.choices.map(choice => [choice.selector, ...link(choice)])] : link(e))])]));
   }
   // Classic scripts share a global lexical/var environment. Conservatively reject
   // cross-script host-name rebinding rather than relocate a custom loader's args.
@@ -622,26 +684,20 @@ export function buildWorkerGraph(entryUrl, {
       if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
       continue;
     }
-    const replacements = []; let bytes = Buffer.byteLength(record.original), end = record.original.length;
-    for (const edit of record.edits) {
-      if (edit.end > end) fail('TRANSFORM', 'Overlapping worker source rewrites', record.url);
+    const replacements = workerReplacements(record.edits, edit => {
       let value = edit.target.external;
       if (value === undefined) {
         const from = edit.fetch ? roots.get(record.realm).fileName : record.fileName;
         const relative = path.posix.relative(path.posix.dirname(from), edit.target.fileName);
         value = (relative.startsWith('.') ? relative : './' + relative) + edit.suffix;
       }
-      value = JSON.stringify(value);
-      bytes += Buffer.byteLength(value) - Buffer.byteLength(record.original.slice(edit.start, edit.end));
-      replacements.push({...edit, value}); end = edit.start;
-    }
+      return JSON.stringify(value);
+    });
+    const bytes = replacements.reduce((total, edit) => total + Buffer.byteLength(edit.value) -
+      Buffer.byteLength(record.original.slice(edit.start, edit.end)), Buffer.byteLength(record.original));
     outputBytes += bytes;
     if (outputBytes > maxBytes) fail('BUDGET', 'Relocated worker output exceeds maxBytes', entryUrl);
-    const parts = []; let offset = 0;
-    for (const edit of replacements.reverse()) {
-      parts.push(record.original.slice(offset, edit.start), edit.value); offset = edit.end;
-    }
-    parts.push(record.original.slice(offset)); record.source = parts.join('');
+    record.source = applyWorkerEdits(record.original, replacements, record.url);
   }
   const files = [...modules.values(), ...assets.values()].map(record => ({
     type: 'asset', fileName: record.fileName, source: record.source,
@@ -738,13 +794,10 @@ export function moduleWorkerRollupPlugin(options = {}) {
           const relative = path.relative(baseDir, path.join(documentDir, target.fileName)).split(path.sep).join('/');
           replacement = JSON.stringify((relative.startsWith('.') ? relative : './' + relative) + target.suffix);
         }
-        edits.push({start: site.argument.start, end: site.argument.end, text: replacement});
+        workerEdit(edits, site, {text: replacement});
       }
       if (!edits.length) return null;
-      let output = code;
-      for (const edit of edits.sort((a, b) => b.start - a.start))
-        output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
-      return {code: output, map: null};
+      return {code: applyWorkerEdits(code, workerReplacements(edits, edit => edit.text), id), map: null};
     },
   };
 }

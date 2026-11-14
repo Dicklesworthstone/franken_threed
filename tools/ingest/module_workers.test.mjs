@@ -10,7 +10,7 @@ import { Worker as Thread } from "node:worker_threads";
 import { buildApplication } from "./build_application.mjs";
 import { parseTagAttributes } from "./html_parser.mjs";
 import { packHtml } from "./pack_html.mjs";
-import { buildModuleWorkerGraph, moduleWorkerRollupPlugin } from "./module_workers.mjs";
+import { buildModuleWorkerGraph, findWorkerSites, findWorkerUrlOperands, moduleWorkerRollupPlugin } from "./module_workers.mjs";
 
 // Test host only: real native worker threads, ESM, classic script evaluation,
 // Wasm compilation and filesystem-backed Response bodies. Production worker
@@ -433,4 +433,163 @@ test("documentRoot worker host fallback cannot swallow inspected symlink escapes
       pathToFileURL(path.join(root, "main.mjs")).href), {code: "F3D_DOCUMENT_ROOT_ESCAPE"});
     assert.equal(emitted.length, 0);
   }
+});
+
+test("worker selectors follow immutable module strings without moving their bindings", () => {
+  const source = `
+    const directory = './workers/', name = choose() ? 'one' : 'two', alias = name;
+    function start() {
+      const entry = directory + alias + '.mjs';
+      new Worker(entry, {type:'module'});
+      new SharedWorker(new URL(\`\${directory}\${name}.mjs\`, import.meta.url), {type:'module'});
+    }`;
+  const sites = findWorkerSites(source, {relative:true});
+  assert.deepEqual(sites.map(site => [site.kind,site.specifier,site.base]), [
+    ['Worker','./workers/one.mjs','realm'], ['Worker','./workers/two.mjs','realm'],
+    ['SharedWorker','./workers/one.mjs','module'], ['SharedWorker','./workers/two.mjs','module'],
+  ]);
+  assert.equal(source.slice(sites[0].argument.start,sites[0].argument.end),'entry');
+  assert.equal(sites[0].argument,sites[1].argument);
+  assert.equal(findWorkerUrlOperands(source).length,1);
+  for (const source of [
+    "let entry='./one.mjs';new Worker(entry,{type:'module'});",
+    "const entry='./one.mjs';function start(entry){new Worker(entry,{type:'module'});}",
+    "const entry='./one.mjs';function start(){let entry='./two.mjs';new Worker(entry,{type:'module'});}",
+    "const entry=new URL('./one.mjs',import.meta.url);entry.pathname='/two.mjs';new Worker(entry,{type:'module'});",
+    "import entry from './choice.mjs';new Worker(entry,{type:'module'});",
+  ]) assert.deepEqual(findWorkerSites(source,{relative:true}),[]);
+  assert.deepEqual(findWorkerSites("const entry='./one.js';new Worker(entry);",
+    {sourceType:'script',relative:true}),[],'classic aliases retain their existing conservative scope policy');
+});
+
+test("relocated const worker choices keep selectors, observations and TDZ failures", async (t) => {
+  const root = fixture({
+    "modules/app.mjs": `
+      export function start(flag, log) {
+        const name = (log.push('select'), flag ? 'selected' : 'other');
+        const entry = './' + name + '.mjs', alias = entry;
+        log.push(entry);
+        const worker = new Worker((log.push('argument'), alias),
+          {type:'module',name:(log.push('options'),name)});
+        log.push(entry); return worker;
+      }
+      export function early(log) {
+        new Worker(entry,{type:'module',name:(log.push('options'),'early')});
+        const entry = './selected.mjs';
+      }`,
+    "site/selected.mjs": "import {value} from './lib/value.mjs';postMessage(value);",
+    "site/lib/value.mjs": "export const value=42;",
+    "site/other.mjs": "postMessage(7);",
+  });
+  const built = await build(root), log = [];
+  workerHost(t,pathToFileURL(path.join(built.outDir,'site/base.html')));
+  fs.renameSync(path.join(root,'site'),path.join(root,'source-site-unavailable'));
+  fs.renameSync(path.join(root,'modules'),path.join(root,'source-modules-unavailable'));
+  assert.equal(await built.application.start(true,log).result,42);
+  assert.equal(await built.application.start(false,log).result,7);
+  assert.deepEqual(log,[
+    'select','./selected.mjs','argument','options','./selected.mjs',
+    'select','./other.mjs','argument','options','./other.mjs',
+  ]);
+  const before = log.slice();
+  assert.throws(()=>built.application.early(log),ReferenceError);
+  assert.deepEqual(log,before,'TDZ failure precedes options and worker construction');
+});
+
+test("module-relative URL operands can select immutable worker strings", async (t) => {
+  const root = fixture({
+    "modules/app.mjs": `
+      const directory='./tasks/';
+      export const start=flag=>{
+        const file=flag?'selected':'other',entry=\`\${directory}\${file}.mjs\`;
+        return new Worker(new URL(entry,import.meta.url),{type:'module'});
+      };`,
+    "modules/tasks/selected.mjs": "import {value} from './value.mjs';postMessage(value);",
+    "modules/tasks/value.mjs": "export const value=42;",
+    "modules/tasks/other.mjs": "postMessage(7);",
+  });
+  const built = await build(root);
+  workerHost(t,pathToFileURL(path.join(built.outDir,'site/base.html')));
+  fs.renameSync(path.join(root,'modules'),path.join(root,'source-modules-unavailable'));
+  assert.equal(await built.application.start(true).result,42);
+  assert.equal(await built.application.start(false).result,7);
+});
+
+test("nested worker graphs relocate const selectors in the originating realm", async (t) => {
+  const root = fixture({
+    "entry.mjs": "export const start=flag=>{const entry=flag?'./one.mjs?job=1#one':'./two.mjs';return new Worker(entry,{type:'module'});};",
+    "one.mjs": "postMessage(1);",
+    "two.mjs": "postMessage(2);",
+  });
+  const graph = buildModuleWorkerGraph(pathToFileURL(path.join(root,'entry.mjs')).href,
+    {requireClosedRuntimeUrls:true});
+  assert.equal(graph.entries.length,3);
+  for (const file of graph.files) {
+    const filename=path.join(root,'relocated',file.fileName);
+    fs.mkdirSync(path.dirname(filename),{recursive:true});fs.writeFileSync(filename,file.source);
+  }
+  const original=globalThis.Worker, calls=[];
+  globalThis.Worker=class {constructor(url,options){calls.push({url,options});}};
+  t.after(()=>{if(original===undefined)delete globalThis.Worker;else globalThis.Worker=original;});
+  const filename=pathToFileURL(path.join(root,'relocated',graph.entryFile));
+  const application=await import(filename.href);
+  fs.renameSync(path.join(root,'one.mjs'),path.join(root,'source-one-unavailable'));
+  fs.renameSync(path.join(root,'two.mjs'),path.join(root,'source-two-unavailable'));
+  application.start(true);application.start(false);
+  for (const [index,name] of ['one.mjs?job=1#one','two.mjs'].entries()) {
+    const entry=graph.entries.find(entry=>entry.url===pathToFileURL(path.join(root,name.split('?')[0])).href+(index===0?'?job=1#one':''));
+    const expected=pathToFileURL(path.join(root,'relocated',entry.fileName)).href+(index===0?'?job=1#one':'');
+    assert.equal(new URL(calls[index].url,filename).href,expected);
+    assert.equal(calls[index].options.type,'module');
+  }
+});
+
+test("worker selector dispatch preserves nested constructor edits and effect order", () => {
+  const root=fixture({
+    "index.html":'<script type="module" src="./entry.mjs"></script>',
+    "side.mjs":"postMessage('side');", "one.mjs":"postMessage(1);", "two.mjs":"postMessage(2);",
+  });
+  const source=`
+    const name=(log.push('initialize'),flag?'one':'two');
+    const worker=new Worker(\`\${(new Worker('./side.mjs',{type:'module'}),'./')}\${name}.mjs\`,
+      {type:'module',name:(log.push('options'),'outer')});
+    log.push(name);`;
+  const plugin=moduleWorkerRollupPlugin({documentUrl:pathToFileURL(path.join(root,'index.html')).href});
+  const files=[];
+  const output=plugin.transform.call({emitFile(file){files.push(file);return String(files.length);}},
+    source,pathToFileURL(path.join(root,'entry.mjs')).href);
+  assert.ok(output);
+  for (const flag of [true,false]) {
+    const log=[],calls=[];
+    vm.runInNewContext(output.code,{flag,log,Worker:class {constructor(url,options){calls.push(url);log.push(options.name??'side');}}});
+    assert.equal(calls.length,2);
+    assert.deepEqual(log,['initialize','side','options','outer',flag?'one':'two']);
+    for (const url of calls) assert.ok(files.some(file=>file.fileName===url.replace(/^\.\//,'')));
+  }
+});
+
+test("one worker alias keeps source-type separation and shared-worker identity at each use", () => {
+  const root=fixture({
+    "index.html":'<script type="module" src="./entry.mjs"></script>',
+    "worker.js":"postMessage(42);",
+  });
+  const plugin=moduleWorkerRollupPlugin({documentUrl:pathToFileURL(path.join(root,'index.html')).href});
+  const files=[],host={emitFile(file){files.push(file);return String(files.length);}};
+  const source=`const entry='./worker.js';
+    new Worker(entry,{type:'module'});new Worker(entry);
+    new SharedWorker(entry,{type:'module',name:'same'});log.push(entry);`;
+  const first=plugin.transform.call(host,source,pathToFileURL(path.join(root,'modules/first.mjs')).href);
+  const second=plugin.transform.call(host,`const entry='./worker.js';
+    new SharedWorker(entry,{type:'module',name:'same'});log.push(entry);`,
+    pathToFileURL(path.join(root,'other/second.mjs')).href);
+  const calls=[],log=[];
+  const context=()=>({log,Worker:class {constructor(url,options){calls.push({url,options});}},
+    SharedWorker:class {constructor(url,options){calls.push({url,options});}}});
+  vm.runInNewContext(first.code,context());vm.runInNewContext(second.code,context());
+  assert.equal(calls.length,4);
+  assert.notEqual(calls[0].url,calls[1].url,'classic and module script goals keep separate emitted files');
+  assert.equal(calls[0].url,calls[2].url,'the same module graph does not acquire a different URL by consumer kind');
+  assert.equal(calls[2].url,calls[3].url,'SharedWorker identity does not depend on the discovering parent module');
+  assert.deepEqual(log,['./worker.js','./worker.js']);
+  assert.equal(files.length,2);
 });
