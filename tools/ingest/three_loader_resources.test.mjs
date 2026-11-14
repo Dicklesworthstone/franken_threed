@@ -12,7 +12,7 @@ import { packHtml } from "./pack_html.mjs";
 import { createThreeLoaderResourceModule, isThreeLoaderResourceModule, threeLoaderResourceEdits } from "./three_loader_resources.mjs";
 import { vertex, vertexExpected } from "../../tests/fixtures/meshopt/vectors.mjs";
 import { fbxResources, fbxPixel } from "./fixtures/fbx_resources.mjs";
-import { zipSync, strToU8 } from "../../upstream/three.js/examples/jsm/libs/fflate.module.js";
+import { gzipSync, zipSync, strToU8 } from "../../upstream/three.js/examples/jsm/libs/fflate.module.js";
 
 const core = new URL("../../upstream/three.js/build/three.core.js", import.meta.url);
 const gltf = new URL("../../upstream/three.js/examples/jsm/loaders/GLTFLoader.js", import.meta.url);
@@ -613,6 +613,141 @@ test("packed HDR/EXR environments, fonts and geometry execute retained addon par
     font: {name: 'Packed font', shapes: 1}, stl: positions, ply: positions,
     opacity: [.25, .5, 1], obj: positions});
   assert.equal(result.requests.length, 7, 'each retained load reaches the embedded host route');
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
+test('packed volume and voxel assets retain raw, gzip and ASCII samples, scenes and pending options offline', async () => {
+  const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
+  const values = [0, 1, 256, 65535, 2, 3, 1024, 4096], samples = Buffer.alloc(values.length * 2);
+  values.forEach((value, index) => samples.writeUInt16LE(value, index * 2));
+  const header = encoding => Buffer.from(`NRRD0005\ntype: ushort\ndimension: 3\nsizes: 2 2 2\nencoding: ${encoding}\nendian: little\nspace: left-posterior-superior\nspace directions: (1,0,0) (0,2,0) (0,0,3)\n# retained volume fixture\n\n`);
+  const resources = {
+    'volumes/raw #.nrrd': Buffer.concat([header('raw'), samples]),
+    'volumes/gzip.nrrd': Buffer.concat([header('gzip'), gzipSync(samples)]),
+    'volumes/ascii.nrrd': Buffer.concat([header('ascii'), Buffer.from(values.join(' ') + '\n')]),
+    'volumes/bad.nrrd': Buffer.concat([header('bzip2'), samples]),
+    'voxels/monument.vox': fs.readFileSync(new URL('../../upstream/three.js/examples/models/vox/monu10.vox', import.meta.url)),
+    'voxels/bad.vox': Buffer.from('VOX '),
+  };
+  const fingerprint = view => {
+    let hash = 2166136261;
+    for (const byte of new Uint8Array(view.buffer, view.byteOffset, view.byteLength)) hash = Math.imul(hash ^ byte, 16777619);
+    return [view.constructor.name, view.byteLength, hash >>> 0];
+  };
+  const describeVoxel = value => {
+    const nodes = [];
+    value.scene?.traverse(object => nodes.push({type: object.type, name: object.name, matrix: [...object.matrix.elements],
+      attributes: object.isMesh ? Object.fromEntries(Object.entries(object.geometry.attributes).map(([name, attribute]) => [name, fingerprint(attribute.array)])) : null}));
+    return {chunks: value.chunks.map(chunk => ({size: chunk.size, data: fingerprint(chunk.data), palette: chunk.palette})), nodes};
+  };
+  const describeVolume = volume => ({values: [...volume.data], type: volume.data.constructor.name,
+    dimensions: volume.dimensions, spacing: volume.spacing, matrix: [...volume.matrix.elements],
+    range: [volume.windowLow, volume.windowHigh], segmentation: volume.segmentation ?? null});
+  const {VOXLoader} = await import(loaderUrl('VOXLoader'));
+  const {NRRDLoader} = await import(loaderUrl('NRRDLoader'));
+  const sourceBytes = bytes => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const sourceVoxel = describeVoxel(new VOXLoader().parse(sourceBytes(resources['voxels/monument.vox'])));
+  const sourceVolume = describeVolume(new NRRDLoader().parse(sourceBytes(resources['volumes/raw #.nrrd'])));
+  const failures = [];
+  for (const [loader, bytes] of [[new NRRDLoader(), resources['volumes/bad.nrrd']], [new VOXLoader(), resources['voxels/bad.vox']]]) {
+    try { loader.parse(sourceBytes(bytes)); } catch(error) { failures.push([error.name, error.message]); }
+  }
+  assert.equal(failures.length, 2);
+  const f = fixture({'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import {NRRDLoader} from ${JSON.stringify(loaderUrl('NRRDLoader'))};
+      import {VOXLoader,buildData3DTexture} from ${JSON.stringify(loaderUrl('VOXLoader'))};
+      const fingerprint=${fingerprint.toString()}, describeVoxel=${describeVoxel.toString()}, describeVolume=${describeVolume.toString()};
+      export async function run(){
+        const order=[],loader=new NRRDLoader().setPath('volumes/');loader.setSegmentation(false);
+        const pending=loader.loadAsync('raw%20%23.nrrd?edition=2#scan').then(value=>{order.push('loaded');return value;});
+        order.push('returned');loader.segmentation=true;const raw=await pending;
+        const gzip=await new NRRDLoader().loadAsync('volumes/gzip.nrrd');
+        const ascii=await new NRRDLoader().loadAsync('volumes/ascii.nrrd');
+        loader.setSegmentation(false);const again=await loader.loadAsync('raw%20%23.nrrd?edition=2#scan');
+        const voxLoader=new VOXLoader().setPath('voxels/'),vox=await voxLoader.loadAsync('monument.vox');
+        const copy=await voxLoader.loadAsync('monument.vox'),texture=buildData3DTexture(vox.chunks[0]);
+        const volumes=[raw,gzip,ascii,again].map(describeVolume),voxel=describeVoxel(vox);
+        raw.data[0]=42;vox.chunks[0].data[0]^=1;
+        const failures=[];
+        try{await new NRRDLoader().loadAsync('volumes/bad.nrrd');}catch(error){failures.push([error.name,error.message]);}
+        try{await new VOXLoader().loadAsync('voxels/bad.vox');}catch(error){failures.push([error.name,error.message]);}
+        return {order,volumes,voxel,failures,independent:raw!==again&&raw.data!==again.data&&again.data[0]===0&&
+          vox.scene!==copy.scene&&vox.chunks[0].data!==copy.chunks[0].data&&vox.chunks[0].data[0]!==copy.chunks[0].data[0],
+          texture:{dimensions:[texture.image.width,texture.image.height,texture.image.depth],data:fingerprint(texture.image.data)}};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  const {buildData3DTexture} = await import(loaderUrl('VOXLoader'));
+  const texture = buildData3DTexture(new VOXLoader().parse(sourceBytes(resources['voxels/monument.vox'])).chunks[0]);
+  assert.deepEqual(result.result, {order: ['returned', 'loaded'],
+    volumes: [true, null, null, false].map(segmentation => ({...sourceVolume, segmentation})),
+    voxel: sourceVoxel, failures, independent: true,
+    texture: {dimensions: [texture.image.width, texture.image.height, texture.image.depth], data: fingerprint(texture.image.data)}});
+  assert.deepEqual(sourceVolume.values, values);
+  assert.ok(sourceVoxel.nodes.some(node => node.attributes?.position));
+  assert.equal(result.requests.length, 8);
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
+test('packed color-grading LUTs retain float and byte textures, domains, callbacks and parser errors offline', async () => {
+  const loaderUrl = name => new URL(`../../upstream/three.js/examples/jsm/loaders/${name}.js`, import.meta.url).href;
+  const colors = ['0 0 0', '1 0 0', '0 1 0', '1 1 0', '0 0 1', '1 0 1', '0 1 1', '1 1 1'];
+  const cube = 'TITLE "Retained grade"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0.1 0.2 0.3\nDOMAIN_MAX 0.8 0.9 1\n' + colors.join('\n') + '\n';
+  const threeDl = '0 1023\n' + colors.map(line => line.split(' ').map(Number).map(value => value * 1024).join(' ')).join('\n') + '\n';
+  const resources = {'luts/grade #.CUBE': Buffer.from(cube), 'luts/grade.3dl': Buffer.from(threeDl),
+    'luts/bad.CUBE': Buffer.from('TITLE "Missing size"\n'), 'luts/bad.3dl': Buffer.from('0 1 3\n')};
+  const describe = value => ({size: value.size, title: value.title ?? null,
+    domain: value.domainMin ? [value.domainMin.toArray(), value.domainMax.toArray()] : null,
+    type: value.texture3D.type, storage: value.texture3D.image.data.constructor.name, data: [...value.texture3D.image.data],
+    dimensions: [value.texture3D.image.width, value.texture3D.image.height, value.texture3D.image.depth],
+    sampler: [value.texture3D.minFilter,value.texture3D.magFilter,value.texture3D.wrapS,value.texture3D.wrapT,value.texture3D.wrapR],
+    mipmaps: value.texture3D.generateMipmaps, version: value.texture3D.version});
+  const {LUTCubeLoader} = await import(loaderUrl('LUTCubeLoader'));
+  const {LUT3dlLoader} = await import(loaderUrl('LUT3dlLoader'));
+  const {FloatType, UnsignedByteType} = await import(core.href);
+  const expected = [describe(new LUTCubeLoader().setType(FloatType).parse(cube)), describe(new LUTCubeLoader().setType(UnsignedByteType).parse(cube)),
+    describe(new LUT3dlLoader().setType(FloatType).parse(threeDl)), describe(new LUT3dlLoader().setType(UnsignedByteType).parse(threeDl))];
+  const failures = [];
+  for (const [loader, input] of [[new LUTCubeLoader(), resources['luts/bad.CUBE']], [new LUT3dlLoader(), resources['luts/bad.3dl']]]) {
+    try { loader.parse(input.toString()); } catch(error) { failures.push([error.name,error.message]); }
+  }
+  assert.equal(failures.length, 2);
+  const f = fixture({'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import {FloatType,UnsignedByteType} from ${JSON.stringify(core.href)};
+      import {LUTCubeLoader} from ${JSON.stringify(loaderUrl('LUTCubeLoader'))};
+      import {LUT3dlLoader} from ${JSON.stringify(loaderUrl('LUT3dlLoader'))};
+      const describe=${describe.toString()};
+      export async function run(){
+        const order=[],cube=new LUTCubeLoader().setType(UnsignedByteType).setPath('luts/');
+        const pending=cube.loadAsync('grade%20%23.CUBE?edition=2#lut').then(value=>{order.push('loaded');return value;});
+        order.push('returned');cube.type=FloatType;const floatCube=await pending;
+        cube.setType(UnsignedByteType);const byteCube=await cube.loadAsync('grade%20%23.CUBE?edition=2#lut');
+        const film=new LUT3dlLoader().setPath('luts/');film.type=UnsignedByteType;
+        const filmPending=film.loadAsync('grade.3dl');film.setType(FloatType);const floatFilm=await filmPending;
+        film.type=UnsignedByteType;const byteFilm=await film.loadAsync('grade.3dl');
+        const textures=[floatCube,byteCube,floatFilm,byteFilm].map(describe),failures=[];
+        floatCube.texture3D.image.data[0]=.75;
+        try{await new LUTCubeLoader().loadAsync('luts/bad.CUBE');}catch(error){failures.push([error.name,error.message]);}
+        await new Promise(resolve=>new LUT3dlLoader().load('luts/bad.3dl',()=>{throw new Error('Invalid LUT accepted');},undefined,error=>{failures.push([error.name,error.message]);resolve();}));
+        return {order,textures,failures,independent:floatCube.texture3D!==byteCube.texture3D&&byteCube.texture3D.image.data[0]===0&&
+          floatFilm.texture3D!==byteFilm.texture3D&&floatFilm.texture3D.image.data!==byteFilm.texture3D.image.data};
+      }`, ...resources});
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const [name, bytes] of Object.entries(resources)) assert.deepEqual(fs.readFileSync(path.join(f.out, name)), bytes);
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.result, {order: ['returned', 'loaded'], textures: expected, failures, independent: true});
+  assert.equal(result.requests.length, 6);
   assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
 });
 

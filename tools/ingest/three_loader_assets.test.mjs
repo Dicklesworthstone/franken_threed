@@ -166,6 +166,36 @@ test("pinned single-file addons retain finite paths, decoder settings and import
     'exr/sky.exr', 'font.json', 'geometry/mesh.stl', 'mesh.ply', 'mesh.obj', 'namespace.hdr', 'namespace-font.json']);
 });
 
+test("volume, voxel and color-grading loaders retain finite files and live source options", () => {
+  const requests = discover(`import { FloatType, UnsignedByteType } from 'three';
+    import { NRRDLoader as Volume, VOXLoader, LUTCubeLoader, LUT3dlLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as Voxels from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/VOXLoader.js')};
+    const volume=new Volume().setPath('volumes/'); volume.setSegmentation(false);
+    volume.loadAsync('raw%20%23.nrrd?version=2#scan'); volume.segmentation=true;
+    new Volume().load('second.nrrd');
+    new VOXLoader().setPath('models/').loadAsync(choice?'one.vox':'two.vox');
+    new Voxels.VOXLoader().load('namespace.vox');
+    const cube=new LUTCubeLoader().setType(FloatType).setPath('luts/');
+    cube.loadAsync('grade.CUBE'); cube.type=UnsignedByteType;
+    const film=new LUT3dlLoader(); film.type=FloatType; film.setPath('luts/');
+    film.load('grade.3dl'); film.setType(UnsignedByteType); film.parse(runtimeText);`);
+  assert.deepEqual(requests.map(({url}) => url), ['volumes/raw%20%23.nrrd?version=2#scan',
+    'second.nrrd', 'models/one.vox', 'models/two.vox', 'namespace.vox', 'luts/grade.CUBE', 'luts/grade.3dl']);
+});
+
+test("volume and LUT discovery preserves custom managers, escaped loaders and opaque configuration", () => {
+  const requests = discover(`import { NRRDLoader, VOXLoader, LUTCubeLoader, LUT3dlLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import { NRRDLoader as Foreign } from 'file:///foreign/NRRDLoader.js';
+    new Foreign().load('foreign.nrrd'); new VOXLoader(manager).load('managed.vox');
+    function shadow(NRRDLoader){new NRRDLoader().load('shadow.nrrd');}
+    const escaped=new LUTCubeLoader(); customize(escaped); escaped.load('escaped.CUBE');
+    const changed=new NRRDLoader(); changed.segmentation=opaque; changed.load('opaque.nrrd');
+    const method=new NRRDLoader(); method.segmentation=()=>true; method.load('method.nrrd');
+    const lut=new LUT3dlLoader(); lut.type=runtimeType; lut.load('opaque.3dl');
+    new LUTCubeLoader().setPath(runtimePath).load('dynamic.CUBE');`);
+  assert.deepEqual(requests, []);
+});
+
 test("H8's original UltraHDR environment request enters the application resource closure", () => {
   const html = fs.readFileSync(new URL("examples/webgpu_compute_particles_fluid.html", rootUrl), "utf8");
   const source = /<script type="module">([\s\S]*?)<\/script>/.exec(html)[1];

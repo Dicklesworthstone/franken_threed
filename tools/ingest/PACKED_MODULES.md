@@ -558,7 +558,8 @@ image host checks resource bytes and ownership, not browser image-decoder parity
 Finite document-relative loads through the pinned `HDRLoader`, `RGBELoader`,
 `EXRLoader`, `FontLoader`, `STLLoader`, `PLYLoader`, `OBJLoader`, `PCDLoader`,
 `VTKLoader`, `XYZLoader`, `BVHLoader`, `GCodeLoader`, `PDBLoader`, `DDSLoader`,
-`KTXLoader` and `TGALoader` include their source files in application output and
+`KTXLoader`, `TGALoader`, `NRRDLoader`, `VOXLoader`, `LUTCubeLoader` and
+`LUT3dlLoader` include their source files in application output and
 the prepared standalone resource map. DDS and KTX also accept finite six-file
 cube arrays under the same mutation/escape guards as `CubeTextureLoader`.
 Named and namespace imports from their source modules or the addon aggregate
@@ -581,6 +582,17 @@ source options, including writes during pending loads. Parser errors, deprecated
 loader warnings, callback and synchronous texture-return behavior stay upstream.
 These tests run the original parsers with source/build files unavailable and
 external requests rejected; they do not establish GPU format support.
+
+Volume, voxel and color-grading resources use the same retained-parser path.
+NRRD raw, gzip and ASCII samples preserve dimensions, spacing, transforms and
+live segmentation options. VOX files preserve chunks, palettes, scene geometry
+and the source `buildData3DTexture()` result. `.CUBE` and `.3dl` LUTs preserve
+float/byte texture data, domains and sampler settings. NRRD `segmentation` and
+LUT `type` changes during pending loads retain their parse-time source behavior.
+Offline execution compares these results with the pinned parsers, verifies
+independent loads and native parser errors, and rejects every external request.
+This closes finite file selections; mutable runtime LUT registries and live
+resource URLs still require the ordinary deployment path.
 
 ## Self-contained USDZ scene archives
 

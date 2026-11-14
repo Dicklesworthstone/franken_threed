@@ -44,6 +44,10 @@ const SINGLE_FILE_ADDONS = new Map([
   ["DDSLoader", new Set()],
   ["KTXLoader", new Set()],
   ["TGALoader", new Set()],
+  ["NRRDLoader", new Set(["setSegmentation"])],
+  ["VOXLoader", new Set()],
+  ["LUTCubeLoader", new Set(["setType"])],
+  ["LUT3dlLoader", new Set(["setType"])],
   // The archive owns its model parts and images. The retained parser creates
   // their Blob URLs; no ZIP contents are extracted or rewritten by packaging.
   ["ThreeMFLoader", new Set()],
@@ -56,9 +60,11 @@ const BOOLEAN_OPTIONS = new Map([
   ["BVHLoader", new Set(["animateBonePositions", "animateBoneRotations"])],
   ["GCodeLoader", new Set(["splitLayer"])],
   ["LDrawLoader", new Set(["smoothNormals"])],
+  ["NRRDLoader", new Set(["segmentation"])],
 ]);
 const CUBE_URL_LOADERS = new Set(["CubeTextureLoader", "HDRCubeTextureLoader", "DDSLoader", "KTXLoader"]);
-const LIGHTING_DATA_TYPES = new Set(["FloatType", "HalfFloatType", "UnsignedByteType"]);
+const TEXTURE_DATA_TYPES = new Set(["FloatType", "HalfFloatType", "UnsignedByteType"]);
+const DATA_TYPE_LOADERS = new Set(["IESLoader", "LUTCubeLoader", "LUT3dlLoader"]);
 const ADDON_FILES = new Map([["ThreeMFLoader", "3MFLoader.js"], ["Rhino3dmLoader", "3DMLoader.js"]]);
 const RHINO_LIBRARIES = ["rhino3dm.js", "rhino3dm.wasm"];
 const ADDON_SETTINGS = new Map([
@@ -177,7 +183,7 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       if (specifier.type === "ImportNamespaceSpecifier" && addons.length) value = { addonNamespace: new Set(addons) };
       if (specifier.type === "ImportSpecifier") {
         const imported = specifier.imported.name ?? specifier.imported.value;
-        if ((core || resolved === root + "src/constants.js") && LIGHTING_DATA_TYPES.has(imported)) value = { lightingDataType: true };
+        if ((core || resolved === root + "src/constants.js") && TEXTURE_DATA_TYPES.has(imported)) value = { textureDataType: true };
         if (core && imported === "DefaultLoadingManager") value = { manager: true };
         if ((core || managerModule) && imported === "LoadingManager") value = { loader: imported };
         if ((core && CORE_LOADERS.has(imported)) ||
@@ -303,18 +309,18 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     }
     return null;
   };
-  // IESLoader exposes a data field, not a setDataType() method. Preserve its
-  // live parse-time value without admitting callable fields or opaque aliases.
-  const lightingDataType = (node, active = new Set()) => {
+  // IES and LUT loaders expose their parse-time texture type as a data field.
+  // Preserve live assignments without admitting callable fields or opaque aliases.
+  const textureDataType = (node, active = new Set()) => {
     if (node?.type === "Literal") return typeof node.value === "number" && Number.isFinite(node.value);
     if (node?.type === "Identifier") {
       const binding = lookup(node.name, node);
-      if (binding?.kind === "import") return binding.value?.lightingDataType === true;
-      return binding?.kind === "const" && !active.has(binding) && lightingDataType(binding.init, new Set(active).add(binding));
+      if (binding?.kind === "import") return binding.value?.textureDataType === true;
+      return binding?.kind === "const" && !active.has(binding) && textureDataType(binding.init, new Set(active).add(binding));
     }
     if (node?.type === "MemberExpression" && node.object.type === "Identifier")
-      return lookup(node.object.name, node.object)?.value?.namespace === true && LIGHTING_DATA_TYPES.has(memberName(node));
-    return node?.type === "ConditionalExpression" && lightingDataType(node.consequent, active) && lightingDataType(node.alternate, active);
+      return lookup(node.object.name, node.object)?.value?.namespace === true && TEXTURE_DATA_TYPES.has(memberName(node));
+    return node?.type === "ConditionalExpression" && textureDataType(node.consequent, active) && textureDataType(node.alternate, active);
   };
   const statementList = (node) => containing(ancestorsByNode.get(node) ?? [], (parent) => parent.type === "BlockStatement" || parent.type === "Program");
   const receiverSetter = (use, call) => {
@@ -513,10 +519,10 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
       const member = ref.parent, call = ref.ancestors.at(-3), method = memberName(member);
       // Only source-owned data configuration and simple value reads are admitted. An app
       // may replace the field with a method whose `this` can mutate loader paths.
-      const iesType = value.loader === "IESLoader" && method === "type";
-      if (member?.object === ref.node && (iesType || BOOLEAN_OPTIONS.get(value.loader)?.has(method))) {
+      const textureType = DATA_TYPE_LOADERS.has(value.loader) && method === "type";
+      if (member?.object === ref.node && (textureType || BOOLEAN_OPTIONS.get(value.loader)?.has(method))) {
         const dataAssignment = call?.type === "AssignmentExpression" && call.left === member && call.operator === "=" &&
-          (iesType ? lightingDataType(call.right) : call.right.type === "Literal" && typeof call.right.value === "boolean");
+          (textureType ? textureDataType(call.right) : call.right.type === "Literal" && typeof call.right.value === "boolean");
         const read = call?.type === "VariableDeclarator" && call.init === member ||
           ["IfStatement", "ConditionalExpression"].includes(call?.type) && call.test === member ||
           call?.type === "UnaryExpression" && call.operator === "!" && call.argument === member ||
