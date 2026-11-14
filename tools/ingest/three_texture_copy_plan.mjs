@@ -10,6 +10,18 @@ export class ThreeStorageCopyError extends Error {
 }
 const fail = (code, message) => { throw new ThreeStorageCopyError(code, message); };
 const natural = n => Number.isSafeInteger(n) && n >= 0;
+// WebGPU permits copies between the linear and sRGB encodings of the same
+// eight-bit RGBA/BGRA texels. This is a bitwise copy, not color conversion;
+// unrelated formats (including equal-byte-width channel swaps) remain invalid.
+function copyCompatibleFormat(source, destination) {
+  if (source === destination) return true;
+  for (const linear of ['rgba8unorm', 'bgra8unorm']) {
+    const srgb = `${linear}-srgb`;
+    if ((source === linear && destination === srgb) ||
+        (source === srgb && destination === linear)) return true;
+  }
+  return false;
+}
 function extent(shape, level) {
   if (!shape || !['2d', '2d-array', '3d'].includes(shape.viewDimension) ||
       ![shape.width, shape.height, shape.depth, shape.mipLevelCount].every(n => natural(n) && n > 0))
@@ -28,7 +40,8 @@ function extent(shape, level) {
 export function inspectStorageTextureCopy(source, destination, region = null, position = null,
   sourceLevel = 0, destinationLevel = 0, sameTexture = false) {
   const from = extent(source, sourceLevel), to = extent(destination, destinationLevel);
-  if (source.format !== destination.format) fail('FORMAT', 'Texture copies require the same native format');
+  if (!copyCompatibleFormat(source.format, destination.format))
+    fail('FORMAT', 'Texture copies require copy-compatible native formats');
   let origin = [0, 0, 0], size = from.slice(), target = [0, 0, 0];
   if (region !== null) {
     if (!region || (!!region.isBox2 === !!region.isBox3) || !region.min || !region.max)
