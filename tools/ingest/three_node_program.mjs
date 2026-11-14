@@ -1555,6 +1555,13 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // its own attributes, including interleaved version/range history.
     const instancedGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
       object.geometry.isInstancedBufferGeometry === true;
+    // Named storage vertices use the compute owner's live allocation, while
+    // ordinary attributes keep their existing upload history. Select them per
+    // render object even when a CPU geometry constructed the shared shader.
+    const storageGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
+      !object.geometry.isInstancedBufferGeometry;
+    const namedGeometry = geometrySetup || storageGeometryExtension &&
+      Object.values(object.geometry.attributes).some(attribute => attribute.isStorageBufferAttribute);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
@@ -1583,17 +1590,19 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
             [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) ||
           !instancedGeometryExtension && (attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute) ||
           attribute.isStorageInstancedBufferAttribute ||
-          attribute.isStorageBufferAttribute && !geometrySetup) ||
+          attribute.isStorageBufferAttribute && !geometrySetup && !storageGeometryExtension) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
+    if (storageGeometryExtension) for (const attribute of Object.values(object.geometry.attributes))
+      if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
     const {attachment, chain} = builderScope(context);
     // Admission runs during projection, before the source light list is ready.
     // Only actual program construction may initialize NodeManager's call key.
-    if (validationOnly) return {chain, geometrySetup};
+    if (validationOnly) return {chain, geometrySetup, namedGeometry};
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
@@ -1624,7 +1633,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const dynamic = hash(object.receiveShadow ? hash(callKey.key, 1) : callKey.key,
       renderer.contextNode.id, renderer.contextNode.version);
-    return {contextId, dynamic, chain, lightsNode, geometrySetup};
+    return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -1815,6 +1824,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // the very same builder nodes, including their captured PMREM texture.
     if (construction && previous?.sharedBuilder && previous.geometry === object.geometry &&
         !previousState.namedGeometryDisposed && namedAttributesMatch(previousState) &&
+        (!construction.namedGeometry || previousState.namedAttributes !== null) &&
         (sourceKey || previousState.sharedDynamic === construction.dynamic) &&
         (previousState.materialVersion === material.version || previous.sharedBuilder.key === construction.key)) {
       previousState.materialVersion = material.version;
@@ -2079,7 +2089,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       return Object.freeze({index, name: group.name, byteLength, uniforms: Object.freeze(uniforms), entries: Object.freeze(entries)});
     });
     if (uniformBytes > maxUniformBytes) fail('LIMIT', 'Native node draw exceeds its uniform byte budget');
-    const {attributes, generated, named} = geometryMetadata(builder, object.geometry, object, sharedBuilder?.geometrySetup === true);
+    const {attributes, generated, named} = geometryMetadata(builder, object.geometry, object, construction?.namedGeometry === true);
     const vertex = builder.vertexShader, fragment = builder.fragmentShader;
     const shared = shaderPairs.get(vertex)?.get(fragment);
     const shaders = shared ?? {vertex, fragment, bytes: 2 * (vertex.length + fragment.length), references: 0};
@@ -2176,9 +2186,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
       storageNodes, storageSignature: storageKey, uniformNodes, skinUniforms, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0,
-      attributeOwner: descriptor, namedAttributes: sharedBuilder?.geometrySetup ? named : null,
+      attributeOwner: descriptor, namedAttributes: construction?.namedGeometry ? named : null,
       sourceGeometry: previousState?.sourceGeometry ?? object.geometry,
-      namedSelectionPending: sharedBuilder?.geometrySetup === true, namedGeometryDisposed: false,
+      namedSelectionPending: construction?.namedGeometry === true, namedGeometryDisposed: false,
       sharedAttributes: sharedAttributeOwners(generated)});
     // Source geometry constructors may add named storage attributes. Adopt
     // their accepted layout now, including the canonical vec3 padding above,
@@ -2190,7 +2200,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       storageNodes, storageSignature: storageKey, uniformNodes, skinUniforms, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
-    if (sharedBuilder?.geometrySetup) {
+    if (construction?.namedGeometry) {
       const state = nodeStates.get(descriptor);
       entry.sourceGeometry = state.sourceGeometry;
       entry.onGeometryDispose = () => { state.namedSelectionPending = true; state.namedGeometryDisposed = true; };

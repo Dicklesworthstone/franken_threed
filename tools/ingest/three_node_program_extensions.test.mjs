@@ -762,6 +762,183 @@ test('InstancedMesh extension generated streams retain source upload history acr
   assert.deepEqual(geometry.attributes[color.name].array, colorHistory);
 });
 
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} named storage geometry shares source construction and reselects replaced attributes`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupPosition(builder) {
+      return super.setupPosition(builder).addAssign(N.attribute('applicationOffset', 'vec3'));
+    }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.material === builder.context.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'StorageGeometryExtension'; this.applicationGain = .375; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'StorageGeometryExtension');
+  const material = new (registered ? Application : Extension)();
+  const a = f.add(material), b = f.add(material);
+  for (const item of [a, b]) {
+    const geometry = item.object.geometry;
+    geometry.setAttribute('applicationOffset', new T.BufferAttribute(new Float32Array(geometry.attributes.position.count * 3), 3));
+  }
+  const store = (item, name) => {
+    const previous = item.object.geometry.attributes[name];
+    const attribute = new T.StorageBufferAttribute(previous.array.slice(), previous.itemSize);
+    item.object.geometry.setAttribute(name, attribute);
+    return attribute;
+  };
+  const compare = item => {
+    const reference = f.reference(item), sourceAttributes = f.referenceObject(item).getAttributes(), expected = trace.splice(0);
+    const descriptor = f.compile(item); assert.deepEqual(trace.splice(0), expected);
+    equalShaders(descriptor, reference);
+    const captured = [], sourcePacket = f.referenceDraw(item), packet = f.capture(item, descriptor, {
+      captureVertexAttribute(attribute) { captured.push(attribute); return {install() {}}; },
+      captureGeometry() {}
+    });
+    assert.deepEqual(packet.uniforms, sourcePacket.uniforms);
+    assert.deepEqual(captured, sourceAttributes.filter(attribute => attribute.isStorageBufferAttribute));
+    assert.deepEqual(f.programs.vertexStorage(descriptor), captured);
+    for (const attribute of descriptor.attributes) {
+      const selected = f.programs.geometry(descriptor).attributes[attribute.name];
+      assert.equal(selected.id, item.object.geometry.attributes[attribute.name].id);
+      assert.ok(sourceAttributes.includes(item.object.geometry.attributes[attribute.name]));
+    }
+    return {reference, descriptor, packet, captured};
+  };
+  // A CPU-backed owner may construct the shared shader before a matching
+  // storage-backed owner arrives. Storage identity is per render object.
+  const firstA = compare(a), initialPosition = store(b, 'position'), initialOffset = store(b, 'applicationOffset');
+  const firstB = compare(b);
+  assert.equal(firstB.reference, firstA.reference);
+  assert.deepEqual(firstB.captured, [initialPosition, initialOffset]);
+  assert.notEqual(firstB.descriptor, firstA.descriptor);
+  const previousGeometry = f.programs.geometry(firstB.descriptor);
+  const replacement = store(b, 'position'); replacement.array[0] = 9;
+  f.renderer.info.calls++;
+  const replacedB = compare(b);
+  assert.equal(replacedB.reference, firstB.reference, 'named replacements keep source shader construction');
+  assert.notEqual(replacedB.descriptor, firstB.descriptor);
+  assert.deepEqual(replacedB.captured, [replacement, initialOffset]);
+  assert.equal(previousGeometry.attributes.position.id, initialPosition.id, 'accepted geometry retains its original selection');
+  const convertedA = store(a, 'position'); f.renderer.info.calls++;
+  const storageA = compare(a);
+  assert.equal(storageA.reference, firstA.reference);
+  assert.notEqual(storageA.descriptor, firstA.descriptor, 'CPU-to-storage replacement refreshes a warm descriptor');
+  assert.deepEqual(storageA.captured, [convertedA]);
+  assert.equal(compare(b).descriptor, replacedB.descriptor, 'other objects retain their independent selection');
+  a.object.geometry.setAttribute('position', new T.BufferAttribute(convertedA.array.slice(), 3));
+  f.renderer.info.calls++;
+  const cpuA = compare(a); assert.equal(cpuA.reference, firstA.reference); assert.deepEqual(cpuA.captured, []);
+  // A new owner built after compute padding uses the source's vec4 inputs,
+  // including named attributes whose expressions explicitly request vec3.
+  const padded = f.add(material), count = padded.object.geometry.attributes.position.count;
+  padded.object.geometry.setAttribute('position', new T.StorageBufferAttribute(count, 4));
+  padded.object.geometry.setAttribute('applicationOffset', new T.StorageBufferAttribute(count, 4));
+  const paddedProgram = compare(padded).descriptor;
+  assert.equal(paddedProgram.attributes.find(attribute => attribute.name === 'position').components, 4);
+  assert.equal(paddedProgram.attributes.find(attribute => attribute.name === 'applicationOffset').components, 4);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(b).reference, firstB.reference);
+  const originalGeometry = b.object.geometry;
+  b.object.geometry = originalGeometry.clone(); f.renderer.info.calls++;
+  const replacedGeometry = compare(b); assert.equal(replacedGeometry.reference, firstB.reference);
+  assert.notEqual(replacedGeometry.descriptor, replacedB.descriptor);
+  const sourceObject = f.referenceObject(b);
+  originalGeometry.dispose(); f.renderer.info.calls++;
+  assert.equal(sourceObject.attributes, null, 'source disposal still belongs to the constructor geometry');
+  const disposedOriginal = compare(b);
+  assert.notEqual(disposedOriginal.descriptor, replacedGeometry.descriptor);
+  b.object.geometry.dispose(); f.renderer.info.calls++;
+  assert.notEqual(sourceObject.attributes, null, 'setGeometry does not transfer the source disposal listener');
+  const disposedB = compare(b); assert.equal(disposedB.reference, firstB.reference);
+  assert.equal(disposedB.descriptor, disposedOriginal.descriptor);
+  assert.deepEqual(firstB.captured, [initialPosition, initialOffset]);
+});
+
+test('named storage geometry preserves source before-update selection and constructor-geometry disposal after replacement', t => {
+  const T = SourceThree, N = T.TSL;
+  const cases = [false, true].map(candidate => {
+    const f = fixture(t, {}, T), state = {candidate, f, before() {}, setups: 0};
+    class Extension extends T.MeshBasicNodeMaterial {
+      constructor() {
+        super(); this.applicationPulse = N.uniform(1);
+        this.applicationPulse.updateBeforeType = 'object'; this.applicationPulse.updateBefore = () => state.before();
+      }
+      setupPosition(builder) { return super.setupPosition(builder).assign(N.attribute('selectedPosition', 'vec3')); }
+      setupOutput(builder, output) { state.setups++; return super.setupOutput(builder, output.mul(this.applicationPulse)); }
+    }
+    const item = f.add(new Extension()), geometry = item.object.geometry, replacement = geometry.clone();
+    const named = Array.from({length: 7}, () => new T.StorageBufferAttribute(geometry.attributes.position.count, 3));
+    geometry.setAttribute('selectedPosition', named[0]); replacement.setAttribute('selectedPosition', named[3]);
+    return Object.assign(state, {item, geometry, replacement, named});
+  });
+  const source = cases[0], candidate = cases[1], expected = [], actual = [], builders = [];
+  const changes = [1, 2, null, 4, 5, 6, null];
+  let sourceObject;
+  for (const [index, next] of changes.entries()) {
+    for (const state of cases) {
+      if (index === 3) state.item.object.geometry = state.replacement;
+      if (index === 4) state.geometry.dispose();
+      if (index === 5) state.replacement.dispose();
+      state.before = () => {
+        if (next !== null) state.item.object.geometry.setAttribute('selectedPosition', state.named[next]);
+      };
+      state.f.renderer.info.calls++;
+    }
+    if (index === 4) assert.equal(sourceObject.attributes, null);
+    if (index === 5) assert.notEqual(sourceObject.attributes, null);
+    sourceObject = source.f.referenceObject(source.item);
+    const builder = sourceObject.getNodeBuilderState(); builders.push(builder);
+    source.f.referenceDraw(source.item, {fullLifecycle: true});
+    expected.push(source.named.findIndex(attribute => sourceObject.getAttributes().includes(attribute)));
+    const descriptor = candidate.f.compile(candidate.item); equalShaders(descriptor, builder);
+    const captured = [];
+    candidate.f.capture(candidate.item, descriptor, {
+      captureVertexAttribute(attribute) { captured.push(attribute); return {install() {}}; }, captureGeometry() {}
+    });
+    actual.push(candidate.named.findIndex(attribute => captured.includes(attribute)));
+  }
+  assert.deepEqual(expected, [1, 1, 2, 4, 5, 5, 6]);
+  assert.deepEqual(actual, expected);
+  assert.ok(builders.every(builder => builder === builders[0]));
+  assert.deepEqual(cases.map(state => state.setups), [1, 1]);
+});
+
+test('named storage geometry rejects malformed and excluded attributes before custom shader effects', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = f.add(new Extension()), geometry = item.object.geometry, original = geometry.attributes.position;
+  for (const change of [attribute => { attribute.normalized = true; }, attribute => { attribute.count = .5; },
+    attribute => { attribute.version = -1; }, attribute => { attribute.itemSize = 5; }]) {
+    const attribute = new T.StorageBufferAttribute(original.array.slice(), 3); change(attribute);
+    geometry.setAttribute('position', attribute);
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'});
+    assert.equal(effects, 0);
+  }
+  for (const attribute of [new T.StorageBufferAttribute(new Uint32Array(original.array.length), 3),
+    new T.StorageInstancedBufferAttribute(original.array.slice(), 3)]) {
+    geometry.setAttribute('position', attribute);
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+    assert.equal(effects, 0);
+  }
+  geometry.setAttribute('position', new T.StorageBufferAttribute(original.array.slice(), 3));
+  item.object.geometry = new T.InstancedBufferGeometry().copy(geometry);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  item.object.geometry = geometry;
+  class CustomMesh extends T.Mesh {}
+  Object.setPrototypeOf(item.object, CustomMesh.prototype);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+});
+
 for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const stored of ['matrix', 'color', 'both'])
 test(`${registered ? 'registered' : 'inherited'} ${family} storage InstancedMesh extensions retain source ${stored} bindings and construction`, t => {
   const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];

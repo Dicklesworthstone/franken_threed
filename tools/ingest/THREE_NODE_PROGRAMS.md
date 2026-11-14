@@ -36,7 +36,7 @@ select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
 morph targets), CPU- or storage-backed `InstancedMesh`, and ordinary meshes with
-CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
+named storage vertex inputs or CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
 single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
@@ -74,6 +74,28 @@ a matrix/color attribute under an unchanged custom source key retains the existi
 explicit rejection; changing the actual program key or disposing its source owner
 allows reconstruction against the replacement. Version-only material invalidation
 does not silently redirect captured bindings.
+
+Custom materials on ordinary `Mesh` objects also accept named Float32
+`StorageBufferAttribute` vertices, including positions and application attributes
+selected with `TSL.attribute()`. Compute and graphics retain the same allocation,
+including source vec3 padding, marked upload ranges and resident GPU bytes when
+the CPU array is stale. Equivalent materials and geometry layouts share source
+shader construction even when an ordinary CPU geometry constructs it first.
+Each render object selects its own named inputs. Replacing a named storage
+attribute, or moving between CPU and storage inputs, refreshes that selection
+without replaying source shader setup; accepted queued draws retain their prior
+buffers. Selection follows the source before-update boundary, including its
+constructor-geometry disposal listener after an entire geometry is replaced.
+This profile retains
+rigid, unnormalized Float32 vertices; instanced storage geometry, interleaved
+storage, integer storage vertices and custom mesh subclasses remain outside it.
+Six inherited/registered Basic, Standard and Physical source comparisons check
+exact shaders, uniform bytes, shared construction and replacement/disposal
+behavior. A source lifecycle comparison checks cold/warm callback selection and
+disposal after geometry replacement. Focused rejection tests check malformed inputs before custom effects.
+Two public-renderer recording-device cases verify independent allocations,
+compute/draw order, delayed replacements, partial uploads and queued uniform
+bytes. These checks do not execute GPU arithmetic or establish pixel parity.
 
 Custom materials on `InstancedBufferGeometry` share source construction by
 material and geometry layout while each mesh selects its own named attribute

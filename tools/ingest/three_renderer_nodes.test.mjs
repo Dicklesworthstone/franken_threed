@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
@@ -1497,6 +1498,102 @@ test('native InstancedMesh borrows compute matrices and colors while retaining q
   assert.match(draws[0].pipeline.vertex.module.code,/@builtin\(\s*instance_index\s*\)/);
   assert.match(draws[0].pipeline.vertex.module.code,/array<\s*mat4x4<f32>/);
   assert.equal(f.renderer.info.render.drawCalls,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+for(const registered of [false,true])
+test(`custom named storage vertices retain compute allocations and queued replacements (registered=${registered})`,async t=>{
+  const f=fixture(t);recordCompute(f.device);f.renderer.outputColorSpace=T.LinearSRGBColorSpace;
+  let setups=0;
+  class Extension extends T.MeshBasicNodeMaterial{
+    constructor(){super();this.applicationGain=.3125;}
+    setupOutput(builder,output){
+      setups++;return super.setupOutput(builder,T.TSL.vec4(output.rgb
+        .mul(T.TSL.materialReference('applicationGain','float')),output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial{
+    constructor(){super();this.type='StorageVertexApplication';this.applicationGain=.3125;}
+  }
+  if(registered)f.renderer.library.addMaterial(Extension,'StorageVertexApplication');
+  const material=new(registered?Application:Extension)(),other=new T.Mesh(f.mesh.geometry.clone(),material);
+  f.mesh.material=material;f.mesh.frustumCulled=other.frustumCulled=false;
+  f.mesh.renderOrder=-1;other.renderOrder=1;f.scene.add(other);
+  t.after(()=>{other.geometry.dispose();material.dispose();});
+  const original=f.mesh.geometry.attributes.position;
+  const attributes=Array.from({length:3},()=>new T.StorageBufferAttribute(original.array.slice(),3));
+  const [a,b,replacement]=attributes;
+  const sourceDevice=geometryDevice(),sourceAttribute=new T.StorageBufferAttribute(original.array.slice(),3),sourceRecords=new WeakMap();
+  const sourceUploader=new SourceWebGPUAttributeUtils({device:sourceDevice,get(attribute){
+    let record=sourceRecords.get(attribute);if(!record)sourceRecords.set(attribute,record={});return record;
+  }});
+  sourceUploader.createAttribute(sourceAttribute,128|32|8|4);
+  const sourceBuffer=sourceRecords.get(sourceAttribute).buffer;
+  t.after(()=>sourceBuffer.destroy());
+  f.mesh.geometry.setAttribute('position',a);other.geometry.setAttribute('position',b);
+  const nodes=attributes.map(attribute=>T.TSL.storage(attribute,'vec3',attribute.count));
+  const kernel=T.TSL.Fn(()=>{
+    for(const node of nodes)node.element(T.TSL.instanceIndex).addAssign(T.TSL.vec3(0));
+  })().compute(original.count);
+  await f.renderer.compileComputeAsync(kernel);
+  assert.ok(attributes.every(attribute=>attribute.itemSize===4),'compute prepares the source vec3 padding');
+  const buffers=attributes.map(attribute=>captureComputeStorage(f.device,attribute).resolve().buffer);
+  assert.equal(new Set(buffers).size,3,'separate geometry inputs own separate live storage');
+  // The recorder does not execute WGSL. Model earlier GPU results while the
+  // public CPU arrays stay stale, then inspect bytes at command submission.
+  for(const [index,buffer]of buffers.entries())new Float32Array(buffer.data)[0]=[.625,1.125,2.125][index];
+  new Float32Array(sourceBuffer.data)[0]=2.125;
+  const initialWrites=buffers.map(buffer=>f.device.writes.filter(write=>write.buffer===buffer).length);
+  const order=[],submit=f.device.queue.submit.bind(f.device.queue);
+  f.device.queue.submit=commands=>{
+    for(const passes of commands)for(const pass of passes){
+      if(pass.dispatches?.length)order.push('compute');
+      for(const draw of pass.draws)if(draw.streams.size)order.push('draw');
+    }
+    submit(commands);
+  };
+  const first=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  a.array[0]=b.array[0]=99;f.mesh.geometry.setAttribute('position',replacement);
+  f.renderer.render(f.scene,f.camera);
+  for(const attribute of [replacement,sourceAttribute]){
+    attribute.array[0]=3.125;attribute.array[1]=attribute.array[4]=99;
+    attribute.addUpdateRange(0,1);attribute.needsUpdate=true;
+  }
+  // r186 expands a packed vec3 range to the whole padded vertex. Compare the
+  // actual source uploader, including untouched vertices outside that range.
+  sourceUploader.updateAttribute(sourceAttribute);
+  assert.deepEqual(sourceDevice.writes.map(write=>[write.offset,write.input.byteLength]),[[0,16]]);
+  const second=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  assert.equal(setups,1,'equivalent geometry owners and named replacements share source construction');
+  for(const attribute of attributes)attribute.array.fill(99);
+  material.applicationGain=99;
+  await Promise.all([first,second,drain(f.renderer)]);await f.renderer.waitForGPU();
+  const draws=nativeDraws(f.device),selected=[buffers[0],buffers[1],buffers[2],buffers[1],buffers[2],buffers[1]];
+  assert.equal(draws.length,6);
+  assert.deepEqual(order,['compute','draw','draw','draw','draw','compute','draw','draw']);
+  for(const [index,draw]of draws.entries()){
+    assert.equal(draw.streams.get(0),selected[index],'each accepted draw retains its selected compute allocation');
+    assert.equal(draw.pipeline.vertex.buffers[0].arrayStride,16);
+    assert.equal(draw.pipeline.vertex.buffers[0].attributes[0].format,'float32x4');
+    assert.equal(draw.pipeline,draws[0].pipeline);
+    assert.ok(uniformBlocks(draw).flat().includes(.3125),'queued material uniforms keep their accepted value');
+  }
+  const words=(draw,buffer)=>new Float32Array(draw.contents.get(buffer).buffer);
+  assert.deepEqual(draws.map((draw,index)=>words(draw,selected[index])[0]),[.625,1.125,2.125,1.125,3.125,1.125]);
+  assert.deepEqual(draws[4].contents.get(buffers[2]),new Uint8Array(sourceBuffer.data));
+  assert.equal(words(draws[4],buffers[2])[1],99,'the source padded range uploads the complete first vertex');
+  assert.equal(words(draws[4],buffers[2])[4],original.array[3],'vertices outside the source range retain resident GPU bytes');
+  assert.deepEqual(f.device.writes.filter(write=>write.buffer===buffers[2]).slice(initialWrites[2])
+    .map(write=>[write.offset,write.input.byteLength]),sourceDevice.writes.map(write=>[write.offset,write.input.byteLength]));
+  assert.equal(f.device.computePasses.length,2);
+  for(const [index,buffer]of buffers.entries()){
+    assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,initialWrites[index]+(index===2?1:0),
+      'only the marked host range uploads; graphics never overwrites resident storage');
+    assert.ok(f.device.computePasses.every(pass=>[...pass.groups.values()].some(group=>
+      group.entries.some(entry=>entry.resource?.buffer===buffer))));
+  }
+  assert.equal(f.device.buffers.filter(buffer=>buffer.label==='f3d-compute-buffer'&&(buffer.usage&128)).length,3);
+  assert.ok(f.device.buffers.every(buffer=>(buffer.usage&1)===0),'vertices borrow storage without readback');
+  assert.equal(setups,1);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
 for(const registered of [false,true])
