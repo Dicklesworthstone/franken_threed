@@ -9,6 +9,7 @@ import { registerHooks } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker as Thread, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { packHtml } from "./pack_html.mjs";
+import { buildApplication } from "./build_application.mjs";
 
 const dataURL = (source) => "data:text/javascript;base64," + Buffer.from(source).toString("base64");
 const decode = (url) => Buffer.from(url.slice(url.indexOf(",") + 1).split("#")[0], "base64").toString();
@@ -136,9 +137,9 @@ if (!isMainThread) {
       pack() { return packHtml(path.join(source, "index.html"), output, options); },
       original: { driver: true, kind: "document", entryUrl: pathToFileURL(path.join(source, "index.html")).href,
         url: pathToFileURL(path.join(source, "app.mjs")).href },
-      emitted() {
-        const html = fs.readFileSync(output, "utf8");
-        return { driver: true, kind: "document", entryUrl: pathToFileURL(output).href,
+      emitted(file = output) {
+        const html = fs.readFileSync(file, "utf8");
+        return { driver: true, kind: "document", entryUrl: pathToFileURL(file).href,
           url: /<script type="module" src="([^"]+)"/.exec(html)[1],
           imports: JSON.parse(/<script type="importmap">(.*?)<\/script>/s.exec(html)[1]).imports };
       },
@@ -210,6 +211,52 @@ if (!isMainThread) {
     assert.equal(report.workerCount, 4);
   });
 
+  test("finite worker dependencies and data execute offline before and after a normal build", async (t) => {
+    const f = fixture(t, {
+      "app.mjs": driver(`${receive}return receive(new Worker('./tasks/main.mjs',{type:'module'}));`),
+      "tasks/main.mjs": `import '../shared/helper.mjs';`,
+      "shared/helper.mjs": `const events=[],paths={module:'./lazy.mjs?identity=one',other:'./never.mjs',
+          second:'./lazy.mjs?identity=two',body:'./body.txt?kind=text#body',wasm:'./empty.wasm',json:'./config.json'};
+        const alias=paths,{body,wasm}=alias;
+        const lazy=await import(alias[(events.push('select'),true?'module':'other')]);
+        const same=await import(alias.module),other=await import(alias.second);
+        const config=await import(alias.json,{with:{type:(events.push('type'),'json')}});
+        const entry=await (await fetch(alias[(events.push((await import(alias.module))===lazy?'nested':'wrong'),'body')],
+          {method:'GET',headers:(events.push('headers'),{})})).text();
+        const module=await (await fetch(new URL((events.push('asset'),body),import.meta.url))).text();
+        const compiled=await WebAssembly.compileStreaming(fetch(new URL(wasm,import.meta.url)));
+        const failures=[];
+        try{await import(early,{with:(events.push('late-options'),{})});}catch(e){failures.push(e.name);}
+        const early='./lazy.mjs?identity=one';
+        try{fetch(earlyBody);}catch(e){failures.push(e.name);}
+        try{new URL(earlyBody,import.meta.url);}catch(e){failures.push(e.name);}
+        const earlyBody='./body.txt';
+        postMessage({same:lazy===same,distinct:lazy!==other,runs:globalThis.runs,config:config.default.value,
+          entry,module,wasm:WebAssembly.Module.exports(compiled),body,events,failures});`,
+      "shared/lazy.mjs": `globalThis.runs=(globalThis.runs||0)+1;export const value=42;`,
+      "shared/never.mjs": `throw new Error('unselected module');`,
+      "shared/config.json": '{"value":42}',
+      "tasks/body.txt": 'entry bytes', "shared/body.txt": 'module bytes',
+      "shared/empty.wasm": Buffer.from([0,97,115,109,1,0,0,0]),
+    });
+    const expected={same:true,distinct:true,runs:2,config:42,entry:'entry bytes',module:'module bytes',
+      wasm:[],body:'./body.txt?kind=text#body',events:['select','type','nested','headers','asset'],
+      failures:['ReferenceError','ReferenceError','ReferenceError']};
+    assert.deepEqual(await execute(f.original),expected,'native source execution');
+    f.pack();
+    const packed=f.emitted();
+    fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+    assert.deepEqual(await execute(packed),expected,'standalone execution with source unavailable');
+    fs.renameSync(path.join(f.root,'source-unavailable'),f.source);
+    const built=await buildApplication(path.join(f.source,'index.html'),path.join(f.root,'build'));
+    const builtPacked=path.join(f.root,'built-packed.html');
+    packHtml(path.join(built.outDir,built.htmlFile),builtPacked);
+    const packedBuild=f.emitted(builtPacked);
+    fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+    fs.renameSync(built.outDir,path.join(f.root,'build-unavailable'));
+    assert.deepEqual(await execute(packedBuild),expected,'packed normal build with both source and build unavailable');
+  });
+
   test("conditional Worker URLs preserve selector, URL construction and option ordering", async (t) => {
     await equivalent(t, {
       "app.mjs": driver(`${receive}const log=[];const flag=false;
@@ -242,6 +289,20 @@ if (!isMainThread) {
         w.onmessage=e=>{w.terminate();postMessage([events,e.data])};`,
       "values.js": `var answer=42;events.push(answer);`, "lib/leaf.mjs": `postMessage('leaf');`,
     }, [[42], "leaf"]);
+  });
+
+  test("classic ESM helpers retain finite importScripts bases, argument order and repeated execution", async (t) => {
+    await equivalent(t, {
+      "app.mjs": driver(`${receive}return receive(new Worker('./main.js'));`),
+      "main.js": `self.events=[];import('./nested/helper.mjs');`,
+      "nested/helper.mjs": `const paths={entry:'./shared.js',module:'./shared.js',other:'./never.js'};
+        const alias=paths;
+        self.importScripts(alias[(events.push('entry-url'),true?'entry':'other')],
+          new URL((events.push('module-url'),alias.module),import.meta.url));
+        importScripts(alias.entry);postMessage(events);`,
+      "shared.js": `events.push('entry');`,"nested/shared.js":`events.push('module');`,
+      "never.js": `throw new Error('unselected classic script');`,
+    }, ['entry-url','module-url','entry','module','entry']);
   });
 
   test("classic finite importScripts arguments keep selected execution and all argument effects", async (t) => {

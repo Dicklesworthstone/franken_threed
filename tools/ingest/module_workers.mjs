@@ -469,16 +469,18 @@ export function buildWorkerGraph(entryUrl, {
       continue;
     }
     const ast = parse(source, record.url, record.sourceType), changed = changedGlobals(ast), edits = [];
+    const classify = createDynamicImportClassifier(ast);
     const root = roots.get(record.realm);
     record.changed = changed;
-    function replace(node, target, fetch = false) {
+    function replace(choice, target, fetch = false) {
       const actual = target.asset ?? target;
       if (!actual.external) record.edges.add(actual);
-      edits.push({start: node.start, end: node.end, target: actual, suffix: target.external ? '' : suffix(target.url), fetch});
+      workerEdit(edits, choice, {target: actual, suffix: target.external ? '' : suffix(target.url), fetch});
     }
-    function dependency(node, declaration, asUrl = false) {
+    function dependency(choice, declaration) {
+      const value = choice.specifier ?? text(choice.argument), asUrl = choice.base === 'module';
       let resolved;
-      try { resolved = asUrl ? resolveDocumentUrl(text(node), record.url, documentRoot) : resolveModule(text(node), record.url); }
+      try { resolved = asUrl ? resolveDocumentUrl(value, record.url, documentRoot) : resolveModule(value, record.url); }
       catch (cause) {
         if (cause.code?.startsWith('F3D_DOCUMENT_')) throw cause;
         fail('RESOLUTION', cause.message, record.url);
@@ -488,7 +490,7 @@ export function buildWorkerGraph(entryUrl, {
       // Remote modules keep host-owned attribute handling and require no local
       // format decision, including runtime-computed options.
       const sourceType = remote(resolved) ? 'module' : importSourceType(declaration, record.url);
-      replace(node, module(resolved, record.realm, sourceType));
+      replace(choice, module(resolved, record.realm, sourceType));
     }
     function uses(name, callee = null) {
       record.hostUses.add(name);
@@ -534,20 +536,20 @@ export function buildWorkerGraph(entryUrl, {
     // operands first so executable dependencies cannot also become raw assets.
     walk.simple(ast, {
       ImportExpression(node) {
-        const choices = urlChoices(node.source, changed);
-        if (!choices) fail('DYNAMIC_IMPORT', 'Use bounded literal/URL import choices in a relocated worker', record.url);
+        const choices = urlChoices(node.source, changed, true, [], 0, classify);
+        if (!choices) fail('DYNAMIC_IMPORT', 'Use bounded string/URL import choices in a relocated worker', record.url);
         imports.set(node, choices);
         for (const choice of choices) if (choice.base === 'module') workerURLs.add(choice.urlNode.start);
       },
       CallExpression(node) {
         if (hostCall(node.callee, 'fetch')) {
-          for (const choice of urlChoices(node.arguments[0], changed, false) ?? [])
-            fetchUrlArguments.set(choice.argument, staticGet(node.arguments[1]));
+          for (const choice of urlChoices(node.arguments[0], changed, true, [], 0, classify) ?? [])
+            if (choice.base === 'module') fetchUrlArguments.set(choice.argument, staticGet(node.arguments[1]));
         }
         if (!hostCall(node.callee, 'importScripts')) return;
-        const choices = node.arguments.map(argument => urlChoices(argument, changed));
+        const choices = node.arguments.map(argument => urlChoices(argument, changed, true, [], 0, classify));
         if (root.workerType === 'classic' && choices.some(choice => !choice))
-          fail('IMPORT_SCRIPTS', 'Classic worker imports require bounded literal/URL script choices', record.url);
+          fail('IMPORT_SCRIPTS', 'Classic worker imports require bounded string/URL script choices', record.url);
         scriptImports.set(node, choices);
         for (const choice of choices.flat()) if (choice?.base === 'module') workerURLs.add(choice.urlNode.start);
       },
@@ -563,13 +565,13 @@ export function buildWorkerGraph(entryUrl, {
       uses(site.kind); if (site.base === 'module') uses('URL');
     }
     walk.simple(ast, {
-      ImportDeclaration: node => dependency(node.source, node),
-      ExportNamedDeclaration: node => { if (node.source) dependency(node.source, node); },
-      ExportAllDeclaration: node => dependency(node.source, node),
+      ImportDeclaration: node => dependency({argument: node.source}, node),
+      ExportNamedDeclaration: node => { if (node.source) dependency({argument: node.source}, node); },
+      ExportAllDeclaration: node => dependency({argument: node.source}, node),
       ImportExpression(node) {
         for (const choice of imports.get(node)) {
-          if (choice.base === 'module' && hostRootUrl(text(choice.argument), documentRoot)) continue;
-          dependency(choice.argument, node, choice.base === 'module');
+          if (choice.base === 'module' && hostRootUrl(choice.specifier ?? text(choice.argument), documentRoot)) continue;
+          dependency(choice, node);
           if (choice.base === 'module') uses('URL');
         }
       },
@@ -580,11 +582,11 @@ export function buildWorkerGraph(entryUrl, {
           if (root.workerType !== 'classic') return;
           for (const choices of scriptImports.get(node)) {
             for (const choice of choices) {
-              const value = text(choice.argument);
+              const value = choice.specifier ?? text(choice.argument);
               if (hostRootUrl(value, documentRoot)) continue;
               const url = resolveDocumentUrl(value, choice.base === 'module' ? record.url : root.url, documentRoot);
               if (new URL(url).protocol !== 'file:') continue;
-              replace(choice.argument, module(url, record.realm, 'script'), choice.base === 'realm');
+              replace(choice, module(url, record.realm, 'script'), choice.base === 'realm');
               uses('importScripts', node.callee);
               if (choice.base === 'module') uses('URL');
             }
@@ -592,17 +594,18 @@ export function buildWorkerGraph(entryUrl, {
           return;
         }
         if (!hostCall(node.callee, 'fetch')) return;
-        const candidates = literalChoices(node.arguments[0]);
-        if (!candidates) {
-          // A static import.meta URL is closed by the URL-asset visit below.
-          // Otherwise a document Worker string must retain its host route:
+        const choices = urlChoices(node.arguments[0], changed, true, [], 0, classify);
+        if (!choices) {
+          // A document Worker string must retain its host route:
           // relocating an unknown relative request would change its base.
-          if (requireClosedRuntimeUrls && !urlChoices(node.arguments[0], changed, false))
+          if (requireClosedRuntimeUrls)
             fail('DYNAMIC_RESOURCE', 'A dynamic fetch URL needs the original worker host route', record.url);
           return;
         }
-        for (const candidate of candidates) {
-          const value = text(candidate);
+        for (const choice of choices) {
+          // Module-relative URL operands are closed by the URL-asset visit.
+          if (choice.base === 'module') continue;
+          const value = choice.specifier ?? text(choice.argument);
           if (hostRootUrl(value, documentRoot) || URL.canParse(value)) continue;
           const rooted = documentRoot && isRootRelativeDocumentUrl(value);
           if (!rooted && !staticGet(node.arguments[1]))
@@ -613,7 +616,7 @@ export function buildWorkerGraph(entryUrl, {
           if (rooted &&
               (!staticGet(node.arguments[1]) || !localFileExists(url))) continue;
           // fetch()/importScripts() use the worker entry, NOT an imported script.
-          replace(candidate, asset(url), true);
+          replace(choice, asset(url), true);
           uses('fetch', node.callee);
         }
       },
@@ -622,18 +625,18 @@ export function buildWorkerGraph(entryUrl, {
             ['Worker', 'SharedWorker'].some(kind => hostCall(node.callee, kind)))
           fail('DYNAMIC_RESOURCE', 'A dynamic worker URL/options needs the original worker host route', record.url);
         if (changed.has('URL') || workerURLs.has(node.start)) return;
-        const operand = urlOperand(node), candidates = literalChoices(operand);
+        const operand = urlOperand(node), candidates = workerStringChoices(operand, classify);
         if (operand && !candidates && requireClosedRuntimeUrls)
           fail('DYNAMIC_RESOURCE', 'A dynamic module asset URL needs the original worker host route', record.url);
         if (!candidates) return;
-        for (const argument of candidates) {
-          const value = text(argument);
+        for (const choice of candidates) {
+          const value = choice.specifier;
           if (hostRootUrl(value, documentRoot)) continue;
           const url = resolveDocumentUrl(value, record.url, documentRoot);
           if (new URL(url).protocol !== 'file:') continue;
-          if (documentRoot && isRootRelativeDocumentUrl(value) && fetchUrlArguments.has(argument) &&
-              (!fetchUrlArguments.get(argument) || !localFileExists(url))) continue;
-          replace(argument, asset(url)); uses('URL');
+          if (documentRoot && isRootRelativeDocumentUrl(value) && fetchUrlArguments.has(choice.argument) &&
+              (!fetchUrlArguments.get(choice.argument) || !localFileExists(url))) continue;
+          replace(choice, asset(url)); uses('URL');
         }
       },
     });

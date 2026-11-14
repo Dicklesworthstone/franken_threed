@@ -10,7 +10,7 @@ import { Worker as Thread } from "node:worker_threads";
 import { buildApplication } from "./build_application.mjs";
 import { parseTagAttributes } from "./html_parser.mjs";
 import { packHtml } from "./pack_html.mjs";
-import { buildModuleWorkerGraph, findWorkerSites, findWorkerUrlOperands, moduleWorkerRollupPlugin } from "./module_workers.mjs";
+import { buildModuleWorkerGraph, buildWorkerGraph, findWorkerSites, findWorkerUrlOperands, moduleWorkerRollupPlugin } from "./module_workers.mjs";
 
 // Test host only: real native worker threads, ESM, classic script evaluation,
 // Wasm compilation and filesystem-backed Response bodies. Production worker
@@ -592,4 +592,85 @@ test("one worker alias keeps source-type separation and shared-worker identity a
   assert.equal(calls[2].url,calls[3].url,'SharedWorker identity does not depend on the discovering parent module');
   assert.deepEqual(log,['./worker.js','./worker.js']);
   assert.equal(files.length,2);
+});
+
+test("relocated worker dependencies close finite imports and data without changing native evaluation", async (t) => {
+  const root = fixture({
+    "modules/app.mjs": `export const start=()=>new Worker('./tasks/main.mjs',{type:'module'});`,
+    "site/tasks/main.mjs": `import '../../shared/helper.mjs';`,
+    "shared/helper.mjs": `import {value,bump} from './state.mjs';
+      const events=[], paths={chosen:'./lazy.mjs?mode=one#view',other:'./never.mjs',
+        second:'./lazy.mjs?mode=two#view',json:'./settings.json?kind=json',body:'./body.txt?copy=1#bytes',wasm:'./empty.wasm'};
+      const alias=paths, {body,wasm}=alias;
+      const lazy=await import(alias[(events.push('select'),true?'chosen':'other')]);
+      const again=await import(alias.chosen), distinct=await import(alias.second);
+      const settings=await import(alias.json,{with:{type:(events.push('type'),'json')}});
+      const sameSettings=await import(alias.json,{with:{type:'json'}});
+      const entry=await (await fetch(alias[(events.push((await import(alias.chosen))===lazy?'nested':'wrong'),'body')],
+        {method:'GET',headers:(events.push('headers'),{})})).text();
+      const module=await (await fetch(new URL((events.push('asset'),body),import.meta.url))).text();
+      const compiled=await WebAssembly.compileStreaming(fetch(new URL(wasm,import.meta.url)));
+      const failures=[];
+      try{await import(earlyImport,{with:(events.push('late-import-options'),{})});}catch(e){failures.push(e.name);}
+      const earlyImport='./lazy.mjs?mode=one#view';
+      try{fetch(earlyBody,{headers:(events.push('late-fetch-options'),{})});}catch(e){failures.push(e.name);}
+      try{new URL(earlyBody,import.meta.url);}catch(e){failures.push(e.name);}
+      const earlyBody='./body.txt';
+      bump();postMessage({same:lazy===again,distinct:lazy!==distinct,values:[value,lazy.read(),distinct.read()],
+        runs:globalThis.runs,settings:settings.default.value,sameSettings:settings.default===sameSettings.default,
+        entry,module,wasm:WebAssembly.Module.exports(compiled),body,events,failures});`,
+    "shared/state.mjs": `export let value=0;export const bump=()=>value++;`,
+    "shared/lazy.mjs": `import {value} from './state.mjs';globalThis.runs=(globalThis.runs||0)+1;export const read=()=>value;`,
+    "shared/never.mjs": `throw new Error('unselected module must not execute');`,
+    "shared/settings.json": '{"value":42}',
+    "site/tasks/body.txt": 'entry-relative bytes',
+    "shared/body.txt": 'module-relative bytes',
+    "shared/empty.wasm": Buffer.from([0,97,115,109,1,0,0,0]),
+  });
+  const output = root + '-output';
+  const built = await buildApplication(path.join(root,'index.html'),output);
+  assert.ok(built.emittedFiles.some(name=>name.startsWith('f3d-workers/')),'the complete worker graph is relocated');
+  const relocated = output + '-relocated';
+  fs.renameSync(output,relocated);
+  fs.renameSync(root,root+'-source-unavailable');
+  workerHost(t,pathToFileURL(path.join(relocated,'site/base.html')));
+  const application = await import(pathToFileURL(path.join(relocated,built.entryFiles[0])).href);
+  assert.deepEqual(await application.start().result,{
+    same:true,distinct:true,values:[1,1,1],runs:2,settings:42,sameSettings:true,
+    entry:'entry-relative bytes',module:'module-relative bytes',wasm:[],body:'./body.txt?copy=1#bytes',
+    events:['select','type','nested','headers','asset'],failures:['ReferenceError','ReferenceError','ReferenceError'],
+  });
+});
+
+test("worker dependency closure refuses mutable, escaped and shadowed selectors before publication", () => {
+  const sources = [
+    use=>`let target='./resource.mjs';${use('target')}`,
+    use=>`const paths={file:'./resource.mjs'};paths.file='./other.mjs';${use('paths.file')}`,
+    use=>`export const paths={file:'./resource.mjs'};${use('paths.file')}`,
+    use=>`const paths={file:'./resource.mjs'};consume(paths);${use('paths.file')}`,
+    use=>`const paths={file:'./resource.mjs'};${use('paths[unknown]')}`,
+    use=>`const target='./resource.mjs';function start(target){${use('target')}}`,
+  ];
+  for (const [use,graphCode,packCode] of [
+    [value=>`import(${value});`,'DYNAMIC_IMPORT','DYNAMIC_IMPORT_OPEN'],
+    [value=>`fetch(${value});`,'DYNAMIC_RESOURCE','WORKER_FETCH'],
+    [value=>`new URL(${value},import.meta.url);`,'DYNAMIC_RESOURCE','DYNAMIC_ASSET'],
+  ]) for (const source of sources) {
+    const root=fixture({
+      'index.html':'<script type="module">new Worker("./worker.mjs",{type:"module"});</script>',
+      'worker.mjs':source(use),'resource.mjs':'export const value=42;','other.mjs':'export const value=7;',
+    });
+    assert.throws(()=>buildModuleWorkerGraph(pathToFileURL(path.join(root,'worker.mjs')).href,
+      {requireClosedRuntimeUrls:true}),{code:'F3D_WORKER_'+graphCode});
+    const output=path.join(root,'packed.html');
+    assert.throws(()=>packHtml(path.join(root,'index.html'),output),{code:packCode});
+    assert.equal(fs.existsSync(output),false);
+  }
+  const classic=fixture({
+    'index.html':'<script type="module">new Worker("./worker.js");</script>',
+    'worker.js':`"use strict";const target='./resource.txt';fetch(target);`,'resource.txt':'bytes',
+  });
+  assert.throws(()=>buildWorkerGraph(pathToFileURL(path.join(classic,'worker.js')).href,
+    {workerType:'classic',requireClosedRuntimeUrls:true}),{code:'F3D_WORKER_DYNAMIC_RESOURCE'});
+  assert.throws(()=>packHtml(path.join(classic,'index.html'),path.join(classic,'packed.html')),{code:'WORKER_FETCH'});
 });

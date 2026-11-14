@@ -407,7 +407,18 @@ embedded worker Blob URL is created only for the selected entry. A normal
 build's generated mapping remains analyzable when that build is later packed.
 Nested worker/resource edits inside a selector retain their own source order.
 
-Mutable bindings, parameters, imported selectors, property/call results and
+The same proof now closes dependencies and data inside module workers: finite
+`import()`, `fetch()` and `new URL(..., import.meta.url)` operands may use private
+constant records, aliases and supported object destructuring. ESM helpers in a
+classic worker also support finite `importScripts()` operands. Imports and URL
+assets keep their containing module's base; string fetch/script requests keep
+the worker entry's base. The original selector, options and TDZ behavior remain
+in place, including nested imports inside a resource selector. Normal relocated
+builds and direct/build-then-pack output retain native lazy/JSON identity, query
+variants, live bindings, response bodies and streaming Wasm. Unclosed worker
+fetch operands now fail standalone packing explicitly before publication.
+
+Mutable bindings, parameters, imported selectors, opaque property/call results and
 aliases to mutable URL objects do not establish a finite string set. Classic
 script aliases retain the existing conservative scope policy. Unproved normal
 build routes stay host-owned; standalone packing still refuses open worker

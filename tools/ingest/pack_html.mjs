@@ -791,7 +791,6 @@ export function packHtml(
         workerURLs.add(node);
         rewriteURLs(ref, from, emit, code, depth + 1, budget);
       } else {
-        if (code !== "WORKER_URL") fail(code, `${from}: URL must have finite literal results`);
         let targets;
         try { targets = [...finiteImports(node, new Map(), 0, classifyImport)]; }
         catch (error) {
@@ -924,15 +923,12 @@ export function packHtml(
       uses(name);
       if (node.callee.type === "MemberExpression") uses(node.callee.object.name);
     }
-    const urlResult = (node) => node && (literal(node) !== null ||
-      ["SequenceExpression", "ConditionalExpression"].includes(node.type) ||
-      node.type === "NewExpression" && node.callee.name === "URL");
     walk.simple(ast, {
       ImportExpression(node) { markImportURLs(node.source); },
       CallExpression(node) {
         if (worker?.kind === "classic" && hostCall(node, "importScripts"))
           node.arguments.forEach((argument) => markImportURLs(argument));
-        if (worker && hostCall(node, "fetch") && urlResult(node.arguments[0]))
+        if (worker && hostCall(node, "fetch"))
           markImportURLs(node.arguments[0]);
       },
     });
@@ -1007,7 +1003,7 @@ export function packHtml(
           }
           return; // Keep the native call, order, repeated evaluation and throws.
         }
-        if (worker && hostCall(node, "fetch") && urlResult(node.arguments[0])) {
+        if (worker && hostCall(node, "fetch")) {
           const options = result(node.arguments[1]);
           if (node.arguments.length > 2 || node.optional || hostBinding(node, "fetch") ||
               options && !(options.type === "Literal" && options.value === null) &&
