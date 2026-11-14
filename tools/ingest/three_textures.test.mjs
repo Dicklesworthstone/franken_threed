@@ -16,13 +16,13 @@ test('sampled texture validation captures issued uploads without future scopes o
   const d = textureDevice(), p = pool(d), texture = make();
   const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; };
   const first = deferred(), later = deferred(), completion = deferred();
-  const pop = d.popErrorScope, scopes = [first.promise, Promise.resolve(null), later.promise];
-  d.popErrorScope = () => { const result = pop(); return scopes.shift() ?? result; };
+  const pop = d.popErrorScope; let nextScope = first.promise;
+  d.popErrorScope = () => { const result = pop(), gated = nextScope; nextScope = null; return gated ?? result; };
   d.queue.onSubmittedWorkDone = () => completion.promise;
   t.after(() => { first.resolve(null); later.resolve(null); completion.resolve(); p.dispose(); });
   p.prepare([texture]); const validation = p.validation; let ready = false;
   validation.then(() => { ready = true; });
-  texture.needsUpdate = true; p.update([texture]);
+  nextScope = later.promise; texture.needsUpdate = true; p.update([texture]);
   await new Promise(resolve => setImmediate(resolve)); assert.equal(ready, false);
   first.resolve(null); await validation;
   assert.equal(ready, true);
@@ -119,6 +119,68 @@ test('callback exceptions do not become native failure or replay the successful 
   const d=textureDevice(),p=pool(d),t=make(),sentinel={};let calls=0;t.onUpdate=()=>{calls++;throw sentinel;};
   assert.throws(()=>p.prepare([t]),e=>e===sentinel);assert.equal(p.failed,false);assert.equal(d.textureWrites.length,1);
   p.update([t]);assert.equal(calls,1);assert.equal(p.binding(t).version,t.version);p.dispose();
+});
+
+for(const webglVersioning of [false,true])test(`source texture callbacks cannot poison upload validation (WebGL versioning: ${webglVersioning})`,async()=>{
+  const d=textureDevice(),p=pool(d,{webglVersioning}),t=make(),foreign={message:'source-owned GPU error'},uncaptured=[];
+  d.pushErrorScope=filter=>d.scopes.push({filter,error:null});
+  d.popErrorScope=()=>Promise.resolve(d.scopes.pop().error);
+  const allocate=d.createBuffer;
+  d.createBuffer=descriptor=>{
+    if(descriptor.usage!==0)return allocate(descriptor);
+    const scope=d.scopes.findLast(scope=>scope.filter==='validation');
+    if(scope)scope.error??=foreign;else uncaptured.push(foreign);
+    return {destroy(){}};
+  };
+  const sourceOperation=()=>d.createBuffer({size:4,usage:0});
+  let callbacks=0;
+  t.onUpdate=source=>{
+    assert.equal(source,t);callbacks++;
+    assert.equal(p.binding(t).sourceVersion,t.source.version,'source acknowledges before callback');
+    sourceOperation();
+  };
+  const clear=t.clearUpdateRanges;
+  t.clearUpdateRanges=function(){sourceOperation();return clear.call(this);};
+  p.prepare([t]);await p.whenIdle();
+  const before=p.nativeTexture(t).levels[0].slice();
+  t.image.data.fill(99);t.addUpdateRange(4,4);t.needsUpdate=true;p.update([t]);await p.whenIdle();
+  assert.equal(p.failed,false);assert.equal(callbacks,2);assert.equal(uncaptured.length,3);
+  assert.ok(uncaptured.every(error=>error===foreign));assert.deepEqual(d.scopes,[]);
+  const after=p.nativeTexture(t).levels[0];
+  assert.deepEqual(after.slice(0,4),before.slice(0,4));assert.deepEqual([...after.slice(4,8)],[99,99,99,99]);
+  assert.deepEqual(after.slice(8),before.slice(8));
+  assert.equal(p.binding(t).version,t.version,'texture acknowledges after callback');p.dispose();
+});
+
+test('source image getters and partial byte views run outside native validation scopes',async()=>{
+  const d=textureDevice(),p=pool(d),t=make(),image=t.image,width=image.width,data=image.data;
+  let dimensions=0,views=0;
+  Object.defineProperty(image,'width',{get(){dimensions++;assert.equal(d.scopes.length,0);return width;}});
+  const subarray=data.subarray;
+  data.subarray=function(...args){views++;assert.equal(d.scopes.length,0);return subarray.apply(this,args);};
+  p.prepare([t]);await p.whenIdle();
+  data.fill(53);t.addUpdateRange(4,4);t.needsUpdate=true;p.update([t]);await p.whenIdle();
+  assert.ok(dimensions>1);assert.equal(views,1);assert.equal(p.failed,false);
+  assert.deepEqual([...p.nativeTexture(t).levels[0].slice(4,8)],[53,53,53,53]);p.dispose();
+});
+
+test('a failed second texture scope push closes the installed scope before terminal cleanup',()=>{
+  const d=textureDevice(),p=pool(d),failure=new Error('scope setup failed');
+  d.pushErrorScope=filter=>{if(filter==='out-of-memory')throw failure;d.scopes.push(filter);};
+  assert.throws(()=>p.prepare([make()]),error=>error===failure);
+  assert.deepEqual(d.scopes,[]);assert.equal(d.textures.length,0);assert.equal(p.diagnostics.textureBytes,0);
+  assert.equal(p.failed,true);p.dispose();
+});
+
+test('explicit native sampled writes retain validation and synchronous callback error semantics',async()=>{
+  const d=textureDevice(),p=pool(d),t=make(),sentinel=new Error('native write callback');
+  p.prepare([t]);await p.whenIdle();
+  assert.throws(()=>p.writeTexture(t,()=>{throw sentinel;}),error=>error===sentinel);
+  assert.equal(p.failed,false);await p.validation;
+  d.scopeError={message:'invalid sampled copy'};
+  p.writeTexture(t,texture=>d.queue.writeTexture({texture},new Uint8Array(16),{bytesPerRow:8},[2,2,1]));
+  await assert.rejects(p.whenIdle(),{code:'THREE_TEXTURE_DEVICE'});
+  assert.equal(p.failed,true);assert.equal(p.diagnostics.textureBytes,0);assert.ok(d.textures.every(texture=>texture.destroyed));p.dispose();
 });
 
 test('all image/range and aggregate-budget admission completes before device effects',()=>{

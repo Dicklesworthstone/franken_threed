@@ -468,14 +468,27 @@ export function createGpuThreeTextures(device,{
     for(const variants of sources.values())for(const r of variants.values())r.texture.destroy();
     sources.clear();textureBytes=0;pipelines.clear();samplers.clear();mipSampler=null;}
   function stop(error){if(!terminal){terminal=error;release();rejectStop(error);}return terminal;}
-  function native(fn){try{return fn();}catch(error){throw stop(error);}}
-  function checked(fn){
-    native(()=>device.pushErrorScope('validation'));native(()=>device.pushErrorScope('out-of-memory'));
-    try{return fn();}finally{
-      const scopes=native(()=>[device.popErrorScope(),device.popErrorScope()]);
-      const checked=Promise.all(scopes).then(errors=>{const e=errors.find(Boolean);if(e)throw new ThreeTextureError('DEVICE',e.message||'Texture operation failed');}).catch(e=>{throw stop(e);});
-      pending=Promise.all([pending,checked]).then(()=>{});pending.catch(()=>{});
+  // Scope only owned GPU work. Source getters, range clearing and onUpdate
+  // can issue their own GPU commands; their errors belong to the application.
+  function native(fn){return checked(fn,true);}
+  function checked(fn,terminalOnThrow=false){
+    let result,caught,failed=false,setup=true,scopes=0;const reports=[];
+    try{
+      device.pushErrorScope('validation');scopes++;
+      device.pushErrorScope('out-of-memory');scopes++;
+      setup=false;result=fn();
+    }catch(error){caught=error;failed=true;}
+    finally{
+      // Drain every scope that was installed, even when a later push or pop
+      // throws. Observe pop failures after returned allocations acquire owners.
+      while(scopes>0){scopes--;try{reports.push(Promise.resolve(device.popErrorScope()));}catch(error){reports.push(Promise.reject(error));}}
     }
+    const checked=Promise.all(reports).then(errors=>{const e=errors.find(Boolean);if(e)throw new ThreeTextureError('DEVICE',e.message||'Texture operation failed');}).catch(e=>{throw stop(e);});
+    pending=Promise.all([pending,checked]).then(()=>{});pending.catch(()=>{});
+    // writeTexture lends native storage to an explicit operation, whose own
+    // synchronous exception keeps its existing nonterminal caller semantics.
+    if(failed){if(setup||terminalOnThrow)throw stop(caught);throw caught;}
+    return result;
   }
   function samplerFor(descriptor){
     const key=JSON.stringify(descriptor);let sampler=samplers.get(key);
@@ -587,7 +600,8 @@ export function createGpuThreeTextures(device,{
           const rowBytes=d.width*4,pitch=Math.ceil(rowBytes/d.alignment)*d.alignment;
           for(const range of ranges(t,d.width)){
             const pixel=Math.floor(range.start/4),x=pixel%d.width,y=Math.floor(pixel/d.width),width=Math.ceil(range.count/4);
-            if(width)native(()=>device.queue.writeTexture({texture:a.texture,origin:[x,y,0]},t.image.data.subarray(y*pitch+x*4),{bytesPerRow:pitch},[width,1,1]));
+            if(width){const data=t.image.data.subarray(y*pitch+x*4);
+              native(()=>device.queue.writeTexture({texture:a.texture,origin:[x,y,0]},data,{bytesPerRow:pitch},[width,1,1]));}
             if(width)stats.writeCalls++;
           }
           t.clearUpdateRanges();
@@ -600,7 +614,8 @@ export function createGpuThreeTextures(device,{
           // mip upload; the authored mip rows themselves remain unchanged.
           const flipY=nativeCube&&d.cube&&d.manual?d.flipY&&level===0&&d.levels%2===1:d.flipY;
           if(flipY){data=new Uint8Array(row*image.height);for(let y=0;y<image.height;y++)data.set(src.subarray((image.height-1-y)*pitch,(image.height-1-y)*pitch+row),y*row);}
-          native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:flipY?row:pitch},[image.width,image.height,1]));stats.writeCalls++;
+          const size=[image.width,image.height,1];
+          native(()=>device.queue.writeTexture({texture:a.texture,mipLevel:level,...(d.cube?{origin:[0,0,layer]}:{})},data,{bytesPerRow:flipY?row:pitch},size));stats.writeCalls++;
         }
       }else if(!d.video||d.videoReady)for(const {image,level,layer} of d.uploads){
         native(()=>device.queue.copyExternalImageToTexture({source:image,flipY:d.flipY},
@@ -639,7 +654,7 @@ export function createGpuThreeTextures(device,{
         if(d.source===s.source&&d.key===s.key)fail('COPY','A sampled GPU seed requires independent storage');
       }else if(copyOnly)fail('OPTIONS','A copy-only initialization requires a GPU seed');
       validatePlans(list);
-      if(list.length)checked(()=>{for(const {t,d} of list){
+      for(const {t,d} of list){
         let r=match(t,d),created=false;
         if(!r){
           let resource=sources.get(d.source)?.get(d.key);
@@ -682,7 +697,7 @@ export function createGpuThreeTextures(device,{
         }
         remember(r,d);
         if(!copyOnly)upload(t,r,d);
-      }});
+      }
       return api;
     }finally{busy=false;}
   }
@@ -693,10 +708,10 @@ export function createGpuThreeTextures(device,{
   function update(input){
     const list=plans(input);if(busy)fail('REENTRANT','Cannot update during a texture operation');
     for(const {t,d} of list)if(!match(t,d))fail('PREPARE','Texture structure changed; call prepare');
-    busy=true;try{if(list.length)checked(()=>{for(const {t,d} of list){const r=match(t,d);remember(r,d);upload(t,r,d);}});return api;}finally{busy=false;}
+    busy=true;try{for(const {t,d} of list){const r=match(t,d);remember(r,d);upload(t,r,d);}return api;}finally{busy=false;}
   }
   const api=Object.freeze({prepare,update,binding,inspect,
-    sampler(descriptor){live();return samplers.get(JSON.stringify(descriptor))??checked(()=>samplerFor(descriptor));},
+    sampler(descriptor){live();return samplerFor(descriptor);},
     validatePreparation(input){validatePlans(plans(input));},
     // Borrowed native storage, for consumers such as the background renderer.
     // The pool remains its sole owner; callers must not destroy this texture.
