@@ -79,11 +79,40 @@ never authorizes a binding: the compiler separately checks lexical scope, TDZ,
 constness, helper identity and closure, and the host guards actual values. The
 finite local worklists and bounded helper graph terminate on reference cycles.
 
+## Borrowed windows at helper calls
+
+General-control kernels can form nonescaping `subarray(begin, end)` views in
+local initializers, rebindings and helper arguments. Direct conditional array
+arguments also keep their pointer and intrinsic length without a temporary
+source variable:
+
+```js
+function blend(from, to) {
+  for (let i = 0; i < to.length; i++) to[i] += from[i] / 3;
+  return to.length;
+}
+function update(a, b, chooseA, begin, end) {
+  return blend((chooseA ? a : b).subarray(begin, end), b.subarray(begin, end));
+}
+```
+
+The receiver, range arguments and later helper arguments are evaluated once in
+source order. Negative, fractional, infinite and NaN ranges retain the native
+clamping rules. Overlapping windows still share the staged storage; creating a
+window does not snapshot its elements. Nested helpers, void calls and Boolean
+helper predicates use the same borrowed-view path and shared work budget.
+
+The existing runtime checks native `subarray`, constructor and species
+descriptors before entering Wasm. Custom methods/species, coercive ranges,
+failed bounds and exhausted budgets execute the original JavaScript, with no
+speculative writes published first. No new view object escapes to application
+code, and this change adds no ABI, memory owner or callback boundary.
+
 ## Retained boundaries
 
 References cannot escape as function results, enter scalar arithmetic or identity
 comparisons, or expose properties other than supported element access and
-intrinsic length. Array allocation, methods such as `subarray`, unsupported
+intrinsic length. Array allocation, methods beyond admitted borrowed views, unsupported
 object operations, uninitialized bindings and mixed scalar/reference assignment
 retain JavaScript. Automatic application specialization can lift read-only
 module bindings containing Numbers or numeric typed arrays into
@@ -109,7 +138,8 @@ node --test tools/ingest/numeric_array_references.test.mjs \
 
 Tests run real Wasm in Node against untouched JavaScript, across all nine element
 layouts, cyclic swaps, conditional selections, alias snapshots, overlapping and
-unequal-length views, helper parameter rebinding, source scope/TDZ checks,
+unequal-length views, inline helper windows, argument evaluation order,
+helper parameter rebinding, source scope/TDZ checks,
 NaN payload preservation and complete bounds/work-limit rollback. Real linked
 dynamic application builds compare arrays and upload snapshots on every frame.
 CLI output is executed after relocation in fresh processes both with and without

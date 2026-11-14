@@ -374,6 +374,101 @@ test('coercive subarray ranges retain original coercions and nonescaping admissi
     {parameterTypes:['f64[]']}),NumericKernelCompileError);
 });
 
+for(const [Type,type] of layouts)
+test(`${Type.name}: helper arguments borrow conditional and nested subarray views without copying aliases`,()=>{
+  function mix(from,to){for(let i=0;i<to.length;i++)to[i]+=from[i]/3+1.5;return to.length;}
+  function windows(a,b,start,end){return mix(a.subarray(start,end).subarray(0),b.subarray(start,end));}
+  function root(a,b,flag,start,end){return windows(flag?a:b,flag?b:a,start,end);}
+  const artifact=compile(root,[type,type,'f64','f64','f64'],[mix,windows]);
+  assert.deepEqual(artifact.manifest.parameters.slice(0,2).map(p=>[p.read,p.write]),[[true,true],[true,true]]);
+  assert.deepEqual(artifact.manifest.typedArrayMethods,['subarray']);
+  const native=engine(artifact);
+  for(const [flag,start,end] of [[0,0,6],[1,-4,99],[NaN,-Infinity,Infinity],[1,NaN,3.9],[0,4,1]]){
+    const data=new Type([1,2,3,4,5,6,7]),expected=data.slice();
+    assert.equal(native.run(data.subarray(0,6),data.subarray(1),flag,start,end),
+      root(expected.subarray(0,6),expected.subarray(1),flag,start,end));
+    equal(data,expected);
+  }
+  assert.equal(native.diagnostics.wasmCalls,5);assert.equal(native.diagnostics.fallbackCalls,0);
+});
+
+test('helper view arguments evaluate scalar and range effects once in left-to-right order',()=>{
+  function mark(log,value){log[0]=log[0]*10+value;return value;}
+  function consume(first,view,last,log){log[0]=log[0]*10+5;view[0]+=first+last;return view.length;}
+  function delegate(a,log){return consume(mark(log,1),a.subarray(mark(log,2),mark(log,4)),mark(log,3),log);}
+  function root(a,log){return delegate(a.subarray(0),log);}
+  const native=engine(compile(root,['f64[]','f64[]'],[mark,consume,delegate]));
+  const a=new Float64Array([1,2,3,4,5]),log=new Float64Array(1),expected=a.slice(),expectedLog=log.slice();
+  assert.equal(native.run(a,log),root(expected,expectedLog));equal(a,expected);equal(log,expectedLog);
+  assert.equal(log[0],12435);assert.equal(a[2],7);assert.equal(native.diagnostics.wasmCalls,1);
+});
+
+test('helper view arguments remain live across later argument writes and conditional branches stay lazy',()=>{
+  function change(a,log){log[0]+=1;a[1]+=10;return 1;}
+  function consume(view,step){view[0]+=step;return view[0];}
+  function branch(a,b,log,flag){return consume(flag?a.subarray(1):b.subarray(change(b,log)),change(a,log));}
+  function root(a,b,log,flag){return branch(a,b,log,flag);}
+  const native=engine(compile(root,['f64[]','f64[]','f64[]','f64'],[change,consume,branch]));
+  for(const flag of [0,1]){
+    const a=new Float64Array([1,2,3]),b=new Float64Array([4,5,6]),log=new Float64Array(1);
+    const ea=a.slice(),eb=b.slice(),el=log.slice();
+    assert.equal(native.run(a,b,log,flag),root(ea,eb,el,flag));equal(a,ea);equal(b,eb);equal(log,el);
+    assert.equal(log[0],flag?1:2);
+  }
+});
+
+test('view arguments reach void and Boolean helper calls through every helper context',()=>{
+  function positive(a){for(let i=0;i<a.length;i++)if(a[i]<=0)return false;return true;}
+  function edit(a){for(let i=0;i<a.length;i++)a[i]+=1;}
+  function relay(a,b,flag){if(positive((flag?a:b).subarray(1)))edit(a.subarray(1));return a[1];}
+  function root(a,b,flag){return relay(a.subarray(0),b.subarray(0),flag);}
+  const native=engine(compile(root,['f64[]','f64[]','f64'],[positive,edit,relay]));
+  for(const flag of [0,1]){
+    const a=new Float64Array([1,2,3]),b=new Float64Array([4,-1,6]),ea=a.slice(),eb=b.slice();
+    assert.equal(native.run(a,b,flag),root(ea,eb,flag));equal(a,ea);equal(b,eb);
+  }
+  assert.equal(native.diagnostics.wasmCalls,2);
+});
+
+test('failed helper windows roll back all earlier writes before one complete source fallback',()=>{
+  function edit(view,n){for(let i=0;i<n;i++)view[i]+=1;return view[0];}
+  function root(a,n){a[0]+=10;return edit(a.subarray(1,3),n);}
+  for(const [n,options] of [[3,{}],[2,{maxIterations:1}]]){
+    const native=engine(compile(root,['f64[]','f64'],[edit],options),{fallback:root});
+    const a=new Float64Array([1,2,3,4]),expected=a.slice();
+    assert.equal(native.run(a,n),root(expected,n));equal(a,expected);assert.equal(a[0],11);
+    assert.equal(native.diagnostics.wasmCalls,0);assert.equal(native.diagnostics.fallbackCalls,1);
+    assert.equal(native.diagnostics.lastGuardFailure,'KERNEL_EXECUTION_FAILED');
+  }
+});
+
+test('helper window species fallback preserves source exceptions and partial effects once',()=>{
+  function edit(view){for(let i=0;i<view.length;i++)view[i]+=1;return view.length;}
+  function root(a){a[0]+=10;return edit(a.subarray(1));}
+  const native=engine(compile(root,['f64[]'],[edit]),{fallback:root});
+  const a=new Float64Array([1,2,3]),failure=new Error('view species');let calls=0;
+  Object.defineProperty(a,'constructor',{get(){calls++;throw failure;}});
+  assert.throws(()=>native.run(a),error=>error===failure);equal(a,[11,2,3]);assert.equal(calls,1);
+  const b=new Float64Array([1,2,3]);
+  Object.defineProperty(b,'subarray',{value:function(){calls++;return new Float64Array([7,8]);}});
+  assert.equal(native.run(b),2);equal(b,[11,2,3]);assert.equal(calls,2);
+  assert.equal(native.diagnostics.wasmCalls,0);assert.equal(native.diagnostics.fallbackCalls,2);
+});
+
+test('helper view arguments cannot mix layouts, escape or bypass lexical scope',()=>{
+  const helpers=[function edit(a){for(let i=0;i<a.length;i++)a[i]+=1;return a.length;}];
+  for(const source of [
+    'function root(a,b,flag){return edit(flag?a:b);}',
+    'function root(a,b,flag){return edit(flag?a:1);}',
+    'function root(a,b,flag){let result=edit(a.subarray(0));let a=b;return result;}',
+  ])assert.throws(()=>compileNumericKernel(source,{parameterTypes:['f64[]','f32[]','f64'],generalControl:true,
+    helperSources:new Map(helpers.map(helper=>[helper.name,helper.toString()]))}),NumericKernelCompileError);
+  function scalar(value){return value+1;}
+  function root(a,flag){a[0]+=scalar(flag?2:3);return a[0];}
+  const native=engine(compile(root,['f64[]','f64'],[scalar]));
+  const a=new Float64Array([1]);assert.equal(native.run(a,0),5);equal(a,[5]);
+});
+
 
 test('conservative reference-owner publication preserves untouched NaN payload bits',()=>{
   function redirect(a,b){a=b;a[0]+=1;}

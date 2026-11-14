@@ -409,7 +409,7 @@ export function compileNumericKernel(source, {
     return helperCompiler.call(node, arg => expression(arg, depth + 1),
       params.has(node.callee.name) || temporaries.has(node.callee.name) ||
       node.callee.name === indexName || node.callee.name === fn.id.name,
-      null, generalDepth, helperArray, resultUsed);
+      null, generalDepth, arg => arrayReferences.argument(arg), resultUsed);
   }
   function binary(operator, left, right) {
     return emitBitwiseBinary(operator, left, right, () => temporaryBase + temporaryCount++)

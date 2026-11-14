@@ -241,6 +241,27 @@ test('source discovery follows subarray references through conditional views and
   assert.equal(count(app),6);assert.equal(count(app,'fallbackCalls'),0);
 });
 
+test('automatic compilation discovers conditional helper arguments and inline windows through delegating helpers',async t=>{
+  const app=await application(t,`
+    function edit(from,to){for(let i=0;i<to.length;i++)to[i]+=from[i]/3;return to.length;}
+    function window(a,b,start,end){return edit(a.subarray(start,end),b.subarray(start,end));}
+    function choose(a,b,flag,start,end){return window(flag?a:b,flag?b:a,start,end);}
+    export const run=(a,b,flag,start,end)=>choose(a,b,flag,start,end);
+  `);
+  const candidate=app.result.report.candidates.find(item=>item.functionName==='choose');
+  assert.equal(candidate.route,'guarded-numeric-wasm');
+  assert.deepEqual(candidate.parameterTypes,['f64[]','f64[]','f64','f64','f64']);
+  assert.deepEqual(candidate.typedArrayMethods,['subarray']);
+  for(const Type of [Float32Array,Float64Array]){
+    const data=new Type([1,2,3,4,5]),expected=data.slice();
+    const a=data.subarray(0,4),b=data.subarray(1),ea=expected.subarray(0,4),eb=expected.subarray(1);
+    for(const [flag,start,end] of [[0,0,4],[1,1,-1],[NaN,-Infinity,Infinity]]){
+      assert.equal(app.app.run(a,b,flag,start,end),app.reference.run(ea,eb,flag,start,end));equal(data,expected);
+    }
+  }
+  assert.equal(count(app),6);assert.equal(count(app,'fallbackCalls'),0);
+});
+
 test('callback window islands publish current buffers before upload and retain custom species in place',async t=>{
   const app=await application(t,`
     export const make=(a,b,upload)=>(begin,end)=>{let total=0;
@@ -287,5 +308,33 @@ test('linked application packages execute helper subarrays with retained JavaScr
     `],{encoding:'utf8'});
     assert.ifError(run.error);
     assert.equal(run.status,0,run.stderr);
+  }
+});
+
+test('linked helper-argument windows survive relocation and publish one complete transaction per frame',async t=>{
+  const files=fixture(t);
+  fs.writeFileSync(path.join(files.src,'window.mjs'),`export function edit(from,to){
+    for(let i=0;i<to.length;i++)to[i]+=from[i]/3+1.5;return to[0];
+  }`);
+  fs.writeFileSync(path.join(files.src,'solver.mjs'),`import {edit} from './window.mjs';
+    export function solve(a,b,passes){let total=0;
+      for(let pass=0;pass<passes;pass++)total+=edit(a.subarray(0,-1),b.subarray(1));
+      return total;
+    }
+  `);
+  const build=await buildApplication(files.entry,files.out,{specializeNumeric:true});
+  assert.equal(build.numericSpecialization.compiledLoopIslands,1);
+  const moved=path.join(files.root,'relocated');fs.renameSync(files.out,moved);
+  const entry=pathToFileURL(path.join(moved,build.entryFiles[0])).href,reference=pathToFileURL(path.join(files.src,'frame.mjs')).href;
+  for(const wasm of [true,false]){
+    const run=spawnSync(process.execPath,['--input-type=module','--eval',`
+      import assert from 'node:assert/strict';let calls=0;
+      if(${wasm}){const Native=WebAssembly.Instance;WebAssembly.Instance=function(...args){const instance=Reflect.construct(Native,args);return {exports:{...instance.exports,run(...args){const result=instance.exports.run(...args);calls++;return result;}}};};}
+      else globalThis.WebAssembly=undefined;
+      const module=await (await import(${JSON.stringify(entry)})).load(),reference=await import(${JSON.stringify(reference)});
+      const equal=${equal.toString()};${verifyFrames.toString()}
+      verifyFrames(module,reference,Float32Array);verifyFrames(module,reference,Float64Array);assert.equal(calls,${wasm?40:0});
+    `],{encoding:'utf8'});
+    assert.ifError(run.error);assert.equal(run.status,0,run.stderr);
   }
 });

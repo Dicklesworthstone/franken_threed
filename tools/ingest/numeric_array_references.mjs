@@ -102,6 +102,15 @@ export function createArrayReferenceCompiler({resolveArray, allocateLocal, condi
     return value.emit(target);
   }
   return {
+    argument(node) {
+      const array = resolveArray(node);
+      if (array) return array;
+      // A nonescaping argument expression has the same borrowed-view contract
+      // as a local initializer. Emit its setup at THIS argument's position,
+      // before later arguments may mutate storage or rebind source references.
+      const reference = this.declare(node, false);
+      return reference ? {...reference.binding, setup:reference.bytes} : null;
+    },
     declare(node, mutable) {
       const value = choice(node);
       if (!value) return null;

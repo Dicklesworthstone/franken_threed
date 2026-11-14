@@ -154,7 +154,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       const array = arrays[index];
       if (!array) return emitArgument(arg);
       array.mark(entry.effects[index]);
-      return [...arrayPointer(array), ...arrayLength(array)];
+      return [...(array.setup ?? []), ...arrayPointer(array), ...arrayLength(array)];
     });
     return [...argumentsCode, ...(intrinsics ? intrinsics.localCall(entry.index) : [0x10, ...u32(entry.index)]),
       ...(!resultUsed && entry.resultType !== 'void' ? [0x1a] : [])];
@@ -194,6 +194,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return binding?.type ? binding : null;
     }
     const arrayReferences = createArrayReferenceCompiler({resolveArray, allocateLocal, condition, expression, control, fail, enabled:checkedArrays});
+    const arrayArgument = node => arrayReferences.argument(node);
     const reboundParameters = reboundArrayParameters(fn, owner.parameterTypes), referenceInitializers = [];
     for (const param of fn.params) if (reboundParameters.has(param.name)) {
       const reference = arrayReferences.declare(param, true);
@@ -316,7 +317,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         const intrinsic = intrinsics?.call(node, arg => expression(arg, depth + 1),
           environment.has('Math') || helperSources.has('Math'), () => owner.wasmTypes.length + localCount++);
         if (intrinsic) return intrinsic;
-        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner, loopDepth, resolveArray);
+        return call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name), owner, loopDepth, arrayArgument);
       }
       fail(`Scalar helper expression ${node.type} is not closed`, node);
     }
@@ -326,7 +327,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       if (isNumericBooleanSearchCall(node)) return [...search(node, depth), 0xab];
       if (node.type === 'CallExpression' && node.callee.type === 'Identifier')
         return [...number(0), ...call(node, arg => expression(arg, depth + 1), environment.has(node.callee.name),
-          owner, loopDepth, resolveArray, 'predicate'), 0x99, 0x63];
+          owner, loopDepth, arrayArgument, 'predicate'), 0x99, 0x63];
       if (node.type === 'BinaryExpression' && Object.hasOwn(COMPARE, node.operator)) {
         return [...expression(node.left, depth + 1), ...expression(node.right, depth + 1), COMPARE[node.operator]];
       }
@@ -514,7 +515,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             if (bulk) { bytes.push(...bulk); }
             else if (reduced) { bytes.push(...reduced, 0x1a); }
             else if (update?.type === 'CallExpression' && update.callee.type === 'Identifier') {
-              bytes.push(...call(update, arg => expression(arg), environment.has(update.callee.name), owner, loopDepth, resolveArray, false));
+              bytes.push(...call(update, arg => expression(arg), environment.has(update.callee.name), owner, loopDepth, arrayArgument, false));
             } else if (control && update?.type === 'SequenceExpression') {
               bytes.push(...effects(update, depth + 1));
             } else if (update?.type === 'UpdateExpression' && ['++', '--'].includes(update.operator)) {
