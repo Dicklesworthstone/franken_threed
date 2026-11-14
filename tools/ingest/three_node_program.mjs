@@ -1579,7 +1579,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         // keeps those bindings with their matrix/color owner across reuse.
         Object.keys(object.geometry.morphAttributes).length && (!extension ||
           !instanceExtension && object.count > 1 && object.morphTexture != null) || !extension && object.receiveShadow ||
-        !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
+        !extension && prepared.transparent || prepared.wireframe || !extension && prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (geometrySetup ? ['lightsNode', 'contextNode'] : extension ? ['geometryNode', 'lightsNode', 'contextNode']
           : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||

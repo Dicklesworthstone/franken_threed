@@ -202,6 +202,88 @@ test('custom material keys retain source callback counts through invalidation an
   assert.notEqual(compare(), changed);
 });
 
+for (const registered of [false, true]) for (const back of [false, true]) for (const dispersive of [false, true])
+test(`Physical transmission extensions retain source construction and framebuffer updates (registered=${registered}, back=${back}, dispersion=${dispersive})`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [], updates = [], copies = [];
+  const canvas = {width: 32, height: 24, getDrawingBufferSize(value) { return value.set(this.width, this.height); }};
+  Object.assign(f.renderer, {getCanvasTarget: () => canvas,
+    getDrawingBufferSize: value => canvas.getDrawingBufferSize(value),
+    getViewport: value => value.set(0, 0, canvas.width, canvas.height), getPixelRatio: () => 1,
+    copyFramebufferToTexture(texture) { copies.push({texture, width: texture.image.width,
+      height: texture.image.height, mipmaps: texture.generateMipmaps}); },
+    _getSampledTextureInputs: () => ({prepareFramebuffer(texture, type) { texture.type = type; },
+      layoutOf: ({texture}) => texture.isFramebufferTexture
+        ? {texture: {sampleType: 'float', viewDimension: '2d', multisampled: false}} : null})});
+  const pulse = () => N.uniform(1).onObjectUpdate(frame => {
+    updates.push([frame.object, frame.material, frame.renderer]); return 1;
+  });
+  class Extension extends T.MeshPhysicalNodeMaterial {
+    constructor() { super(); trace.push('construct'); this.applicationGain = .375; this.applicationVariant = 0; this.applicationPulse = pulse(); }
+    customProgramCacheKey() { trace.push(['key', this.side]); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')).mul(this.applicationPulse), output.a));
+    }
+  }
+  class Application extends T.MeshPhysicalMaterial {
+    constructor() { super(); this.type = 'TransmissionApplication'; this.applicationGain = .375; this.applicationVariant = 0; this.applicationPulse = pulse(); }
+    customProgramCacheKey() { trace.push(['key', this.side]); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'TransmissionApplication');
+  const material = new (registered ? Application : Extension)();
+  material.transmission = .75; material.thickness = .4375; material.roughness = .25;
+  material.attenuationDistance = 3.5; material.dispersion = dispersive ? .625 : 0;
+  material.side = back ? T.BackSide : T.FrontSide;
+  const light = new T.AmbientLight(0xffffff, .5); f.scene.add(light); f.lights.setLights([light]);
+  const a = f.add(material), b = f.add(material); trace.length = 0;
+  const phase = item => {
+    const reference = f.reference(item), expectedTrace = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expectedTrace); equalShaders(descriptor, reference);
+    assert.equal(copies.length, 0, 'source construction never captures the framebuffer');
+    const sourcePacket = f.referenceDraw(item, {fullLifecycle: true}), expectedCopies = copies.splice(0), expectedUpdates = updates.splice(0);
+    const packet = f.capture(item, descriptor), actualCopies = copies.splice(0);
+    assert.deepEqual(actualCopies, expectedCopies); assert.deepEqual(updates.splice(0), expectedUpdates);
+    assert.deepEqual(packet.uniforms, sourcePacket.uniforms);
+    assert.deepEqual(packet.textures.filter(binding => binding.isSampledTexture).map(binding => binding.texture), sourcePacket.textures);
+    assert.match(descriptor.fragment, /getVolumeTransmissionRay/); assert.match(descriptor.fragment, /volumeAttenuation/);
+    for (const copy of actualCopies) {
+      assert.equal(copy.mipmaps, true); assert.equal(copy.texture.generateMipmaps, false);
+      assert.ok(sourcePacket.textures.includes(copy.texture));
+    }
+    return {reference, descriptor, packet, copies: actualCopies};
+  };
+  const first = phase(a), other = phase(b), saved = first.packet.uniforms.map(bytes => bytes.slice());
+  assert.equal(first.reference, other.reference, 'equal render objects share the source physical builder');
+  assert.equal(first.copies.length, 1); assert.equal(other.copies.length, 0, 'front/back snapshot copies follow source RENDER frequency');
+  assert.deepEqual([first.copies[0].width, first.copies[0].height], [32, 24]);
+  material.applicationGain = .875; material.transmission = .625; material.thickness = .6875;
+  if (dispersive) material.dispersion = .8125;
+  canvas.width = 48; canvas.height = 40; f.renderer.info.calls++;
+  const changed = phase(a); assert.equal(changed.descriptor, first.descriptor); assert.equal(changed.copies.length, 1);
+  assert.equal(changed.copies[0].texture, first.copies[0].texture);
+  assert.deepEqual([changed.copies[0].width, changed.copies[0].height], [48, 40]);
+  for (const value of [.875, .625, .6875, ...(dispersive ? [.8125] : [])]) assert.ok(values(changed.packet).includes(value));
+  assert.deepEqual(first.packet.uniforms, saved);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(phase(a).descriptor, first.descriptor, 'value-only invalidation retains source setup');
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyed = phase(a), keyedOther = phase(b);
+  assert.notEqual(keyed.reference, first.reference); assert.equal(keyed.reference, keyedOther.reference);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0); f.renderer.info.calls++;
+  assert.notEqual(phase(a).reference, keyed.reference); assert.deepEqual(first.packet.uniforms, saved);
+});
+
+test('transmission extensions require the framebuffer owner before custom shader hooks', t => {
+  const f = fixture(t); let effects = 0;
+  class Extension extends T.MeshPhysicalNodeMaterial {
+    constructor() { super(); this.transmission = .5; }
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  assert.throws(() => f.compile(f.add(new Extension())), {code: 'THREE_NODE_PROGRAM_TRANSMISSION'});
+  assert.equal(effects, 0);
+});
+
 test('generated extension resources and node budgets refuse before publishing a graphics program', t => {
   const f = fixture(t); let setups = 0, updates = 0;
   class WritesStorage extends T.MeshBasicNodeMaterial {

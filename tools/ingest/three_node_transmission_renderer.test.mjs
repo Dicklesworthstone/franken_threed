@@ -216,6 +216,65 @@ test('ordinary Physical transmission submits opaque color, one copy and mips, th
   assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
 });
 
+for (const registered of [false, true])
+test(`custom Physical transmission retains queued front/back copies and live material callbacks (registered=${registered})`, async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f, updates = [];
+  let setups = 0;
+  const pulse = N.uniform(1).setName('customTransmissionPulse').onObjectUpdate(frame => {
+    updates.push([frame.renderer, frame.object, frame.material, frame.renderer.getRenderTarget(), frame.material.side]); return 1;
+  });
+  class Extension extends THREE.MeshPhysicalNodeMaterial {
+    constructor() { super(); this.applicationGain = .15625; this.applicationPulse = pulse; }
+    setupOutput(builder, output) {
+      setups++;
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')).mul(this.applicationPulse), output.a));
+    }
+  }
+  class Application extends THREE.MeshPhysicalMaterial {
+    constructor() { super(); this.type = 'QueuedTransmissionApplication'; this.applicationGain = .15625; this.applicationPulse = pulse; }
+  }
+  if (registered) renderer.library.addMaterial(Extension, 'QueuedTransmissionApplication');
+  const material = new (registered ? Application : Extension)();
+  material.transmission = .75; material.thickness = .0625; material.dispersion = .5;
+  material.side = THREE.DoubleSide; material.color.setRGB(.1875, .3125, .4375);
+  const object = f.mesh(material); object.renderOrder = 1;
+  f.mesh(new THREE.MeshBasicMaterial({color: 0x804020}));
+  const first = new THREE.RenderTarget(16, 16, {type: THREE.HalfFloatType}), second = new THREE.RenderTarget(8, 8, {type: THREE.HalfFloatType});
+  t.after(() => { first.dispose(); second.dispose(); material.dispose(); });
+  renderer.setRenderTarget(first); renderer.render(scene, camera);
+  material.applicationGain = .90625; material.thickness = .5625; material.dispersion = .75;
+  material.color.setRGB(.6875, .8125, .9375);
+  renderer.setRenderTarget(second); renderer.render(scene, camera);
+  assert.deepEqual(updates, [first, first, second, second].map((target, index) =>
+    [renderer, object, material, target, index % 2 === 0 ? THREE.BackSide : THREE.FrontSide]));
+  assert.equal(setups, 2, 'matching target layouts retain one source builder for each side');
+  assert.equal(material.side, THREE.DoubleSide);
+  material.applicationGain = 99; material.thickness = 99; material.color.setRGB(99, 99, 99);
+  renderer.setRenderTarget(null); await renderer.waitForGPU();
+  const recorded = copies(f.events), draws = f.device.snapshots.flat().filter(draw => code(draw).includes('customTransmissionPulse'));
+  assert.equal(draws.length, 4); assert.equal(recorded.length, 4);
+  assert.deepEqual(recorded.map(copy => [copy.size.width, copy.size.height]), [[16, 16], [16, 16], [8, 8], [8, 8]]);
+  assert.equal(new Set(recorded.map(copy => copy.destination.texture)).size, 4);
+  assert.deepEqual(recorded.map(copy => copy.destination.texture.mipLevelCount), [5, 5, 4, 4]);
+  const order = [];
+  for (const event of f.events) {
+    if (event.copy) order.push('copy');
+    else for (const draw of event.draws.filter(draw => draw.indexed))
+      order.push(code(draw).includes('customTransmissionPulse') ? draw.pipeline.primitive.frontFace : 'opaque');
+  }
+  assert.deepEqual(order, ['opaque', 'copy', 'cw', 'copy', 'ccw', 'opaque', 'copy', 'cw', 'copy', 'ccw']);
+  for (const [index, draw] of draws.entries()) {
+    assert.ok(sampled(draw).includes(recorded[index].destination.texture));
+    const values = uniformValues(draw), later = index >= 2;
+    for (const value of later ? [.90625, .5625, .6875] : [.15625, .0625, .1875]) assert.ok(values.includes(value));
+    assert.ok(!values.includes(99)); assert.match(code(draw), /getVolumeTransmissionRay/);
+  }
+  assert.equal(setups, 2); assert.equal(updates.length, 4); assert.equal(object.material, material);
+  assert.equal(renderer._nodeCaptureBytes, 0); assert.equal(renderer._materialCaptureValues, 0);
+  assert.equal(renderer._targets.capture(first).references, 0); assert.equal(renderer._targets.capture(second).references, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.framebuffers.bindings, 0);
+});
+
 test('transmission backfaces precede alpha and fronts, with each snapshot at its source boundary', async t => {
   const f = await fixture(t), {renderer, scene, camera} = f;
   f.mesh(new THREE.MeshBasicMaterial());

@@ -45,6 +45,16 @@ Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
 
+Inherited and registered Physical materials also support transmission and
+dispersion through the existing framebuffer-copy, mipmap and sampled-texture
+owners. Their original setup and node updates retain source identities and
+copy frequency. DoubleSide glass keeps opaque, backface and frontface ordering;
+queued target switches retain distinct sampled generations and accepted material
+uniforms. Eight source-builder combinations match pinned WGSL and lifecycle
+effects, with two public-renderer cases covering both registration routes across
+two target sizes. These are source and recording-device checks, with browser
+pixel and hardware performance validation still open.
+
 Custom instance materials retain the pinned source's per-object builder key: two
 `InstancedMesh` objects sharing one material keep separate matrix and color
 bindings. Small CPU matrix palettes use the existing uniform path; larger palettes
