@@ -898,6 +898,187 @@ test('SkinnedMesh extensions reject malformed skeletons, unsupported attributes 
   assert.deepEqual(accepted.uniforms, saved);
 });
 
+
+function morphItem(f, T, material, {skinned = false, targets = null, relative = false, influences = [.125, .375]} = {}) {
+  const item = skinned ? skinnedItem(f, T, material) : f.add(material), geometry = item.object.geometry;
+  if (targets) geometry.morphAttributes = targets;
+  else {
+    geometry.morphAttributes.position = [.5, 1.5].map(height => {
+      const attribute = geometry.attributes.position.clone();
+      for (let index = 0; index < attribute.count; index++) attribute.setZ(index, height);
+      return attribute;
+    });
+    geometry.morphAttributes.normal = [.25, .75].map(offset => {
+      const attribute = geometry.attributes.normal.clone();
+      for (let index = 0; index < attribute.count; index++) attribute.setY(index, offset);
+      return attribute;
+    });
+    geometry.morphAttributes.color = [.5, .875].map(alpha => new T.Float32BufferAttribute(
+      Array.from({length: geometry.attributes.position.count}, () => [.25, .5, .75, alpha]).flat(), 4));
+  }
+  geometry.morphTargetsRelative = relative;
+  item.object.updateMorphTargets(); item.object.morphTargetInfluences = influences.slice();
+  return item;
+}
+function morphTexture(packet) {
+  return packet.textures.find(binding => binding.isSampledTexture && binding.texture.isDataArrayTexture)?.texture;
+}
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const skinned of [false, true])
+test((registered ? 'registered' : 'inherited') + ' ' + family + ' morph extensions share source targets with skinned=' + skinned, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.material === builder.context.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'MorphExtension'; this.applicationGain = .375; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'MorphExtension');
+  const material = new (registered ? Application : Extension)(), a = morphItem(f, T, material, {skinned}),
+    b = morphItem(f, T, material, {skinned, targets: a.object.geometry.morphAttributes, relative: true, influences: [.25, .5]});
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'cache keys and setup follow the source construction boundaries');
+    equalInstanceShaders(descriptor, reference);
+    return {reference, descriptor};
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.notEqual(a.object.geometry, b.object.geometry);
+  assert.equal(firstA.reference, firstB.reference, 'identical target attribute IDs share construction across geometry identities');
+  assert.notEqual(firstA.descriptor, firstB.descriptor, 'each source render object keeps its own bindings');
+  assert.match(firstA.descriptor.vertex, /textureLoad/);
+  const capture = (item, descriptor) => {
+    const expected = f.referenceDraw(item, {fullLifecycle: true}), packet = f.capture(item, descriptor),
+      atlas = morphTexture(packet);
+    assert.equal(atlas, expected.textures.find(texture => texture.isDataArrayTexture));
+    assert.equal(atlas.image.depth, 2);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return packet;
+  };
+  const acceptedA = capture(a, firstA.descriptor), acceptedB = capture(b, firstB.descriptor),
+    savedA = acceptedA.uniforms.map(bytes => bytes.slice()), savedB = acceptedB.uniforms.map(bytes => bytes.slice()),
+    atlas = morphTexture(acceptedA), atlasBytes = atlas.image.data.slice();
+  assert.equal(morphTexture(acceptedB), atlas);
+  assert.equal(atlas.image.width, a.object.geometry.attributes.position.count * 3,
+    'source packing retains position, normal and four-component color target streams');
+  material.applicationGain = .875;
+  a.object.morphTargetInfluences = new Float32Array([.75, 0]);
+  b.object.morphTargetInfluences = [.5, .25];
+  a.object.geometry.morphTargetsRelative = true; b.object.geometry.morphTargetsRelative = false;
+  if (skinned) {
+    a.object.skeleton.bones[0].position.x = 7; b.object.skeleton.bones[0].position.x = 19;
+    f.scene.updateMatrixWorld();
+  }
+  f.renderer.info.calls++;
+  assert.equal(compare(b).descriptor, firstB.descriptor); assert.equal(compare(a).descriptor, firstA.descriptor);
+  const changedB = capture(b, firstB.descriptor), changedA = capture(a, firstA.descriptor);
+  assert.ok(values(changedA).includes(.875)); assert.ok(values(changedB).includes(.875));
+  assert.notDeepEqual(changedA.uniforms, savedA); assert.notDeepEqual(changedB.uniforms, savedB);
+  if (skinned) { assert.ok(values(changedA).includes(7)); assert.ok(values(changedB).includes(19)); }
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+  assert.deepEqual(atlas.image.data, atlasBytes, 'live weights and skeletal animation never repack source targets');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor); assert.equal(compare(b).descriptor, firstB.descriptor);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0); f.renderer.info.calls++;
+  const rebuiltA = compare(a), rebuiltB = compare(b);
+  assert.notEqual(rebuiltA.reference, firstA.reference); assert.equal(rebuiltA.reference, rebuiltB.reference);
+  assert.equal(morphTexture(capture(a, rebuiltA.descriptor)), atlas, 'material disposal retains the geometry-owned source atlas');
+});
+
+for (const skinned of [false, true])
+test('morph extensions preserve source target-ID invalidation and geometry atlas disposal with skinned=' + skinned, t => {
+  const T = SourceThree, f = fixture(t, {}, T), trace = [];
+  class Extension extends T.MeshStandardNodeMaterial {
+    constructor() { super(); this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) { trace.push('setup'); return super.setupOutput(builder, output); }
+  }
+  const material = new Extension(), item = morphItem(f, T, material, {skinned}), geometry = item.object.geometry;
+  const phase = () => {
+    const source = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected); equalInstanceShaders(descriptor, source);
+    const sourcePacket = f.referenceDraw(item), packet = f.capture(item, descriptor), atlas = morphTexture(packet);
+    assert.equal(atlas, sourcePacket.textures.find(texture => texture.isDataArrayTexture));
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return {source, descriptor, packet, atlas};
+  };
+  const first = phase(), firstBytes = first.atlas.image.data.slice(), saved = first.packet.uniforms.map(bytes => bytes.slice());
+  geometry.morphAttributes.position[0].setZ(0, 9); geometry.morphAttributes.position[0].needsUpdate = true;
+  f.renderer.info.calls++;
+  assert.equal(phase().descriptor, first.descriptor); assert.deepEqual(first.atlas.image.data, firstBytes);
+  geometry.morphAttributes.position[0] = geometry.morphAttributes.position[0].clone();
+  f.renderer.info.calls++;
+  assert.equal(phase().descriptor, first.descriptor, 'target identity changes wait for source material invalidation');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const replaced = phase();
+  assert.notEqual(replaced.source, first.source); assert.notEqual(replaced.descriptor, first.descriptor);
+  assert.equal(replaced.atlas, first.atlas, 'same-count target replacement preserves geometry-cached packed data');
+  geometry.dispose(); f.renderer.info.calls++;
+  assert.equal(phase().descriptor, replaced.descriptor);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(phase().descriptor, replaced.descriptor, 'version-only invalidation retains the disposed graph texture');
+  assert.deepEqual(first.atlas.image.data, firstBytes);
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const repacked = phase();
+  assert.notEqual(repacked.source, replaced.source); assert.notEqual(repacked.atlas, first.atlas);
+  assert.equal(repacked.atlas.image.data[2], 9);
+  assert.deepEqual(first.atlas.image.data, firstBytes); assert.deepEqual(first.packet.uniforms, saved);
+  for (const targets of Object.values(geometry.morphAttributes)) targets.push(targets[1].clone());
+  item.object.morphTargetInfluences = [.125, .25, .5];
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const expanded = phase();
+  assert.notEqual(expanded.source, repacked.source); assert.notEqual(expanded.atlas, repacked.atlas);
+  assert.equal(expanded.atlas.image.depth, 3);
+});
+
+test('morph extensions use the source indexed target key without invoking application iterators', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {}
+  const item = morphItem(f, T, new Extension());
+  for (const targets of Object.values(item.object.geometry.morphAttributes)) {
+    targets[Symbol.iterator] = () => { effects++; throw new Error('application target iterator'); };
+  }
+  const reference = f.reference(item), descriptor = f.compile(item);
+  equalInstanceShaders(descriptor, reference);
+  f.referenceDraw(item); equalInstanceUniforms(f, item, descriptor, f.capture(item, descriptor));
+  assert.equal(effects, 0);
+});
+
+test('morph extensions reject malformed targets and keep instanced morph construction outside the profile', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const material = new Extension(), item = morphItem(f, T, material),
+    targets = item.object.geometry.morphAttributes.position, influences = item.object.morphTargetInfluences;
+  item.object.morphTargetInfluences = [1];
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
+  item.object.morphTargetInfluences = influences;
+  targets[1] = new T.Float32BufferAttribute([1, 2, 3], 3);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
+  targets[1] = targets[0].clone();
+  item.object.count = 2;
+  item.object.morphTexture = new T.DataTexture(new Float32Array(24), 3, 2, T.RGBAFormat, T.FloatType);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  item.object.count = 1; item.object.morphTexture = null;
+  const instances = instanceItem(f, T, material);
+  instances.object.geometry.morphAttributes = item.object.geometry.morphAttributes;
+  instances.object.morphTargetInfluences = influences.slice();
+  assert.throws(() => f.compile(instances), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  const descriptor = f.compile(item), accepted = f.capture(item, descriptor), saved = accepted.uniforms.map(bytes => bytes.slice()),
+    acceptedEffects = effects;
+  item.object.morphTargetInfluences = [1];
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(effects, acceptedEffects); assert.deepEqual(accepted.uniforms, saved);
+});
+
 for (const registered of [false, true])
 test((registered ? 'registered' : 'inherited') + ' SkinnedMesh extensions share source large-skeleton texture construction with live owners', t => {
   const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];

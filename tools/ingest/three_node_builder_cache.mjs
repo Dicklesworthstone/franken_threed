@@ -47,8 +47,9 @@ export function threeNodeBuilderMaterialKey(three, renderer, object, material, c
       if (attribute.normalized) key += 'n,';
     }
     for (const name of Object.keys(geometry.morphAttributes).sort()) {
+      const targets = geometry.morphAttributes[name];
       key += 'morph-' + name + ',';
-      for (const attribute of geometry.morphAttributes[name]) key += attribute.id + ',';
+      for (let index = 0, length = targets.length; index < length; index++) key += targets[index].id + ',';
     }
     if (geometry.index) key += 'index,';
   }

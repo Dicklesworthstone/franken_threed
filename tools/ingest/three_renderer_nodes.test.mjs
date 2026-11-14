@@ -1897,8 +1897,10 @@ function customSkinnedMesh(f,material,count=2){
 const customSkinnedDraws=device=>nativeDraws(device).filter(draw=>
   /skinIndex/.test(draw.pipeline.vertex.module.code));
 function skinPalette(draw){
-  const declaration=/((?:@(?:group|binding)\s*\(\s*\d+\s*\)\s*){2})var<uniform>\s+NodeBuffer_\d+\s*:/
-    .exec(draw.pipeline.vertex.module.code);
+  const code=draw.pipeline.vertex.module.code;
+  const name=/struct\s+(NodeBuffer_\d+)Struct\s*\{\s*value\s*:\s*array<\s*mat4x4<f32>/.exec(code)?.[1];
+  const declaration=[...code.matchAll(/((?:@(?:group|binding)\s*\(\s*\d+\s*\)\s*){2})var<uniform>\s+(NodeBuffer_\d+)\s*:/g)]
+    .find(match=>match[2]===name);
   assert.ok(declaration,'source skinning exposes its uniform palette');
   const groupIndex=Number(/@group\s*\(\s*(\d+)/.exec(declaration[1])[1]);
   const binding=Number(/@binding\s*\(\s*(\d+)/.exec(declaration[1])[1]);
@@ -2007,4 +2009,117 @@ test('custom SkinnedMesh materials capture bone textures above the device unifor
     .map(write=>new Float32Array(write.bytes.buffer,write.bytes.byteOffset,write.bytes.byteLength/4));
   assert.deepEqual(palettes.map(words=>words[1024*16+14]),[.25,.75]);
   assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+function customMorphTargets(mesh,relative=false){
+  const geometry=mesh.geometry;geometry.morphTargetsRelative=relative;
+  for(const name of ['position','normal'])geometry.morphAttributes[name]=[0,1].map(target=>
+    new T.Float32BufferAttribute(Array.from(geometry.attributes[name].array,(value,component)=>
+      (relative?0:value)+(component%3===target?(name==='position'?.25:.125):0)),3));
+  mesh.updateMorphTargets();mesh.morphTargetInfluences.splice(0,2,.25,.5);
+  mesh.frustumCulled=false;return geometry;
+}
+const customMorphDraws=device=>nativeDraws(device).filter(draw=>
+  /texture_2d_array<f32>/.test(draw.pipeline.vertex.module.code));
+function capturedMorphWeights(draw){
+  assert.match(draw.pipeline.vertex.module.code,/value : array< vec4<f32>, 2 >/);
+  const words=uniformBlocks(draw).find(block=>block.length===8);
+  assert.ok(words,'source morph weights retain their padded raw buffer');
+  assert.deepEqual([words[1],words[2],words[3],words[5],words[6],words[7]],[0,0,0,0,0,0]);
+  return [words[0],words[4]];
+}
+
+for(const registered of [false,true])for(const skinned of [false,true])
+test(`custom ${registered?'registered':'inherited'} morph materials capture queued weights with skinning=${skinned}`,async t=>{
+  const f=fixture(t),setups=[];f.device.limits.maxTextureArrayLayers=256;
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor(){super();this.applicationGain=.375;}
+    setupOutput(builder,output){
+      setups.push(builder.object);
+      return super.setupOutput(builder,T.TSL.vec4(
+        output.rgb.mul(T.TSL.materialReference('applicationGain','float')),output.a));
+    }
+  }
+  if(registered)f.renderer.library.materialNodes.set('MeshBasicMaterial',Extension);
+  const material=registered?new T.MeshBasicMaterial():new Extension();material.applicationGain=.375;
+  const item=skinned?customSkinnedMesh(f,material):{mesh:f.mesh,geometry:f.mesh.geometry};
+  item.mesh.material=material;customMorphTargets(item.mesh);t.after(()=>item.geometry.dispose());
+  await f.renderer.init();
+  if(skinned)item.bones[1].position.x=.125;
+  f.renderer.render(f.scene,f.camera);
+  item.mesh.morphTargetInfluences=[1.25,-.5];item.geometry.morphTargetsRelative=true;
+  material.applicationGain=.625;if(skinned)item.bones[1].position.x=.875;
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  item.mesh.morphTargetInfluences.fill(99);material.applicationGain=99;
+  if(skinned)item.mesh.skeleton.boneMatrices.fill(99);
+  await drain(f.renderer);
+  const draws=customMorphDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(capturedMorphWeights),[[.25,.5],[1.25,-.5]]);
+  assert.ok(uniformBlocks(draws[0]).flat().includes(.375));
+  assert.ok(uniformBlocks(draws[1]).flat().includes(.625));
+  if(skinned){
+    assert.deepEqual(draws.map(draw=>skinPalette(draw)[28]),[.125,.875]);
+    assert.ok(draws.every(draw=>draw.pipeline.vertex.module.code.indexOf('textureLoad')<
+      draw.pipeline.vertex.module.code.indexOf('skinWeight.x')));
+  }
+  assert.equal(draws[0].pipeline,draws[1].pipeline);
+  assert.deepEqual(setups,[item.mesh]);assert.equal(item.mesh.material,material);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom morph materials share the source atlas and construction while capturing independent object weights',async t=>{
+  const f=fixture(t),setups=[];f.device.limits.maxTextureArrayLayers=256;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){setups.push(builder.object);return super.setupOutput(builder,output);}
+  }
+  const material=new Extension(),left=f.mesh;left.material=material;customMorphTargets(left);
+  const right=new T.Mesh(new T.PlaneGeometry(),material);right.frustumCulled=false;
+  right.geometry.morphAttributes={...left.geometry.morphAttributes};
+  right.geometry.morphTargetsRelative=true;right.updateMorphTargets();right.morphTargetInfluences=[.75,-.25];
+  left.renderOrder=-1;right.renderOrder=1;f.scene.add(right);
+  t.after(()=>{left.geometry.dispose();right.geometry.dispose();});
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(customMorphDraws(f.device).length,0);
+  f.renderer.render(f.scene,f.camera);left.morphTargetInfluences.fill(99);right.morphTargetInfluences.fill(99);
+  await drain(f.renderer);
+  const draws=customMorphDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(capturedMorphWeights),[[.25,.5],[.75,-.25]]);
+  assert.deepEqual(setups,[left]);
+  assert.equal(draws[0].pipeline.vertex.module.code,draws[1].pipeline.vertex.module.code);
+  const atlases=new Set(f.device.textureWrites.filter(write=>write.destination.texture.format==='rgba32float')
+    .map(write=>write.destination.texture));
+  assert.equal(atlases.size,1,'shared target identities retain the first source geometry atlas');
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom morph materials retain source atlas lifetime and queued reconstruction',async t=>{
+  const f=fixture(t);let setups=0;f.device.limits.maxTextureArrayLayers=256;
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor(){super();this.applicationVariant=0;}
+    customProgramCacheKey(){return super.customProgramCacheKey()+':'+this.applicationVariant;}
+    setupOutput(builder,output){setups++;return super.setupOutput(builder,output);}
+  }
+  const material=new Extension(),mesh=f.mesh;mesh.material=material;
+  const geometry=customMorphTargets(mesh),target=geometry.morphAttributes.position[0];
+  t.after(()=>geometry.dispose());await f.renderer.init();
+  f.renderer.render(f.scene,f.camera);await f.renderer.waitForGPU();
+  // Explicit texture disposal invalidates queued sampled uses; finish that draw
+  // before geometry.dispose dispatches the source atlas texture's dispose event.
+  target.array[0]=5;target.needsUpdate=true;geometry.dispose();material.needsUpdate=true;
+  f.renderer.render(f.scene,f.camera);
+  assert.equal(setups,1,'version-only invalidation retains the source graph and packed atlas');
+  material.applicationVariant=1;material.needsUpdate=true;f.renderer.render(f.scene,f.camera);
+  target.array[0]=99;mesh.morphTargetInfluences.fill(99);await drain(f.renderer);
+  const draws=customMorphDraws(f.device);assert.equal(draws.length,3);
+  assert.deepEqual(draws.map(capturedMorphWeights),[[.25,.5],[.25,.5],[.25,.5]]);
+  const generations=new Map();
+  for(const write of f.device.textureWrites)if(write.destination.texture.format==='rgba32float'&&
+    !generations.has(write.destination.texture))
+    generations.set(write.destination.texture,new Float32Array(write.bytes.buffer,write.bytes.byteOffset,write.bytes.byteLength/4)[0]);
+  assert.deepEqual(draws.map(draw=>{
+    const textures=[...draw.groups.values()].flatMap(({group})=>group.entries)
+      .map(entry=>entry.resource?.texture).filter(texture=>texture?.format==='rgba32float');
+    assert.equal(new Set(textures).size,1);return generations.get(textures[0]);
+  }),[-.25,-.25,5]);
+  assert.equal(setups,2);assert.equal(f.renderer._nodeCaptureBytes,0);
 });

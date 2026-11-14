@@ -1562,7 +1562,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
         Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension || object.geometry.isInstancedBufferGeometry ||
-        Object.keys(object.geometry.morphAttributes).length || !extension && object.receiveShadow ||
+        // Morph.js owns ordinary target atlases and live influence uniforms.
+        // Per-instance morph textures retain their separate construction boundary.
+        Object.keys(object.geometry.morphAttributes).length && (!extension || instanceExtension ||
+          object.count > 1 && object.morphTexture != null) || !extension && object.receiveShadow ||
         !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (geometrySetup ? ['lightsNode', 'contextNode'] : extension ? ['geometryNode', 'lightsNode', 'contextNode']

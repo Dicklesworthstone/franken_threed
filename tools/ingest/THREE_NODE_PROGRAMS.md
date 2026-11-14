@@ -34,9 +34,9 @@ Custom subclasses of supported node-material families and ordinary materials
 registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
-profile covers ordinary meshes, CPU-backed `InstancedMesh` and `SkinnedMesh`
-objects without morph targets, with opaque or transparent, single-output
-materials and float geometry attributes (plus Uint16/Uint32 skin indices),
+profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
+morph targets), plus CPU-backed `InstancedMesh`, with opaque or transparent,
+single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
@@ -67,9 +67,21 @@ once-per-frame behavior. Skeletons above the device uniform limit use the pinned
 bone-texture path, with captured texture generations for pending draws.
 Material invalidation and disposal retain source construction lifetimes.
 
-Storage-backed custom instances, custom mesh subclasses, instanced geometries
-and custom morph materials remain outside this extension slice; their ordinary
-built-in paths keep their existing support.
+Custom morph materials on ordinary meshes and skinned meshes reuse the pinned
+atlas packing and target-attribute identity keys. Distinct geometries referencing
+the same target attributes share source construction and its first atlas, while
+each draw captures its own weights, relative-mode base and skeletal palette.
+Target lists use the source's indexed traversal without invoking application
+array iterators. Same-count edits retain the existing packed atlas; geometry
+disposal clears future packing, and actual source-key reconstruction repacks
+current data. Version-only invalidation retains the existing graph and atlas.
+Queued draws preserve accepted weights and uniforms. As with the existing
+sampled-texture owner, explicit atlas disposal invalidates queued sampled uses;
+complete pending work before geometry disposal dispatches that event.
+
+Storage-backed custom instances, custom mesh subclasses, instanced geometries,
+morphing on custom instance materials and per-instance morph textures remain
+outside this extension slice; their ordinary built-in paths keep their existing support.
 
 Admission uses the nearest pinned material-family defaults without running a
 custom conversion constructor. The actual source builder performs conversion
