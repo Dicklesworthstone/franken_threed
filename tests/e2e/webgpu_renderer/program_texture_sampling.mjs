@@ -141,6 +141,31 @@ async function capture(mode) {
             try {await draw((signed ? 'i' : 'u') + dimension + '-fetch-offset', value);} finally {value.dispose(); texture.dispose();}
           }
         }
+        const samplerImages = [17, 71].map(shift => {
+          const data = Uint8Array.from({length: 16}, (_, i) => i % 4 === 3 ? 255 : (i * 13 + shift) % 256);
+          const texture = new T.DataTexture(data, 2, 2);
+          texture.minFilter = texture.magFilter = T.NearestFilter;
+          texture.wrapS = shift === 17 ? T.RepeatWrapping : T.MirroredRepeatWrapping;
+          texture.generateMipmaps = false; texture.needsUpdate = true;
+          return texture;
+        });
+        try {
+          const helpers = `uniform sampler2D images[2];
+            vec4 pair(sampler2D maps[2],vec2 p){vec4 a=texture(maps[0],p);vec4 b=texture(maps[maps.length()-1],p);return vec4(a.r,b.g,a.b,b.a);}
+            vec4 forward(sampler2D maps[2],vec2 p){return pair(maps,p);}`;
+          const fragment = 'precision highp float;in vec2 vUv;out vec4 color;' + helpers +
+            'void main(){color=forward(images,vUv*vec2(2.5,1.5)-vec2(.25));}';
+          const vertexSample = 'precision highp float;in vec3 position;flat out vec4 sampleColor;' + helpers +
+            'void main(){sampleColor=forward(images,vec2(.25,.75));gl_Position=vec4(position.xy,0.,1.);}';
+          for (const [name, shader, vs] of [
+            ['sampler-array-fragment', fragment, vertex],
+            ['sampler-array-vertex', 'precision highp float;flat in vec4 sampleColor;out vec4 color;void main(){color=sampleColor;}', vertexSample],
+          ]) {
+            const value = material(samplerImages[0], shader, vs);
+            value.uniforms = {images: {value: samplerImages}};
+            try {await draw(name, value);} finally {value.dispose();}
+          }
+        } finally {for (const texture of samplerImages) texture.dispose();}
         // Every RGBA scalar format uses the same source component ranges.
         // Padded rows and partial first allocation must preserve unrequested
         // pixels through both WebGL and the new texture residency owner.
@@ -290,6 +315,9 @@ try {
     assert.notDeepEqual(frame(label + '-initial'), frame(label + '-requested'), 'requested scalar ranges reach the sampled texture');
     assert.notDeepEqual(frame(label + '-requested'), frame(label + '-full'), 'a full request publishes remaining scalar pixels');
   }
+  assert.ok(frame('sampler-array-vertex').every((value, index) => value === [121, 188, 147, 255][index % 4]),
+    'vertex array forwarding samples both source textures at base level');
+  assert.notDeepEqual(frame('sampler-array-fragment'), frame('sampler-array-vertex'), 'fragment array forwarding retains varying coordinates');
   assert.notDeepEqual(frame('2D-proj'), frame('2D-proj-bias'), 'projection bias selects another source mip');
   assert.notDeepEqual(frame('2D-offset'), frame('2D-offset-bias'), 'offset bias selects another source mip');
   assert.deepEqual(frame('2D-proj'), frame('2D-proj-vec3'), '2D vec4 projection ignores its third component');

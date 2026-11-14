@@ -359,6 +359,146 @@ test('combined samplers split into texture/sampler bindings, also as function pa
   assert.throws(() => program(minimalVS, F('int i = 1; color = texture(shadows[i], vec3(0.5));', 'uniform sampler2DShadow shadows[2];')), /constant/);
 });
 
+test('sampler array parameters forward original texture handles through nested and scalar helpers', () => {
+  const r = program(minimalVS, F('color = forward(images, vec2(0.5));', `
+    uniform sampler2D images[2];
+    vec4 leaf(sampler2D image, vec2 uv) { return texture(image, uv); }
+    vec4 pair(sampler2D maps[2], vec2 uv) {
+      const int last = maps.length() - 1;
+      return leaf(maps[0], uv) + leaf(maps[last], uv);
+    }
+    vec4 forward(const sampler2D maps[2], vec2 uv) { return pair((maps), uv); }
+  `));
+  assert.deepEqual(r.reflection.textures.map(t => [t.name, t.element, t.textureBinding, t.samplerBinding]),
+    [['images', 0, 0, 1], ['images', 1, 2, 3]]);
+  assert.match(r.fragment, /fn pair\(f3d_samplers_0_0_texture: texture_2d<f32>, f3d_samplers_0_0_sampler: sampler, f3d_samplers_0_1_texture: texture_2d<f32>, f3d_samplers_0_1_sampler: sampler, uv_in: vec2<f32>\)/);
+  assert.match(r.fragment, /leaf\(f3d_samplers_0_0_texture, f3d_samplers_0_0_sampler,/);
+  assert.match(r.fragment, /leaf\(f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler,/);
+  assert.match(r.fragment, /return pair\(f3d_samplers_0_0_texture, f3d_samplers_0_0_sampler, f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler,/);
+  assert.match(r.fragment, /forward\(images_0_texture, images_0_sampler, images_1_texture, images_1_sampler,/);
+  assert.doesNotMatch(r.fragment, /array<texture_|array<sampler|undefined|null/);
+});
+
+test('sampler array overloads retain element type, count and matching prototypes', () => {
+  const r = program(minimalVS, F('color = readSet(single, vec2(0.5)) + readSet(pair, vec2(0.5)) + readSet(cubes, vec3(1.0));', `
+    uniform sampler2D single[1], pair[2];
+    uniform samplerCube cubes[2];
+    vec4 readSet(sampler2D maps[2], vec2 uv);
+    vec4 readSet(sampler2D maps[1], vec2 uv) { return texture(maps[0], uv); }
+    vec4 readSet(sampler2D maps[2], vec2 uv) { return texture(maps[1], uv); }
+    vec4 readSet(samplerCube maps[2], vec3 direction) { return texture(maps[1], direction); }
+  `));
+  assert.match(r.fragment, /fn readSet_sampler2D1_vec2\(/);
+  assert.equal((r.fragment.match(/fn readSet_sampler2D2_vec2\(/g) ?? []).length, 1);
+  assert.match(r.fragment, /fn readSet_samplerCube2_vec3\(/);
+  assert.match(r.fragment, /readSet_sampler2D1_vec2\(single_0_texture, single_0_sampler,/);
+  assert.match(r.fragment, /readSet_sampler2D2_vec2\(pair_0_texture, pair_0_sampler, pair_1_texture, pair_1_sampler,/);
+  assert.match(r.fragment, /readSet_samplerCube2_vec3\(cubes_0_texture, cubes_0_sampler, cubes_1_texture, cubes_1_sampler,/);
+  for (const uniform of ['sampler2D images[1]', 'samplerCube images[2]', 'sampler2D images', 'float images[2]'])
+    assert.throws(() => program(minimalVS, F('color = readSet(images);',
+      'uniform ' + uniform + '; vec4 readSet(sampler2D maps[2]) { return texture(maps[0], vec2(0.5)); }')), /No matching overload/);
+});
+
+test('sampler array parameters preserve each integer and shadow sampling control through forwarding', () => {
+  for (const [type, result, coordinate, sampleType] of [
+    ['isampler2D', 'ivec4', 'vec2', 'sint'],
+    ['usampler3D', 'uvec4', 'vec3', 'uint'],
+    ['usamplerCube', 'uvec4', 'vec3', 'uint'],
+  ]) {
+    const r = program(minimalVS, F('color = vec4(forward(images, ' + coordinate + '(0.5)));', `
+      uniform highp ${type} images[2];
+      ${result} leaf(${type} image, ${coordinate} p) { return texture(image, p); }
+      ${result} pair(${type} maps[2], ${coordinate} p) { return leaf(maps[1], p); }
+      ${result} forward(${type} maps[2], ${coordinate} p) { return pair(maps, p); }
+    `));
+    assert.deepEqual(r.reflection.textures.map(t => [t.sampleType, t.samplingOffset]), [[sampleType, 64], [sampleType, 80]]);
+    assert.match(r.fragment, /f3d_samplers_0_0_sampling: vec4<u32>/);
+    assert.match(r.fragment, /f3d_samplers_0_1_sampling: vec4<u32>/);
+    assert.match(r.fragment, /leaf\(f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler, f3d_samplers_0_1_sampling,/);
+    assert.match(r.fragment, /pair\(f3d_samplers_0_0_texture, f3d_samplers_0_0_sampler, f3d_samplers_0_0_sampling, f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler, f3d_samplers_0_1_sampling,/);
+    assert.match(r.fragment, /forward\(images_0_texture, images_0_sampler, f3d_u\.f3d_sampling_0, images_1_texture, images_1_sampler, f3d_u\.f3d_sampling_1,/);
+  }
+  const r = program(minimalVS, F('color = vec4(forward(shadows, vec3(0.5)));', `
+    uniform highp sampler2DShadow shadows[2];
+    float pair(sampler2DShadow maps[2], vec3 p) { return texture(maps[0], p) + texture(maps[1], p); }
+    float forward(sampler2DShadow maps[2], vec3 p) { return pair(maps, p); }
+  `));
+  assert.match(r.fragment, /f3d_samplers_0_0_sampler: sampler_comparison/);
+  assert.match(r.fragment, /f3d_samplers_0_1_sampler: sampler_comparison/);
+  for (const element of [0, 1])
+    assert.match(r.fragment, new RegExp('textureSampleCompare\\(f3d_samplers_0_' + element + '_texture, f3d_samplers_0_' + element + '_sampler,.*f3d_samplers_0_' + element + '_depth_reference_clamp != 0u'));
+  assert.match(r.fragment, /pair\(f3d_samplers_0_0_texture, f3d_samplers_0_0_sampler, f3d_samplers_0_0_depth_reference_clamp, f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler, f3d_samplers_0_1_depth_reference_clamp,/);
+  assert.match(r.fragment, /forward\(shadows_0_texture, shadows_0_sampler, f3d_u\.f3d_depth_reference_clamp_0\.x, shadows_1_texture, shadows_1_sampler, f3d_u\.f3d_depth_reference_clamp_1\.x,/);
+});
+
+test('sampler arrays preserve ordinary argument effects and avoid source parameter name collisions', () => {
+  const r = program(minimalVS, F('color = combine(images, next(), images, next());', `
+    uniform sampler2D images[2];
+    int calls = 0;
+    float next() { calls++; return float(calls); }
+    vec4 combine(sampler2D maps[2], float maps_0_texture, sampler2D other[2], float last) {
+      return texture(maps[0], vec2(maps_0_texture)) + texture(other[1], vec2(last));
+    }
+  `));
+  assert.match(r.fragment, /f3d_samplers_0_0_texture: texture_2d<f32>/);
+  assert.match(r.fragment, /maps_0_texture_in: f32/);
+  assert.match(r.fragment, /f3d_samplers_5_1_texture: texture_2d<f32>/);
+  const body = r.fragment.slice(r.fragment.indexOf('fn main_()'), r.fragment.indexOf('@fragment'));
+  const calls = [...body.matchAll(/let (f3d_t\d+) = next\(\);/g)];
+  assert.equal(calls.length, 2);
+  assert.match(body, new RegExp('combine\\(images_0_texture, images_0_sampler, images_1_texture, images_1_sampler, ' +
+    calls[0][1] + ', images_0_texture, images_0_sampler, images_1_texture, images_1_sampler, ' + calls[1][1] + '\\)'));
+  assert.ok(calls[0].index < calls[1].index && calls[1].index < body.indexOf('color = combine('));
+});
+
+test('sampler array parameters retain vertex level-zero sampling and the ESSL 1.00 entrance', () => {
+  const r = program(`
+    attribute vec3 position; uniform sampler2D images[2]; varying vec4 value;
+    vec4 readSet(sampler2D maps[2], vec2 uv) { return texture2D(maps[1], uv); }
+    void main() { value = readSet(images, position.xy); gl_Position = vec4(position, 1.0); }
+  `, `
+    precision highp float; uniform sampler2D images[2]; varying vec4 value;
+    vec4 readSet(sampler2D maps[2], vec2 uv) { return texture2D(maps[0], uv); }
+    void main() { gl_FragColor = value + readSet(images, vec2(0.5)); }
+  `);
+  assert.equal(r.reflection.textures.length, 2);
+  assert.match(r.vertex, /textureSampleLevel\(f3d_samplers_0_1_texture, f3d_samplers_0_1_sampler, uv, 0\.0\)/);
+  assert.match(r.fragment, /textureSample\(f3d_samplers_0_0_texture, f3d_samplers_0_0_sampler, uv\)/);
+});
+
+test('sampler array parameters reject invalid selectors, qualifiers, sizes and unbounded expansion', () => {
+  for (const index of ['-1', '2', '0.0', 'true', 'index', 'int(gl_FragCoord.x)'])
+    assert.throws(() => program(minimalVS, F('color = vec4(1.0);', `
+      vec4 readSet(sampler2D maps[2], int index) { return texture(maps[${index}], vec2(0.5)); }
+    `)), /Sampler array index/, index);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+    'vec4 readSet(sampler2D maps[2]) { return texture(maps, vec2(0.5)); }')), /Sampler arrays must be indexed/);
+  for (const qualifier of ['out', 'inout']) for (const suffix of ['', '[2]'])
+    assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+      'void invalid(' + qualifier + ' sampler2D maps' + suffix + ') {}')), /Samplers cannot be out or inout/);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+    'void invalid(sampler2D maps[2.0]) {}')), /Sampler array parameters require a positive constant integer size/);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+    'void invalid(sampler2D maps[2147483647]) {}')), /Sampler parameter expansion exceeds 4096 elements/);
+  assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
+    'void invalid(sampler2D first[2048], sampler2D second[2049]) {}')), /Sampler parameter expansion exceeds 4096 elements/);
+});
+
+test('unnamed mixed sampler parameters preserve resource, value and pointer arguments', () => {
+  const r = program(minimalVS, F('color = unused(images, images[0], 2.0);',
+    'uniform sampler2D images[2]; vec4 unused(sampler2D[2], sampler2D, float) { return vec4(1.0); }'));
+  assert.match(r.fragment, /fn unused\(f3d_samplers_0_0_texture: texture_2d<f32>, f3d_samplers_0_0_sampler: sampler, f3d_samplers_0_1_texture: texture_2d<f32>, f3d_samplers_0_1_sampler: sampler, f3d_samplers_4_texture: texture_2d<f32>, f3d_samplers_4_sampler: sampler, f3d_parameter_6_in: f32\)/);
+  assert.match(r.fragment, /unused\(images_0_texture, images_0_sampler, images_1_texture, images_1_sampler, images_0_texture, images_0_sampler, f3d_t\d+\)/);
+  assert.doesNotMatch(r.fragment, /var f3d_parameter_/);
+  for (const qualifier of ['out', 'inout']) {
+    const pointer = program(minimalVS, F('float target = 3.0; unused(images, 2.0, target); color = vec4(1.0);',
+      'uniform sampler2D images[2]; void unused(sampler2D[2], float, ' + qualifier + ' float) {}'));
+    assert.match(pointer.fragment, /f3d_parameter_4_in: f32, f3d_parameter_5: ptr<function, f32>\)/);
+    assert.match(pointer.fragment, /unused\(images_0_texture, images_0_sampler, images_1_texture, images_1_sampler, f3d_t\d+, &f3d_t\d+\)/);
+    assert.doesNotMatch(pointer.fragment, /var f3d_parameter_/);
+  }
+});
+
 test('varyings link by name with matching locations; arrays and matrices use one location per slot', () => {
   const vs = V('vUv = position.xy; vArr[0] = vec4(1.0); vArr[1] = vec4(2.0); vM = mat3(1.0); vI = 3; gl_Position = mvp * vec4(position, 1.0);',
     'out vec2 vUv;\nout vec4 vArr[2];\nout mat3 vM;\nflat out int vI;');

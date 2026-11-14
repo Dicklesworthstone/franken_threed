@@ -51,6 +51,16 @@ admitted. The source rules are in the
   then need no flip; the caller swaps the pipeline's front face.
 - `gl_FragCoord` in GL window coordinates (bottom-left origin); `dFdy` keeps GL's
   upward sign; `texture()` outside fragment shaders samples level 0.
+- Sized sampler arrays pass through user functions as independent texture/sampler
+  parameters. Array forwarding and scalar-element calls preserve the original
+  bindings, including each integer sampler's wrap/LOD controls and each shadow
+  sampler's depth-reference clamp. Overloads match both the sampler type and
+  array length; selectors must be constant integers. ESSL 3.00 array `.length()`
+  can select an element, while ESSL 1.00 `texture2D` helpers retain the existing
+  vertex level-zero behavior. Out/inout samplers are rejected, and per-function
+  expansion is bounded to 4,096 sampler elements before emission. Compiler and
+  reflection regressions cover these calls. The sampler-array checkpoints in
+  `program_texture_sampling.mjs` still require browser pixel validation.
 - Floating-point 2D/3D projected sampling supports implicit LOD, bias, explicit
   LOD and explicit gradients, with or without texel offsets. Only the texture
   coordinates are divided by the final projective component; explicit gradients

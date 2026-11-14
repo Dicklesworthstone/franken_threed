@@ -53,6 +53,8 @@ const VOID = {k: 'void'}, FLOAT = S('float'), INT = S('int'), UINT = S('uint'), 
 // Blocks flatten into distinct reflected fields. Bound this expansion before
 // allocating element tables; ordinary uniform arrays stay compact in the IR.
 const MAX_UNIFORM_BLOCK_MEMBERS = 4096;
+// Sampler arrays become individual resource parameters, not WGSL value arrays.
+const MAX_SAMPLER_PARAMETER_ELEMENTS = 4096;
 const SCALAR_PREFIX = {float: '', int: 'i', uint: 'u', bool: 'b'};
 const WGSL_SCALAR = {float: 'f32', int: 'i32', uint: 'u32', bool: 'bool'};
 const SAMPLERS = {
@@ -63,6 +65,7 @@ const SAMPLERS = {
   usampler2D: {dim: '2d', s: 'uint'}, usampler3D: {dim: '3d', s: 'uint'}, usamplerCube: {dim: 'cube', s: 'uint'}, usampler2DArray: {dim: '2d-array', s: 'uint'},
 };
 const integerSampler = type => type.s === 'int' || type.s === 'uint';
+const samplerElement = type => type.k === 'smp' ? type : type.k === 'a' && type.of.k === 'smp' ? type.of : null;
 function basicType(name) {
   if (name === 'void') return VOID;
   if (WGSL_SCALAR[name]) return S(name);
@@ -482,8 +485,10 @@ class Unit {
       }
       case 'method': {
         let receiver = e.a; while (receiver.k === 'paren') receiver = receiver.e;
-        if (e.name === 'length' && e.args.length === 0 && receiver.k === 'id')
-          return this.lookup(receiver.name, scope)?.elements?.length;
+        if (e.name === 'length' && e.args.length === 0 && receiver.k === 'id') {
+          const symbol = this.lookup(receiver.name, scope);
+          return symbol?.elements?.length ?? (symbol?.type?.k === 'a' ? symbol.type.n : undefined);
+        }
         return undefined;
       }
       default: return undefined;
@@ -503,7 +508,23 @@ class Unit {
     }
   }
   signature(d) {
-    const params = d.params.map(p => ({q: p.q, name: p.name, type: this.resolveType(p.type, p.array)}));
+    let samplerElements = 0;
+    const params = d.params.map(p => {
+      const type = this.resolveType(p.type, p.array);
+      if (samplerElement(type)) {
+        if (p.q === 'out' || p.q === 'inout') essError('Samplers cannot be out or inout parameters', p.line);
+        const count = type.k === 'a' ? type.n : 1;
+        if (type.k === 'a') {
+          const size = p.array ?? p.type.array, scalar = size && size !== 'unsized' ? this.expr(size, {scope: null, pre: []}).t : null;
+          if (!Number.isSafeInteger(count) || count < 1 || scalar?.k !== 's' || !['int', 'uint'].includes(scalar.s))
+            essError('Sampler array parameters require a positive constant integer size', p.line);
+        }
+        samplerElements += count;
+        if (samplerElements > MAX_SAMPLER_PARAMETER_ELEMENTS)
+          essError(`Sampler parameter expansion exceeds ${MAX_SAMPLER_PARAMETER_ELEMENTS} elements`, p.line);
+      }
+      return {q: p.q, name: p.name, type};
+    });
     const ret = this.resolveType(d.ret);
     const list = this.functions.get(d.name) ?? [];
     let f = list.find(x => x.params.length === params.length && x.params.every((p, i) => same(p.type, params[i].type)));
@@ -846,20 +867,27 @@ class Unit {
     const scope = {vars: new Map(), parent: null};
     const params = [];
     for (const p of f.params) {
-      if (p.name === null) continue;
-      const w = safe(p.name);
-      if (p.type.k === 'smp') {
-        params.push(`${w}_texture: ${textureType(p.type)}`, `${w}_sampler: ${p.type.shadow ? 'sampler_comparison' : 'sampler'}`);
-        if (integerSampler(p.type)) params.push(`${w}_sampling: vec4<u32>`);
-        if (p.type.shadow) params.push(`${w}_depth_reference_clamp: u32`);
-        scope.vars.set(p.name, {kind: 'samplerParam', type: p.type, w});
+      const sampler = samplerElement(p.type);
+      // Keep generated names out of the source parameter namespace. Unnamed
+      // formals retain their physical slots without adding source locals.
+      const w = sampler && (p.type.k === 'a' || p.name === null) ? `f3d_samplers_${params.length}`
+        : p.name === null ? `f3d_parameter_${params.length}` : safe(p.name);
+      if (sampler) {
+        const count = p.type.k === 'a' ? p.type.n : null;
+        for (let i = 0; i < (count ?? 1); i++) {
+          const base = count === null ? w : `${w}_${i}`;
+          params.push(`${base}_texture: ${textureType(sampler)}`, `${base}_sampler: ${sampler.shadow ? 'sampler_comparison' : 'sampler'}`);
+          if (integerSampler(sampler)) params.push(`${base}_sampling: vec4<u32>`);
+          if (sampler.shadow) params.push(`${base}_depth_reference_clamp: u32`);
+        }
+        if (p.name !== null) scope.vars.set(p.name, {kind: 'samplerParam', type: p.type, w, count});
       } else if (p.q === 'out' || p.q === 'inout') {
         params.push(`${w}: ptr<function, ${this.wgsl(p.type)}>`);
-        scope.vars.set(p.name, {kind: 'pparam', type: p.type, w});
+        if (p.name !== null) scope.vars.set(p.name, {kind: 'pparam', type: p.type, w});
       } else {
         // Parameters are mutable locals in GLSL: copy into a var.
         params.push(`${w}_in: ${this.wgsl(p.type)}`);
-        scope.vars.set(p.name, {kind: 'local', type: p.type, w, paramCopy: true});
+        if (p.name !== null) scope.vars.set(p.name, {kind: 'local', type: p.type, w, paramCopy: true});
       }
     }
     const ret = f.ret.k === 'void' ? '' : ` -> ${this.wgsl(f.ret)}`;
@@ -1289,7 +1317,7 @@ class Unit {
     switch (s.kind) {
       case 'uniform': return {c: `f3d_u.${this.shared.uniforms.get(s.name).field}`, t: s.type, u: true};
       case 'sampler': return {c: null, t: s.type, smp: {kind: 'global', name: s.name, sampler: s.sampler}};
-      case 'samplerParam': return {c: null, t: s.type, smp: {kind: 'param', w: s.w}};
+      case 'samplerParam': return {c: null, t: s.type, smp: {kind: 'param', w: s.w, count: s.count}};
       case 'pparam': return {c: `(*${s.w})`, t: s.type, ref: true};
       case 'ublock': return {c: null, t: {k: 'ublock'}, block: s};
       default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type, ref: true};
@@ -1297,8 +1325,12 @@ class Unit {
   }
   samplerNames(r, line) {
     if (!r.smp) essError('Expected a sampler', line);
-    if (r.smp.kind === 'param') return {tex: `${r.smp.w}_texture`, smp: `${r.smp.w}_sampler`, type: r.t,
-      sampling: `${r.smp.w}_sampling`, depthReferenceClamp: `${r.smp.w}_depth_reference_clamp`};
+    if (r.t.k === 'a') essError('Sampler arrays must be indexed with a constant', line);
+    if (r.smp.kind === 'param') {
+      const base = r.smp.count === null ? r.smp.w : `${r.smp.w}_${r.smp.element}`;
+      return {tex: `${base}_texture`, smp: `${base}_sampler`, type: r.t,
+        sampling: `${base}_sampling`, depthReferenceClamp: `${base}_depth_reference_clamp`};
+    }
     const s = r.smp.sampler, base = s.count === null ? safe(r.smp.name) : `${safe(r.smp.name)}_${r.smp.element}`;
     if (s.count !== null && r.smp.element === undefined) essError('Sampler arrays must be indexed with a constant', line);
     return {tex: `${base}_texture`, smp: `${base}_sampler`, type: s.type,
@@ -1315,9 +1347,11 @@ class Unit {
       return {c: null, t: {k: 'ublock'}, block: a.block.elements[k]};
     }
     if (a.smp) {
-      const k = this.constValue(e.index, ctx.scope);
-      if (typeof k !== 'number') essError('Sampler array index must be a constant expression', e.line);
-      if (k < 0 || k >= a.smp.sampler.count) essError('Sampler array index out of range', e.line);
+      if (a.t.k !== 'a') essError('Sampler indexing requires an array', e.line);
+      const index = this.expr(e.index, ctx), k = this.constValue(e.index, ctx.scope);
+      if (index.t.k !== 's' || !['int', 'uint'].includes(index.t.s) || !Number.isSafeInteger(k))
+        essError('Sampler array index must be a constant integer expression', e.line);
+      if (k < 0 || k >= a.t.n) essError('Sampler array index out of range', e.line);
       return {c: null, t: a.t.of, smp: {...a.smp, element: k}};
     }
     // A stored aggregate contributes its address, not an early value copy:
@@ -1611,16 +1645,20 @@ class Unit {
     // An out argument evaluates its address without loading its old value.
     const arguments_ = e.args.map(a => this.callArgument(a, ctx));
     const raw = arguments_.map(a => a.result), parts = raw.map(r => r.smp || !r.u ? r : this.uniformValue(r));
-    const f = list.find(x => x.params.length === parts.length && x.params.every((p, i) => p.type.k === 'smp'
-      ? !!parts[i].smp && this.samplerNames(raw[i], e.line).type.name === p.type.name : !parts[i].smp && same(p.type, parts[i].t)));
+    const f = list.find(x => x.params.length === parts.length && x.params.every((p, i) =>
+      !!samplerElement(p.type) === !!parts[i].smp && same(p.type, parts[i].t)));
     if (!f) essError(`No matching overload for ${e.name}(${parts.map(p => glslName(p.t)).join(', ')})`, e.line);
     const callArgs = [], writeback = [];
     f.params.forEach((p, i) => {
       ctx.pre.push(...arguments_[i].pre);
-      if (p.type.k === 'smp') {
-        const s = this.samplerNames(raw[i], e.line); callArgs.push(s.tex, s.smp);
-        if (integerSampler(p.type)) callArgs.push(s.sampling);
-        if (p.type.shadow) callArgs.push(s.depthReferenceClamp);
+      const sampler = samplerElement(p.type);
+      if (sampler) {
+        for (let element = 0; element < (p.type.k === 'a' ? p.type.n : 1); element++) {
+          const argument = p.type.k === 'a' ? {...raw[i], t: sampler, smp: {...raw[i].smp, element}} : raw[i];
+          const s = this.samplerNames(argument, e.line); callArgs.push(s.tex, s.smp);
+          if (integerSampler(sampler)) callArgs.push(s.sampling);
+          if (sampler.shadow) callArgs.push(s.depthReferenceClamp);
+        }
         return;
       }
       if (p.q === 'out' || p.q === 'inout') {
