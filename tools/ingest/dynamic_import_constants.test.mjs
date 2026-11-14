@@ -179,6 +179,65 @@ test("record selections agree with native keys, duplicate data fields and select
   }
 });
 
+test("const object destructuring closes private resource fields without changing the source AST", () => {
+  const sites = selectors(`
+    const routes={viewer:'./viewer.mjs',editor:(observe(),'./editor.mjs')}, alias=routes;
+    const {viewer:entry,editor}=alias, copy=entry;
+    const {prefix}={prefix:'./assets/'};
+    const {1:asset}={1:select()?'day.png':'night.png'};
+    import(select()?copy:editor);
+    new URL(prefix+asset,import.meta.url);
+    function nested(){const {viewer:entry}={viewer:'./nested.mjs'};return import(entry)}
+    export const {viewer:publicEntry}=routes;
+    import(publicEntry);
+  `);
+  assert.deepEqual(sites.map(site => site.candidates), [
+    ['./viewer.mjs','./editor.mjs'], ['./assets/day.png','./assets/night.png'], ['./nested.mjs'], ['./viewer.mjs'],
+  ]);
+});
+
+test("destructured resource fields require private own data and ordinary const object patterns", () => {
+  for (const source of [
+    "const routes={entry:'./a.mjs'};const {entry}=routes;routes.entry='./b.mjs';import(entry);",
+    "const routes={entry:'./a.mjs'};const {entry}=routes;consume(routes);import(entry);",
+    "const routes={entry:'./a.mjs'};const {entry}=routes;export {routes};import(entry);",
+    "export const routes={entry:'./a.mjs'};const {entry}=routes;import(entry);",
+    "const {entry}=opaque;import(entry);",
+    "const {entry}={get entry(){return './a.mjs'}};import(entry);",
+    "const {entry}={...opaque,entry:'./a.mjs'};import(entry);",
+    "const {entry}={__proto__:{entry:'./a.mjs'}};import(entry);",
+    "const routes={entry:'./a.mjs'};const {entry,missing}=routes;import(entry);",
+    "const routes={entry:'./a.mjs'};const {entry,...rest}=routes;import(entry);",
+    "const routes={entry:'./a.mjs'};const {entry='./fallback.mjs'}=routes;import(entry);",
+    "const routes={entry:'./a.mjs'};const {['entry']:entry}=routes;import(entry);",
+    "const [entry]=['./a.mjs'];import(entry);",
+    "const {nested:{entry}}={nested:{entry:'./a.mjs'}};import(entry);",
+    "let {entry}={entry:'./a.mjs'};import(entry);",
+    "const {entry}={entry:'./a.mjs'};function load({entry}){return import(entry)}",
+    "const {entry}={entry:'./a.mjs'};function load(){import(entry);var entry}",
+    "const routes={entry:'./a.mjs'};const {entry}=routes;eval(code);import(entry);",
+  ]) assert.equal(selectors(source)[0].classification,'nonliteral',source);
+
+  const source = `const routes={entry:'./before.mjs'};
+    Object.defineProperty(Object.prototype,'missing',{get(){this.entry='./after.mjs'},configurable:true});
+    try {const {missing,entry}=routes;return entry} finally {delete Object.prototype.missing}`;
+  assert.equal(new Function(source)(),'./after.mjs');
+  assert.equal(selectors(source.replace('return entry','import(entry)'))[0].classification,'nonliteral',
+    'an unused missing field can invoke a prototype getter that mutates the table');
+});
+
+test("destructured selectors preserve default-parameter scope, switch scope and bounded cycles", () => {
+  const sites = selectors(`
+    const {entry}={entry:'./outer.mjs'};
+    function run(value=import(entry)){var entry;return import(entry)}
+    switch(import(entry)){case 0:const {entry}={entry:'./case.mjs'};import(entry)}
+    function pending(){const result=import(later);const {entry:later}={entry:'./later.mjs'};return result}
+  `);
+  assert.deepEqual(sites.map(site => site.candidates),
+    [['./outer.mjs'],undefined,['./outer.mjs'],['./case.mjs'],['./later.mjs']]);
+  assert.equal(selectors("const {entry}=routes,routes={entry};import(entry);")[0].classification,'nonliteral');
+});
+
 test("record closure requires every alias to remain private and every use to read an own field", () => {
   const tails = [
     "routes.viewer='./changed.mjs';", "routes['viewer']+='?changed';", "routes.viewer++;",
@@ -187,7 +246,7 @@ test("record closure requires every alias to remain private and every use to rea
     "for(routes.viewer of unknown){}", "for(routes.viewer in unknown){}",
     "const alias=routes;alias.viewer='./changed.mjs';", "let alias=routes;",
     "consume(routes);", "globalThis.routes=routes;", "const holder={routes};",
-    "const {viewer}=routes;", "const values=[...routes];", "const clone={...routes};",
+    "const values=[...routes];", "const clone={...routes};",
     "Object.defineProperty(routes,'viewer',{get:opaque});", "Object.setPrototypeOf(routes,unknown);",
     "routes[unknown];", "routes.missing;", "routes.toString();", "routes.valueOf();",
     "routes.viewer();", "routes.viewer?.();", "new routes.viewer();",

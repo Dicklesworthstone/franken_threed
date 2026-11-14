@@ -99,15 +99,18 @@ const finiteRequireFiles = () => ({
   'later.mjs': `export {default} from './library.cjs';`,
   'library.cjs': `const state = require('./state.cjs');
     const names = {left:'./a', right:'./b'}, alias = names, suffix = '.cjs';
+    const {left, right} = alias;
     module.exports = {
       state, label:'source receiver',
       load(flag) { return require(\`\${alias[flag ? 'left' : 'right']}\${suffix}\`); },
       scalar(flag) { const path = flag ? './a.cjs' : './b.cjs', copy = path; return require(copy); },
+      destructured(flag) { return require((state.events.push('destructured'), (flag ? left : right) + suffix)); },
       select(flag) { return require((state.events.push([this.label, arguments[1]]), flag ? './a.cjs' : './b.cjs')); },
       nested(flag) { return require((require(flag ? './branch-a.cjs' : './branch-b.cjs'), './a.cjs')); },
       json(flag) { return require(flag ? './config' : './config.json'); },
       retry(flag) { return require(flag ? './retry.cjs' : './a.cjs'); },
       tdz() { return load(); const path = './a.cjs'; function load() { return require(path); } },
+      destructuredTdz() { return require(path); const {path} = {path:'./a.cjs'}; },
       throwing(flag) { return require((state.events.push('selector throw'), (() => { throw state.failure; })(), flag ? './a.cjs' : './b.cjs')); },
       shadowed(require, flag) { return require(flag ? './a.cjs' : './b.cjs'); },
       async waiting(pending, flag) { return require((await pending, flag ? './a.cjs' : './b.cjs')); },
@@ -130,6 +133,7 @@ async function exerciseFiniteRequires(app, config) {
   const {state} = app;
   assert.deepEqual(state.events, [], 'unselected modules have no initialization effects');
   assert.throws(app.tdz, ReferenceError);
+  assert.throws(app.destructuredTdz, ReferenceError);
   assert.deepEqual(state.events, [], 'TDZ precedes module initialization');
   const a = app.load(true);
   assert.equal(a.cycle.a, a);
@@ -164,6 +168,9 @@ async function exerciseFiniteRequires(app, config) {
   assert.deepEqual(generator.next(), {value:'resume', done:false});
   assert.equal(state.events.at(-1), 'pause');
   assert.deepEqual(generator.next(), {value:a, done:true});
+  assert.equal(app.destructured(true), a);
+  assert.equal(app.destructured(false), b);
+  assert.deepEqual(state.events.slice(-2), ['destructured', 'destructured'], 'one selector effect per cached require');
 }
 
 test('finite CommonJS require choices preserve native selectors, lazy cycles, JSON and retry semantics after relocation', async () => {

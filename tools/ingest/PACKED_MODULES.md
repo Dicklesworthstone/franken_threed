@@ -211,7 +211,8 @@ also retry. This behavior is covered in relocated builds and packed output, with
 the original source and build trees unavailable.
 
 Finite `require()` selections can use conditional strings, immutable local
-aliases, templates, concatenation and private constant lookup tables. The build
+aliases, templates, concatenation and private constant lookup tables, including
+the ordinary object destructuring described below. The build
 presents each possible target to the pinned CommonJS compiler as a lazy literal
 require. The original operand still executes once in its original scope;
 selectors, `this`, `arguments`, nested requires, errors, `await` and `yield`
@@ -338,8 +339,26 @@ only the import argument receives a URL mapping. Native lazy evaluation, module
 identity, live bindings, JSON attributes and temporal-dead-zone failures remain
 host-owned. Document modules and packed module-worker helpers share this rule.
 
-Parameters, mutable or imported bindings, destructured values and property/call
-results are not assumed constant. Lexical shadowing is respected, including
+Private constant records also support ordinary own-field object destructuring:
+
+```js
+const routes = { viewer: './viewer.mjs', editor: './editor.mjs' };
+const { viewer: entry, editor } = routes;
+export const open = preview => import(preview ? entry : editor);
+```
+
+Aliases, direct object literals, renamed fields and exported extracted strings
+keep the same bounded proof. Every field in the pattern must name an existing
+own data property, including unused fields: a missing property could invoke a
+prototype getter with the table as its receiver. The table and all its aliases
+must remain private and unmodified. The source pattern and initializer run
+unchanged; analysis does not freeze objects or replace runtime reads. This
+shared rule also reaches module worker URLs, finite document fetches, Three
+loader resources and finite CommonJS requires.
+
+Parameters, mutable or imported bindings, opaque property/call results,
+array patterns, rest/default/nested/computed patterns and escaped tables are
+not assumed constant. Lexical shadowing is respected, including
 function defaults and switch discriminants. Alias cycles and excessive expansion
 remain unresolved: analysis admits at most 128 candidates, 64 nested expression
 or alias steps and 64 KiB per expanded string; packing retains its 64-target

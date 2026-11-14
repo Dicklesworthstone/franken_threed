@@ -217,7 +217,7 @@ export function createDynamicImportClassifier(ast) {
   // literal-only path remains conservative; ES modules are always strict.
   if (ast.sourceType === "script") return node => classifyDynamicImportArgument(node);
   const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap(), selections = new WeakMap();
-  const parents = new WeakMap(), nodes = [];
+  const parents = new WeakMap(), destructured = new WeakMap(), nodes = [];
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
     "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
@@ -246,8 +246,21 @@ export function createDynamicImportClassifier(ast) {
         if (functions.has(scope.type)) scope = scope.body;
       } else scope = containing(parent => lexical.has(parent.type));
       for (const declaration of node.declarations) {
-        put(scope, collectPatternIdentifiers(declaration.id),
-          node.kind === "const" && declaration.id.type === "Identifier" ? declaration.init : null);
+        const pattern = declaration.id;
+        if (node.kind === "const" && declaration.init && pattern.type === "ObjectPattern" &&
+            pattern.properties.length <= 128 && pattern.properties.every(property =>
+              property.type === "Property" && property.kind === "init" && !property.method && !property.computed &&
+              property.value.type === "Identifier" && (property.key.type === "Identifier" ||
+                property.key.type === "Literal" && ["string", "number"].includes(typeof property.key.value)))) {
+          // Analysis-only reads retain the actual receiver's lexical scope and
+          // give each binding its own cache entry. Never rewrite the pattern:
+          // initializer effects and TDZ failures still belong to the source.
+          const members = pattern.properties.map(property => ({type: "MemberExpression",
+            object: declaration.init, property: property.key, computed: property.key.type === "Literal", optional: false}));
+          destructured.set(declaration, members);
+          pattern.properties.forEach((property, index) => put(scope, [property.value.name], members[index]));
+        } else put(scope, collectPatternIdentifiers(pattern),
+          node.kind === "const" && pattern.type === "Identifier" ? declaration.init : null);
       }
     } else if (node.type === "ImportDeclaration") {
       put(ast, node.specifiers.map(specifier => specifier.local.name));
@@ -280,7 +293,7 @@ export function createDynamicImportClassifier(ast) {
     }
     return null;
   };
-  const selectRecord = privateStringRecordSelections(nodes, parents, initializerOf);
+  const selectRecord = privateStringRecordSelections(nodes, parents, initializerOf, destructured);
   let depth = 0;
   const resolveReference = node => {
     const sources = node.type === "Identifier" ? [initializerOf(node)] : selectRecord(node);
@@ -310,17 +323,17 @@ export function createDynamicImportClassifier(ast) {
 /** A const binding alone does not freeze its object. Admit a lookup only after
  * every alias is proved private and every use reads an existing own data field.
  * Unknown keys may call prototype getters with the table as receiver; calls,
- * writes, exports, destructuring and reflection may expose or mutate it.
+ * writes, table exports, opaque patterns and reflection may expose or mutate it.
  * Keep those cases on the ordinary runtime path. No application code is run.
  */
-function privateStringRecordSelections(nodes, parents, initializerOf) {
+function privateStringRecordSelections(nodes, parents, initializerOf, destructured) {
   const records = new WeakMap(), aliases = new WeakMap(), aliasDepths = new WeakMap();
   const keys = new WeakMap(), strings = new WeakMap();
   // Direct eval can mutate a private record without a syntactic reference.
   if (nodes.some(node => node.type === "CallExpression" && node.callee.type === "Identifier" &&
       node.callee.name === "eval")) return () => null;
   for (const node of nodes) {
-    if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" ||
+    if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" && !destructured.has(node) ||
         parents.get(node)?.kind !== "const") continue;
     const source = node.init, fields = new Map();
     if (source?.type === "ObjectExpression" && source.properties.length <= 128) {
@@ -341,6 +354,7 @@ function privateStringRecordSelections(nodes, parents, initializerOf) {
     }
   }
   const recordOf = (node, depth = 0) => {
+    if (records.has(node)) return records.get(node);
     if (node?.type !== "Identifier" || depth >= 64) return null;
     const source = initializerOf(node);
     if (!source) return null;
@@ -398,6 +412,8 @@ function privateStringRecordSelections(nodes, parents, initializerOf) {
     const record = recordOf(node);
     if (!record) continue;
     const parent = parents.get(node);
+    if (parent?.type === "VariableDeclarator" && parent.init === node && destructured.has(parent) &&
+        destructured.get(parent).every(member => selectedKeys(member).every(key => record.fields.has(key)))) continue;
     if (parent?.type === "VariableDeclarator" && parents.get(parent)?.kind === "const" &&
         (parent.id === node || parent.init === node && recordOf(parent.id) === record)) {
       if (parents.get(parents.get(parent))?.type !== "ExportNamedDeclaration") continue;

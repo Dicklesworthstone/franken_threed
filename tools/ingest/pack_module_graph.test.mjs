@@ -186,6 +186,24 @@ for (const lane of ["document", "worker"]) {
     }, { ok: true, value: [["effect"], 42] });
   });
 
+  test(`${lane}: destructured resource tables preserve lazy identity, effects and TDZ failures offline`, async t => {
+    await equivalent(t, lane, {
+      'main.mjs': `const log=[];
+        const routes={first:(log.push('first'),'./lazy.mjs'),second:(log.push('second'),'./lazy.mjs?other#view')};
+        const alias=routes, {first:entry,second}=alias;
+        const {settings}={settings:'./settings.json'};
+        export async function run(){
+          const one=await import((log.push('load'),entry));
+          const same=await import(entry), other=await import(second);
+          one.bump();const config=await import(settings,{with:{type:'json'}});
+          let error;try{const result=import(later);const {path:later}={path:'./lazy.mjs'};await result}
+          catch(e){error=e.name}
+          return [log,one===same,one!==other,same.value,other.value,config.default.value,error,entry];
+        }`,
+      'lazy.mjs': "export let value=1;export const bump=()=>++value;",
+    }, {ok:true,value:[['first','second','load'],true,true,2,1,42,'ReferenceError','./lazy.mjs']});
+  });
+
   for (const options of [
     "options", "{...options}", "{with:attrs}", "{with:{...attrs}}",
     "{with:{[key]:'json'}}", "{get with(){return {type:'json'}}}",
