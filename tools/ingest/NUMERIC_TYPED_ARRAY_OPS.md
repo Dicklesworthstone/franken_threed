@@ -55,6 +55,29 @@ identities across chunks. The generated application needs only the existing
 self-contained runtime and dispatcher assets; the bulk emitter is build-time
 code, not another shipping interpreter or host adapter.
 
+## Borrowed windows in bulk calls
+
+Inline `subarray` windows and conditional array references can be receivers of
+`set`, `fill` and `copyWithin`, or the source argument of `set`:
+
+```js
+out.set(input.subarray(start, end), offset);
+out.subarray(start, end).fill(0);
+(select ? left : right).copyWithin(1, 0, -1);
+```
+
+Nested windows reuse the existing borrowed pointer/length ABI. Conditional
+branches must select the same storage layout, and only the selected branch
+executes. The receiver is captured before source/range arguments; `set` captures
+its source before evaluating the offset. Range helpers may mutate staged arrays
+or rebind local views without retargeting those snapshots. Automatic function,
+helper and loop-island discovery follows every possible base view.
+
+Native method, constructor and species guards retain original JavaScript when
+view creation or method lookup can run application code. The existing alias,
+bounds, work-budget and publication rules apply; no new array allocation owner,
+runtime adapter or ABI is introduced.
+
 ## Native semantics and limits
 
 Receivers and arguments are captured in source evaluation order. Numeric range

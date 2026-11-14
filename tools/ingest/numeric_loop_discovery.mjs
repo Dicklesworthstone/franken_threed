@@ -123,6 +123,10 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
         record.required.add(bindingKey(node.object.name, scope));
       if (node.type === 'ForOfStatement')
         for (const name of visibleReferences(node.right)) record.required.add(name);
+      // Receivers may be borrowed/conditional expressions without a direct
+      // subscript elsewhere. Trace each possible base through the same graph.
+      if (isNumericBulkCall(node))
+        for (const name of visibleReferences(node.callee.object)) record.required.add(name);
       // set's source may never be subscripted elsewhere, including through
       // aliases and reordered helper parameters. Treat it as a required view.
       if (isNumericBulkCall(node) && node.callee.property.name === 'set')

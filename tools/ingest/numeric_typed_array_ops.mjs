@@ -244,7 +244,9 @@ export function compileTypedArrayOperation(node, {
   if (owner) owner.loopDepth = Math.max(owner.loopDepth, loopDepth + 1);
   receiver.mark({read:true, write:true});
   if (method === 'set') source.mark({read:true});
-  const code = [];
+  // Reference setup may evaluate range/selector helpers. Snapshot the receiver
+  // before evaluating set's source, and the source before its scalar offset.
+  const code = [...(receiver.setup ?? [])];
   const save = bytes => { const local = allocateLocal(); code.push(...bytes, ...set(local)); return local; };
   const ptr = save([...arrayPointer(receiver), 0xb8]);
   const length = save([...arrayLength(receiver), 0xb8]);
@@ -276,6 +278,7 @@ export function compileTypedArrayOperation(node, {
     ...get(index), ...number(1), 0xa0, ...set(index), 0x0c, 0, 0x0b, 0x0b];
 
   if (method === 'set') {
+    code.push(...(source.setup ?? []));
     const fromPtr = save([...arrayPointer(source), 0xb8]), count = save([...arrayLength(source), 0xb8]);
     const offset = arg(1, number(0));
     code.push(...integer(offset), ...trapUnless([...get(offset), ...number(0), 0x66,

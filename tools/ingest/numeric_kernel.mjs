@@ -836,7 +836,7 @@ export function compileNumericKernel(source, {
         if (iteration) { bytes.push(...iteration); continue; }
         const searched = search(assignment, depth);
         if (searched) { bytes.push(...searched, 0x1a); continue; }
-        const bulk = compileTypedArrayOperation(assignment, {resolveArray:helperArray, expression,
+        const bulk = compileTypedArrayOperation(assignment, {resolveArray:arg => arrayReferences.argument(arg), expression,
           allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth});
         if (bulk) { bytes.push(...bulk); continue; }
         const reduced = reduction(assignment, depth);

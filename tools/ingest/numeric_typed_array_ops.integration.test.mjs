@@ -52,6 +52,26 @@ test('bulk-only functions discover both array slots and retain exported identity
   assert.equal(count(app),4);assert.equal(count(app,'fallbackCalls'),0);
 });
 
+test('borrowed bulk expressions discover conditional helper receivers and preserve exported identities',async t=>{
+  const app=await application(t,`
+    function fillWindow(a,b,choose,value){(choose?a:b).fill(value,1,-1);}
+    export function update(a,b,choose,value){fillWindow(a,b,choose,value);a.subarray(1).set((choose?b:a).subarray(0,2));}
+    export const identity=update,fillIdentity=fillWindow,step=(a,b,choose,value)=>update(a,b,choose,value);
+  `);
+  const candidate=app.result.report.candidates.find(item=>item.functionName==='update');
+  assert.equal(candidate.route,'guarded-numeric-wasm');
+  assert.deepEqual(candidate.parameterTypes,['f64[]','f64[]','f64','f64']);
+  assert.deepEqual(candidate.typedArrayMethods,['fill','set','subarray']);
+  assert.equal(app.app.update,app.app.identity);
+  assert.equal(app.app.update.name,app.reference.update.name);assert.equal(app.app.update.length,app.reference.update.length);
+  assert.equal(app.app.fillIdentity.toString(),app.reference.fillIdentity.toString());
+  for(const Type of [Float32Array,Float64Array])for(const choose of [0,1]){
+    const a=new Type([1,2,3,4,5]),b=new Type([6,7,8,9,10]),expected=a.slice(),other=b.slice();
+    app.app.step(a,b,choose,1/3);app.reference.step(expected,other,choose,1/3);equal(a,expected);equal(b,other);
+  }
+  assert.equal(count(app),4);assert.equal(count(app,'fallbackCalls'),0);
+});
+
 test('reduction-only functions discover callback array captures and inline helper graphs automatically',async t=>{
   const app=await application(t,`
     export function weighted(a,weights,scale){return a.reduce((sum,value,index)=>sum+value*weights[index]*scale,0);}
@@ -494,7 +514,8 @@ test('linked imported identities can dispatch a bulk-only producer without repla
 
 const FRAME=`import {magnitude} from './helper.mjs';
  export const make=(a,b,upload)=>{let sum=0;return {step(value){
-  a.set(b);for(let i=0;i<a.length;i++){a[i]+=magnitude(value);sum+=a[i];}a.copyWithin(1,0,-1);a.fill(value,-1);
+  a.subarray(0).set(b.subarray(0));for(let i=0;i<a.length;i++){a[i]+=magnitude(value);sum+=a[i];}
+  a.subarray(0).copyWithin(1,0,-1);a.subarray(0).fill(value,-1);
   upload({array:[...a],sum});return sum;
  }}};`;
 function fixture(t){
@@ -520,7 +541,7 @@ test('real linked dynamic application combines bulk operations, loops and helper
   const report=build.numericSpecialization;assert.equal(report.compiledLoopIslands,1);assert.equal(report.accelerated,false);
   assert.equal(report.runtimeAssets.length,2,'compiler emitter is not a runtime dependency');
   const region=report.units.flatMap(unit=>unit.loopIslands?.candidates??[]).find(item=>item.route==='guarded-loop-wasm');
-  assert.equal(region.kind,'NumericWorkSequence');assert.deepEqual(region.typedArrayMethods,['copyWithin','fill','set']);
+  assert.equal(region.kind,'NumericWorkSequence');assert.deepEqual(region.typedArrayMethods,['copyWithin','fill','set','subarray']);
   for(const asset of report.runtimeAssets)assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(files.out,asset.fileName))).digest('hex'),asset.sha256);
   const counts=observe(t),entry=await import(pathToFileURL(path.join(files.out,build.entryFiles[0]))),module=await entry.load();
   const reference=await import(pathToFileURL(path.join(files.src,'frame.mjs')));assert.equal(counts.instances,0);

@@ -48,6 +48,107 @@ for (const [Type,type] of types) {
   });
 }
 
+for(const [Type,type] of types)test(`${Type.name}: inline borrowed bulk receivers and sources preserve ranges and overlap`,()=>{
+  const ranges=[[0,16],[2,12],[-6,-1],[1.8,8.7],[99,100],[NaN,NaN],[-Infinity,Infinity],[9,3]];
+  for(const [method,statement] of [
+    ['fill','a.subarray(start,end).fill(value,1,-1)'],
+    ['copyWithin','a.subarray(start,end).copyWithin(1,0,-1)'],
+    ['set','a.subarray(start,end).set(b.subarray(start,end).subarray(0),0)'],
+  ]){
+    const source=`function run(a,b,start,end,value){${statement};}`;
+    const {kernel,artifact}=compile(source,[type,type,'f64','f64','f64']);
+    const reference=Function('return ('+source+')')();
+    assert.deepEqual(artifact.manifest.typedArrayMethods,[method,'subarray']);
+    for(const [start,end] of ranges)for(const shift of [-2,0,2]){
+      const a=new Type(Array.from({length:24},(_,i)=>seed[i%seed.length])),b=a.slice();
+      kernel.run(a.subarray(2,18),a.subarray(2+shift,18+shift),start,end,257.5);
+      reference(b.subarray(2,18),b.subarray(2+shift,18+shift),start,end,257.5);same(a,b);
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,ranges.length*3);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  }
+});
+
+test('borrowed bulk expressions preserve lazy selection and receiver/source/offset helper order',()=>{
+  const helper='function mark(trace,value,digit){trace[0]=trace[0]*10+digit;return value;}';
+  const source=`function run(a,b,trace,choose){
+    (choose?a.subarray(mark(trace,1,1),mark(trace,5,2)):a.subarray(mark(trace,0,8),mark(trace,4,9)))
+      .set(b.subarray(mark(trace,0,3),mark(trace,2,4)),mark(trace,1,5));return trace[0];
+  }`;
+  const reference=Function(helper+';return ('+source+')')();
+  const {kernel}=compile(source,['f64[]','f64[]','f64[]','f64'],{helperSources:new Map([['mark',helper]])});
+  for(const choose of [0,1]){
+    const a=new Float64Array([0,2,3,4,5,6]),b=a.slice();
+    assert.equal(kernel.run(a,a,a.subarray(0,1),choose),reference(b,b,b.subarray(0,1),choose));
+    assert.equal(a[0],choose?12345:89345);same(a,b);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,2);assert.equal(kernel.diagnostics.fallbackCalls,0);
+});
+
+test('root and helper bulk calls snapshot a mutable receiver before source range callbacks',()=>{
+  const helper=`function change(a,b,flags){let target=a;
+    target.set(b.subarray(flags.findIndex(value=>{target=b;return value>0;}),2),1);return target[0];
+  }`;
+  const reference=Function('return ('+helper+')')();
+  for(const nested of [false,true]){
+    const source=nested?'function run(a,b,flags){return change(a,b,flags);}':helper;
+    const {kernel}=compile(source,['f64[]','f64[]','f64[]'],
+      nested?{helperSources:new Map([['change',helper]])}:{});
+    const a=new Float64Array([1,2,3,4,5]),b=a.slice(),input=new Float64Array([7,8,9]),expected=input.slice();
+    assert.equal(kernel.run(a,input,new Float64Array([1])),reference(b,expected,new Float64Array([1])));
+    same(a,b);same(input,expected);assert.deepEqual([...a],[1,7,8,4,5]);
+    assert.equal(kernel.diagnostics.wasmCalls,1);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  }
+});
+
+test('inline subarray set converts distinct layouts and retains source execution for mixed-layout overlap',()=>{
+  const source='function run(out,input){out.subarray(1).set(input.subarray(1,4));}';
+  const reference=Function('return ('+source+')')();
+  for(const [Out,outType,In,inType] of [
+    [Float32Array,'f32[]',Float64Array,'f64[]'],[Uint8ClampedArray,'u8c[]',Float64Array,'f64[]'],
+    [Int16Array,'i16[]',Uint32Array,'u32[]'],
+  ]){
+    const {kernel}=compile(source,[outType,inType]);
+    const a=new Out(6),b=a.slice(),input=new In([-1,-2.5,257.5,65537,Infinity]);
+    kernel.run(a,input);reference(b,input);same(a,b);assert.equal(kernel.diagnostics.wasmCalls,1);
+  }
+  const overlap='function run(a,b){a[0]+=1;a.subarray(1).set(b.subarray(1,3),1);}';
+  const fallback=Function('return ('+overlap+')')();
+  const {kernel}=compile(overlap,['u8[]','u16[]'],{runtime:{fallback}});
+  const a=new Uint8Array([1,2,3,4,5,6,7,8]),b=a.slice();
+  kernel.run(a,new Uint16Array(a.buffer));fallback(b,new Uint16Array(b.buffer));same(a,b);
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,1);
+});
+
+test('borrowed bulk late failures roll back before one source execution and keep partial exceptions',()=>{
+  const source='function run(a,b,offset){a[0]+=1;a.subarray(1).set(b.subarray(0,2),offset);a.subarray(-2).fill(9);return a[0];}';
+  const fallback=Function('return ('+source+')')();
+  const {kernel}=compile(source,['f64[]','f64[]','f64'],{maxIterations:3,runtime:{fallback}});
+  for(const offset of [-1,0,Infinity,4]){
+    const a=new Float64Array([1,2,3,4,5]),b=a.slice(),input=new Float64Array([7,8,9]);
+    let actualError,expectedError,actual,expected;
+    try{actual=kernel.run(a,input,offset);}catch(error){actualError=error.constructor;}
+    try{expected=fallback(b,input,offset);}catch(error){expectedError=error.constructor;}
+    assert.equal(actualError,expectedError);assert.equal(actual,expected);same(a,b);assert.equal(a[0],2);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,4);
+  const a=new Float64Array([1,2,3,4,5]),b=a.slice(),empty=new Float64Array();
+  assert.equal(kernel.run(a,empty,0),fallback(b,empty,0));same(a,b);assert.equal(kernel.diagnostics.wasmCalls,1);
+});
+
+test('borrowed bulk method and species guards preserve exact source callbacks and exceptions',()=>{
+  const source='function run(a,b){a[0]+=1;a.subarray(1).set(b.subarray(0,2));}';
+  const fallback=Function('return ('+source+')')(),native=Float64Array.prototype.subarray;
+  const {kernel}=compile(source,['f64[]','f64[]'],{runtime:{fallback}});
+  const a=new Float64Array([1,2,3,4]),b=new Float64Array([7,8,9]);let gets=0,calls=0;
+  Object.defineProperty(b,'subarray',{get(){gets++;return function(...args){calls++;assert.equal(this,b);return Reflect.apply(native,this,args);};}});
+  kernel.run(a,b);assert.deepEqual([...a],[2,7,8,4]);assert.equal(gets,1);assert.equal(calls,1);
+  const c=new Float64Array([1,2,3,4]),d=new Float64Array([7,8,9]),sentinel=new Error('source species');let species=0;
+  Object.defineProperty(d,'constructor',{value:{get [Symbol.species](){species++;throw sentinel;}}});
+  assert.throws(()=>kernel.run(c,d),error=>error===sentinel);assert.equal(species,1);assert.deepEqual([...c],[2,2,3,4]);
+  assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,2);
+  kernel.run(new Float64Array(4),new Float64Array([7,8,9]));assert.equal(kernel.diagnostics.wasmCalls,1);
+});
+
 test('all 81 cross-layout set pairs preserve Number element conversion without JS calls',()=>{
   for(const [Out,outType] of types) for(const [In,inType] of types) {
     const {kernel}=compile('function run(out,input){out.set(input,1);}',[outType,inType]);
@@ -167,7 +268,8 @@ test('mixed-layout overlaps take the original path instead of reading overwritte
 });
 
 test('bulk methods reject reference escape, unknown/dynamic methods and extra arguments',()=>{
-  for(const body of ['return a.fill(1);','a[method](1);','a.set(b,0,1);','a.fill(...b);','a.sort();'])
+  for(const body of ['return a.fill(1);','return a.subarray().fill(1);','a[method](1);','a.set(b,0,1);',
+    'a.fill(...b);','a.subarray(...b).fill(1);','a.slice(0).fill(1);',"a['subarray'](0).fill(1);",'a.sort();'])
     assert.throws(()=>compileNumericCandidate(`function run(a,b,method){${body}}`,{parameterTypes:['f64[]','f64[]','f64']}));
 });
 

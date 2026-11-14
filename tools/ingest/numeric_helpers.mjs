@@ -509,7 +509,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
             if (iteration) { bytes.push(...iteration); continue; }
             const searched = search(update, depth);
             if (searched) { bytes.push(...searched, 0x1a); continue; }
-            const bulk = compileTypedArrayOperation(update, {resolveArray, expression, allocateLocal,
+            const bulk = compileTypedArrayOperation(update, {resolveArray:arrayArgument, expression, allocateLocal,
               control, fail, loopDepth, owner});
             const reduced = bulk ? null : reduction(update, depth);
             if (bulk) { bytes.push(...bulk); }
