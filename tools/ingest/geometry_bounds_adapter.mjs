@@ -17,15 +17,16 @@ const tag=descriptor(typed,Symbol.toStringTag).get,length=descriptor(typed,'leng
 const classes=new WeakMap(),dispatches=new WeakMap(),statistics=new WeakMap();
 const boxVectorMethods=['fromBufferAttribute','min','max'];
 const methodNames={box:['expandByPoint'],vector:[...boxVectorMethods,'distanceToSquared','add'],attribute:['getX','getY','getZ']};
-const emptyBase={values:new F64(0),itemSize:3,type:'f64[]'};
+const emptyBase={values:new F64(0),stride:3,offset:0,type:'f64[]'};
 
 /** Compiler-emitted registrations refer only to exact source class definitions. */
-export function registerGeometryBoundsClass(kind,Class,Child) {
+export function registerGeometryBoundsClass(kind,Class,Child,layout='contiguous') {
   const proto=data(Class,'prototype'),parent=prototype(proto);
   const methods=methodNames[kind].map(name=>[name,data(proto,name)]);
-  set(classes,proto,{kind,parent,methods});
+  const countGetter=layout==='interleaved'?descriptor(proto,'count')?.get:null;
+  set(classes,proto,{kind,parent,methods,layout,countGetter});
   if(Child) {
-    const child=data(Child,'prototype');if(prototype(child)===proto)set(classes,child,{kind,parent:proto,methods});
+    const child=data(Child,'prototype');if(prototype(child)===proto)set(classes,child,{kind,parent:proto,methods,layout,countGetter});
   }
 }
 export function createGeometryBoundsDispatch(variants,resolveMath) {
@@ -62,11 +63,20 @@ function vector(object,state,offset,required=boxVectorMethods,writable=true) {
 }
 function attributeInput(attribute) {
   if(!shape(attribute,'attribute'))return null;
-  const values=data(attribute,'array'),count=data(attribute,'count'),itemSize=data(attribute,'itemSize');
-  if(data(attribute,'normalized')!==false || !integer(count) || count<0 || !integer(itemSize) || itemSize<3)return null;
+  const proto=prototype(attribute),record=get(classes,proto),itemSize=data(attribute,'itemSize');
+  if(data(attribute,'normalized')!==false || !integer(itemSize) || itemSize<3)return null;
+  let values,count,stride=itemSize,offset=0;
+  if(record.layout==='interleaved') {
+    const countDescriptor=descriptor(proto,'count');
+    if(descriptor(attribute,'count') || !record.countGetter || countDescriptor?.get!==record.countGetter || countDescriptor.set)return null;
+    const buffer=data(attribute,'data');if(!isNumericObject(buffer))return null;
+    values=data(buffer,'array');count=data(buffer,'count');stride=data(buffer,'stride');offset=data(attribute,'offset');
+    if(!integer(stride) || stride<itemSize || !integer(offset) || offset<0 || offset>stride-itemSize)return null;
+  }else {values=data(attribute,'array');count=data(attribute,'count');}
+  if(!integer(count) || count<0 || !integer(count*stride))return null;
   try {
     const name=apply(tag,values,[]),type=name==='Float32Array'?'f32[]':name==='Float64Array'?'f64[]':null;
-    return type && apply(length,values,[])===count*itemSize?{values,count,itemSize,type}:null;
+    return type && apply(length,values,[])===count*stride?{values,count,stride,offset,type}:null;
   }catch{return null;}
 }
 function inputs(owner,attribute,scratch) {
@@ -101,7 +111,7 @@ export function tryGeometryBoxBounds(owner,token,attribute,scratch) {
   // Host initialization can encounter a policy hook. Revalidate live objects
   // before borrowing data; the admitted scan and publication invoke no hooks.
   if(!matrixNumericPlatformIntact() || !(input=inputs(owner,attribute,scratch)))return fallback('GEOMETRY_BOUNDS_GUARD');
-  try{runtime.run(input.values,input.state,input.count,input.itemSize);}
+  try{runtime.run(input.values,input.state,input.count,input.stride,input.offset);}
   catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_BOUNDS_EXECUTION');}
   // Preserve source-produced NaN bits for later typed-buffer observations.
   for(let i=0;i<9;i++)if(input.state[i]!==input.state[i])return fallback('GEOMETRY_BOUNDS_NAN');
@@ -143,7 +153,8 @@ export function tryGeometryRadiusBounds(owner,token,method,attribute,position,ce
   if(!matrixNumericPlatformIntact() || !(input=radiusInputs(attribute,position,center,scratch,offset,maximum,relative)))
     return fallback('GEOMETRY_BOUNDS_GUARD');
   let result;
-  try{result=runtime.run(input.values,input.base.values,input.state,input.count,input.itemSize,input.base.itemSize,maximum,relative?1:0);}
+  try{result=runtime.run(input.values,input.base.values,input.state,input.count,input.stride,input.base.stride,
+    input.offset,input.base.offset,maximum,relative?1:0);}
   catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_BOUNDS_EXECUTION');}
   if(result!==result)return fallback('GEOMETRY_BOUNDS_NAN');
   for(let i=0;i<9;i++)if(input.state[i]!==input.state[i])return fallback('GEOMETRY_BOUNDS_NAN');

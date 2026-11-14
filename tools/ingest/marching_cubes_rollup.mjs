@@ -105,7 +105,7 @@ export function marchingCubesRollupPlugin(options={}) {
           if(tangents.report)tangentReports.push({id,...tangents.report});
           if(tangents.changed){edits.push(...tangents.edits);headers.push(tangents.header);tail+=tangents.tail;}
         }
-        if(normalCandidate || code.includes('class Box3')) {
+        if(normalCandidate || code.includes('class Box3') || code.includes('class InterleavedBuffer')) {
           const bounds=specializeGeometryBounds(code,{...sources,runtimeModule:BOUNDS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
           if(bounds.report)boundsReports.push({id,...bounds.report});
           if(bounds.changed){edits.push(...bounds.edits);headers.push(bounds.header);tail+=bounds.tail;}

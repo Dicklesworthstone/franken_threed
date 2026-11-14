@@ -7,7 +7,8 @@ const boxBlob='675f74156954c1df38cafb2862d8bbd21a0e6b98';
 const fresh=(source,name)=>{let value='__f3d_bounds_'+name;while(source.includes(value))value+='_';return value;};
 export function geometryBoundsSourceRole(source) {
   if(sourceBlob(source)===boxBlob)return 'box';
-  const role=geometryNormalSourceRole(source);return ['core','vector','attributes','geometry'].includes(role)?role:null;
+  const role=geometryNormalSourceRole(source);
+  return ['core','vector','attributes','interleaved-attributes','geometry'].includes(role)?role:null;
 }
 export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vectorSource,attributeSource,
   maxMemoryPages=2048,maxIterations=100000000}={}) {
@@ -17,6 +18,8 @@ export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vec
   headers.push('import {registerGeometryBoundsClass as '+register+'} from '+JSON.stringify(runtimeModule)+';');
   if(role==='vector' || role==='core')tails.push(register+'("vector",Vector3);');
   if(role==='attributes' || role==='core')tails.push(register+'("attribute",BufferAttribute,Float32BufferAttribute);');
+  if(role==='interleaved-attributes' || role==='core')
+    tails.push(register+'("attribute",InterleavedBufferAttribute,null,"interleaved");');
   const report={sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,
     compiledMethods:[],accelerationClaim:false};
   if(role==='core'){vectorSource=source;attributeSource=source;}

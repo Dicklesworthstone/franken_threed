@@ -1,6 +1,7 @@
 /** Expand only the pinned bounds scan's actual attribute/vector statements.
  * The source still owns makeEmpty, morph selection and public observations.
  * Every component operation remains f64 and in its original evaluation order.
+ * Guarded integer strides and offsets alter only source accessor addresses.
  */
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
@@ -30,11 +31,14 @@ export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) 
     }
     if(node.type==='Literal')return node.raw??JSON.stringify(node.value);
     if(node.type==='MemberExpression') {
+      if(node.computed && node.object.type==='MemberExpression' && !node.object.computed &&
+          node.object.property.name==='array' && value(node.object.object,env)===attr)
+        return 'values[('+expression(node.property,env)+' + offset)]';
       const object=value(node.object,env),key=node.property.name;
       if(object?.kind==='vector' && !node.computed && ['x','y','z'].includes(key))
         return 'state['+(object.offset+['x','y','z'].indexOf(key))+']';
       if(object===attr && !node.computed) {
-        if(key==='array')return 'values';if(key==='itemSize')return 'itemSize';if(key==='count')return 'count';
+        if(key==='array')return 'values';if(key==='itemSize')return 'stride';if(key==='count')return 'count';
       }
       if(typeof object!=='string')throw new TypeError('Unsupported bounds member');
       return node.computed?object+'['+expression(node.property,env)+']':object+'.'+key;
@@ -77,7 +81,7 @@ export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) 
   // exact identity after all three loads. No per-vertex objects are allocated.
   const argument={type:'Identifier',name:scratchName};
   const body=call(load,env)+call({...expansion,arguments:[argument]},env);
-  return {source:'function scanBounds(values,state,count,itemSize){for('+loop.init.kind+' '+init+';'+
+  return {source:'function scanBounds(values,state,count,stride,offset){for('+loop.init.kind+' '+init+';'+
     expression(loop.test,env)+';'+expression(loop.update,env)+'){'+body+'}}',
     span:{start:loop.start,end:loop.end},scratchName,
     requirements:Object.fromEntries(Object.entries(requirements).map(([name,methods])=>[name,[...methods]]))};
@@ -85,7 +89,7 @@ export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) 
 
 export function compileGeometryBoxKernels(derived,{maxMemoryPages=2048,maxIterations=100000000}={}) {
   return ['f32[]','f64[]'].map(type=>{
-    const artifact=compileNumericKernel(derived.source,{parameterTypes:[type,'f64[]','f64','f64'],
+    const artifact=compileNumericKernel(derived.source,{parameterTypes:[type,'f64[]','f64','f64','f64'],
       generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned Box3.setFromBufferAttribute'});
     return {type,base64:Buffer.from(artifact.wasm).toString('base64')};
   });
@@ -130,15 +134,19 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
   const distance=normalMethod(vector,'distanceToSquared');
   const helper='function __boundsDistance(state)'+rewrite(vectorSource,distance.body,
     new Map([...cells('this',3),...cells(distance.params[0].name,0)]));
-  const attributes=new Map([[positionName,{array:'baseValues',size:'baseItemSize'}],[morphName,{array:'values',size:'itemSize'}]]);
+  const attributes=new Map([[positionName,{array:'baseValues',stride:'baseStride',offset:'baseOffset'}],
+    [morphName,{array:'values',stride:'stride',offset:'offset'}]]);
   function load(call,ordinaryScan) {
-    const name=call.arguments[0].name,layout=ordinaryScan?{array:'values',size:'itemSize'}:attributes.get(name);
+    const name=call.arguments[0].name,layout=ordinaryScan?{array:'values',stride:'stride',offset:'offset'}:attributes.get(name);
     const target=call.callee.object.name===scratchName?0:6,method=normalMethod(vector,'fromBufferAttribute');
     const index=geometrySource.slice(call.arguments[1].start,call.arguments[1].end);
     return method.body.body.filter(node=>node.type!=='ReturnStatement').map(node=>rewrite(vectorSource,node,new Map(cells('this',target)),getter=>{
       const source=normalMethod(attribute,getter.callee.property.name);
-      return rewrite(attributeSource,source.body.body[0].declarations[0].init,
-        new Map([['this.array',layout.array],['this.itemSize',layout.size],[source.params[0].name,'('+index+')']]));
+      const read=source.body.body[0].declarations[0].init;
+      if(read.type!=='MemberExpression' || !read.computed || path(read.object)!=='this.array')
+        throw new TypeError('Unsupported verified bounds accessor');
+      return layout.array+'[('+rewrite(attributeSource,read.property,
+        new Map([['this.itemSize',layout.stride],[source.params[0].name,'('+index+')']]))+' + '+layout.offset+')]';
     })).join('\n');
   }
   function emit(node,ordinaryScan) {
@@ -158,7 +166,7 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
   }
   const scans=[['radius',ordinary],['morph-radius',morph]].map(([method,loop])=>({method,
     span:{start:loop.start,end:loop.end},attribute:method==='radius'?positionName:morphName,
-    source:'function scanRadius(values,baseValues,state,count,itemSize,baseItemSize,'+reductionName+',relative){'+
+    source:'function scanRadius(values,baseValues,state,count,stride,baseStride,offset,baseOffset,'+reductionName+',relative){'+
       'for('+rewrite(geometrySource,loop.init,new Map([[positionName+'.count','count'],[morphName+'.count','count']]))+';'+
       geometrySource.slice(loop.test.start,loop.test.end)+';'+geometrySource.slice(loop.update.start,loop.update.end)+')'+
       emit(loop.body,method==='radius')+'return '+reductionName+';}',
@@ -169,7 +177,7 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
 export function compileGeometryRadiusKernels(derived,{maxMemoryPages=2048,maxIterations=100000000}={}) {
   const variants=[];
   for(const scan of derived.scans)for(const type of ['f32[]','f64[]'])for(const baseType of scan.method==='radius'?['f64[]']:['f32[]','f64[]']) {
-    const artifact=compileNumericKernel(scan.source,{parameterTypes:[type,baseType,'f64[]','f64','f64','f64','f64','f64'],
+    const artifact=compileNumericKernel(scan.source,{parameterTypes:[type,baseType,'f64[]','f64','f64','f64','f64','f64','f64','f64'],
       helperSources:new Map([['__boundsDistance',derived.helper]]),generalControl:true,allowMath:true,maxMemoryPages,maxIterations,
       sourceName:'pinned BufferGeometry.computeBoundingSphere '+scan.method});
     variants.push({method:scan.method,type,baseType,base64:Buffer.from(artifact.wasm).toString('base64')});
