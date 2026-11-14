@@ -252,6 +252,78 @@ function recordMipPasses(f) {
   return passes;
 }
 
+for (const [type, depth, first, count] of [['DataTexture', 1, 0, 1], ['DataArrayTexture', 6, 2, 3], ['Data3DTexture', 4, 1, 2]])
+test(`${type} base copies regenerate the allocated cube pyramid after the complete face range`, async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), destination = f.target({generateMipmaps: true});
+  const bytes = Uint8Array.from({length: 4 * 4 * depth * 4}, (_, i) => (13 + i * 17) % 251);
+  const before = bytes.slice(), source = new f.T[type](bytes, 4, 4, depth), face = 6 - count;
+  assert.equal(f.renderer.copyTextureToTexture(source, destination.texture,
+    box(1, 1, first, 2, 2, count), point(0, 0, face)), undefined);
+  assert.equal(f.commands.length, 1, 'one copy covers the complete accepted face range');
+  assert.equal(f.events.filter(event => event === 'submit').length, 2, 'the copy precedes one complete cube mip submission');
+  checkRegion(f.commands[0].from.texture, f.native(destination), {
+    sourceOrigin: [1, 1, first], destinationOrigin: [0, 0, face], size: [2, 2, count]});
+  assert.deepEqual(passes.map(pass => {
+    const view = pass.colorAttachments[0].view.view;
+    return [view.baseMipLevel, view.baseArrayLayer, view.arrayLayerCount];
+  }), [1, 2].flatMap(level => Array.from({length: 6}, (_, layer) => [level, layer, 1])));
+  assert.equal(destination.entry.storage.diagnostics.mipGenerations, 1);
+  assert.equal(destination.entry.references, 0); assert.equal(f.textures.length, 2);
+  assert.deepEqual(bytes, before); assert.equal(destination.texture.generateMipmaps, true);
+  await f.renderer.waitForGPU();
+});
+
+for (const [width, mips] of [[1, 1], [8, 1], [8, 2]])
+test(`generated cube copies retain their ${width}-texel allocation with ${mips} mip levels`, async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f);
+  const destination = f.target({width, height: width, mips, generateMipmaps: false});
+  f.targets.ensure(destination.entry);
+  const original = f.native(destination), bytes = f.targets.allocatedBytes;
+  destination.texture.generateMipmaps = true;
+  const source = new f.T.DataTexture(rgba([31]), 1, 1);
+  f.renderer.copyTextureToTexture(source, destination.texture, null, point(0, 0, 5));
+  assert.equal(f.native(destination), original, 'generation never replaces an existing cube allocation');
+  assert.equal(original.levels.length, mips); assert.equal(f.targets.allocatedBytes, bytes);
+  assert.equal(passes.length, (mips - 1) * 6);
+  assert.equal(destination.entry.storage.diagnostics.mipGenerations, mips > 1 ? 1 : 0);
+  assert.equal(destination.entry.references, 0);
+  assert.deepEqual(original.levels[0].data.subarray(5 * width * width * 4, 5 * width * width * 4 + 4), rgba([31]));
+  await f.renderer.waitForGPU();
+});
+
+test('queued cube base copies retain each accepted pixel version and mip-generation policy', async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), destination = f.target({generateMipmaps: true});
+  const source = new f.T.DataTexture(rgba([21]), 1, 1), position = point(0, 0, 1);
+  f.renderer._preparing = true;
+  f.renderer.copyTextureToTexture(source, destination.texture, null, position);
+  source.image.data.set(rgba([41])); source.needsUpdate = true;
+  destination.texture.generateMipmaps = false; position.z = 4;
+  f.renderer.copyTextureToTexture(source, destination.texture, null, position);
+  source.image.data.fill(99); destination.texture.generateMipmaps = true; position.z = 99;
+  assert.equal(f.commands.length, 0); assert.equal(destination.entry.references, 2);
+  f.flush();
+  assert.deepEqual(f.commands.map(command => command.to.origin), [[0, 0, 1], [0, 0, 4]]);
+  assert.deepEqual(f.commands.map(command => [...command.from.texture.levels[0].data]), [[21, 21, 21, 255], [41, 41, 41, 255]]);
+  assert.equal(passes.length, 12, 'only the first accepted copy regenerates mips');
+  assert.equal(f.events.filter(event => event === 'submit').length, 3); assert.equal(destination.entry.references, 0);
+  assert.equal(destination.entry.storage.diagnostics.mipGenerations, 1);
+  await f.renderer.waitForGPU();
+});
+
+test('disposed generated cube destinations release queued sampled captures before any upload', async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), destination = f.target({generateMipmaps: true});
+  const source = new f.T.DataTexture(rgba([21]), 1, 1);
+  f.renderer._preparing = true;
+  f.renderer.copyTextureToTexture(source, destination.texture, null, point(0, 0, 5));
+  destination.dispose(); f.flush();
+  assert.equal(f.commands.length, 0); assert.equal(passes.length, 0); assert.equal(f.textures.length, 0);
+  assert.equal(destination.entry.references, 0);
+  // Accepted upload versions stay cached for a live source. Disposal must now
+  // release that cache because the rejected destination left no retained lease.
+  source.dispose(); assert.equal(f.inputs.diagnostics.snapshotBytes, 0);
+  await assert.rejects(f.renderer.waitForGPU());
+});
+
 test('ordinary sampled mip copies preserve complete authored pyramids and isolate uploaded Source aliases', async t => {
   const f = cubeSetup(t), source = mipTexture(f.T, 8, 4, 21), destination = mipTexture(f.T, 4, 2, 1);
   const alias = mipTexture(f.T, 4, 2, 1); alias.source = destination.source; alias.mipmaps = destination.mipmaps;

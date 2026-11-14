@@ -5,7 +5,7 @@ render-target color sources and destinations across ordinary 2D images, cube
 faces, array layers and 3D volume slices. Cube targets can also feed the shared
 storage-texture owner, including a complete six-face cube, a face range, or a
 selected source mip. GPU storage can write those cube faces in the reverse
-direction, including authored destination mip levels. Copies use the existing
+direction, including authored destination mip levels. Raw copies use the existing
 native images and resource owners: no sampler, orientation replica, seeding
 shader or CPU readback is introduced.
 
@@ -59,8 +59,18 @@ Cube allocation identity survives CubeCamera's temporary generation toggles.
 Each copy captures the current generation policy rather than inheriting the
 flag from an earlier allocation observation. Later flag changes do not redirect
 queued writes. Raw cube writes leave mip generation source-ordered, just like
-the existing face-aware target transfers; they do not generate a cube pyramid
-or filter source pixels implicitly.
+the existing face-aware target transfers. Authored writes do not generate a
+cube pyramid or filter source pixels implicitly.
+
+Sampled data and decoded images can also write cube destinations. A level-zero
+copy with captured `generateMipmaps: true` submits its complete accepted face
+range before regenerating the allocated cube pyramid, matching the pinned native
+backend. The existing cube-aware filter rebuilds all six faces at each derived
+level; base texels outside the copy stay untouched. Generation never grows an
+existing cube allocation, including one-level and partial authored chains after
+the public flag changes. Source pixels, face selection and generation policy
+remain captured independently for each queued copy. Generated higher-level writes
+and WebGL generated cube destinations retain their explicit unsupported boundary.
 
 Both endpoints use their own mip-local bounds. Array layer counts stay fixed;
 volume depth shrinks with each mip, including NPOT and one-texel tails. Native
@@ -97,11 +107,23 @@ GPU errors and completion continue to belong to the existing owners.
 
 WebGL, depth and pre-initialization copies retain their existing transfer path.
 Sampled-image copies keep their captured-upload path; they are not rerouted here.
-Sampled-image-to-cube destinations and additional depth/combined-aspect copies
-remain unsupported. MRT and authored-mip allocation capabilities remain those
+Additional depth/combined-aspect copies remain unsupported. MRT and authored-mip allocation capabilities remain those
 of the existing target owner.
 
 ## Evidence
+
+The sampled-copy regressions cover generated cube destinations, complete
+2D/array/volume source ranges, untouched base texels, ordered mip attachments,
+queued policy and pixel versions, partial allocations, cancellation and WebGL
+rejection:
+
+```sh
+node --test tools/ingest/three_sampled_native_copy.test.mjs \
+  tools/ingest/three_sampled_texture_copy.test.mjs \
+  tools/ingest/three_sampled_texture_copy_mips.test.mjs
+```
+
+These are recording-device checks, not filtered GPU-pixel evidence.
 
 Run the cube destination and cross-owner regressions:
 

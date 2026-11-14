@@ -42,14 +42,14 @@ function captureDestination(renderer, texture, level, inputs) {
   if (entry.shape.sampleCount !== 1) fail('SAMPLES', 'Sampled copies require a single-sample target destination');
   if (colorIndex < 0) fail('STALE', 'Color texture no longer belongs to its render target');
   const color = entry.shape.colors[colorIndex];
-  const explicitMipmaps = !renderer._shaderEncodedOutput && (entry.historyGroup || entry.shape.textures.length > 1 ||
+  const explicitMipmaps = !renderer._shaderEncodedOutput && (entry.shape.cube || entry.historyGroup || entry.shape.textures.length > 1 ||
     !entry.shape.cube && !entry.shape.array && !entry.shape.volume);
   // CubeCamera can toggle generation without changing the native allocation.
   // Capture this call's policy; authored faces share its six array layers.
   const generateMipmaps = entry.shape.cube || explicitMipmaps
     ? texture.generateMipmaps : color.generateMipmaps;
-  if (entry.shape.cube && generateMipmaps !== false)
-    fail('LEVEL', 'Cube destinations require an authored, non-generated mip chain');
+  if (entry.shape.cube && !explicitMipmaps && generateMipmaps !== false)
+    fail('LEVEL', 'Generated cube destinations require the native WebGPU renderer');
   // Authored chains already belong to the target's native allocation. The
   // shared planner validates the selected mip and its independent XYZ extent.
   // Do not write a derived level: the owner's next mip refresh would replace it.

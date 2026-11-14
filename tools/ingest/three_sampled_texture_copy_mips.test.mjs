@@ -18,7 +18,7 @@ function deferred() {
   return {promise, resolve, reject};
 }
 function fixture(options = {}) {
-  const events = [], commands = [], errors = [], active = new Set(), history = new Map(), validations = [];
+  const events = [], commands = [], errors = [], active = new Set(), history = new Map(), validations = [], generations = [];
   let refs = 0, releases = 0, rollbacks = 0, sourceReleases = 0;
   const source = {version: 1, alive: true, bytes: Uint8Array.of(1, 2, 3, 4),
     shape: {width: 2, height: 2, depth: 1, mipLevelCount: 1, format: 'rgba8unorm', viewDimension: '2d'}};
@@ -66,8 +66,9 @@ function fixture(options = {}) {
       }
       if (targets.budgetError) throw targets.budgetError;
     },
-    withNativeColorDestination(borrow, run, {validation}) {
+    withNativeColorDestination(borrow, run, {validation, generateMipmaps}) {
       targets.assertCurrent(borrow.entry); events.push('destination');
+      generations.push(generateMipmaps);
       const result = run(nativeDestination);
       const task = Promise.resolve(validation); task.catch(() => {}); validations.push(task);
       return result;
@@ -117,7 +118,7 @@ function fixture(options = {}) {
     for (const request of renderer._pending.splice(0)) request.reject(error('DISPOSED'));
   };
   return {source, destination, target, shape, device, renderer, targets, inputs, nativeDestination,
-    events, commands, errors, history, active, validations, copy, flush, dispose,
+    events, commands, errors, history, active, validations, generations, copy, flush, dispose,
     get refs() { return refs; }, get releases() { return releases; },
     get sourceReleases() { return sourceReleases; }, get rollbacks() { return rollbacks; }};
 }
@@ -185,9 +186,20 @@ test('cube policy follows the current public flag and remains captured through t
   f.renderer._preparing = true;
   f.copy(null, point(0, 0, 5)); // Public false overrides the earlier descriptor's true.
   f.destination.generateMipmaps = true;
-  for (const level of [0, 2])
-    assert.throws(() => f.copy(null, null, 0, level), {code: 'THREE_STORAGE_COPY_LEVEL'});
-  await f.flush(); assert.equal(f.commands.length, 1); assert.deepEqual(f.errors, []); released(f);
+  f.copy(null, point(0, 0, 2), 0, 0);
+  assert.throws(() => f.copy(null, null, 0, 2), {code: 'THREE_STORAGE_COPY_LEVEL'});
+  f.destination.generateMipmaps = false;
+  await f.flush(); assert.equal(f.commands.length, 2); assert.deepEqual(f.errors, []);
+  assert.deepEqual(f.commands.map(command => command.to.mipLevel), [2, 0]);
+  assert.deepEqual(f.generations, [false, true]);
+  assert.equal(f.refs, 0); assert.equal(f.active.size, 0);
+});
+
+test('WebGL generated cube destinations remain rejected before source capture', () => {
+  const f = fixture({cube: true, viewDimension: 'cube', layers: 6, generateMipmaps: true});
+  f.renderer._shaderEncodedOutput = true;
+  assert.throws(() => f.copy(null, null, 0, 0), {code: 'THREE_STORAGE_COPY_LEVEL'});
+  assert.deepEqual(f.events, []); assert.equal(f.refs, 0); assert.equal(f.history.size, 0);
 });
 
 test('multi-slice source copies select an authored volume mip without changing source pixels', () => {

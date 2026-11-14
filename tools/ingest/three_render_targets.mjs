@@ -1578,7 +1578,10 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         // Pinned copyTextureToTexture filters a generated level-zero destination
         // after the raw copy. Only that selected color becomes a new pyramid.
         if (generateMipmaps) {
-          growColorMipmaps(entry, [colorIndex]);
+          // CubeCamera can toggle generation after allocation. Pinned cube
+          // copies filter only the allocated levels, including authored partial
+          // chains; immutable cube storage must not grow after the copy.
+          if (!entry.shape.cube) growColorMipmaps(entry, [colorIndex]);
           entry.storage.generateMipmaps([colorIndex]);
         }
         return result;

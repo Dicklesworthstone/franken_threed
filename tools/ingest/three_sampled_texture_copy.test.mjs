@@ -334,9 +334,9 @@ test('array and 3D target writes retain selected slices and raw float32 formats'
 });
 
 test('unsupported target destinations fail before source capture or GPU work', () => {
-  for (const [options, code] of [[{cube: true}, 'LEVEL'], [{sampleCount: 4}, 'SAMPLES']]) {
+  for (const [options, code, level] of [[{cube: true}, 'LEVEL', 1], [{sampleCount: 4}, 'SAMPLES', 0]]) {
     const f = targetFixture(options);
-    assert.throws(() => f.copy(), {code: 'THREE_STORAGE_COPY_' + code});
+    assert.throws(() => f.copy(null, null, 0, level), {code: 'THREE_STORAGE_COPY_' + code});
     assert.equal(f.active.size, 0); assert.equal(f.targetReferences, 0); assert.equal(f.commands.length, 0);
   }
   const f = targetFixture();
