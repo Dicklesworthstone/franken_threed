@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import * as acorn from "acorn";
 import { packHtml } from "./pack_html.mjs";
+import { buildApplication } from "./build_application.mjs";
 
 const decode = (url) =>
   Buffer.from(url.slice(url.indexOf(",") + 1).split("#")[0], "base64").toString();
@@ -299,4 +300,106 @@ test("budget, root containment, symlink and output protections apply to workers"
   const bytes = fs.readFileSync(f.output);
   assert.throws(() => f.pack(), { code: "OUTPUT_EXISTS" });
   assert.deepEqual(fs.readFileSync(f.output), bytes);
+});
+
+test("packed immutable worker selectors preserve bindings, effects, URL objects and TDZ", async (t) => {
+  const f=fixture({
+    "one.mjs":"export const answer=42;", "two.mjs":"export const answer=7;",
+  },`
+    export function chooseWorker(flag, asUrl, log) {
+      const name=(log.push('initialize'),flag?'one':'two'),entry='./'+name+'.mjs',alias=entry;
+      log.push(entry);
+      const worker=asUrl
+        ?new Worker(new URL((log.push('argument'),alias),import.meta.url),
+          {type:'module',name:(log.push('options'),name)})
+        :new Worker((log.push('argument'),alias),{type:'module',name:(log.push('options'),name)});
+      log.push(entry);return worker;
+    }
+    export function early(log) {
+      new Worker(entry,{type:'module',name:(log.push('options'),'early')});
+      const entry='./one.mjs';
+    }`);
+  assert.equal(f.pack().workerCount,2);
+  const entry=modules(f.output).find(url=>decode(url).includes('export function chooseWorker'));
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  const original=globalThis.Worker,calls=[];
+  globalThis.Worker=class {constructor(url,options){this.url=url;this.options=options;calls.push(this);}};
+  t.after(()=>{if(original===undefined)delete globalThis.Worker;else globalThis.Worker=original;});
+  const application=await import(entry);
+  for (const flag of [true,false]) for (const asUrl of [false,true]) {
+    const log=[],worker=application.chooseWorker(flag,asUrl,log),name=flag?'one':'two';
+    assert.deepEqual(log,['initialize','./'+name+'.mjs','argument','options','./'+name+'.mjs']);
+    assert.equal(worker.url instanceof URL,asUrl);
+    assert.equal(worker.options.name,name);
+    const code=await (await fetch(worker.url)).text();
+    const loaded=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+    assert.equal(loaded.answer,flag?42:7);
+  }
+  const log=[];
+  assert.throws(()=>application.early(log),ReferenceError);
+  assert.deepEqual(log,[]);
+  assert.equal(calls.length,4,'TDZ failure never constructs a worker');
+});
+
+test("normal-build worker dispatch expressions stay closed when subsequently packed", async (t) => {
+  const f=fixture({
+    "one.mjs":"import {value} from './lib/value.mjs';export const answer=value;",
+    "lib/value.mjs":"export const value=42;",
+    "two.mjs":"export const answer=7;",
+  },`export function chooseBuiltWorker(flag,log) {
+    const name=(log.push('select'),flag?'one':'two'),entry=\`./\${name}.mjs\`;
+    return new Worker(entry,{type:'module',name:(log.push('options'),name)});
+  }`);
+  const built=await buildApplication(path.join(f.source,'index.html'),path.join(f.root,'dist'));
+  assert.equal(packHtml(path.join(built.outDir,'index.html'),f.output).workerCount,2);
+  const entry=modules(f.output).find(url=>decode(url).includes('new Worker'));
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  fs.renameSync(built.outDir,path.join(f.root,'dist-unavailable'));
+  const original=globalThis.Worker;
+  globalThis.Worker=class {constructor(url){this.url=url;}};
+  t.after(()=>{if(original===undefined)delete globalThis.Worker;else globalThis.Worker=original;});
+  const application=await import(entry);
+  for (const flag of [true,false]) {
+    const log=[],worker=application.chooseBuiltWorker(flag,log);
+    const code=await (await fetch(worker.url)).text();
+    const loaded=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+    assert.equal(loaded.answer,flag?42:7);
+    assert.deepEqual(log,['select','options']);
+  }
+});
+
+test("packed nested module workers retain lexical finite string choices", async (t) => {
+  const f=fixture({
+    "worker.mjs":`export function nested(flag) {
+      const directory='./children/',file=flag?'one':'two',entry=directory+file+'.mjs';
+      return new Worker(entry,{type:'module'});
+    }`,
+    "children/one.mjs":"export const answer=1;", "children/two.mjs":"export const answer=2;",
+  });
+  assert.equal(f.pack().workerCount,3);
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  const code=await body(factories(f.output)[0]);
+  const application=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+  const original=globalThis.Worker;
+  globalThis.Worker=class {constructor(url){this.url=url;}};
+  t.after(()=>{if(original===undefined)delete globalThis.Worker;else globalThis.Worker=original;});
+  for (const flag of [true,false]) {
+    const worker=application.nested(flag),code=await (await fetch(worker.url)).text();
+    const child=await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
+    assert.equal(child.answer,flag?1:2);
+  }
+});
+
+test("mutable, imported, shadowed and URL-object selectors retain ordinary deployment", () => {
+  for (const source of [
+    "let entry='./worker.mjs';new Worker(entry,{type:'module'});",
+    "const entry='./worker.mjs';function start(entry){new Worker(entry,{type:'module'});}",
+    "const entry='./worker.mjs';function start(){let entry='./worker.mjs';new Worker(entry,{type:'module'});}",
+    "import entry from './choice.mjs';new Worker(entry,{type:'module'});",
+    "const entry=new URL('./worker.mjs',import.meta.url);entry.pathname='/other.mjs';new Worker(entry,{type:'module'});",
+  ]) {
+    const f=fixture({"choice.mjs":"export default './worker.mjs';"},source);
+    assert.throws(()=>f.pack(),{code:'WORKER_URL'});
+    assert.equal(fs.existsSync(f.output),false);
+  }
 });

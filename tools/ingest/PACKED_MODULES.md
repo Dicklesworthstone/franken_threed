@@ -342,6 +342,42 @@ module URL. Worker module cycles still fail explicitly rather than shipping a
 replacement linker. Source `import.meta` reflection outside admitted static URL
 operands remains unsupported, as do reflective changes to host constructors.
 
+## Immutable worker URL selectors
+
+Module source can select a worker through immutable primitive strings, using the
+same bounded lexical analysis as lazy imports:
+
+```js
+const directory = './workers/';
+export function startWorker(mode) {
+  const name = mode ? 'decode' : 'prepare';
+  const entry = `${directory}${name}.mjs`;
+  return new Worker(entry, { type: 'module' });
+}
+```
+
+Normal application builds and standalone packing include both finite worker
+graphs. Direct document strings keep the document base; `new URL(entry,
+import.meta.url)` keeps the importing module's base. The same rules apply to
+nested workers in module code and module helpers. Normal builds also discover
+SharedWorker selectors through this path; their existing standalone boundary is
+unchanged.
+
+Only the constructor operand is mapped. Original constants, other reads of
+their values, selector/initializer effects, URL-object construction, options and
+temporal-dead-zone failures stay in place. The operand executes once, and an
+embedded worker Blob URL is created only for the selected entry. A normal
+build's generated mapping remains analyzable when that build is later packed.
+Nested worker/resource edits inside a selector retain their own source order.
+
+Mutable bindings, parameters, imported selectors, property/call results and
+aliases to mutable URL objects do not establish a finite string set. Classic
+script aliases retain the existing conservative scope policy. Unproved normal
+build routes stay host-owned; standalone packing still refuses open worker
+graphs before writing output. The existing 128-candidate discovery and
+64-target packing limits apply. This closes a source dependency pattern without
+changing the worker host, introducing a runtime linker or claiming acceleration.
+
 ## Nested dedicated worker graphs
 
 Dedicated workers may be constructed by document classic scripts and modules,

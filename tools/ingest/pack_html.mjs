@@ -765,8 +765,9 @@ export function packHtml(
       if (worker?.kind === "classic") for (const name of names) worker.hostUses.add(name);
       else if (!worker) for (const name of names) documentWorkerUses.add(name);
     }
-    // Rewrite only finite URL result leaves. Conditions, comma-prefix effects,
-    // native URL construction and caller options keep their execution ordering.
+    const classifyImport = createDynamicImportClassifier(ast);
+    // Rewrite finite URL results at their use, keeping declarations, selectors,
+    // native URL construction and caller options in their original order.
     function rewriteURLs(node, origin, emit, code, depth = 0, budget = { count: 0 }) {
       if (!node || depth > 64 || budget.count >= 64) fail(code, `${from}: URL choices exceed their bound`);
       const value = literal(node);
@@ -789,7 +790,25 @@ export function packHtml(
         allowedMeta.add(base.object);
         workerURLs.add(node);
         rewriteURLs(ref, from, emit, code, depth + 1, budget);
-      } else fail(code, `${from}: URL must have finite literal results`);
+      } else {
+        if (code !== "WORKER_URL") fail(code, `${from}: URL must have finite literal results`);
+        let targets;
+        try { targets = [...finiteImports(node, new Map(), 0, classifyImport)]; }
+        catch (error) {
+          if (error instanceof HtmlPackingError && error.code === "DYNAMIC_IMPORT_OPEN")
+            fail(code, `${from}: URL must have finite string results`);
+          throw error;
+        }
+        if (!targets.length || targets.some(value => !value) || budget.count + targets.length > 64)
+          fail(code, `${from}: URL choices exceed their bound or contain an empty URL`);
+        budget.count += targets.length;
+        const chain = targets.map(value =>
+          `v === ${JSON.stringify(value)} ? ${emit(value, origin)} : `).join("");
+        // Insertion edits preserve any nested source effects that have their
+        // own import/resource/worker edits. The original value is read once.
+        replacements.push({start: node.start, end: node.start, value: `((v) => ${chain}v)(`});
+        replacements.push({start: node.end, end: node.end, value: ")"});
+      }
     }
     for (const site of workerSites) {
       // This exact emitted module is the host boundary for hash-proven source
@@ -840,7 +859,6 @@ export function packHtml(
         fail("WORKER_IMPORT", "Bare worker imports must be bundled before export");
       return workerModuleFor(local(value, from), kind, worker).data;
     };
-    const classifyImport = createDynamicImportClassifier(ast);
     function importSource(node, kind, urlSemantics = false, depth = 0) {
       if (depth > 64) fail("DYNAMIC_IMPORT_OPEN", `${from}: import analysis exceeds its bound`);
       const value = literal(node);
