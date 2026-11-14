@@ -141,6 +141,47 @@ async function capture(mode) {
             try {await draw((signed ? 'i' : 'u') + dimension + '-fetch-offset', value);} finally {value.dispose(); texture.dispose();}
           }
         }
+        // Every RGBA scalar format uses the same source component ranges.
+        // Padded rows and partial first allocation must preserve unrequested
+        // pixels through both WebGL and the new texture residency owner.
+        for (const [name, Kind, integral] of [
+          ['UnsignedByteType', Uint8Array, false], ['HalfFloatType', Uint16Array, false], ['FloatType', Float32Array, false],
+          ['ByteType', Int8Array, true], ['UnsignedByteType', Uint8Array, true],
+          ['ShortType', Int16Array, true], ['UnsignedShortType', Uint16Array, true],
+          ['IntType', Int32Array, true], ['UnsignedIntType', Uint32Array, true],
+        ]) {
+          const bpc = Kind.BYTES_PER_ELEMENT, stride = Math.ceil(3 * 4 * bpc / 8) * 8 / bpc;
+          const data = new Kind(stride * 3 + 6).subarray(2, -4);
+          const texture = new T.DataTexture(data, 3, 3, integral ? T.RGBAIntegerFormat : T.RGBAFormat, T[name]);
+          texture.unpackAlignment = 8;
+          const signed = [T.ByteType, T.ShortType, T.IntType].includes(T[name]);
+          const sampler = integral ? signed ? 'isampler2D' : 'usampler2D' : 'sampler2D';
+          const result = integral ? 'uvec4 texel=uvec4(texelFetch(image,ivec2(vUv*3.),0));' +
+            'uint value=texel.r^(texel.g<<8u)^(texel.b<<16u)^(texel.a<<24u);' +
+            'color=vec4(uvec4(value,value>>8u,value>>16u,value>>24u)&uvec4(255u))/255.;'
+            : 'color=texelFetch(image,ivec2(vUv*3.),0);';
+          const value = material(texture, `precision highp float;precision highp int;in vec2 vUv;out vec4 color;
+            uniform highp ${sampler} image;void main(){${result}}`);
+          const label = `partial-${integral ? 'integer-' : ''}${name}`;
+          const fill = step => {
+            for (let i = 0; i < data.length; i++) {
+              const sample = ((step * 3 + i * 5) & 15) / 16;
+              data[i] = integral ? (0x81234567 + step * 0x10307 + i * 0x70701) >>> 0
+                : name === 'HalfFloatType' ? T.DataUtils.toHalfFloat(sample)
+                : name === 'FloatType' ? sample : sample * 256;
+            }
+          };
+          try {
+            fill(0); texture.addUpdateRange(16, 4); texture.needsUpdate = true;
+            await draw(label + '-initial', value);
+            fill(1); await draw(label + '-unmarked', value);
+            texture.addUpdateRange(0, 3); texture.addUpdateRange(4, 4); texture.addUpdateRange(20, 4);
+            texture.addUpdateRange(24, 0); texture.needsUpdate = true;
+            await draw(label + '-requested', value);
+            if (texture.updateRanges.length !== 0) throw Error(label + ': accepted source ranges were not consumed');
+            fill(2); texture.needsUpdate = true; await draw(label + '-full', value);
+          } finally { value.dispose(); texture.dispose(); }
+        }
         // A depth pattern varying in both axes exposes row-orientation and
         // projected-reference errors. Keep nearest comparison deterministic.
         const depth = new T.DepthTexture(8, 8, T.FloatType); depth.compareFunction = T.LessEqualCompare;
@@ -243,6 +284,12 @@ try {
   assert.equal(candidate.route, 'general-webgpu'); assert.ok(candidate.draws > 0);
   assert.equal(candidate.frames.length, source.frames.length);
   const frame = name => source.frames.find(frame => frame.name === name).pixels;
+  for (const {name} of source.frames.filter(frame => /^partial-.*-initial$/.test(frame.name))) {
+    const label = name.slice(0, -8);
+    assert.deepEqual(frame(label + '-initial'), frame(label + '-unmarked'), 'unmarked scalar edits stay GPU-stale');
+    assert.notDeepEqual(frame(label + '-initial'), frame(label + '-requested'), 'requested scalar ranges reach the sampled texture');
+    assert.notDeepEqual(frame(label + '-requested'), frame(label + '-full'), 'a full request publishes remaining scalar pixels');
+  }
   assert.notDeepEqual(frame('2D-proj'), frame('2D-proj-bias'), 'projection bias selects another source mip');
   assert.notDeepEqual(frame('2D-offset'), frame('2D-offset-bias'), 'offset bias selects another source mip');
   assert.deepEqual(frame('2D-proj'), frame('2D-proj-vec3'), '2D vec4 projection ignores its third component');

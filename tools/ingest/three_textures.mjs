@@ -4,7 +4,8 @@
  * allocations; update() uploads only requested texture/source versions. Native
  * failures are terminal, callback exceptions preserve their source upload history.
  *
- * Byte DataTextures: R/RG/RGBA, manual/generated mipmaps and RGBA row ranges.
+ * DataTextures: R/RG/RGBA, manual/generated mipmaps and RGBA row ranges
+ * across normalized byte, half/float and signed/unsigned integer storage.
  * Decoded image/canvas/ImageData: browser external-copy sRGB profile.
  * CubeTextures admit six matching byte/image faces with authored or generated
  * mips. VideoTextures copy ready HTMLVideoElement frames into stable 2D residency,
@@ -381,7 +382,7 @@ function textureInspector(T,{
     const images=uploads.map(entry=>entry.image);
     if(!Array.isArray(t.updateRanges))fail('RANGE','Expected source update ranges');
     if(!nativeAllocation&&t.updateRanges.length&&!(nativeMedia&&data&&!layered&&!cube)){
-      if(integral||cube||layered||!data||manual||channels!==4||t.flipY||bpc!==1)fail('RANGE','Partial source uploads require unflipped RGBA byte base pixels');
+      if(cube||layered||!data||manual||channels!==4||t.flipY)fail('RANGE','Partial source uploads require unflipped RGBA base pixels');
       for(const r of t.updateRanges){
         integer(r.start,0,width*height*4,'range start');integer(r.count,0,width*height*4-r.start,'range count');
         const x=Math.floor(r.start/4)%width,count=Math.ceil(r.count/4);
@@ -597,10 +598,15 @@ export function createGpuThreeTextures(device,{
             native(()=>device.queue.writeTexture({texture:a.texture},src,{bytesPerRow:pitch,rowsPerImage:d.height},[d.width,d.height,d.layers]));stats.writeCalls++;
           }
         }else if(t.updateRanges.length&&!d.native2DData){
-          const rowBytes=d.width*4,pitch=Math.ceil(rowBytes/d.alignment)*d.alignment;
+          // r186's ranges count RGBA components for every scalar type. GL's
+          // row/skip pixel state addresses the padded source in bytes. An
+          // intrinsic byte view also avoids invoking application subarray or
+          // species hooks that the pinned GL upload never calls.
+          const rowBytes=d.width*4*d.bpc,pitch=Math.ceil(rowBytes/d.alignment)*d.alignment;
           for(const range of ranges(t,d.width)){
             const pixel=Math.floor(range.start/4),x=pixel%d.width,y=Math.floor(pixel/d.width),width=Math.ceil(range.count/4);
-            if(width){const data=t.image.data.subarray(y*pitch+x*4);
+            if(width){const source=t.image.data,offset=y*pitch+x*4*d.bpc;
+              const data=new Uint8Array(source.buffer,source.byteOffset+offset,source.byteLength-offset);
               native(()=>device.queue.writeTexture({texture:a.texture,origin:[x,y,0]},data,{bytesPerRow:pitch},[width,1,1]));}
             if(width)stats.writeCalls++;
           }

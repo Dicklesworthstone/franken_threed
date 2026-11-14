@@ -152,7 +152,7 @@ for(const webglVersioning of [false,true])test(`source texture callbacks cannot 
   assert.equal(p.binding(t).version,t.version,'texture acknowledges after callback');p.dispose();
 });
 
-test('source image getters and partial byte views run outside native validation scopes',async()=>{
+test('source image getters run outside native validation scopes without calling custom byte views',async()=>{
   const d=textureDevice(),p=pool(d),t=make(),image=t.image,width=image.width,data=image.data;
   let dimensions=0,views=0;
   Object.defineProperty(image,'width',{get(){dimensions++;assert.equal(d.scopes.length,0);return width;}});
@@ -160,7 +160,7 @@ test('source image getters and partial byte views run outside native validation 
   data.subarray=function(...args){views++;assert.equal(d.scopes.length,0);return subarray.apply(this,args);};
   p.prepare([t]);await p.whenIdle();
   data.fill(53);t.addUpdateRange(4,4);t.needsUpdate=true;p.update([t]);await p.whenIdle();
-  assert.ok(dimensions>1);assert.equal(views,1);assert.equal(p.failed,false);
+  assert.ok(dimensions>1);assert.equal(views,0,'pinned GL upload does not call source subarray');assert.equal(p.failed,false);
   assert.deepEqual([...p.nativeTexture(t).levels[0].slice(4,8)],[53,53,53,53]);p.dispose();
 });
 
@@ -314,6 +314,103 @@ test('half-float and float DataTextures upload exact bytes; float32 linear filte
   const srgb=new T.DataTexture(new Uint16Array(4),1,1,T.RGBAFormat,T.HalfFloatType);srgb.colorSpace=T.SRGBColorSpace;srgb.needsUpdate=true;
   assert.throws(()=>p.prepare([srgb]),{code:'THREE_TEXTURE_COLOR'});
   p.dispose();
+});
+
+const rgbaStorageTypes = [
+  ['UnsignedByteType', Uint8Array, false, 'UNSIGNED_BYTE'],
+  ['HalfFloatType', Uint16Array, false, 'HALF_FLOAT'],
+  ['FloatType', Float32Array, false, 'FLOAT'],
+  ['ByteType', Int8Array, true, 'BYTE'], ['UnsignedByteType', Uint8Array, true, 'UNSIGNED_BYTE'],
+  ['ShortType', Int16Array, true, 'SHORT'], ['UnsignedShortType', Uint16Array, true, 'UNSIGNED_SHORT'],
+  ['IntType', Int32Array, true, 'INT'], ['UnsignedIntType', Uint32Array, true, 'UNSIGNED_INT'],
+];
+for (const [name, Kind, integral, glType] of rgbaStorageTypes)
+test(`partial ${integral ? 'integer ' : ''}${name} uploads match pinned source bytes and histories`, async t => {
+  const {WebGLTextures} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLTextures.js')));
+  const {WebGLProperties} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLProperties.js')));
+  const bpc = Kind.BYTES_PER_ELEMENT, width = 3, height = 3, pitch = Math.ceil(width * 4 * bpc / 8) * 8;
+  const makeTexture = () => {
+    // A nonzero source-view offset and padded byte rows expose accidental
+    // mixing of component, pixel and byte offsets, including 16/32-bit storage.
+    const data = new Kind(pitch * height / bpc + 6).subarray(2, -4);
+    const texture = new T.DataTexture(data, width, height, integral ? T.RGBAIntegerFormat : T.RGBAFormat, T[name]);
+    texture.unpackAlignment = 8; texture.needsUpdate = true; return texture;
+  };
+  const a = makeTexture(), b = makeTexture(), d = textureDevice(), p = pool(d, {webglVersioning: true});
+  const bytes = texture => new Uint8Array(texture.image.data.buffer, texture.image.data.byteOffset, texture.image.data.byteLength);
+  const parameters = new Map(), uploads = [], properties = WebGLProperties();
+  let bound, next = 1;
+  const gl = new Proxy({TEXTURE0: 0, createTexture: () => ({}), deleteTexture() {}, texParameteri() {}, generateMipmap() {}},
+    {get(object, key) { if (!(key in object)) object[key] = next++; return object[key]; }});
+  const state = {activeTexture() {}, bindTexture(_target, texture) { bound = texture; },
+    pixelStorei(key, value) { parameters.set(key, value); }, getParameter: key => parameters.get(key) ?? 0,
+    texStorage2D(_target, _levels, _format, w, h) { bound.width = w; bound.data = new Uint8Array(w * h * 4 * bpc); },
+    texSubImage2D(_target, _level, x, y, w, h, _format, _type, data) {
+      const row = parameters.get(gl.UNPACK_ROW_LENGTH) || w;
+      const stride = Math.ceil(row * 4 * bpc / parameters.get(gl.UNPACK_ALIGNMENT)) * parameters.get(gl.UNPACK_ALIGNMENT);
+      const start = (parameters.get(gl.UNPACK_SKIP_ROWS) || 0) * stride + (parameters.get(gl.UNPACK_SKIP_PIXELS) || 0) * 4 * bpc;
+      const source = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      for (let iy = 0; iy < h; iy++) bound.data.set(source.subarray(start + iy * stride, start + iy * stride + w * 4 * bpc),
+        ((y + iy) * bound.width + x) * 4 * bpc);
+      if (w) uploads.push({origin: [x, y, 0], size: [w, h, 1]});
+    }};
+  const uploader = new WebGLTextures(gl, {has: () => false, get: () => null}, state, properties,
+    {maxTextures: 16, maxTextureSize: 8192},
+    {convert: value => value === T[name] ? gl[glType] : value === a.format ? integral ? gl.RGBA_INTEGER : gl.RGBA : value},
+    {memory: {textures: 0}});
+  t.after(() => { a.dispose(); b.dispose(); p.dispose(); });
+  const callbacks = [[], []];
+  for (const [index, texture] of [a, b].entries()) texture.onUpdate = source =>
+    callbacks[index].push([source.version, source.source.version, source.updateRanges.length]);
+  const consume = () => {
+    p.prepare([a]); uploader.setTexture2D(b, 0);
+    assert.deepEqual(p.nativeTexture(a).levels[0], properties.get(b).__webglTexture.data);
+    assert.deepEqual(d.textureWrites.map(write => ({origin: write.destination.origin ?? [0, 0, 0], size: write.size})), uploads);
+    assert.deepEqual(a.updateRanges, b.updateRanges); assert.deepEqual(callbacks[0], callbacks[1]);
+  };
+  for (const texture of [a, b]) { bytes(texture).fill(0x37); texture.addUpdateRange(16, 4); }
+  consume(); assert.ok(p.nativeTexture(a).levels[0].slice(0, width * 4 * bpc).every(value => value === 0));
+  for (let frame = 0; frame < 18; frame++) {
+    for (const texture of [a, b]) {
+      const data = bytes(texture);
+      for (let i = 0; i < data.length; i++) data[i] = (frame * 29 + i * 17) & 255;
+      texture.addUpdateRange(24, 0); texture.addUpdateRange(4, 4); texture.addUpdateRange(0, 3);
+      texture.addUpdateRange(20, 4);
+      // Unrequested edits and ranges remain CPU-only until the next request.
+      if (frame % 3 !== 0) texture.needsUpdate = true;
+    }
+    consume();
+  }
+  const before = d.textureWrites.length;
+  for (const texture of [a, b]) { texture.addUpdateRange(4, 0); texture.needsUpdate = true; }
+  consume(); assert.equal(d.textureWrites.length, before);
+});
+
+for (const [name, Kind, integral] of rgbaStorageTypes)
+test(`partial ${integral ? 'integer ' : ''}${name} ignores source subarray and species hooks`, () => {
+  const bpc = Kind.BYTES_PER_ELEMENT, data = new Kind(16).subarray(2, 14);
+  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = i * 13 + 7;
+  data.subarray = () => { throw new Error('source subarray must not execute'); };
+  Object.defineProperty(data, 'constructor', {get() { throw new Error('source species must not execute'); }});
+  const texture = new T.DataTexture(data, 3, 1, integral ? T.RGBAIntegerFormat : T.RGBAFormat, T[name]);
+  texture.addUpdateRange(4, 4); texture.needsUpdate = true;
+  const d = textureDevice(), p = pool(d, {webglVersioning: true});
+  p.prepare([texture]);
+  const expected = new Uint8Array(12 * bpc); expected.set(bytes.subarray(4 * bpc, 8 * bpc), 4 * bpc);
+  assert.deepEqual(p.nativeTexture(texture).levels[0], expected); assert.deepEqual(texture.updateRanges, []);
+  p.dispose();
+});
+
+for (const [name, Kind, integral] of rgbaStorageTypes)
+test(`native ${integral ? 'integer ' : ''}${name} uploads keep the source full-upload range contract`, () => {
+  const d = textureDevice(), p = pool(d, {nativeMedia: true});
+  const data = new Kind(16), texture = new T.DataTexture(data, 2, 2, integral ? T.RGBAIntegerFormat : T.RGBAFormat, T[name]);
+  const bytes = new Uint8Array(data.buffer); bytes.fill(0x31); texture.needsUpdate = true;
+  p.prepare([texture]); bytes.fill(0x57); texture.addUpdateRange(4, 4); texture.needsUpdate = true; p.update([texture]);
+  assert.deepEqual(p.nativeTexture(texture).levels[0], bytes);
+  assert.deepEqual(texture.updateRanges, [{start: 4, count: 4}], 'WebGPUTextureUtils does not consume ranges');
+  assert.deepEqual(d.textureWrites.at(-1).size, [2, 2, 1]); p.dispose();
 });
 
 test('automatic WebGL textures keep accepted sampling and shared GPU pixels until needsUpdate',()=>{

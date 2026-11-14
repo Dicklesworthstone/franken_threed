@@ -64,8 +64,11 @@ version to upload; setting texture.needsUpdate follows the normal source API.
 Unrequested CPU changes remain GPU-stale. Each upload-domain resource tracks its
 own source generation, preventing accidental cross-domain acknowledgment.
 
-RGBA partial updates execute the pinned uploader's component-to-pixel rounding,
-in-place row-local merging and range clearing. Row-crossing/unsupported ranges
+RGBA partial updates admit normalized bytes, half/float values and signed/unsigned
+8-, 16- and 32-bit integers. They execute the pinned uploader's component-to-pixel
+rounding, in-place row-local merging and range clearing. Source offsets preserve
+typed-array view offsets and byte-aligned row padding without converting numeric
+values or integer bits. Row-crossing/unsupported ranges
 are rejected before writes. Only requested source pixels are published; an
 initial partial upload leaves the other native pixels zero-initialized. Mips
 are regenerated from GPU state after a partial update, not stale CPU neighbors.
@@ -152,6 +155,10 @@ regressions also cover shared Source uploads, source/mip replacement, disposal
 and callback acknowledgment. A second differential executes the actual pinned
 VideoTexture and WebGLTextures to compare first-frame admission, upload and
 sampler histories, explicit source replacement and fallback-media transitions.
+The scalar-format differential additionally compares partial first allocations,
+padded source rows, nonzero typed-array offsets, unrequested edits and range
+mutation across all nine RGBA storage profiles. Native WebGPU regressions retain
+its separate complete-image upload rule and unconsumed source range array.
 Its media boundary records submission parameters; browser decoding and frame
 pixels are not executed. Other tests cover pooling, sampling, mips, external-copy descriptors, exact
 budgets, native errors, disposal and pending completion. The device boundary is
