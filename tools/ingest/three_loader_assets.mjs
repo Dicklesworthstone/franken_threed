@@ -8,6 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import * as walk from "acorn-walk";
+import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
 import { isInternalLibraryModule } from "./route_bridge.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { fbxAssetUris } from "./pack_fbx.mjs";
@@ -280,32 +281,14 @@ export function findThreeLoaderRequests(ast, { resolveModule, packageRootUrl, on
     managerExposed = true;
   });
   if (managerExposed) { onDefaultManagerExposure?.(); return []; }
-  const combine = (left, right, concatenate) => {
-    if (!left || !right || left.length * right.length > LIMIT) return null;
-    return [...new Set(left.flatMap((a) => right.map((b) => concatenate(a, b))))];
-  };
-  const finite = (node, active = new Set()) => {
-    if (!node) return null;
-    if (node.type === "Literal" && typeof node.value === "string") return [node.value];
-    if (node.type === "Identifier") {
-      const binding = lookup(node.name, node);
-      if (binding?.kind !== "const" || !binding.init || active.has(binding)) return null;
-      const next = new Set(active).add(binding);
-      return finite(binding.init, next);
-    }
-    if (node.type === "BinaryExpression" && node.operator === "+") return combine(finite(node.left, active), finite(node.right, active), (a, b) => a + b);
-    if (node.type === "ConditionalExpression") {
-      const yes = finite(node.consequent, active), no = finite(node.alternate, active);
-      return yes && no && yes.length + no.length <= LIMIT ? [...new Set([...yes, ...no])] : null;
-    }
-    if (node.type === "TemplateLiteral") {
-      let result = [node.quasis[0].value.cooked];
-      for (let i = 0; i < node.expressions.length; i++) {
-        result = combine(result, finite(node.expressions[i], active), (a, b) => a + b + node.quasis[i + 1].value.cooked);
-      }
-      return result;
-    }
-    return null;
+  // Use the same bounded lexical/ownership proof as module, fetch and worker
+  // closure. Discover possible resource strings without folding their reads,
+  // selector effects or TDZ failures out of the retained loading expression.
+  const classifyString = createDynamicImportClassifier(ast);
+  const finite = node => {
+    const value = classifyString(node);
+    return value.classification === "literal" ? [value.specifier] :
+      value.classification === "finite_set" ? value.candidates : null;
   };
   const constructor = (node, active = new Set()) => {
     if (node?.type === "Identifier") {

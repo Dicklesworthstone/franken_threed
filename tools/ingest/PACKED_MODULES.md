@@ -463,6 +463,33 @@ and main-thread decoding still worked afterward. With source and build trees
 unavailable, the packed application made no HTTP requests and reported no page
 or console errors.
 
+## Loader resource selectors
+
+Three loader URLs, `setPath()`, `setResourcePath()`, decoder/transcoder paths and
+cube-face entries use the same bounded string analysis as module imports,
+workers and document fetches. Private constant records and dense arrays may
+select resources through immutable aliases:
+
+```js
+const paths = { models: 'models/', buffers: 'geometry/' };
+const models = { preview: 'preview.gltf', full: 'full.gltf' };
+new GLTFLoader().setPath(paths.models).setResourcePath(paths.buffers)
+  .loadAsync(models[preview ? 'preview' : 'full']);
+```
+
+Both possible models and their local sidecars enter the normal output and the
+prepared standalone resource map. Discovery reads the complete module without
+executing it. Original URL values, initialization and key-selection effects,
+callback ordering, independent loaded objects and temporal-dead-zone errors
+remain source-owned. Mutated or escaped tables, unknown keys, accessors,
+unproved loading managers and escaped loaders keep their existing host route.
+
+The focused loader suites exercise discovery for files, models, cube faces and
+runtime codecs. The packed execution regression uses the pinned FileLoader and
+GLTFLoader after source and build directories become unavailable; it verifies
+raw bytes, encoded filenames, URL suffixes and independent scene construction.
+This is retained-loader resource closure, not browser image or GPU validation.
+
 ## Saved ObjectLoader scenes
 
 Finite `ObjectLoader.load()` and `loadAsync()` requests now include external

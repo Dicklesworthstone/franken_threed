@@ -64,6 +64,51 @@ test("follows named constructor aliases, finite string choices, templates and st
   ]);
 });
 
+test("private resource tables close loader files, model sidecars, cube faces and runtime codecs", () => {
+  const requests = discover(`import { FileLoader, CubeTextureLoader } from 'three';
+    import { GLTFLoader } from ${JSON.stringify(gltfUrl)};
+    import { DRACOLoader } from ${JSON.stringify(dracoUrl)};
+    import { KTX2Loader } from ${JSON.stringify(ktx2Url)};
+    const paths={files:'assets/',models:'models/',sidecars:'shared/',draco:'draco/',basis:'basis/'}, alias=paths;
+    const files=['one.txt','two.txt'], index=choose?0:1;
+    new FileLoader().setPath((observe(),alias.files)).loadAsync(files[index]);
+    const models={primary:'first.gltf',alternate:'second.gltf'}, choice=choose?'primary':'alternate';
+    const draco=new DRACOLoader().setDecoderPath(paths.draco);
+    const basis=new KTX2Loader().setTranscoderPath(paths.basis).detectSupport(renderer);
+    new GLTFLoader().setDRACOLoader(draco).setKTX2Loader(basis).setPath(paths.models)
+      .setResourcePath(paths.sidecars).loadAsync(models[choice]);
+    const faces={px:'px.png',nx:'nx.png',py:'py.png',ny:'ny.png',pz:'pz.png',nz:'nz.png'};
+    new CubeTextureLoader().load([faces.px,faces.nx,faces.py,faces.ny,faces.pz,faces.nz]);`);
+  assert.deepEqual(requests.map(({url}) => url), [
+    'assets/one.txt', 'assets/two.txt', 'models/first.gltf', 'models/second.gltf',
+    'draco/draco_wasm_wrapper.js', 'draco/draco_decoder.wasm', 'draco/draco_decoder.js',
+    'basis/basis_transcoder.js', 'basis/basis_transcoder.wasm',
+    'px.png', 'nx.png', 'py.png', 'ny.png', 'pz.png', 'nz.png',
+  ]);
+  assert.deepEqual(requests.filter(({loader}) => loader === 'GLTFLoader').map(({resourcePath}) => resourcePath),
+    ['shared/', 'shared/']);
+});
+
+test("loader resource tables keep mutations, escapes, shadowing and unknown selections on the host route", () => {
+  for (const tail of [
+    "routes.entry='changed.txt';", "const alias=routes;alias.entry='changed.txt';",
+    "consume(routes);", "export {routes};", "routes.missing;", "routes[unknown];",
+    "Object.defineProperty(routes,'entry',{get:opaque});", "routes.entry();", "eval(code);",
+  ]) {
+    assert.deepEqual(discover(`import { FileLoader } from 'three';
+      const routes={entry:'file.txt'}; new FileLoader().load(routes.entry); ${tail}`), [], tail);
+  }
+  for (const source of [
+    "const routes={get entry(){return 'file.txt'}};new FileLoader().load(routes.entry);",
+    "const routes={entry:'file.txt'};function load(routes){new FileLoader().load(routes.entry)}",
+    "const routes=['first.txt',,'third.txt'];new FileLoader().load(routes[0]);",
+    "const routes={entry:'file.txt'};new FileLoader().load(routes[flag?'entry':'missing']);",
+    "const routes={base:'assets/'};consume(routes);new FileLoader().setPath(routes.base).load('file.txt');",
+    "const routes={entry:'file.txt'};const loader=new FileLoader();consume(loader);loader.load(routes.entry);",
+    "const routes={entry:'file.txt'};new FileLoader(manager).load(routes.entry);",
+  ]) assert.deepEqual(discover(`import { FileLoader } from 'three';${source}`), [], source);
+});
+
 test("does not infer resources from foreign names, shadowed imports, mutable arrays or escaping loaders", () => {
   const requests = discover(`import * as THREE from 'three';
     import { TextureLoader } from 'file:///unrelated/build/three.core.js';

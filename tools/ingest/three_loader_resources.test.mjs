@@ -141,6 +141,67 @@ test("packed source loaders and Meshopt preserve callbacks, manager URLs and dec
   assert.deepEqual(fs.readFileSync(core), sourceBefore, "the pinned source oracle is never edited");
 });
 
+test("resource-table loader choices execute offline with original effects, model sidecars and independent scenes", async () => {
+  const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  const model = JSON.stringify({asset: {version: '2.0'}, scene: 0, scenes: [{nodes: [0]}],
+    nodes: [{mesh: 0}], meshes: [{primitives: [{attributes: {POSITION: 0}}]}],
+    buffers: [{uri: 'triangle%20%23.bin?version=1#positions', byteLength: positions.byteLength}],
+    bufferViews: [{buffer: 0, byteOffset: 0, byteLength: positions.byteLength}],
+    accessors: [{bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0]}]});
+  const f = fixture({
+    'index.html': '<script type="module" src="app.mjs"></script>',
+    'app.mjs': `import { FileLoader } from ${JSON.stringify(core.href)};
+      import { GLTFLoader } from ${JSON.stringify(gltf.href)};
+      export async function run() {
+        const effects=[], paths={files:'data/',models:'models/',buffers:'geometry/'}, base=paths;
+        const names={day:(effects.push('initialize'),'day%20%23.txt?version=1#text'),night:'night.txt'}, alias=names;
+        const loader=new FileLoader().setPath((effects.push('path'),base.files)), texts=[];
+        for(const day of [true,false]) {
+          const pending=loader.loadAsync((effects.push('select'),alias[day?'day':'night']));
+          effects.push('returned'); texts.push(await pending); effects.push('loaded');
+        }
+        const models=['triangle.gltf','copy.gltf'], scenes=[];
+        const modelsLoader=new GLTFLoader().setPath(paths.models).setResourcePath(paths.buffers);
+        for(const first of [true,false]) scenes.push((await modelsLoader.loadAsync(models[first?0:1])).scene);
+        let tdz;
+        try {
+          const pending=new FileLoader().loadAsync(later.entry);
+          const later={entry:'data/day%20%23.txt?version=1#text'};
+          await pending;
+        } catch(error) {tdz=error.name;}
+        const first=scenes[0].children[0], second=scenes[1].children[0];
+        first.position.x=7;
+        return {texts,effects,tdz,logical:[alias.day,paths.models],positions:[...first.geometry.attributes.position.array],
+          independent:scenes[0]!==scenes[1]&&first.geometry!==second.geometry&&first.material!==second.material,
+          otherPosition:second.position.x};
+      }`,
+    'data/day #.txt': 'day source bytes',
+    'data/night.txt': 'night source bytes',
+    'models/triangle.gltf': model,
+    'models/copy.gltf': model,
+    'geometry/triangle #.bin': Buffer.from(positions.buffer),
+  });
+  await buildApplication(f.entry, f.out, {prepareStandaloneLoaders: true});
+  for (const relative of ['data/day #.txt', 'data/night.txt', 'models/triangle.gltf', 'models/copy.gltf', 'geometry/triangle #.bin']) {
+    assert.deepEqual(fs.readFileSync(path.join(f.out, relative)), fs.readFileSync(path.join(f.root, 'source', relative)),
+      `normal output preserves original resource bytes: ${relative}`);
+  }
+  packHtml(path.join(f.out, 'index.html'), f.packed);
+  const html = fs.readFileSync(f.packed, 'utf8');
+  fs.renameSync(path.join(f.root, 'source'), path.join(f.root, 'source-unavailable'));
+  fs.renameSync(f.out, path.join(f.root, 'build-unavailable'));
+  const result = await execute(html);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.result, {
+    texts: ['day source bytes', 'night source bytes'],
+    effects: ['initialize', 'path', 'select', 'returned', 'loaded', 'select', 'returned', 'loaded'],
+    tdz: 'ReferenceError', logical: ['day%20%23.txt?version=1#text', 'models/'], positions: [...positions],
+    independent: true, otherPosition: 0,
+  });
+  assert.equal(result.requests.length, 6, 'two files, two models and each independent geometry request execute natively');
+  assert.ok(result.requests.every(({url}) => url.startsWith('data:')));
+});
+
 test("ObjectLoader saved scenes retain external images, cube faces and edited JSON round trips offline", async () => {
   const faces = ["px", "nx", "py", "ny", "pz", "nz"];
   const model = JSON.stringify({metadata: {version: 4.6, type: "Object"},
