@@ -35,7 +35,7 @@ registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
-morph targets), CPU- or storage-backed `InstancedMesh`, and ordinary meshes with
+morph targets), CPU- or storage-backed `InstancedMesh`, exact `BatchedMesh`, and ordinary meshes with
 named storage vertex inputs or CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
 single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
@@ -65,6 +65,18 @@ govern generated streams, and source invalidation/disposal governs reconstructio
 Inherited and registered Basic, Standard and Physical materials, including
 transparent `DoubleSide` construction, have focused source-builder and public
 renderer regressions.
+
+Inherited and registered batch materials reuse the existing source selection,
+native subdraw and texture-history owners. Batch texture UUIDs keep construction
+and captured matrix/color/index bindings separate for objects sharing a material.
+Vertex and output setup hooks, default/custom program keys, version-only reuse
+and disposal retain their pinned source boundaries. Replacing a captured batch
+texture allocation under an unchanged source key retains the explicit stale-graph
+rejection; source material invalidation reconstructs against the new allocation.
+Focused source comparisons and public-renderer recording tests cover indexed
+and nonindexed batches, sorted logical IDs versus draw ordinals, and queued
+geometry, texture and custom uniform values. These checks do not establish
+browser pixels or hardware performance.
 
 Custom instance materials also accept source `StorageInstancedBufferAttribute`
 matrices and colors, including mixed CPU/storage inputs. Graphics reads borrow

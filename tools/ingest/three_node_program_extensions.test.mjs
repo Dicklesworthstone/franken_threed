@@ -1741,3 +1741,123 @@ test('SkinnedMesh extensions retain explicit authored shared-palette allocation 
   assert.throws(() => f.capture(b, second), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.deepEqual(accepted.uniforms, saved);
 });
+
+
+function batchedExtensionItem(f, T, material, {indexed = true, translation = 0, colors = true} = {}) {
+  f.renderer._getSampledTextureInputs ??= () => ({layoutOf: ({texture}) => texture.format === T.RedIntegerFormat
+    ? {texture: {sampleType: 'uint', viewDimension: '2d', multisampled: false}} : null});
+  const object = new T.BatchedMesh(8, 128, 256, material);
+  object.frustumCulled = object.perObjectFrustumCulled = object.sortObjects = false;
+  const geometries = [new T.PlaneGeometry(.5, .5), new T.BoxGeometry(.25, .25, .25)]
+    .map(geometry => indexed ? geometry : geometry.toNonIndexed());
+  const geometryIds = geometries.map(geometry => object.addGeometry(geometry));
+  for (const [index, geometry] of [0, 1, 0].entries()) {
+    const id = object.addInstance(geometryIds[geometry]);
+    object.setMatrixAt(id, new T.Matrix4().makeTranslation(translation + index, 0, 0));
+    if (colors) object.setColorAt(id, new T.Color(.25, .5, .75));
+  }
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld);
+  object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+  object.onBeforeRender(f.renderer, f.scene, f.camera, object.geometry, material);
+  return {object, material, geometries, geometryIds};
+}
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true])
+test((registered ? 'registered' : 'inherited') + ' ' + family + ' BatchedMesh extensions retain source hooks, bindings and construction keys', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupPosition(builder) { trace.push(['position', builder.object]); return super.setupPosition(builder); }
+    setupOutput(builder, output) {
+      trace.push(['output', builder.object, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'BatchExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'BatchExtension');
+  const material = new (registered ? Application : Extension)();
+  const a = batchedExtensionItem(f, T, material), b = batchedExtensionItem(f, T, material, {translation: 10});
+  t.after(() => { for (const item of [a, b]) { if (item.object._matricesTexture !== null) item.object.dispose(); item.geometries.forEach(geometry => geometry.dispose()); } material.dispose(); });
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'source vertex/output hooks and cache keys keep their construction order');
+    equalShaders(descriptor, reference);
+    const sourceDraw = f.referenceDraw(item, {fullLifecycle: true}), packet = f.capture(item, descriptor);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    assert.deepEqual(packet.textures.map(binding => binding.texture), sourceDraw.textures);
+    assert.ok(packet.textures.some(binding => binding.texture === item.object._matricesTexture));
+    assert.ok(packet.textures.some(binding => binding.texture === item.object._indirectTexture));
+    assert.ok(packet.textures.some(binding => binding.texture === item.object._colorsTexture));
+    return {reference, descriptor, packet};
+  };
+  const firstA = compare(a), firstB = compare(b), saved = firstA.packet.uniforms.map(bytes => bytes.slice());
+  assert.notEqual(firstA.reference, firstB.reference, 'source batch texture UUIDs isolate builders for two objects sharing a material');
+  assert.notEqual(firstA.descriptor, firstB.descriptor);
+  material.applicationGain = .875;
+  a.object.setMatrixAt(0, new T.Matrix4().makeTranslation(7, 0, 0));
+  a.object.setColorAt(0, new T.Color(.625, .25, .125));
+  f.renderer.info.calls++;
+  const changed = compare(a);
+  assert.equal(changed.descriptor, firstA.descriptor); assert.ok(values(changed.packet).includes(.875));
+  assert.equal(compare(b).descriptor, firstB.descriptor);
+  assert.deepEqual(firstA.packet.uniforms, saved, 'accepted object uniforms retain their original generation');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor, 'version-only invalidation retains the source batching graph');
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyedA = compare(a), keyedB = compare(b);
+  assert.notEqual(keyedA.reference, firstA.reference); assert.notEqual(keyedA.descriptor, firstA.descriptor);
+  assert.notEqual(keyedB.reference, firstB.reference); assert.notEqual(keyedB.descriptor, firstB.descriptor);
+  a.object.dispose(); f.renderer.info.calls++;
+  assert.equal(f.programs.diagnostics.programs, 1);
+  assert.equal(compare(b).descriptor, keyedB.descriptor, 'batch disposal leaves the other object and shared material live');
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+test('BatchedMesh extensions retain the default material key and source texture replacement boundary', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = batchedExtensionItem(f, T, new Extension(), {colors: false});
+  t.after(() => { item.object.dispose(); item.geometries.forEach(geometry => geometry.dispose()); item.material.dispose(); });
+  const reference = f.reference(item), descriptor = f.compile(item);
+  equalShaders(descriptor, reference); assert.equal(effects, 2);
+  f.referenceDraw(item, {fullLifecycle: true}); f.capture(item, descriptor);
+  item.object.setColorAt(0, new T.Color(.25, .5, .75)); f.renderer.info.calls++;
+  assert.equal(f.reference(item), reference); assert.equal(f.compile(item), descriptor);
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(effects, 2, 'the accepted source graph must not silently acquire a later color allocation');
+  item.material.needsUpdate = true; f.renderer.info.calls++;
+  const coloredReference = f.reference(item), colored = f.compile(item);
+  equalShaders(colored, coloredReference); assert.notEqual(colored, descriptor); assert.notEqual(coloredReference, reference);
+  assert.ok(f.capture(item, colored).textures.some(binding => binding.texture === item.object._colorsTexture));
+  item.object.setInstanceCount(12); f.renderer.info.calls++;
+  assert.throws(() => f.capture(item, colored), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  item.material.needsUpdate = true;
+  const resizedReference = f.reference(item), resized = f.compile(item);
+  equalShaders(resized, resizedReference); assert.notEqual(resized, colored);
+  assert.ok(f.capture(item, resized).textures.some(binding => binding.texture === item.object._matricesTexture));
+});
+
+test('BatchedMesh extensions refuse altered selection callbacks and malformed textures before application hooks', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = batchedExtensionItem(f, T, new Extension()), selection = item.object.onBeforeRender;
+  t.after(() => { item.object.dispose(); item.geometries.forEach(geometry => geometry.dispose()); item.material.dispose(); });
+  item.object.onBeforeRender = () => { effects++; };
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
+  item.object.onBeforeRender = selection;
+  const format = item.object._indirectTexture.format; item.object._indirectTexture.format = T.RGBAFormat;
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
+  item.object._indirectTexture.format = format;
+  const descriptor = f.compile(item);
+  assert.ok(effects > 0); assert.match(descriptor.vertex, /instance_index/);
+});

@@ -420,3 +420,66 @@ for (const indexed of [false, true]) test(`native ${indexed ? 'indexed' : 'nonin
   assert.deepEqual(device.bundleEncoders[1].draws.map(firstInstance), [7, 4, 0]);
   cache.dispose();
 });
+
+
+function submittedBatchUniforms(draw) {
+  const values = [];
+  for (const {group, offsets} of draw.groups.values()) {
+    let dynamic = 0;
+    for (const {resource} of group.entries) if (resource.buffer) {
+      const bytes = draw.contents.get(resource.buffer), offset = (resource.offset ?? 0) + (offsets[dynamic++] ?? 0);
+      values.push(...new Float32Array(bytes.buffer, bytes.byteOffset + offset, resource.size / 4));
+    }
+  }
+  return values;
+}
+
+for (const indexed of [false, true]) for (const registered of [false, true])
+test((registered ? 'registered' : 'inherited') + ' BatchedMesh extensions submit queued ' +
+  (indexed ? 'indexed' : 'nonindexed') + ' geometry, source sorting and texture histories', async t => {
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor() { super(); this.applicationGain = .375; }
+    setupOutput(builder, output) {
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'RendererBatchExtension'; this.applicationGain = .375; }
+  }
+  const material = new (registered ? Application : Extension)(), f = await fixture(t, {indexed, material});
+  if (registered) f.renderer.library.addMaterial(Extension, 'RendererBatchExtension');
+  f.mesh.sortObjects = true; let selections = 0;
+  f.mesh.customSort = list => { selections++; list.sort((a, b) => b.index - a.index); };
+  const matrixWidth = f.mesh._matricesTexture.image.width, colorWidth = f.mesh._colorsTexture.image.width;
+  const position = f.mesh.geometry.attributes.position, firstPosition = position.array[0];
+  f.mesh.setVisibleAt(1, false); f.renderer.render(f.scene, f.camera);
+  f.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(2.5, .25, 0));
+  f.mesh.setColorAt(0, new T.Color(.125, .375, .625));
+  f.mesh.setVisibleAt(1, true); f.mesh.setVisibleAt(2, false);
+  position.array[0] = -.75; position.needsUpdate = true; material.applicationGain = .875;
+  f.renderer.render(f.scene, f.camera);
+  f.mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(99, 99, 99));
+  f.mesh.setColorAt(0, new T.Color(.875, .875, .875));
+  position.array[0] = 99; material.applicationGain = .125; f.mesh.setVisibleAt(0, false);
+  await f.renderer.waitForGPU();
+  const captured = frames(f.device);
+  assert.deepEqual(captured.map(frame => frame.length), [2, 2]); assert.equal(selections, 2);
+  for (const frame of captured) {
+    assert.ok(frame.every(draw => draw.indexed === indexed));
+    assert.deepEqual(frame.map(firstInstance), [0, 1], 'draw ordinals remain distinct from sorted logical instance IDs');
+  }
+  assert.deepEqual(textureWords(captured[0][0], 'r32uint', colorWidth, Uint32Array).slice(0, 2), [2, 0]);
+  assert.deepEqual(textureWords(captured[1][0], 'r32uint', colorWidth, Uint32Array).slice(0, 2), [1, 0]);
+  const ranges = f.geometryIds.map(id => f.mesh.getGeometryRangeAt(id));
+  assert.deepEqual(captured[0].map(draw => [draw.args[0], draw.args[2]]), [ranges[0], ranges[0]].map(range => [range.count, range.start]));
+  assert.deepEqual(captured[1].map(draw => [draw.args[0], draw.args[2]]), [ranges[1], ranges[0]].map(range => [range.count, range.start]));
+  assert.equal(textureWords(captured[0][0], 'rgba32float', matrixWidth, Float32Array)[12], -1);
+  assert.equal(textureWords(captured[1][0], 'rgba32float', matrixWidth, Float32Array)[12], 2.5);
+  assert.deepEqual(textureWords(captured[0][0], 'rgba32float', colorWidth, Float32Array).slice(0, 3), [1, 0, 0]);
+  assert.deepEqual(textureWords(captured[1][0], 'rgba32float', colorWidth, Float32Array).slice(0, 3), [.125, .375, .625]);
+  const positionAt = draw => new DataView(draw.contents.get(draw.streams.get(0)).buffer).getFloat32(0, true);
+  assert.deepEqual(captured.map(frame => positionAt(frame[0])), [firstPosition, -.75]);
+  assert.ok(submittedBatchUniforms(captured[0][0]).includes(.375));
+  assert.ok(submittedBatchUniforms(captured[1][0]).includes(.875));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

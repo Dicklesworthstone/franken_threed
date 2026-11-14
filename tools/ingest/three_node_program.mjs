@@ -1550,6 +1550,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // instance bindings across mesh identities.
     const skinExtension = extension && Object.getPrototypeOf(object) === three.SkinnedMesh.prototype;
     const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype;
+    // Batch.js captures this object's matrix/index/color textures. The source
+    // key already includes batch texture UUIDs; selection and draw ordinals
+    // continue through the existing batch owner.
+    const batchExtension = extension && Object.getPrototypeOf(object) === three.BatchedMesh.prototype;
     // Named instance streams share source construction by geometry layout.
     // Each render object's ordinary geometry owner still selects and captures
     // its own attributes, including interleaved version/range history.
@@ -1572,7 +1576,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
-        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension && !batchExtension ||
         object.geometry.isInstancedBufferGeometry && !instancedGeometryExtension ||
         // Morph.js owns the target atlas, influence uniforms and captured
         // per-instance weight texture. The source instance UUID key above
