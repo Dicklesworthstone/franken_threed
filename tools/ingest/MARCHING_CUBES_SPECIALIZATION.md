@@ -118,23 +118,36 @@ original public methods. Source-tree imports and the pinned core package share
 this path. `numericSpecialization.libraryKernels.geometryTransforms` reports
 the compiled methods separately from MarchingCubes and generic numeric loops.
 
+The same path also derives `InterleavedBufferAttribute.applyMatrix4`,
+`applyNormalMatrix` and `transformDirection` from their pinned method bodies.
+Interleaved positions, normals and four-component tangents, including ordinary
+GLTFLoader `byteStride` geometry, keep their original shared backing array.
+Only the source XYZ stores change; tangent W, UVs, other channels and typed-view
+prefixes/tails retain their exact bytes. The original geometry algorithm still
+requests uploads between position, normal and tangent transforms, preserving
+the shared buffer's version increments and any `needsUpdate` observations.
+
 The admitted profile is a genuine source-created BufferAttribute or
 Float32BufferAttribute with three unnormalized Float32/Float64 components per
-item and a witnessed Matrix3/Matrix4 with ordinary numeric elements. The
+item, or a source-created InterleavedBufferAttribute with at least three
+components in a witnessed InterleavedBuffer with fixed Float32/Float64 storage.
+Matrices must be witnessed Matrix3/Matrix4 objects with ordinary numeric elements. The
 compiler retains source expression order, perspective division, normalization,
 every Float32 store and the original private scratch vector's final unrounded
 values. Methods, attribute/array identities, synchronous return values,
 `needsUpdate` behavior and geometry bounds remain source-owned. Shared,
 resizable, detached, subclassed or unsupported storage, custom accessors and
 methods, proxies, modified source and failed memory/work budgets retain the
-original loop before any native result is published. Two-component matrix
-transforms, normalized/integer attributes and interleaved attributes remain
-on their ordinary JavaScript path.
+original loop before any native result is published. Interleaved count/data
+accessors and proxies keep their original reads and partial effects; the guard
+never invokes a user getter speculatively. Two-component matrix transforms and
+normalized/integer attributes remain on their ordinary JavaScript path.
 
 Run `node tools/ingest/geometry_transforms.test.mjs` for actual emitted Wasm
 differentials against pinned r186, including normal/position composition through
 BufferGeometry, scratch-vector observations, conservative callbacks and bounded
-execution failure. This remains a copying baseline with no measured speedup.
+execution failure, plus shared interleaved streams and a complete GLTFLoader
+application build. This remains a copying baseline with no measured speedup.
 
 ## Source-library tangent generation
 

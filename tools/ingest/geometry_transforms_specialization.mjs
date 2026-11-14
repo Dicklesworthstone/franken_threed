@@ -8,23 +8,31 @@ import {compileNumericKernel} from './numeric_kernel.mjs';
 
 const methods=['applyMatrix4','applyMatrix3','applyNormalMatrix','transformDirection'];
 const matrix3Blob='1ce4def6d838f12ef4feb7a5c1b4149efb39fcdf';
+const interleavedAttributeBlob='f1b91a0893fd596669b02a31538e80d53aa73f93';
+const interleavedBufferBlob='d74d26e5f2dd1ad84f443c26aa688074a3f9e2ef';
 const fresh=(source,name)=>{let value='__f3d_attribute_'+name;while(source.includes(value))value+='_';return value;};
 export function geometryTransformSourceRole(source) {
   const role=geometryNormalSourceRole(source);
-  return ['core','attributes','vector'].includes(role)?role:sourceBlob(source)===matrix3Blob?'matrix3':null;
+  if(['core','attributes','vector'].includes(role))return role;
+  const blob=sourceBlob(source);
+  return blob===matrix3Blob?'matrix3':blob===interleavedAttributeBlob?'interleaved-attributes':
+    blob===interleavedBufferBlob?'interleaved-buffer':null;
 }
 
 /** Inline only the verified vector/attribute calls. Arithmetic, component loads,
  * store order, perspective division and normalization come from those bodies. */
-export function deriveGeometryTransformKernels(attributeSource,vectorSource) {
-  const attribute=normalClasses(attributeSource).get('BufferAttribute'),vector=normalClasses(vectorSource).get('Vector3');
+export function deriveGeometryTransformKernels(attributeSource,vectorSource,{interleaved=false}={}) {
+  const attribute=normalClasses(attributeSource).get(interleaved?'InterleavedBufferAttribute':'BufferAttribute'),
+    vector=normalClasses(vectorSource).get('Vector3');
   if(!attribute || !vector)throw new TypeError('Missing verified attribute-transform classes');
   let serial=0;
   const requirements={attribute:new Set(),vector:new Set()},derived=[];
-  const attr={kind:'attribute'},vec={kind:'vector'},matrix={kind:'matrix'};
+  const attr={kind:'attribute'},vec={kind:'vector'},matrix={kind:'matrix'},buffer={kind:'buffer'};
   function value(node,env) {
     if(node.type==='Identifier')return env.get(node.name)??node.name;
     if(node.type==='ThisExpression')return env.get('this');
+    if(interleaved && node.type==='MemberExpression' && !node.computed &&
+        node.property.name==='data' && value(node.object,env)===attr)return buffer;
     return expression(node,env);
   }
   function expression(node,env) {
@@ -37,7 +45,9 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource) {
       if(object===vec && !node.computed && ['x','y','z'].includes(key))return 'v_'+key;
       if(object===attr && !node.computed) {
         if(key==='array')return 'values';if(key==='count')return 'count';if(key==='itemSize')return '3';
+        if(interleaved && key==='offset')return 'offset';
       }
+      if(object===buffer && !node.computed && ['array','count','stride'].includes(key))return key==='array'?'values':key;
       if(object===matrix && !node.computed && key==='elements')return 'elements';
       if(typeof object!=='string')throw new TypeError('Unsupported transform member');
       return node.computed?`${object}[${expression(node.property,env)}]`:`${object}.${key}`;
@@ -101,19 +111,19 @@ export function deriveGeometryTransformKernels(attributeSource,vectorSource) {
     }
     throw new TypeError('Unsupported verified transform statement: '+node.type);
   }
-  for(const name of methods) {
+  for(const name of interleaved?methods.filter(name=>name!=='applyMatrix3'):methods) {
     const method=normalMethod(attribute,name),body=method.body.body;
     const loop=name==='applyMatrix3'?body[0].alternate.consequent.body[0]:body[0];
     const scratch=loop.body.body[0].expression.callee.object.name;
     const env=new Map([['this',attr],[method.params[0].name,matrix],[scratch,vec]]);
-    const source=`function transform(values,elements,scratch,count){let v_x=scratch[0],v_y=scratch[1],v_z=scratch[2];`+
+    const source=`function transform(values,elements,scratch,count${interleaved?',stride,offset':''}){let v_x=scratch[0],v_y=scratch[1],v_z=scratch[2];`+
       emit(loop,env)+'scratch[0]=v_x;scratch[1]=v_y;scratch[2]=v_z;}';
     derived.push({name,source,scratch,span:{start:body[0].start,end:body.at(-1).start}});
   }
   return {methods:derived,requirements:{attribute:[...requirements.attribute],vector:[...requirements.vector]}};
 }
 
-export function specializeGeometryTransforms(source,{runtimeModule,vectorSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+export function specializeGeometryTransforms(source,{runtimeModule,objectsModule,vectorSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
   const role=geometryTransformSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),edits=[],imports=[],tail=[];
@@ -132,23 +142,37 @@ export function specializeGeometryTransforms(source,{runtimeModule,vectorSource,
     imports.push(`import {registerGeometryTransformVector as ${register}} from ${JSON.stringify(runtimeModule)};`);
     tail.push(`${register}(Vector3);`);
   }
-  if(role==='attributes' || role==='core') {
+  if(['core','interleaved-attributes','interleaved-buffer'].includes(role)) {
+    const allocation=fresh(source,'interleaved_allocation');
+    imports.push(`import {registerNumericObject as ${allocation}} from ${JSON.stringify(objectsModule)};`);
+    for(const name of role==='core'?['InterleavedBuffer','InterleavedBufferAttribute']:
+      [role==='interleaved-buffer'?'InterleavedBuffer':'InterleavedBufferAttribute']) {
+      const ctor=normalMethod(classes.get(name),'constructor');
+      edits.push({start:ctor.body.start+1,end:ctor.body.start+1,text:`\n${allocation}(this);\n`});
+    }
+  }
+  for(const className of role==='core'?['BufferAttribute','InterleavedBufferAttribute']:
+    role==='attributes'?['BufferAttribute']:role==='interleaved-attributes'?['InterleavedBufferAttribute']:[]) {
     if(role==='core')vectorSource=source;
     if(role!=='core' && geometryTransformSourceRole(vectorSource??'')!=='vector')
       return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
-    const derived=deriveGeometryTransformKernels(source,vectorSource),variants=[];
+    const interleaved=className==='InterleavedBufferAttribute',layout=interleaved?'interleaved':'contiguous';
+    const derived=deriveGeometryTransformKernels(source,vectorSource,{interleaved}),variants=[];
     for(const method of derived.methods)for(const type of ['f32[]','f64[]']) {
-      const artifact=compileNumericKernel(method.source,{parameterTypes:[type,'f64[]','f64[]','f64'],
-        generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned BufferAttribute.'+method.name});
-      variants.push({method:method.name,type,base64:Buffer.from(artifact.wasm).toString('base64')});
+      const artifact=compileNumericKernel(method.source,{parameterTypes:[type,'f64[]','f64[]','f64',...(interleaved?['f64','f64']:[])],
+        generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned '+className+'.'+method.name});
+      variants.push({method:method.name,type,layout,base64:Buffer.from(artifact.wasm).toString('base64')});
     }
-    const register=fresh(source,'register'),create=fresh(source,'create'),token=fresh(source,'dispatch'),attempt=fresh(source,'try');
+    const prefix=interleaved?'interleaved_':'',register=fresh(source,prefix+'register'),create=fresh(source,prefix+'create'),
+      token=fresh(source,prefix+'dispatch'),attempt=fresh(source,prefix+'try');
     imports.push(`import {registerGeometryTransformAttributes as ${register},createGeometryTransformDispatch as ${create},tryGeometryTransform as ${attempt}} from ${JSON.stringify(runtimeModule)};var ${token};`);
-    tail.push(`${register}(BufferAttribute,[Float32BufferAttribute]);`,`${token}=${create}(${JSON.stringify(variants)},Vector3,()=>Math);`);
+    tail.push(`${register}(${className},[${interleaved?'':'Float32BufferAttribute'}],${JSON.stringify(layout)});`,
+      `${token}=${create}(${JSON.stringify(variants)},Vector3,()=>Math);`);
     for(const method of derived.methods)edits.push({...method.span,text:`if (!${attempt}(this,${token},${JSON.stringify(method.name)},m,${method.scratch})) {\n`+
       source.slice(method.span.start,method.span.end)+'\n}\n'});
-    report.compiledMethods=methods.slice();report.wasmVariants=variants.length;
-    report.wasmBytes=variants.reduce((sum,variant)=>sum+Buffer.from(variant.base64,'base64').length,0);
+    report.compiledMethods.push(...derived.methods.map(method=>(interleaved?className+'.':'')+method.name));
+    report.wasmVariants=(report.wasmVariants??0)+variants.length;
+    report.wasmBytes=(report.wasmBytes??0)+variants.reduce((sum,variant)=>sum+Buffer.from(variant.base64,'base64').length,0);
   }
   return {changed:true,edits,header:imports.join('\n')+'\n',tail:'\n'+tail.join('\n')+'\n',report};
 }

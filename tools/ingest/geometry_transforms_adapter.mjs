@@ -28,11 +28,12 @@ export function registerGeometryTransformVector(Vector) {
   if(prototype(proto)===objectPrototype)set(vectors,Vector,{proto,
     methods:new Map(vectorMethods.map(name=>[name,data(proto,name)]))});
 }
-export function registerGeometryTransformAttributes(Base,children) {
+export function registerGeometryTransformAttributes(Base,children,layout='contiguous') {
   const base=data(Base,'prototype'),methods=new Map(attributeMethods.map(name=>[name,data(base,name)]));
-  set(attributes,base,{parent:prototype(base),methods});
+  const countGetter=layout==='interleaved'?descriptor(base,'count')?.get:null;
+  set(attributes,base,{parent:prototype(base),methods,layout,countGetter});
   for(const Child of children) {
-    const child=data(Child,'prototype');if(prototype(child)===base)set(attributes,child,{parent:base,methods});
+    const child=data(Child,'prototype');if(prototype(child)===base)set(attributes,child,{parent:base,methods,layout,countGetter});
   }
 }
 export function createGeometryTransformDispatch(variants,Vector,resolveMath) {
@@ -58,7 +59,9 @@ function vectorInput(record,scratch) {
 }
 function attributeInput(object) {
   const proto=prototype(object),record=get(attributes,proto);
-  if(!record || data(object,'itemSize')!==3 || data(object,'normalized')!==false)return null;
+  const itemSize=data(object,'itemSize');
+  if(!record || data(object,'normalized')!==false ||
+      (record.layout==='interleaved'? !integer(itemSize) || itemSize<3 : itemSize!==3))return null;
   for(const [name,method]of record.methods) {
     if(!method)return null;
     let current=object,found=false;
@@ -72,11 +75,21 @@ function attributeInput(object) {
     }
     if(!found)return null;
   }
-  const array=data(object,'array'),count=data(object,'count');
-  if(!integer(count) || count<0)return null;
+  let array,count,stride=3,offset=0;
+  if(record.layout==='interleaved') {
+    // The ordinary count getter is source code, not a speculative read. Check
+    // its identity and the allocation of data before reading own data fields;
+    // a Proxy or accessor resumes the original source loop without extra calls.
+    const countDescriptor=descriptor(proto,'count');
+    if(descriptor(object,'count') || !record.countGetter || countDescriptor?.get!==record.countGetter || countDescriptor.set)return null;
+    const buffer=data(object,'data');if(!isNumericObject(buffer))return null;
+    array=data(buffer,'array');count=data(buffer,'count');stride=data(buffer,'stride');offset=data(object,'offset');
+    if(!integer(stride) || stride<itemSize || !integer(offset) || offset<0 || offset>stride-itemSize)return null;
+  }else {array=data(object,'array');count=data(object,'count');}
+  if(!integer(count) || count<0 || !integer(count*stride))return null;
   try {
     const type=apply(tag,array,[])==='Float32Array'?'f32[]':apply(tag,array,[])==='Float64Array'?'f64[]':null;
-    return type && apply(length,array,[])===count*3?{array,count,type}:null;
+    return type && apply(length,array,[])===count*stride?{array,count,type,stride,offset,layout:record.layout}:null;
   }catch{return null;}
 }
 function matrixInput(matrix,method) {
@@ -119,13 +132,16 @@ export function tryGeometryTransform(owner,token,method,matrix,scratch) {
   if(!record)return fallback('GEOMETRY_TRANSFORM_PLATFORM');
   let input=inputs(record,owner,method,matrix,scratch);
   if(!input)return fallback('GEOMETRY_TRANSFORM_GUARD');
-  const variant=record.variants.find(value=>value.method===method && value.type===input.type);
+  const variant=record.variants.find(value=>value.method===method && value.type===input.type && value.layout===input.layout);
   if(!variant)return fallback('GEOMETRY_TRANSFORM_STORAGE');
   const runtime=kernel(record,variant);if(!runtime)return fallback(variant.failure);
   // Initialization may encounter a host policy hook. Discard old snapshots and
   // revalidate before the single checked synchronous kernel publication.
   if(!matrixNumericPlatformIntact() || !(input=inputs(record,owner,method,matrix,scratch)))return fallback('GEOMETRY_TRANSFORM_GUARD');
-  try{runtime.run(input.array,input.elements,input.vector,input.count);}
+  try{
+    if(input.layout==='interleaved')runtime.run(input.array,input.elements,input.vector,input.count,input.stride,input.offset);
+    else runtime.run(input.array,input.elements,input.vector,input.count);
+  }
   catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_TRANSFORM_EXECUTION');}
   scratch.x=input.vector[0];scratch.y=input.vector[1];scratch.z=input.vector[2];
   stats.wasmCalls++;stats.lastFailure=null;return true;

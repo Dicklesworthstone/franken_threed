@@ -146,8 +146,8 @@ export function marchingCubesRollupPlugin(options={}) {
           if(instance.report)instanceReports.push({id,...instance.report});
           if(instance.changed){edits.push(...instance.edits);headers.push(instance.header);}
         }
-        if(normalCandidate || code.includes('class Matrix3')) {
-          const attributes=specializeGeometryTransforms(code,{...sources,runtimeModule:ATTRIBUTE_TRANSFORMS,maxMemoryPages,maxIterations});
+        if(normalCandidate || code.includes('class Matrix3') || code.includes('class InterleavedBuffer')) {
+          const attributes=specializeGeometryTransforms(code,{...sources,runtimeModule:ATTRIBUTE_TRANSFORMS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
           if(attributes.report)attributeReports.push({id,...attributes.report});
           if(attributes.changed){edits.push(...attributes.edits);headers.push(attributes.header);tail+=attributes.tail;}
         }
@@ -191,7 +191,8 @@ export function marchingCubesRollupPlugin(options={}) {
           return [key,undefined];
         })).then(values=>finish(Object.fromEntries(values)));
       }
-      if(normalCandidate && geometryTransformSourceRole(code)==='attributes') {
+      if((normalCandidate || code.includes('class InterleavedBufferAttribute')) &&
+          ['attributes','interleaved-attributes'].includes(geometryTransformSourceRole(code))) {
         return this.resolve('../math/Vector3.js',id,{skipSelf:true}).then(resolved=>{
           let vectorSource;
           if(resolved && !resolved.external)try {
