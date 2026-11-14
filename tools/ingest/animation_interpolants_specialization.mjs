@@ -12,12 +12,14 @@ const sources=new Map([
   ['24b3096de529e13fbe0723db76fd84a7028b14e4','CubicInterpolant'],
   ['b14b25b527f4c4c9a8ac81b64a65c6299f936181','BezierInterpolant'],
 ]);
+const gltfBlob='cd95b20593264ba8b503f8152484c456be64b1af';
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 const fresh=(source,name)=>{let value='__f3d_interpolation_'+name;while(source.includes(value))value+='_';return value;};
 
 export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryPages=2048,maxIterations=100000000}={}) {
-  const role=sources.get(sourceBlob(source)) ??
-    (createHash('sha256').update(source).digest('hex')===coreHash?'core':null);
+  const blob=sourceBlob(source),role=sources.get(blob) ??
+    (blob===gltfBlob?'GLTFCubicSplineInterpolant':
+      createHash('sha256').update(source).digest('hex')===coreHash?'core':null);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
   const ast=acorn.parse(source,{ecmaVersion:'latest',sourceType:'module'});
   const classes=new Map(ast.body.filter(node=>node.type==='ClassDeclaration').map(node=>[node.id.name,node]));
@@ -28,7 +30,7 @@ export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryP
     const last=body.at(-1),loop=body.findLast(node=>node.type==='ForStatement');
     if(last.type!=='ReturnStatement' || last.argument.name!=='result' || !loop)
       throw new TypeError('Missing pinned interpolation boundaries');
-    const mode=Class.replace('Interpolant','').toLowerCase(),token=fresh(source,mode);
+    const mode=Class==='GLTFCubicSplineInterpolant'?'gltfCubicSpline':Class.replace('Interpolant','').toLowerCase(),token=fresh(source,mode);
     let start,args,parameterTypes,prefix='';
     if(mode==='linear') {
       const first=body[0],stride=first.declarations.find(node=>node.id.name==='stride');
@@ -38,6 +40,14 @@ export function specializeAnimationInterpolants(source,{runtimeModule,maxMemoryP
       // coercions remain in the original suffix when the native guard refuses.
       start=stride.end;
       prefix='const '+source.slice(rest.start,first.end)+'\n'+source.slice(first.end,loop.end);
+      args=['result','values','stride','i1','t0','t','t1'];
+      parameterTypes=['f64[]','f64[]',...Array(5).fill('f64')];
+    }else if(mode==='gltfCubicSpline') {
+      // The loader's public interpolation object keeps the original property
+      // reads and the quaternion subclass keeps normalization after this call.
+      // Only the pinned Hermite segment, including tangent-duration scaling,
+      // enters the same numeric transaction as the core interpolants.
+      start=body[3].start;prefix=source.slice(start,loop.end);
       args=['result','values','stride','i1','t0','t','t1'];
       parameterTypes=['f64[]','f64[]',...Array(5).fill('f64')];
     }else if(mode==='cubic') {

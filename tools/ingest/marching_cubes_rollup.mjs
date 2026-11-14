@@ -120,7 +120,7 @@ export function marchingCubesRollupPlugin(options={}) {
           if(quaternion.report)quaternionReports.push({id,...quaternion.report});
           if(quaternion.changed){edits.push(...quaternion.edits);headers.push(quaternion.header);tail+=quaternion.tail;}
         }
-        if(['LinearInterpolant','CubicInterpolant','BezierInterpolant'].some(name=>code.includes('class '+name))) {
+        if(['LinearInterpolant','CubicInterpolant','BezierInterpolant','GLTFCubicSplineInterpolant'].some(name=>code.includes('class '+name))) {
           const interpolants=specializeAnimationInterpolants(code,{runtimeModule:INTERPOLANTS,maxMemoryPages,maxIterations});
           if(interpolants.report)interpolantReports.push({id,...interpolants.report});
           if(interpolants.changed){edits.push(...interpolants.edits);headers.push(interpolants.header);tail+=interpolants.tail;}

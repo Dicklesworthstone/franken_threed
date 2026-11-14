@@ -53,6 +53,13 @@ function inputs(record,result,values,stride,args) {
   for(let i=0;i<args.length;i++)if(!(mode==='bezier' && (i===2 || i===3)) && typeof args[i]!=='number')return null;
   let offsets,tangents=null;
   if(mode==='linear')offsets=[(args[0]-1)*stride,args[0]*stride];
+  else if(mode==='gltfCubicSpline') {
+    const current=args[0]*(stride*3);
+    // Previous value/outgoing tangent and current incoming tangent/value are
+    // the only source windows read by the Hermite segment. Unused keyframes
+    // and the first/last tangent vectors do not enter the copied transaction.
+    offsets=[current-2*stride,current-stride,current,current+stride];
+  }
   else if(mode==='cubic')offsets=[args[2],args[1],args[0],args[3]];
   else {
     offsets=[args[1],args[0]];
@@ -88,10 +95,13 @@ export function tryAnimationInterpolant(token,result,values,stride,...args) {
   let output;
   try {
     output=new F64(stride);
-    const packed=new F64(input.offsets.length*stride);
+    // Leave the first glTF incoming-tangent slot empty to preserve the exact
+    // source offset expressions at normalized keyframe index 1.
+    const first=record.mode==='gltfCubicSpline'?1:0;
+    const packed=new F64((input.offsets.length+first)*stride);
     for(let key=0;key<input.offsets.length;key++)for(let i=0;i<stride;i++)
-      packed[key*stride+i]=values[input.offsets[key]+i];
-    if(record.mode==='linear')runtime.run(output,packed,stride,1,args[1],args[2],args[3]);
+      packed[(key+first)*stride+i]=values[input.offsets[key]+i];
+    if(record.mode==='linear'||record.mode==='gltfCubicSpline')runtime.run(output,packed,stride,1,args[1],args[2],args[3]);
     else if(record.mode==='cubic')runtime.run(output,packed,stride,2*stride,stride,0,3*stride,...args.slice(4));
     else {
       const incoming=new F64(4*stride),outgoing=new F64(2*stride),t=input.tangents;
