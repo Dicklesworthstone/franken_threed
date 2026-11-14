@@ -135,7 +135,9 @@ export function selectGltfMaterialVariant(json, selection = null, options = {}) 
       const assigned = new Set();
       let selectedMaterial = primitive.material;
       for (const mapping of mappings) {
-        fields(mapping, ["material", "variants"], "variant mapping");
+        fields(mapping, ["material", "variants", "name"], "variant mapping");
+        if (mapping.name !== undefined && typeof mapping.name !== "string")
+          fail("SHAPE", "Variant mapping name must be a string");
         const material = index(mapping.material, materials.length, "mapped material");
         object(materials[material], "material");
         const choices = array(mapping.variants, "mapped variants", 1);

@@ -52,6 +52,19 @@ test("select by index or exact name with per-primitive fallback", () => {
   assert.equal(select(doc, 0).variant, 0);
   assert.equal(select(doc, null).variant, null);
 });
+test("optional mapping names preserve selection, defaults and frozen authored data", () => {
+  const doc = asset();
+  mappings(doc)[0].name = "Paint";
+  mappings(doc)[1].name = "Paint";
+  doc.meshes[0].primitives[1].extensions[EXT].mappings[0].name = "";
+  const before = JSON.stringify(doc);
+  deepFreeze(doc);
+  assert.deepEqual(materials(select(doc, "red")), [1, 2, 1]);
+  assert.deepEqual(materials(select(doc, "blue")), [2, 2, 1]);
+  assert.deepEqual(materials(select(doc, null)), [0, undefined, 1]);
+  assert.throws(() => select(doc, "Paint"), code("SELECTION"));
+  assert.equal(JSON.stringify(doc), before);
+});
 test("selection never edits frozen authored data or renumbers shared resources", () => {
   const doc = deepFreeze(asset()), before = JSON.stringify(doc);
   const result = select(doc, "blue"), projected = result.json;
@@ -138,6 +151,8 @@ for (const [name, mutate, expected] of [
   ["out of range unselected material", d => { mappings(d)[1].material = 3; }, "INDEX"],
   ["missing mapped material", d => { delete mappings(d)[1].material; }, "INDEX"],
   ["null mapped material", d => { d.materials[2] = null; }, "SHAPE"],
+  ["non-string mapping name", d => { mappings(d)[1].name = 42; }, "SHAPE"],
+  ["null mapping name", d => { mappings(d)[0].name = null; }, "SHAPE"],
   ["invalid authored default", d => { primitive(d).material = 10; }, "INDEX"],
   ["unknown mapping field", d => { mappings(d)[0].unexpected = true; }, "UNSUPPORTED"],
   ["unknown variant semantics", d => { d.extensions[EXT].variants[0].extensions = { OTHER: {} }; }, "UNSUPPORTED"],
