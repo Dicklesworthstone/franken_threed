@@ -21,6 +21,7 @@ function fixture(t, {indexed = true, authored = true, interleaved = false} = {})
     getCurrentTexture() { return device.createTexture({size: [64, 64], format: configured.format, usage: 16}); },
   })};
   const renderer = new Renderer({canvas, device}); t.after(() => renderer.dispose());
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
   const base = new THREE.PlaneGeometry(.5, .5);
   const geometry = new THREE.InstancedBufferGeometry().copy(indexed ? base : base.toNonIndexed());
   geometry.instanceCount = 3;
@@ -78,6 +79,56 @@ test('ordinary materials on InstancedBufferGeometry select native programs witho
   assert.equal(draw.args[1], 3); assert.equal(instanceStreams(draw).length, 1);
   assert.match(draw.pipeline.vertex.module.code, /color/);
   assert.equal(f.mesh.material, f.material); assert.equal(f.geometry.isInstancedBufferGeometry, true);
+});
+
+for (const registered of [false, true]) for (const interleaved of [false, true])
+test(`custom instanced geometry retains queued ${interleaved ? 'interleaved' : 'separate'} streams and source updates (registered=${registered})`, async t => {
+  const f = fixture(t, {authored: false, interleaved}), original = f.material, expectedCounts = [];
+  let setups = 0, updates = 0, after = 0, requested = 3;
+  const pulse = N.uniform(1).onObjectUpdate(frame => {
+    assert.equal(frame.object, f.mesh); assert.equal(frame.material, f.material);
+    updates++; f.geometry.instanceCount = requested; expectedCounts.push(sourceCount(f)); return 1;
+  });
+  pulse.updateAfterType = 'object'; pulse.updateAfter = () => { after++; f.geometry.instanceCount = 99; };
+  class Extension extends THREE.MeshBasicNodeMaterial {
+    setupPosition(builder) { return super.setupPosition(builder).addAssign(N.attribute('offset', 'vec3')); }
+    setupOutput(builder, output) {
+      setups++; return super.setupOutput(builder, N.vec4(output.rgb.mul(pulse), output.a));
+    }
+  }
+  class Application extends THREE.MeshBasicMaterial {
+    constructor() { super(); this.type = 'InstancedGeometryApplication'; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstancedGeometryApplication');
+  f.material = new (registered ? Application : Extension)(); f.material.vertexColors = true;
+  f.mesh.material = f.material; f.mesh.count = 19; f.owner.meshPerAttribute = 2;
+  t.after(() => { original.dispose(); f.material.dispose(); });
+  const initial = [...f.owner.array], changedIndex = interleaved ? 3 : 0, untouchedIndex = interleaved ? 0 : 3;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  f.owner.array[changedIndex] = .875; f.owner.array[untouchedIndex] = 50;
+  f.owner.addUpdateRange(changedIndex, 1); f.owner.needsUpdate = true;
+  for (requested of [1, 0, 2]) f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(expectedCounts, [3, 1, 0, 2]);
+  assert.equal(setups, 1); assert.equal(updates, 4); assert.equal(after, 4);
+  assert.deepEqual(f.owner.updateRanges, []);
+  f.owner.array.fill(99); f.geometry.instanceCount = 77;
+  await drain(f.renderer);
+  const actual = draws(f.device);
+  assert.deepEqual(actual.map(draw => draw.args[1]), expectedCounts.filter(count => count !== 0));
+  // Interleaved offset/color bindings share a single original owner; separate
+  // streams retain the color owner independently of the offset stream.
+  const captured = actual.map(draw => interleaved ? instanceStreams(draw)[0]
+    : instanceStreams(draw).find(stream => stream.values[1] === .25));
+  assert.deepEqual(captured[0].values, initial);
+  const changed = initial.map((value, index) => index === changedIndex ? .875 : value);
+  assert.deepEqual(captured[1].values, changed); assert.deepEqual(captured[2].values, changed);
+  assert.ok(actual.every(draw => instanceStreams(draw).length === (interleaved ? 1 : 2)));
+  if (interleaved) {
+    assert.equal(captured[0].layout.arrayStride, 24);
+    assert.deepEqual(captured[0].layout.attributes.map(attribute => attribute.offset).sort((a, b) => a - b), [0, 12]);
+  }
+  assert.equal(setups, 1); assert.equal(updates, 4); assert.equal(after, 4);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('queued instance counts follow source node update ordering and keep zero draws without replaying callbacks', async t => {

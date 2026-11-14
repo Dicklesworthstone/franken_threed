@@ -1551,6 +1551,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype &&
       object.instanceMatrix?.isStorageInstancedBufferAttribute !== true &&
       object.instanceColor?.isStorageInstancedBufferAttribute !== true;
+    // Named instance streams share source construction by geometry layout.
+    // Each render object's ordinary geometry owner still selects and captures
+    // its own attributes, including interleaved version/range history.
+    const instancedGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
+      object.geometry.isInstancedBufferGeometry === true;
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
@@ -1561,7 +1566,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
-        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension || object.geometry.isInstancedBufferGeometry ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension ||
+        object.geometry.isInstancedBufferGeometry && !instancedGeometryExtension ||
         // Morph.js owns the target atlas, influence uniforms and captured
         // per-instance weight texture. The source instance UUID key above
         // keeps those bindings with their matrix/color owner across reuse.
@@ -1576,7 +1582,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.entries(object.geometry.attributes).some(([name, attribute]) =>
           attribute.array?.constructor !== Float32Array && !(skinExtension && name === 'skinIndex' &&
             [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) ||
-          attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute ||
+          !instancedGeometryExtension && (attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute) ||
+          attribute.isStorageInstancedBufferAttribute ||
           attribute.isStorageBufferAttribute && !geometrySetup) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||

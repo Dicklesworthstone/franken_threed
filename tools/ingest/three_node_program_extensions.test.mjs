@@ -635,6 +635,105 @@ test((registered ? 'registered' : 'inherited') + ' ' + family + ' InstancedMesh 
   material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
 });
 
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const interleaved of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} InstancedBufferGeometry extensions share source construction with ${interleaved ? 'interleaved' : 'separate'} streams`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupPosition(builder) {
+      const position = super.setupPosition(builder);
+      return position.addAssign(N.attribute('offset', 'vec3'));
+    }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.material === builder.context.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float'))
+        .mul(this.applicationVariant ? .5 : 1), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'InstancedGeometryExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstancedGeometryExtension');
+  const material = new (registered ? Application : Extension)(); material.vertexColors = true;
+  const add = translation => {
+    const item = f.add(material), geometry = new T.InstancedBufferGeometry().copy(item.object.geometry);
+    geometry.instanceCount = 3;
+    if (interleaved) {
+      const owner = new T.InstancedInterleavedBuffer(new Float32Array(
+        Array.from({length: 3}, (_, index) => [translation + index, 0, 0, .25, .5, .75]).flat()), 6, 2);
+      geometry.setAttribute('offset', new T.InterleavedBufferAttribute(owner, 3, 0));
+      geometry.setAttribute('color', new T.InterleavedBufferAttribute(owner, 3, 3));
+    } else {
+      geometry.setAttribute('offset', new T.InstancedBufferAttribute(new Float32Array(
+        Array.from({length: 3}, (_, index) => [translation + index, 0, 0]).flat()), 3, false, 2));
+      geometry.setAttribute('color', new T.InstancedBufferAttribute(new Float32Array(
+        Array.from({length: 3}, () => [.25, .5, .75]).flat()), 3, false, 2));
+    }
+    item.object.geometry = geometry;
+    return item;
+  };
+  const a = add(2), b = add(11);
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'construction and custom-key effects match the source');
+    equalShaders(descriptor, reference);
+    const sourcePacket = f.referenceDraw(item), packet = f.capture(item, descriptor);
+    assert.deepEqual(packet.uniforms, sourcePacket.uniforms);
+    const geometry = f.programs.geometry(descriptor), attributes = f.referenceObject(item).getAttributes();
+    for (const name of ['offset', 'color']) {
+      assert.equal(geometry.attributes[name], item.object.geometry.attributes[name]);
+      assert.ok(attributes.includes(geometry.attributes[name]));
+    }
+    return {reference, descriptor, packet};
+  };
+  const firstA = compare(a), firstB = compare(b), saved = firstA.packet.uniforms.map(bytes => bytes.slice());
+  assert.equal(firstA.reference, firstB.reference, 'the source shares one builder across matching instanced geometry layouts');
+  assert.notEqual(firstA.descriptor, firstB.descriptor, 'each mesh retains its own geometry selection and bindings');
+  assert.notEqual(f.programs.geometry(firstA.descriptor), f.programs.geometry(firstB.descriptor));
+  a.object.geometry.instanceCount = 1; b.object.geometry.instanceCount = 2;
+  material.applicationGain = .875; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor); assert.equal(compare(b).descriptor, firstB.descriptor);
+  assert.ok(values(compare(a).packet).includes(.875)); assert.deepEqual(firstA.packet.uniforms, saved);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor); assert.equal(compare(b).descriptor, firstB.descriptor);
+  const prior = a.object.geometry.attributes.offset;
+  const replacement = interleaved ? new T.InterleavedBufferAttribute(prior.data.clone({}), 3, 0) : prior.clone();
+  a.object.geometry.setAttribute('offset', replacement); f.renderer.info.calls++;
+  const selectedA = compare(a);
+  assert.equal(selectedA.reference, firstA.reference, 'replacing named stream storage retains the source graph');
+  assert.equal(f.programs.geometry(selectedA.descriptor).attributes.offset, replacement);
+  assert.equal(compare(b).descriptor, firstB.descriptor, 'the other geometry keeps its own stream owners');
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyedA = compare(a), keyedB = compare(b);
+  assert.equal(keyedA.reference, keyedB.reference); assert.notEqual(keyedA.reference, firstA.reference);
+  assert.notEqual(keyedA.descriptor.fragment, firstA.descriptor.fragment);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0); f.renderer.info.calls++;
+  const rebuiltA = compare(a), rebuiltB = compare(b);
+  assert.equal(rebuiltA.reference, rebuiltB.reference); assert.notEqual(rebuiltA.reference, keyedA.reference);
+  assert.deepEqual(firstA.packet.uniforms, saved);
+});
+
+test('InstancedBufferGeometry extensions retain CPU Float32 and ordinary Mesh boundaries before hooks', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = f.add(new Extension()), geometry = new T.InstancedBufferGeometry().copy(item.object.geometry);
+  geometry.instanceCount = 2; item.object.geometry = geometry;
+  for (const attribute of [new T.StorageInstancedBufferAttribute(2, 3),
+    new T.InstancedBufferAttribute(new Uint32Array(6), 3)]) {
+    geometry.setAttribute('offset', attribute);
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  }
+  geometry.setAttribute('offset', new T.InstancedBufferAttribute(new Float32Array(6), 3));
+  class CustomMesh extends T.Mesh {}
+  Object.setPrototypeOf(item.object, CustomMesh.prototype);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+});
+
 test('InstancedMesh extension generated streams retain source upload history across versionless and partial CPU edits', t => {
   const T = SourceThree, f = fixture(t, {}, T);
   class Extension extends T.MeshBasicNodeMaterial {}

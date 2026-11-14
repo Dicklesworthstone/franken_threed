@@ -35,7 +35,8 @@ registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
-morph targets), plus CPU-backed `InstancedMesh`, with opaque or transparent,
+morph targets), CPU-backed `InstancedMesh`, and ordinary meshes with
+CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
 single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
@@ -54,6 +55,17 @@ govern generated streams, and source invalidation/disposal governs reconstructio
 Inherited and registered Basic, Standard and Physical materials, including
 transparent `DoubleSide` construction, have focused source-builder and public
 renderer regressions.
+
+Custom materials on `InstancedBufferGeometry` share source construction by
+material and geometry layout while each mesh selects its own named attribute
+streams. Separate Float32 instance attributes and interleaved Float32 owners
+retain the existing geometry upload history, requested partial ranges and
+captured counts. Replacing a named stream preserves source graph reuse while
+updating that mesh's bindings; material keys and disposal still reconstruct at
+source boundaries. Twelve inherited/registered Basic, Standard and Physical
+comparisons match pinned WGSL, uniform bytes and construction effects. Four
+public-renderer cases verify queued stream bytes, count and update ordering,
+including zero draws and GPU-stale bytes outside requested ranges.
 
 Custom skinned materials retain source builder sharing by bone count. Each mesh
 sizes its own uniform palette binding, including when a second equal-count
@@ -92,10 +104,14 @@ and Physical families with both weight representations. They compare generated
 WGSL, texture bindings, uniform bytes, construction callback counts, independent
 instance owners, target replacement, version-only reuse and disposal against
 pinned r186. All twelve failed the former admission guard and pass with this
-composition. The executor became unavailable before full-suite and public
-renderer integration checks completed; browser/GPU pixels remain unverified.
+composition. Four public-renderer cases also pass for inherited/registered
+materials, both 4-instance uniform
+matrices and 1,025-instance generated matrix attributes. They preserve marked
+morph texture generations, unmarked texture changes, matrix/color update ranges,
+material uniforms, counts and capture cleanup across queued draws. The revised
+malformed-target regression also passes. Browser/GPU pixels remain unverified.
 
-Storage-backed custom instances, custom mesh subclasses, instanced geometries
+Storage-backed custom instances, custom mesh subclasses, non-Float32 instance streams
 and per-instance weight textures on non-instance objects remain outside this
 extension slice; their ordinary built-in paths keep their existing support.
 

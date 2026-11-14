@@ -30,8 +30,9 @@ function fixture(t, {linear = true} = {}) {
   Object.assign(device.limits, {maxTextureDimension2D: 8192, maxBindingsPerBindGroup: 1000});
   device.textures = []; device.textureWrites = [];
   device.createTexture = descriptor => {
-    const texture = {dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...descriptor,
+    const texture = {dimension: '2d', sampleCount: 1, ...descriptor,
       width: descriptor.size.width ?? descriptor.size[0], height: descriptor.size.height ?? descriptor.size[1],
+      depthOrArrayLayers: descriptor.size.depthOrArrayLayers ?? descriptor.size[2] ?? 1,
       createView(options = {}) { return {texture, ...options}; }, destroy() { this.destroyed = true; }};
     device.textures.push(texture); return texture;
   };
@@ -80,6 +81,85 @@ test('custom node-material subclasses select source graphs without authored slot
   for (const [index, color] of colors.entries()) assert.ok(hasColor(actual[index], color));
   assert.equal(setups, 1, 'deferred preparation does not replay setup');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const registered of [false, true]) for (const count of [4, 1025])
+test(`custom instance morphs retain queued weight textures and ${count === 4 ? 'uniform' : 'attribute'} matrix history (registered=${registered})`, async t => {
+  const f = fixture(t);
+  Object.assign(f.device.limits, {maxTextureArrayLayers: 256});
+  f.device.queue.writeTexture = (destination, data) => f.device.textureWrites.push({destination,
+    bytes: new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength).slice()});
+  let setups = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor() { super(); this.applicationGain = .375; }
+    setupOutput(builder, output) {
+      setups++;
+      return super.setupOutput(builder, T.TSL.vec4(
+        output.rgb.mul(T.TSL.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'InstanceMorphApplication'; this.applicationGain = .375; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstanceMorphApplication');
+  const material = new (registered ? Application : Extension)(), geometry = f.mesh.geometry;
+  geometry.morphTargetsRelative = true;
+  geometry.morphAttributes.position = [0, 1].map(axis => new T.Float32BufferAttribute(
+    Array.from(geometry.attributes.position.array, (_, component) => component % 3 === axis ? .25 : 0), 3));
+  const mesh = new T.InstancedMesh(geometry, material, count); mesh.frustumCulled = false;
+  for (let index = 0; index < count; index++) {
+    mesh.setMatrixAt(index, new T.Matrix4().makeTranslation(index + 1, 0, 0));
+    mesh.setColorAt(index, new T.Color(.25, .5, .75));
+  }
+  const setWeights = offset => {
+    for (let index = 0; index < count; index++)
+      mesh.setMorphAt(index, {morphTargetInfluences: [.125 + offset + index * .125, .375 - offset]});
+  };
+  setWeights(0); mesh.morphTexture.needsUpdate = true;
+  f.scene.remove(f.mesh); f.scene.add(mesh);
+  t.after(() => { mesh.dispose(); material.dispose(); });
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  setWeights(.5); mesh.morphTexture.needsUpdate = true;
+  mesh.instanceMatrix.array[12] = 7; mesh.instanceMatrix.array[28] = 19;
+  mesh.instanceMatrix.addUpdateRange(12, 1); mesh.instanceMatrix.needsUpdate = true;
+  mesh.instanceColor.array[0] = .625; mesh.instanceColor.array[3] = .875;
+  mesh.instanceColor.addUpdateRange(0, 1); mesh.instanceColor.needsUpdate = true;
+  material.applicationGain = .875; mesh.count = 3;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  setWeights(99); mesh.count = 2;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.equal(setups, 1);
+  mesh.instanceMatrix.array.fill(99); mesh.instanceColor.array.fill(99); material.applicationGain = 99;
+  await drain(f.renderer);
+  const actual = draws(f.device);
+  assert.deepEqual(actual.map(draw => draw.args[1]), [count, 3, 2]);
+  const textureViews = draw => [...draw.groups.values()].flatMap(({group}) => group.entries)
+    .map(entry => entry.resource).filter(resource => resource?.texture);
+  const textures = actual.map(draw => textureViews(draw).find(view => view.texture.format === 'r32float').texture);
+  const weights = texture => {
+    const bytes = f.device.textureWrites.find(write => write.destination.texture === texture).bytes;
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)];
+  };
+  assert.deepEqual(weights(textures[0]),
+    Array.from({length: count}, (_, index) => [1, .125 + index * .125, .375]).flat());
+  assert.deepEqual(weights(textures[1]),
+    Array.from({length: count}, (_, index) => [1, .625 + index * .125, -.125]).flat());
+  assert.notEqual(textures[0], textures[1]); assert.equal(textures[1], textures[2]);
+  const streams = draw => draw.pipeline.vertex.buffers.flatMap((layout, slot) => {
+    if (layout.stepMode !== 'instance') return [];
+    const bytes = draw.contents.get(draw.streams.get(slot));
+    return [{stride: layout.arrayStride, values: [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]}];
+  });
+  assert.deepEqual(actual.map(draw => streams(draw).find(stream => stream.stride === 12).values.slice(0, 4)),
+    [[.25, .5, .75, .25], [.625, .5, .75, .25], [.625, .5, .75, .25]]);
+  const matrices = actual.map(draw => count === 4 ? blocks(draw).find(words => words.length === count * 16)
+    : streams(draw).find(stream => stream.stride === 64).values);
+  assert.deepEqual(matrices.map(words => [words[12], words[28]]),
+    [[1, 2], [7, count === 4 ? 19 : 2], [7, count === 4 ? 19 : 2]]);
+  assert.ok(blocks(actual[0]).flat().includes(.375));
+  assert.ok(actual.slice(1).every(draw => blocks(draw).flat().includes(.875)));
+  assert.ok(actual.every(draw => draw.pipeline.vertex.module.code.includes('texture_2d_array<f32>')));
+  assert.equal(setups, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 for (const registered of [false, true])
