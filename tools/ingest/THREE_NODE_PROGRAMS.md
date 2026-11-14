@@ -35,7 +35,7 @@ registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
-morph targets), CPU-backed `InstancedMesh`, and ordinary meshes with
+morph targets), CPU- or storage-backed `InstancedMesh`, and ordinary meshes with
 CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
 single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
@@ -47,7 +47,7 @@ built-in material profiles retain their broader supported features.
 
 Custom instance materials retain the pinned source's per-object builder key: two
 `InstancedMesh` objects sharing one material keep separate matrix and color
-bindings. Small matrix palettes use the existing uniform path; larger palettes
+bindings. Small CPU matrix palettes use the existing uniform path; larger palettes
 use the existing generated attribute streams. Accepted draws preserve matrix,
 RGB, material-uniform and count snapshots while pipeline preparation is pending,
 including zero-count requests. Source upload versions and partial ranges still
@@ -55,6 +55,25 @@ govern generated streams, and source invalidation/disposal governs reconstructio
 Inherited and registered Basic, Standard and Physical materials, including
 transparent `DoubleSide` construction, have focused source-builder and public
 renderer regressions.
+
+Custom instance materials also accept source `StorageInstancedBufferAttribute`
+matrices and colors, including mixed CPU/storage inputs. Graphics reads borrow
+the same allocations used by compute, without readback or stale CPU uploads.
+Explicit upload versions, source vec3 padding, queued counts and uniform bytes
+retain the existing owners. Pinned-source comparisons cover Basic, Standard and
+Physical inheritance/registration with each storage combination; recording-device
+checks cover allocation identity, resident bytes, marked uploads and queue order.
+These checks do not execute GPU shader arithmetic or establish pixel parity.
+With no other tracked change, edits to an untracked custom material property and
+unmarked storage bytes retain the source observer's shared refresh and prior
+object uniforms. Marking an instance upload version triggers its full refresh.
+Both transitions are checked against the pinned source monitor.
+
+The source instance nodes capture attribute identities at construction. Replacing
+a matrix/color attribute under an unchanged custom source key retains the existing
+explicit rejection; changing the actual program key or disposing its source owner
+allows reconstruction against the replacement. Version-only material invalidation
+does not silently redirect captured bindings.
 
 Custom materials on `InstancedBufferGeometry` share source construction by
 material and geometry layout while each mesh selects its own named attribute
@@ -111,7 +130,7 @@ morph texture generations, unmarked texture changes, matrix/color update ranges,
 material uniforms, counts and capture cleanup across queued draws. The revised
 malformed-target regression also passes. Browser/GPU pixels remain unverified.
 
-Storage-backed custom instances, custom mesh subclasses, non-Float32 instance streams
+Custom mesh subclasses, non-Float32 instance streams
 and per-instance weight textures on non-instance objects remain outside this
 extension slice; their ordinary built-in paths keep their existing support.
 

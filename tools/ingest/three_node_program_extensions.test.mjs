@@ -762,7 +762,138 @@ test('InstancedMesh extension generated streams retain source upload history acr
   assert.deepEqual(geometry.attributes[color.name].array, colorHistory);
 });
 
-test('InstancedMesh extensions keep storage, subclasses and stale CPU-array boundaries before shader callbacks', t => {
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const stored of ['matrix', 'color', 'both'])
+test(`${registered ? 'registered' : 'inherited'} ${family} storage InstancedMesh extensions retain source ${stored} bindings and construction`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'StorageInstanceExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'StorageInstanceExtension');
+  const material = new (registered ? Application : Extension)();
+  const add = translation => {
+    const item = instanceItem(f, T, material, 4, translation);
+    if (stored !== 'color') item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(item.object.instanceMatrix.array, 16);
+    if (stored !== 'matrix') item.object.instanceColor = new T.StorageInstancedBufferAttribute(item.object.instanceColor.array, 3);
+    return item;
+  };
+  const a = add(2), b = add(11);
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected); equalInstanceShaders(descriptor, reference);
+    f.referenceDraw(item, {fullLifecycle: true});
+    const packet = f.capture(item, descriptor);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    const source = f.referenceObject(item).getBindings().flatMap((group, groupIndex) => group.bindings.flatMap((binding, bindingIndex) =>
+      binding.isStorageBuffer ? [[groupIndex, bindingIndex, binding.attribute]] : []));
+    assert.deepEqual(packet.storage.map(binding => [binding.group, binding.binding, binding.attribute]), source);
+    assert.ok(packet.storage.every(binding => !binding.writable));
+    assert.deepEqual(packet.storage.map(binding => binding.attribute),
+      [item.object.instanceMatrix, item.object.instanceColor].filter(attribute => attribute.isStorageInstancedBufferAttribute));
+    assert.equal(descriptor.instanceCapacity, 4);
+    assert.equal(packet.attributes === null, stored !== 'matrix');
+    if (packet.attributes) packet.attributes.install();
+    return {reference, descriptor, packet};
+  };
+  const firstA = compare(a), firstB = compare(b), saved = firstA.packet.uniforms.map(bytes => bytes.slice());
+  assert.notEqual(firstA.reference, firstB.reference, 'source instance UUIDs isolate captured storage bindings');
+  assert.notEqual(firstA.descriptor, firstB.descriptor);
+  material.applicationGain = .875; a.object.instanceMatrix.array[12] = 7;
+  a.object.instanceMatrix.needsUpdate = true; a.object.instanceColor.array[0] = .625; a.object.instanceColor.needsUpdate = true;
+  f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor); assert.equal(compare(b).descriptor, firstB.descriptor);
+  assert.ok(values(compare(a).packet).includes(.875)); assert.deepEqual(firstA.packet.uniforms, saved);
+  if (stored !== 'matrix') {
+    const color = a.object.instanceColor, packed = color.array;
+    color.array = new Float32Array(color.count * 4);
+    for (let index = 0; index < color.count; index++) color.array.set(packed.subarray(index * 3, index * 3 + 3), index * 4);
+    color.itemSize = 4; f.renderer.info.calls++;
+    assert.equal(compare(a).descriptor, firstA.descriptor, 'compute vec3 padding keeps the same captured source storage layout');
+  }
+  for (const count of [3, 1, 0]) {
+    a.object.count = count; f.renderer.info.calls++;
+    assert.equal(compare(a).descriptor, firstA.descriptor, 'live draw counts retain source storage construction');
+  }
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor);
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyedA = compare(a), keyedB = compare(b);
+  assert.notEqual(keyedA.reference, firstA.reference); assert.notEqual(keyedB.reference, firstB.reference);
+  a.object.dispose(); f.renderer.info.calls++;
+  assert.equal(f.programs.diagnostics.programs, 1);
+  const rebuiltA = compare(a); assert.notEqual(rebuiltA.reference, keyedA.reference);
+  assert.equal(compare(b).descriptor, keyedB.descriptor);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+  assert.deepEqual(firstA.packet.uniforms, saved);
+});
+
+for (const registered of [false, true])
+test(`storage InstancedMesh extensions follow pinned observer refresh for untracked edits (registered=${registered})`, t => {
+  const T = SourceThree, f = fixture(t, {}, T);
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor() { super(); this.applicationGain = .3125; }
+    setupOutput(builder, output) {
+      return super.setupOutput(builder, T.TSL.vec4(output.rgb.mul(T.TSL.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'StorageObserverApplication'; this.applicationGain = .3125; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'StorageObserverApplication');
+  const item = instanceItem(f, T, new (registered ? Application : Extension)());
+  item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(item.object.instanceMatrix.array, 16);
+  item.object.instanceColor = new T.StorageInstancedBufferAttribute(item.object.instanceColor.array, 3);
+  const object = f.referenceObject(item), frame = new T.NodeFrame(); frame.renderer = f.renderer;
+  const observer = object.getMonitor(), kinds = [];
+  const observe = () => { frame.renderId = f.renderer.info.calls++; kinds.push(observer.needsRefresh(object, frame)); };
+  observe();
+  item.material.applicationGain = .5625; item.object.instanceMatrix.array[12] = 99; item.object.instanceColor.array[0] = 99;
+  item.object.count = 1; observe();
+  item.material.applicationGain = .8125; item.object.instanceMatrix.needsUpdate = item.object.instanceColor.needsUpdate = true;
+  item.object.count = 2; observe();
+  assert.deepEqual(kinds, [T.RenderObjectRefreshType.FULL, T.RenderObjectRefreshType.SHARED, T.RenderObjectRefreshType.FULL],
+    'the real source observer retains object uniforms until the instance upload version changes');
+});
+
+test('storage InstancedMesh extensions retain captured attributes until source key invalidation', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor() { super(); this.applicationVariant = 0; }
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = instanceItem(f, T, new Extension());
+  item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(item.object.instanceMatrix.array, 16);
+  const original = item.object.instanceMatrix, source = f.reference(item), descriptor = f.compile(item), accepted = f.capture(item, descriptor);
+  const replacement = new T.StorageInstancedBufferAttribute(original.array.slice(), 16); replacement.array[12] = 7;
+  item.object.instanceMatrix = replacement; f.renderer.info.calls++;
+  assert.equal(f.reference(item), source); assert.equal(f.compile(item), descriptor);
+  const acceptedEffects = effects;
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(effects, acceptedEffects); assert.equal(accepted.storage[0].attribute, original);
+  f.referenceDraw(item, {fullLifecycle: true});
+  assert.equal(f.referenceObject(item).getBindings().flatMap(group => group.bindings)
+    .find(binding => binding.isStorageBuffer).attribute, original, 'the retained source builder still captures the original attribute');
+  item.material.applicationVariant = 1; item.material.needsUpdate = true; f.renderer.info.calls++;
+  const changedSource = f.reference(item), changed = f.compile(item);
+  assert.notEqual(changedSource, source); assert.notEqual(changed, descriptor); equalInstanceShaders(changed, changedSource);
+  assert.equal(f.capture(item, changed).storage[0].attribute, replacement);
+  assert.equal(accepted.storage[0].attribute, original);
+  item.material.geometryNode = T.TSL.Fn(() => {})().compute(1);
+  const beforeGeometryHook = effects;
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, beforeGeometryHook, 'custom geometry construction retains its separate admission boundary');
+});
+
+test('InstancedMesh extensions keep malformed storage, subclasses and stale CPU-array boundaries before shader callbacks', t => {
   const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
   class Extension extends T.MeshBasicNodeMaterial {
     customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
@@ -770,8 +901,8 @@ test('InstancedMesh extensions keep storage, subclasses and stale CPU-array boun
   }
   const material = new Extension(), item = instanceItem(f, T, material);
   const original = item.object.instanceMatrix;
-  item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(original.array, 16);
-  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(original.array, 4);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_STORAGE'});
   assert.equal(effects, 0);
   item.object.instanceMatrix = original;
   const prototype = Object.getPrototypeOf(item.object);

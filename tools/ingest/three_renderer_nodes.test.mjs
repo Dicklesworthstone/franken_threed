@@ -1499,6 +1499,81 @@ test('native InstancedMesh borrows compute matrices and colors while retaining q
   assert.equal(f.renderer.info.render.drawCalls,2);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
 
+for(const registered of [false,true])
+test(`custom storage instances borrow compute allocations and preserve queued GPU history (registered=${registered})`,async t=>{
+  const f=fixture(t);recordCompute(f.device);f.renderer.outputColorSpace=T.LinearSRGBColorSpace;
+  const {mesh,matrices,colors}=storageInstances(f),updates=[],after=[];
+  let requested=3,setups=0;
+  const pulse=T.TSL.uniform(1).onObjectUpdate(frame=>{
+    assert.equal(frame.object,mesh);assert.equal(frame.material,material);
+    frame.object.count=requested;updates.push(requested);return 1;
+  });
+  pulse.updateAfterType='object';pulse.updateAfter=frame=>{after.push(frame.object.count);frame.object.count=99;};
+  class Extension extends T.MeshBasicNodeMaterial{
+    constructor(){super();this.applicationGain=.3125;}
+    setupOutput(builder,output){
+      setups++;return super.setupOutput(builder,T.TSL.vec4(output.rgb
+        .mul(T.TSL.materialReference('applicationGain','float')).mul(pulse),output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial{
+    constructor(){super();this.type='StorageInstanceApplication';this.applicationGain=.3125;}
+  }
+  if(registered)f.renderer.library.addMaterial(Extension,'StorageInstanceApplication');
+  const material=new(registered?Application:Extension)();mesh.material=material;
+  t.after(()=>{mesh.dispose();material.dispose();});
+  const matrixNode=T.TSL.storage(matrices,'mat4',4),colorNode=T.TSL.storage(colors,'vec3',4);
+  const kernel=T.TSL.Fn(()=>{
+    const index=T.TSL.instanceIndex;
+    matrixNode.element(index).assign(matrixNode.element(index));
+    colorNode.element(index).addAssign(T.TSL.vec3(0));
+  })().compute(4);
+  await f.renderer.compileComputeAsync(kernel);
+  const buffers=[matrices,colors].map(attribute=>captureComputeStorage(f.device,attribute).resolve().buffer);
+  // Model prior GPU-produced bytes at the recording boundary. The public CPU
+  // arrays stay stale; these identity kernels must retain the resident result.
+  new Float32Array(buffers[0].data)[12]=.625;new Float32Array(buffers[1].data)[0]=.375;
+  assert.equal(matrices.array[12],0);assert.equal(colors.array[0],.125);
+  const initialWrites=buffers.map(buffer=>f.device.writes.filter(write=>write.buffer===buffer).length);
+  const first=f.renderer.compute(kernel);f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=99;colors.array[0]=99;requested=1;material.applicationGain=.5625;
+  f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=1.5;matrices.needsUpdate=true;colors.array[0]=.875;colors.needsUpdate=true;
+  const second=f.renderer.compute(kernel);requested=2;material.applicationGain=.8125;
+  f.renderer.render(f.scene,f.camera);requested=0;f.renderer.render(f.scene,f.camera);
+  assert.equal(setups,1);assert.deepEqual(updates,[3,1,2,0]);assert.deepEqual(after,updates);
+  matrices.array.fill(99);colors.array.fill(99);material.applicationGain=99;mesh.count=99;
+  await Promise.all([first,second,drain(f.renderer)]);await f.renderer.waitForGPU();
+  const draws=nativeDraws(f.device);
+  assert.deepEqual(draws.map(draw=>draw.args[1]),[3,1,2]);
+  // The pinned observer retains object uniforms on SHARED refresh: an
+  // untracked application property and unmarked CPU edit do not invalidate
+  // them. The marked storage version requests FULL on the third draw.
+  for(const [index,draw] of draws.entries()){
+    assert.ok(buffers.every(buffer=>storageResources(draw).some(resource=>resource.buffer===buffer)));
+    assert.ok(uniformBlocks(draw).flat().includes([.3125,.3125,.8125][index]),
+      `draw ${index} keeps its accepted gain: ${JSON.stringify(uniformBlocks(draw))}`);
+    assert.equal(draw.pipeline,draws[0].pipeline);
+  }
+  const words=(draw,buffer)=>new Float32Array(draw.contents.get(buffer).buffer);
+  assert.deepEqual(draws.map(draw=>words(draw,buffers[0])[12]),[.625,.625,1.5]);
+  assert.deepEqual(draws.map(draw=>words(draw,buffers[1])[0]),[.375,.375,.875]);
+  assert.equal(f.device.computePasses.length,2);
+  for(const [index,buffer] of buffers.entries()){
+    assert.equal(f.device.writes.filter(write=>write.buffer===buffer).length,initialWrites[index]+1,
+      'graphics never uploads stale CPU data and only the marked host version uploads');
+    assert.ok(f.device.computePasses.every(pass=>[...pass.groups.values()].some(group=>
+      group.entries.some(entry=>entry.resource?.buffer===buffer))));
+  }
+  assert.equal(f.device.buffers.filter(buffer=>buffer.label==='f3d-compute-buffer'&&(buffer.usage&128)).length,2);
+  assert.ok(f.device.buffers.every(buffer=>(buffer.usage&1)===0),'compute-to-render never allocates a readback buffer');
+  assert.equal(setups,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+  const writes=f.device.writes.length,submissions=f.device.submissions.length,acquired=f.acquired();requested=5;
+  assert.throws(()=>f.renderer.render(f.scene,f.camera),{code:'THREE_NODE_PROGRAM_OBJECT'});
+  assert.equal(f.device.writes.length,writes);assert.equal(f.device.submissions.length,submissions);
+  assert.equal(f.acquired(),acquired);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 test('native InstancedMesh captures replacement storage identities before later queued changes',async t=>{
   const f=fixture(t),{mesh,matrices:a,colors:firstColor}=storageInstances(f,2);
   await f.renderer.init();f.renderer.render(f.scene,f.camera);

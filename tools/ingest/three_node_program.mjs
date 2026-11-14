@@ -1546,11 +1546,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const prototype = materialPrototype(prepared);
     // r186 keys InstancedMesh builders by object UUID: their instance nodes
     // close over that object's matrix/color attributes. Reuse the existing
-    // CPU instance owner, without sharing those bindings across mesh identities.
+    // CPU histories and compute storage owner without sharing captured
+    // instance bindings across mesh identities.
     const skinExtension = extension && Object.getPrototypeOf(object) === three.SkinnedMesh.prototype;
-    const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype &&
-      object.instanceMatrix?.isStorageInstancedBufferAttribute !== true &&
-      object.instanceColor?.isStorageInstancedBufferAttribute !== true;
+    const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype;
     // Named instance streams share source construction by geometry layout.
     // Each render object's ordinary geometry owner still selects and captures
     // its own attributes, including interleaved version/range history.
