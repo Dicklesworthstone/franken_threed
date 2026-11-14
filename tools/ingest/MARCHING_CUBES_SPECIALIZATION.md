@@ -45,7 +45,7 @@ Each addon module has a lazy dispatch token. Native initialization happens only
 on an admitted invocation, and a failed initialization is not retried every
 frame. Changed WebAssembly bindings or memory-growth hooks retain JavaScript
 without invoking replacement getters. Restoring platform bindings, capacity or
-disjoint buffers permits later native calls. The generic host refuses aliased
+disjoint buffers permits later native calls. This addon path refuses aliased
 writable storage, shared/resizable buffers, unsupported views, capacity failures,
 memory limits and exhausted execution fuel before publication.
 
@@ -107,6 +107,37 @@ the exact upstream checkout; it does not substitute host doubles for build tests
 The plugin report and runtime diagnostics distinguish compiled source, actual
 Wasm calls and fallback calls. A compiled addon is not a measured acceleration
 claim. Full H2 browser/material/control and performance gates remain open.
+
+## Source-library normal generation
+
+The numeric opt-in derives `BufferGeometry.computeVertexNormals` and
+`normalizeNormals` from the pinned geometry, Vector3 and BufferAttribute bodies.
+The same ten Float32/Float64 and Uint16/Uint32 kernel variants handle contiguous
+and native interleaved records through checked stride/offset arguments. Source
+arithmetic, indexed scatter order and every typed store retain their original
+boundaries; only accessor addresses use the proven record layout.
+
+Direct source imports and the pinned package core both register exact
+InterleavedBufferAttribute methods and the source count getter, with witnessed
+InterleavedBuffer data. Separate streams, shared position/normal records and
+shifted same-type views retain backing identities and untouched channels.
+Overlapping same-type views share the existing ordered Wasm scratch transaction,
+so later reads observe earlier writes just as in source. Each view keeps its
+own bounds; mixed-type writable overlap retains JavaScript.
+
+The original normal allocation/reset prefix, normalization call and final
+`needsUpdate` setter stay in place. This preserves source behavior even when
+resetting normals overlaps position channels. Normalization also materializes
+the module scratch vector's final unrounded Number components. Custom methods,
+count/data accessors, proxies, normalized or unsupported storage, unavailable
+Wasm and budget failures keep the original source path without partial native
+publication. `geometryNormalsDiagnostics` distinguishes actual Wasm and fallback
+calls; `numericSpecialization.libraryKernels.geometryNormals` reports compilation.
+
+The complete normal and attribute-transform suites pass 30 checks, including
+source/package execution, repeated deformations, shared and shifted views,
+mixed-type fallback, untouched bytes, version changes and scratch observations.
+This is a copying baseline; browser and measured speedup claims remain open.
 
 ## Source-library attribute transforms
 

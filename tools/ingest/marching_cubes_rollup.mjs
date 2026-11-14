@@ -95,7 +95,7 @@ export function marchingCubesRollupPlugin(options={}) {
       }
       const normalCandidate=code.includes('class BufferGeometry') || code.includes('class BufferAttribute') || code.includes('class Vector3');
       const finish=(sources={})=>{
-        if(normalCandidate) {
+        if(normalCandidate || code.includes('class InterleavedBuffer')) {
           const normals=specializeGeometryNormals(code,{...sources,runtimeModule:NORMALS,objectsModule:OBJECTS,maxMemoryPages,maxIterations});
           if(normals.report)normalReports.push({id,...normals.report});
           if(normals.changed){edits.push(...normals.edits);headers.push(normals.header);tail=normals.tail;}

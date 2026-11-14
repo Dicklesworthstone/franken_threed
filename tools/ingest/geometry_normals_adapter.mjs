@@ -1,5 +1,5 @@
 /** Guarded source-library geometry loops; all public Three objects stay retained.
- * Unknown identities/prototypes, custom methods and overlapping storage keep
+ * Unknown identities/prototypes, custom methods and mixed-type overlap keep
  * the original method body. The numeric runtime stages every write before one
  * synchronous publication. This is a copying baseline, not a speedup claim.
  */
@@ -26,12 +26,13 @@ const platformIntact=()=>wasm && data(globalThis,'WebAssembly')===wasm &&
   platform.every(([object,key,value])=>data(object,key)===value) && descriptor(memoryPrototype,'buffer')?.get===bufferGetter;
 
 /** Compiler-emitted registrations for exact source class definitions. */
-export function registerGeometryNormalAttributes(Base,children) {
+export function registerGeometryNormalAttributes(Base,children,layout='contiguous') {
   const base=data(Base,'prototype'),methods=new Map(attributeMethods.map(name=>[name,data(base,name)]));
-  attributes.set(base,{parent:prototype(base),methods});
+  const countGetter=layout==='interleaved'?descriptor(base,'count')?.get:null;
+  attributes.set(base,{parent:prototype(base),methods,layout,countGetter});
   for(const Child of children) {
     const child=data(Child,'prototype');
-    if(prototype(child)===base)attributes.set(child,{parent:base,methods});
+    if(prototype(child)===base)attributes.set(child,{parent:base,methods,layout,countGetter});
   }
 }
 export function registerGeometryNormalVector(Vector) {
@@ -69,11 +70,21 @@ function attributeInput(object,size) {
     }
     if(!found)return null;
   }
-  const array=data(object,'array'),count=data(object,'count');
-  if(data(object,'itemSize')!==size || data(object,'normalized')!==false || !integer(count) || count<0)return null;
+  const itemSize=data(object,'itemSize');
+  if(data(object,'normalized')!==false || (record.layout==='interleaved'
+    ? size!==3 || !integer(itemSize) || itemSize<size : itemSize!==size))return null;
+  let array,count,stride=size,offset=0;
+  if(record.layout==='interleaved') {
+    const countDescriptor=descriptor(proto,'count');
+    if(descriptor(object,'count') || !record.countGetter || countDescriptor?.get!==record.countGetter || countDescriptor.set)return null;
+    const buffer=data(object,'data');if(!isNumericObject(buffer))return null;
+    array=data(buffer,'array');count=data(buffer,'count');stride=data(buffer,'stride');offset=data(object,'offset');
+    if(!integer(stride) || stride<itemSize || !integer(offset) || offset<0 || offset>stride-itemSize)return null;
+  }else {array=data(object,'array');count=data(object,'count');}
+  if(!integer(count) || count<0 || !integer(count*stride))return null;
   try {
     const type=tags[apply(tag,array,[])];
-    return type && apply(length,array,[])===count*size?{array,count,type}:null;
+    return type && apply(length,array,[])===count*stride?{array,count,type,stride,offset}:null;
   }catch{return null;}
 }
 function kernel(record,variant) {
@@ -82,7 +93,9 @@ function kernel(record,variant) {
     try {
       const binary=apply(decode,globalThis,[variant.base64]),bytes=new U8(binary.length);
       for(let i=0;i<binary.length;i++)bytes[i]=apply(charCode,binary,[i]);
-      variant.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath});
+      // The source loops keep every load/store in order. Same-type aliases
+      // share staged storage; mixed-type writable overlap still retains JS.
+      variant.kernel=instantiateNumericKernel(bytes,{resolveMath:record.resolveMath,preserveAliasing:true});
     }catch{variant.failure='GEOMETRY_NORMAL_INITIALIZATION';}
     variant.base64=null;
   }
@@ -100,7 +113,7 @@ function inputs(record,method,position,index,normal,scratch) {
     if(!positions || !['f32[]','f64[]'].includes(positions.type) || !indices || !['u16[]','u32[]'].includes(indices.type) ||
         normals.count!==positions.count)return null;
     return {types:[positions.type,indices.type,normals.type],args:[positions.array,indices.array,normals.array,
-      positions.count,normals.count,indices.count,index===null?0:1]};
+      positions.count,normals.count,indices.count,index===null?0:1,positions.stride,positions.offset,normals.stride,normals.offset]};
   }
   if(!isNumericObject(scratch) || prototype(scratch)!==vector.proto)return null;
   for(const [name,method] of vector.methods) {
@@ -112,7 +125,7 @@ function inputs(record,method,position,index,normal,scratch) {
     const d=own(scratch,name);if(!d?.writable || typeof d.value!=='number')return null;values.push(d.value);
   }
   const staged=new F64(values);
-  return {types:[normals.type],args:[normals.array,staged,normals.count],staged};
+  return {types:[normals.type],args:[normals.array,staged,normals.count,normals.stride,normals.offset],staged};
 }
 /** Source prefixes already ran. A miss resumes only the original numeric block. */
 export function tryGeometryNormals(owner,token,method,position,index,normal,scratch=null) {

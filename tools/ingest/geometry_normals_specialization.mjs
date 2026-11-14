@@ -3,7 +3,9 @@ import {createHash} from 'node:crypto';
 import {sourceBlob} from './marching_cubes_specialization.mjs';
 import {normalClasses,normalMethod,deriveGeometryNormalKernels,compileGeometryNormalKernels} from './geometry_normals_compile.mjs';
 const blobs={geometry:'db7bfe67f8b159c9126da0c55e1cb5db66eca529',
-  attributes:'958fb453e027aee4a048001b3232c92d6fd6716b',vector:'b2e4c4e65cc50afc89b6cd8f8e706a0d1001d71a'};
+  attributes:'958fb453e027aee4a048001b3232c92d6fd6716b',vector:'b2e4c4e65cc50afc89b6cd8f8e706a0d1001d71a',
+  'interleaved-attributes':'f1b91a0893fd596669b02a31538e80d53aa73f93',
+  'interleaved-buffer':'d74d26e5f2dd1ad84f443c26aa688074a3f9e2ef'};
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 export function geometryNormalSourceRole(source) {
   const blob=sourceBlob(source);
@@ -31,6 +33,19 @@ export function specializeGeometryNormals(source,{runtimeModule,objectsModule,ve
   if(role==='core' || role==='attributes') {
     imports.push(`import {registerGeometryNormalAttributes as ${registerAttributes}} from ${JSON.stringify(runtimeModule)};`);
     tail.push(`${registerAttributes}(BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute]);`);
+  }
+  if(['core','interleaved-attributes','interleaved-buffer'].includes(role)) {
+    const register=fresh(source,'interleaved_allocation');
+    imports.push(`import {registerNumericObject as ${register}} from ${JSON.stringify(objectsModule)};`);
+    for(const name of role==='core'?['InterleavedBuffer','InterleavedBufferAttribute']:
+      [role==='interleaved-buffer'?'InterleavedBuffer':'InterleavedBufferAttribute']) {
+      const ctor=normalMethod(classes.get(name),'constructor');
+      edits.push({start:ctor.body.start+1,end:ctor.body.start+1,text:`\n${register}(this);\n`});
+    }
+    if(role!=='interleaved-buffer') {
+      if(role!=='core')imports.push(`import {registerGeometryNormalAttributes as ${registerAttributes}} from ${JSON.stringify(runtimeModule)};`);
+      tail.push(`${registerAttributes}(InterleavedBufferAttribute,[],"interleaved");`);
+    }
   }
   if(role==='core' || role==='geometry') {
     if(role==='core'){vectorSource=source;attributeSource=source;}

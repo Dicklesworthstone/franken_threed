@@ -1,8 +1,9 @@
 /** Inline the pinned normal loops' actual Vector3/BufferAttribute method bodies.
  * The result is ordinary numeric source fed to the existing checked Wasm
  * compiler. No alternative normal algorithm, reassociation or f32 fusion is
- * introduced. Guards establish non-normalized contiguous attributes and the
- * exact methods whose source is expanded here.
+ * introduced. Guards establish non-normalized native accessors and their
+ * integer record layouts. Only accessor addresses acquire stride/offset data;
+ * the same ten kernels retain every source arithmetic and typed-store boundary.
  */
 import * as acorn from 'acorn';
 import {compileNumericKernel} from './numeric_kernel.mjs';
@@ -30,7 +31,7 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
   let serial=0;
   const requirements={vector:new Set(),attribute:new Set()};
   const vectorValue=name=>({kind:'vector',name});
-  const attr=(name,array,count,size)=>({kind:'attribute',name,array,count,size});
+  const attr=(name,array,count,size,stride=String(size),offset='0')=>({kind:'attribute',name,array,count,stride,offset});
   const numeric=value=>typeof value==='string';
   function value(node,env) {
     if (node.type==='ThisExpression') return env.get('this');
@@ -44,11 +45,18 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
     }
     if (node.type==='Literal') return node.raw??JSON.stringify(node.value);
     if (node.type==='MemberExpression') {
+      if(node.computed && node.object.type==='MemberExpression' && !node.object.computed && node.object.property.name==='array') {
+        const owner=value(node.object.object,env);
+        if(owner?.kind==='attribute') {
+          const index=expression(node.property,env);
+          return `${owner.array}[${owner.offset==='0'?index:`(${index} + ${owner.offset})`}]`;
+        }
+      }
       const object=value(node.object,env),property=node.property.name;
       if (object?.kind==='vector' && !node.computed && ['x','y','z'].includes(property)) return object.name+'_'+property;
       if (object?.kind==='attribute' && !node.computed) {
         if(property==='array')return object.array;
-        if(property==='itemSize')return String(object.size);
+        if(property==='itemSize')return object.stride;
         if(property==='count')return object.count;
       }
       if (!numeric(object)) throw new TypeError('Unsupported verified member access');
@@ -130,17 +138,17 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
     throw new TypeError(`Unsupported verified normal statement: ${node.type}`);
   }
   const computeEnv=new Map([['index',attr('index','indices','indexCount',1)],
-    ['positionAttribute',attr('positionAttribute','positions','positionCount',3)],
-    ['normalAttribute',attr('normalAttribute','normals','normalCount',3)]]);
+    ['positionAttribute',attr('positionAttribute','positions','positionCount',3,'positionStride','positionOffset')],
+    ['normalAttribute',attr('normalAttribute','normals','normalCount',3,'normalStride','normalOffset')]]);
   // The sole object-truthiness branch is the already captured index choice.
   const segment=computeBody.slice(first,end),branch=segment.find(node=>node.type==='IfStatement');
-  const computeSource='function computeNormals(positions,indices,normals,positionCount,normalCount,indexCount,indexed){'+
+  const computeSource='function computeNormals(positions,indices,normals,positionCount,normalCount,indexCount,indexed,positionStride,positionOffset,normalStride,normalOffset){'+
     segment.map(node=>node===branch
       ?`if(indexed)${emit(node.consequent,new Map(computeEnv))}else ${emit(node.alternate,new Map(computeEnv))}`
       :emit(node,computeEnv)).join('')+'}';
-  const normalizeEnv=new Map([['normals',attr('normals','normals','normalCount',3)],
+  const normalizeEnv=new Map([['normals',attr('normals','normals','normalCount',3,'normalStride','normalOffset')],
     [scratchName,vectorValue('__scratch')]]);
-  const normalizeSource='function normalizeNormals(normals,scratch,normalCount){'+
+  const normalizeSource='function normalizeNormals(normals,scratch,normalCount,normalStride,normalOffset){'+
     'let __scratch_x=scratch[0],__scratch_y=scratch[1],__scratch_z=scratch[2];'+emit(normalizationLoop,normalizeEnv)+
     'scratch[0]=__scratch_x;scratch[1]=__scratch_y;scratch[2]=__scratch_z;}';
   return {computeSource,normalizeSource,computeSpan:{start:segment[0].start,end:segment.at(-1).end},
@@ -152,12 +160,12 @@ export function compileGeometryNormalKernels(sources,{maxMemoryPages=2048,maxIte
   const settings={maxMemoryPages,maxIterations,generalControl:true,allowMath:true};
   const variants=[];
   for(const positionType of ['f32[]','f64[]'])for(const normalType of ['f32[]','f64[]'])for(const indexType of ['u16[]','u32[]']) {
-    const parameterTypes=[positionType,indexType,normalType,'f64','f64','f64','f64'];
+    const parameterTypes=[positionType,indexType,normalType,'f64','f64','f64','f64','f64','f64','f64','f64'];
     const artifact=compileNumericKernel(sources.computeSource,{...settings,parameterTypes,sourceName:'pinned BufferGeometry.computeVertexNormals'});
     variants.push({method:'compute',types:[positionType,indexType,normalType],base64:Buffer.from(artifact.wasm).toString('base64')});
   }
   for(const normalType of ['f32[]','f64[]']) {
-    const artifact=compileNumericKernel(sources.normalizeSource,{...settings,parameterTypes:[normalType,'f64[]','f64'],sourceName:'pinned BufferGeometry.normalizeNormals'});
+    const artifact=compileNumericKernel(sources.normalizeSource,{...settings,parameterTypes:[normalType,'f64[]','f64','f64','f64'],sourceName:'pinned BufferGeometry.normalizeNormals'});
     variants.push({method:'normalize',types:[normalType],base64:Buffer.from(artifact.wasm).toString('base64')});
   }
   return variants;
