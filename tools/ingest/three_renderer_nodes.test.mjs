@@ -1881,3 +1881,130 @@ test('custom InstancedMesh material disposal rebuilds construction without expos
   assert.equal(draws.length,2);assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.125]);
   assert.equal(setups,2);assert.equal(f.renderer._nodeCaptureBytes,0);
 });
+
+function customSkinnedMesh(f,material,count=2){
+  const geometry=new T.PlaneGeometry();
+  geometry.setAttribute('skinIndex',new T.Uint16BufferAttribute(
+    [0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0],4));
+  geometry.setAttribute('skinWeight',new T.Float32BufferAttribute(
+    [.25,.75,0,0,.25,.75,0,0,.25,.75,0,0,.25,.75,0,0],4));
+  const mesh=new T.SkinnedMesh(geometry,material);
+  const bones=Array.from({length:count},()=>new T.Bone());
+  bones[0].add(...bones.slice(1));mesh.add(bones[0]);mesh.bind(new T.Skeleton(bones));
+  mesh.frustumCulled=false;f.scene.remove(f.mesh);f.scene.add(mesh);
+  return {mesh,bones,geometry};
+}
+const customSkinnedDraws=device=>nativeDraws(device).filter(draw=>
+  /skinIndex/.test(draw.pipeline.vertex.module.code));
+function skinPalette(draw){
+  const declaration=/((?:@(?:group|binding)\s*\(\s*\d+\s*\)\s*){2})var<uniform>\s+NodeBuffer_\d+\s*:/
+    .exec(draw.pipeline.vertex.module.code);
+  assert.ok(declaration,'source skinning exposes its uniform palette');
+  const groupIndex=Number(/@group\s*\(\s*(\d+)/.exec(declaration[1])[1]);
+  const binding=Number(/@binding\s*\(\s*(\d+)/.exec(declaration[1])[1]);
+  const {group,offsets}=draw.groups.get(groupIndex);
+  const entry=group.entries.find(value=>value.binding===binding),resource=entry.resource;
+  const layout=group.layout.entries.filter(value=>value.buffer?.type==='uniform').sort((a,b)=>a.binding-b.binding);
+  const offset=(resource.offset??0)+(offsets[layout.findIndex(value=>value.binding===binding)]??0);
+  const bytes=draw.contents.get(resource.buffer);
+  return [...new Float32Array(bytes.buffer,bytes.byteOffset+offset,resource.size/4)];
+}
+
+for(const registered of [false,true])
+test(`custom ${registered?'registered':'inherited'} SkinnedMesh materials retain queued animation palettes and uniforms`,async t=>{
+  const f=fixture(t),setups=[],updates=[];
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor(){super();this.applicationGain=.375;}
+    setupOutput(builder,output){
+      setups.push(builder.object);
+      return super.setupOutput(builder,T.TSL.vec4(
+        output.rgb.mul(T.TSL.materialReference('applicationGain','float')),output.a));
+    }
+  }
+  if(registered)f.renderer.library.materialNodes.set('MeshBasicMaterial',Extension);
+  const material=registered?new T.MeshBasicMaterial():new Extension();material.applicationGain=.375;
+  const {mesh,bones,geometry}=customSkinnedMesh(f,material);
+  t.after(()=>geometry.dispose());mesh.onBeforeRender=()=>updates.push(bones[1].position.x);
+  await f.renderer.init();bones[1].position.x=.25;f.renderer.render(f.scene,f.camera);
+  bones[1].position.x=.75;material.applicationGain=.625;f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene,f.camera);
+  bones[1].position.x=99;material.applicationGain=99;mesh.skeleton.boneMatrices.fill(99);
+  await drain(f.renderer);
+  const draws=customSkinnedDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[28]),[.25,.75]);
+  assert.ok(uniformBlocks(draws[0]).flat().includes(.375));
+  assert.ok(uniformBlocks(draws[1]).flat().includes(.625));
+  assert.equal(draws[0].pipeline,draws[1].pipeline);
+  assert.deepEqual(setups,[mesh]);assert.deepEqual(updates,[.25,.75]);
+  assert.ok(geometry.attributes.skinIndex.array instanceof Uint16Array);
+  assert.equal(geometry.attributes.skinIndex.gpuType,T.FloatType);
+  assert.match(draws[0].pipeline.vertex.module.code,/skinIndex\s*:\s*vec4<u32>/);
+  assert.equal(mesh.material,material);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+for(const paddedFirst of [false,true])
+test(`custom SkinnedMesh materials share source construction with the ${paddedFirst?'first':'second'} palette padded`,async t=>{
+  const f=fixture(t),setups=[];
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){setups.push(builder.object);return super.setupOutput(builder,output);}
+  }
+  const material=new Extension(),left=customSkinnedMesh(f,material),right=customSkinnedMesh(f,material);
+  t.after(()=>{left.geometry.dispose();right.geometry.dispose();});
+  left.mesh.renderOrder=-1;right.mesh.renderOrder=1;
+  (paddedFirst?left:right).mesh.skeleton.computeBoneTexture();
+  assert.notEqual(left.mesh.skeleton.boneMatrices.length,right.mesh.skeleton.boneMatrices.length);
+  left.bones[1].position.x=.25;right.bones[1].position.x=.75;
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(customSkinnedDraws(f.device).length,0);
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  let draws=customSkinnedDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[28]),[.25,.75]);
+  assert.equal(draws[0].pipeline.vertex.module.code,draws[1].pipeline.vertex.module.code);
+  assert.equal(draws[0].pipeline.fragment.module.code,draws[1].pipeline.fragment.module.code);
+  assert.deepEqual(setups,[left.mesh]);
+  left.bones[1].position.x=.5;right.bones[1].position.x=.875;f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene,f.camera);
+  left.mesh.skeleton.boneMatrices.fill(99);right.mesh.skeleton.boneMatrices.fill(99);
+  await drain(f.renderer);draws=customSkinnedDraws(f.device).slice(2);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[28]),[.5,.875]);
+  assert.deepEqual(setups,[left.mesh]);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom SkinnedMesh material replacement and disposal keep accepted skeleton snapshots',async t=>{
+  const f=fixture(t);let setups=0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){setups++;return super.setupOutput(builder,output);}
+  }
+  const material=new Extension(),{mesh,bones,geometry}=customSkinnedMesh(f,material);
+  t.after(()=>geometry.dispose());await f.renderer.init();
+  bones[1].position.y=.25;f.renderer.render(f.scene,f.camera);
+  const previous=mesh.skeleton;
+  mesh.skeleton=new T.Skeleton(bones,previous.boneInverses.map(matrix=>matrix.clone()));
+  bones[1].position.y=.625;f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  await drain(f.renderer);
+  let draws=customSkinnedDraws(f.device);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[29]),[.25,.625]);assert.equal(setups,1);
+  material.dispose();bones[1].position.y=.875;f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene,f.camera);mesh.skeleton.boneMatrices.fill(99);await drain(f.renderer);
+  draws=customSkinnedDraws(f.device);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[29]),[.25,.625,.875]);
+  assert.equal(setups,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom SkinnedMesh materials capture bone textures above the device uniform limit',async t=>{
+  const f=fixture(t);
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){return super.setupOutput(builder,output);}
+  }
+  const {mesh,bones,geometry}=customSkinnedMesh(f,new Extension(),1025);
+  t.after(()=>geometry.dispose());await f.renderer.init();
+  bones[1024].position.z=.25;f.renderer.render(f.scene,f.camera);
+  bones[1024].position.z=.75;f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  bones[1024].position.z=99;mesh.skeleton.boneMatrices.fill(99);await drain(f.renderer);
+  const draws=customSkinnedDraws(f.device);assert.equal(draws.length,2);
+  assert.ok(draws.every(draw=>/textureLoad/.test(draw.pipeline.vertex.module.code)));
+  const palettes=f.device.textureWrites.filter(write=>write.destination.texture.format==='rgba32float')
+    .map(write=>new Float32Array(write.bytes.buffer,write.bytes.byteOffset,write.bytes.byteLength/4));
+  assert.deepEqual(palettes.map(words=>words[1024*16+14]),[.25,.75]);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});

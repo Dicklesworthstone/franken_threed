@@ -753,3 +753,251 @@ test((registered ? 'registered' : 'inherited') + ' InstancedMesh extensions pres
   item.object.dispose(); f.renderer.info.calls++;
   assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, 2);
 });
+
+
+function skinnedItem(f, T, material, {count = 2, padded = false, translation = 0, IndexArray = Uint16Array} = {}) {
+  f.renderer.backend.capabilities = {getUniformBufferLimit: () => 65536};
+  const previous = f.add(material), geometry = previous.object.geometry;
+  f.scene.remove(previous.object);
+  const indices = Array.from({length: geometry.attributes.position.count}, () => [0, Math.min(1, count - 1), 0, 0]).flat();
+  const weights = Array.from({length: geometry.attributes.position.count}, () => [.25, .75, 0, 0]).flat();
+  geometry.setAttribute('skinIndex', new T.BufferAttribute(new IndexArray(indices), 4));
+  geometry.setAttribute('skinWeight', new T.Float32BufferAttribute(weights, 4));
+  geometry.computeTangents();
+  const object = new T.SkinnedMesh(geometry, material), bones = Array.from({length: count}, () => new T.Bone());
+  for (const bone of bones.slice(1)) bones[0].add(bone);
+  object.add(bones[0]); object.bind(new T.Skeleton(bones));
+  if (padded) object.skeleton.computeBoneTexture();
+  bones[0].position.x = translation;
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld);
+  object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+  return {object, material};
+}
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const paddedFirst of [false, true])
+test((registered ? 'registered' : 'inherited') + ' ' + family + ' SkinnedMesh extensions share source construction with paddedFirst=' + paddedFirst, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.material === builder.context.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'SkinExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'SkinExtension');
+  const material = new (registered ? Application : Extension)(),
+    a = skinnedItem(f, T, material, {padded: paddedFirst, translation: 2}),
+    b = skinnedItem(f, T, material, {padded: !paddedFirst, translation: 11});
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'keys and setup use the source render-object boundaries');
+    equalInstanceShaders(descriptor, reference);
+    return {reference, descriptor};
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.equal(firstA.reference, firstB.reference, 'source builder sharing uses bone count, never skeleton identity or palette capacity');
+  assert.notEqual(firstA.descriptor, firstB.descriptor, 'shared construction retains distinct render-object binding wrappers');
+  assert.notEqual(a.object.skeleton.boneMatrices.byteLength, b.object.skeleton.boneMatrices.byteLength);
+  const capture = (item, descriptor) => {
+    f.referenceDraw(item, {fullLifecycle: true});
+    const packet = f.capture(item, descriptor);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    const sourceGroups = f.referenceObject(item).getBindings();
+    for (const group of descriptor.groups) for (const member of group.uniforms) {
+      const binding = sourceGroups[group.index].bindings[member.binding];
+      if (binding.isNodeUniformBuffer) assert.equal(member.byteLength, binding.byteLength,
+        'each palette allocation preserves its full source capacity');
+    }
+    assert.equal(item.object.geometry.attributes.skinIndex.array.constructor, Uint16Array,
+      'shader construction and queued capture leave public integer skin indices unchanged');
+    return packet;
+  };
+  const acceptedA = capture(a, firstA.descriptor), acceptedB = capture(b, firstB.descriptor),
+    savedA = acceptedA.uniforms.map(bytes => bytes.slice()), savedB = acceptedB.uniforms.map(bytes => bytes.slice());
+  assert.ok(values(acceptedA).includes(2)); assert.ok(values(acceptedB).includes(11));
+  material.applicationGain = .875;
+  a.object.skeleton.bones[0].position.x = 7; b.object.skeleton.bones[0].position.x = 19;
+  f.scene.updateMatrixWorld(); f.renderer.info.calls++;
+  assert.equal(compare(b).descriptor, firstB.descriptor);
+  assert.equal(compare(a).descriptor, firstA.descriptor);
+  const changedB = capture(b, firstB.descriptor), changedA = capture(a, firstA.descriptor);
+  assert.ok(values(changedB).includes(19)); assert.ok(values(changedA).includes(7));
+  assert.ok(values(changedA).includes(.875)); assert.ok(values(changedB).includes(.875));
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+  const replacement = new T.Skeleton(a.object.skeleton.bones);
+  if (paddedFirst) replacement.computeBoneTexture();
+  a.object.skeleton = replacement; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor, 'compatible skeleton replacement retains the source builder and object descriptor');
+  capture(a, firstA.descriptor);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor);
+  assert.equal(compare(b).descriptor, firstB.descriptor);
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyedA = compare(a), keyedB = compare(b);
+  assert.notEqual(keyedA.descriptor, firstA.descriptor); assert.notEqual(keyedB.descriptor, firstB.descriptor);
+  assert.equal(keyedA.reference, keyedB.reference); assert.notEqual(keyedA.reference, firstA.reference);
+  capture(a, keyedA.descriptor); capture(b, keyedB.descriptor);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+  f.renderer.info.calls++;
+  const rebuiltA = compare(a), rebuiltB = compare(b);
+  assert.notEqual(rebuiltA.reference, keyedA.reference); assert.equal(rebuiltA.reference, rebuiltB.reference);
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+});
+
+test('SkinnedMesh extensions keep source once-per-frame skeleton updates and Uint32 indices', t => {
+  const T = SourceThree, f = fixture(t, {}, T), events = [];
+  class Extension extends T.MeshStandardNodeMaterial {}
+  const material = new Extension(), a = skinnedItem(f, T, material, {IndexArray: Uint32Array}),
+    b = skinnedItem(f, T, material, {IndexArray: Uint32Array}), skeleton = a.object.skeleton;
+  b.object.skeleton = skeleton;
+  const update = skeleton.update;
+  skeleton.update = function () { events.push(f.renderer.info.calls); return update.call(this); };
+  const first = f.compile(a), second = f.compile(b);
+  assert.deepEqual(events, [], 'compilation does not evaluate skeleton updates');
+  for (const item of [a, b, a]) f.capture(item, item === a ? first : second);
+  assert.deepEqual(events, [1], 'separate owners of the same skeleton update it once in a frame');
+  f.renderer.info.calls++; skeleton.bones[0].position.x = 13; f.scene.updateMatrixWorld();
+  for (const item of [b, a]) f.capture(item, item === a ? first : second);
+  assert.deepEqual(events, [1, 2]);
+  assert.equal(a.object.geometry.attributes.skinIndex.array.constructor, Uint32Array);
+  assert.equal(b.object.geometry.attributes.skinIndex.array.constructor, Uint32Array);
+});
+
+test('SkinnedMesh extensions reject malformed skeletons, unsupported attributes and layout changes before callbacks', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = skinnedItem(f, T, new Extension()), skeleton = item.object.skeleton,
+    palette = skeleton.boneMatrices, index = item.object.geometry.attributes.skinIndex;
+  skeleton.boneMatrices = new Float32Array(16);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
+  skeleton.boneMatrices = palette;
+  item.object.geometry.attributes.skinIndex = new T.Uint8BufferAttribute(index.array, 4);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  item.object.geometry.attributes.skinIndex = index;
+  item.object.geometry.setAttribute('unrelatedInteger', new T.Uint16BufferAttribute([1, 2, 3, 4], 1));
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  item.object.geometry.deleteAttribute('unrelatedInteger');
+  class CustomSkin extends T.SkinnedMesh {}
+  Object.setPrototypeOf(item.object, CustomSkin.prototype);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  Object.setPrototypeOf(item.object, T.SkinnedMesh.prototype);
+  const descriptor = f.compile(item), accepted = f.capture(item, descriptor), saved = accepted.uniforms.map(bytes => bytes.slice()),
+    acceptedEffects = effects;
+  skeleton.computeBoneTexture();
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(effects, acceptedEffects, 'growing an existing source allocation remains an explicit layout boundary');
+  assert.deepEqual(accepted.uniforms, saved);
+});
+
+for (const registered of [false, true])
+test((registered ? 'registered' : 'inherited') + ' SkinnedMesh extensions share source large-skeleton texture construction with live owners', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T.MeshPhysicalNodeMaterial {
+    setupOutput(builder, output) {
+      trace.push('setup'); return super.setupOutput(builder, N.vec4(output.rgb.mul(.75), output.a));
+    }
+  }
+  class Application extends T.MeshPhysicalMaterial { constructor() { super(); this.type = 'TextureSkinExtension'; } }
+  if (registered) f.renderer.library.addMaterial(Extension, 'TextureSkinExtension');
+  const material = new (registered ? Application : Extension)(),
+    a = skinnedItem(f, T, material, {count: 1025, translation: 3}),
+    b = skinnedItem(f, T, material, {count: 1025, translation: 17});
+  const sourceA = f.reference(a), expectedA = trace.splice(0), first = f.compile(a);
+  assert.deepEqual(trace.splice(0), expectedA); equalInstanceShaders(first, sourceA);
+  const sourceB = f.reference(b), expectedB = trace.splice(0), second = f.compile(b);
+  assert.deepEqual(trace.splice(0), expectedB); equalInstanceShaders(second, sourceB);
+  assert.equal(sourceA, sourceB); assert.match(first.vertex, /textureLoad/);
+  const capture = (item, descriptor) => {
+    f.referenceDraw(item, {fullLifecycle: true});
+    const expected = item.object.skeleton.boneTexture, packet = f.capture(item, descriptor);
+    assert.equal(packet.textures.filter(binding => binding.isSampledTexture).length, 1);
+    assert.equal(packet.textures.find(binding => binding.isSampledTexture).texture, expected);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return packet;
+  };
+  const acceptedA = capture(a, first), acceptedB = capture(b, second);
+  assert.notEqual(acceptedA.textures[0].texture, acceptedB.textures[0].texture);
+  a.object.skeleton = new T.Skeleton(a.object.skeleton.bones); f.renderer.info.calls++;
+  assert.equal(f.compile(a), first); const next = capture(a, first);
+  assert.notEqual(next.textures[0].texture, acceptedA.textures[0].texture);
+  assert.equal(f.compile(b), second); capture(b, second);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+
+test('SkinnedMesh extensions preserve authored reference overrides and their source update order', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [], extraPalette = new Float32Array(32);
+  new T.Matrix4().makeScale(.625, .75, .875).toArray(extraPalette);
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      const reference = N.referenceBuffer('skeleton.boneMatrices', 'mat4', 2);
+      reference.getValueFromReference = () => { trace.push('authored-read'); return extraPalette; };
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(reference.element(0).element(0).x), output.a));
+    }
+  }
+  const material = new Extension(), a = skinnedItem(f, T, material, {padded: true}),
+    b = skinnedItem(f, T, material);
+  const compare = item => {
+    const source = f.reference(item), expectedConstruction = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expectedConstruction, 'local palette sizing never calls authored reference methods');
+    equalInstanceShaders(descriptor, source);
+    f.referenceDraw(item, {fullLifecycle: true}); const expectedUpdates = trace.splice(0);
+    const packet = f.capture(item, descriptor);
+    assert.deepEqual(trace.splice(0), expectedUpdates, 'authored reads run only at the same source update boundaries');
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return descriptor;
+  };
+  const first = compare(a), second = compare(b); f.renderer.info.calls++;
+  assert.equal(compare(a), first); assert.equal(compare(b), second);
+});
+
+test('SkinnedMesh extensions reject callback mutations of actual palette layout after source reference updates', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T); let updates = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      const gain = N.uniform(.75).onObjectUpdate(() => {
+        updates++;
+        const reference = [...builder.nodes].find(node => node.property === 'skeleton.boneMatrices');
+        reference.node.value = new Float32Array(reference.node.value.length + 16);
+        return .75;
+      });
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(gain), output.a));
+    }
+  }
+  const item = skinnedItem(f, T, new Extension()), palette = item.object.skeleton.boneMatrices,
+    descriptor = f.compile(item);
+  assert.equal(updates, 0);
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(updates, 1); assert.equal(item.object.skeleton.boneMatrices, palette,
+    'the rejected node mutation does not replace or resize the public skeleton palette');
+});
+
+
+test('SkinnedMesh extensions retain explicit authored shared-palette allocation boundaries', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T),
+    sharedGroup = N.sharedUniformGroup('applicationPalette');
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      const reference = N.referenceBuffer('skeleton.boneMatrices', 'mat4', 2).setGroup(sharedGroup);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(reference.element(0).element(0).x), output.a));
+    }
+  }
+  const material = new Extension(), a = skinnedItem(f, T, material), b = skinnedItem(f, T, material, {padded: true}),
+    first = f.compile(a), accepted = f.capture(a, first), saved = accepted.uniforms.map(bytes => bytes.slice()),
+    second = f.compile(b);
+  const sharedLayout = descriptor => descriptor.groups.find(group => group.name === 'applicationPalette');
+  assert.equal(sharedLayout(first).uniforms[0].byteLength, a.object.skeleton.boneMatrices.byteLength);
+  assert.equal(sharedLayout(second).uniforms[0].byteLength, sharedLayout(first).uniforms[0].byteLength,
+    'an authored shared binding retains its source allocation instead of acquiring another object capacity');
+  assert.throws(() => f.capture(b, second), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.deepEqual(accepted.uniforms, saved);
+});

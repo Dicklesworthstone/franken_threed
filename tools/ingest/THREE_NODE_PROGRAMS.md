@@ -34,8 +34,9 @@ Custom subclasses of supported node-material families and ordinary materials
 registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
-profile covers ordinary meshes and CPU-backed `InstancedMesh` objects with opaque
-or transparent, single-output materials and float geometry attributes,
+profile covers ordinary meshes, CPU-backed `InstancedMesh` and `SkinnedMesh`
+objects without morph targets, with opaque or transparent, single-output
+materials and float geometry attributes (plus Uint16/Uint32 skin indices),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
@@ -52,9 +53,23 @@ including zero-count requests. Source upload versions and partial ranges still
 govern generated streams, and source invalidation/disposal governs reconstruction.
 Inherited and registered Basic, Standard and Physical materials, including
 transparent `DoubleSide` construction, have focused source-builder and public
-renderer regressions. Storage-backed custom instances, custom mesh subclasses,
-instanced geometries and custom skinned/morph materials remain outside this
-extension slice; their ordinary built-in paths keep their existing support.
+renderer regressions.
+
+Custom skinned materials retain source builder sharing by bone count. Each mesh
+sizes its own uniform palette binding, including when a second equal-count
+skeleton has a different initial array capacity after `computeBoneTexture()`.
+This does not mutate the shared reference node or run application updates during
+construction. Bind matrices and compatible skeleton replacements remain live,
+and accepted animation palettes and material uniforms remain immutable while
+queued. Uint16/Uint32 joint indices use the existing native attribute owner
+without rewriting the source attribute. Skeleton updates retain the source's
+once-per-frame behavior. Skeletons above the device uniform limit use the pinned
+bone-texture path, with captured texture generations for pending draws.
+Material invalidation and disposal retain source construction lifetimes.
+
+Storage-backed custom instances, custom mesh subclasses, instanced geometries
+and custom morph materials remain outside this extension slice; their ordinary
+built-in paths keep their existing support.
 
 Admission uses the nearest pinned material-family defaults without running a
 custom conversion constructor. The actual source builder performs conversion

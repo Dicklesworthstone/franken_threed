@@ -461,7 +461,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (bytes > (renderer._device?.limits?.maxUniformBufferBindingSize ?? 65536) || bytes > maxUniformBytes)
       fail('LIMIT', 'Native managed uniform array exceeds its binding or draw byte budget');
   }
-  function inspectUniformBuffer(node) {
+  function inspectUniformBuffer(node, array = node.value) {
     // BufferNode emits the caller's array layout verbatim. Unlike UniformArrayNode,
     // it inserts no per-element padding: scalar/vec2 arrays therefore do not have
     // a legal uniform-address-space stride in the pinned WGSL output.
@@ -471,7 +471,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const matrix = Number(type?.[3] ?? 0), stride = matrix === 3 ? 12 : matrix ? matrix * matrix : 4;
     const tail = matrix === 3 ? 11 : type?.[2] === '3' || node.nodeType === 'color' ? 3 : stride;
     const Scalar = type?.[1] === 'i' ? Int32Array : type?.[1] === 'u' ? Uint32Array : Float32Array;
-    const array = node.value, required = (node.bufferCount - 1) * stride + tail;
+    const required = (node.bufferCount - 1) * stride + tail;
     if (!type || !nativeUniformBuffer(node) || !(array instanceof Scalar) ||
         !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
         !Number.isSafeInteger(node.bufferCount) || node.bufferCount < 1 ||
@@ -487,9 +487,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('LIMIT', 'Native uniform array exceeds its binding or draw byte budget');
     return bytes;
   }
-  function uniformSignature(nodes, builder) {
+  function uniformSignature(nodes, builder, object = null, skinUniforms = null) {
     return JSON.stringify(nodes.map(node => {
-      const bytes = inspectUniformBuffer(node), group = node.groupNode;
+      const bytes = inspectUniformBuffer(node, skinUniforms?.has(node) ? object.skeleton.boneMatrices : node.value), group = node.groupNode;
       // Source uniforms share by their node hash, never by typed-array identity.
       // Values and same-layout replacements remain live NodeUniformBuffer inputs.
       return [node.getUniformHash(builder), node.nodeType, node.bufferType, node.bufferCount, bytes,
@@ -1547,6 +1547,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // r186 keys InstancedMesh builders by object UUID: their instance nodes
     // close over that object's matrix/color attributes. Reuse the existing
     // CPU instance owner, without sharing those bindings across mesh identities.
+    const skinExtension = extension && Object.getPrototypeOf(object) === three.SkinnedMesh.prototype;
     const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype &&
       object.instanceMatrix?.isStorageInstancedBufferAttribute !== true &&
       object.instanceColor?.isStorageInstancedBufferAttribute !== true;
@@ -1560,7 +1561,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
-        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension || object.geometry.isInstancedBufferGeometry ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || !extension && object.receiveShadow ||
         !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
@@ -1568,7 +1569,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
         !extension && [...MATERIAL_MAPS].some(name => prepared[name] != null) ||
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
-        Object.values(object.geometry.attributes).some(attribute => attribute.array?.constructor !== Float32Array ||
+        Object.entries(object.geometry.attributes).some(([name, attribute]) =>
+          attribute.array?.constructor !== Float32Array && !(skinExtension && name === 'skinIndex' &&
+            [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) ||
           attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute ||
           attribute.isStorageBufferAttribute && !geometrySetup) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
@@ -1858,7 +1861,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     if (!previous?.sharedBuilder && previous?.key === reuseKey && pmremSignature(previous.pmremNodes) === previous.pmremSignature &&
         textureSignature(previous.textureNodes, previous.textureReferences, filtering) === previous.textureSignature &&
         storageSignature(previous.storageNodes) === previous.storageSignature &&
-        uniformSignature(previous.uniformNodes, previous.builder) === previous.uniformSignature &&
+        uniformSignature(previous.uniformNodes, previous.builder, object, previous.skinUniforms) === previous.uniformSignature &&
         attributeSignature(previous.attributeNodes, object) === previous.attributeSignature) {
       updateThreeNodeClipping(previous.builder.clippingContext, context);
       if (version !== preparedMaterial.version) {
@@ -1953,6 +1956,23 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       environmentVersions.set(node.value, node.value.pmremVersion);
     const pmremKey = pmremSignature(pmremNodes);
     if (builder.nodes.size > maxNodes) fail('LIMIT', 'Generated native node graph exceeds its node budget');
+    // Source builder states share their reference nodes, but each render object
+    // allocates its own uniform buffers after the object references update.
+    // Size a new skin palette from this object without retargeting shared nodes
+    // or running callbacks early; equal bone counts may have different capacity.
+    const skinUniforms = new Set();
+    if (sharedBuilder && skinSignature) for (const node of builder.nodes) {
+      if (Object.getPrototypeOf(node) === three.ReferenceNode.prototype &&
+          node.property === 'skeleton.boneMatrices' && node.object === null &&
+          node.uniformType === 'mat4' && node.count === object.skeleton.bones.length &&
+          node.group === null && node.updateType === three.NodeUpdateType.OBJECT &&
+          node.node?.groupNode === three.TSL.objectGroup && node.node.groupNode.shared !== true &&
+          node.properties.length === 2 && node.properties[0] === 'skeleton' && node.properties[1] === 'boneMatrices' &&
+          ['updateReference', 'getValueFromReference', 'updateValue', 'update'].every(name =>
+            node[name] === three.ReferenceNode.prototype[name]) &&
+          Object.getPrototypeOf(node.node) === three.BufferNode.prototype)
+        skinUniforms.add(node.node);
+    }
     const bindings = sharedBuilder ? cloneThreeNodeBuilderBindings(builder) : builder.getBindings();
     const boundTextures = new Set(bindings.flatMap(group => group.bindings)
       .filter(binding => binding.textureNode?.isTextureNode).map(binding => binding.textureNode.value));
@@ -1992,7 +2012,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const entries = group.bindings.map((binding, slot) => {
         const base = {binding: slot, visibility: binding.visibility};
         if (binding.isNodeUniformsGroup === true || binding.isNodeUniformBuffer === true) {
-          const size = binding.isNodeUniformBuffer ? inspectUniformBuffer(binding.nodeUniform) : binding.byteLength;
+          const size = binding.isNodeUniformBuffer ? inspectUniformBuffer(binding.nodeUniform,
+            skinUniforms.has(binding.nodeUniform) ? object.skeleton.boneMatrices : binding.nodeUniform.value) : binding.byteLength;
           if (binding.isNodeUniformsGroup && binding.uniforms.some(u => !TYPES.has(u.nodeUniform?.type)))
             fail('UNIFORM', 'Native node uniforms must be ordinary scalars, vectors or matrices');
           if (!Number.isSafeInteger(size) || size < 4 || size % 4 ||
@@ -2110,7 +2131,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureFiltering.set(texture, texture.minFilter === three.NearestFilter && texture.magFilter === three.NearestFilter);
     const storageNodes = [...graphNodes].filter(node => node.isStorageBufferNode);
     const storageKey = storageSignature(storageNodes);
-    const uniformNodes = [...graphNodes].filter(nativeUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder);
+    const uniformNodes = [...graphNodes].filter(nativeUniformBuffer), uniformKey = uniformSignature(uniformNodes, builder, object, skinUniforms);
     const attributeNodes = [...graphNodes].filter(node => node instanceof three.BufferAttributeNode && node.attribute);
     const attributeKey = attributeSignature(attributeNodes, object);
     // Instance.js caches derived color/interleaved attributes by the original
@@ -2143,7 +2164,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       textureNodes, textureReferences, textureFiltering, materialVersion: material.version,
       materialSide: preparedMaterial.side, sidePass: context.sidePass === true,
       textureSignature: signature, materialMapSignature: materialMapSignature(material),
-      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
+      storageNodes, storageSignature: storageKey, uniformNodes, skinUniforms, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey, geometry: object.geometry, generated: generated.length > 0,
       attributeOwner: descriptor, namedAttributes: sharedBuilder?.geometrySetup ? named : null,
       sourceGeometry: previousState?.sourceGeometry ?? object.geometry,
@@ -2156,7 +2177,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);
     const entry = {key, passId, descriptor, builder, sharedBuilder, material, object, geometry: object.geometry, shaders, pmremNodes, pmremSignature: pmremKey,
       textureNodes, textureReferences, textureSignature: signature,
-      storageNodes, storageSignature: storageKey, uniformNodes, uniformSignature: uniformKey,
+      storageNodes, storageSignature: storageKey, uniformNodes, skinUniforms, uniformSignature: uniformKey,
       attributeNodes, attributeSignature: attributeKey};
     entry.onDispose = () => retire(entry);
     if (sharedBuilder?.geometrySetup) {
@@ -2425,8 +2446,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
     return Object.freeze(storage);
   }
-  function checkUniformBuffers(state) {
-    if (uniformSignature(state.uniformNodes, state.builder) !== state.uniformSignature)
+  function checkUniformBuffers(state, updated = false) {
+    if (uniformSignature(state.uniformNodes, state.builder, state.object, updated ? null : state.skinUniforms) !== state.uniformSignature)
       fail('CHANGED', 'Native uniform array layout, group or binding aliases changed; compile the graph again');
   }
   function checkAttributes(state, context = null) {
@@ -2671,7 +2692,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       assertMorphs(object, state.morphSignature);
       checkLights(state);
       checkPMREM(state);
-      checkUniformBuffers(state);
+      checkUniformBuffers(state, true);
       checkAttributes(state, context);
       checkPipelineContext(state, object);
       checkFog(state, context);
