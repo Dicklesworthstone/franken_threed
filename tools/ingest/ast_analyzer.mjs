@@ -68,7 +68,7 @@ function toSourceSpan(node, offsets = {}) {
  * - ConditionalExpression (both branches finite string expressions)
  *
  * Strictly rejects:
- * - Unresolved Identifiers, CallExpressions, MemberExpressions, TaggedTemplateExpressions
+ * - Unproved references, CallExpressions, TaggedTemplateExpressions
  * - Non-string Literals (numbers, booleans, null, regex)
  * - Binary operators other than '+'
  * - Expressions whose Cartesian expansion exceeds limit
@@ -77,9 +77,9 @@ function toSourceSpan(node, offsets = {}) {
  * @param {number} [limit=128] - Maximum number of candidates before aborting to nonliteral
  * @returns {string[] | null}
  */
-function extractFiniteStringCandidates(node, limit = 128, resolveIdentifier = null, depth = 0) {
+function extractFiniteStringCandidates(node, limit = 128, resolveReference = null, depth = 0) {
   if (!node || depth > 64) return null;
-  const expand = child => extractFiniteStringCandidates(child, limit, resolveIdentifier, depth + 1);
+  const expand = child => extractFiniteStringCandidates(child, limit, resolveReference, depth + 1);
 
   switch (node.type) {
     case "Literal": {
@@ -90,7 +90,8 @@ function extractFiniteStringCandidates(node, limit = 128, resolveIdentifier = nu
     }
 
     case "Identifier":
-      return resolveIdentifier?.(node) ?? null;
+    case "MemberExpression":
+      return resolveReference?.(node) ?? null;
 
     case "TemplateLiteral": {
       if (node.expressions.length === 0) {
@@ -171,7 +172,7 @@ function extractFiniteStringCandidates(node, limit = 128, resolveIdentifier = nu
  * @param {any} sourceNode
  * @returns {{ classification: 'literal' | 'finite_set' | 'nonliteral', specifier: string | null, specifiers?: string[], finite_set?: string[], finiteSet?: string[], candidates?: string[] }}
  */
-export function classifyDynamicImportArgument(sourceNode, resolveIdentifier = null) {
+export function classifyDynamicImportArgument(sourceNode, resolveReference = null) {
   if (!sourceNode) {
     return { classification: "nonliteral", specifier: null };
   }
@@ -191,7 +192,7 @@ export function classifyDynamicImportArgument(sourceNode, resolveIdentifier = nu
   }
 
   // Complex finite expressions (binary '+', template interpolation, conditionals)
-  const candidates = extractFiniteStringCandidates(sourceNode, 128, resolveIdentifier);
+  const candidates = extractFiniteStringCandidates(sourceNode, 128, resolveReference);
   if (candidates && candidates.length > 0) {
     return {
       classification: "finite_set",
@@ -206,16 +207,17 @@ export function classifyDynamicImportArgument(sourceNode, resolveIdentifier = nu
   return { classification: "nonliteral", specifier: null };
 }
 
-/** Resolve only immutable lexical string bindings, without evaluating their
- * initializers or rewriting reads. All other declarations still shadow outer
- * constants. Runtime selection, TDZ failures and initializer effects stay in
- * the source; this proves a set of possible import URLs, not a constant value.
+/** Resolve immutable lexical strings and private own-data lookup tables without
+ * evaluating initializers or rewriting reads. All other declarations still
+ * shadow outer constants. Runtime selection, TDZ failures and initializer
+ * effects stay in the source; this proves possible URLs, not a constant value.
  */
 export function createDynamicImportClassifier(ast) {
   // Sloppy scripts can introduce bindings with direct eval/with. Their existing
   // literal-only path remains conservative; ES modules are always strict.
   if (ast.sourceType === "script") return node => classifyDynamicImportArgument(node);
-  const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap();
+  const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap(), selections = new WeakMap();
+  const parents = new WeakMap(), nodes = [];
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
     "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
@@ -226,10 +228,12 @@ export function createDynamicImportClassifier(ast) {
     for (const name of names) bindings.set(name, bindings.has(name) ? null : initializer);
   };
   walk.fullAncestor(ast, (node, _state, ancestors) => {
-    const parents = ancestors.slice(0, -1);
-    const containing = predicate => parents.findLast(predicate);
+    const chain = ancestors.slice(0, -1);
+    nodes.push(node);
+    parents.set(node, chain.at(-1));
+    const containing = predicate => chain.findLast(predicate);
     if (node.type === "Identifier") {
-      enclosing.set(node, parents.filter((parent, index) =>
+      enclosing.set(node, chain.filter((parent, index) =>
         (lexical.has(parent.type) || classes.has(parent.type)) &&
         // A switch's case bindings are not in scope in its discriminant.
         !(parent.type === "SwitchStatement" && ancestors[index + 1] === parent.discriminant)));
@@ -247,6 +251,14 @@ export function createDynamicImportClassifier(ast) {
       }
     } else if (node.type === "ImportDeclaration") {
       put(ast, node.specifiers.map(specifier => specifier.local.name));
+    } else if (node.type === "ExportNamedDeclaration" && !node.source) {
+      // Acorn-walk does not visit export specifier identifiers as expressions.
+      // They still expose a local table to arbitrary module consumers.
+      for (const specifier of node.specifiers) {
+        nodes.push(specifier.local);
+        enclosing.set(specifier.local, [ast]);
+        parents.set(specifier.local, node);
+      }
     } else if (functions.has(node.type)) {
       for (const parameter of node.params) put(node, collectPatternIdentifiers(parameter));
       if (node.id) {
@@ -260,27 +272,149 @@ export function createDynamicImportClassifier(ast) {
       if (node.type === "ClassDeclaration") put(containing(parent => lexical.has(parent.type)), [node.id.name]);
     }
   });
-  let depth = 0;
-  const resolveIdentifier = node => {
+  const initializerOf = node => {
     const chain = enclosing.get(node) ?? [];
     for (let index = chain.length - 1; index >= 0; index--) {
       const bindings = scopes.get(chain[index]);
-      if (!bindings?.has(node.name)) continue;
-      const initializer = bindings.get(node.name);
-      if (!initializer || depth >= 64) return null;
-      if (values.has(initializer)) return values.get(initializer);
-      // A pending value breaks alias cycles; memoization also bounds repeated
-      // aliases whose source expression would otherwise expand exponentially.
-      values.set(initializer, null);
-      depth++;
-      const result = extractFiniteStringCandidates(initializer, 128, resolveIdentifier);
-      depth--;
-      values.set(initializer, result);
-      return result;
+      if (bindings?.has(node.name)) return bindings.get(node.name);
     }
     return null;
   };
-  return node => classifyDynamicImportArgument(node, resolveIdentifier);
+  const selectRecord = privateStringRecordSelections(nodes, parents, initializerOf);
+  let depth = 0;
+  const resolveReference = node => {
+    const sources = node.type === "Identifier" ? [initializerOf(node)] : selectRecord(node);
+    if (!sources || sources.some(source => !source) || depth >= 64) return null;
+    // Reuse the initializer cache for scalar aliases; each selected member has
+    // its own result because another key may name a different field.
+    const key = node.type === "Identifier" ? sources[0] : node;
+    const cache = node.type === "Identifier" ? values : selections;
+    if (cache.has(key)) return cache.get(key);
+    cache.set(key, null);
+    depth++;
+    const result = new Set();
+    for (const source of sources) {
+      const candidates = extractFiniteStringCandidates(source, 128, resolveReference);
+      if (!candidates) { depth--; return null; }
+      for (const candidate of candidates) result.add(candidate);
+      if (result.size > 128) { depth--; return null; }
+    }
+    depth--;
+    const candidates = [...result];
+    cache.set(key, candidates);
+    return candidates;
+  };
+  return node => classifyDynamicImportArgument(node, resolveReference);
+}
+
+/** A const binding alone does not freeze its object. Admit a lookup only after
+ * every alias is proved private and every use reads an existing own data field.
+ * Unknown keys may call prototype getters with the table as receiver; calls,
+ * writes, exports, destructuring and reflection may expose or mutate it.
+ * Keep those cases on the ordinary runtime path. No application code is run.
+ */
+function privateStringRecordSelections(nodes, parents, initializerOf) {
+  const records = new WeakMap(), aliases = new WeakMap(), aliasDepths = new WeakMap();
+  const keys = new WeakMap(), strings = new WeakMap();
+  // Direct eval can mutate a private record without a syntactic reference.
+  if (nodes.some(node => node.type === "CallExpression" && node.callee.type === "Identifier" &&
+      node.callee.name === "eval")) return () => null;
+  for (const node of nodes) {
+    if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" ||
+        parents.get(node)?.kind !== "const") continue;
+    const source = node.init, fields = new Map();
+    if (source?.type === "ObjectExpression" && source.properties.length <= 128) {
+      let plain = true;
+      for (const property of source.properties) {
+        const key = property.key;
+        const name = !property.computed && key?.type === "Identifier" ? key.name :
+          key?.type === "Literal" && ["string", "number"].includes(typeof key.value) ? String(key.value) : null;
+        if (property.type !== "Property" || property.kind !== "init" || property.method ||
+            name === null || name === "__proto__") { plain = false; break; }
+        fields.set(name, property.value);
+      }
+      if (plain) records.set(source, {fields, closed: true});
+    } else if (source?.type === "ArrayExpression" && source.elements.length <= 128 &&
+        source.elements.every(element => element && element.type !== "SpreadElement")) {
+      source.elements.forEach((value, index) => fields.set(String(index), value));
+      records.set(source, {fields, closed: true});
+    }
+  }
+  const recordOf = (node, depth = 0) => {
+    if (node?.type !== "Identifier" || depth >= 64) return null;
+    const source = initializerOf(node);
+    if (!source) return null;
+    if (aliases.has(source))
+      return depth + (aliasDepths.get(source) ?? 64) < 64 ? aliases.get(source) : null;
+    aliases.set(source, null);
+    const record = records.get(source) ?? recordOf(source, depth + 1);
+    const hops = records.has(source) ? 0 : 1 + (aliasDepths.get(initializerOf(source)) ?? 64);
+    aliases.set(source, record);
+    aliasDepths.set(source, hops);
+    return depth + hops < 64 ? record : null;
+  };
+  const stringKeys = (node, depth = 0) => {
+    if (!node || depth >= 64) return null;
+    if (strings.has(node)) return strings.get(node);
+    strings.set(node, null);
+    const result = extractFiniteStringCandidates(node, 128, reference => reference.type === "Identifier"
+      ? stringKeys(initializerOf(reference), depth + 1) : null);
+    strings.set(node, result);
+    return result;
+  };
+  const propertyKeys = (node, depth = 0) => {
+    if (!node || depth >= 64) return null;
+    if (keys.has(node)) return keys.get(node);
+    keys.set(node, null);
+    let result;
+    if (node.type === "Literal" && ["string", "number"].includes(typeof node.value)) result = [String(node.value)];
+    else if (node.type === "Identifier") result = propertyKeys(initializerOf(node), depth + 1);
+    else if (node.type === "ConditionalExpression") {
+      const left = propertyKeys(node.consequent, depth + 1), right = propertyKeys(node.alternate, depth + 1);
+      if (left && right) result = [...new Set([...left, ...right])];
+    } else if (node.type === "SequenceExpression") result = propertyKeys(node.expressions.at(-1), depth + 1);
+    // Numeric keys are legal, but never pass numeric aliases to the string '+'
+    // evaluator: 1 + 1 selects key "2", not the concatenation "11".
+    else result = stringKeys(node);
+    if (!result || result.length > 128) return null;
+    keys.set(node, result);
+    return result;
+  };
+  const selectedKeys = member => !member.computed && member.property.type === "Identifier"
+    ? [member.property.name] : propertyKeys(member.property);
+  const isWrite = node => {
+    for (let parent = parents.get(node); parent; node = parent, parent = parents.get(node)) {
+      if (parent.type === "AssignmentExpression" || parent.type === "ForInStatement" || parent.type === "ForOfStatement")
+        return parent.left === node;
+      if (parent.type === "UpdateExpression" || parent.type === "UnaryExpression" && parent.operator === "delete") return true;
+      if (parent.type === "Property" && parents.get(parent)?.type === "ObjectPattern" && parent.value === node ||
+          ["ObjectPattern", "ArrayPattern", "RestElement"].includes(parent.type) ||
+          parent.type === "AssignmentPattern" && parent.left === node) continue;
+      return false;
+    }
+    return false;
+  };
+  for (const node of nodes) {
+    const record = recordOf(node);
+    if (!record) continue;
+    const parent = parents.get(node);
+    if (parent?.type === "VariableDeclarator" && parents.get(parent)?.kind === "const" &&
+        (parent.id === node || parent.init === node && recordOf(parent.id) === record)) {
+      if (parents.get(parents.get(parent))?.type !== "ExportNamedDeclaration") continue;
+    }
+    if (parent?.type === "MemberExpression" && parent.object === node && !parent.optional && !isWrite(parent)) {
+      const use = parents.get(parent), selected = selectedKeys(parent);
+      const receiver = (use?.type === "CallExpression" || use?.type === "NewExpression") && use.callee === parent ||
+        use?.type === "TaggedTemplateExpression" && use.tag === parent;
+      if (!receiver && selected?.length && selected.every(key => record.fields.has(key))) continue;
+    }
+    record.closed = false;
+  }
+  return member => {
+    const record = recordOf(member.object), selected = selectedKeys(member);
+    return record?.closed && !member.optional && selected?.length && selected.every(key => record.fields.has(key))
+      ? selected.map(key => record.fields.get(key)) : null;
+  };
 }
 
 /** The native module goal, without evaluating import options. Sequence prefixes
