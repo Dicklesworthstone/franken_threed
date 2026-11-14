@@ -191,7 +191,7 @@ BOM handling, duplicate keys, signed zero and own `__proto__` properties through
 relocated builds and standalone packing. JSON never runs through the JavaScript
 frontend or an application-replaced `JSON.parse`.
 
-Dynamic require selection, synchronous requires of ESM/live external
+Unbounded require selection, synchronous requires of ESM/live external
 modules, and CommonJS URL query/hash variants produce explicit build errors.
 Malformed required JSON also remains a build error: eagerly linking invalid
 JSON would change a conditional or caught synchronous require failure. Ordinary
@@ -209,6 +209,24 @@ the new instance. Self-requires still reach the stable module entry. Exceptions
 retain their original values, including primitive throws, and failed ancestors
 also retry. This behavior is covered in relocated builds and packed output, with
 the original source and build trees unavailable.
+
+Finite `require()` selections can use conditional strings, immutable local
+aliases, templates, concatenation and private constant lookup tables. The build
+presents each possible target to the pinned CommonJS compiler as a lazy literal
+require. The original operand still executes once in its original scope;
+selectors, `this`, `arguments`, nested requires, errors, `await` and `yield`
+keep their source boundaries. Unselected modules do not initialize. Selected
+modules retain shared exports, cyclic partial state, JSON identity and retry
+after a failed initializer. Source maps retain the original source and operand
+positions; the already-locked `magic-string` build dependency is pinned directly
+for this normalization.
+
+This proof does not admit mutable or escaping lookup tables, unknown selectors,
+dynamic scope, require rebinding/escape, or CommonJS wrapper/module introspection.
+Shadowed application functions named `require` remain untouched. Every finite
+candidate must satisfy the existing static-require contract: missing targets,
+malformed JSON and synchronous ESM requirements still fail before output is
+written. The normalization does not introduce a runtime Node resolver.
 
 This is a browser-bundler route, not a complete Node loader. Node module/cache
 introspection and native host APIs need the existing frontend or native Node

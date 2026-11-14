@@ -6,7 +6,8 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import {parse} from 'acorn';
 import * as walk from 'acorn-walk';
 import commonjs from '@rollup/plugin-commonjs';
-import {isIdentifierShadowedAtAncestors} from './ast_analyzer.mjs';
+import MagicString from 'magic-string';
+import {createDynamicImportClassifier, isIdentifierShadowedAtAncestors} from './ast_analyzer.mjs';
 
 const ENTRY = '\0f3d-commonjs-entry:';
 const JSON_ENTRY = '\0f3d-commonjs-json:';
@@ -76,6 +77,64 @@ export function commonjsEntry(url, sources) {
 export function assertUnbundledModule(url, sources, sourceType = 'module') {
   if (isCommonJS(url, sources, {sourceType}))
     throw commonjsError('UNBUNDLED', 'CommonJS needs the application bundler; retained modules and worker sources must already be browser JavaScript', url);
+}
+
+/** Present a finite require as literal lazy calls to the maintained compiler.
+ * The source operand stays at its original call site: selectors, this,
+ * arguments, TDZ failures and nested requires execute exactly once there.
+ * Helpers never import or initialize a selected module by themselves.
+ */
+function finiteCommonjsRequires(code, id) {
+  const ast = parse(code, {ecmaVersion: 'latest', sourceType: 'module', allowReturnOutsideFunction: true});
+  const sites = [], names = new Set(), scopeCache = new WeakMap();
+  let opaque = false;
+  walk.fullAncestor(ast, (node, _state, ancestors) => {
+    const parent = ancestors.at(-2);
+    if (node.type === 'Identifier') names.add(node.name);
+    if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'eval')
+      opaque = true;
+    // The shared classifier models lexical module scope. Sloppy CommonJS
+    // Annex B block functions can introduce additional function-scope vars.
+    if (node.type === 'FunctionDeclaration' && parent?.type !== 'Program' &&
+        !(parent?.type === 'BlockStatement' && /^(?:Function|ArrowFunction)/.test(ancestors.at(-3)?.type ?? '') &&
+          ancestors.at(-3).body === parent)) opaque = true;
+    // The source CommonJS wrapper's mapped arguments and module.require can
+    // replace its require without a direct assignment to that identifier.
+    if (node.type === 'Identifier' && node.name === 'arguments' &&
+        !ancestors.slice(0, -1).some(value => ['FunctionDeclaration', 'FunctionExpression'].includes(value.type)))
+      opaque = true;
+    if (node.type === 'Identifier' && node.name === 'module' &&
+        !isIdentifierShadowedAtAncestors('module', ancestors, scopeCache) &&
+        !(parent?.type === 'MemberExpression' && parent.object === node &&
+          (parent.computed ? parent.property.value : parent.property.name) === 'exports')) opaque = true;
+    if (node.type !== 'Identifier' || node.name !== 'require' ||
+        isIdentifierShadowedAtAncestors('require', ancestors, scopeCache)) return;
+    // Do not postpone a mutable/escaped callee lookup until after the operand.
+    // A copied require, require.cache/resolve, assignment, or reflection keeps
+    // the existing compiler boundary instead of receiving a partial rewrite.
+    if (parent?.type !== 'CallExpression' || parent.callee !== node || parent.optional ||
+        parent.arguments.length !== 1 || parent.arguments[0].type === 'SpreadElement') opaque = true;
+    else if (!(parent.arguments[0].type === 'Literal' && typeof parent.arguments[0].value === 'string')) sites.push(parent);
+  });
+  if (opaque || !sites.length) return null;
+  const classify = createDynamicImportClassifier(ast), edits = new MagicString(code), helpers = [];
+  for (const site of sites) {
+    const selected = classify(site.arguments[0]);
+    const candidates = selected.classification === 'literal' ? [selected.specifier] : selected.candidates;
+    if (!candidates?.length) continue;
+    let helper = '__f3dFiniteRequire' + helpers.length;
+    while (names.has(helper)) helper += '_';
+    names.add(helper);
+    // A switch uses only primitive string equality, without prototype lookups,
+    // coercion, or eager evaluation of unselected module initializers.
+    helpers.push(`\nfunction ${helper}(value) {\nswitch (value) {\n` +
+      candidates.map(value => `case ${JSON.stringify(value)}: return require(${JSON.stringify(value)});\n`).join('') +
+      '}\nthrow new TypeError("Unproved CommonJS require selection");\n}\n');
+    edits.overwrite(site.callee.start, site.callee.end, helper);
+  }
+  if (!helpers.length) return null;
+  edits.append(helpers.join(''));
+  return {code: edits.toString(), map: edits.generateMap({hires: true, source: id, includeContent: true})};
 }
 
 /** Keep the pinned compiler's initializer, but give each failed attempt its own
@@ -185,7 +244,13 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
     }
     return retryableCommonjs(result, id, ast);
   };
-  return [compiler, {
+  return [{
+    name: 'f3d-commonjs-finite-requires',
+    transform(code, id) {
+      if (!id.startsWith('file:') || !isCommonJS(id, moduleSources)) return null;
+      return finiteCommonjsRequires(code, id);
+    },
+  }, compiler, {
     name: 'f3d-commonjs-boundary',
     resolveId(source, importer, options) {
       if (originalEntry(source) || source.startsWith(JSON_ENTRY)) return source;

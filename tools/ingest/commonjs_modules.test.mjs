@@ -92,6 +92,113 @@ test('CommonJS packages keep nested requires, cycles, lazy effects and singleton
   assert.deepEqual(fs.readFileSync((await value.module()).asset), Buffer.from([9, 2, 6, 5]));
 });
 
+const finiteRequireFiles = () => ({
+  'index.html': '<script type="module" src="./entry.mjs"></script>',
+  'entry.mjs': `import app from './library.cjs'; import config from './config.json' with {type:'json'};
+    export {app, config}; export const later = () => import('./later.mjs');`,
+  'later.mjs': `export {default} from './library.cjs';`,
+  'library.cjs': `const state = require('./state.cjs');
+    const names = {left:'./a', right:'./b'}, alias = names, suffix = '.cjs';
+    module.exports = {
+      state, label:'source receiver',
+      load(flag) { return require(\`\${alias[flag ? 'left' : 'right']}\${suffix}\`); },
+      scalar(flag) { const path = flag ? './a.cjs' : './b.cjs', copy = path; return require(copy); },
+      select(flag) { return require((state.events.push([this.label, arguments[1]]), flag ? './a.cjs' : './b.cjs')); },
+      nested(flag) { return require((require(flag ? './branch-a.cjs' : './branch-b.cjs'), './a.cjs')); },
+      json(flag) { return require(flag ? './config' : './config.json'); },
+      retry(flag) { return require(flag ? './retry.cjs' : './a.cjs'); },
+      tdz() { return load(); const path = './a.cjs'; function load() { return require(path); } },
+      throwing(flag) { return require((state.events.push('selector throw'), (() => { throw state.failure; })(), flag ? './a.cjs' : './b.cjs')); },
+      shadowed(require, flag) { return require(flag ? './a.cjs' : './b.cjs'); },
+      async waiting(pending, flag) { return require((await pending, flag ? './a.cjs' : './b.cjs')); },
+      *paused(flag) { return require((state.events.push('pause'), yield 'resume', flag ? './a.cjs' : './b.cjs')); }
+    };`,
+  'state.cjs': `module.exports = {events:[], attempts:0, failure:{reason:'source failure'}};`,
+  'a.cjs': `const state = require('./state.cjs'); state.events.push('a');
+    exports.name = 'a'; exports.cycle = require('./cycle.cjs'); exports.ready = true;`,
+  'cycle.cjs': `const path = './a.cjs'; const a = require(path);
+    module.exports = {a, partial:a.name, readyAtLoad:a.ready};`,
+  'b.cjs': `require('./state.cjs').events.push('b'); module.exports = {name:'b'};`,
+  'branch-a.cjs': `require('./state.cjs').events.push('branch a');`,
+  'branch-b.cjs': `require('./state.cjs').events.push('branch b');`,
+  'retry.cjs': `const state = require('./state.cjs'); exports.attempt = ++state.attempts;
+    if (state.attempts === 1) throw state.failure;`,
+  'config.json': '{"count":0,"zero":-0,"__proto__":{"own":true}}',
+});
+
+async function exerciseFiniteRequires(app, config) {
+  const {state} = app;
+  assert.deepEqual(state.events, [], 'unselected modules have no initialization effects');
+  assert.throws(app.tdz, ReferenceError);
+  assert.deepEqual(state.events, [], 'TDZ precedes module initialization');
+  const a = app.load(true);
+  assert.equal(a.cycle.a, a);
+  assert.equal(a.cycle.partial, 'a');
+  assert.equal(a.cycle.readyAtLoad, undefined, 'cycles see the partial exports');
+  assert.equal(a.ready, true);
+  assert.deepEqual(state.events, ['a']);
+  assert.equal(app.scalar(true), a);
+  const b = app.select(false, 42);
+  assert.equal(b, app.load(false));
+  assert.equal(b, app.scalar(false));
+  assert.deepEqual(state.events, ['a', ['source receiver', 42], 'b']);
+  assert.equal(app.nested(false), a);
+  assert.equal(app.nested(true), a);
+  assert.deepEqual(state.events, ['a', ['source receiver', 42], 'b', 'branch b', 'branch a']);
+  assert.equal(app.json(false), config);
+  assert.equal(app.json(true), config);
+  config.count++;
+  assert.equal(app.json(false).count, 1);
+  assert.equal(Object.is(config.zero, -0), true);
+  assert.equal(Object.hasOwn(config, '__proto__'), true);
+  assert.throws(() => app.retry(true), error => error === state.failure);
+  const retried = app.retry(true);
+  assert.equal(retried.attempt, 2);
+  assert.equal(app.retry(true), retried);
+  assert.equal(state.attempts, 2);
+  assert.throws(() => app.throwing(true), error => error === state.failure);
+  assert.equal(state.events.at(-1), 'selector throw');
+  assert.equal(app.shadowed(value => value, false), './b.cjs');
+  assert.equal(await app.waiting(Promise.resolve(), false), b);
+  const generator = app.paused(true);
+  assert.deepEqual(generator.next(), {value:'resume', done:false});
+  assert.equal(state.events.at(-1), 'pause');
+  assert.deepEqual(generator.next(), {value:a, done:true});
+}
+
+test('finite CommonJS require choices preserve native selectors, lazy cycles, JSON and retry semantics after relocation', async () => {
+  const root = fixture(finiteRequireFiles()), require = nodeModule.createRequire(import.meta.url);
+  await exerciseFiniteRequires(require(path.join(root, 'library.cjs')), require(path.join(root, 'config.json')));
+  const built = await buildApplication(path.join(root, 'entry.mjs'), path.join(root, 'dist'));
+  const moved = fs.mkdtempSync(path.join(os.tmpdir(), 'f3d-finite-commonjs-deployed-'));
+  fs.renameSync(path.join(root, 'dist'), path.join(moved, 'app'));
+  fs.renameSync(root, root + '-source-unavailable');
+  const result = await import(pathToFileURL(path.join(moved, 'app', built.entryFiles[0])).href);
+  await exerciseFiniteRequires(result.app, result.config);
+  assert.equal((await result.later()).default, result.app);
+});
+
+test('finite CommonJS require choices execute in packed output without source or build files', {
+  skip: typeof nodeModule.registerHooks !== 'function',
+}, async () => {
+  const root = fixture(finiteRequireFiles());
+  const built = await buildApplication(path.join(root, 'index.html'), path.join(root, 'dist'));
+  const packed = path.join(root, 'standalone.html');
+  packHtml(path.join(built.outDir, built.htmlFile), packed);
+  const html = fs.readFileSync(packed, 'utf8');
+  const imports = JSON.parse(/<script type="importmap">([\s\S]*?)<\/script>/.exec(html)[1]).imports;
+  const entry = /<script[^>]*type="module"[^>]*src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(root, root + '-source-unavailable');
+  const hook = nodeModule.registerHooks({resolve(specifier, context, next) {
+    return next(imports[specifier] ?? specifier, context);
+  }});
+  try {
+    const result = await import(entry);
+    await exerciseFiniteRequires(result.app, result.config);
+    assert.equal((await result.later()).default, result.app);
+  } finally { hook.deregister(); }
+});
+
 const retryFiles = () => ({
   'main.cjs': `const state = require('./state.cjs');
     module.exports = {state, load: () => require('./parent.cjs'), observer: () => require('./observer.cjs'),
@@ -275,6 +382,33 @@ test('direct CommonJS entries and side-effect-only packages produce executable E
   const built = await buildApplication(path.join(root, 'entry.cjs'), path.join(root, 'dist'));
   const result = await import(pathToFileURL(path.join(root, 'dist', built.entryFiles[0])).href);
   assert.deepEqual(result.default, {answer: 42, side: {}});
+});
+
+test('finite require normalization keeps original source maps at the selected operand', async () => {
+  const operand = "enabled ? './left.cjs' : './right.cjs'";
+  const source = `const label = 'source';\nmodule.exports = enabled => require((${operand}));`;
+  const root = fixture({'main.cjs':source, 'left.cjs':'module.exports = 1;', 'right.cjs':'module.exports = 2;'});
+  const entry = pathToFileURL(path.join(root, 'main.cjs')).href;
+  const moduleSources = createModuleSources();
+  const bundle = await rollup({input:entry, plugins:[
+    ...commonjsPlugins({moduleSources, resolveModule:(specifier, from, request) =>
+      resolveModuleSpecifier(specifier, from, {}, {_moduleSources:moduleSources, ...request})}),
+    f3dRollupPlugin({_moduleSources:moduleSources, commonJS:true, mapBaseUrl:entry}),
+  ]});
+  try {
+    const {output} = await bundle.generate({format:'es', sourcemap:true});
+    const chunk = output.find(value => value.type === 'chunk'), map = chunk.map;
+    const sourceIndex = map.sourcesContent.indexOf(source);
+    assert.ok(sourceIndex >= 0, 'map contains original, not normalized, source');
+    const at = chunk.code.indexOf(operand);
+    assert.ok(at >= 0);
+    const before = chunk.code.slice(0, at), original = source.slice(0, source.indexOf(operand));
+    const mapped = new nodeModule.SourceMap(map).findEntry(before.split('\n').length - 1,
+      at - before.lastIndexOf('\n') - 1);
+    assert.equal(mapped.originalSource, map.sources[sourceIndex]);
+    assert.equal(mapped.originalLine, original.split('\n').length - 1);
+    assert.equal(mapped.originalColumn, original.length - original.lastIndexOf('\n') - 1);
+  } finally { await bundle.close(); }
 });
 
 test('CommonJS JSON dependencies share native ESM identity and exact values after relocation', async () => {
@@ -528,6 +662,46 @@ test('unsupported CommonJS require and retained-module boundaries fail before pu
     await assert.rejects(buildApplication(path.join(root, files['index.html'] ? 'index.html' : 'main.mjs'), out), error =>
       (error.pluginCode ?? error.code) === `F3D_COMMONJS_${expected}`, name);
     assert.equal(fs.existsSync(out), false, name);
+  }
+});
+
+test('finite require admission does not hide mutable selectors, dynamic scope or exposed require ownership', async () => {
+  for (const [name, source] of [
+    ['mutable selector', `let target = './left.cjs'; module.exports = () => require(target);`],
+    ['parameter shadow', `const target = './left.cjs'; module.exports = target => require(target);`],
+    ['record escape', `const paths = {left:'./left.cjs'}; exports.paths = paths; exports.load = () => require(paths.left);`],
+    ['record mutation', `const paths = {left:'./left.cjs'}; paths.left = './right.cjs'; module.exports = () => require(paths.left);`],
+    ['record accessor', `const paths = {get left(){return './left.cjs'}}; module.exports = () => require(paths.left);`],
+    ['direct eval', `const target = './left.cjs'; module.exports = () => {eval("var target = './right.cjs'"); return require(target);};`],
+    ['Annex B scope', `const target = './left.cjs'; module.exports = () => {if (true) {function target(){}} return require(target);};`],
+    ['callee rebinding', `module.exports = flag => require((require = () => 7, flag ? './left.cjs' : './right.cjs'));`],
+    ['callee escape', `const copy = require; module.exports = flag => require(flag ? './left.cjs' : './right.cjs');`],
+    ['module require mutation', `module.require = () => 7; module.exports = flag => require(flag ? './left.cjs' : './right.cjs');`],
+    ['wrapper arguments', `const frame = arguments; module.exports = flag => require((frame[1] = () => 7, flag ? './left.cjs' : './right.cjs'));`],
+    ['nonstring alternative', `module.exports = flag => require(flag ? './left.cjs' : null);`],
+    ['extra operand', `module.exports = flag => require(flag ? './left.cjs' : './right.cjs', sideEffect());`],
+    ['optional call', `module.exports = flag => require?.(flag ? './left.cjs' : './right.cjs');`],
+  ]) {
+    const root = fixture({'main.cjs':source, 'left.cjs':'module.exports = 1;', 'right.cjs':'module.exports = 2;'});
+    const output = path.join(root, 'dist');
+    await assert.rejects(buildApplication(path.join(root, 'main.cjs'), output), error =>
+      (error.pluginCode ?? error.code) === 'F3D_COMMONJS_DYNAMIC_REQUIRE', name);
+    assert.equal(fs.existsSync(output), false, name);
+  }
+});
+
+test('every finite require candidate keeps the existing synchronous target boundaries', async () => {
+  for (const [target, extra, code] of [
+    ['./invalid.json', {'invalid.json':'{"value":'}, 'F3D_COMMONJS_JSON_REQUIRE'],
+    ['./module.mjs', {'module.mjs':'export const answer = 42;'}, 'F3D_COMMONJS_ESM_REQUIRE'],
+    ['./missing.cjs', {}, null],
+  ]) {
+    const root = fixture({'main.cjs':`module.exports = flag => require(flag ? './valid.cjs' : ${JSON.stringify(target)});`,
+      'valid.cjs':'module.exports = 42;', ...extra});
+    const output = path.join(root, 'dist');
+    await assert.rejects(buildApplication(path.join(root, 'main.cjs'), output), error =>
+      code === null || (error.pluginCode ?? error.code) === code, target);
+    assert.equal(fs.existsSync(output), false, target);
   }
 });
 
