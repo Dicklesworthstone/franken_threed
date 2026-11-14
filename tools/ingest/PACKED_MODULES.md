@@ -566,6 +566,27 @@ image host checks resource bytes and ownership, not browser image-decoder parity
 
 ## Single-file addon assets
 
+Finite `GaussianSplatPLYLoader`, `SPLATLoader`, `SPZLoader` and `KSPLATLoader`
+model URLs use the same source-owned resource closure. Named and namespace
+imports, constructor aliases, finite URL choices and `setPath()` preserve their
+original semantics. The original model bytes are copied into networked output
+and embedded by standalone preparation; decoding stays in the pinned loaders.
+SPZ's gzip and asynchronous Zstd/Wasm decoder paths remain reachable through the
+ordinary module graph, without a new runtime resource host or parser.
+
+A new splat regression compares original source execution, relocated networked
+output and packed output after source/build directories become unavailable. It
+covers positions, covariance, normalized colors, packed spherical harmonics,
+bounds, independent loaded geometry, pending path changes, progress/callback
+ordering, runtime parsing and malformed-input errors. Custom managers, escaped
+loaders and unproved URL paths retain their existing host route.
+
+Validation on 2026-11-14 reproduced the missing resources in the discovery test.
+The complete package execution regression did not finish: its test worker exited
+during the run and the execution host became unavailable. That execution check
+still needs a completed run; no browser/GPU or Gaussian-splat rendering coverage
+is claimed by this resource-discovery change.
+
 Finite document-relative loads through the pinned `HDRLoader`, `RGBELoader`,
 `EXRLoader`, `FontLoader`, `STLLoader`, `PLYLoader`, `OBJLoader`, `PCDLoader`,
 `VTKLoader`, `XYZLoader`, `BVHLoader`, `GCodeLoader`, `PDBLoader`, `DDSLoader`,

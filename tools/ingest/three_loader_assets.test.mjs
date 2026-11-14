@@ -196,6 +196,38 @@ test("volume and LUT discovery preserves custom managers, escaped loaders and op
   assert.deepEqual(requests, []);
 });
 
+test("Gaussian splat loaders retain finite models, source identities and decoding calls", () => {
+  const requests = discover(`import { GaussianSplatPLYLoader as PLY, SPLATLoader, SPZLoader, KSPLATLoader } from ${JSON.stringify(rootUrl + 'examples/jsm/Addons.js')};
+    import * as Splat from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/SPLATLoader.js')};
+    const paths={models:'models/',alternate:'other/'}, models={preview:'preview.ply',full:'full.ply'};
+    const Loader=PLY, ply=new Loader().setPath(paths.models);
+    ply.loadAsync(models[preview?'preview':'full']); ply.parse(runtimePLY);
+    new Splat.SPLATLoader().setPath('binary/').load('cloud%20%23.splat?version=2#points');
+    const spz=new SPZLoader(); spz.setPath('compressed/');
+    spz.loadAsync(modern?'model.v4.spz':'model.v3.spz'); spz.parse(runtimeBytes,onLoad,onError);
+    const ksplat=new KSPLATLoader().setPath(paths.alternate);
+    ksplat.parse(runtimeKSplat); ksplat.load('cloud.ksplat');
+    new SPLATLoader().loadAsync('direct.splat');`);
+  assert.deepEqual(requests.map(({url})=>url), ['models/preview.ply','models/full.ply',
+    'binary/cloud%20%23.splat?version=2#points','compressed/model.v4.spz','compressed/model.v3.spz',
+    'other/cloud.ksplat','direct.splat']);
+});
+
+test("Gaussian splat discovery keeps custom managers, escaped loaders and mutable paths source-owned", () => {
+  for (const name of ['GaussianSplatPLYLoader','SPLATLoader','SPZLoader','KSPLATLoader']) {
+    const imported=`import {${name} as Loader} from ${JSON.stringify(rootUrl + 'examples/jsm/loaders/' + name + '.js')};`;
+    for (const operation of [
+      "new Loader(manager).load('managed');",
+      "const loader=new Loader();customize(loader);loader.load('escaped');",
+      "const loader=new Loader();loader.parse=custom;loader.load('changed');",
+      "const loader=new Loader();loader.setPath(runtimePath).load('dynamic');",
+      "const paths={entry:'first'};paths.entry='second';new Loader().load(paths.entry);",
+      "function run(Loader){new Loader().load('shadowed');}",
+    ]) assert.deepEqual(discover(imported+operation),[],name+': '+operation);
+    assert.deepEqual(discover(`import {${name}} from 'file:///foreign/${name}.js';new ${name}().load('foreign');`),[]);
+  }
+});
+
 test("H8's original UltraHDR environment request enters the application resource closure", () => {
   const html = fs.readFileSync(new URL("examples/webgpu_compute_particles_fluid.html", rootUrl), "utf8");
   const source = /<script type="module">([\s\S]*?)<\/script>/.exec(html)[1];
