@@ -315,7 +315,33 @@ function createResidency(device, geometry, {
     if (disposed) fail('DISPOSED', 'Geometry adapter is disposed');
     if (terminal) throw terminal;
   }
-  function native(fn) { try { return fn(); } catch (error) { throw stop(error); } }
+  function native(fn) {
+    // Public attribute getters, range hooks and onUpload callbacks may issue
+    // unrelated work on this same device. Scope only our native operation so
+    // those effects cannot be captured as a geometry failure. Close every
+    // installed scope before returning to source code, even on setup failure.
+    let result, caught, failed = false, scopes = 0;
+    const reports = [];
+    try {
+      device.pushErrorScope('validation'); scopes++;
+      device.pushErrorScope('out-of-memory'); scopes++;
+      result = fn();
+    } catch (error) { caught = error; failed = true; }
+    finally {
+      while (scopes > 0) {
+        scopes--;
+        try { reports.push(Promise.resolve(device.popErrorScope())); }
+        catch (error) { reports.push(Promise.reject(error)); }
+      }
+    }
+    const errors = Promise.all(reports).then(values => {
+      const error = values.find(Boolean);
+      if (error) throw new BufferGeometryGpuError('GEOMETRY_GPU_DEVICE', error.message || 'GPU upload failed');
+    }).catch(error => { throw stop(error); });
+    pending = Promise.all([pending, errors]).then(() => {}); pending.catch(() => {});
+    if (failed) throw stop(caught);
+    return result;
+  }
   function write(record, array, start, end) {
     if (record.divisor > 1) {
       if (start === end) return;
@@ -358,7 +384,6 @@ function createResidency(device, geometry, {
     live(); if (busy) fail('REENTRANT', 'Cannot update geometry from an upload callback');
     integer(maxAdditionalBytes, 0, maxBytes, 'additional allocation budget');
     busy = true;
-    let scoped = false;
     try {
       const shape = describeSource(geometry, device);
       sourceRange(geometry, shape.indexOwner ? shape.indexCount : shape.vertexCount);
@@ -403,7 +428,6 @@ function createResidency(device, geometry, {
       if (sourceAttributeCallbacks && instanceHistory)
         instanceHistory.prepareRaw(shape.owners.values());
       if (addedBytes > maxAdditionalBytes || allocatedBytes + addedBytes > maxBytes || records.size + addedCount > maxAttributes) fail('LIMIT', 'Geometry residency budget exceeded');
-      native(() => { device.pushErrorScope('validation'); device.pushErrorScope('out-of-memory'); }); scoped = true;
       for (const entry of shape.owners.values()) {
         const {owner, borrowed} = entry, array = owner.array;
         if (borrowed) {
@@ -489,18 +513,7 @@ function createResidency(device, geometry, {
         ...(shape.instanceCapacity !== undefined ? {instanceCapacity: shape.instanceCapacity, instanced: shape.instanced} : {})});
       version++; stats.updates++;
       return handle;
-    } finally {
-      if (scoped) {
-        // Callback exceptions are not native errors. Pop both scopes without
-        // yielding and preserve the callback's partial-write/version history.
-        const errors = Promise.all([device.popErrorScope(), device.popErrorScope()]).then(values => {
-          const error = values.find(Boolean);
-          if (error) throw new BufferGeometryGpuError('GEOMETRY_GPU_DEVICE', error.message || 'GPU upload failed');
-        }).catch(error => { throw stop(error); });
-        pending = Promise.all([pending, errors]).then(() => {}); pending.catch(() => {});
-      }
-      busy = false;
-    }
+    } finally { busy = false; }
   }
   const onDispose = () => {
     if (busy) fail('REENTRANT', 'Cannot release geometry from an upload callback');

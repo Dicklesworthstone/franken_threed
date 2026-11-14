@@ -4,6 +4,7 @@ import {pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {createGpuBufferGeometry,bufferGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {createWebGLInstanceHistory} from './webgl_instance_history.mjs';
 const root = process.env.F3D_THREE_ROOT ?? path.resolve('upstream/three.js');
 const {BufferAttribute,BufferGeometry,InterleavedBuffer,InterleavedBufferAttribute,Float16BufferAttribute} = await import(pathToFileURL(path.join(root,'build/three.core.js')));
 const {WebGLAttributes} = await import(pathToFileURL(path.join(root,'src/renderers/webgl/WebGLAttributes.js')));
@@ -132,6 +133,49 @@ test('throwing update callback preserves writes, cleared ranges and unacknowledg
   for(const a of [g.attributes.position,o.attributes.position]){a.array[8]=88;a.onUpload(()=>{});}
   gpu.update();gl.update(o.attributes.position,0);same(gpu.vertexBuffer,gl.get(o.attributes.position).buffer);
   assert.equal(new Float32Array(gpu.vertexBuffer.data)[8],88);gpu.dispose();
+});
+
+for (const sharedHistory of [false, true])
+test(`source upload callbacks cannot leak their GPU errors into geometry scopes (shared history: ${sharedHistory})`,async()=>{
+  const d=geometryDevice(),g=geometry(),p=g.attributes.position;
+  const uncaptured=[],foreign={message:'unrelated source callback validation'};
+  d.pushErrorScope=filter=>d.scopes.push({filter,error:null});
+  d.popErrorScope=()=>Promise.resolve(d.scopes.pop().error);
+  const report=()=>{
+    const scope=d.scopes.findLast(scope=>scope.filter==='validation');
+    if(scope)scope.error??=foreign;else uncaptured.push(foreign);
+  };
+  const allocate=d.createBuffer;
+  d.createBuffer=descriptor=>{
+    // A real GPUDevice reports invalid source-owned API calls to the active
+    // validation scope or uncapturederror; neither belongs to this uploader.
+    if(descriptor.usage===0){report();return {destroy(){}};}
+    return allocate(descriptor);
+  };
+  const callback=()=>d.createBuffer({size:4,usage:0});
+  p.onUpload(callback);
+  const clear=p.clearUpdateRanges;
+  p.clearUpdateRanges=function(){callback();return clear.call(this);};
+  const history=sharedHistory?createWebGLInstanceHistory({geometry:true}):null;
+  const gpu=createGpuBufferGeometry(d,g,{instanceHistory:history});
+  await gpu.whenIdle();
+  p.array[0]=8;p.array[3]=9;p.addUpdateRange(3,1);p.needsUpdate=true;
+  gpu.update();await gpu.whenIdle();
+  assert.equal(gpu.failed,false);assert.equal(uncaptured.length,3);
+  assert.ok(uncaptured.every(error=>error===foreign));assert.deepEqual(d.scopes,[]);
+  assert.equal(new Float32Array(gpu.vertexBuffer.data)[0],0,'unrequested CPU edit remains stale');
+  assert.equal(new Float32Array(gpu.vertexBuffer.data)[3],9,'requested upload still commits before its callback');
+  gpu.dispose();history?.dispose();
+});
+
+test('a failed second error-scope push unwinds the first without issuing geometry work',()=>{
+  const d=geometryDevice(),failure=new Error('scope installation failed');
+  d.pushErrorScope=filter=>{
+    if(filter==='out-of-memory')throw failure;
+    d.scopes.push(filter);
+  };
+  assert.throws(()=>createGpuBufferGeometry(d,geometry()),error=>error===failure);
+  assert.deepEqual(d.scopes,[]);assert.equal(d.buffers.length,0);assert.equal(d.writes.length,0);
 });
 
 test('independent replicas consume public ranges with separate GPU histories',()=>{
