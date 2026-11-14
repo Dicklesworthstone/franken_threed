@@ -34,13 +34,27 @@ Custom subclasses of supported node-material families and ordinary materials
 registered with `renderer.library.addMaterial(NodeClass, materialType)` now
 select the native source-builder path without a dummy authored node slot.
 Replacing a built-in material mapping also selects that path. The extension
-profile covers rigid, opaque or transparent, single-output meshes with float attributes,
+profile covers ordinary meshes and CPU-backed `InstancedMesh` objects with opaque
+or transparent, single-output materials and float geometry attributes,
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
 Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
+
+Custom instance materials retain the pinned source's per-object builder key: two
+`InstancedMesh` objects sharing one material keep separate matrix and color
+bindings. Small matrix palettes use the existing uniform path; larger palettes
+use the existing generated attribute streams. Accepted draws preserve matrix,
+RGB, material-uniform and count snapshots while pipeline preparation is pending,
+including zero-count requests. Source upload versions and partial ranges still
+govern generated streams, and source invalidation/disposal governs reconstruction.
+Inherited and registered Basic, Standard and Physical materials, including
+transparent `DoubleSide` construction, have focused source-builder and public
+renderer regressions. Storage-backed custom instances, custom mesh subclasses,
+instanced geometries and custom skinned/morph materials remain outside this
+extension slice; their ordinary built-in paths keep their existing support.
 
 Admission uses the nearest pinned material-family defaults without running a
 custom conversion constructor. The actual source builder performs conversion

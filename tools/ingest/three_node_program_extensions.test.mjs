@@ -68,7 +68,7 @@ function fixture(t, options = {}, Three = T) {
       [renderer._handleObjectFunction, renderer._compilationPromises, renderer._currentRenderContext] = previous;
     }
   };
-  return {renderer, programs, source, scene, camera, lights, add, context, compile, capture, reference, referenceDraw, passes};
+  return {renderer, programs, source, scene, camera, lights, add, context, compile, capture, reference, referenceObject, referenceDraw, passes};
 }
 const values = packet => packet.uniforms.flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
 function equalShaders(descriptor, reference) {
@@ -531,4 +531,225 @@ test(`${registered ? 'registered' : 'inherited'} ${family} extensions retain sou
   f.scene.fog = null; f.renderer.info.calls++;
   const removed = phase('removed fog'); assert.doesNotMatch(removed.descriptor.fragment, /smoothstep/);
   assert.ok(removed.trace.some(event => Array.isArray(event) && event[0] === 'setup' && event[2] === false));
+});
+
+
+function instanceItem(f, T, material, count = 4, translation = 0) {
+  f.renderer.backend.capabilities = {getUniformBufferLimit: () => 256};
+  const item = f.add(material), geometry = item.object.geometry;
+  f.scene.remove(item.object);
+  const object = new T.InstancedMesh(geometry, material, count);
+  for (let index = 0; index < count; index++) {
+    object.setMatrixAt(index, new T.Matrix4().makeTranslation(translation + index, 0, 0));
+    object.setColorAt(index, new T.Color(.25, .5, .75));
+  }
+  object.instanceMatrix.needsUpdate = object.instanceColor.needsUpdate = true;
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld);
+  object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+  return {object, material};
+}
+function equalInstanceShaders(descriptor, reference) {
+  // BufferNode names include process-global creation IDs. The full shaders,
+  // including array capacity, binding slots and all operations, must agree.
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(descriptor.vertex), canonical(reference.vertexShader));
+  assert.equal(canonical(descriptor.fragment), canonical(reference.fragmentShader));
+}
+function equalInstanceUniforms(f, item, descriptor, packet) {
+  const groups = f.referenceObject(item).getBindings();
+  for (const layout of descriptor.groups) for (const member of layout.uniforms) {
+    const binding = groups[layout.index].bindings[member.binding];
+    binding.update();
+    const value = binding.buffer;
+    assert.deepEqual(packet.uniforms[layout.index].subarray(member.offset, member.offset + value.byteLength),
+      new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  }
+}
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const count of [4, 5])
+test((registered ? 'registered' : 'inherited') + ' ' + family + ' InstancedMesh extensions preserve source construction and ' +
+  (count === 4 ? 'uniform' : 'attribute') + ' matrix bindings', t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'InstanceExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstanceExtension');
+  const material = new (registered ? Application : Extension)(), a = instanceItem(f, T, material, count, 2),
+    b = instanceItem(f, T, material, count, 11);
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'keys and setup run at the source construction boundaries');
+    equalInstanceShaders(descriptor, reference);
+    return {reference, descriptor};
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.notEqual(firstA.reference, firstB.reference, 'the source UUID key gives each instance object its own builder');
+  assert.notEqual(firstA.descriptor, firstB.descriptor);
+  assert.equal(firstA.descriptor.instanceCapacity, count);
+  f.referenceDraw(a, {fullLifecycle: true});
+  const accepted = f.capture(a, firstA.descriptor), saved = accepted.uniforms.map(bytes => bytes.slice());
+  equalInstanceUniforms(f, a, firstA.descriptor, accepted);
+  accepted.attributes.install();
+  const geometry = f.programs.geometry(firstA.descriptor);
+  const color = firstA.descriptor.attributes.find(attribute => !a.object.geometry.attributes[attribute.name] && attribute.components === 3);
+  assert.ok(color);
+  assert.deepEqual([...geometry.attributes[color.name].array], Array.from({length: count}, () => [.25, .5, .75]).flat());
+  material.applicationGain = .875; a.object.instanceMatrix.array[12] = 7;
+  a.object.instanceMatrix.needsUpdate = true;
+  a.object.instanceColor.array[0] = .625; a.object.instanceColor.needsUpdate = true;
+  f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor);
+  f.referenceDraw(a, {fullLifecycle: true});
+  const changed = f.capture(a, firstA.descriptor);
+  equalInstanceUniforms(f, a, firstA.descriptor, changed); assert.ok(values(changed).includes(.875));
+  changed.attributes.install(); assert.equal(geometry.attributes[color.name].array[0], .625);
+  accepted.attributes.install(); assert.equal(geometry.attributes[color.name].array[0], .25);
+  assert.deepEqual(accepted.uniforms, saved, 'accepted uniforms and generated instance streams remain immutable');
+  f.referenceDraw(b, {fullLifecycle: true});
+  const other = f.capture(b, firstB.descriptor); equalInstanceUniforms(f, b, firstB.descriptor, other);
+  other.attributes.install();
+  assert.notEqual(f.programs.geometry(firstA.descriptor), f.programs.geometry(firstB.descriptor));
+  assert.equal(f.programs.geometry(firstB.descriptor).attributes[color.name].array[0], .25,
+    'the second object never borrows the first instance color stream');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor, 'version-only invalidation retains the source builder');
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const keyedA = compare(a), keyedB = compare(b);
+  assert.notEqual(keyedA.descriptor, firstA.descriptor); assert.notEqual(keyedB.descriptor, firstB.descriptor);
+  assert.notEqual(keyedA.reference, firstA.reference); assert.notEqual(keyedB.reference, firstB.reference);
+  a.object.dispose(); f.renderer.info.calls++;
+  assert.equal(f.programs.diagnostics.programs, 1);
+  const rebuiltA = compare(a); assert.notEqual(rebuiltA.descriptor, keyedA.descriptor);
+  assert.notEqual(rebuiltA.reference, keyedA.reference);
+  assert.equal(compare(b).descriptor, keyedB.descriptor, 'disposing one object retains the other builder');
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+test('InstancedMesh extension generated streams retain source upload history across versionless and partial CPU edits', t => {
+  const T = SourceThree, f = fixture(t, {}, T);
+  class Extension extends T.MeshBasicNodeMaterial {}
+  const item = instanceItem(f, T, new Extension(), 5), descriptor = f.compile(item),
+    generated = descriptor.attributes.filter(attribute => !item.object.geometry.attributes[attribute.name]),
+    geometry = f.programs.geometry(descriptor), column = generated.find(attribute => attribute.components === 4),
+    color = generated.find(attribute => attribute.components === 3);
+  const first = f.capture(item, descriptor); first.attributes.install();
+  const matrixHistory = geometry.attributes[column.name].data.array.slice(), colorHistory = geometry.attributes[color.name].array.slice();
+  item.object.instanceMatrix.array[12] = 9; item.object.instanceMatrix.array[28] = 19;
+  item.object.instanceColor.array[0] = .875; item.object.instanceColor.array[3] = .125;
+  f.renderer.info.calls++;
+  const stale = f.capture(item, descriptor); stale.attributes.install();
+  assert.deepEqual(geometry.attributes[column.name].data.array, matrixHistory);
+  assert.deepEqual(geometry.attributes[color.name].array, colorHistory);
+  item.object.instanceMatrix.addUpdateRange(12, 1); item.object.instanceMatrix.needsUpdate = true;
+  item.object.instanceColor.addUpdateRange(0, 1); item.object.instanceColor.needsUpdate = true;
+  f.renderer.info.calls++;
+  const partial = f.capture(item, descriptor); partial.attributes.install();
+  assert.equal(geometry.attributes[column.name].data.array[12], 9);
+  assert.equal(geometry.attributes[column.name].data.array[28], matrixHistory[28]);
+  assert.equal(geometry.attributes[color.name].array[0], .875);
+  assert.equal(geometry.attributes[color.name].array[3], colorHistory[3]);
+  first.attributes.install();
+  assert.deepEqual(geometry.attributes[column.name].data.array, matrixHistory);
+  assert.deepEqual(geometry.attributes[color.name].array, colorHistory);
+});
+
+test('InstancedMesh extensions keep storage, subclasses and stale CPU-array boundaries before shader callbacks', t => {
+  const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const material = new Extension(), item = instanceItem(f, T, material);
+  const original = item.object.instanceMatrix;
+  item.object.instanceMatrix = new T.StorageInstancedBufferAttribute(original.array, 16);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, 0);
+  item.object.instanceMatrix = original;
+  const prototype = Object.getPrototypeOf(item.object);
+  class CustomInstances extends T.InstancedMesh {}
+  Object.setPrototypeOf(item.object, CustomInstances.prototype);
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, 0);
+  Object.setPrototypeOf(item.object, prototype);
+  const descriptor = f.compile(item), acceptedEffects = effects;
+  original.array = original.array.slice();
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.throws(() => f.capture(item, descriptor), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(effects, acceptedEffects);
+});
+
+
+for (const registered of [false, true]) for (const precompile of [false, true])
+test((registered ? 'registered' : 'inherited') + ' InstancedMesh extensions preserve transparent side construction with precompile=' + precompile, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { trace.push(['key', this.side]); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push(['setup', this.side, builder.object]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(.75), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'TransparentInstanceExtension'; }
+    customProgramCacheKey() { trace.push(['key', this.side]); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'TransparentInstanceExtension');
+  const material = new (registered ? Application : Extension)();
+  material.transparent = true; material.side = T.DoubleSide; material.opacity = .375;
+  const item = instanceItem(f, T, material);
+  const phase = compilation => {
+    const reference = f.passes(item, (selected, options) => {
+      const state = f.reference(selected, options);
+      f.referenceDraw(selected, options);
+      const uniforms = f.referenceObject(selected, options).getBindings().map(group => group.bindings.map(binding => {
+        if (!binding.isUniformsGroup && !binding.isNodeUniformBuffer) return null;
+        binding.update();
+        const value = binding.buffer;
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+      }));
+      return {state, uniforms};
+    }, compilation), expected = trace.splice(0);
+    const candidate = f.passes(item, (selected, options) => {
+      const descriptor = f.compile(selected, options), context = f.context(selected, options);
+      f.programs.before(descriptor, context);
+      const packet = f.capture(selected, descriptor, {...options, beforeDone: true});
+      f.programs.after(descriptor, context);
+      return {descriptor, packet};
+    }, compilation);
+    assert.deepEqual(trace.splice(0), expected);
+    assert.equal(candidate.length, reference.length);
+    candidate.forEach(({descriptor, packet}, index) => {
+      equalInstanceShaders(descriptor, reference[index].state);
+      for (const layout of descriptor.groups) for (const member of layout.uniforms) {
+        const bytes = reference[index].uniforms[layout.index][member.binding];
+        assert.deepEqual(packet.uniforms[layout.index].subarray(member.offset, member.offset + bytes.byteLength), bytes);
+      }
+    });
+    assert.equal(material.side, T.DoubleSide);
+    return {reference, candidate, trace: expected};
+  };
+  const first = phase(precompile);
+  assert.equal(first.trace.filter(event => event[0] === 'setup').length, precompile ? 1 : 2);
+  assert.equal(first.reference[0].state === first.reference[1].state, precompile);
+  assert.notEqual(first.candidate[0].descriptor, first.candidate[1].descriptor, 'each side keeps independent instance binding wrappers');
+  material.opacity = .8125; item.object.instanceMatrix.array[12] = 7; item.object.instanceMatrix.needsUpdate = true;
+  f.renderer.info.calls++;
+  const warm = phase(false);
+  assert.equal(warm.trace.length, 0);
+  assert.equal(warm.candidate[0].descriptor, first.candidate[0].descriptor);
+  assert.equal(warm.candidate[1].descriptor, first.candidate[1].descriptor);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, precompile ? 2 : 0);
+  item.object.dispose(); f.renderer.info.calls++;
+  assert.equal(phase(false).trace.filter(event => event[0] === 'setup').length, 2);
 });

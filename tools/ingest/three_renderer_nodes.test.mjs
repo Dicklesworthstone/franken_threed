@@ -1801,3 +1801,83 @@ test('ordinary instances share earlier fixed geometry generations and source dis
   assert.deepEqual(nativeDraws(f.device).slice(-2).map(firstWord),[99,99]);
   assert.equal(f.renderer._nodeCaptureBytes,0);
 });
+
+const customInstanceDraws=device=>nativeDraws(device).filter(draw=>instanceStreams(draw).length>0);
+
+for(const registered of [false,true])
+test(`custom ${registered?'registered':'inherited'} InstancedMesh materials retain queued uniforms, colors and zero counts`,async t=>{
+  const f=fixture(t),setups=[],updates=[];
+  class Extension extends T.MeshBasicNodeMaterial {
+    constructor(){super();this.applicationGain=.375;}
+    setupOutput(builder,output){
+      setups.push(builder.object);
+      return super.setupOutput(builder,T.TSL.vec4(
+        output.rgb.mul(T.TSL.materialReference('applicationGain','float')),output.a));
+    }
+  }
+  if(registered)f.renderer.library.materialNodes.set('MeshBasicMaterial',Extension);
+  const material=registered?new T.MeshBasicMaterial():new Extension();
+  material.applicationGain=.375;f.material=material;
+  const {mesh,matrices,colors}=cpuInstances(f);
+  mesh.onBeforeRender=()=>updates.push(mesh.count);
+  await f.renderer.init();f.renderer.render(f.scene,f.camera);
+  matrices.array[12]=1.5;colors.array[0]=.875;colors.needsUpdate=true;
+  material.applicationGain=.625;mesh.count=2;
+  f.renderer._nodes.nodeFrame.update();f.renderer.render(f.scene,f.camera);
+  mesh.count=0;f.renderer.render(f.scene,f.camera);
+  material.applicationGain=99;mesh.count=99;matrices.array.fill(99);colors.array.fill(99);
+  await drain(f.renderer);
+  const draws=customInstanceDraws(f.device);
+  assert.deepEqual(draws.map(draw=>draw.args[1]),[3,2]);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===48)?.[12]),[0,1.5]);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw).map(stream=>stream.values[0])),[[.125],[.875]]);
+  assert.ok(uniformBlocks(draws[0]).flat().includes(.375));
+  assert.ok(uniformBlocks(draws[1]).flat().includes(.625));
+  assert.equal(draws[0].pipeline,draws[1].pipeline);
+  assert.deepEqual(setups,[mesh]);assert.deepEqual(updates,[3,2,0]);
+  assert.equal(mesh.material,material);assert.equal(matrices.version,0);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom InstancedMesh materials keep source instance owners separate when a material is shared',async t=>{
+  const f=fixture(t),setups=[];
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){setups.push(builder.object);return super.setupOutput(builder,output);}
+  }
+  f.material=new Extension();
+  const left=cpuInstances(f,2),right=cpuInstances(f,2);
+  left.mesh.renderOrder=-1;right.mesh.renderOrder=1;
+  left.matrices.array[12]=.25;right.matrices.array[12]=1.75;
+  left.colors.array[0]=.125;right.colors.array[0]=.875;
+  await f.renderer.compileAsync(f.scene,f.camera);
+  assert.equal(customInstanceDraws(f.device).length,0);
+  left.colors.array[0]=99;right.colors.array[0]=99;
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  let draws=customInstanceDraws(f.device);
+  assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===32&&words[15]===1&&words[31]===1)?.[12]),[.25,1.75]);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.875]);
+  assert.deepEqual(setups,[left.mesh,right.mesh]);
+  left.colors.array[0]=.625;left.colors.needsUpdate=true;
+  right.matrices.array[12]=2.25;right.matrices.needsUpdate=true;f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  draws=customInstanceDraws(f.device).slice(2);
+  assert.deepEqual(draws.map(draw=>uniformBlocks(draw).find(words=>words.length===32&&words[15]===1&&words[31]===1)?.[12]),[.25,2.25]);
+  assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.625,.875]);
+  assert.deepEqual(setups,[left.mesh,right.mesh]);
+  assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
+test('custom InstancedMesh material disposal rebuilds construction without exposing stale CPU colors',async t=>{
+  const f=fixture(t);let setups=0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder,output){setups++;return super.setupOutput(builder,output);}
+  }
+  f.material=new Extension();const {colors}=cpuInstances(f,2);
+  await f.renderer.compileAsync(f.scene,f.camera);f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  colors.array[0]=99;f.material.dispose();
+  f.renderer.render(f.scene,f.camera);await drain(f.renderer);
+  const draws=customInstanceDraws(f.device);
+  assert.equal(draws.length,2);assert.deepEqual(draws.map(draw=>instanceStreams(draw)[0].values[0]),[.125,.125]);
+  assert.equal(setups,2);assert.equal(f.renderer._nodeCaptureBytes,0);
+});

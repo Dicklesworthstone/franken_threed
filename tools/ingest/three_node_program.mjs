@@ -1310,7 +1310,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // shared rigid PBR profile has that complete source cache lifecycle.
     if ((extension || hasThreeCustomProgramCacheKey(three, sourceMaterial)) && !sharedConstruction(sourceMaterial, material,
       object, context, lights, inspectThreeLightingContext(three, renderer.contextNode), true))
-      fail('HOOK', 'Native material extensions and custom program keys require their shared rigid construction profile');
+      fail('HOOK', 'Native material extensions and custom program keys require their shared source construction profile');
     for (const key of Object.keys(material)) {
       const value = material[key];
       if (value?.isTexture) {
@@ -1544,6 +1544,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const lazyGeometry = !extension && lazyGeometrySetup(material);
     const geometrySetup = !extension && (retainGeometry || customGeometrySetup(material) || lazyGeometry);
     const prototype = materialPrototype(prepared);
+    // r186 keys InstancedMesh builders by object UUID: their instance nodes
+    // close over that object's matrix/color attributes. Reuse the existing
+    // CPU instance owner, without sharing those bindings across mesh identities.
+    const instanceExtension = extension && Object.getPrototypeOf(object) === three.InstancedMesh.prototype &&
+      object.instanceMatrix?.isStorageInstancedBufferAttribute !== true &&
+      object.instanceColor?.isStorageInstancedBufferAttribute !== true;
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
@@ -1554,7 +1560,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
         three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
-        Object.getPrototypeOf(object) !== three.Mesh.prototype || object.geometry.isInstancedBufferGeometry ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension || object.geometry.isInstancedBufferGeometry ||
         Object.keys(object.geometry.morphAttributes).length || !extension && object.receiveShadow ||
         !extension && prepared.transparent || prepared.wireframe || prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
@@ -1685,7 +1691,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
         inspectThreeLightingContext(three, renderer.contextNode), false, geometryProfile);
       if (!construction || construction.chain !== chain)
-        fail('HOOK', 'Custom native material construction must retain its shared rigid profile');
+        fail('HOOK', 'Custom native material construction must retain its shared source profile');
       return construction;
     };
     let construction = profile();
