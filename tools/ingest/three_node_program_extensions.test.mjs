@@ -899,8 +899,9 @@ test('SkinnedMesh extensions reject malformed skeletons, unsupported attributes 
 });
 
 
-function morphItem(f, T, material, {skinned = false, targets = null, relative = false, influences = [.125, .375]} = {}) {
-  const item = skinned ? skinnedItem(f, T, material) : f.add(material), geometry = item.object.geometry;
+function morphItem(f, T, material, {skinned = false, instances = null, targets = null, relative = false, influences = [.125, .375]} = {}) {
+  const item = skinned ? skinnedItem(f, T, material) : instances === null ? f.add(material)
+    : instanceItem(f, T, material, instances), geometry = item.object.geometry;
   if (targets) geometry.morphAttributes = targets;
   else {
     geometry.morphAttributes.position = [.5, 1.5].map(height => {
@@ -923,6 +924,75 @@ function morphItem(f, T, material, {skinned = false, targets = null, relative = 
 function morphTexture(packet) {
   return packet.textures.find(binding => binding.isSampledTexture && binding.texture.isDataArrayTexture)?.texture;
 }
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const perInstance of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} instance morph extensions retain source ${perInstance ? 'texture' : 'uniform'} weights and construction`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [], count = perInstance ? 5 : 4;
+  class Extension extends T[`Mesh${family}NodeMaterial`] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return `${super.customProgramCacheKey()}:${this.applicationVariant}`; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T[`Mesh${family}Material`] {
+    constructor() { super(); this.type = 'InstanceMorphExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return `${super.customProgramCacheKey()}:${this.applicationVariant}`; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstanceMorphExtension');
+  const material = new (registered ? Application : Extension)(),
+    a = morphItem(f, T, material, {instances: count, relative: perInstance}),
+    b = morphItem(f, T, material, {instances: count, targets: a.object.geometry.morphAttributes, relative: true});
+  const weights = (item, offset) => {
+    for (let index = 0; index < count; index++)
+      item.object.setMorphAt(index, {morphTargetInfluences: [.125 + offset + index * .125, .375 - offset]});
+    item.object.morphTexture.needsUpdate = true;
+  };
+  if (perInstance) {
+    weights(a, 0); weights(b, .25);
+    // Source InstancedMesh has no object-wide weights on its texture path.
+    a.object.morphTargetInfluences = b.object.morphTargetInfluences = undefined;
+  }
+  const compare = item => {
+    const source = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'source UUID and morph-target keys govern construction effects');
+    equalInstanceShaders(descriptor, source);
+    return {source, descriptor};
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.notEqual(firstA.source, firstB.source, 'each instance object owns its captured matrix/color and morph graph');
+  const capture = (item, descriptor) => {
+    const expected = f.referenceDraw(item, {fullLifecycle: true}), packet = f.capture(item, descriptor);
+    assert.deepEqual(sampled(packet), expected.textures);
+    equalInstanceUniforms(f, item, descriptor, packet);
+    assert.equal(sampled(packet).includes(item.object.morphTexture), perInstance);
+    return packet;
+  };
+  const accepted = capture(a, firstA.descriptor), other = capture(b, firstB.descriptor),
+    saved = accepted.uniforms.map(bytes => bytes.slice()), atlas = morphTexture(accepted), atlasBytes = atlas.image.data.slice();
+  assert.notEqual(atlas, morphTexture(other), 'distinct source geometry atlases never borrow another instance owner');
+  material.applicationGain = .875;
+  if (!perInstance) a.object.morphTargetInfluences = [.5, .25];
+  a.object.geometry.morphTargetsRelative = true;
+  a.object.instanceMatrix.array[12] = 9; a.object.instanceMatrix.needsUpdate = true;
+  a.object.instanceColor.array[0] = .625; a.object.instanceColor.needsUpdate = true;
+  if (perInstance) weights(a, .5);
+  f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor);
+  const changed = capture(a, firstA.descriptor);
+  assert.ok(values(changed).includes(.875)); assert.deepEqual(accepted.uniforms, saved);
+  assert.deepEqual(atlas.image.data, atlasBytes, 'weight updates retain the source geometry atlas');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor, 'version-only invalidation retains source construction');
+  a.object.geometry.morphAttributes.position[0] = a.object.geometry.morphAttributes.position[0].clone();
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const replaced = compare(a); assert.notEqual(replaced.source, firstA.source);
+  assert.notEqual(replaced.descriptor, firstA.descriptor); assert.equal(morphTexture(capture(a, replaced.descriptor)), atlas);
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  assert.notEqual(compare(a).descriptor, replaced.descriptor);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+});
 
 for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const skinned of [false, true])
 test((registered ? 'registered' : 'inherited') + ' ' + family + ' morph extensions share source targets with skinned=' + skinned, t => {
@@ -1050,7 +1120,7 @@ test('morph extensions use the source indexed target key without invoking applic
   assert.equal(effects, 0);
 });
 
-test('morph extensions reject malformed targets and keep instanced morph construction outside the profile', t => {
+test('morph extensions reject malformed targets and non-instance weight-texture owners before hooks', t => {
   const T = SourceThree, f = fixture(t, {}, T); let effects = 0;
   class Extension extends T.MeshBasicNodeMaterial {
     customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
@@ -1070,8 +1140,8 @@ test('morph extensions reject malformed targets and keep instanced morph constru
   item.object.count = 1; item.object.morphTexture = null;
   const instances = instanceItem(f, T, material);
   instances.object.geometry.morphAttributes = item.object.geometry.morphAttributes;
-  instances.object.morphTargetInfluences = influences.slice();
-  assert.throws(() => f.compile(instances), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  instances.object.morphTargetInfluences = [1];
+  assert.throws(() => f.compile(instances), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
   const descriptor = f.compile(item), accepted = f.capture(item, descriptor), saved = accepted.uniforms.map(bytes => bytes.slice()),
     acceptedEffects = effects;
   item.object.morphTargetInfluences = [1];

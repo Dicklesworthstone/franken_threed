@@ -79,9 +79,25 @@ Queued draws preserve accepted weights and uniforms. As with the existing
 sampled-texture owner, explicit atlas disposal invalidates queued sampled uses;
 complete pending work before geometry disposal dispatches that event.
 
-Storage-backed custom instances, custom mesh subclasses, instanced geometries,
-morphing on custom instance materials and per-instance morph textures remain
-outside this extension slice; their ordinary built-in paths keep their existing support.
+Custom instance materials also compose with position, normal and color morph
+targets through the existing instance and morph owners. Object-wide influence
+uniforms and source-valid per-instance weight textures retain the pinned
+construction rules. Each InstancedMesh keeps its UUID-scoped matrix/color
+bindings, morph-target identity keys and geometry-owned target atlas. Weight
+and material-uniform changes remain live while already captured uniform bytes
+stay unchanged; actual source-key changes reconstruct the graph.
+
+Twelve source-builder regressions cover inherited and registered Basic, Standard
+and Physical families with both weight representations. They compare generated
+WGSL, texture bindings, uniform bytes, construction callback counts, independent
+instance owners, target replacement, version-only reuse and disposal against
+pinned r186. All twelve failed the former admission guard and pass with this
+composition. The executor became unavailable before full-suite and public
+renderer integration checks completed; browser/GPU pixels remain unverified.
+
+Storage-backed custom instances, custom mesh subclasses, instanced geometries
+and per-instance weight textures on non-instance objects remain outside this
+extension slice; their ordinary built-in paths keep their existing support.
 
 Admission uses the nearest pinned material-family defaults without running a
 custom conversion constructor. The actual source builder performs conversion
