@@ -1861,3 +1861,101 @@ test('BatchedMesh extensions refuse altered selection callbacks and malformed te
   const descriptor = f.compile(item);
   assert.ok(effects > 0); assert.match(descriptor.vertex, /instance_index/);
 });
+
+for (const registered of [false, true]) for (const Type of [Float32Array, Int8Array, Uint8Array, Int16Array, Uint16Array])
+for (const components of Type === Float32Array ? [3] : [2, 3, 4]) for (const interleaved of Type === Float32Array ? [true] : [false, true])
+test(`${registered ? 'registered' : 'inherited'} extensions share source ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'normalized'} inputs`, t => {
+  const f = fixture(t), trace = [], normalized = Type !== Float32Array;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push('setup');
+      const value = N.attribute('applicationData', 'vec' + components);
+      return super.setupOutput(builder, output.mul(components === 2 ? N.vec4(value, 0, 1) : components === 3 ? N.vec4(value, 1) : value));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'PublicGeometryExtension'; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'PublicGeometryExtension');
+  const material = new (registered ? Application : Extension)(), items = [f.add(material), f.add(material)], results = [];
+  for (const [index, item] of items.entries()) {
+    const count = item.object.geometry.attributes.position.count, array = new Type(count * (interleaved ? 8 : components)).fill(index + 1);
+    const attribute = interleaved
+      ? new T.InterleavedBufferAttribute(new T.InterleavedBuffer(array, 8), components, 4, normalized)
+      : new T.BufferAttribute(array, components, normalized);
+    item.object.geometry.setAttribute('applicationData', attribute);
+    const source = f.reference(item), sourceAttributes = f.referenceObject(item).getAttributes(), expected = trace.splice(0);
+    const descriptor = f.compile(item); assert.deepEqual(trace.splice(0), expected); equalShaders(descriptor, source);
+    const packet = f.capture(item, descriptor, {captureGeometry() {}});
+    assert.equal(packet.programGeometry.attributes.applicationData, attribute);
+    assert.ok(sourceAttributes.includes(attribute));
+    assert.equal(f.programs.attributeBytes(descriptor), 0, 'public inputs stay with the ordinary upload owner');
+    f.renderer.info.calls++;
+    assert.equal(f.reference(item), source); assert.equal(f.compile(item), descriptor);
+    assert.deepEqual(trace, []);
+    results.push(source);
+  }
+  assert.equal(results[0], results[1], 'equivalent geometry owners share source shader construction');
+});
+
+test('interleaved extensions preserve source UUID selection across before updates and same-owner views', t => {
+  const states = [false, true].map(candidate => {
+    const f = fixture(t), state = {candidate, f, before() {}, setups: 0};
+    class Extension extends T.MeshBasicNodeMaterial {
+      constructor() {
+        super(); this.pulse = N.uniform(1);
+        this.pulse.updateBeforeType = 'object'; this.pulse.updateBefore = () => state.before();
+      }
+      setupPosition(builder) { return super.setupPosition(builder).assign(N.attribute('selectedPosition', 'vec3')); }
+      setupOutput(builder, output) { state.setups++; return super.setupOutput(builder, output.mul(this.pulse)); }
+    }
+    const item = f.add(new Extension()), geometry = item.object.geometry;
+    const owners = Array.from({length: 4}, () => new T.InterleavedBuffer(new Float32Array(32), 8));
+    const named = [new T.InterleavedBufferAttribute(owners[0], 3, 0), new T.InterleavedBufferAttribute(owners[0], 3, 4),
+      new T.InterleavedBufferAttribute(owners[1], 3, 0), new T.InterleavedBufferAttribute(owners[1], 3, 4),
+      new T.InterleavedBufferAttribute(owners[2], 3, 0), new T.InterleavedBufferAttribute(owners[3], 3, 4)];
+    geometry.setAttribute('selectedPosition', named[0]);
+    return Object.assign(state, {item, geometry, named});
+  });
+  const expected = [], actual = [], builders = [], [source, candidate] = states;
+  for (const [index, next] of [1, 2, null, 3, 4, null, 5].entries()) {
+    for (const state of states) {
+      if (index === 6) state.geometry.dispose();
+      state.before = () => { if (next !== null) state.geometry.setAttribute('selectedPosition', state.named[next]); };
+      state.f.renderer.info.calls++;
+    }
+    const object = source.f.referenceObject(source.item), builder = object.getNodeBuilderState(); builders.push(builder);
+    source.f.referenceDraw(source.item, {fullLifecycle: true});
+    expected.push(source.named.findIndex(attribute => object.getAttributes().includes(attribute)));
+    const descriptor = candidate.f.compile(candidate.item); equalShaders(descriptor, builder);
+    const packet = candidate.f.capture(candidate.item, descriptor, {captureGeometry() {}});
+    actual.push(candidate.named.indexOf(packet.programGeometry.attributes.selectedPosition));
+  }
+  assert.deepEqual(expected, [1, 1, 2, 2, 2, 4, 5]); assert.deepEqual(actual, expected);
+  assert.ok(builders.every(builder => builder === builders[0]));
+  assert.deepEqual(states.map(state => state.setups), [1, 1]);
+});
+
+test('interleaved and normalized extension boundaries reject invalid source layouts before shader effects', t => {
+  const f = fixture(t); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = f.add(new Extension()), geometry = item.object.geometry;
+  for (const attribute of [new T.BufferAttribute(new Float64Array(12), 3),
+    new T.BufferAttribute(new Uint8ClampedArray(12), 3, true), new T.BufferAttribute(new Uint8Array(12), 3),
+    new T.BufferAttribute(new Uint32Array(12), 3, true)]) {
+    geometry.setAttribute('applicationData', attribute);
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
+  }
+  for (const attribute of [new T.BufferAttribute(new Uint8Array(4), 1, true),
+    new T.BufferAttribute(new Float32Array(12), 3, true),
+    new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Uint8Array(32), 8), 3, 2, true),
+    new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Uint16Array(12), 3), 2, 0, true)]) {
+    geometry.setAttribute('applicationData', attribute);
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(effects, 0);
+  }
+});

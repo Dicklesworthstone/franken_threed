@@ -33,7 +33,7 @@
  * after() belongs after that draw has been accepted. Callers capture before any
  * asynchronous pipeline preparation and retain the resulting byte arrays.
  */
-import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute} from './three_node_attributes.mjs';
+import {createThreeNodeAttributes, inspectThreeNodeStorageAttribute, inspectThreeNodeSharedAttribute} from './three_node_attributes.mjs';
 import {inspectThreeNativeShadowFilter, inspectThreeNativeShadowGraph, captureThreeNativeShadowGraphs, installThreeNativeShadowTargets,
   registerThreeNativeShadow, updateThreeNativeShadow, withThreeNativeComputePrerequisites} from './three_node_shadows.mjs';
 import {inspectThreePipelineContext, inspectThreeLightingContext, inspectThreeNativePass,
@@ -398,6 +398,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         owner.isInstancedInterleavedBuffer, owner.usage];
     }));
   }
+  const namedAttributeId = attribute => attribute?.isInterleavedBufferAttribute ? attribute.data?.uuid : attribute?.id;
   function geometryMetadata(builder, geometry, object, pinNamed = false) {
     const generated = [], named = [];
     const attributes = builder.getAttributesArray().map((attribute, location) => {
@@ -420,10 +421,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           fail('ATTRIBUTE', `Native generated attribute ${attribute.name} scalar type must match its source array`);
       }
       if (!node?.attribute) {
-        named.push([attribute.name, source.id]);
-        if (pinNamed && (source.array?.constructor !== Float32Array || source.isInterleavedBufferAttribute ||
-            source.isInstancedBufferAttribute || source.normalized))
-          fail('ATTRIBUTE', 'Shared native geometry requires rigid Float32 named attributes');
+        named.push([attribute.name, namedAttributeId(source), source]);
+        if (pinNamed && inspectThreeNodeSharedAttribute(three, source, fail).instanced)
+          fail('ATTRIBUTE', 'Shared named geometry requires ordinary vertex inputs');
       }
       if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source,
         shared: node ? inspectAttributeInput(node, object) === true : !storage});
@@ -434,11 +434,15 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const sharedAttributeOwners = generated => [...new Set(generated.filter(source => source.shared).map(({attribute}) =>
     attribute.isInterleavedBufferAttribute ? attribute.data : attribute))];
   function namedAttributesMatch(state) {
-    return !state.namedAttributes || state.namedAttributes.every(([name, id]) => state.geometry.attributes[name]?.id === id);
+    return !state.namedAttributes || state.namedAttributes.every(([name, id]) => namedAttributeId(state.geometry.attributes[name]) === id);
   }
   function selectGeometryAttributes(state) {
     if (!state.namedSelectionPending) return;
-    if (!namedAttributesMatch(state)) {
+    // Before the first source getAttributes, even another view of the same
+    // interleaved UUID becomes the selected attribute. Warm draws retain the
+    // prior view until RenderObjects detects a different owner identity.
+    if (!namedAttributesMatch(state) || state.namedAttributes.some(([name, , attribute]) =>
+      state.geometry.attributes[name] !== attribute)) {
       const {generated, named} = geometryMetadata(state.builder, state.geometry, state.object, true);
       const token = {};
       generatedAttributes.register(token, state.geometry, generated);
@@ -1559,13 +1563,14 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // its own attributes, including interleaved version/range history.
     const instancedGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
       object.geometry.isInstancedBufferGeometry === true;
-    // Named storage vertices use the compute owner's live allocation, while
-    // ordinary attributes keep their existing upload history. Select them per
-    // render object even when a CPU geometry constructed the shared shader.
-    const storageGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
+    // Named storage vertices use the compute owner's live allocation. Public
+    // interleaved/normalized inputs retain the ordinary upload owner and the
+    // source RenderObject's per-object attribute selection across shader reuse.
+    const ordinaryGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
       !object.geometry.isInstancedBufferGeometry;
-    const namedGeometry = geometrySetup || storageGeometryExtension &&
-      Object.values(object.geometry.attributes).some(attribute => attribute.isStorageBufferAttribute);
+    const namedGeometry = geometrySetup || ordinaryGeometryExtension &&
+      Object.values(object.geometry.attributes).some(attribute =>
+        attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized);
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
@@ -1591,18 +1596,24 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.entries(object.geometry.attributes).some(([name, attribute]) =>
           attribute.array?.constructor !== Float32Array && !(skinExtension && name === 'skinIndex' &&
-            [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) ||
-          !instancedGeometryExtension && (attribute.isInterleavedBufferAttribute || attribute.isInstancedBufferAttribute) ||
+            [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) &&
+            !(ordinaryGeometryExtension && attribute.normalized === true &&
+              [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(attribute.array?.constructor)) ||
+          attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !ordinaryGeometryExtension ||
+          !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
           attribute.isStorageInstancedBufferAttribute ||
-          attribute.isStorageBufferAttribute && !geometrySetup && !storageGeometryExtension) ||
+          attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
-    if (storageGeometryExtension) for (const attribute of Object.values(object.geometry.attributes))
+    if (ordinaryGeometryExtension) for (const attribute of Object.values(object.geometry.attributes)) {
       if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
+      else if (attribute.isInterleavedBufferAttribute || attribute.normalized)
+        inspectThreeNodeSharedAttribute(three, attribute, fail);
+    }
     const {attachment, chain} = builderScope(context);
     // Admission runs during projection, before the source light list is ready.
     // Only actual program construction may initialize NodeManager's call key.

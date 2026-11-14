@@ -37,7 +37,8 @@ Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
 morph targets), CPU- or storage-backed `InstancedMesh`, exact `BatchedMesh`, and ordinary meshes with
 named storage vertex inputs or CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
-single-output materials and float geometry attributes (plus Uint16/Uint32 skin indices),
+single-output materials and Float32 geometry attributes (plus Uint16/Uint32 skin indices
+and the ordinary-mesh normalized inputs described below),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
@@ -77,6 +78,25 @@ Focused source comparisons and public-renderer recording tests cover indexed
 and nonindexed batches, sorted logical IDs versus draw ordinals, and queued
 geometry, texture and custom uniform values. These checks do not establish
 browser pixels or hardware performance.
+
+Inherited and registered materials on ordinary exact `Mesh` objects also accept
+Float32 interleaved attributes and normalized Int8, Uint8, Int16 and Uint16
+vectors with two to four components. Interleaved layouts retain their source
+stride, offset and owner; narrow formats must satisfy the pinned native vertex
+alignment. Named inputs share shader construction while each render object keeps
+its source attribute selection. Selection uses the interleaved owner's UUID,
+including same-owner view replacement before the first draw and retained warm
+views after that boundary.
+
+These public inputs use the existing geometry history owner. Separate narrow
+vectors that receive native padding upload every component of each affected
+vertex, including an empty component range inside a vertex. Empty ranges at a
+vertex boundary upload nothing. Unpadded updates preserve exact source ranges
+and reject invalid four-byte alignment on later uploads. Initial allocation
+retains pending ranges, queued draws retain their accepted bytes, and a change
+to an already resident padded layout requires a replacement attribute owner.
+Focused pinned-source shader and uploader comparisons and queued renderer byte
+checks cover these behaviors; they do not establish rasterized pixel parity.
 
 Custom instance materials also accept source `StorageInstancedBufferAttribute`
 matrices and colors, including mixed CPU/storage inputs. Graphics reads borrow

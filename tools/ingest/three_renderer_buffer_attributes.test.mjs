@@ -24,7 +24,10 @@ function fixture(t) {
   return {renderer, device, scene, camera, material, mesh};
 }
 const drain = async renderer => { while (renderer._drain) await renderer._drain; };
-const draws = device => device.snapshots.flat().filter(draw => draw.pipeline.vertex.entryPoint === 'main');
+// Output conversion also uses main; select the public inputs exercised here.
+const draws = device => device.snapshots.flat().filter(draw =>
+  draw.pipeline.vertex.entryPoint === 'main' &&
+  /@location\(\s*\d+\s*\)\s*(?:nodeAttribute\d+|color)\s*:/.test(draw.pipeline.vertex.module.code));
 function attributeWords(draw, input, Type = Float32Array) {
   const shader = draw.pipeline.vertex.module.code;
   const location = Number(new RegExp(`@location\\(\\s*(\\d+)\\s*\\)\\s*${input.name}\\s*:`).exec(shader)?.[1]);
@@ -117,5 +120,52 @@ test('external public node inputs cannot replace an earlier uncaptured fixed upl
   await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_CHANGED'});
   assert.equal(updates, 0, 'history validation precedes user node callbacks');
   assert.equal(draws(f.device).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const registered of [false, true]) for (const Type of [Float32Array, Int8Array, Uint8Array, Int16Array, Uint16Array])
+for (const interleaved of Type === Float32Array ? [true] : [false, true])
+test(`public material extensions retain queued ${Type.name} ${interleaved ? 'interleaved' : 'normalized'} bytes (registered=${registered})`, async t => {
+  const f = fixture(t), normalized = Type !== Float32Array, stride = interleaved ? 8 : 3, offset = interleaved ? 4 : 0;
+  const max = new Map([[Float32Array, 1], [Int8Array, 127], [Uint8Array, 255], [Int16Array, 32767], [Uint16Array, 65535]]).get(Type);
+  const min = Type === Int8Array ? -128 : Type === Int16Array ? -32768 : 0;
+  const normalize = value => normalized ? Math.fround(Math.max(value / max, -1)) : value;
+  let uploads = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) { return super.setupOutput(builder, output.mul(.75)); }
+  }
+  class Application extends T.MeshBasicMaterial { constructor() { super(); this.type = 'QueuedGeometryExtension'; } }
+  if (registered) f.renderer.library.addMaterial(Extension, 'QueuedGeometryExtension');
+  f.mesh.material = new (registered ? Application : Extension)(); f.mesh.material.vertexColors = true;
+  const make = array => {
+    const owner = interleaved ? new T.InterleavedBuffer(array, stride) : new T.BufferAttribute(array, 3, normalized);
+    owner.onUpload(() => { uploads++; });
+    return {owner, attribute: interleaved ? new T.InterleavedBufferAttribute(owner, 3, offset, normalized) : owner};
+  };
+  const array = new Type(4 * stride).fill(7);
+  for (let i = 0; i < 4; i++) array.set([min, max, max / 2], i * stride + offset);
+  const source = make(array); f.mesh.geometry.setAttribute('color', source.attribute);
+  await f.renderer.init(); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(draws(f.device).length, 0);
+  const geometryDraws = () => draws(f.device).filter(draw => /@location\(\s*\d+\s*\)\s*color\s*:/.test(draw.pipeline.vertex.module.code));
+  const first = [...array], expected = first.slice();
+  f.renderer.render(f.scene, f.camera);
+  array.fill(min); array.set([max, 0, max / 2], offset);
+  const start = interleaved ? offset : 1, count = interleaved ? 4 : 0;
+  source.owner.addUpdateRange(start, count); source.owner.needsUpdate = true;
+  for (let i = interleaved ? start : 0; i < (interleaved ? start + count : 3); i++) expected[i] = array[i];
+  f.renderer.render(f.scene, f.camera);
+  array.fill(max); f.renderer.render(f.scene, f.camera);
+  const replacement = make(new Type(array.length).fill(max / 2));
+  f.mesh.geometry.setAttribute('color', replacement.attribute); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  assert.equal(geometryDraws().length, 4);
+  assert.deepEqual(geometryDraws().map(draw => attributeWords(draw, {name: 'color'}).words),
+    [first, expected, expected, [...replacement.owner.array]].map(values => values.map(normalize)));
+  assert.deepEqual(source.owner.updateRanges, []); assert.equal(uploads, 0, 'native uploads do not invoke WebGL onUpload callbacks');
+  assert.equal(source.attribute.normalized, normalized); assert.equal(source.attribute.itemSize, 3);
+  f.mesh.geometry.dispose(); replacement.owner.array.fill(max);
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(attributeWords(geometryDraws().at(-1), {name: 'color'}).words, [...replacement.owner.array].map(normalize));
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import SourceWebGPUAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
 import {createThreeNodeBundleGeometry} from './three_node_bundle_geometry.mjs';
 import {createGpuProgramGeometry, programGeometrySnapshot} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -357,4 +358,107 @@ test('GPU view proofs retain accepted shape and cannot be forged or used as indi
   source.setIndex(view);
   assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
   assert.equal(owner.diagnostics.allocatedBytes, 36); accepted.release();
+});
+
+for (const Type of [Int8Array, Uint8Array, Int16Array, Uint16Array]) for (const components of [2, 3, 4])
+for (const interleaved of [false, true])
+test(`native ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'separate'} ranges match pinned upload bytes`, t => {
+  const owner = histories(t), source = new T.BufferGeometry(), device = geometryDevice(), records = new Map();
+  const backend = {device, get(key) { if (!records.has(key)) records.set(key, {}); return records.get(key); }};
+  const uploader = new SourceWebGPUAttributeUtils(backend), stride = interleaved ? 8 : components, offset = interleaved ? 4 : 0;
+  const make = () => {
+    const array = new Type(new ArrayBuffer((4 * stride + 8) * Type.BYTES_PER_ELEMENT), 4 * Type.BYTES_PER_ELEMENT, 4 * stride);
+    for (let i = 0; i < array.length; i++) array[i] = i + 10;
+    return interleaved ? new T.InterleavedBufferAttribute(new T.InterleavedBuffer(array, stride), components, offset, true)
+      : new T.BufferAttribute(array, components, true);
+  };
+  const reference = make(), attribute = make(), referenceOwner = interleaved ? reference.data : reference;
+  const inputOwner = interleaved ? attribute.data : attribute, original = reference.array, initial = [...original], packets = [];
+  source.setAttribute('value', attribute);
+  const padded = !interleaved && components * Type.BYTES_PER_ELEMENT % 4 !== 0;
+  const firstRange = padded ? {start: 1, count: 0} : {start: offset, count: 4 / Type.BYTES_PER_ELEMENT};
+  for (const target of [referenceOwner, inputOwner]) target.addUpdateRange(firstRange.start, firstRange.count);
+  uploader.createAttribute(reference, 32);
+  const layout = uploader.createShaderVertexBuffers({getAttributes: () => [reference]})[0];
+  assert.equal(layout.arrayStride, interleaved ? stride * Type.BYTES_PER_ELEMENT : Math.ceil(components * Type.BYTES_PER_ELEMENT / 4) * 4);
+  assert.equal(layout.attributes[0].offset, offset * Type.BYTES_PER_ELEMENT);
+  const compare = renderId => {
+    const packet = owner.capture(source, renderId, ['value']); packets.push(packet);
+    const gpu = new Type(backend.get(referenceOwner).buffer.data), raw = [];
+    if (interleaved) raw.push(...gpu.slice(0, attribute.array.length));
+    else for (let vertex = 0; vertex < attribute.count; vertex++)
+      raw.push(...gpu.slice(vertex * layout.arrayStride / Type.BYTES_PER_ELEMENT,
+        vertex * layout.arrayStride / Type.BYTES_PER_ELEMENT + components));
+    assert.deepEqual([...packet.geometry.attributes.value.array], raw);
+    return packet;
+  };
+  const first = compare(1);
+  assert.deepEqual(inputOwner.updateRanges, [firstRange], 'first upload keeps ranges, including empty interior ranges');
+  for (const target of [referenceOwner, inputOwner]) { target.array.fill(70); target.needsUpdate = true; }
+  uploader.updateAttribute(reference); compare(2);
+  assert.deepEqual(inputOwner.updateRanges, []); assert.deepEqual(referenceOwner.updateRanges, []);
+  assert.deepEqual([...first.geometry.attributes.value.array], initial, 'accepted older bytes remain immutable');
+  const range = padded ? {start: components - 1, count: 2} : {start: offset, count: 4 / Type.BYTES_PER_ELEMENT};
+  for (const target of [referenceOwner, inputOwner]) {
+    target.array.fill(90); target.addUpdateRange(range.start, range.count); target.needsUpdate = true;
+  }
+  const held = compare(2);
+  assert.deepEqual(inputOwner.updateRanges, [range], 'one upload per logical render retains later pending ranges');
+  uploader.updateAttribute(reference); const updated = compare(3);
+  assert.notEqual(updated.geometry, held.geometry);
+  assert.deepEqual(inputOwner.updateRanges, []);
+  if (padded) {
+    for (const target of [referenceOwner, inputOwner]) {
+      target.array.fill(110); target.addUpdateRange(components, 0); target.needsUpdate = true;
+    }
+    uploader.updateAttribute(reference);
+    assert.deepEqual(compare(4).geometry.attributes.value.array, updated.geometry.attributes.value.array,
+      'an empty range at a vertex boundary uploads no components');
+  }
+  assert.equal(reference.array, original); assert.equal(reference.itemSize, components, 'native padding stays private');
+  for (const packet of packets) packet.release();
+});
+
+test('native unpadded normalized ranges preserve first-upload behavior and refuse source-invalid alignment', t => {
+  const owner = histories(t), source = new T.BufferGeometry();
+  const attribute = new T.BufferAttribute(new Uint8Array([10, 20, 30, 40]), 4, true);
+  source.setAttribute('color', attribute); attribute.addUpdateRange(1, 1);
+  const record = {}, uploader = new SourceWebGPUAttributeUtils({device: geometryDevice(), get: () => record});
+  uploader.createAttribute(attribute, 32);
+  const first = owner.capture(source, 1); assert.deepEqual(attribute.updateRanges, [{start: 1, count: 1}]);
+  attribute.array.fill(90); attribute.needsUpdate = true;
+  assert.throws(() => uploader.updateAttribute(attribute), 'source queue rejects the same unaligned write');
+  assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_ATTRIBUTE'});
+  assert.deepEqual(attribute.updateRanges, [{start: 1, count: 1}]);
+  assert.deepEqual([...first.geometry.attributes.color.array], [10, 20, 30, 40]);
+  attribute.clearUpdateRanges(); attribute.addUpdateRange(0, 4);
+  const next = owner.capture(source, 2); assert.deepEqual([...next.geometry.attributes.color.array], [90, 90, 90, 90]);
+  assert.deepEqual(attribute.updateRanges, []); first.release(); next.release();
+});
+
+for (const [Type, before, after] of [[Uint8Array, 3, 4], [Uint8Array, 4, 3], [Uint8Array, 2, 3], [Int16Array, 3, 2]])
+test(`native ${Type.name} resident ${before}-to-${after} component padding changes require a new owner`, t => {
+  const owner = histories(t), source = new T.BufferGeometry(), attribute = new T.BufferAttribute(new Type(12).fill(10), before, true);
+  source.setAttribute('value', attribute); const first = owner.capture(source, 1);
+  attribute.itemSize = after; attribute.count = 12 / after; attribute.array.fill(90);
+  attribute.addUpdateRange(0, 4); attribute.needsUpdate = true;
+  assert.throws(() => owner.capture(source, 2), {code: 'THREE_NODE_BUNDLE_GEOMETRY_CHANGED'});
+  assert.deepEqual(attribute.updateRanges, [{start: 0, count: 4}]);
+  assert.deepEqual([...first.geometry.attributes.value.array], Array(12).fill(10));
+  source.setAttribute('value', new T.BufferAttribute(attribute.array, after, true));
+  const replaced = owner.capture(source, 2);
+  assert.deepEqual([...replaced.geometry.attributes.value.array], Array(12).fill(90));
+  first.release(); replaced.release();
+});
+
+for (const Type of [Float32Array, Uint16Array])
+test(`native ${Type.name} unpadded reinterpretation retains its legal raw layout`, t => {
+  const owner = histories(t), source = new T.BufferGeometry(), normalized = Type === Uint16Array;
+  const attribute = new T.BufferAttribute(new Type(12).fill(10), normalized ? 2 : 3, normalized);
+  source.setAttribute('value', attribute); const first = owner.capture(source, 1);
+  attribute.itemSize = 4; attribute.count = 3; attribute.array.fill(90); attribute.needsUpdate = true;
+  const next = owner.capture(source, 2);
+  assert.deepEqual([...next.geometry.attributes.value.array], Array(12).fill(90));
+  assert.deepEqual([...first.geometry.attributes.value.array], Array(12).fill(10));
+  first.release(); next.release();
 });

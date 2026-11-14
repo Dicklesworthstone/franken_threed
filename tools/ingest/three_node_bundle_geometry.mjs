@@ -112,7 +112,10 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
     if (!Array.isArray(owner.updateRanges) || owner.updateRanges.some(range => !Number.isSafeInteger(range?.start) || range.start < 0 ||
         !Number.isSafeInteger(range.count) || range.count < 0 || range.start + range.count > array.length))
       reject('ATTRIBUTE', 'Bundle attribute update ranges must fit their source array');
-    return {attribute, owner, array, interleaved, stride, offset, usage: owner.usage,
+    const rangeItemSize = !interleaved && attribute.normalized === true && attribute.itemSize > 1 &&
+      [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(array.constructor) &&
+      attribute.itemSize * array.BYTES_PER_ELEMENT % 4 ? attribute.itemSize : 0;
+    return {attribute, owner, array, interleaved, stride, offset, usage: owner.usage, rangeItemSize,
       shape: [attribute.count, attribute.itemSize, stride, offset, attribute.normalized, attribute.gpuType,
         attribute.isFloat16BufferAttribute === true, attribute.isInstancedBufferAttribute === true,
         owner.isInstancedInterleavedBuffer === true, owner.meshPerAttribute]};
@@ -136,9 +139,15 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       const record = owners.get(source.owner);
       if (record?.generation && (record.type !== source.array.constructor || record.length !== source.array.length))
         reject('CHANGED', 'Replace a bundle attribute when changing its storage layout');
+      if (record?.generation && record.rangeItemSize !== source.rangeItemSize)
+        reject('CHANGED', 'Replace a native attribute when changing its resident padded vertex layout');
       source.previous = record;
       source.upload = !record?.generation || record.renderId !== renderId &&
         (record.version < source.owner.version || source.owner.usage === three.DynamicDrawUsage);
+      if (source.upload && record?.generation && !record.rangeItemSize && source.attribute.normalized === true &&
+          source.array.BYTES_PER_ELEMENT < 4 && source.owner.updateRanges.some(({start, count}) =>
+            start * source.array.BYTES_PER_ELEMENT % 4 || count * source.array.BYTES_PER_ELEMENT % 4))
+        reject('ATTRIBUTE', 'Native unpadded attribute update ranges require four-byte offsets and sizes');
       if (source.upload) addedBytes += source.array.byteLength;
     }
     // Cached alternatives must not pin superseded uploads against the byte
@@ -158,9 +167,19 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       }
       if (source.upload) {
         const first = !record.generation, ranges = source.owner.updateRanges;
+        if (first) {
+          // r186 pads separate normalized narrow vectors to a four-byte
+          // vertex stride. Its later ranges upload whole affected vertices,
+          // including edited components outside the requested component span.
+          record.rangeItemSize = source.rangeItemSize;
+        }
         const array = first || ranges.length === 0 ? source.array.slice() : record.generation.array.slice();
         if (!first && ranges.length) {
-          for (const {start, count} of ranges) array.set(source.array.subarray(start, start + count), start);
+          for (const {start, count} of ranges) {
+            const size = record.rangeItemSize, begin = size ? Math.floor(start / size) * size : start;
+            const end = size ? Math.ceil((start + count) / size) * size : start + count;
+            array.set(source.array.subarray(begin, end), begin);
+          }
           source.owner.clearUpdateRanges();
         }
         const residency = first ? {} : record.generation?.residency;

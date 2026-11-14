@@ -31,6 +31,45 @@ export function inspectThreeNodeStorageAttribute(three, attribute, reject) {
       attribute.isInstancedBufferAttribute === true, attribute.meshPerAttribute])};
 }
 
+export function inspectThreeNodeSharedAttribute(three, attribute, reject) {
+  return inspectAttribute(three, attribute, reject, true);
+}
+function inspectAttribute(three, attribute, reject, shared = false) {
+  if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute)
+    return inspectThreeNodeStorageAttribute(three, attribute, reject);
+  const interleaved = attribute?.isInterleavedBufferAttribute === true;
+  const owner = interleaved ? attribute.data : attribute, array = owner?.array;
+  const normalized = shared && attribute?.normalized === true &&
+    [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(array?.constructor);
+  if (!normalized && (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || attribute?.normalized) ||
+      !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
+      !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
+      !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
+      normalized && (attribute.itemSize < 2 || attribute.isFloat16BufferAttribute) ||
+      !shared && attribute.gpuType === three.IntType ||
+      !Number.isSafeInteger(owner.version) || owner.version < 0)
+    reject('ATTRIBUTE', 'Native vertex inputs require fixed 32-bit streams or shared normalized 8/16-bit vectors');
+  try { new Uint8Array(array.buffer, 0, 0); }
+  catch { reject('ATTRIBUTE', 'Native generated attribute storage is detached'); }
+  const stride = interleaved ? owner.stride : attribute.itemSize, offset = interleaved ? attribute.offset : 0;
+  // Source WebGPU selects interleaved step mode from the owner only. A raw
+  // BufferAttributeNode's instanced flag does not promote its plain owner.
+  const instanced = interleaved ? owner.isInstancedInterleavedBuffer === true : attribute.isInstancedBufferAttribute === true;
+  if (!Number.isSafeInteger(stride) || stride < attribute.itemSize || stride > 512 ||
+      !Number.isSafeInteger(offset) || offset < 0 || offset + attribute.itemSize > stride ||
+      array.length !== attribute.count * stride || (instanced && owner.meshPerAttribute !== 1))
+    reject('ATTRIBUTE', 'Native generated streams require a complete source stride and instance divisor one');
+  // WebGPUAttributeUtils rounds narrow vector formats to four-byte groups.
+  // Separate inputs receive source padding; interleaved inputs must already
+  // contain that space and satisfy native vertex offset/stride alignment.
+  const bytes = array.BYTES_PER_ELEMENT, formatBytes = Math.ceil(attribute.itemSize * bytes / 4) * 4;
+  if (interleaved && (stride * bytes % 4 || offset * bytes % 4 || offset * bytes + formatBytes > stride * bytes))
+    reject('ATTRIBUTE', 'Shared native interleaved inputs require aligned source vertex formats');
+  return {owner, array, interleaved, instanced, stride, offset,
+    signature: JSON.stringify([array.constructor.name, array.length, attribute.count, stride, offset, attribute.itemSize,
+      interleaved, instanced, owner.meshPerAttribute, attribute.normalized, attribute.gpuType])};
+}
+
 export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, fail} = {}) {
   const reject = (code, message) => {
     if (fail) return fail(code, message);
@@ -40,30 +79,7 @@ export function createThreeNodeAttributes(three, {maxBytes = 64 * 1024 * 1024, f
   const owners = new Map(), geometries = new Map(), views = new WeakMap();
   let allocatedBytes = 0, disposed = false;
   const live = () => { if (disposed) reject('DISPOSED', 'Native attribute histories are disposed'); };
-  function shape(attribute, shared = false) {
-    if (attribute?.isStorageBufferAttribute || attribute?.isStorageInstancedBufferAttribute)
-      return inspectThreeNodeStorageAttribute(three, attribute, reject);
-    const interleaved = attribute?.isInterleavedBufferAttribute === true;
-    const owner = interleaved ? attribute.data : attribute, array = owner?.array;
-    if (![Float32Array, Int32Array, Uint32Array].includes(array?.constructor) || !(array.buffer instanceof ArrayBuffer) || array.buffer.resizable ||
-        !Number.isSafeInteger(array.length) || !Number.isSafeInteger(attribute?.count) || attribute.count < 0 ||
-        !Number.isSafeInteger(attribute?.itemSize) || attribute.itemSize < 1 || attribute.itemSize > 4 ||
-        attribute.normalized || !shared && attribute.gpuType === three.IntType ||
-        !Number.isSafeInteger(owner.version) || owner.version < 0)
-      reject('ATTRIBUTE', 'Native generated attributes require fixed, unshared Float32, Int32 or Uint32 scalar/vector streams');
-    try { new Uint8Array(array.buffer, 0, 0); }
-    catch { reject('ATTRIBUTE', 'Native generated attribute storage is detached'); }
-    const stride = interleaved ? owner.stride : attribute.itemSize, offset = interleaved ? attribute.offset : 0;
-    // Source WebGPU selects interleaved step mode from the owner only. A raw
-    // BufferAttributeNode's instanced flag does not promote its plain owner.
-    const instanced = interleaved ? owner.isInstancedInterleavedBuffer === true : attribute.isInstancedBufferAttribute === true;
-    if (!Number.isSafeInteger(stride) || stride < attribute.itemSize || stride > 512 ||
-        !Number.isSafeInteger(offset) || offset < 0 || offset + attribute.itemSize > stride ||
-        array.length !== attribute.count * stride || (instanced && owner.meshPerAttribute !== 1))
-      reject('ATTRIBUTE', 'Native generated streams require a complete source stride and instance divisor one');
-    return {owner, array, interleaved, instanced, stride, offset,
-      signature: JSON.stringify([array.constructor.name, array.length, attribute.count, stride, offset, attribute.itemSize, interleaved, instanced, owner.meshPerAttribute])};
-  }
+  const shape = (attribute, shared = false) => inspectAttribute(three, attribute, reject, shared);
   function register(descriptor, geometry, attributes) {
     live();
     if (views.has(descriptor)) reject('ATTRIBUTE', 'Native generated geometry is already registered');
