@@ -419,6 +419,32 @@ test(`native ${Type.name} vec${components} ${interleaved ? 'interleaved' : 'sepa
   for (const packet of packets) packet.release();
 });
 
+for (const Type of [Uint8Array, Uint16Array])
+test(`native raw interleaved ${Type.name} joints preserve pinned uploads and source range alignment`, t => {
+  const owner = histories(t), geometry = new T.BufferGeometry(), device = geometryDevice(), records = new Map();
+  const backend = {device, get(key) { if (!records.has(key)) records.set(key, {}); return records.get(key); }};
+  const uploader = new SourceWebGPUAttributeUtils(backend);
+  const make = () => new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Type(
+    [0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0]), 8), 4, 4);
+  const reference = make(), attribute = make(), input = attribute.data, source = reference.data, packets = [];
+  geometry.setAttribute('skinIndex', attribute); uploader.createAttribute(reference, 32);
+  const compare = id => {
+    const packet = owner.capture(geometry, id, ['skinIndex']); packets.push(packet);
+    assert.deepEqual(packet.geometry.attributes.skinIndex.array, new Type(backend.get(source).buffer.data));
+    return packet;
+  };
+  const first = compare(1);
+  for (const target of [input, source]) {
+    target.array.fill(7); target.array.set([1,0,0,0], 4); target.addUpdateRange(4,4); target.needsUpdate = true;
+  }
+  uploader.updateAttribute(reference); compare(2);
+  assert.deepEqual([...first.geometry.attributes.skinIndex.array], [0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0]);
+  input.addUpdateRange(5,1); input.needsUpdate = true;
+  assert.throws(() => owner.capture(geometry, 3, ['skinIndex']), /four-byte offsets and sizes/);
+  assert.deepEqual(input.updateRanges, [{start:5,count:1}], 'invalid narrow writes do not consume pending updates');
+  for (const packet of packets) packet.release();
+});
+
 test('native unpadded normalized ranges preserve first-upload behavior and refuse source-invalid alignment', t => {
   const owner = histories(t), source = new T.BufferGeometry();
   const attribute = new T.BufferAttribute(new Uint8Array([10, 20, 30, 40]), 4, true);

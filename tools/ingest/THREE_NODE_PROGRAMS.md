@@ -37,8 +37,8 @@ Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
 morph targets), CPU- or storage-backed `InstancedMesh`, exact `BatchedMesh`, and ordinary meshes with
 named storage vertex inputs or CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
-single-output materials and Float32 geometry attributes (plus Uint16/Uint32 skin indices
-and the ordinary-mesh normalized inputs described below),
+single-output materials and Float32 geometry attributes (plus Uint8/Uint16/Uint32 skin indices
+and the ordinary/skinned-mesh normalized inputs described below),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
 properties, including the pinned accessors installed by Physical construction.
@@ -79,7 +79,7 @@ and nonindexed batches, sorted logical IDs versus draw ordinals, and queued
 geometry, texture and custom uniform values. These checks do not establish
 browser pixels or hardware performance.
 
-Inherited and registered materials on ordinary exact `Mesh` objects also accept
+Inherited and registered materials on exact `Mesh` and `SkinnedMesh` objects also accept
 Float32 interleaved attributes and normalized Int8, Uint8, Int16 and Uint16
 vectors with two to four components. Interleaved layouts retain their source
 stride, offset and owner; narrow formats must satisfy the pinned native vertex
@@ -97,6 +97,18 @@ retains pending ranges, queued draws retain their accepted bytes, and a change
 to an already resident padded layout requires a replacement attribute owner.
 Focused pinned-source shader and uploader comparisons and queued renderer byte
 checks cover these behaviors; they do not establish rasterized pixel parity.
+
+Packed skins retain separate or interleaved unsigned byte/word joint indices and
+normalized byte/word skin weights, alongside interleaved position, normal and UV
+inputs. Source shader construction can be shared across equivalent skeleton
+layouts while each object retains its own selected attributes, palette and
+material uniforms. Raw narrow interleaved updates preserve the source's
+four-byte write alignment; separate joint streams use the existing integer
+conversion path. Queued poses and partial uploads survive source geometry or
+material disposal without exposing unrequested CPU edits. The focused tests
+compare inherited and registered Basic, Standard and Physical materials with
+pinned source WGSL and uniform data, and verify public-renderer command bytes;
+browser pixels and hardware performance are not established by these checks.
 
 Custom instance materials also accept source `StorageInstancedBufferAttribute`
 matrices and colors, including mixed CPU/storage inputs. Graphics reads borrow

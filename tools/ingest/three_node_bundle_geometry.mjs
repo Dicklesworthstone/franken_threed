@@ -144,7 +144,8 @@ export function createThreeNodeBundleGeometry(three, {maxBytes = 64 * 1024 * 102
       source.previous = record;
       source.upload = !record?.generation || record.renderId !== renderId &&
         (record.version < source.owner.version || source.owner.usage === three.DynamicDrawUsage);
-      if (source.upload && record?.generation && !record.rangeItemSize && source.attribute.normalized === true &&
+      if (source.upload && record?.generation && !record.rangeItemSize &&
+          (source.attribute.normalized === true || source.interleaved) &&
           source.array.BYTES_PER_ELEMENT < 4 && source.owner.updateRanges.some(({start, count}) =>
             start * source.array.BYTES_PER_ELEMENT % 4 || count * source.array.BYTES_PER_ELEMENT % 4))
         reject('ATTRIBUTE', 'Native unpadded attribute update ranges require four-byte offsets and sizes');

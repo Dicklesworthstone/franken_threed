@@ -2084,6 +2084,60 @@ function skinPalette(draw){
   return [...new Float32Array(bytes.buffer,bytes.byteOffset+offset,resource.size/4)];
 }
 
+function skinVertexValues(draw,name,vertex=0){
+  const match=new RegExp('@location\\(\\s*(\\d+)\\s*\\)\\s+'+name+'\\s*:').exec(draw.pipeline.vertex.module.code);
+  assert.ok(match,`source skinning input ${name}`);
+  const location=Number(match[1]),slot=draw.pipeline.vertex.buffers.findIndex(layout=>layout.attributes.some(a=>a.shaderLocation===location));
+  const layout=draw.pipeline.vertex.buffers[slot],attribute=layout.attributes.find(a=>a.shaderLocation===location);
+  const bytes=draw.contents.get(draw.streams.get(slot)),offset=attribute.offset+vertex*layout.arrayStride;
+  const Type=attribute.format.startsWith('uint')?Uint32Array:Float32Array;
+  return [...new Type(bytes.buffer,bytes.byteOffset+offset,Number(/x([234])$/.exec(attribute.format)?.[1]??1))];
+}
+
+for(const registered of [false,true])for(const Type of [Uint8Array,Uint16Array])for(const interleaved of [false,true])
+test(`packed ${registered?'registered':'inherited'} skin ${Type.name} ${interleaved?'interleaved':'separate'} inputs retain queued poses, uploads and disposal`,async t=>{
+  const f=fixture(t);let setups=0;
+  class Extension extends T.MeshBasicNodeMaterial{
+    setupOutput(builder,output){setups++;return super.setupOutput(builder,output.mul(T.TSL.materialReference('applicationGain','float')));}
+  }
+  if(registered)f.renderer.library.materialNodes.set('MeshBasicMaterial',Extension);
+  const material=registered?new T.MeshBasicMaterial():new Extension();material.applicationGain=.375;
+  const {mesh,bones,geometry}=customSkinnedMesh(f,material);t.after(()=>geometry.dispose());
+  const positions=geometry.attributes.position,vertices=new T.InterleavedBuffer(new Float32Array(positions.count*8),8);
+  for(let i=0;i<positions.count;i++)vertices.array.set([positions.getX(i),positions.getY(i),positions.getZ(i),0,0,1,0,0],i*8);
+  geometry.setAttribute('position',new T.InterleavedBufferAttribute(vertices,3,0));
+  geometry.setAttribute('normal',new T.InterleavedBufferAttribute(vertices,3,3));
+  const max=Type===Uint8Array?255:65535,stride=interleaved?8:4,offset=interleaved?4:0;
+  const owners={};
+  for(const [name,words,normalized] of [['skinIndex',[0,1,0,0],false],['skinWeight',[Math.round(max*.25),Math.round(max*.75),0,0],true]]){
+    const array=new Type(positions.count*stride);
+    for(let i=0;i<positions.count;i++)array.set(words,i*stride+offset);
+    const owner=interleaved?new T.InterleavedBuffer(array,stride):new T.BufferAttribute(array,4,normalized);
+    geometry.setAttribute(name,interleaved?new T.InterleavedBufferAttribute(owner,4,offset,normalized):owner);owners[name]=owner;
+  }
+  await f.renderer.init();bones[1].position.x=.25;f.renderer.render(f.scene,f.camera);
+  const initialPosition=[...positions.array.slice(0,3)],initialWeights=[Math.fround(Math.round(max*.25)/max),Math.fround(Math.round(max*.75)/max),0,0];
+  vertices.array[0]=.125;vertices.array[1]=99;vertices.addUpdateRange(0,1);vertices.needsUpdate=true;
+  owners.skinIndex.array.set([1,0,0,0],offset);owners.skinIndex.array[stride+offset]=1;
+  owners.skinWeight.array.set([max,0,0,0],offset);owners.skinWeight.array[stride+offset]=0;
+  for(const owner of Object.values(owners)){owner.addUpdateRange(offset,4);owner.needsUpdate=true;}
+  bones[1].position.x=.75;material.applicationGain=.625;f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene,f.camera);
+  assert.deepEqual(vertices.updateRanges,[]);for(const owner of Object.values(owners))assert.deepEqual(owner.updateRanges,[]);
+  vertices.array.fill(-99);for(const owner of Object.values(owners))owner.array.fill(0);
+  geometry.dispose();material.dispose();f.scene.remove(mesh);mesh.skeleton.boneMatrices.fill(99);
+  await drain(f.renderer);
+  const draws=customSkinnedDraws(f.device);assert.equal(draws.length,2);
+  assert.deepEqual(draws.map(draw=>skinPalette(draw)[28]),[.25,.75]);
+  assert.deepEqual(draws.map(draw=>skinVertexValues(draw,'position')),[initialPosition,[.125,initialPosition[1],initialPosition[2]]]);
+  assert.deepEqual(draws.map(draw=>skinVertexValues(draw,'skinIndex')),[[0,1,0,0],[1,0,0,0]]);
+  assert.deepEqual(draws.map(draw=>skinVertexValues(draw,'skinWeight')),[initialWeights,[1,0,0,0]]);
+  assert.deepEqual(skinVertexValues(draws[1],'skinIndex',1),[0,1,0,0],'unrequested joints remain GPU-stale');
+  assert.deepEqual(skinVertexValues(draws[1],'skinWeight',1),initialWeights,'unrequested weights remain GPU-stale');
+  assert.ok(uniformBlocks(draws[0]).flat().includes(.375));assert.ok(uniformBlocks(draws[1]).flat().includes(.625));
+  assert.equal(setups,1);assert.equal(f.renderer._nodeCaptureBytes,0);
+});
+
 for(const registered of [false,true])
 test(`custom ${registered?'registered':'inherited'} SkinnedMesh materials retain queued animation palettes and uniforms`,async t=>{
   const f=fixture(t),setups=[],updates=[];

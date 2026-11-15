@@ -408,6 +408,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         : vector?.[1] === 'i' || vector?.[3] === 'int' ? 'int' : 'float';
       const node = attribute.node, source = node?.attribute ?? geometry.attributes[attribute.name];
       const storage = source?.isStorageBufferAttribute || source?.isStorageInstancedBufferAttribute;
+      const narrowInteger = !node && pinNamed && object.isSkinnedMesh === true && attribute.name === 'skinIndex';
       const padded = storage && source.itemSize === 4 && components === 3;
       if (!components || !source || source.itemSize !== components && !padded ||
           node && !(node instanceof three.BufferAttributeNode))
@@ -422,10 +423,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       }
       if (!node?.attribute) {
         named.push([attribute.name, namedAttributeId(source), source]);
-        if (pinNamed && inspectThreeNodeSharedAttribute(three, source, fail).instanced)
+        if (pinNamed && inspectThreeNodeSharedAttribute(three, source, fail, narrowInteger).instanced)
           fail('ATTRIBUTE', 'Shared named geometry requires ordinary vertex inputs');
       }
-      if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source,
+      if (node || storage || pinNamed) generated.push({name: attribute.name, attribute: source, narrowInteger,
         shared: node ? inspectAttributeInput(node, object) === true : !storage});
       return Object.freeze({name: attribute.name, location, locations: 1, components, scalar});
     });
@@ -1568,7 +1569,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // source RenderObject's per-object attribute selection across shader reuse.
     const ordinaryGeometryExtension = extension && Object.getPrototypeOf(object) === three.Mesh.prototype &&
       !object.geometry.isInstancedBufferGeometry;
-    const namedGeometry = geometrySetup || ordinaryGeometryExtension &&
+    // Skinning reads ordinary named vertex inputs as well as its bone palette.
+    // Keep interleaved positions and normalized weights with the same public
+    // attribute owner rather than constructing a second deformation uploader.
+    const sharedVertexExtension = ordinaryGeometryExtension || skinExtension;
+    const namedGeometry = geometrySetup || sharedVertexExtension &&
       Object.values(object.geometry.attributes).some(attribute =>
         attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized);
     // Transparent side passes retain separate render-object bindings. Their
@@ -1596,10 +1601,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         Object.values(Object.getOwnPropertyDescriptors(material)).some(property => property.enumerable && !Object.hasOwn(property, 'value')) ||
         Object.entries(object.geometry.attributes).some(([name, attribute]) =>
           attribute.array?.constructor !== Float32Array && !(skinExtension && name === 'skinIndex' &&
-            [Uint16Array, Uint32Array].includes(attribute.array?.constructor)) &&
-            !(ordinaryGeometryExtension && attribute.normalized === true &&
+            [Uint8Array, Uint16Array, Uint32Array].includes(attribute.array?.constructor)) &&
+            !(sharedVertexExtension && attribute.normalized === true &&
               [Int8Array, Uint8Array, Int16Array, Uint16Array].includes(attribute.array?.constructor)) ||
-          attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !ordinaryGeometryExtension ||
+          attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !sharedVertexExtension ||
           !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
           attribute.isStorageInstancedBufferAttribute ||
           attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension) ||
@@ -1609,10 +1614,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
-    if (ordinaryGeometryExtension) for (const attribute of Object.values(object.geometry.attributes)) {
+    if (sharedVertexExtension) for (const [name, attribute] of Object.entries(object.geometry.attributes)) {
       if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
       else if (attribute.isInterleavedBufferAttribute || attribute.normalized)
-        inspectThreeNodeSharedAttribute(three, attribute, fail);
+        inspectThreeNodeSharedAttribute(three, attribute, fail, skinExtension && name === 'skinIndex');
     }
     const {attachment, chain} = builderScope(context);
     // Admission runs during projection, before the source light list is ready.

@@ -1264,6 +1264,68 @@ function skinnedItem(f, T, material, {count = 2, padded = false, translation = 0
   return {object, material};
 }
 
+function packedSkinInputs(T, geometry, Type, interleaved) {
+  const {position, normal, uv, skinIndex, skinWeight} = geometry.attributes;
+  const vertices = new T.InterleavedBuffer(new Float32Array(position.count * 8), 8);
+  for (let i = 0; i < position.count; i++) {
+    vertices.array.set([position.getX(i), position.getY(i), position.getZ(i),
+      normal.getX(i), normal.getY(i), normal.getZ(i), uv.getX(i), uv.getY(i)], i * 8);
+  }
+  for (const [name, size, offset] of [['position', 3, 0], ['normal', 3, 3], ['uv', 2, 6]])
+    geometry.setAttribute(name, new T.InterleavedBufferAttribute(vertices, size, offset));
+  const max = Type === Uint8Array ? 255 : 65535;
+  for (const [name, source, normalized] of [['skinIndex', skinIndex, false], ['skinWeight', skinWeight, true]]) {
+    const array = new Type(position.count * (interleaved ? 8 : 4));
+    for (let i = 0; i < position.count; i++) for (let c = 0; c < 4; c++)
+      array[i * (interleaved ? 8 : 4) + (interleaved ? 4 : 0) + c] =
+        normalized ? Math.round(source.array[i * 4 + c] * max) : source.array[i * 4 + c];
+    geometry.setAttribute(name, interleaved
+      ? new T.InterleavedBufferAttribute(new T.InterleavedBuffer(array, 8), 4, 4, normalized)
+      : new T.BufferAttribute(array, 4, normalized));
+  }
+}
+
+for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true])
+for (const Type of [Uint8Array, Uint16Array]) for (const interleaved of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} SkinnedMesh materials preserve interleaved geometry and ${Type.name} ${interleaved ? 'interleaved' : 'separate'} joints and normalized weights`, t => {
+  const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
+  class Extension extends T['Mesh' + family + 'NodeMaterial'] {
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+    setupOutput(builder, output) {
+      trace.push('setup');
+      return super.setupOutput(builder, output.mul(N.materialReference('applicationGain', 'float')));
+    }
+  }
+  class Application extends T['Mesh' + family + 'Material'] {
+    constructor() { super(); this.type = 'PackedSkinExtension'; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey(); }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'PackedSkinExtension');
+  const material = new (registered ? Application : Extension)(); material.applicationGain = .625;
+  const items = [skinnedItem(f, T, material, {translation: 2}), skinnedItem(f, T, material, {translation: 7})];
+  let reference;
+  for (const item of items) {
+    packedSkinInputs(T, item.object.geometry, Type, interleaved);
+    const expected = f.reference(item), sourceAttributes = f.referenceObject(item).getAttributes(), calls = trace.splice(0);
+    const descriptor = f.compile(item); assert.deepEqual(trace.splice(0), calls);
+    equalInstanceShaders(descriptor, expected);
+    if (reference) assert.equal(expected, reference, 'matching packed layouts share source construction across skeletons');
+    reference = expected;
+    f.referenceDraw(item, {fullLifecycle: true});
+    const packet = f.capture(item, descriptor, {captureGeometry() {}});
+    equalInstanceUniforms(f, item, descriptor, packet);
+    for (const name of ['position', 'skinIndex', 'skinWeight']) {
+      assert.equal(packet.programGeometry.attributes[name], item.object.geometry.attributes[name]);
+      assert.ok(sourceAttributes.includes(item.object.geometry.attributes[name]));
+    }
+    assert.equal(f.programs.attributeBytes(descriptor), 0, 'joint and weight inputs use the existing geometry upload owner');
+    assert.equal(item.object.geometry.attributes.skinIndex.array.constructor, Type);
+    assert.equal(item.object.geometry.attributes.skinWeight.normalized, true);
+    f.renderer.info.calls++;
+    assert.equal(f.reference(item), expected); assert.equal(f.compile(item), descriptor); assert.deepEqual(trace, []);
+  }
+});
+
 for (const family of ['Basic', 'Standard', 'Physical']) for (const registered of [false, true]) for (const paddedFirst of [false, true])
 test((registered ? 'registered' : 'inherited') + ' ' + family + ' SkinnedMesh extensions share source construction with paddedFirst=' + paddedFirst, t => {
   const T = SourceThree, N = T.TSL, f = fixture(t, {}, T), trace = [];
@@ -1369,9 +1431,16 @@ test('SkinnedMesh extensions reject malformed skeletons, unsupported attributes 
   skeleton.boneMatrices = new Float32Array(16);
   assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_OBJECT'}); assert.equal(effects, 0);
   skeleton.boneMatrices = palette;
-  item.object.geometry.attributes.skinIndex = new T.Uint8BufferAttribute(index.array, 4);
+  item.object.geometry.attributes.skinIndex = new T.Int8BufferAttribute(index.array, 4);
   assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
   item.object.geometry.attributes.skinIndex = index;
+  const weight = item.object.geometry.attributes.skinWeight;
+  for (const invalid of [new T.BufferAttribute(new Float32Array(weight.array), 4, true),
+    new T.InterleavedBufferAttribute(new T.InterleavedBuffer(new Uint8Array(32), 8), 4, 2, true)]) {
+    item.object.geometry.attributes.skinWeight = invalid;
+    assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(effects, 0);
+  }
+  item.object.geometry.attributes.skinWeight = weight;
   item.object.geometry.setAttribute('unrelatedInteger', new T.Uint16BufferAttribute([1, 2, 3, 4], 1));
   assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'}); assert.equal(effects, 0);
   item.object.geometry.deleteAttribute('unrelatedInteger');
@@ -1900,7 +1969,8 @@ test(`${registered ? 'registered' : 'inherited'} extensions share source ${Type.
   assert.equal(results[0], results[1], 'equivalent geometry owners share source shader construction');
 });
 
-test('interleaved extensions preserve source UUID selection across before updates and same-owner views', t => {
+for (const skinned of [false, true])
+test(`interleaved ${skinned ? 'SkinnedMesh' : 'Mesh'} extensions preserve source UUID selection across before updates and same-owner views`, t => {
   const states = [false, true].map(candidate => {
     const f = fixture(t), state = {candidate, f, before() {}, setups: 0};
     class Extension extends T.MeshBasicNodeMaterial {
@@ -1911,7 +1981,7 @@ test('interleaved extensions preserve source UUID selection across before update
       setupPosition(builder) { return super.setupPosition(builder).assign(N.attribute('selectedPosition', 'vec3')); }
       setupOutput(builder, output) { state.setups++; return super.setupOutput(builder, output.mul(this.pulse)); }
     }
-    const item = f.add(new Extension()), geometry = item.object.geometry;
+    const item = skinned ? skinnedItem(f, T, new Extension()) : f.add(new Extension()), geometry = item.object.geometry;
     const owners = Array.from({length: 4}, () => new T.InterleavedBuffer(new Float32Array(32), 8));
     const named = [new T.InterleavedBufferAttribute(owners[0], 3, 0), new T.InterleavedBufferAttribute(owners[0], 3, 4),
       new T.InterleavedBufferAttribute(owners[1], 3, 0), new T.InterleavedBufferAttribute(owners[1], 3, 4),
@@ -1929,7 +1999,7 @@ test('interleaved extensions preserve source UUID selection across before update
     const object = source.f.referenceObject(source.item), builder = object.getNodeBuilderState(); builders.push(builder);
     source.f.referenceDraw(source.item, {fullLifecycle: true});
     expected.push(source.named.findIndex(attribute => object.getAttributes().includes(attribute)));
-    const descriptor = candidate.f.compile(candidate.item); equalShaders(descriptor, builder);
+    const descriptor = candidate.f.compile(candidate.item); equalInstanceShaders(descriptor, builder);
     const packet = candidate.f.capture(candidate.item, descriptor, {captureGeometry() {}});
     actual.push(candidate.named.indexOf(packet.programGeometry.attributes.selectedPosition));
   }
