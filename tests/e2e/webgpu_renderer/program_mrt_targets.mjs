@@ -100,6 +100,46 @@ async function capture(mode) {
             renderer.setClearColor(0);
           } finally {target.dispose();}
         }
+        // Fragment arrays are ordinary source values until the final output
+        // interface. Check every actual attachment, including integer payloads.
+        const arrayVertex = 'in vec3 position;void main(){gl_Position=vec4(position,1.);}';
+        const arrayCases = [
+          {name: 'implicit', declarations: 'out vec4 colors[2];',
+            body: 'colors[0]=vec4(.25+delta,.5,.75,1.);colors[1]=vec4(.75,.25+delta,.5,1.);', locations: [0, 1]},
+          {name: 'sparse', declarations: 'layout(location=1) out vec4 colors[2];',
+            body: 'colors[0]=vec4(.25+delta,.5,.75,1.);colors[1]=vec4(.75,.25+delta,.5,1.);', locations: [1, 2]},
+          {name: 'helper', declarations: 'layout(location=0) out vec4 colors[2];layout(location=2) out vec4 colors_e0;' +
+            'void update(inout vec4 copy[2],int selected){copy[selected].xy+=vec2(delta);}',
+            body: 'colors=vec4[2](vec4(.25,.5,.75,1.),vec4(.75,.25,.5,1.));update(colors,1);' +
+              'const int last=colors.length()-1;colors[0].xy=colors[last].yx;colors_e0=colors[0];', locations: [0, 1, 2]},
+          {name: 'unsigned', type: T.UnsignedIntType, declarations: 'out uvec4 colors[2];',
+            body: 'colors[0]=uvec4(0xffffffffu-uint(delta),0x80000000u,3u,5u);colors[1]=uvec4(7u,11u,17u+uint(delta),23u);', locations: [0, 1]},
+          {name: 'signed', type: T.IntType, declarations: 'out ivec4 colors[2];',
+            body: 'colors[0]=ivec4(-65537-int(delta),-2147483647,3,5);colors[1]=ivec4(7,11,-17-int(delta),23);', locations: [0, 1]},
+        ];
+        for (const entry of arrayCases) for (const samples of entry.name === 'implicit' ? [0, 4] : [0]) {
+          const target = new T.WebGLRenderTarget(8, 4, {count: Math.max(...entry.locations) + 1, samples, depthBuffer: false,
+            minFilter: T.NearestFilter, magFilter: T.NearestFilter,
+            type: entry.type ?? T.UnsignedByteType, format: entry.type ? T.RGBAIntegerFormat : T.RGBAFormat});
+          const material = new T.RawShaderMaterial({glslVersion: T.GLSL3, vertexShader: arrayVertex,
+            fragmentShader: 'precision highp float;precision highp int;uniform float delta;' + entry.declarations + 'void main(){' + entry.body + '}',
+            uniforms: {delta: {value: 0}}, depthTest: false, depthWrite: false, blending: T.NoBlending});
+          const mesh = new T.Mesh(quad.geometry, material); mesh.frustumCulled = false;
+          try {
+            for (let phase = 0; phase < 2; phase++) {
+              if (phase) target.setSize(6, 3);
+              material.uniforms.delta.value = phase * (entry.type ? 1 : .125);
+              renderer.setRenderTarget(target); renderer.render(mesh, postCamera); await complete();
+              for (const attachment of entry.locations) {
+                const Buffer = entry.type === T.UnsignedIntType ? Uint32Array : entry.type === T.IntType ? Int32Array : Uint8Array;
+                const data = new Buffer(target.width * target.height * 4);
+                await renderer.readRenderTargetPixelsAsync(target, 0, 0, target.width, target.height, data, undefined, attachment);
+                frames.push({name: `output-array-${entry.name}-${samples}-${phase}-${attachment}`,
+                  pixels: Array.from(new Uint8Array(data.buffer)), exact: true});
+              }
+            }
+          } finally {target.dispose(); material.dispose();}
+        }
         return {frames, errors, route: renderer.info.f3d?.route, draws: renderer.info.f3d?.nativeDrawCalls};
       } finally {output.dispose(); diffuse.dispose(); material.dispose(); post.dispose(); mesh.geometry.dispose(); quad.geometry.dispose(); renderer.dispose();}
     }, {mode, shaders});
@@ -117,9 +157,13 @@ try {
     assert.deepEqual(result.frames[frame].pixels, result.frames[frame - 1].pixels, 'manual MSAA clear preserves the last resolved image');
     assert.notDeepEqual(result.frames[frame].pixels, result.frames[frame + 1].pixels, 'the next render resolves the cleared multisample storage');
   }
-  const results = source.frames.map(({name, pixels: reference}, frame) => {
+  const results = source.frames.map(({name, pixels: reference, exact}, frame) => {
     assert.equal(candidate.frames[frame].name, name);
     const actual = candidate.frames[frame].pixels; assert.equal(actual.length, reference.length);
+    if (exact) {
+      assert.ok(reference.some(value => value !== 0), `${name}: source array output has visible content`);
+      assert.deepEqual(actual, reference, `${name}: exact output-array attachment bytes`);
+    }
     let maxError = 0, differingBytes = 0, over = 0;
     for (let i = 0; i < actual.length; i += 4) {
       let error = 0;

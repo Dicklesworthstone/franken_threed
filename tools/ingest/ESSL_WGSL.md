@@ -42,6 +42,25 @@ checks reject source-invalid declarations; ESSL 1.00 struct varyings are not
 admitted. The source rules are in the
 [Khronos ESSL 3.00 specification](https://registry.khronos.org/OpenGL/specs/es/3.0/GLSL_ES_Specification_3.00.pdf).
 
+ESSL 3.00 fragment output arrays flatten numeric scalar/vector elements into
+consecutive WGSL output locations. The private source array keeps whole-value
+assignment and function copy-in/copy-out semantics. Reflection exposes each
+element separately (`colors[0]`, `colors[1]`, etc.) with its element type and
+location, so the existing MRT owner validates every attachment's scalar format
+and sample count. A sole output starts at location zero unless explicitly placed;
+multiple output variables require explicit, nonoverlapping locations, following
+sections 4.3.6 and 4.3.8.2 of the same specification. Output expansion is bounded
+to 4,096 elements before allocating the generated interface; actual attachment
+limits remain the renderer's responsibility.
+
+Direct output-array subscripts must be constant integers. The existing constant
+evaluator admits scalar literals and constructors, arithmetic, constant aliases
+and array `.length()` expressions; builtin-derived constants such as `min(0, 1)`
+remain unsupported. Dynamic indexing still works on copied local/function arrays
+and on vector components inside a selected output element. Matrix, boolean,
+structure and nested-array outputs, centroid outputs, overlapping locations and
+out-of-range subscripts fail explicitly.
+
 ## Semantics preserved
 
 - Clip depth: `gl_Position.z` remapped from GL `[-w, w]` to WebGPU `[0, w]`
@@ -224,6 +243,15 @@ approximated with implicit sampling or an arbitrary level.
 
 ## Evidence
 
+- `essl_fragment_outputs.test.mjs` covers flattened float/signed/unsigned
+  outputs, whole-array copies, helper calls, direct subscript rules, escaped
+  names and invalid interfaces. `animation_program_mrt.test.mjs` also compiles
+  array programs through the actual attachment planner, including sparse and
+  mixed-format targets, multisampling and rejection before pipeline allocation.
+  Both suites pass **24 tests**. The added array cases in
+  `program_mrt_targets.mjs` cover per-attachment readback, integer payloads,
+  resize and uniform updates; browser pixel validation remains pending because
+  Chromium cannot launch in this environment. No pixel-parity claim is made.
 - `essl_integer_cube.test.mjs` covers source/GPU dimension reflection, both integer
   signs, arrays/helpers, argument effects, base-level vertex sampling, alias views,
   upload history, Source sharing, disposal and loading defaults. Together with the

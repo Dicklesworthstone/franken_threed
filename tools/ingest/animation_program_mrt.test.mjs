@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {createProgramMeshes} from './animation_program_mesh.mjs';
 import {createGpuProgramGeometry} from './gpu_buffer_geometry.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {compileEsslProgram} from './essl_wgsl.mjs';
 
 function fixture(t, formats = ['rgba8unorm', 'rgba16float'], samples = 1) {
   const device = geometryDevice(), pipelines = [];
@@ -88,4 +89,45 @@ test('immediate callback-created MRT programs use the same attachment mapping', 
   const f = fixture(t);
   const record = f.owner.addImmediate(f.gpu, {program: f.program, raster: f.raster});
   assert.deepEqual(record.pipelines.normal.fragment.targets.map(target => target.format), ['rgba8unorm', 'rgba16float']);
+});
+
+const arrayProgram = (declarations, body) => compileEsslProgram(
+  '#version 300 es\nvoid main(){gl_Position=vec4(0.,0.,0.,1.);}',
+  '#version 300 es\nprecision highp float;precision highp int;\n' + declarations + '\nvoid main(){' + body + '}');
+
+for (const samples of [1, 4]) test(`compiled output arrays reach every mixed-format target (${samples} samples)`, async t => {
+  const f = fixture(t, ['rgba8unorm', 'rgba16float', 'rgba8unorm'], samples);
+  Object.assign(f.program, arrayProgram('layout(location=1) out vec4 colors[2];',
+    'colors[0]=vec4(.25);colors[1]=vec4(.75);'));
+  const record = await f.add();
+  assert.deepEqual(record.reflection.outputs.map(output => output.location), [1, 2]);
+  assert.deepEqual(f.pipelines[0].fragment.targets, [
+    {format: 'rgba8unorm', writeMask: 0}, {format: 'rgba16float', writeMask: 15}, {format: 'rgba8unorm', writeMask: 15},
+  ]);
+  assert.equal(f.pipelines[0].multisample.count, samples);
+});
+
+test('compiled signed and unsigned output arrays keep their independent integer formats', async t => {
+  const f = fixture(t, ['rg32sint', 'rg32uint', 'rg32uint']);
+  Object.assign(f.program, arrayProgram('layout(location=1) out uvec4 colors[2];layout(location=0) out ivec2 tags[1];',
+    'colors[0]=uvec4(0xffffffffu,0x80000000u,3u,5u);colors[1]=uvec4(7u);tags[0]=ivec2(-1,-65537);'));
+  await f.add();
+  assert.deepEqual(f.pipelines[0].fragment.targets, [
+    {format: 'rg32sint', writeMask: 15}, {format: 'rg32uint', writeMask: 15}, {format: 'rg32uint', writeMask: 15},
+  ]);
+  assert.deepEqual(f.program.reflection.outputs.map(output => output.glslType), ['uvec4', 'uvec4', 'ivec2']);
+});
+
+test('every compiled output-array element checks the attachment type before allocation', async t => {
+  const f = fixture(t, ['rgba32uint', 'rgba32sint']);
+  Object.assign(f.program, arrayProgram('out uvec4 colors[2];', 'colors[0]=uvec4(1u);colors[1]=uvec4(2u);'));
+  await assert.rejects(f.add(), /require i32 fragment outputs/);
+  assert.equal(f.pipelines.length, 0);
+});
+
+test('compiled output arrays cannot silently exceed the allocated attachments', async t => {
+  const f = fixture(t);
+  Object.assign(f.program, arrayProgram('layout(location=1) out vec4 colors[2];', 'colors[0]=vec4(.25);colors[1]=vec4(.75);'));
+  await assert.rejects(f.add(), /distinct allocated color attachments/);
+  assert.equal(f.pipelines.length, 0);
 });

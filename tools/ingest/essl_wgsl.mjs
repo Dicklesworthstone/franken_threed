@@ -55,6 +55,9 @@ const VOID = {k: 'void'}, FLOAT = S('float'), INT = S('int'), UINT = S('uint'), 
 const MAX_UNIFORM_BLOCK_MEMBERS = 4096;
 // Sampler arrays become individual resource parameters, not WGSL value arrays.
 const MAX_SAMPLER_PARAMETER_ELEMENTS = 4096;
+// A fragment array expands into individual WGSL entry-point members. The
+// renderer checks the device's smaller attachment limit; bound compilation too.
+const MAX_FRAGMENT_OUTPUT_LOCATIONS = 4096;
 const SCALAR_PREFIX = {float: '', int: 'i', uint: 'u', bool: 'b'};
 const WGSL_SCALAR = {float: 'f32', int: 'i32', uint: 'u32', bool: 'bool'};
 const SAMPLERS = {
@@ -280,7 +283,9 @@ function reflect(shared, units, varyings) {
     attributes: units.vertex.inputs.filter(i => !i.builtin).map(i => ({name: i.name, glslType: glslName(i.type), location: i.location,
       locations: i.type.k === 'm' ? i.type.c : 1, components: i.type.k === 'm' ? i.type.r : comps(i.type), scalar: scalarOf(i.type)})),
     varyings: varyings.map(v => ({name: v.name, glslType: glslName(v.type), location: v.location, flat: v.flat, centroid: v.centroid})),
-    outputs: units.fragment.outputs.filter(o => !o.builtin).map(o => ({name: o.name, glslType: glslName(o.type), location: o.location})),
+    outputs: units.fragment.outputs.filter(o => !o.builtin).flatMap(o =>
+      ioSlots(o.type, shared).map((slot, i) => ({name: o.name + slot.access,
+        glslType: glslName(slot.type), location: o.location + i}))),
     writesPointSize: units.vertex.used.has('gl_PointSize'),
     usesFragCoord: units.fragment.used.has('gl_FragCoord'),
     writesFragDepth: units.fragment.used.has('gl_FragDepth'),
@@ -630,10 +635,23 @@ class Unit {
         }
         if (storage === 'in' && this.stage === 'vertex' && type.k === 'a') essError('Vertex inputs cannot be arrays', v.line);
         if (type.k === 's' && type.s === 'bool' || type.k === 'v' && type.s === 'bool') essError('Boolean stage I/O is not ESSL', v.line);
-        const io = {name: v.name, type, w, flat: d.q.interp === 'flat', centroid: d.q.centroid, location: d.q.layout?.location ?? null};
+        const fragmentOutput = this.stage === 'fragment' && storage === 'out';
+        if (fragmentOutput) {
+          const element = type.k === 'a' ? type.of : type;
+          if (!['s', 'v'].includes(element.k) || !['float', 'int', 'uint'].includes(element.s))
+            essError('Fragment outputs require numeric scalars, vectors or one-dimensional arrays of them', v.line);
+          if (d.q.centroid) essError('Fragment outputs cannot use centroid interpolation', v.line);
+          if (type.k === 'a') {
+            if (this.version !== 300) essError('Fragment output arrays require ESSL 3.00', v.line);
+            const size = v.array ?? d.type.array, scalar = size && size !== 'unsized' ? this.expr(size, {scope: null, pre: []}).t : null;
+            if (!Number.isSafeInteger(type.n) || type.n < 1 || scalar?.k !== 's' || !['int', 'uint'].includes(scalar.s))
+              essError('Fragment output arrays require a positive constant integer size', v.line);
+          }
+        }
+        const io = {name: v.name, type, w, flat: d.q.interp === 'flat', centroid: d.q.centroid, location: d.q.layout?.location ?? null, line: v.line};
         (storage === 'in' ? this.inputs : this.outputs).push(io);
         this.privates.push(`var<private> ${w}: ${this.wgsl(type)};`);
-        this.globals.set(v.name, {kind: 'global', type, w});
+        this.globals.set(v.name, {kind: 'global', type, w, fragmentOutputArray: fragmentOutput && type.k === 'a'});
         continue;
       }
       if (storage === 'const') {
@@ -844,11 +862,30 @@ class Unit {
     }
     if (this.used.has('gl_FrontFacing')) { fields.push('@builtin(front_facing) f3d_front_facing: bool,'); copy.push('f3d_FrontFacing = input.f3d_front_facing;'); }
     const outFields = [], outCopy = [];
-    let location = 0;
+    const locations = new Set();
+    let outputCount = 0;
     for (const o of this.outputs) {
-      if (o.location === null) o.location = location;
-      location = o.location + 1;
-      outFields.push(`@location(${o.location}) ${o.w}: ${this.wgsl(o.type)},`); outCopy.push(`out.${o.w} = ${o.w};`);
+      if (o.location === null) {
+        if (this.outputs.length !== 1) essError('Multiple fragment outputs require explicit locations', o.line);
+        o.location = 0;
+      }
+      const count = o.type.k === 'a' ? o.type.n : 1;
+      if (!Number.isSafeInteger(o.location) || o.location < 0 || !Number.isSafeInteger(o.location + count - 1))
+        essError('Fragment output location must be a nonnegative integer', o.line);
+      outputCount += count;
+      if (outputCount > MAX_FRAGMENT_OUTPUT_LOCATIONS)
+        essError(`Fragment output expansion exceeds ${MAX_FRAGMENT_OUTPUT_LOCATIONS} locations`, o.line);
+      ioSlots(o.type, this.shared).forEach((slot, i) => {
+        const location = o.location + i;
+        if (locations.has(location)) essError(`Fragment output location ${location} is already occupied`, o.line);
+        locations.add(location);
+        // A private array retains normal GLSL value/copy semantics. Only the
+        // final interface expands; generated member names cannot alias a user
+        // output such as colors_e0 next to an array called colors.
+        const field = o.type.k === 'a' ? `f3d_o${location}` : o.w;
+        outFields.push(`@location(${location}) ${field}: ${this.wgsl(slot.type)},`);
+        outCopy.push(`out.${field} = ${o.w}${slot.access};`);
+      });
     }
     if (this.used.has('gl_FragDepth')) { outFields.push('@builtin(frag_depth) f3d_frag_depth: f32,'); outCopy.push('out.f3d_frag_depth = f3d_FragDepth;'); }
     const lines = [];
@@ -1140,11 +1177,15 @@ class Unit {
         if (b) { this.used.add(e.name); this.builtinPrivate(e.name, b); return {c: b.w, t: b.type}; }
         if (!s) essError(`Undeclared identifier ${e.name}`, e.line);
         if (s.kind === 'pparam') return {c: `(*${s.w})`, t: s.type};
-        if (s.kind === 'local' || s.kind === 'global') { if (s.readonly || s.isConst) essError(`Cannot assign to const ${e.name}`, e.line); return {c: s.w, t: s.type}; }
+        if (s.kind === 'local' || s.kind === 'global') { if (s.readonly || s.isConst) essError(`Cannot assign to const ${e.name}`, e.line); return {c: s.w, t: s.type, fragmentOutputArray: s.fragmentOutputArray}; }
         essError(`${e.name} is not assignable`, e.line);
       }
       case 'index': {
         const base = this.lvalue(e.a, ctx, indices);
+        if (base.fragmentOutputArray) {
+          const index = this.fragmentOutputIndex(e.index, base.t, ctx);
+          return {c: `${base.c}[${index}]`, t: base.t.of};
+        }
         let index = indices?.get(e);
         if (index === undefined) {
           const code = this.indexCode(e.index, ctx);
@@ -1248,7 +1289,7 @@ class Unit {
     switch (e.k) {
       case 'num': { const n = parseNumber(e.v); return {c: n.code, t: n.type}; }
       case 'bool': return {c: String(e.v), t: BOOL};
-      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u || r.block ? r : {c: `(${r.c})`, t: r.t, smp: r.smp, ref: r.ref}; }
+      case 'paren': { const r = this.exprRaw(e.e, ctx); return r.u || r.block ? r : {c: `(${r.c})`, t: r.t, smp: r.smp, ref: r.ref, fragmentOutputArray: r.fragmentOutputArray}; }
       case 'id': return this.identifier(e, ctx);
       case 'seq': {
         for (const x of e.list.slice(0, -1)) ctx.pre.push(...this.exprStatement(x, ctx));
@@ -1320,7 +1361,7 @@ class Unit {
       case 'samplerParam': return {c: null, t: s.type, smp: {kind: 'param', w: s.w, count: s.count}};
       case 'pparam': return {c: `(*${s.w})`, t: s.type, ref: true};
       case 'ublock': return {c: null, t: {k: 'ublock'}, block: s};
-      default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type, ref: true};
+      default: if (this.globals.get(e.name) === s) this.usedGlobals.add(e.name); return {c: s.w, t: s.type, ref: true, fragmentOutputArray: s.fragmentOutputArray};
     }
   }
   samplerNames(r, line) {
@@ -1339,6 +1380,10 @@ class Unit {
   }
   index(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
+    if (a.fragmentOutputArray) {
+      const index = this.fragmentOutputIndex(e.index, a.t, ctx);
+      return {c: `${a.c}[${index}]`, t: a.t.of, ref: true};
+    }
     if (a.block?.elements) {
       const index = this.expr(e.index, ctx), k = this.constValue(e.index, ctx.scope);
       if (!['int', 'uint'].includes(index.t.s) || index.t.k !== 's' || !Number.isSafeInteger(k))
@@ -1374,6 +1419,15 @@ class Unit {
       return {c: `${base.c}[${index.c}]`, t, u: true};
     }
     return {c: `${base.c}[${index.c}]`, t, ref: a.ref};
+  }
+  /** ESSL 3.00 §4.3.6 restricts the output array's own subscript, not a
+   * copied function parameter/local array or a vector component inside it. */
+  fragmentOutputIndex(expression, type, ctx) {
+    const index = this.expr(expression, ctx), value = this.constValue(expression, ctx.scope);
+    if (index.t.k !== 's' || !['int', 'uint'].includes(index.t.s) || !Number.isSafeInteger(value))
+      essError('Fragment output array index must be a constant integer expression', expression.line);
+    if (value < 0 || value >= type.n) essError('Fragment output array index out of range', expression.line);
+    return String(value) + (index.t.s === 'uint' ? 'u' : '');
   }
   field(e, ctx) {
     const a = this.exprRaw(e.a, ctx);
