@@ -21,6 +21,8 @@ export function specializeGeometryTangents(source,{runtimeModule,vectorSource,ve
   if(role==='core' || role==='vector2')tails.push(`${register}('Vector2',Vector2);`);
   if(role==='core' || role==='attributes')
     tails.push(`${register}('attribute',BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute]);`);
+  if(role==='core' || role==='interleaved-attributes')
+    tails.push(`${register}('attribute',InterleavedBufferAttribute,[],"interleaved");`);
   if(role==='core' || role==='geometry') {
     if(role==='core'){vectorSource=source;vector2Source=source;attributeSource=source;}
     else if(geometryTangentSourceRole(vectorSource??'')!=='vector' || geometryTangentSourceRole(vector2Source??'')!=='vector2' ||

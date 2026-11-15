@@ -231,3 +231,35 @@ It does not preserve original function-source strings: applications that observe
 source text need an appropriate build contract or the specialization opt-out,
 as with other source-changing bundler transforms. Full application compatibility
 and the renderer/performance release gates remain separate requirements.
+
+### Source-derived tangent generation
+
+The same `--specialize-numeric` build option compiles the pinned
+`BufferGeometry.computeTangents()` algorithm to one synchronous Wasm transaction.
+Position, normal, UV and tangent attributes may independently use contiguous or
+interleaved Float32/Float64 storage, with ordinary Uint16/Uint32 indices. Source
+and built-core imports share the same 32 typed variants. Record strides and
+offsets are runtime inputs, so interleaving adds no variant combinations.
+
+The kernel retains the source's two group passes, accumulation order,
+Gram–Schmidt orthogonalization, handedness and typed-store rounding. Disjoint
+attribute lanes may share one interleaved buffer; private output staging keeps
+neighboring values and their exact bytes, including NaN payloads. Public arrays,
+attributes and backing buffers keep identity. Attribute allocation, source
+errors and the final geometry flag remain in JavaScript at their original
+positions; the operation does not request a GPU upload.
+
+True output/input overlap, uncertain shared layouts, normalized or custom
+attributes, getters, proxies, modified methods and exhausted budgets retain the
+original algorithm before any native output is published. Full byte extents
+govern overlap and memory checks. The focused tests execute actual generated
+Wasm and compare complete buffers with the unchanged pinned implementation:
+
+```bash
+node --max-old-space-size=256 --test --test-concurrency=1 \
+  tools/ingest/geometry_tangents.test.mjs \
+  tools/ingest/geometry_tangents_interleaved.test.mjs
+```
+
+This preserves the existing tangent algorithm; it does not substitute
+MikkTSpace, establish rendered parity or claim a measured speedup.

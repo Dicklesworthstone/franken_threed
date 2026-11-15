@@ -28,8 +28,9 @@ const methods={Vector3:['fromBufferAttribute','sub','copy','multiplyScalar','add
 /** Emitted only at pinned array/object literals and class declarations. A Proxy
  * around an allocation never acquires its target's witness. */
 export function registerGeometryTangentAllocation(value) {apply(addMethod,allocations,[value]);return value;}
-export function registerGeometryTangentClass(kind,Class,children=[]) {
-  const proto=data(Class,'prototype'),record={kind,proto,parent:prototype(proto),Class,
+export function registerGeometryTangentClass(kind,Class,children=[],layout='contiguous') {
+  const proto=data(Class,'prototype'),record={kind,proto,parent:prototype(proto),Class,layout,
+    countGetter:layout==='interleaved'?descriptor(proto,'count')?.get:null,
     methods:methods[kind].map(name=>[name,data(proto,name)])};
   set(classes,Class,record);set(classes,proto,record);
   for(const Child of children) {
@@ -67,16 +68,29 @@ function attributeInput(object,size) {
     }
     if(!found)return null;
   }
-  const array=data(object,'array'),count=data(object,'count');
-  if(data(object,'itemSize')!==size || data(object,'normalized')!==false || !integer(count) || count<0)return null;
+  const itemSize=data(object,'itemSize');
+  if(data(object,'normalized')!==false || (known.layout==='interleaved'
+    ? size===1 || !integer(itemSize) || itemSize<size : itemSize!==size))return null;
+  let array,count,stride=size,componentOffset=0;
+  if(known.layout==='interleaved') {
+    // Inspect descriptors and witnessed backing storage, never invoke a source
+    // accessor during speculative admission. The original count getter reads
+    // this same own data field. Custom getters and Proxies retain source code.
+    const countDescriptor=descriptor(proto,'count');
+    if(descriptor(object,'count') || !known.countGetter || countDescriptor?.get!==known.countGetter || countDescriptor.set)return null;
+    const interleaved=data(object,'data');if(!isNumericObject(interleaved))return null;
+    array=data(interleaved,'array');count=data(interleaved,'count');stride=data(interleaved,'stride');componentOffset=data(object,'offset');
+    if(!integer(stride) || stride<itemSize || !integer(componentOffset) || componentOffset<0 || componentOffset>stride-itemSize)return null;
+  }else {array=data(object,'array');count=data(object,'count');}
+  if(!integer(count) || count<0 || !integer(count*stride))return null;
   try {
     const layout=layouts[apply(tag,array,[])];
-    if(!layout || prototype(array)!==layout.Type.prototype || apply(length,array,[])!==count*size)return null;
+    if(!layout || prototype(array)!==layout.Type.prototype || apply(length,array,[])!==count*stride)return null;
     const storage=apply(buffer,array,[]),byteLength=apply(bufferLength,storage,[]),byteOffset=apply(offset,array,[]);
     if(resizable && apply(resizable,storage,[]))return null;
-    const bytes=count*size*layout.bytes;
+    const bytes=count*stride*layout.bytes;
     if(bytes+byteOffset>byteLength)return null;
-    return {array,count,storage,byteOffset,bytes,...layout};
+    return {...layout,array,count,storage,byteOffset,bytes,size,stride,componentOffset};
   }catch{return null;}
 }
 function groupsInput(owner,indexCount,maxBytes) {
@@ -104,7 +118,16 @@ function inputs(owner,record,position,normal,uv,index,tangent) {
   for(let i=0;i<4;i++) {
     const input=values[i];
     if(input.storage===target.storage && input.bytes && target.bytes && input.byteOffset<target.byteOffset+target.bytes &&
-        target.byteOffset<input.byteOffset+input.bytes)return null;
+        target.byteOffset<input.byteOffset+input.bytes) {
+      // A common interleaved record shares its array across attributes. Native
+      // tangents may write disjoint lanes in that record without changing a
+      // later normal/index read. Unknown or genuinely intersecting layouts
+      // keep the source recurrence instead of separating aliased state.
+      const separateLanes=input.type===target.type && input.byteOffset===target.byteOffset &&
+        input.count===target.count && input.stride===target.stride &&
+        (input.componentOffset+input.size<=target.componentOffset || target.componentOffset+target.size<=input.componentOffset);
+      if(!separateLanes)return null;
+    }
   }
   const groups=groupsInput(owner,values[3].count,record.maxMemoryBytes);
   if(!groups)return null;
@@ -143,12 +166,17 @@ export function tryGeometryTangents(owner,token,position,normal,uv,index,tangent
   if(!input)return fallback('GEOMETRY_TANGENT_GUARD');
   try {
     const {values,target,groups,groupCount}=input,count=values[0].count;
-    const output=new target.Type(count*4),tan1=new F64(count*3),tan2=new F64(count*3);
+    const output=new target.Type(count*target.stride),tan1=new F64(count*3),tan2=new F64(count*3);
     apply(copy,output,[target.array]);
-    runtime.run(values[0].array,values[1].array,values[2].array,values[3].array,output,groups,tan1,tan2,groupCount);
+    runtime.run(values[0].array,values[1].array,values[2].array,values[3].array,output,groups,tan1,tan2,groupCount,
+      values[0].stride,values[0].componentOffset,values[1].stride,values[1].componentOffset,
+      values[2].stride,values[2].componentOffset,target.stride,target.componentOffset);
     // Engines may choose different NaN payloads for Wasm arithmetic. Keep those
     // uncommon results on the source path before publishing a single byte.
-    for(let i=0;i<count*4;i++)if(output[i]!==output[i])return fallback('GEOMETRY_TANGENT_NAN');
+    for(let i=0;i<count;i++)for(let j=0;j<4;j++) {
+      const value=output[i*target.stride+target.componentOffset+j];
+      if(value!==value)return fallback('GEOMETRY_TANGENT_NAN');
+    }
     apply(copy,target.array,[output]);
   }catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_TANGENT_EXECUTION');}
   stats.wasmCalls++;stats.lastFailure=null;return true;
