@@ -54,9 +54,12 @@ to 4,096 elements before allocating the generated interface; actual attachment
 limits remain the renderer's responsibility.
 
 Direct output-array subscripts must be constant integers. The existing constant
-evaluator admits scalar literals and constructors, arithmetic, constant aliases
-and array `.length()` expressions; builtin-derived constants such as `min(0, 1)`
-remain unsupported. Dynamic indexing still works on copied local/function arrays
+evaluator admits typed scalar and aggregate expressions, constant aliases,
+array `.length()` expressions and deterministic builtins such as `min`, `max`,
+`clamp`, `abs` and `sign` (see **Structural constant expressions** below).
+Local constant booleans preserve both true and false through aliases and
+conditional selectors. Variables that hide builtin names cannot supply a
+folded builtin selector. Dynamic indexing still works on copied local/function arrays
 and on vector components inside a selected output element. Matrix, boolean,
 structure and nested-array outputs, centroid outputs, overlapping locations and
 out-of-range subscripts fail explicitly.

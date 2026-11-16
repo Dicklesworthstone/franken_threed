@@ -12,6 +12,45 @@ const F = (body, decls = '') => `#version 300 es\nprecision highp float;\nlayout
 const program = (vs, fs) => compileEsslProgram(vs, fs);
 const minimalVS = V('gl_Position = mvp * vec4(position, 1.0);');
 
+test('integer builtin selectors retain signed and unsigned boundary semantics', () => {
+  for (const [index, expected] of [
+    ['sign(-8) + 1', 0], ['sign(0)', 0], ['sign(8)', 1],
+    ['min(0xffffffffu, 1u)', 1], ['max(0x80000000u, 1u) >> 31u', 1],
+    ['clamp(0xffffffffu, 0u, 1u)', 1], ['abs(-2147483647) >> 30', 1],
+    ['abs(int(0x80000000u)) < 0 ? 0 : 1', 0],
+    ['min(int(0xffffffffu), 1) + 1', 0], ['min(0xffffffffu + 2u, 2u)', 1],
+  ]) {
+    const r = program(minimalVS, F(`color = blocks[${index}].tint;`,
+      'layout(std140) uniform Params { vec4 tint; } blocks[2];'));
+    assert.match(r.fragment, new RegExp(`color = f3d_u\\.f3d_block0_${expected}_0;`), index);
+  }
+});
+
+test('sign-derived local constant aliases remain WGSL constants', () => {
+  const r = program(minimalVS, F(`const int direction = sign(-1);
+    const bool negative = direction < 0;
+    const bool positive = !negative;
+    color = texture(images[positive ? 0 : 1], vec2(.5));`, 'uniform sampler2D images[2];'));
+  assert.match(r.fragment, /const direction: i32 = sign\(/);
+  assert.match(r.fragment, /const negative: bool =/);
+  assert.match(r.fragment, /const positive: bool =/);
+  assert.match(r.fragment, /images_1_texture, images_1_sampler/);
+});
+
+test('builtin constant selectors reject variable shadows, mixed types and out-of-range values', () => {
+  const declarations = 'uniform sampler2D images[2];';
+  for (const index of ['min(1, 1u)', 'max(true, false)', 'abs(1u)', 'sign(1u)', 'clamp(0, 2, 1)'])
+    assert.throws(() => program(minimalVS, F(`color = texture(images[${index}], vec2(.5));`, declarations)),
+      /Sampler array index must be a constant integer expression/, index);
+  for (const index of ['min(-1, 0)', 'max(1, 2)', 'clamp(5u, 0u, 2u)'])
+    assert.throws(() => program(minimalVS, F(`color = texture(images[${index}], vec2(.5));`, declarations)),
+      /Sampler array index out of range/, index);
+  assert.throws(() => program(minimalVS, F('const int abs = 1;color = texture(images[abs(0)], vec2(.5));', declarations)),
+    /Sampler array index must be a constant/);
+  assert.throws(() => program(minimalVS, F('color = texture(images[abs(0)], vec2(.5));',
+    declarations + 'const int abs = 1;')), /Sampler array index must be a constant/);
+});
+
 test('preprocessor: function-like macros, nested conditionals, defined() and #error', () => {
   const {tokens} = preprocess('#define SQ(a) ((a) * (a))\n#define N 3\n#if defined(N) && N > 2\nfloat x = SQ(N + 1);\n#elif 1\nbad\n#else\nbad\n#endif\n#ifdef MISSING\nbad\n#endif');
   assert.equal(tokens.map(t => t.v).join(' '), 'float x = ( ( 3 + 1 ) * ( 3 + 1 ) ) ;');

@@ -432,8 +432,9 @@ class Unit {
   constant(e, scope) {
     return evaluateEsslConstant(e, {lookup: name => this.lookup(name, scope), basicType, parseNumber, same,
       structs: this.shared.structs,
-      // Declarations may precede a user overload that shadows a builtin.
-      isUserFunction: name => this.userFunctionNames.has(name)});
+      // Declarations may precede a user overload; lexical variables can also
+      // hide a builtin name and must never be evaluated as the builtin.
+      isUserFunction: name => this.userFunctionNames.has(name) || this.lookup(name, scope) !== undefined});
   }
   constValue(e, scope) {
     return this.constant(e, scope)?.value;
@@ -710,7 +711,7 @@ class Unit {
       case 'ctor': return e.args.every(constant);
       case 'field': return constant(e.a);
       case 'index': return constant(e.a) && constant(e.index);
-      case 'call': return !this.functions.has(e.name) && ['sin', 'cos', 'sqrt', 'pow', 'normalize', 'abs', 'min', 'max', 'clamp', 'exp', 'log', 'exp2', 'log2', 'radians', 'degrees', 'tan', 'floor', 'ceil', 'fract', 'length', 'dot', 'cross'].includes(e.name) && e.args.every(constant);
+      case 'call': return !this.functions.has(e.name) && ['sin', 'cos', 'sqrt', 'pow', 'normalize', 'abs', 'sign', 'min', 'max', 'clamp', 'exp', 'log', 'exp2', 'log2', 'radians', 'degrees', 'tan', 'floor', 'ceil', 'fract', 'length', 'dot', 'cross'].includes(e.name) && e.args.every(constant);
       default: return false;
     }
   }

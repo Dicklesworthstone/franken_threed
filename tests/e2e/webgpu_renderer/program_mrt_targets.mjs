@@ -112,6 +112,9 @@ async function capture(mode) {
             'void update(inout vec4 copy[2],int selected){copy[selected].xy+=vec2(delta);}',
             body: 'colors=vec4[2](vec4(.25,.5,.75,1.),vec4(.75,.25,.5,1.));update(colors,1);' +
               'const int last=colors.length()-1;colors[0].xy=colors[last].yx;colors_e0=colors[0];', locations: [0, 1, 2]},
+          {name: 'integer-builtins', declarations: 'out vec4 colors[min(3,abs(-2))];',
+            body: 'const bool first=sign(-3)<0;const bool last=!first;colors[clamp(-3,0,1)]=vec4(.25,.5,.75,1.);' +
+              'colors[max(0u,uint(first))]=vec4(colors[last?sign(1):0].bgr+vec3(delta),1.);', locations: [0, 1]},
           {name: 'unsigned', type: T.UnsignedIntType, declarations: 'out uvec4 colors[2];',
             body: 'colors[0]=uvec4(0xffffffffu-uint(delta),0x80000000u,3u,5u);colors[1]=uvec4(7u,11u,17u+uint(delta),23u);', locations: [0, 1]},
           {name: 'signed', type: T.IntType, declarations: 'out ivec4 colors[2];',

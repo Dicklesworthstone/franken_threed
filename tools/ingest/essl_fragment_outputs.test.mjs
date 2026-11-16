@@ -65,6 +65,23 @@ test('fragment output arrays reject dynamic and out-of-range direct reads and wr
   }
 });
 
+test('fragment arrays preserve false constant aliases and reject computed out-of-range selectors', () => {
+  const result = compile('out vec4 values[min(3, abs(-2))];', `
+    const bool first = true;
+    const bool second = !first;
+    values[clamp(-3, 0, 1)] = vec4(.25);
+    values[max(0u, uint(first))] = values[second ? sign(1) : 0];`);
+  assert.deepEqual(result.reflection.outputs.map(o => o.location), [0, 1]);
+  assert.match(result.fragment, /values\[0\] = vec4<f32>\(0.25\);/);
+  assert.match(result.fragment, /values\[1u\] = values\[0\];/);
+  for (const index of ['min(-1, 0)', 'max(1, 2)', 'clamp(3, 0, 2)'])
+    assert.throws(() => compile('out vec4 values[2];', `values[${index}] = vec4(1.);`),
+      /Fragment output array index out of range/, index);
+  assert.throws(() => compile('uniform bool enabled;out vec4 values[2];',
+    'const bool selected = enabled;values[selected ? 0 : 1] = vec4(1.);'),
+    /Fragment output array index must be a constant/);
+});
+
 test('fragment output location validation includes the full array range', () => {
   assert.throws(() => compile('layout(location=2) out vec4 a[2];layout(location=3) out vec4 b;'), /location 3 is already occupied/);
   assert.throws(() => compile('layout(location=3) out vec4 b;layout(location=2) out vec4 a[2];'), /location 3 is already occupied/);
