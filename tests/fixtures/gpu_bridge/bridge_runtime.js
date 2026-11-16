@@ -128,6 +128,7 @@ export class WebGpuBridgeHost {
     this.bindGroups = new Map();
     this.bundles = new Map();
     this.computePipelines = new Map();
+    this.pendingPreparations = new WeakMap();
     this.bufferEpochs = new Map();
     this.errorScopeActive = false;
     this.lastRenderTargetId = null;
@@ -142,6 +143,7 @@ export class WebGpuBridgeHost {
     this.bindGroups.clear();
     this.bundles.clear();
     this.computePipelines.clear();
+    this.pendingPreparations = new WeakMap();
     this.bufferEpochs.clear();
     this.lastRenderTargetId = null;
   }
@@ -352,6 +354,7 @@ export class WebGpuBridgeHost {
 
     this.errorScopeActive = true;
     const device = this.device;
+    const deviceGeneration = this.deviceGeneration;
     if (!device) {
       this.errorScopeActive = false;
       throw new Error("Cannot execute error scopes: device not initialized");
@@ -394,7 +397,7 @@ export class WebGpuBridgeHost {
           throw new Error(`WebGPU error scope reported error: ${err.message || err}`);
         }
       }
-      if (this.device !== device) {
+      if (this.device !== device || this.deviceGeneration !== deviceGeneration) {
         throw new Error("WebGPU device changed before scoped work completed");
       }
     }
@@ -454,6 +457,35 @@ export class WebGpuBridgeHost {
     }
 
     const dataPayload = packetBytes.subarray(dataBlockStart);
+
+    // Native creation is synchronous, but validity is not. Later packets may
+    // issue against a provisional pipeline/bundle without yielding; their
+    // validation receipt must also await its producer. Keep the exact objects
+    // so a late failure cannot remove a newer replacement using the same ID.
+    const device = this.device;
+    const deviceGeneration = this.deviceGeneration;
+    const preparations = this.pendingPreparations;
+    const preparation = { promise: null };
+    const dependencies = new Set();
+    const created = [];
+    const publishPrepared = (cache, id, value) => {
+      cache.set(id, value);
+      preparations.set(value, preparation);
+      created.push({ cache, id, value });
+    };
+    const usePrepared = (value) => {
+      const producer = preparations.get(value);
+      if (producer && producer !== preparation) dependencies.add(producer.promise);
+      return value;
+    };
+    const finishPreparation = (failed) => {
+      for (const { cache, id, value } of created) {
+        preparations.delete(value);
+        if (failed && this.device === device && this.deviceGeneration === deviceGeneration &&
+            cache.get(id) === value) cache.delete(id);
+      }
+      created.length = 0;
+    };
 
     // Synchronous execution block inside error scopes
     let submitted = false;
@@ -832,7 +864,7 @@ export class WebGpuBridgeHost {
                 multisample: { count: sampleCount },
               });
 
-              this.pipelines.set(pipelineId, {
+              publishPrepared(this.pipelines, pipelineId, {
                 pipeline,
                 bindGroupLayout,
                 hasUniformBuffer,
@@ -996,7 +1028,7 @@ export class WebGpuBridgeHost {
                 },
               });
 
-              this.pipelines.set(pipelineId, {
+              publishPrepared(this.pipelines, pipelineId, {
                 pipeline,
                 bindGroupLayout,
                 hasUniformBuffer,
@@ -1161,7 +1193,7 @@ export class WebGpuBridgeHost {
                 },
               });
 
-              this.pipelines.set(pipelineId, {
+              publishPrepared(this.pipelines, pipelineId, {
                 pipeline,
                 bindGroupLayout,
                 hasUniformBuffer,
@@ -1298,7 +1330,7 @@ export class WebGpuBridgeHost {
               }
 
               if (vertexCount > 0) {
-                const pipelineRecord = this.pipelines.get(pipelineId);
+                const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
                 if (!pipelineRecord) {
                   throw new Error(`RenderPass: unknown pipelineId ${pipelineId}`);
                 }
@@ -1552,7 +1584,7 @@ export class WebGpuBridgeHost {
               }
 
               if (vertexCount > 0) {
-                const pipelineRecord = this.pipelines.get(pipelineId);
+                const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
                 if (!pipelineRecord) {
                   throw new Error(`RenderPassDepth: unknown pipelineId ${pipelineId}`);
                 }
@@ -1832,7 +1864,7 @@ export class WebGpuBridgeHost {
                 throw new Error(`Invalid bundle target formatCode: ${targetFormatCode}`);
               }
 
-              const pipelineRecord = this.pipelines.get(pipelineId);
+              const pipelineRecord = usePrepared(this.pipelines.get(pipelineId));
               if (!pipelineRecord) {
                 throw new Error(`RecordBundle: unknown pipelineId ${pipelineId}`);
               }
@@ -1929,7 +1961,7 @@ export class WebGpuBridgeHost {
               }
 
               const bundle = bundleEncoder.finish();
-              this.bundles.set(bundleId, bundle);
+              publishPrepared(this.bundles, bundleId, bundle);
               break;
             }
 
@@ -2101,7 +2133,7 @@ export class WebGpuBridgeHost {
 
               const bundleList = [];
               for (const bId of bundleIds) {
-                const b = this.bundles.get(bId);
+                const b = usePrepared(this.bundles.get(bId));
                 if (!b) {
                   throw new Error(`ExecuteBundles: unknown bundleId ${bId}`);
                 }
@@ -2287,7 +2319,7 @@ export class WebGpuBridgeHost {
                 },
               });
 
-              this.computePipelines.set(pipelineId, {
+              publishPrepared(this.computePipelines, pipelineId, {
                 pipeline: computePipeline,
                 bindGroupLayout: bindGroupLayout,
                 bindingSpecs: bindingSpecs,
@@ -2314,7 +2346,7 @@ export class WebGpuBridgeHost {
                 );
               }
 
-              const pipelineRecord = this.computePipelines.get(pipelineId);
+              const pipelineRecord = usePrepared(this.computePipelines.get(pipelineId));
               if (!pipelineRecord) {
                 throw new Error(`DispatchCompute: unknown compute pipelineId ${pipelineId}`);
               }
@@ -2549,6 +2581,10 @@ export class WebGpuBridgeHost {
         }
       }
     });
+    preparation.promise = Promise.all([completion, ...dependencies]).then(
+      () => finishPreparation(false),
+      (error) => { finishPreparation(true); throw error; },
+    );
     // Keep bookkeeping in queue-effect order even when scope promises settle
     // in another order. Never invoke the observer while device scopes are open.
     try {
@@ -2562,10 +2598,10 @@ export class WebGpuBridgeHost {
       }
     } catch (error) {
       // The already-issued work still owns its asynchronous scope results.
-      await completion.catch(() => {});
+      await preparation.promise.catch(() => {});
       throw error;
     }
-    await completion;
+    await preparation.promise;
   }
 
   /**

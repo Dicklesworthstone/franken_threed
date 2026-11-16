@@ -7,26 +7,33 @@ const dataUrl = (source) => "data:text/javascript;base64," + Buffer.from(source)
 const memorySource = await readFile(new URL("./memory_transport.js", import.meta.url), "utf8");
 const bridgeSource = await readFile(new URL("./bridge_runtime.js", import.meta.url), "utf8");
 const { WebGpuBridgeHost } = await import(dataUrl(
+  "const GPUShaderStage = {VERTEX: 1, FRAGMENT: 2, COMPUTE: 4};\n" +
   bridgeSource.replace('"./memory_transport.js"', JSON.stringify(dataUrl(memorySource))),
 ));
 
 // Recording-device coverage of production packet decoding and submission order.
 // These assertions do not certify real GPU validation or rendered pixels.
-function packet(commands) {
-  const bytes = new Uint8Array(16 + commands.reduce((size, [, fields]) => size + 2 + fields.length * 4, 0));
+function packet(commands, payload = new Uint8Array()) {
+  const commandBytes = commands.map(command => {
+    if (command instanceof Uint8Array) return command;
+    const [opcode, fields] = command;
+    const bytes = new Uint8Array(2 + fields.length * 4), view = new DataView(bytes.buffer);
+    view.setUint16(0, opcode, true);
+    fields.forEach((value, index) => view.setUint32(2 + index * 4, value, true));
+    return bytes;
+  });
+  const bytes = new Uint8Array(16 + commandBytes.reduce((size, value) => size + value.length, 0) + payload.length);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x50443346, true);
   view.setUint16(4, 1, true);
   view.setUint32(8, commands.length, true);
+  view.setUint32(12, payload.length, true);
   let cursor = 16;
-  for (const [opcode, fields] of commands) {
-    view.setUint16(cursor, opcode, true);
-    cursor += 2;
-    for (const value of fields) {
-      view.setUint32(cursor, value, true);
-      cursor += 4;
-    }
+  for (const command of commandBytes) {
+    bytes.set(command, cursor);
+    cursor += command.length;
   }
+  bytes.set(payload, cursor);
   return bytes;
 }
 const ONE_F32 = 0x3f800000;
@@ -45,7 +52,8 @@ function recordBundle({ batch = false, drawCount = 2, offset = 0, stride = 256 }
 const executeBundles = (ids = [42]) => [8, [ids.length, ...ids]];
 
 function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeError = null } = {}) {
-  const events = [], descriptors = [], passes = [], scopes = [];
+  const events = [], descriptors = [], passes = [], scopes = [], validationResults = [];
+  let nextPipeline = 100;
   const host = new WebGpuBridgeHost();
   host.pipelines.set(100, {
     pipeline: { id: 100 },
@@ -74,6 +82,7 @@ function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeE
         assert.ok(pipeline && bound && vertex, "draw must rebind all state after executeBundles");
         events.push([kind + ":draw", ...args]);
       },
+      dispatchWorkgroups(...args) { events.push(["dispatch", ...args]); },
       executeBundles(bundles) {
         events.push(["execute", bundles.length]);
         pipeline = null;
@@ -86,12 +95,19 @@ function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeE
   }
   host.device = {
     limits: { minUniformBufferOffsetAlignment: 256 },
+    lost: new Promise(() => {}),
     pushErrorScope(kind) { scopes.push(kind); events.push(["push", kind]); },
     popErrorScope() {
       const kind = scopes.pop();
       events.push(["pop", kind]);
-      return Promise.resolve(kind === "validation" ? scopeError : null);
+      return Promise.resolve(kind === "validation"
+        ? (validationResults.length ? validationResults.shift() : scopeError) : null);
     },
+    createShaderModule: (descriptor) => ({ descriptor }),
+    createBindGroupLayout: (descriptor) => ({ descriptor }),
+    createPipelineLayout: (descriptor) => ({ descriptor }),
+    createRenderPipeline: (descriptor) => ({ id: nextPipeline++, descriptor }),
+    createComputePipeline: (descriptor) => ({ id: nextPipeline++, descriptor }),
     createBindGroup: (descriptor) => ({ descriptor }),
     createRenderBundleEncoder(descriptor) {
       descriptors.push(descriptor);
@@ -99,11 +115,12 @@ function fixture({ depthFormat = "depth24plus", depthWriteEnabled = true, scopeE
     },
     createCommandEncoder: () => ({
       beginRenderPass(descriptor) { passes.push(descriptor); return encoder("pass"); },
+      beginComputePass() { return encoder("compute"); },
       finish() { events.push(["finish"]); return {}; },
     }),
     queue: { submit() { events.push(["submit"]); } },
   };
-  return { host, events, descriptors, passes, scopes };
+  return { host, events, descriptors, passes, scopes, validationResults };
 }
 
 for (const depthFormat of ["depth24plus", "depth32float"]) {
@@ -187,6 +204,7 @@ test("depth bundle validation failures remain visible through the device error s
     executeBundles(),
   ])), /WebGPU error scope reported error: injected incompatible bundle depth layout/);
   assert.equal(f.host.errorScopeActive, false);
+  assert.equal(f.host.bundles.has(42), false, "failed bundle must not remain reusable");
   assert.deepEqual(f.scopes, []);
   assert.deepEqual(f.events.slice(-3), [
     ["submit"], ["pop", "out-of-memory"], ["pop", "validation"],
@@ -209,4 +227,140 @@ test("depth bundle decoding retains bounds, offset, multisample and opener check
     assert.equal(f.events.some(([name]) => name === "submit"), false);
     assert.deepEqual(f.scopes, []);
   }
+});
+
+const SHADER = new TextEncoder().encode("@compute @workgroup_size(1) fn main() {}");
+const createPipeline = ({ depth = false, id = 100 } = {}) => [depth ? 12 : 3, [
+  id, 0, SHADER.length, 2, 1, 1, 16, 20, ...(depth ? [3, 1, 2] : []),
+]];
+function computeCommand(opcode, fields) {
+  // Compute headers contain a two-byte pad before their u32 fields.
+  const bytes = new Uint8Array(4 + fields.length * 4), view = new DataView(bytes.buffer);
+  view.setUint16(0, opcode, true);
+  fields.forEach((value, index) => view.setUint32(4 + index * 4, value, true));
+  return bytes;
+}
+const createCompute = (id = 101) => computeCommand(21, [id, 0, SHADER.length, 0, 0, 0, 0]);
+const dispatchCompute = (id = 101) => computeCommand(22, [id, 1, 1, 1, 0]);
+function deferred() {
+  let resolve;
+  const promise = new Promise(yes => { resolve = yes; });
+  return { promise, resolve };
+}
+const outcome = promise => promise.then(() => "success", error => error.message);
+
+test("failed render/compute preparation removes only newly created residency", async () => {
+  const f = fixture({ scopeError: { message: "invalid shader" } });
+  const good = f.host.pipelines.get(100);
+  await assert.rejects(f.host.executePacket(packet([
+    createPipeline({ id: 102 }), createCompute(),
+  ], SHADER)), /invalid shader/);
+  assert.equal(f.host.pipelines.has(102), false);
+  assert.equal(f.host.computePipelines.has(101), false);
+  assert.equal(f.host.pipelines.get(100), good, "an unrelated valid pipeline survives");
+  assert.equal(f.events.filter(([name]) => name === "submit").length, 1, "issued work is not rolled back");
+  await assert.rejects(f.host.executePacket(packet([dispatchCompute()])), /unknown compute pipelineId/);
+});
+
+test("bundle preparation and execution inherit pending pipeline validation", async () => {
+  const f = fixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const producer = outcome(f.host.executePacket(packet([createPipeline({ depth: true })], SHADER)));
+  const bundle = outcome(f.host.executePacket(packet([recordBundle()])));
+  let consumerSettled = false;
+  const consumer = outcome(f.host.executePacket(packet([depthPass(), executeBundles()])));
+  consumer.then(() => { consumerSettled = true; });
+  await new Promise(setImmediate);
+  assert.equal(consumerSettled, false, "a dependent packet cannot report successful validation first");
+  assert.equal(f.events.filter(([name]) => name === "submit").length, 3, "queue issue stays synchronous");
+  validation.resolve({ message: "producer pipeline invalid" });
+  for (const message of await Promise.all([producer, bundle, consumer])) assert.match(message, /producer pipeline invalid/);
+  assert.equal(f.host.pipelines.has(100), false);
+  assert.equal(f.host.bundles.has(42), false);
+  await assert.rejects(f.host.executePacket(packet([recordBundle()])), /unknown pipelineId/);
+  await assert.rejects(f.host.executePacket(packet([depthPass(), executeBundles()])), /unknown bundleId/);
+});
+
+for (const kind of ["color", "depth", "compute"]) {
+  test(kind + " draws/dispatches await the pipeline producer's validation", async () => {
+    const f = fixture(), validation = deferred();
+    f.validationResults.push(validation.promise);
+    const create = kind === "compute" ? createCompute() : createPipeline({ depth: kind === "depth" });
+    const draw = kind === "compute" ? dispatchCompute() : kind === "depth" ? depthPass(3)
+      : [4, [(1 << 24) | (1 << 8), 10, 0, 0, 0, ONE_F32, 100, 2, 3, 0, 1]];
+    const producer = outcome(f.host.executePacket(packet([create], SHADER)));
+    const consumer = outcome(f.host.executePacket(packet([draw])));
+    validation.resolve({ message: "delayed compile failure" });
+    for (const message of await Promise.all([producer, consumer])) assert.match(message, /delayed compile failure/);
+  });
+}
+
+test("late validation failure preserves a newer same-ID pipeline and bundle", async () => {
+  const f = fixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const old = outcome(f.host.executePacket(packet([
+    createPipeline({ depth: true }), createCompute(), recordBundle(),
+  ], SHADER)));
+  await f.host.executePacket(packet([
+    createPipeline({ depth: true }), createCompute(), recordBundle(),
+  ], SHADER));
+  const replacements = [f.host.pipelines.get(100), f.host.computePipelines.get(101), f.host.bundles.get(42)];
+  validation.resolve({ message: "old preparation failed" });
+  assert.match(await old, /old preparation failed/);
+  assert.deepEqual([f.host.pipelines.get(100), f.host.computePipelines.get(101), f.host.bundles.get(42)], replacements);
+  await f.host.executePacket(packet([depthPass(), executeBundles(), dispatchCompute()]));
+});
+
+test("old-device validation cannot invalidate replacement-device residency", async () => {
+  const f = fixture(), replacement = fixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const old = outcome(f.host.executePacket(packet([createPipeline(), createCompute()], SHADER)));
+  f.host.installDeviceForTest({}, replacement.host.device);
+  await f.host.executePacket(packet([createPipeline(), createCompute()], SHADER));
+  const current = f.host.pipelines.get(100), compute = f.host.computePipelines.get(101);
+  validation.resolve({ message: "retired device failed" });
+  assert.match(await old, /retired device failed/);
+  assert.equal(f.host.pipelines.get(100), current);
+  assert.equal(f.host.computePipelines.get(101), compute);
+});
+
+test("validation receipts check device generation even if the native device object is reused", async () => {
+  const f = fixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const old = outcome(f.host.executePacket(packet([createPipeline()], SHADER)));
+  f.host.installDeviceForTest({}, f.host.device);
+  await f.host.executePacket(packet([createPipeline()], SHADER));
+  const current = f.host.pipelines.get(100);
+  validation.resolve(null);
+  assert.match(await old, /device changed/);
+  assert.equal(f.host.pipelines.get(100), current);
+});
+
+test("synchronous packet failure removes preparations without undoing issued writes", async () => {
+  const f = fixture();
+  f.host.device.queue.writeBuffer = () => f.events.push(["write"]);
+  await assert.rejects(f.host.executePacket(packet([
+    createPipeline(), createCompute(), [2, [1, 0, 0, 4]], [0xffff, []],
+  ], SHADER)), /Unknown opcode/);
+  assert.equal(f.host.pipelines.has(100), false);
+  assert.equal(f.host.computePipelines.has(101), false);
+  assert.equal(f.events.filter(([name]) => name === "write").length, 1);
+  assert.equal(f.events.some(([name]) => name === "submit"), false);
+});
+
+test("successful concurrent preparation remains reusable and observer failure owns validation", async () => {
+  const f = fixture(), validation = deferred();
+  f.validationResults.push(validation.promise);
+  const producer = f.host.executePacket(packet([createPipeline({ depth: true })], SHADER));
+  const consumer = f.host.executePacket(packet([recordBundle()]));
+  validation.resolve(null);
+  await Promise.all([producer, consumer]);
+  await f.host.executePacket(packet([depthPass(), executeBundles()]));
+  const successful = f.host.pipelines.get(100);
+  f.validationResults.push({ message: "observer packet invalid" });
+  await assert.rejects(f.host.executePacket(packet([createCompute()], SHADER), null, () => {
+    throw new Error("observer failed after submission");
+  }), /observer failed after submission/);
+  assert.equal(f.host.computePipelines.has(101), false);
+  assert.equal(f.host.pipelines.get(100), successful);
 });
