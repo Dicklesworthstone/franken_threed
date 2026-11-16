@@ -14,19 +14,26 @@ const get=(map,key)=>apply(mapGet,map,[key]),set=(map,key,value)=>apply(mapSet,m
 const F64=Float64Array,U8=Uint8Array,decode=globalThis.atob,charCode=String.prototype.charCodeAt;
 const objectPrototype=Object.prototype,typed=prototype(F64.prototype);
 const tag=descriptor(typed,Symbol.toStringTag).get,length=descriptor(typed,'length').get;
+const layouts={Float32Array:{Type:Float32Array,type:'f32[]'},Float64Array:{Type:F64,type:'f64[]'},
+  Uint32Array:{Type:Uint32Array,type:'u32[]'},Uint16Array:{Type:Uint16Array,type:'u16[]'},
+  Uint8Array:{Type:U8,type:'u8[]'},Uint8ClampedArray:{Type:Uint8ClampedArray,type:'u8c[]'},
+  Int32Array:{Type:Int32Array,type:'i32[]'},Int16Array:{Type:Int16Array,type:'i16[]'},Int8Array:{Type:Int8Array,type:'i8[]'}};
+const normalizedTypes=['Float32Array','Uint32Array','Uint16Array','Uint8Array','Uint8ClampedArray','Int32Array','Int16Array','Int8Array'];
 const classes=new WeakMap(),dispatches=new WeakMap(),statistics=new WeakMap();
 const boxVectorMethods=['fromBufferAttribute','min','max'];
 const methodNames={box:['expandByPoint'],vector:[...boxVectorMethods,'distanceToSquared','add'],attribute:['getX','getY','getZ']};
-const emptyBase={values:new F64(0),stride:3,offset:0,type:'f64[]'};
+const emptyBase={values:new F64(0),stride:3,offset:0,type:'f64[]',normalized:false};
 
 /** Compiler-emitted registrations refer only to exact source class definitions. */
-export function registerGeometryBoundsClass(kind,Class,Child,layout='contiguous') {
+export function registerGeometryBoundsClass(kind,Class,children=[],layout='contiguous',normalization=null) {
   const proto=data(Class,'prototype'),parent=prototype(proto);
   const methods=methodNames[kind].map(name=>[name,data(proto,name)]);
   const countGetter=layout==='interleaved'?descriptor(proto,'count')?.get:null;
-  set(classes,proto,{kind,parent,methods,layout,countGetter});
-  if(Child) {
-    const child=data(Child,'prototype');if(prototype(child)===proto)set(classes,child,{kind,parent:proto,methods,layout,countGetter});
+  const arrayGetter=layout==='interleaved'?descriptor(proto,'array')?.get:null;
+  set(classes,proto,{kind,parent,methods,layout,countGetter,arrayGetter,normalization});
+  for(const Child of children) {
+    const child=data(Child,'prototype');
+    if(prototype(child)===proto)set(classes,child,{kind,parent:proto,methods,layout,countGetter,arrayGetter,normalization});
   }
 }
 export function createGeometryBoundsDispatch(variants,resolveMath) {
@@ -36,7 +43,8 @@ function shape(object,kind,required=methodNames[kind]) {
   if(!isNumericObject(object))return false;
   const proto=prototype(object),known=get(classes,proto);
   if(!known || known.kind!==kind || prototype(proto)!==known.parent)return false;
-  for(const [key,method]of known.methods) {
+  for(let i=0;i<known.methods.length;i++) {
+    const pair=known.methods[i],key=pair[0],method=pair[1];
     if(!required.includes(key))continue;
     if(!method)return false;
     let current=object;
@@ -64,19 +72,40 @@ function vector(object,state,offset,required=boxVectorMethods,writable=true) {
 function attributeInput(attribute) {
   if(!shape(attribute,'attribute'))return null;
   const proto=prototype(attribute),record=get(classes,proto),itemSize=data(attribute,'itemSize');
-  if(data(attribute,'normalized')!==false || !integer(itemSize) || itemSize<3)return null;
+  const normalized=data(attribute,'normalized');
+  if(typeof normalized!=='boolean' || !integer(itemSize) || itemSize<3)return null;
   let values,count,stride=itemSize,offset=0;
   if(record.layout==='interleaved') {
     const countDescriptor=descriptor(proto,'count');
     if(descriptor(attribute,'count') || !record.countGetter || countDescriptor?.get!==record.countGetter || countDescriptor.set)return null;
+    if(normalized) {
+      // Only normalized source accessors consult this.array after the raw
+      // load. An own/changed getter must retain its original calls and errors.
+      const arrayDescriptor=descriptor(proto,'array');
+      if(descriptor(attribute,'array') || !record.arrayGetter || arrayDescriptor?.get!==record.arrayGetter || arrayDescriptor.set)return null;
+    }
     const buffer=data(attribute,'data');if(!isNumericObject(buffer))return null;
     values=data(buffer,'array');count=data(buffer,'count');stride=data(buffer,'stride');offset=data(attribute,'offset');
     if(!integer(stride) || stride<itemSize || !integer(offset) || offset<0 || offset>stride-itemSize)return null;
   }else {values=data(attribute,'array');count=data(attribute,'count');}
   if(!integer(count) || count<0 || !integer(count*stride))return null;
   try {
-    const name=apply(tag,values,[]),type=name==='Float32Array'?'f32[]':name==='Float64Array'?'f64[]':null;
-    return type && apply(length,values,[])===count*stride?{values,count,stride,offset,type}:null;
+    const name=apply(tag,values,[]),layout=layouts[name];
+    if(!layout || prototype(values)!==layout.Type.prototype || apply(length,values,[])!==count*stride)return null;
+    if(normalized) {
+      if(name==='Float64Array' || !record.normalization || typeof record.normalization.denormalize!=='function')return null;
+      // MathUtils switches on array.constructor. Inspect descriptors without
+      // invoking custom getters, then verify the source realm's constructors
+      // before selecting its pinned conversion formula inside Wasm.
+      const ctor=descriptor(values,'constructor');
+      if(ctor ? !hasOwn(ctor,'value') || ctor.value!==layout.Type : data(layout.Type.prototype,'constructor')!==layout.Type)return null;
+      for(let i=0;i<normalizedTypes.length;i++) {
+        const key=normalizedTypes[i];if(data(globalThis,key)!==layouts[key].Type)return null;
+      }
+      const current=record.normalization.resolveTypes();
+      for(let i=0;i<normalizedTypes.length;i++)if(current[i]!==layouts[normalizedTypes[i]].Type)return null;
+    }
+    return {values,count,stride,offset,type:layout.type,normalized};
   }catch{return null;}
 }
 function inputs(owner,attribute,scratch) {
@@ -106,12 +135,15 @@ export function tryGeometryBoxBounds(owner,token,attribute,scratch) {
   const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;},record=get(dispatches,token);
   if(!record)return fallback('GEOMETRY_BOUNDS_PLATFORM');
   let input=inputs(owner,attribute,scratch);if(!input)return fallback('GEOMETRY_BOUNDS_GUARD');
-  const variant=record.variants.find(value=>value.type===input.type),runtime=kernel(record,variant);
+  const variant=record.variants.find(value=>value.type===input.type);
+  if(!variant || input.normalized && !variant.normalization)return fallback('GEOMETRY_BOUNDS_STORAGE');
+  const runtime=kernel(record,variant);
   if(!runtime)return fallback(variant.failure);
   // Host initialization can encounter a policy hook. Revalidate live objects
   // before borrowing data; the admitted scan and publication invoke no hooks.
-  if(!matrixNumericPlatformIntact() || !(input=inputs(owner,attribute,scratch)))return fallback('GEOMETRY_BOUNDS_GUARD');
-  try{runtime.run(input.values,input.state,input.count,input.stride,input.offset);}
+  if(!matrixNumericPlatformIntact() || !(input=inputs(owner,attribute,scratch)) || input.normalized && !variant.normalization)
+    return fallback('GEOMETRY_BOUNDS_GUARD');
+  try{runtime.run(input.values,input.state,input.count,input.stride,input.offset,input.normalized?1:0);}
   catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_BOUNDS_EXECUTION');}
   // Preserve source-produced NaN bits for later typed-buffer observations.
   for(let i=0;i<9;i++)if(input.state[i]!==input.state[i])return fallback('GEOMETRY_BOUNDS_NAN');
@@ -148,13 +180,15 @@ export function tryGeometryRadiusBounds(owner,token,method,attribute,position,ce
   let input=radiusInputs(attribute,position,center,scratch,offset,maximum,relative);
   if(!input)return fallback('GEOMETRY_BOUNDS_GUARD');
   const variant=record.variants.find(value=>value.method===method && value.type===input.type && value.baseType===input.base.type);
-  if(!variant)return fallback('GEOMETRY_BOUNDS_STORAGE');
+  if(!variant || input.normalized && !variant.normalization || input.base.normalized && !variant.baseNormalization)
+    return fallback('GEOMETRY_BOUNDS_STORAGE');
   const runtime=kernel(record,variant);if(!runtime)return fallback(variant.failure);
-  if(!matrixNumericPlatformIntact() || !(input=radiusInputs(attribute,position,center,scratch,offset,maximum,relative)))
+  if(!matrixNumericPlatformIntact() || !(input=radiusInputs(attribute,position,center,scratch,offset,maximum,relative)) ||
+      input.normalized && !variant.normalization || input.base.normalized && !variant.baseNormalization)
     return fallback('GEOMETRY_BOUNDS_GUARD');
   let result;
   try{result=runtime.run(input.values,input.base.values,input.state,input.count,input.stride,input.base.stride,
-    input.offset,input.base.offset,maximum,relative?1:0);}
+    input.offset,input.base.offset,maximum,relative?1:0,input.normalized?1:0,input.base.normalized?1:0);}
   catch{return fallback(runtime.diagnostics.lastGuardFailure??'GEOMETRY_BOUNDS_EXECUTION');}
   if(result!==result)return fallback('GEOMETRY_BOUNDS_NAN');
   for(let i=0;i<9;i++)if(input.state[i]!==input.state[i])return fallback('GEOMETRY_BOUNDS_NAN');

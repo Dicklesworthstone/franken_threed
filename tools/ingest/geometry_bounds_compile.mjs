@@ -7,6 +7,13 @@ import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 import * as walk from 'acorn-walk';
 
+const storageTypes=['f32[]','f64[]','i8[]','u8[]','u8c[]','i16[]','u16[]','i32[]','u32[]'];
+function denormalizer(denormalizers,type,name) {
+  const source=denormalizers?.get(type);
+  return source?`function ${name}(${source.parameter}){return ${source.expression};}`:
+    `function ${name}(value){return value;}`;
+}
+
 export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) {
   const box=normalClasses(boxSource).get('Box3'),vector=normalClasses(vectorSource).get('Vector3');
   const attribute=normalClasses(attributeSource).get('BufferAttribute');
@@ -51,9 +58,12 @@ export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) 
       if(receiver==='Math')return 'Math.'+name+'('+node.arguments.map(arg=>expression(arg,env)).join(',')+')';
       if(receiver===attr && ['getX','getY','getZ'].includes(name)) {
         requirements.attribute.add(name);const get=normalMethod(attribute,name);
-        // The normalized branch remains on the source path under the guard.
-        return expression(get.body.body[0].declarations[0].init,new Map(env).set('this',attr)
+        const read=expression(get.body.body[0].declarations[0].init,new Map(env).set('this',attr)
           .set(get.params[0].name,expression(node.arguments[0],env)));
+        // Match the accessor's optional source denormalization after its load.
+        // The pinned helper's constructor branch is selected at build time;
+        // guards establish that constructor before this numeric scan executes.
+        return `(normalized?__boundsDenormalize(${read}):${read})`;
       }
     }
     throw new TypeError('Unsupported verified bounds expression: '+node.type);
@@ -81,17 +91,18 @@ export function deriveGeometryBoxKernel(boxSource,vectorSource,attributeSource) 
   // exact identity after all three loads. No per-vertex objects are allocated.
   const argument={type:'Identifier',name:scratchName};
   const body=call(load,env)+call({...expansion,arguments:[argument]},env);
-  return {source:'function scanBounds(values,state,count,stride,offset){for('+loop.init.kind+' '+init+';'+
+  return {source:'function scanBounds(values,state,count,stride,offset,normalized){for('+loop.init.kind+' '+init+';'+
     expression(loop.test,env)+';'+expression(loop.update,env)+'){'+body+'}}',
     span:{start:loop.start,end:loop.end},scratchName,
     requirements:Object.fromEntries(Object.entries(requirements).map(([name,methods])=>[name,[...methods]]))};
 }
 
-export function compileGeometryBoxKernels(derived,{maxMemoryPages=2048,maxIterations=100000000}={}) {
-  return ['f32[]','f64[]'].map(type=>{
-    const artifact=compileNumericKernel(derived.source,{parameterTypes:[type,'f64[]','f64','f64','f64'],
+export function compileGeometryBoxKernels(derived,{denormalizers,maxMemoryPages=2048,maxIterations=100000000}={}) {
+  return storageTypes.map(type=>{
+    const artifact=compileNumericKernel(derived.source,{parameterTypes:[type,'f64[]','f64','f64','f64','f64'],
+      helperSources:new Map([['__boundsDenormalize',denormalizer(denormalizers,type,'__boundsDenormalize')]]),
       generalControl:true,allowMath:true,maxMemoryPages,maxIterations,sourceName:'pinned Box3.setFromBufferAttribute'});
-    return {type,base64:Buffer.from(artifact.wasm).toString('base64')};
+    return {type,normalization:denormalizers?.has(type)??false,base64:Buffer.from(artifact.wasm).toString('base64')};
   });
 }
 
@@ -145,8 +156,10 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
       const read=source.body.body[0].declarations[0].init;
       if(read.type!=='MemberExpression' || !read.computed || path(read.object)!=='this.array')
         throw new TypeError('Unsupported verified bounds accessor');
-      return layout.array+'[('+rewrite(attributeSource,read.property,
+      const raw=layout.array+'[('+rewrite(attributeSource,read.property,
         new Map([['this.itemSize',layout.stride],[source.params[0].name,'('+index+')']]))+' + '+layout.offset+')]';
+      const base=layout.array==='baseValues';
+      return `(${base?'baseNormalized':'normalized'}?${base?'__boundsBaseDenormalize':'__boundsDenormalize'}(${raw}):${raw})`;
     })).join('\n');
   }
   function emit(node,ordinaryScan) {
@@ -166,7 +179,7 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
   }
   const scans=[['radius',ordinary],['morph-radius',morph]].map(([method,loop])=>({method,
     span:{start:loop.start,end:loop.end},attribute:method==='radius'?positionName:morphName,
-    source:'function scanRadius(values,baseValues,state,count,stride,baseStride,offset,baseOffset,'+reductionName+',relative){'+
+    source:'function scanRadius(values,baseValues,state,count,stride,baseStride,offset,baseOffset,'+reductionName+',relative,normalized,baseNormalized){'+
       'for('+rewrite(geometrySource,loop.init,new Map([[positionName+'.count','count'],[morphName+'.count','count']]))+';'+
       geometrySource.slice(loop.test.start,loop.test.end)+';'+geometrySource.slice(loop.update.start,loop.update.end)+')'+
       emit(loop.body,method==='radius')+'return '+reductionName+';}',
@@ -174,13 +187,17 @@ export function deriveGeometryRadiusKernels(geometrySource,vectorSource,attribut
   return {scans,helper,scratchName,centerName,reductionName,positionName,offsetName,relativeName};
 }
 
-export function compileGeometryRadiusKernels(derived,{maxMemoryPages=2048,maxIterations=100000000}={}) {
+export function compileGeometryRadiusKernels(derived,{denormalizers,maxMemoryPages=2048,maxIterations=100000000}={}) {
   const variants=[];
-  for(const scan of derived.scans)for(const type of ['f32[]','f64[]'])for(const baseType of scan.method==='radius'?['f64[]']:['f32[]','f64[]']) {
-    const artifact=compileNumericKernel(scan.source,{parameterTypes:[type,baseType,'f64[]','f64','f64','f64','f64','f64','f64','f64'],
-      helperSources:new Map([['__boundsDistance',derived.helper]]),generalControl:true,allowMath:true,maxMemoryPages,maxIterations,
+  for(const scan of derived.scans)for(const type of storageTypes)for(const baseType of scan.method==='radius'?['f64[]']:storageTypes) {
+    const artifact=compileNumericKernel(scan.source,{parameterTypes:[type,baseType,'f64[]','f64','f64','f64','f64','f64','f64','f64','f64','f64'],
+      helperSources:new Map([['__boundsDistance',derived.helper],
+        ['__boundsDenormalize',denormalizer(denormalizers,type,'__boundsDenormalize')],
+        ['__boundsBaseDenormalize',denormalizer(denormalizers,baseType,'__boundsBaseDenormalize')]]),
+      generalControl:true,allowMath:true,maxMemoryPages,maxIterations,
       sourceName:'pinned BufferGeometry.computeBoundingSphere '+scan.method});
-    variants.push({method:scan.method,type,baseType,base64:Buffer.from(artifact.wasm).toString('base64')});
+    variants.push({method:scan.method,type,baseType,normalization:denormalizers?.has(type)??false,
+      baseNormalization:denormalizers?.has(baseType)??false,base64:Buffer.from(artifact.wasm).toString('base64')});
   }
   return variants;
 }

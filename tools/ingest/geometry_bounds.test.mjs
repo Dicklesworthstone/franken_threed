@@ -14,6 +14,10 @@ import * as reference from '../../upstream/three.js/build/three.core.js';
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 const exports={Box3:'math/Box3.js',Vector3:'math/Vector3.js',BufferGeometry:'core/BufferGeometry.js',
   BufferAttribute:'core/BufferAttribute.js',Float32BufferAttribute:'core/BufferAttribute.js',
+  Int8BufferAttribute:'core/BufferAttribute.js',Uint8BufferAttribute:'core/BufferAttribute.js',
+  Uint8ClampedBufferAttribute:'core/BufferAttribute.js',Int16BufferAttribute:'core/BufferAttribute.js',
+  Uint16BufferAttribute:'core/BufferAttribute.js',Int32BufferAttribute:'core/BufferAttribute.js',
+  Uint32BufferAttribute:'core/BufferAttribute.js',
   Float16BufferAttribute:'core/BufferAttribute.js',InterleavedBuffer:'core/InterleavedBuffer.js',
   InterleavedBufferAttribute:'core/InterleavedBufferAttribute.js',Mesh:'objects/Mesh.js',
   MeshBasicMaterial:'materials/MeshBasicMaterial.js',Raycaster:'core/Raycaster.js',
@@ -41,7 +45,11 @@ const same=(actual,expected)=>{
 const points=[-2.125,1.25,0,3.5,-4.25,2.125,0.5,0.25,-6.125,1.75,3.25,4.5];
 const attribute=(api,values=points,Type=Float32Array,size=3)=>new api.BufferAttribute(new Type(values),size);
 const interleaved=(api,values=points,Type=Float32Array,stride=7,offset=2)=>{
-  const storage=new Type(values.length/3*stride+6).fill(777),array=storage.subarray(3,storage.length-3);
+  const count=values.length/3*stride;
+  // The source JSON writer views whole backing buffers as Uint32 words.
+  // Keep byte-sized fixtures exportable while retaining nonzero subview offsets.
+  const storage=new Type(Math.ceil((count+6)*Type.BYTES_PER_ELEMENT/4)*4/Type.BYTES_PER_ELEMENT).fill(777);
+  const array=storage.subarray(3,3+count);
   for(let i=0;i<values.length;i+=3)array.set(values.slice(i,i+3),i/3*stride+offset);
   return new api.InterleavedBufferAttribute(new api.InterleavedBuffer(array,stride),3,offset);
 };
@@ -90,6 +98,143 @@ test('interleaved bounds use guarded record offsets without changing source arra
       assert.equal(a.data,storage);assert.equal(storage.array,array);assert.deepEqual(new Uint8Array(array.buffer),bytes);
       assert.equal(api.diagnostics(actual).wasmCalls,values.some(Number.isNaN)?0:1);
     }
+  }
+});
+
+const quantizedTypes=[
+  [Int8Array,-128,127],[Uint8Array,0,255],[Uint8ClampedArray,0,255],
+  [Int16Array,-32768,32767],[Uint16Array,0,65535],
+  [Int32Array,-2147483648,2147483647],[Uint32Array,0,4294967295],
+  [Float32Array,-2.125,3.5],
+];
+test('quantized boxes and spheres run native source decoding for all integer types and attribute layouts',()=>{
+  for(const {api}of fixtures)for(const [Type,min,max]of quantizedTypes)for(const normalized of [false,true])
+    for(const layout of ['contiguous','typed-class','interleaved']) {
+      const values=[min,max,0,max,1,min,-1,0,2,Math.trunc(max/2),min,1];
+      const make=lib=>{
+        const g=new lib.BufferGeometry();let a;
+        if(layout==='interleaved')a=interleaved(lib,values,Type,8,3);
+        else if(layout==='typed-class')a=new lib[Type.name.replace('Array','BufferAttribute')](values,3);
+        else {
+          const storage=new Type(values.length+6).fill(7),view=storage.subarray(3,3+values.length);
+          view.set(values);a=new lib.BufferAttribute(view,3);
+        }
+        a.normalized=normalized;g.setAttribute('position',a);return g;
+      };
+      const actual=make(api),expected=make(reference),position=actual.attributes.position,array=position.array;
+      const bytes=new Uint8Array(array.buffer).slice(),version=position.isInterleavedBufferAttribute?position.data.version:position.version;
+      for(const g of [actual,expected]){g.computeBoundingBox();g.computeBoundingSphere();}
+      same(boxValues(actual.boundingBox),boxValues(expected.boundingBox));
+      same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+      assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius),Type.name+' '+layout);
+      assert.equal(position.array,array);assert.deepEqual(new Uint8Array(array.buffer),bytes);
+      assert.equal(position.isInterleavedBufferAttribute?position.data.version:position.version,version);
+      assert.deepEqual(api.diagnostics(actual.boundingBox),{wasmCalls:1,fallbackCalls:0,lastFailure:null});
+      assert.deepEqual(api.diagnostics(actual),{wasmCalls:1,fallbackCalls:0,lastFailure:null});
+    }
+});
+
+test('quantized relative and absolute morph bounds preserve mixed normalized storage and shared record lanes',()=>{
+  for(const {api}of fixtures)for(const [Position,min,max]of quantizedTypes)
+    for(const Morph of [Float64Array,Int8Array,Uint16Array])for(const relative of [false,true])for(const shared of [false,true]) {
+      const make=lib=>{
+        const g=new lib.BufferGeometry(),position=interleaved(lib,[min,0,max,max,1,min,-1,2,3],Position,9,1);
+        position.normalized=true;
+        let morph;
+        if(shared) {
+          for(let i=0;i<3;i++)position.data.array.set([i-1,2,1],i*9+5);
+          morph=new lib.InterleavedBufferAttribute(position.data,3,5,false);
+        }else {
+          morph=interleaved(lib,[-2,1,0,1,2,-1,0,-1,2],Morph,6,2);
+          morph.normalized=Morph!==Float64Array;
+        }
+        g.setAttribute('position',position);g.morphAttributes.position=[morph];g.morphTargetsRelative=relative;return g;
+      };
+      const actual=make(api),expected=make(reference);
+      for(let frame=0;frame<2;frame++) {
+        for(const g of [actual,expected]) {
+          const a=g.attributes.position,m=g.morphAttributes.position[0];
+          a.data.array[1]=frame?1:min;m.data.array[m.offset+2]=frame?-1:1;
+          g.computeBoundingBox();g.computeBoundingSphere();
+        }
+        same(boxValues(actual.boundingBox),boxValues(expected.boundingBox));
+        same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
+        assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));
+        assert.deepEqual(actual.toJSON().data.boundingSphere,expected.toJSON().data.boundingSphere);
+      }
+      assert.deepEqual(api.diagnostics(actual),{wasmCalls:4,fallbackCalls:0,lastFailure:null});
+      assert.equal(api.diagnostics(actual.boundingBox).wasmCalls,2);
+    }
+});
+
+test('normalized constructor and interleaved array hooks retain exact source calls and exception boundaries',()=>{
+  for(const {api}of fixtures)for(const mode of ['own-constructor','constructor-getter','prototype-constructor','global-constructor','array-getter','max-getter','iterator-close','throw']) {
+    const logs=[[],[]],make=lib=>({box:new lib.Box3(),attribute:interleaved(lib,points.map(v=>v*1000),Int16Array)});
+    const actual=make(api),expected=make(reference);let current=0,restore=()=>{};
+    for(const item of [actual,expected])item.attribute.normalized=true;
+    for(const [i,item]of [actual,expected].entries()) {
+      const values=item.attribute.array;
+      if(mode==='own-constructor')Object.defineProperty(values,'constructor',{value:Float32Array});
+      if(mode==='constructor-getter'||mode==='throw') {
+        let calls=0;
+        Object.defineProperty(values,'constructor',{get(){logs[i].push('constructor');
+          if(mode==='throw' && ++calls===5)throw new RangeError('decode stopped');return Int16Array;}});
+      }
+      if(mode==='array-getter')Object.defineProperty(item.attribute,'array',{get(){logs[i].push('array');return values;}});
+    }
+    if(mode==='prototype-constructor') {
+      const original=Object.getOwnPropertyDescriptor(Int16Array.prototype,'constructor');
+      Object.defineProperty(Int16Array.prototype,'constructor',{configurable:true,get(){logs[current].push('prototype');return Int16Array;}});
+      restore=()=>Object.defineProperty(Int16Array.prototype,'constructor',original);
+    }
+    if(mode==='global-constructor') {
+      const original=Object.getOwnPropertyDescriptor(globalThis,'Float32Array');
+      Object.defineProperty(globalThis,'Float32Array',{configurable:true,get(){logs[current].push('global');return original.value;}});
+      restore=()=>Object.defineProperty(globalThis,'Float32Array',original);
+    }
+    if(mode==='max-getter') {
+      const original=Object.getOwnPropertyDescriptor(Math,'max');
+      Object.defineProperty(Math,'max',{configurable:true,get(){logs[current].push('max');return original.value;}});
+      restore=()=>Object.defineProperty(Math,'max',original);
+    }
+    if(mode==='iterator-close') {
+      const proto=Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+      const original=Object.getOwnPropertyDescriptor(proto,'return'),uint=globalThis.Uint32Array;
+      Object.defineProperty(proto,'return',{configurable:true,value(){logs[current].push('iterator-close');return {done:true};}});
+      globalThis.Uint32Array=Float32Array;
+      restore=()=>{
+        globalThis.Uint32Array=uint;
+        if(original)Object.defineProperty(proto,'return',original);else Reflect.deleteProperty(proto,'return');
+      };
+    }
+    try {
+      for(let i=0;i<2;i++) {
+        const item=[actual,expected][i];current=i;
+        if(mode==='throw')assert.throws(()=>item.box.setFromBufferAttribute(item.attribute),{name:'RangeError',message:'decode stopped'});
+        else item.box.setFromBufferAttribute(item.attribute);
+      }
+    }finally{restore();}
+    same(boxValues(actual.box),boxValues(expected.box));assert.deepEqual(logs[0],logs[1],mode);
+    if(mode==='iterator-close')assert.deepEqual(logs[0],[]);
+    assert.equal(api.diagnostics(actual.box).wasmCalls,0,mode);
+  }
+});
+
+test('unsupported normalized Float64, half floats and shared integer storage retain the original route',()=>{
+  for(const {api}of fixtures)for(const mode of ['float64','half','shared']) {
+    const make=lib=>{
+      const box=new lib.Box3();let a;
+      if(mode==='half')a=new lib.Float16BufferAttribute([0x3c00,0x4000,0x4200,0x4400,0x4500,0x4600],3);
+      else if(mode==='float64')a=new lib.BufferAttribute(new Float64Array(points),3,true);
+      else {const array=new Int16Array(new SharedArrayBuffer(12));array.set([-32768,0,32767,12,24,36]);a=new lib.BufferAttribute(array,3,true);}
+      return {box,a};
+    };
+    const actual=make(api),expected=make(reference);
+    for(const value of [actual,expected]) {
+      if(mode==='float64')assert.throws(()=>value.box.setFromBufferAttribute(value.a),/Invalid component type/);
+      else value.box.setFromBufferAttribute(value.a);
+    }
+    same(boxValues(actual.box),boxValues(expected.box));assert.equal(api.diagnostics(actual.box).wasmCalls,0);
   }
 });
 
@@ -179,12 +324,11 @@ test('escaped private scratch state is materialized and aliased/public vectors k
   }
 });
 
-test('normalized/subclass attributes and proxies preserve original getters and no extra effects',()=>{
-  for(const {api}of fixtures)for(const mode of ['normalized','subclass','attribute-proxy','box-proxy','getter']) {
+test('subclass attributes and proxies preserve original getters and no extra effects',()=>{
+  for(const {api}of fixtures)for(const mode of ['subclass','attribute-proxy','box-proxy','getter']) {
     const logs=[[],[]];
     function make(lib,i) {
       let value=attribute(lib),box=new lib.Box3();
-      if(mode==='normalized')value=new lib.BufferAttribute(new Int16Array(points.map(v=>v*1000)),3,true);
       if(mode==='subclass'){class Custom extends lib.BufferAttribute{getX(index){logs[i].push(index);return super.getX(index)+1;}}value=new Custom(new Float32Array(points),3);}
       if(mode==='attribute-proxy')value=new Proxy(value,{get(target,key,receiver){logs[i].push(String(key));return Reflect.get(target,key,receiver);},getOwnPropertyDescriptor(){throw new Error('speculative descriptor');}});
       if(mode==='box-proxy')box=new Proxy(box,{get(target,key,receiver){logs[i].push(String(key));return Reflect.get(target,key,receiver);},getOwnPropertyDescriptor(){throw new Error('speculative descriptor');}});
@@ -381,7 +525,7 @@ test('empty and nonfinite radius inputs, normalized attributes and shared storag
       messages=errors[0];actual.computeBoundingSphere();messages=errors[1];expected.computeBoundingSphere();
       same(actual.boundingSphere.center.toArray(),expected.boundingSphere.center.toArray());
       assert.ok(Object.is(actual.boundingSphere.radius,expected.boundingSphere.radius));assert.deepEqual(errors[0],errors[1]);
-      if(mode!=='empty')assert.equal(api.diagnostics(actual).wasmCalls,0);
+      if(mode!=='empty')assert.equal(api.diagnostics(actual).wasmCalls,mode==='normalized'?1:0);
     }
   }finally{console.error=error;}
 });
@@ -393,6 +537,14 @@ test('work-budget exhaustion and a fresh no-Wasm module resume the original comp
   const g=new budget.api.BufferGeometry(),eg=new reference.BufferGeometry();g.setAttribute('position',attribute(budget.api));eg.setAttribute('position',attribute(reference));
   g.computeBoundingSphere();eg.computeBoundingSphere();assert.equal(g.boundingSphere.radius,eg.boundingSphere.radius);
   assert.deepEqual(budget.api.diagnostics(g),{wasmCalls:0,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
+  const quantized=[budget.api,reference].map(lib=>{
+    const value=new lib.BufferGeometry();value.setAttribute('position',new lib.Int16BufferAttribute([-32768,0,32767,12,24,36,-7,9,-11],3,true));
+    value.computeBoundingBox();value.computeBoundingSphere();return value;
+  });
+  same(boxValues(quantized[0].boundingBox),boxValues(quantized[1].boundingBox));
+  assert.equal(quantized[0].boundingSphere.radius,quantized[1].boundingSphere.radius);
+  assert.deepEqual(budget.api.diagnostics(quantized[0]),{wasmCalls:0,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
+  assert.deepEqual(budget.api.diagnostics(quantized[0].boundingBox),{wasmCalls:0,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
   const wasm=globalThis.WebAssembly;let api;
   try {globalThis.WebAssembly=undefined;api=await import('data:text/javascript;base64,'+Buffer.from(fixtures[0].code+'\n// no Wasm realm bootstrap').toString('base64'));}
   finally{globalThis.WebAssembly=wasm;}

@@ -1,34 +1,40 @@
 /** Exact source identities admit bounds scans; modified sources remain JS. */
 import {sourceBlob} from './marching_cubes_specialization.mjs';
 import {geometryNormalSourceRole} from './geometry_normals_specialization.mjs';
-import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
+import {normalClasses,normalMethod,deriveAttributeDenormalizers} from './geometry_normals_compile.mjs';
 import {deriveGeometryBoxKernel,compileGeometryBoxKernels,deriveGeometryRadiusKernels,compileGeometryRadiusKernels} from './geometry_bounds_compile.mjs';
 const boxBlob='675f74156954c1df38cafb2862d8bbd21a0e6b98';
+const mathUtilsBlob='57534a9227d042e86d99cb4b38de718bb4a08c7b';
 const fresh=(source,name)=>{let value='__f3d_bounds_'+name;while(source.includes(value))value+='_';return value;};
 export function geometryBoundsSourceRole(source) {
   if(sourceBlob(source)===boxBlob)return 'box';
   const role=geometryNormalSourceRole(source);
   return ['core','vector','attributes','interleaved-attributes','geometry'].includes(role)?role:null;
 }
-export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vectorSource,attributeSource,
+export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vectorSource,attributeSource,mathUtilsSource,
   maxMemoryPages=2048,maxIterations=100000000}={}) {
   const role=geometryBoundsSourceRole(source);if(!role)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),edits=[],headers=[],tails=[];
   const register=fresh(source,'class'),allocation=fresh(source,'allocation');
+  if(role==='core'){vectorSource=source;attributeSource=source;mathUtilsSource=source;}
+  const normalized=role==='core'||sourceBlob(mathUtilsSource??'')===mathUtilsBlob;
+  const normalization=normalized?
+    '{denormalize,resolveTypes:()=>[Float32Array,Uint32Array,Uint16Array,Uint8Array,Uint8ClampedArray,Int32Array,Int16Array,Int8Array]}':'null';
   headers.push('import {registerGeometryBoundsClass as '+register+'} from '+JSON.stringify(runtimeModule)+';');
   if(role==='vector' || role==='core')tails.push(register+'("vector",Vector3);');
-  if(role==='attributes' || role==='core')tails.push(register+'("attribute",BufferAttribute,Float32BufferAttribute);');
+  if(role==='attributes' || role==='core')tails.push(register+'("attribute",BufferAttribute,'+
+    '[Float32BufferAttribute,Uint32BufferAttribute,Uint16BufferAttribute,Uint8BufferAttribute,Uint8ClampedBufferAttribute,'+
+    'Int32BufferAttribute,Int16BufferAttribute,Int8BufferAttribute],"contiguous",'+normalization+');');
   if(role==='interleaved-attributes' || role==='core')
-    tails.push(register+'("attribute",InterleavedBufferAttribute,null,"interleaved");');
+    tails.push(register+'("attribute",InterleavedBufferAttribute,[],"interleaved",'+normalization+');');
   const report={sourceBlob:sourceBlob(source),upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,
     compiledMethods:[],accelerationClaim:false};
-  if(role==='core'){vectorSource=source;attributeSource=source;}
   if((role==='box' || role==='geometry') && (geometryNormalSourceRole(vectorSource??'')!=='vector' ||
       geometryNormalSourceRole(attributeSource??'')!=='attributes'))
     return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
   if(role==='box' || role==='core') {
     const derived=deriveGeometryBoxKernel(source,vectorSource,attributeSource);
-    const variants=compileGeometryBoxKernels(derived,{maxMemoryPages,maxIterations});
+    const variants=compileGeometryBoxKernels(derived,{denormalizers:normalized?deriveAttributeDenormalizers(mathUtilsSource):null,maxMemoryPages,maxIterations});
     const create=fresh(source,'create'),token=fresh(source,'token'),attempt=fresh(source,'try');
     headers.push('import {registerNumericObject as '+allocation+'} from '+JSON.stringify(objectsModule)+';',
       'import {createGeometryBoundsDispatch as '+create+',tryGeometryBoxBounds as '+attempt+'} from '+JSON.stringify(runtimeModule)+';var '+token+';');
@@ -42,7 +48,7 @@ export function specializeGeometryBounds(source,{runtimeModule,objectsModule,vec
   }
   if(role==='geometry' || role==='core') {
     const derived=deriveGeometryRadiusKernels(source,vectorSource,attributeSource);
-    const variants=compileGeometryRadiusKernels(derived,{maxMemoryPages,maxIterations});
+    const variants=compileGeometryRadiusKernels(derived,{denormalizers:normalized?deriveAttributeDenormalizers(mathUtilsSource):null,maxMemoryPages,maxIterations});
     const create=fresh(source,'create_radius'),token=fresh(source,'radius_token'),attempt=fresh(source,'try_radius');
     headers.push('import {createGeometryBoundsDispatch as '+create+',tryGeometryRadiusBounds as '+attempt+'} from '+JSON.stringify(runtimeModule)+';var '+token+';');
     for(const [index,scan]of derived.scans.entries()) {

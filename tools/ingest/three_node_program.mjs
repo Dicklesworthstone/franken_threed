@@ -14,7 +14,7 @@
  * GPU-authored 2D/array/3D storage inputs, including lossless signed/unsigned texel loads,
  * target-owned depth comparisons and read-only
  * scalar/vector/matrix or flat-struct storage buffers, including fragment
- * atomic int/uint members alongside ordinary read-only struct fields.
+ * atomic int/uint members alongside source-writable ordinary record fields.
  * Physical direct lighting retains the source DFG texture, clearcoat, sheen,
  * iridescence, anisotropy, retroreflection and source PMREM environment lighting.
  * Source Fog/FogExp2 and directional/spot/point Basic/PCF/VSM shadows retain
