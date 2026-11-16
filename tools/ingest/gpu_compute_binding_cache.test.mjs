@@ -197,6 +197,103 @@ test('asynchronously prepared pipelines use the same binding cache', async () =>
   assert.equal(calls.groups.length, 1); await owner.whenIdle(); owner.dispose();
 });
 
+test('pipeline residency is an LRU cache, not a lifetime shader quota', async () => {
+  const {owner, pipeline, a, calls} = setup({maxPipelines: 2});
+  owner.dispatch(pipeline, group(a), [1]);
+  const hot = owner.prepareSync({code: 'hot'});
+  owner.dispatch(hot, group(a), [1]);
+  for (let index = 0; index < 12; index++) {
+    assert.equal(owner.prepareSync({code: 'hot'}), hot);
+    const next = owner.prepareSync({code: `variant ${index}`});
+    owner.dispatch(next, group(a), [1]);
+    assert.equal(owner.cachedPipelineCount, 2);
+    assert.equal(owner.cachedBindGroupCount, 2, 'eviction releases the retired pipeline bindings');
+  }
+  assert.notEqual(owner.prepareSync({code: 'noop'}), pipeline, 'an evicted source is compiled again');
+  owner.dispatch(pipeline, group(a), [1]);
+  assert.equal(calls.passes.at(-1).pipeline, pipeline, 'held prepared handles remain usable after eviction');
+  await owner.whenIdle(); owner.dispose();
+  assert.equal(owner.cachedPipelineCount, 0);
+});
+
+test('asynchronous preparation reclaims completed entries and refreshes LRU use', async () => {
+  const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 2});
+  const hot = await owner.prepare({code: 'hot'});
+  for (let index = 0; index < 12; index++) {
+    assert.equal(await owner.prepare({code: 'hot'}), hot);
+    const next = await owner.prepare({code: `variant ${index}`});
+    owner.dispatch(next, [], [1]);
+    assert.equal(owner.cachedPipelineCount, 2);
+  }
+  assert.equal(owner.prepareSync({code: 'hot'}), hot);
+  owner.dispose();
+});
+
+test('pipeline eviction never makes an unresolved native compile budget unbounded', async () => {
+  const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 2});
+  const waiting = [];
+  device.createComputePipelineAsync = descriptor => new Promise(resolve => {
+    waiting.push(() => resolve(device.createComputePipeline(descriptor)));
+  });
+  const first = owner.prepare({code: 'first'}), second = owner.prepare({code: 'second'});
+  await flush();
+  assert.equal(waiting.length, 2);
+  assert.equal(owner.prepare({code: 'first'}), first, 'the same pending key shares its native compilation');
+  assert.throws(() => owner.prepare({code: 'third'}), {code: 'GPU_COMPUTE_BUDGET'});
+  assert.equal(waiting.length, 2, 'rejection precedes another native compile');
+  waiting[0](); const retained = await first;
+  const third = owner.prepare({code: 'third'});
+  await flush(); assert.equal(waiting.length, 3);
+  assert.equal(owner.cachedPipelineCount, 2);
+  waiting[1](); waiting[2](); await Promise.all([second, third]);
+  owner.dispatch(retained, [], [1]); owner.dispose();
+});
+
+test('eviction during a same-key sync/async race returns a valid uncached handle', async () => {
+  const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 1});
+  let finish;
+  device.createComputePipelineAsync = descriptor => new Promise(resolve => {
+    finish = () => resolve(device.createComputePipeline(descriptor));
+  });
+  const pending = owner.prepare({code: 'shared'});
+  await flush();
+  const synchronous = owner.prepareSync({code: 'shared'});
+  const replacement = owner.prepareSync({code: 'replacement'});
+  assert.throws(() => owner.prepare({code: 'too early'}), {code: 'GPU_COMPUTE_BUDGET'},
+    'replacing and evicting the cache key cannot cancel the outstanding native compile');
+  finish(); const asynchronous = await pending;
+  assert.ok(asynchronous);
+  assert.equal(owner.prepareSync({code: 'replacement'}), replacement, 'late completion does not republish an evicted key');
+  for (const pipeline of [synchronous, asynchronous]) owner.dispatch(pipeline, [], [1]);
+  assert.equal(owner.cachedPipelineCount, 1); owner.dispose();
+});
+
+test('failed native compilation frees its pending slot and permits retry', async () => {
+  const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 1});
+  const original = device.createComputePipelineAsync;
+  const failure = new Error('native compilation failed');
+  device.createComputePipelineAsync = () => Promise.reject(failure);
+  await assert.rejects(owner.prepare({code: 'retry'}), error => error === failure);
+  assert.equal(owner.cachedPipelineCount, 0);
+  device.createComputePipelineAsync = original;
+  const pipeline = await owner.prepare({code: 'retry'});
+  owner.dispatch(pipeline, [], [1]); owner.dispose();
+});
+
+test('evicting a synchronous pipeline retains its outstanding validation obligation', async () => {
+  const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 1});
+  let finish;
+  device.popErrorScope = () => new Promise(resolve => { finish = resolve; });
+  const first = owner.prepareSync({code: 'unvalidated'});
+  device.popErrorScope = () => Promise.resolve(null);
+  const second = owner.prepareSync({code: 'replacement'});
+  finish({message: 'evicted pipeline was invalid'});
+  await assert.rejects(owner.whenIdle(), {code: 'GPU_COMPUTE_VALIDATION'});
+  assert.equal(owner.cachedPipelineCount, 0);
+  for (const pipeline of [first, second])
+    assert.throws(() => owner.dispatch(pipeline, [], [1]), {code: 'GPU_COMPUTE_VALIDATION'});
+});
+
 test('binding group indices are part of the key', () => {
   const {owner, pipeline, a, calls} = setup();
   for (const index of [0, 1, 0, 1]) owner.dispatch(pipeline, group(a, null, index), [1]);
@@ -452,6 +549,26 @@ test('device loss clears the cache and retains the terminal error', async () => 
   owner.dispatch(pipeline, group(a), [1]); lose({message: 'lost recorder'}); await flush();
   assert.equal(owner.cachedBindGroupCount, 0);
   await assert.rejects(owner.whenIdle(), {code: 'GPU_COMPUTE_DEVICE_LOST'});
+});
+
+for (const synchronous of [false, true]) test(`queue completion ${synchronous ? 'throw' : 'rejection'} terminates compute ownership`, async () => {
+  const {owner, pipeline, a, aKey, device, calls} = setup();
+  owner.dispatch(pipeline, group(a), [1]);
+  await owner.validationSnapshot();
+  const failure = new Error('queue completion failed');
+  device.queue.onSubmittedWorkDone = () => {
+    if (synchronous) throw failure;
+    return Promise.reject(failure);
+  };
+  await assert.rejects(owner.whenIdle(), error => error === failure);
+  assert.equal(owner.bufferCount, 0); assert.equal(owner.allocatedBytes, 0);
+  assert.equal(owner.cachedBindGroupCount, 0); assert.equal(owner.cachedPipelineCount, 0);
+  assert.ok(calls.buffers.every(buffer => buffer.destroyed));
+  for (const run of [() => owner.upload(aKey, new Uint32Array(4), 1),
+    () => owner.prepareSync({code: 'later'}), () => owner.dispatch(pipeline, group(a), [1])])
+    assert.throws(run, error => error === failure, 'failed queue completion cannot leave a usable compute owner');
+  await assert.rejects(owner.whenIdle(), error => error === failure);
+  owner.dispose();
 });
 
 test('scoped GPU validation failure clears cached groups', async () => {

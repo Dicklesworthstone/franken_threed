@@ -267,7 +267,10 @@ test('pipeline preparation is cached and shader failures never dispatch', async 
   const a = owner.prepare(shader), b = owner.prepare(shader);
   assert.equal(a, b); assert.equal(await a, await b);
   assert.equal(device.calls.filter(c => c[0] === 'pipeline').length, 1);
-  assert.throws(() => owner.prepare({code: 'different'}), /BUDGET/); owner.dispose();
+  const replacement = await owner.prepare({code: 'different'});
+  assert.notEqual(replacement, await a);
+  assert.equal(owner.cachedPipelineCount, 1);
+  owner.dispatch(await a, [], [1]); owner.dispose();
   const bad = createGpuCompute(gpu({messages: [{type: 'error', lineNum: 2, linePos: 3, message: 'bad WGSL'}]}));
   await assert.rejects(bad.prepare(shader), /2:3 bad WGSL/); bad.dispose();
 });

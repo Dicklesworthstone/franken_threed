@@ -85,7 +85,12 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       ![maxBytes, maxBuffers, maxPipelines].every(positive) ||
       !Number.isSafeInteger(maxCachedBindGroups) || maxCachedBindGroups < 0)
     fail('OPTIONS', 'Expected a GPUDevice, positive resource limits and a nonnegative bind-group cache limit');
-  const buffers = new Map(), pipelines = new Map(), compiled = new Map(), ready = new Set(), staging = new Set(), pending = new Set();
+  const buffers = new Map(), pipelines = new Map(), compiled = new Map(), staging = new Set(), pending = new Set();
+  const preparing = new Set();
+  // The cache owns only a bounded working set. Callers may retain a prepared
+  // pipeline beyond eviction; weak admission preserves its use without turning
+  // every shader ever seen into a renderer-lifetime allocation.
+  let ready = new WeakSet();
   const readbacks = new Map();
   const bindGroups = new Map();
   let bindingIds = new WeakMap(), bindingUsers = new WeakMap(), bindingLayouts = new WeakMap(), nextBindingId = 0;
@@ -104,7 +109,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     for (const entry of [...readbacks.values()]) disposeReadback(entry, terminal);
     for (const entry of buffers.values()) entry.buffer.destroy();
     for (const buffer of staging) buffer.destroy();
-    buffers.clear(); staging.clear(); ready.clear(); pipelines.clear(); compiled.clear(); allocatedBytes = 0;
+    buffers.clear(); staging.clear(); ready = new WeakSet(); pipelines.clear(); compiled.clear(); preparing.clear(); allocatedBytes = 0;
     signal?.removeEventListener('abort', onAbort);
   }
   const onAbort = () => stop(signal.reason);
@@ -278,7 +283,7 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     live();
     if (key !== null) {
       while (bindGroups.size >= maxCachedBindGroups) evictBindings(bindGroups.keys().next().value);
-      bindGroups.set(key, {group, buffers: resources});
+      bindGroups.set(key, {group, buffers: resources, pipeline});
       for (const buffer of resources) {
         let users = bindingUsers.get(buffer);
         if (!users) bindingUsers.set(buffer, users = new Set());
@@ -302,14 +307,35 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       bindGroupLayouts: layouts.map(group => device.createBindGroupLayout(group)),
     });
   }
+  function touchPipeline(key) {
+    const promise = pipelines.get(key);
+    pipelines.delete(key); pipelines.set(key, promise);
+    return promise;
+  }
+  function reservePipeline(key) {
+    if (pipelines.has(key) || pipelines.size < maxPipelines) return;
+    // Never evict an unresolved native compilation to make room for another:
+    // cache eviction cannot cancel the browser's outstanding compiler work.
+    for (const candidate of pipelines.keys()) {
+      if (!compiled.has(candidate)) continue;
+      const pipeline = compiled.get(candidate);
+      pipelines.delete(candidate); compiled.delete(candidate);
+      for (const [bindingKey, record] of bindGroups)
+        if (record.pipeline === pipeline) evictBindings(bindingKey);
+      bindingLayouts.delete(pipeline);
+      return;
+    }
+    fail('BUDGET', 'Unresolved compute pipeline preparations exceed maxPipelines');
+  }
   function prepare({code, entryPoint = 'main', label = 'f3d-compute', bindGroupLayouts = null} = {}) {
     live();
     if (typeof code !== 'string' || !code.trim() || typeof entryPoint !== 'string' || !entryPoint)
       fail('SHADER', 'Expected WGSL source and an entry point');
     const layouts = captureLayouts(bindGroupLayouts);
     const key = JSON.stringify([code, entryPoint, layouts]);
-    if (pipelines.has(key)) return pipelines.get(key);
-    if (pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
+    if (pipelines.has(key)) return touchPipeline(key);
+    if (preparing.size >= maxPipelines) fail('BUDGET', 'Unresolved compute pipeline preparations exceed maxPipelines');
+    reservePipeline(key);
     const validations = [];
     const run = (async () => {
       const module = checked(() => device.createShaderModule({label, code}), validations);
@@ -327,12 +353,15 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       // a GPU queue fence, before publishing an asynchronous success.
       await interrupted(Promise.all(validations));
       live();
-      // A source-synchronous compute may have prepared the same key while this
-      // job yielded. Adopt its validated result rather than overwrite its cache.
-      if (pipelines.get(key) !== run) return pipelines.get(key);
-      ready.add(pipeline); compiled.set(key, pipeline); return pipeline;
+      ready.add(pipeline);
+      // A source-synchronous compute may replace and then evict this key while
+      // preparation yields. Adopt a current equivalent result, or return our
+      // validated handle without republishing an evicted cache entry.
+      if (pipelines.get(key) !== run) return pipelines.get(key) ?? pipeline;
+      compiled.set(key, pipeline); return pipeline;
     })();
-    pipelines.set(key, run);
+    pipelines.set(key, run); preparing.add(run);
+    run.finally(() => preparing.delete(run)).catch(() => {});
     run.catch(() => { if (pipelines.get(key) === run) pipelines.delete(key); });
     return run;
   }
@@ -345,8 +374,8 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
       fail('SHADER', 'Expected WGSL source and an entry point');
     const layouts = captureLayouts(bindGroupLayouts);
     const key = JSON.stringify([code, entryPoint, layouts]);
-    if (compiled.has(key)) return compiled.get(key);
-    if (!pipelines.has(key) && pipelines.size >= maxPipelines) fail('BUDGET', 'Compute pipeline count exceeds maxPipelines');
+    if (compiled.has(key)) { touchPipeline(key); return compiled.get(key); }
+    reservePipeline(key);
     const validations = [];
     const pipeline = checked(() => {
       const module = device.createShaderModule({label, code});
@@ -506,7 +535,8 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   }
   async function whenIdle() {
     live();
-    await interrupted(Promise.all([...pending, device.queue.onSubmittedWorkDone()]));
+    try { await interrupted(Promise.all([...pending, device.queue.onSubmittedWorkDone()])); }
+    catch (error) { stop(error); throw error; }
     live();
   }
   // Capture validation already issued by this owner. Resource preparation can
@@ -523,5 +553,6 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
     get allocatedBytes() { return allocatedBytes; }, get bufferCount() { return buffers.size; },
     get readbackBufferCount() { return readbacks.size; }, get readbackBytes() { return readbackBytes; },
     get cachedBindGroupCount() { return bindGroups.size; },
+    get cachedPipelineCount() { return pipelines.size; },
     dispose: () => stop(new GpuComputeError('DISPOSED', 'Compute owner is disposed'))};
 }
