@@ -471,12 +471,19 @@ export function buildWorkerGraph(entryUrl, {
     let source = record.nativeResource ? null : compilerOwned ? bytes.toString('utf8')
       : moduleSources.read(record.url, {sourceType: record.sourceType, source: bytes}).code;
     if (!record.nativeResource && record.sourceType === 'module' && !compilerOwned) {
-      assertUnbundledModule(record.url, moduleSources);
-      if (numericSettings) {
-        const result = specializeNumericModule(source, {...numericSettings,
-          sourceName: record.url, runtimeModule: numericDispatchUrl});
-        record.numericReport = {...result.report, inputSha256: digest(source)};
-        source = result.code;
+      try {
+        assertUnbundledModule(record.url, moduleSources);
+        if (numericSettings) {
+          const result = specializeNumericModule(source, {...numericSettings,
+            sourceName: record.url, runtimeModule: numericDispatchUrl});
+          record.numericReport = {...result.report, inputSha256: digest(source)};
+          source = result.code;
+        }
+      } catch (cause) {
+        // These source checks parse before the relocation parser below. Keep
+        // their syntax failures on the same attributed worker error contract.
+        if (cause instanceof SyntaxError) fail('PARSE', cause.message, record.url);
+        throw cause;
       }
     }
     analyzedBytes += source === null ? bytes.length : Buffer.byteLength(source);
@@ -754,6 +761,7 @@ export function workerNumericReport(units) {
 
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
 export function moduleWorkerRollupPlugin(options = {}) {
+  const ownsModuleSources = options._moduleSources == null;
   options = {...options, documentRoot: normalizeDocumentRoot(options.documentRoot), _moduleSources: moduleSourcesFor(options)};
   const emitted = new Map(), references = new Map(), filesByName = new Map();
   const closedRealmEntries = new Set();
@@ -768,6 +776,11 @@ export function moduleWorkerRollupPlugin(options = {}) {
     buildStart() {
       emitted.clear(); references.clear(); filesByName.clear(); closedRealmEntries.clear();
       totalBytes = totalModules = totalAssets = 0;
+      // Watch rebuilds must re-read edited inputs, while every realm within a
+      // build shares one frontend result. An externally supplied snapshot is
+      // owned by the application build and may already contain another pass.
+      if (ownsModuleSources)
+        options._moduleSources = moduleSourcesFor({transformModule: options.transformModule});
       // A build may share the collector with its classic-document pass. Clear
       // only this plugin's previous records, never another pass's fresh units.
       for (const [key, unit] of ownedNumericUnits)

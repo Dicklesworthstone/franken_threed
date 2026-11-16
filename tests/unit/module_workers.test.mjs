@@ -6,6 +6,7 @@ import {pathToFileURL, fileURLToPath} from 'node:url';
 import {Worker} from 'node:worker_threads';
 import test from 'node:test';
 import {buildModuleWorkerGraph, findModuleWorkerSites, moduleWorkerRollupPlugin} from '../../tools/ingest/module_workers.mjs';
+import {createModuleSources} from '../../tools/ingest/module_sources.mjs';
 
 const construction = (name = 'Worker', target = './worker.mjs', options = "{type:'module'}") =>
   `new ${name}(new URL(${JSON.stringify(target)}, import.meta.url), ${options})`;
@@ -209,7 +210,27 @@ test('a directory is not accepted as a worker asset', t => {
 });
 test('invalid module syntax produces a source-attributed build error', t => {
   const f = fixture(t, {'worker.mjs': 'export !!!'});
-  assert.throws(() => buildModuleWorkerGraph(f.entry), error => codeIs('PARSE')(error) && error.url === f.entry);
+  for (const source of ['export !!!', 'return;']) {
+    f.write('source/worker.mjs', source);
+    for (const specializeNumeric of [undefined, false, true])
+      assert.throws(() => buildModuleWorkerGraph(f.entry, {specializeNumeric}),
+        error => codeIs('PARSE')(error) && error.url === f.entry);
+  }
+  f.write('source/worker.mjs', "import './dep.mjs';");
+  const dependency = f.write('source/dep.mjs', 'export !!!');
+  assert.throws(() => buildModuleWorkerGraph(f.entry), error => codeIs('PARSE')(error) && error.url === dependency);
+});
+test('worker source diagnostics preserve frontend and CommonJS refusal contracts', t => {
+  const f = fixture(t, {'worker.mjs': 'export {};'});
+  const cause = new SyntaxError('frontend rejected source');
+  assert.throws(() => buildModuleWorkerGraph(f.entry, {transformModule() { throw cause; }}),
+    error => error.code === 'F3D_SOURCE_TRANSFORM' && error.url === f.entry && error.cause === cause);
+  for (const specializeNumeric of [false, true]) {
+    assert.throws(() => buildModuleWorkerGraph(f.entry, {specializeNumeric, transformModule: () => 'export !!!'}),
+      error => codeIs('PARSE')(error) && error.url === f.entry);
+    assert.throws(() => buildModuleWorkerGraph(f.entry, {specializeNumeric, transformModule: () => 'module.exports = 1;'}),
+      error => error.code === 'F3D_COMMONJS_UNBUNDLED' && error.url === f.entry);
+  }
 });
 test('standalone workers do not invent page import-map meanings for bare imports', t => {
   const f = fixture(t, {'worker.mjs': "import 'page-only-alias';"});
@@ -277,6 +298,58 @@ test('new build resets emitted identities and watches every transitive input', t
   assert.equal(r.watched.size, 2);
   plugin.buildStart(); f.write('source/dep.mjs', 'export const newValue = 1;');
   plugin.transform.call(r.context, construction(), f.entry); assert.notEqual(first, r.files[2].fileName);
+});
+test('worker builds share one frontend snapshot across realms and refresh it for the next build', t => {
+  const worker = "import {value} from './dep.mjs';postMessage(value);";
+  const f = fixture(t, {'worker.mjs': worker, 'other.mjs': worker, 'dep.mjs': 'export const value: number = 1;'});
+  const calls = [], r = recorder();
+  const plugin = moduleWorkerRollupPlugin({transformModule(source, {url, sourceType}) {
+    calls.push({url, sourceType, source});
+    return source.replaceAll(': number', '');
+  }});
+  const compile = name => {
+    const first = r.files.length;
+    plugin.transform.call(r.context, construction('Worker', name), f.entry);
+    return r.files.slice(first);
+  };
+  plugin.buildStart();
+  const first = compile('./worker.mjs');
+  f.write('source/dep.mjs', 'export const value: number = 2;');
+  const sibling = compile('./other.mjs');
+  assert.ok(sibling.some(file => String(file.source).includes('export const value = 1;')),
+    'a second realm uses the source already normalized in this build');
+  assert.equal(calls.length, 3);
+  assert.equal(new Set(calls.map(call => call.url)).size, 3);
+  assert.ok(calls.every(call => call.sourceType === 'module'));
+  plugin.buildStart();
+  const rebuilt = compile('./worker.mjs'), rebuiltSibling = compile('./other.mjs');
+  assert.notEqual(rebuilt[0].fileName, first[0].fileName);
+  for (const files of [rebuilt, rebuiltSibling])
+    assert.ok(files.some(file => String(file.source).includes('export const value = 2;')));
+  assert.equal(calls.length, 6);
+  assert.equal(new Set(calls.slice(3).map(call => call.url)).size, 3);
+  assert.equal(r.watched.size, 3);
+});
+test('worker buildStart preserves a caller-owned source snapshot and frontend', t => {
+  const f = fixture(t, {'worker.mjs': "import './dep.mjs';", 'dep.mjs': 'export const value: number = 1;'});
+  const calls = [], sources = createModuleSources((source, {url}) => {
+    calls.push(url); return source.replaceAll(': number', '');
+  });
+  const plugin = moduleWorkerRollupPlugin({_moduleSources: sources,
+    transformModule() { throw new Error('the supplied snapshot owns normalization'); }});
+  const dependency = new URL('./dep.mjs', f.entry).href;
+  const preloaded = sources.read(dependency);
+  sources.setFormat(dependency, 'module');
+  f.write('source/dep.mjs', 'export const value: number = 2;');
+  const r = recorder();
+  plugin.buildStart(); plugin.transform.call(r.context, construction(), f.entry);
+  const first = r.files[0].fileName;
+  plugin.buildStart(); plugin.transform.call(r.context, construction(), f.entry);
+  assert.equal(r.files[2].fileName, first, 'the owner retains the explicitly supplied build snapshot');
+  assert.strictEqual(sources.read(dependency), preloaded);
+  assert.equal(sources.format(dependency), 'module');
+  assert.deepEqual(calls, [dependency, f.entry]);
+  assert.ok(r.files.some(file => String(file.source).includes('export const value = 1;')));
 });
 for (const target of ['https://example.invalid/worker.mjs', '/worker.mjs', '//example.invalid/worker.mjs', 'blob:https://example.invalid/id'])
   test(`leaves host-owned worker URL untouched: ${target}`, t => {

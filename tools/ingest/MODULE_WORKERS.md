@@ -33,6 +33,15 @@ violations fail rather than emit an apparently runnable partial graph. Each
 worker graph is fully planned before it is emitted. Module and binary changes
 change the emitted directory hash, including transitive dependencies. Watch
 inputs are registered and graph emission state is reset at each Rollup build.
+Standalone plugins also replace their owned frontend source snapshot at
+`buildStart()`, so dependency edits reach the next worker output and numeric
+report. All worker realms within one build still normalize each source URL and
+kind once. An explicitly supplied `_moduleSources` snapshot belongs to its
+caller: the worker plugin preserves records already ingested by other passes.
+The application build creates a fresh shared snapshot for each build call.
+Invalid module syntax, including failures during early module classification or
+numeric compilation, reports `F3D_WORKER_PARSE` with the failing module URL;
+frontend failures and unsupported CommonJS retain their own error codes.
 Nested closure hashing has its own work bound. Shared build accounting is
 conservative: overlapping graph plans can be charged again even when identical
 emitted files are reused.
@@ -63,7 +72,8 @@ totals; those counts describe generated code, not executed calls or speedup.
 `node --test tools/ingest/numeric_workers.integration.test.mjs` checks actual
 isolated Node worker threads, transferable and overlapping typed arrays, lazy
 imports, module identity, real Wasm calls, fallback, relocated application builds
-and packed worker modules. Browser Worker/SharedWorker host behavior retains its
+and packed worker modules. It also rebuilds edited kernels with a reused plugin
+and executes the new Wasm in a fresh worker. Browser Worker/SharedWorker host behavior retains its
 separate validation requirements. Classic worker scripts themselves remain
 ordinary JavaScript; their imported ESM can use this numeric path.
 

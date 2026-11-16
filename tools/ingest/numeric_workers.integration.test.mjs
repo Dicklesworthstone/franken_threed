@@ -161,6 +161,37 @@ test('reused worker plugins remove stale reports without erasing a fresh shared-
   plugin.buildStart();assert.deepEqual(plugin.api.getNumericReport().units,[]);
 });
 
+test('reused worker plugins rebuild edited kernels and execute the new Wasm in native threads', async t => {
+  const f=fixture(workerFiles), output=path.join(f.root,'watched'), emitted=new Map();
+  const plugin=moduleWorkerRollupPlugin({specializeNumeric:true});
+  const context={emitFile(file){
+    const reference='asset'+emitted.size,target=path.join(output,file.fileName);
+    fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,file.source);
+    emitted.set(reference,file);return reference;
+  }};
+  const compile=()=>{
+    plugin.buildStart();
+    const result=plugin.transform.call(context,fs.readFileSync(path.join(f.source,'app.mjs'),'utf8'),f.url('app.mjs'));
+    const reference=/import\.meta\.ROLLUP_FILE_URL_(\w+)/.exec(result.code)[1];
+    return pathToFileURL(path.join(output,emitted.get(reference).fileName)).href;
+  };
+  const kernelUnit=report=>report.units.find(unit=>unit.sourceName===f.url('kernel.mjs'));
+  const first=compile(), before=plugin.api.getNumericReport();
+  const original=await send(await launch(t,first),packet(Float64Array,false));
+  assert.equal(original.calls,2);
+  fs.writeFileSync(path.join(f.source,'kernel.mjs'),kernelSource.replace('velocity[i]+=1','velocity[i]+=2'));
+  const second=compile(), after=plugin.api.getNumericReport();
+  assert.notEqual(second,first,'a dependency edit invalidates the worker entry identity');
+  assert.notEqual(kernelUnit(after).inputSha256,kernelUnit(before).inputSha256);
+  assert.equal(after.compiledKernels,before.compiledKernels);
+  assert.equal(after.units.length,before.units.length,'the report contains only the current build');
+  const actual=await send(await launch(t,second),packet(Float64Array,false));
+  const expected=await send(await launch(t,f.url('worker.mjs')),packet(Float64Array,false));
+  assert.deepEqual(actual.value,expected.value);
+  assert.notDeepEqual(actual.value.out,original.value.out,'the rebuilt kernel changes observable numeric results');
+  assert.equal(actual.calls,2);
+});
+
 test('native worker ESM keeps lazy/shared identities, transfers and alias semantics through real Wasm and fallback', async t => {
   const f=fixture(workerFiles), compiled=emitGraph(f,'compiled',{specializeNumeric:true});
   const exhausted=emitGraph(f,'budget',{specializeNumeric:{maxIterations:1}});
