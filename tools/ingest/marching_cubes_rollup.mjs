@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import {specializeMarchingCubesModule,specializeMarchingCubesBase} from './marching_cubes_specialization.mjs';
 import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_normals_specialization.mjs';
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
-import {specializeTransformBatch} from './transform_batch_specialization.mjs';
+import {specializeTransformBatch,transformBatchSourceRole} from './transform_batch_specialization.mjs';
 import {specializeEulerUpdateBase,specializeEulerUpdateLoops} from './euler_update_specialization.mjs';
 import {specializeInstancedMatrixBase,specializeInstancedMatrixLoops} from './instanced_matrix_update_specialization.mjs';
 import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
@@ -135,10 +135,12 @@ export function marchingCubesRollupPlugin(options={}) {
           if(skeleton.report)skeletonReports.push({id,...skeleton.report});
           if(skeleton.changed){edits.push(...skeleton.edits);headers.push(skeleton.header);tail+=skeleton.tail;}
         }
-        if(code.includes('class Object3D')) {
-          const batch=specializeTransformBatch(code,{runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
+        if(['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4','Vector3','Quaternion'].some(name=>code.includes('class '+name))) {
+          const batch=specializeTransformBatch(code,{...sources,runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
           if(batch.report)transformReports.push({id,...batch.report});
           if(batch.changed){edits.push(...batch.edits);headers.push(batch.header);}
+        }
+        if(code.includes('class Object3D')) {
           const euler=specializeEulerUpdateBase(code,{runtimeModule:EULER_UPDATES,maxMemoryPages,maxIterations});
           if(euler.report)eulerReports.push({id,...euler.report});
           if(euler.changed){edits.push(...euler.edits);headers.push(euler.header);}
@@ -164,6 +166,15 @@ export function marchingCubesRollupPlugin(options={}) {
         for(const edit of edits.sort((a,b)=>b.start-a.start))transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
         return {code:headers.join('')+transformed+tail,map:null};
       };
+      if(code.includes('class Object3D')&&transformBatchSourceRole(code)==='Object3D') {
+        return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{
+          let matrixSource;
+          if(resolved&&!resolved.external)try {
+            matrixSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
+          }catch{/* An unknown matrix dependency retains the original descendant loop. */}
+          return finish({matrixSource});
+        });
+      }
       if(code.includes('class Skeleton')&&skeletonUpdateSourceRole(code)==='skeleton') {
         return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{
           let matrixSource;
@@ -183,7 +194,8 @@ export function marchingCubesRollupPlugin(options={}) {
         });
       }
       if(normalCandidate && geometryNormalSourceRole(code)==='geometry') {
-        return Promise.all([['vectorSource','../math/Vector3.js'],['vector2Source','../math/Vector2.js'],['attributeSource','./BufferAttribute.js']].map(async([key,specifier])=>{
+        return Promise.all([['vectorSource','../math/Vector3.js'],['vector2Source','../math/Vector2.js'],['attributeSource','./BufferAttribute.js'],
+          ['mathUtilsSource','../math/MathUtils.js']].map(async([key,specifier])=>{
           const resolved=await this.resolve(specifier,id,{skipSelf:true});
           if(resolved && !resolved.external)try {
             return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];
@@ -193,16 +205,17 @@ export function marchingCubesRollupPlugin(options={}) {
       }
       if((normalCandidate || code.includes('class InterleavedBufferAttribute')) &&
           ['attributes','interleaved-attributes'].includes(geometryTransformSourceRole(code))) {
-        return this.resolve('../math/Vector3.js',id,{skipSelf:true}).then(resolved=>{
-          let vectorSource;
+        return Promise.all([['vectorSource','../math/Vector3.js'],['mathUtilsSource','../math/MathUtils.js']].map(async([key,specifier])=>{
+          const resolved=await this.resolve(specifier,id,{skipSelf:true});
           if(resolved && !resolved.external)try {
-            vectorSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
+            return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];
           }catch{/* An unavailable source retains the attribute methods. */}
-          return finish({vectorSource});
-        });
+          return [key,undefined];
+        })).then(values=>finish(Object.fromEntries(values)));
       }
       if(code.includes('class Box3') && geometryBoundsSourceRole(code)==='box') {
-        return Promise.all([['vectorSource','./Vector3.js'],['attributeSource','../core/BufferAttribute.js']].map(async([key,specifier])=>{
+        return Promise.all([['vectorSource','./Vector3.js'],['attributeSource','../core/BufferAttribute.js'],
+          ['mathUtilsSource','./MathUtils.js']].map(async([key,specifier])=>{
           const resolved=await this.resolve(specifier,id,{skipSelf:true});
           if(resolved && !resolved.external)try {
             return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];

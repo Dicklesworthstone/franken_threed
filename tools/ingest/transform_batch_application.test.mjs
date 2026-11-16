@@ -9,7 +9,7 @@ import {buildApplication} from './build_application.mjs';
 
 const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url));
 
-test('emitted applications retain both pivot update routes after relocation, with and without Wasm',async()=>{
+for(const sourceModules of [false,true])test(`emitted ${sourceModules?'source-module':'built-core'} applications retain both pivot update routes after relocation, with and without Wasm`,async()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-world-update-')),source=path.join(root,'source'),out=path.join(root,'built');
   fs.mkdirSync(source);const entry=path.join(source,'main.mjs');
   const body=`export function run(){const scene=new Scene(),branch=new Group();scene.add(branch);
@@ -19,10 +19,15 @@ test('emitted applications retain both pivot update routes after relocation, wit
     const moved=branch.children[0];scene.add(moved);scene.updateWorldMatrix(false,true,true);
     const result=[];scene.traverse(node=>result.push([node.matrix.elements,node.matrixWorld.elements,node.matrixWorldNeedsUpdate]));
     return result;}`;
-  fs.writeFileSync(entry,`import {Scene,Group,Object3D,Vector3} from 'three';\n${body}`);
+  const imports=sourceModules
+    ?`import {Scene} from 'three/src/scenes/Scene.js';import {Group} from 'three/src/objects/Group.js';
+      import {Object3D} from 'three/src/core/Object3D.js';import {Vector3} from 'three/src/math/Vector3.js';`
+    :`import {Scene,Group,Object3D,Vector3} from 'three';`;
+  fs.writeFileSync(entry,`${imports}\n${body}`);
   const built=await buildApplication(entry,out,{specializeNumeric:true,packageRootUrl:pathToFileURL(upstream+path.sep).href});
   const report=JSON.parse(fs.readFileSync(path.join(out,fs.readdirSync(out).find(name=>name.includes('numeric')&&name.endsWith('.json'))),'utf8'));
   assert.deepEqual(report.libraryKernels.transformBatches.modules[0].compiledMethods,['Object3D.updateMatrixWorld','Object3D.updateWorldMatrix']);
+  assert.equal(report.libraryKernels.transformBatches.modules[0].role,sourceModules?'Object3D':'core');
   const oracle=await import('data:text/javascript;base64,'+Buffer.from(`import {Scene,Group,Object3D,Vector3} from ${JSON.stringify(pathToFileURL(path.join(upstream,'build/three.core.js')).href)};${body}`).toString('base64'));
   fs.renameSync(source,path.join(root,'original-source'));const relocated=path.join(root,'relocated');fs.renameSync(out,relocated);
   const module=pathToFileURL(path.join(relocated,built.entryFiles[0])).href,expected=oracle.run();

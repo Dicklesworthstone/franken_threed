@@ -75,7 +75,7 @@ function subtree(api){
   return root;
 }
 
-test('only exact pinned built-core source admits the source-derived child transaction',()=>{
+test('built-core pin remains exact and source modules require their Matrix4 input',()=>{
   const source=fs.readFileSync(path.join(upstream,'build/three.core.js'),'utf8');
   assert.equal(specializeTransformBatch(source+'\n// changed').changed,false);
   assert.equal(specializeTransformBatch(fs.readFileSync(path.join(upstream,'src/core/Object3D.js'),'utf8')).changed,false);

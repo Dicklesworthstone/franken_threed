@@ -8,6 +8,7 @@ const ownKey=Object.hasOwn,freeze=Object.freeze,create=Object.create,F64=Float64
 const weakHas=WeakSet.prototype.has,weakAdd=WeakSet.prototype.add,mapGet=WeakMap.prototype.get,mapSet=WeakMap.prototype.set;
 const setHas=Set.prototype.has,setAdd=Set.prototype.add,decode=host.atob,charCode=String.prototype.charCodeAt,floor=Math.floor;
 const objects=new WeakSet(),numbers=new WeakSet(),arrays=new WeakSet(),dispatches=new WeakMap(),statistics=new WeakMap();
+const registeredClasses=new WeakMap(),registeredConstructors=new WeakMap();
 const own=(object,key)=>{const d=descriptor(object,key);return d && ownKey(d,'value')?d:null;};
 const data=(object,key)=>own(object,key)?.value;
 const nodeKinds=['Object3D','Group','Scene','Bone','Mesh','InstancedMesh'],matrixKinds=['Matrix4'],fields=['position','quaternion','scale'];
@@ -17,28 +18,38 @@ export function registerTransformNumeric(object){apply(weakAdd,numbers,[object])
 export function registerTransformChildren(array){apply(weakAdd,arrays,[array]);return array;}
 // Shared by source update islands; inspection never invokes a Proxy trap.
 export function isTransformChildren(array){return apply(weakHas,arrays,[array]);}
-export function createTransformBatchDispatch(base64,stride,maxMemoryPages){
+export function createTransformBatchDispatch(base64,stride,maxMemoryPages,Matrix4){
   const token=freeze({});
+  const classes=create(null);
+  // A source Object3D module binds only its own imported, already registered
+  // Matrix4. Separate source/core instances never merge their method identities.
+  const matrix=Matrix4 && apply(mapGet,registeredConstructors,[Matrix4]);
+  if(matrix?.name==='Matrix4')classes.Matrix4=matrix;
   apply(mapSet,dispatches,[token,{base64,stride,maxRows:floor((maxMemoryPages*65536-128)/(stride*8)),
-    attempted:false,kernel:null,classes:create(null)}]);
+    attempted:false,kernel:null,classes}]);
   return token;
 }
 /** Emitted immediately after each pinned class definition, before later source
  * initializers can expose its methods through ordinary application callbacks. */
 export function registerTransformBatchClass(token,name,Class){
-  const record=apply(mapGet,dispatches,[token]),proto=data(Class,'prototype');
-  record.classes[name]={proto,parent:prototype(proto),updateMatrix:data(proto,'updateMatrix'),
+  const proto=data(Class,'prototype');
+  const record={name,proto,parent:prototype(proto),updateMatrix:data(proto,'updateMatrix'),
     updateMatrixWorld:data(proto,'updateMatrixWorld'),updateWorldMatrix:data(proto,'updateWorldMatrix'),
     compose:data(proto,'compose'),multiplyMatrices:data(proto,'multiplyMatrices')};
+  apply(mapSet,registeredClasses,[proto,record]);
+  apply(mapSet,registeredConstructors,[Class,record]);
+  if(token)apply(mapGet,dispatches,[token]).classes[name]=record;
 }
-function method(object,key,expected,kinds,classes){
+function method(object,key,expected,kinds){
   if(typeof expected!=='function')return false;
   let current=object,remaining=4;
   while(current && remaining--){
     if(current!==object){
-      let known=null;
-      for(let i=0;i<kinds.length;i++){const value=classes[kinds[i]];if(value?.proto===current){known=value;break;}}
+      const known=apply(mapGet,registeredClasses,[current]);
       if(!known || prototype(current)!==known.parent)return false;
+      let admitted=false;
+      for(let i=0;i<kinds.length;i++)if(kinds[i]===known.name){admitted=true;break;}
+      if(!admitted)return false;
     }
     const d=descriptor(current,key);
     if(d)return ownKey(d,'value') && d.value===expected;
@@ -67,7 +78,7 @@ function hierarchy(record,owner,children,methodName){
     if(entries.length>=record.maxRows || !apply(weakHas,objects,[child]) ||
       apply(setHas,nodes,[child]) || data(child,'parent')!==frame.owner)return null;
     apply(setAdd,nodes,[child]);
-    if(!method(child,methodName,objectClass[methodName],nodeKinds,record.classes))return null;
+    if(!method(child,methodName,objectClass[methodName],nodeKinds))return null;
     const descendants=data(child,'children');
     if(!apply(weakHas,arrays,[descendants]))return null;
     const row=entries.length,descendantCount=data(descendants,'length');
@@ -101,13 +112,13 @@ function input(record,owner,children,force,methodName){
     const inheritedForce=entry.parent<0?force===true:entries[entry.parent].dirtyWrite;
     const update=automatic || dirty.value || inheritedForce,worldWrite=update && worldAutomatic;
     if(update && !dirty.writable)return null;
-    if(automatic && !method(child,'updateMatrix',objectClass.updateMatrix,nodeKinds,record.classes))return null;
+    if(automatic && !method(child,'updateMatrix',objectClass.updateMatrix,nodeKinds))return null;
     const matrix=data(child,'matrix'),world=data(child,'matrixWorld');
     const elements=matrixNumericElements(matrix,automatic),worldElements=matrixNumericElements(world,worldWrite);
     if(!elements || !worldElements || elements===worldElements ||
       apply(setHas,references,[elements]) || apply(setHas,references,[worldElements]))return null;
-    if(automatic && !method(matrix,'compose',matrixClass.compose,matrixKinds,record.classes))return null;
-    if(worldWrite && !method(world,'multiplyMatrices',matrixClass.multiplyMatrices,matrixKinds,record.classes))return null;
+    if(automatic && !method(matrix,'compose',matrixClass.compose,matrixKinds))return null;
+    if(worldWrite && !method(world,'multiplyMatrices',matrixClass.multiplyMatrices,matrixKinds))return null;
     apply(setAdd,references,[elements]);apply(setAdd,references,[worldElements]);
     const offset=i*record.stride;
     state[offset]=automatic?1:0;state[offset+1]=worldAutomatic?1:0;state[offset+2]=dirty.value?1:0;

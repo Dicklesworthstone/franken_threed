@@ -7,6 +7,15 @@ matrix multiplication and dirty/force propagation arithmetic. Both
 `updateMatrixWorld(force)` and
 `updateWorldMatrix(updateParents, updateChildren, force)` use that same kernel.
 
+Both the pinned built core and direct `three/src/*` imports participate. Source
+modules keep their original constructors, prototypes and module identities;
+each `Object3D` transaction binds its actual imported `Matrix4`. The compiler
+verifies the source bytes for both arithmetic owners, and pinned vector,
+quaternion and descendant-class modules supply their own allocation and method
+witnesses. Mixed source/core graphs do not merge distinct class families.
+Modified arithmetic owners or an unregistered constructor keep the original
+JavaScript traversal, without inspecting an unknown constructor.
+
 The selective method keeps its ancestor updates and owner update in their
 original JavaScript positions. Only its descendant loop is replaced, and only
 when the source's `updateChildren === true` branch runs. Each descendant is
@@ -43,8 +52,10 @@ guards can select the retained JavaScript path on each call. Compiler reports
 list the two public methods under `libraryKernels.transformBatches`.
 
 ```sh
-node --max-old-space-size=512 --test tools/ingest/transform_batch.test.mjs
-node --max-old-space-size=512 --test tools/ingest/transform_batch_application.test.mjs
+node --max-old-space-size=256 --test --test-concurrency=1 \
+  tools/ingest/transform_batch.test.mjs \
+  tools/ingest/transform_batch_source.test.mjs \
+  tools/ingest/transform_batch_application.test.mjs
 ```
 
 The suite compares public matrices and observations against unmodified r186,
