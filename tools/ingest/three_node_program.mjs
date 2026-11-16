@@ -1445,6 +1445,17 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         // An explicit local variable owns a value copied from its initializer;
         // assigning it does not write back to the source storage address.
         if (target.isVarNode && target.intent === false) continue;
+        // r186 makes a single-record atomic struct writable in the fragment
+        // stage, including its ordinary scalar/vector/matrix members. Follow
+        // only a selected non-atomic member: assigning the whole record or an
+        // atomic member still requires rejection. Binding validation below
+        // enforces the source fragment-only access before native execution.
+        if (target.isMemberNode && target.structNode?.isStorageBufferNode &&
+            target.structNode.isAtomic === true) {
+          const storage = target.structNode;
+          const member = storage.structTypeNode?.membersLayout?.find(member => member.name === target.property);
+          if (member && member.atomic !== true) { inspectStorage(storage); continue; }
+        }
         if (target.structNode) targets.push(target.structNode);
         // Assignment addresses follow the node/target chain; an index expression
         // may read storage without making the assigned local variable writable.

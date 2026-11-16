@@ -67,7 +67,83 @@ function atomicRecords(T, renderer, floatBacking) {
   return {scene, camera};
 }
 
+// Exactly one fragment writes ordinary members. Other invocations touch only
+// the atomic counter, so this does not depend on racing non-atomic writes or
+// reads. A later compute dispatch and render pass consume the produced fields.
+function ordinaryMembers(T, renderer, floatBacking) {
+  const N = T.TSL, scene = new T.Scene(), consumer = new T.Scene(), target = renderer.getRenderTarget();
+  const width = target.width, height = target.height;
+  const schema = N.struct({hits: {type: 'uint', atomic: true}, balance: {type: 'int', atomic: true},
+    tag: 'uint', gain: 'float', color: 'vec3', padding: 'float', basis: 'mat3'}, 'WritableFragmentRecord');
+  if (schema.getLength() !== 20) throw Error('Writable record fixture lost its padded source stride');
+  const array = floatBacking ? new Float32Array(20) : new Uint32Array(20);
+  const words = new Uint32Array(array.buffer), floats = new Float32Array(array.buffer);
+  words.set([3, (-50) >>> 0, 0x12340000]); floats[6] = .375;
+  const Attribute = floatBacking ? T.StorageInstancedBufferAttribute : T.StorageBufferAttribute;
+  const attribute = new Attribute(array, 20), storage = N.storage(attribute, schema, 1).toAtomic();
+  const step = N.uniform(.25), material = new T.MeshBasicNodeMaterial();
+  material.colorNode = N.Fn(() => {
+    N.If(N.screenCoordinate.x.lessThan(1).and(N.screenCoordinate.y.lessThan(1)), () => {
+      storage.get('gain').assign(step);
+      storage.get('tag').addAssign(N.uint(3));
+      storage.get('color').xy.assign(N.vec2(step, N.float(1).sub(step)));
+      storage.get('basis').assign(N.mat3(1));
+      storage.get('basis').element(0).assign(N.vec3(step, .25, .75));
+      storage.get('basis').element(1).yz.assign(N.vec2(.125, .375));
+      storage.get('basis').element(N.uint(1)).x.addAssign(.5);
+    });
+    N.atomicAdd(storage.get('hits'), N.uint(1));
+    return N.vec3(.125, .25, .5);
+  })();
+  const geometry = new T.PlaneGeometry(2, 2), mesh = new T.Mesh(geometry, material);
+  mesh.frustumCulled = false; scene.add(mesh);
+  const displayed = new T.MeshBasicNodeMaterial();
+  displayed.colorNode = N.select(N.screenCoordinate.x.lessThan(width / 2),
+    storage.get('color').mul(storage.get('gain')),
+    N.vec3(storage.get('basis').element(0).x, storage.get('basis').element(1).x, storage.get('basis').element(2).z.mul(.5)));
+  const displayedMesh = new T.Mesh(geometry, displayed); displayedMesh.frustumCulled = false; consumer.add(displayedMesh);
+  const camera = new T.OrthographicCamera(-1, 1, 1, -1, .1, 20); camera.position.z = 5;
+  const kernel = N.Fn(() => {
+    storage.get('tag').addAssign(N.uint(7));
+    storage.get('gain').mulAssign(.5);
+    storage.get('basis').element(2).z.addAssign(.125);
+  })().compute(1, [1]);
+  const render = renderer.render.bind(renderer), read = renderer.readRenderTargetPixelsAsync.bind(renderer);
+  let frame = 0, initial = null;
+  renderer.render = (...args) => {
+    if (args[0] !== scene || args[1] !== camera) return render(...args);
+    frame++;
+    if (frame === 8) step.value = .5;
+    if (frame === 13) step.value = .75;
+    if (frame === 10) {
+      floats[6] = .875; attribute.addUpdateRange(6, 1); attribute.needsUpdate = true;
+    }
+    render(...args); renderer.compute(kernel); return render(consumer, camera);
+  };
+  renderer.readRenderTargetPixelsAsync = async (...args) => {
+    const pixels = await read(...args);
+    if (args[0] !== target) return pixels;
+    const data = await renderer.getArrayBufferAsync(attribute), gpu = new Uint32Array(data), gpuFloats = new Float32Array(data);
+    if (gpu.length !== 20 || gpu[0] !== 3 + width * height * frame || gpu[1] !== ((-50) >>> 0) || gpu[2] !== 0x12340000 + 10 * frame)
+      throw Error(`Ordinary fragment record ordering diverged at frame ${frame}: ${Array.from(gpu.slice(0, 3))}`);
+    const expected = new Map([[3, step.value * .5], [4, step.value], [5, 1 - step.value], [6, frame >= 10 ? .875 : .375],
+      [7, 0], [8, step.value], [9, .25], [10, .75], [11, 0], [12, .5], [13, .125], [14, .375], [15, 0],
+      [16, 0], [17, 0], [18, 1.125], [19, 0]]);
+    for (const [index, value] of expected) if (gpuFloats[index] !== value)
+      throw Error(`Ordinary fragment field ${index} differs at frame ${frame}: ${gpuFloats[index]} vs ${value}`);
+    if (words[0] !== 3 || words[2] !== 0x12340000 || floats[3] !== 0)
+      throw Error('Fragment record stores were copied into the public CPU array');
+    if (frame === 1) initial = pixels.slice();
+    if (frame >= 8 && initial && pixels.every((value, i) => value === initial[i]))
+      throw Error('The fragment-produced values did not change the later rendered image');
+    return pixels;
+  };
+  return {scene, camera};
+}
+
 export const atomicStructScenarios = {
   native_atomic_structs: (T, renderer) => atomicRecords(T, renderer, false),
   native_atomic_structs_float_backing: (T, renderer) => atomicRecords(T, renderer, true),
+  native_atomic_struct_member_stores: (T, renderer) => ordinaryMembers(T, renderer, false),
+  native_atomic_struct_member_stores_float_backing: (T, renderer) => ordinaryMembers(T, renderer, true),
 };

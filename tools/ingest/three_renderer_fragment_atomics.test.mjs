@@ -6,6 +6,7 @@ import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
+import {atomicStructScenarios} from '../../tests/e2e/webgpu_renderer/scenarios_native_atomic_structs.js';
 
 const N = T.TSL, Renderer = createWebGPURendererClass(T);
 function fixture(t) {
@@ -107,6 +108,128 @@ test(`${Type.name} atomic structs preserve source shaders, padded mixed fields a
   assert.equal(bindings[0].buffer.minBindingSize, 64);
   assert.equal(storage.value.array.constructor, Type);
   assert.deepEqual([...new Uint32Array(storageEntries(draws(f)[0])[0].resource.buffer.data)], [...words]);
+});
+
+for (const Type of [Float32Array, Int32Array, Uint32Array])
+test(`${Type.name} atomic records admit source ordinary member assignments and component stores`, async t => {
+  const f = fixture(t), {storage} = structuredCounter(Type);
+  f.material.colorNode = N.Fn(() => {
+    N.If(N.screenCoordinate.x.lessThan(1).and(N.screenCoordinate.y.lessThan(1)), () => {
+      storage.get('gain').assign(.75);
+      storage.get('tag').addAssign(N.uint(5));
+      storage.get('basis').assign(N.mat3(1));
+      storage.get('basis').element(0).assign(N.vec3(.25, .5, .75));
+      storage.get('basis').element(1).yz.assign(N.vec2(.125, .375));
+      storage.get('basis').element(N.uint(2)).x.addAssign(.5);
+    });
+    N.atomicAdd(storage.get('hits'), N.uint(1));
+    return N.vec3(.5);
+  })();
+  await f.renderer.init();
+  const source = new T.WGSLNodeBuilder(f.mesh, f.renderer);
+  source.scene = f.scene; source.camera = f.camera; source.build();
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(storageWrites(f).length, 0, 'compilation does not run the fragment producer');
+  await f.renderer.renderAsync(f.scene, f.camera);
+  const descriptor = f.captures.find(frame => frame.draws.length).draws[0].binding.nodeProgram;
+  const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.equal(canonical(descriptor.vertex), canonical(source.vertexShader));
+  assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
+  assert.match(descriptor.fragment, /var<storage, read_write>/);
+  assert.match(descriptor.fragment, /\.gain = 0\.75/);
+  assert.match(descriptor.fragment, /\.tag = \(.*\.tag \+ 5u \)/);
+  assert.match(descriptor.fragment, /\.basis = mat3x3<f32>/);
+  assert.match(descriptor.fragment, /\.basis\[ 0u \] = vec3<f32>/);
+  assert.match(descriptor.fragment, /\.basis\[ 1u \]\.y =/);
+  const bindings = descriptor.groups.flatMap(group => group.entries).filter(entry => entry.buffer?.type === 'storage');
+  assert.equal(bindings.length, 1); assert.equal(bindings[0].visibility, 2);
+  assert.equal(storageEntries(draws(f)[0]).length, 1);
+});
+
+test('ordinary fragment record stores share compute and readback residency across partial host uploads', async t => {
+  const f = fixture(t), {storage, words} = structuredCounter(), observed = [], buffers = [];
+  const gain = N.uniform(.75);
+  f.material.colorNode = N.Fn(() => {
+    N.If(N.screenCoordinate.x.lessThan(1).and(N.screenCoordinate.y.lessThan(1)), () => {
+      storage.get('gain').assign(gain); storage.get('tag').addAssign(N.uint(5));
+    });
+    return N.vec3(.5);
+  })();
+  // This recording device injects the producer effects. The browser fixture
+  // separately executes the source and candidate WGSL and compares GPU bytes.
+  f.device.onDraw = draw => {
+    const buffer = storageEntries(draw)[0].resource.buffer, data = new Uint32Array(buffer.data);
+    observed.push([...data.slice(0, 4)]); buffers.push(buffer);
+    new Float32Array(buffer.data)[2] = .75; data[3] += 5;
+  };
+  f.device.onCompute = pass => {
+    const buffer = [...pass.groups.values()].flatMap(group => group.entries).find(entry => entry.resource.buffer.usage & 128).resource.buffer;
+    buffers.push(buffer); new Uint32Array(buffer.data)[0] += new Uint32Array(buffer.data)[3];
+  };
+  const compute = N.Fn(() => { N.atomicAdd(storage.get('hits'), storage.get('tag')); })().compute(1);
+  t.after(() => compute.dispose());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  const first = f.renderer.getArrayBufferAsync(storage.value);
+  f.renderer.compute(compute);
+  words[1] = 99; storage.value.addUpdateRange(1, 1); storage.value.needsUpdate = true;
+  f.renderer.render(f.scene, f.camera);
+  const second = f.renderer.getArrayBufferAsync(storage.value); words.fill(0xdeadbeef);
+  assert.deepEqual([...new Uint32Array(await first).slice(0, 4)], [7, 0xfffffff5, 0x3f400000, 24]);
+  assert.deepEqual([...new Uint32Array(await second).slice(0, 4)], [31, 99, 0x3f400000, 29]);
+  assert.deepEqual(observed, [[7, 0xfffffff5, 0x3f000000, 19], [31, 99, 0x3f400000, 24]]);
+  assert.ok(buffers.every(buffer => buffer === buffers[0]));
+  assert.equal(storageWrites(f).length, 2); assert.equal(storageWrites(f)[1].offset, 4);
+  assert.equal(storageWrites(f)[1].input.byteLength, 4); assert.deepEqual(storage.value.updateRanges, []);
+  assert.ok(words.every(word => word === 0xdeadbeef), 'GPU stores do not materialize into the public CPU array');
+});
+
+for (const invalid of ['atomic member', 'whole record', 'ordinary storage', 'vertex member', 'duplicate writer', 'read-only alias'])
+test(`ordinary fragment record ${invalid} writes retain admission and hazard rejection`, async t => {
+  const f = fixture(t), {storage} = structuredCounter();
+  let target = storage.get('gain');
+  if (invalid === 'ordinary storage') target = N.storage(new T.StorageBufferAttribute(1, 4), N.struct({value: 'vec4'}), 1).get('value').x;
+  const operation = () => {
+    if (invalid === 'atomic member') storage.get('hits').assign(N.uint(1));
+    else if (invalid === 'whole record') storage.assign(storage);
+    else target.assign(.5);
+  };
+  const body = () => { operation(); return N.vec3(1); };
+  if (invalid === 'vertex member') f.material.positionNode = N.Fn(body)();
+  else f.material.colorNode = N.Fn(body)();
+  if (invalid === 'duplicate writer') {
+    const alias = N.storage(storage.value, storage.structTypeNode, 1).toAtomic();
+    f.material.colorNode = N.Fn(() => { operation(); alias.get('gain').assign(.75); return N.vec3(1); })();
+  } else if (invalid === 'read-only alias') {
+    const alias = N.storage(storage.value, 'mat4', 1), material = new T.MeshBasicNodeMaterial();
+    material.colorNode = alias.element(0).element(0).xyz;
+    const mesh = new T.Mesh(f.mesh.geometry, material); mesh.frustumCulled = false; f.scene.add(mesh);
+    t.after(() => material.dispose());
+  }
+  await f.renderer.init();
+  await assert.rejects(f.renderer.renderAsync(f.scene, f.camera), error => /STORAGE|CONFLICT/.test(error.code));
+  assert.equal(storageWrites(f).length, 0); assert.equal(draws(f).length, 0);
+});
+
+for (const name of ['native_atomic_struct_member_stores', 'native_atomic_struct_member_stores_float_backing'])
+test(`${name} browser scenario builds both draw programs and its intervening compute`, async t => {
+  const requests = [], kernels = [], script = {getRenderTarget: () => ({width: 32, height: 32}),
+    render: (...args) => requests.push(args), compute: node => kernels.push(node), readRenderTargetPixelsAsync() {}};
+  const {scene, camera} = atomicStructScenarios[name](T, script);
+  script.render(scene, camera);
+  assert.equal(requests.length, 2); assert.equal(kernels.length, 1);
+  const f = fixture(t); await f.renderer.init();
+  for (const [selectedScene, selectedCamera] of requests) {
+    await f.renderer.renderAsync(selectedScene, selectedCamera);
+    const object = selectedScene.children[0], descriptor = f.captures.at(-1).draws[0].binding.nodeProgram;
+    const source = new T.WGSLNodeBuilder(object, f.renderer); source.scene = selectedScene; source.camera = selectedCamera; source.build();
+    const canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+    assert.equal(canonical(descriptor.vertex), canonical(source.vertexShader));
+    assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
+    t.after(() => { object.material.dispose(); object.geometry.dispose(); });
+  }
+  await f.renderer.computeAsync(kernels[0]);
+  assert.deepEqual(f.events, ['render', 'render', 'compute']);
+  t.after(() => kernels[0].dispose());
 });
 
 test('atomic struct producers share compute residency and preserve partial-upload history', async t => {

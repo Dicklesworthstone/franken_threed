@@ -1273,15 +1273,20 @@ contain atomic `int`/`uint` members alongside ordinary scalar/vector/matrix
 fields. Mark its storage node with `.toAtomic()` and access fields directly,
 for example `atomicAdd(counters.get('hits'), uint(1))`. Mixed Float32, Int32 and
 Uint32 backing arrays retain their raw bytes and the pinned struct padding.
-The ordinary companion fields remain read-only in graphics; compute may update
-them through the same allocation. Member atomicity participates in the cached
-shader interface, so even a same-size change invalidates accepted descriptors
-before node updates.
+Ordinary companion fields of these `.toAtomic()` records also support source
+fragment assignments, including scalar compound assignments, vector swizzles,
+whole matrices and matrix-column/component stores. The pinned builder makes
+the entire record writable in that stage. Fragment producers, later compute
+dispatches and readbacks use the same existing allocation and upload history.
+Ordinary storage without the source atomic flag remains read-only in graphics;
+atomic members still require atomic operations, and whole-record assignments
+remain refused. Member atomicity participates in the cached shader interface,
+so even a same-size change invalidates accepted descriptors before node updates.
 
 The pinned builder emits invalid WGSL for atomic arrays of structs, and its
 singleton struct binding cannot be indexed with `.element(0)`. Both forms remain
 explicitly refused, as do floating-point/vector atomic members and vertex-stage
-atomics. The 21 focused fragment-atomic recording tests cover source shaders,
+atomics. The focused fragment-atomic recording tests cover source shaders,
 binding limits, aliases, captured uploads and FIFO ownership. Separately,
 `node tests/e2e/webgpu_renderer/native_atomic_structs.mjs` executes fragment and
 compute producers on the real GPU and checks signed/unsigned readbacks, untouched
@@ -1289,6 +1294,14 @@ CPU arrays, partial companion-field uploads and exact source/candidate pixels.
 Both backing profiles match all fourteen checkpoints (688,128 RGBA bytes) with
 zero validation errors on Chromium 151.0.7922.34/SwiftShader. This is software-GPU
 correctness evidence, not a hardware throughput measurement.
+
+The added ordinary-member-store scenarios use one fragment writer, then a compute
+dispatch and a later draw that visibly consumes the produced values. They check
+both Uint32 and Float32 backing, padded matrix bytes, partial CPU uploads and
+unchanged public arrays. Their browser comparison remains unverified: Chromium
+cannot launch on the current host (`socket() failed: Operation not permitted`).
+Source-builder and recording-device tests pass; the earlier pixel result above
+does not cover these new stores.
 
 Ordinary meshes and native sprites support source `count` with TSL `instanceIndex`, including
 compute-driven scalar/vector and structured particle positions. Each logical
@@ -2645,8 +2658,8 @@ full tone-mapping compatibility or hardware acceleration.
 
 ## Explicit remaining boundaries
 
-This is a bounded native graphics entrance, not full TSL coverage. Non-atomic
-graphics writes, atomics outside the scalar integer and single-record struct
+This is a bounded native graphics entrance, not full TSL coverage. Graphics
+writes outside source atomic storage records, atomics outside the scalar integer and single-record struct
 fragment profiles above, matrix storage outside the padded Float32 profile,
 and nested/boolean struct members remain refused.
 Render-triggered compute beyond the source geometry profile and resource ordering
