@@ -76,8 +76,9 @@ test('fragment output location validation includes the full array range', () => 
 
 test('fragment output type validation excludes matrices, booleans and nested arrays', () => {
   for (const declaration of ['out mat2 invalid;', 'out mat3 invalid[2];', 'out bvec2 invalid[2];',
-    'out float[2] invalid[2];', 'out vec4 invalid[2.5];', 'centroid out vec4 invalid[2];'])
+    'out float[2] invalid[2];', 'centroid out vec4 invalid[2];'])
     assert.throws(() => compile(declaration), /Fragment output/);
+  assert.throws(() => compile('out vec4 invalid[2.5];'), /constant integer expression/);
   assert.throws(() => compileEsslStage('fragment', 'precision highp float;out vec4 colors[2];void main(){}'),
     /Fragment output arrays require ESSL 3.00/);
 });

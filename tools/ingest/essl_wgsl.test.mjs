@@ -477,7 +477,7 @@ test('sampler array parameters reject invalid selectors, qualifiers, sizes and u
     assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
       'void invalid(' + qualifier + ' sampler2D maps' + suffix + ') {}')), /Samplers cannot be out or inout/);
   assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
-    'void invalid(sampler2D maps[2.0]) {}')), /Sampler array parameters require a positive constant integer size/);
+    'void invalid(sampler2D maps[2.0]) {}')), /constant integer expression/);
   assert.throws(() => program(minimalVS, F('color = vec4(1.0);',
     'void invalid(sampler2D maps[2147483647]) {}')), /Sampler parameter expansion exceeds 4096 elements/);
   assert.throws(() => program(minimalVS, F('color = vec4(1.0);',

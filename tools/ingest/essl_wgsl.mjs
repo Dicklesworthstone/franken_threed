@@ -44,6 +44,7 @@
  */
 import {preprocess, EsslError, essError} from './essl_preprocess.mjs';
 import {parse} from './essl_parse.mjs';
+import {evaluateEsslConstant} from './essl_constants.mjs';
 export {EsslError};
 
 // ---------------------------------------------------------------------------
@@ -379,6 +380,7 @@ class Unit {
     Object.assign(this, {stage, decls, shared, version});
     this.globals = new Map();     // name -> symbol
     this.functions = new Map();   // name -> [{params, ret, wname, decl}]
+    this.userFunctionNames = new Set(decls.filter(d => d.k === 'func' || d.k === 'proto').map(d => d.name));
     this.inputs = []; this.outputs = [];
     this.privates = [];           // module-scope var<private> lines
     this.consts = [];             // module-scope const lines
@@ -422,82 +424,19 @@ class Unit {
     this.shared.structs.set(st.name, {fields, wname: safe(st.name)});
   }
   constInt(e, scope) {
-    const v = this.constValue(e, scope);
-    if (typeof v !== 'number' || !Number.isFinite(v)) essError('Expected a constant integer expression', e.line);
-    return Math.trunc(v);
+    const constant = this.constant(e, scope);
+    if (constant?.type.k !== 's' || !['int', 'uint'].includes(constant.type.s) || !Number.isSafeInteger(constant.value))
+      essError('Expected a constant integer expression', e.line);
+    return constant.value;
   }
-  constScalarType(e, scope) {
-    switch (e.k) {
-      case 'num': return parseNumber(e.v).type.s;
-      case 'bool': return 'bool';
-      case 'paren': return this.constScalarType(e.e, scope);
-      case 'id': { const t = this.lookup(e.name, scope)?.type; return t?.k === 's' ? t.s : undefined; }
-      case 'ctor': return ['int', 'uint', 'float', 'bool'].includes(e.type.name) ? e.type.name : undefined;
-      case 'unary': return e.op === '!' ? 'bool' : this.constScalarType(e.a, scope);
-      case 'bin': return ['==', '!=', '<', '>', '<=', '>=', '&&', '||', '^^'].includes(e.op)
-        ? 'bool' : this.constScalarType(e.a, scope);
-      case 'cond': return this.constScalarType(e.a, scope);
-      case 'method': return e.name === 'length' ? 'int' : undefined;
-      default: return undefined;
-    }
+  constant(e, scope) {
+    return evaluateEsslConstant(e, {lookup: name => this.lookup(name, scope), basicType, parseNumber, same,
+      structs: this.shared.structs,
+      // Declarations may precede a user overload that shadows a builtin.
+      isUserFunction: name => this.userFunctionNames.has(name)});
   }
   constValue(e, scope) {
-    const numeric = value => {
-      if (!Number.isFinite(value)) return undefined;
-      const type = this.constScalarType(e, scope);
-      return type === 'uint' ? value >>> 0 : type === 'int' ? value | 0 : type === 'float' ? value : undefined;
-    };
-    switch (e.k) {
-      case 'num': return parseNumber(e.v).value;
-      case 'bool': return e.v;
-      case 'paren': return this.constValue(e.e, scope);
-      case 'id': { const s = this.lookup(e.name, scope); if (s?.constValue !== undefined) return s.constValue; return undefined; }
-      case 'unary': {
-        const a = this.constValue(e.a, scope);
-        if (e.op === '!') return typeof a === 'boolean' ? !a : undefined;
-        if (typeof a !== 'number') return undefined;
-        return e.op === '-' ? numeric(-a) : e.op === '+' ? a : e.op === '~' ? numeric(~a) : undefined;
-      }
-      case 'bin': {
-        const a = this.constValue(e.a, scope), b = this.constValue(e.b, scope);
-        if (a === undefined || b === undefined) return undefined;
-        if (e.op === '==' || e.op === '!=') return e.op === '==' ? a === b : a !== b;
-        if (typeof a === 'boolean' && typeof b === 'boolean') {
-          return e.op === '&&' ? a && b : e.op === '||' ? a || b : e.op === '^^' ? a !== b : undefined;
-        }
-        if (typeof a !== 'number' || typeof b !== 'number') return undefined;
-        switch (e.op) {
-          case '+': return numeric(a + b); case '-': return numeric(a - b);
-          case '*': return numeric(this.constScalarType(e, scope) === 'float' ? a * b : Math.imul(a, b));
-          case '/': return numeric(a / b); case '%': return numeric(a % b);
-          case '&': return numeric(a & b); case '|': return numeric(a | b); case '^': return numeric(a ^ b);
-          case '<<': return b < 0 || b >= 32 ? undefined : numeric(a << b);
-          case '>>': return b < 0 || b >= 32 ? undefined : numeric(this.constScalarType(e, scope) === 'uint' ? a >>> b : a >> b);
-          case '<': return a < b; case '>': return a > b; case '<=': return a <= b; case '>=': return a >= b;
-        }
-        return undefined;
-      }
-      case 'cond': {
-        const c = this.constValue(e.c, scope), a = this.constValue(e.a, scope), b = this.constValue(e.b, scope);
-        // Every operand must be constant, including an unselected branch.
-        return typeof c === 'boolean' && a !== undefined && b !== undefined ? c ? a : b : undefined;
-      }
-      case 'ctor': {
-        if (e.args.length !== 1 || !['int', 'uint', 'float', 'bool'].includes(e.type.name)) return undefined;
-        const a = this.constValue(e.args[0], scope);
-        if (typeof a !== 'number' && typeof a !== 'boolean') return undefined;
-        return e.type.name === 'bool' ? Boolean(a) : numeric(Number(a));
-      }
-      case 'method': {
-        let receiver = e.a; while (receiver.k === 'paren') receiver = receiver.e;
-        if (e.name === 'length' && e.args.length === 0 && receiver.k === 'id') {
-          const symbol = this.lookup(receiver.name, scope);
-          return symbol?.elements?.length ?? (symbol?.type?.k === 'a' ? symbol.type.n : undefined);
-        }
-        return undefined;
-      }
-      default: return undefined;
-    }
+    return this.constant(e, scope)?.value;
   }
   lookup(name, scope) {
     for (let s = scope; s; s = s.parent) if (s.vars.has(name)) return s.vars.get(name);
@@ -1034,9 +973,10 @@ class Unit {
       } else {
         ctx.scope = inner;
         const label = this.hoisted(ctx, () => this.expr(c.value, ctx));
-        if (label.pre.length || !same(label.result.t, result.t))
+        const constant = this.constant(c.value, inner);
+        if (!same(label.result.t, result.t) || (!constant && (label.pre.length || !this.constEvaluable(c.value, inner))))
           essError('case needs a constant integer matching the switch selector', c.value.line);
-        const value = this.constValue(c.value, inner);
+        const value = constant?.value;
         let code = label.result.c;
         if (Number.isInteger(value)) {
           const integer = result.t.s === 'uint' ? value >>> 0 : value | 0;
@@ -1109,7 +1049,7 @@ class Unit {
       const w = this.local(v.name, type, scope);
       const sym = scope.vars.get(v.name);
       if (s.q.storage === 'const') {
-        if (typeof constant === 'number') sym.constValue = constant;
+        if (constant !== undefined) sym.constValue = constant;
         sym.textureBiasRange = textureBiasRange;
         sym.readonly = true; sym.wgslConst = wgslConst;
       }
@@ -2005,17 +1945,23 @@ class Unit {
   }
   textureOffset(expression, value, dimensions, ctx, line) {
     if (!same(value.t, V('int', dimensions))) essError(`Texture offset needs ivec${dimensions}`, line);
+    const constant = this.constant(expression, ctx.scope);
+    if (constant && same(constant.type, value.t) && !this.constEvaluable(expression, ctx.scope))
+      return `vec${dimensions}<i32>(${constant.value.join(', ')})`;
     if (!this.constEvaluable(expression, ctx.scope)) essError('Texture offset must be a constant expression', line);
     // Argument sequencing may have captured this expression before a later
     // side effect. Regenerate the pure constant to meet WGSL's const-offset rule.
     const {pre, result} = this.hoisted(ctx, () => this.expr(expression, ctx));
-    if (pre.length) essError('Texture offset is not a WGSL constant expression', line);
+    if (pre.length) {
+      if (constant && same(constant.type, value.t)) return `vec${dimensions}<i32>(${constant.value.join(', ')})`;
+      essError('Texture offset is not a WGSL constant expression', line);
+    }
     return result.c;
   }
   /** GLES guarantees a shader bias range of at least [-2, 2]; its larger limit
    * is implementation-defined and is not a WebGPU device capability. Admit
    * only literal/sign/const aliases and explicit builtin clamps proven inside
-   * that portable range. Do not use constValue's integer-oriented arithmetic
+   * that portable range. Do not use the structural constant-expression
    * evaluator to prove floating-point bounds or bake one driver's bias limit. */
   textureBiasRange(expression, scope) {
     if (!expression) return null;

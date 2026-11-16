@@ -97,7 +97,7 @@ test('index evaluation reads stored aggregates afterward but captures produced a
 test('constant aggregate indices remain constant in offset arguments and switch labels', () => {
   const switchBody = main(compile('constant-aggregate-index'));
   assert.match(switchBody, /const key: i32 = vec2<i32>\(1, 2\)\[0\];/);
-  assert.match(switchBody, /case vec2<i32>\(1, 2\)\[1\]/);
+  assert.match(switchBody, /case 2:/);
   const texture = compileEsslStage('fragment', version(`precision highp float;uniform sampler2D image;out vec4 color;
     void main(){color=textureOffset(image,vec2(.5),ivec2(ivec2(1,2)[0]));}`));
   assert.match(texture, /textureSample\(image_texture, image_sampler, f3d_t\d+, vec2<i32>\(vec2<i32>\(1, 2\)\[0\]\)\)/);

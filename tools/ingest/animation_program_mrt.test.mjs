@@ -131,3 +131,26 @@ test('compiled output arrays cannot silently exceed the allocated attachments', 
   await assert.rejects(f.add(), /distinct allocated color attachments/);
   assert.equal(f.pipelines.length, 0);
 });
+
+for (const samples of [1, 4]) test(`builtin-sized output arrays bind real target slots (${samples} samples)`, async t => {
+  const f = fixture(t, ['rgba8unorm', 'rgba16float', 'rgba8unorm'], samples);
+  Object.assign(f.program, arrayProgram('const ivec2 locations=ivec2(0,1);layout(location=1) out vec4 colors[max(1,2)];',
+    'colors[locations.x]=vec4(.25);colors[min(2,locations.y)]=vec4(.75);'));
+  const record = await f.add();
+  assert.deepEqual(record.reflection.outputs, [
+    {name: 'colors[0]', glslType: 'vec4', location: 1}, {name: 'colors[1]', glslType: 'vec4', location: 2},
+  ]);
+  assert.deepEqual(f.pipelines[0].fragment.targets, [
+    {format: 'rgba8unorm', writeMask: 0}, {format: 'rgba16float', writeMask: 15}, {format: 'rgba8unorm', writeMask: 15},
+  ]);
+  assert.equal(f.pipelines[0].multisample.count, samples);
+});
+
+test('computed output extents retain target-count rejection before GPU allocation', async t => {
+  const f = fixture(t);
+  Object.assign(f.program, arrayProgram('out vec4 colors[clamp(4,1,3)];', 'colors[0]=vec4(1.);'));
+  const buffers = f.device.buffers.length;
+  await assert.rejects(f.add(), /distinct allocated color attachments/);
+  assert.equal(f.pipelines.length, 0);
+  assert.equal(f.device.buffers.length, buffers);
+});

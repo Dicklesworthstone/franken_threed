@@ -233,6 +233,33 @@ out-of-range subscripts fail explicitly.
   in-divergent-quads behavior by disabling WGSL's `derivative_uniformity`
   diagnostic. That is the same contract ESSL gives, not an approximation.
 
+## Structural constant expressions
+
+Array extents, sampler and uniform-block selections, fragment-output indices,
+switch labels and texture offsets share a typed constant evaluator. It accepts
+constant scalar/vector operators; array, struct and matrix constructors and
+selection; swizzles; array lengths; and deterministic builtins including
+`min`, `max`, `clamp`, `abs`, `sign`, `floor`, `ceil`, `trunc`, `fract`,
+`roundEven`, Boolean `mix`, `step` and vector comparisons.
+
+For example, `const int count = max(2, 3)` can size sampler and fragment-output
+arrays, and a constant vector or struct field can select their elements. Texture
+offsets are emitted as WGSL constant vectors when source lowering would otherwise
+need temporary variables. Equivalent switch labels are detected after evaluation.
+
+Integer division, unsigned wrap, shift bounds and float32 conversion remain
+explicit. Evaluation has depth, work and aggregate-size limits. Mutable values,
+uniform values, user functions, assignments and sequence expressions cannot
+become structural constants, including in an unselected conditional branch.
+Transcendental builtins remain outside this evaluator; their host `Math` results
+are not used to choose a resource binding. This extends the JavaScript shader
+compiler and does not add a Rust shader frontend or a performance claim.
+
+`essl_constants.test.mjs` exercises the production compiler consumers, while
+`animation_program_mrt.test.mjs` checks the resulting attachment mapping and
+format validation on the owned pipeline path. These are translation and
+recording-device checks; they do not establish new browser pixel results.
+
 ## Explicit errors (not silently dropped)
 
 `gl_PointCoord` outside point programs, `gl_ClipDistance`,
