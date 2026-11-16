@@ -76,6 +76,114 @@ function equalShaders(descriptor, reference) {
   assert.equal(descriptor.fragment, reference.fragmentShader);
 }
 
+function primitiveItem(f, ObjectType, material) {
+  const geometry = new T.BufferGeometry();
+  geometry.setAttribute('position', new T.Float32BufferAttribute([-.5, -.25, 0, -.25, .5, 0, .25, -.5, 0, .5, .25, 0], 3));
+  geometry.setAttribute('lineDistance', new T.Float32BufferAttribute([0, .25, .5, .75], 1));
+  const object = ObjectType === T.Sprite ? new T.Sprite(material) : new ObjectType(geometry, material);
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld);
+  object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+  return {object, material};
+}
+
+for (const [family, ObjectType, topology] of [
+  ['Sprite', T.Sprite, 'triangles'], ['Points', T.Points, 'points'], ['Points', T.Sprite, 'triangles'],
+  ['LineBasic', T.Line, 'line-strip'], ['LineBasic', T.LineSegments, 'lines'],
+  ['LineDashed', T.Line, 'line-strip'], ['LineDashed', T.LineSegments, 'lines'],
+]) for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} extensions on ${ObjectType.name} retain source construction and uniforms`, t => {
+  const f = fixture(t), trace = [];
+  Object.assign(f.renderer, {getPixelRatio: () => 1.5,
+    getSize: value => value.set(64, 48), getViewport: value => value.set(2, 3, 64, 48),
+    getDrawingBufferSize: value => value.set(96, 72)});
+  class Extension extends T[family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.context.material === builder.material]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T[family + 'Material'] {
+    constructor() { super(); this.type = 'PrimitiveExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'PrimitiveExtension');
+  const material = new (registered ? Application : Extension)();
+  material.color.setRGB(.25, .5, .75);
+  if (family === 'Points') material.size = 13;
+  if (family === 'LineDashed') { material.dashSize = .625; material.gapSize = .25; }
+  const a = primitiveItem(f, ObjectType, material), b = primitiveItem(f, ObjectType, material);
+  a.object.position.x = 2; b.object.position.x = 11;
+  if (a.object.isSprite) { a.object.center.set(.125, .25); b.object.center.set(.625, .75); }
+  f.scene.updateMatrixWorld();
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'source setup and key callbacks retain their construction boundaries');
+    equalShaders(descriptor, reference); assert.equal(descriptor.topology, topology);
+    return {reference, descriptor};
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.equal(firstA.reference, firstB.reference, 'ordinary primitive objects share the pinned source builder');
+  assert.notEqual(firstA.descriptor, firstB.descriptor, 'each logical object keeps its own binding wrappers');
+  const capture = (item, descriptor) => {
+    item.object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, item.object.matrixWorld);
+    item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
+    f.referenceDraw(item, {fullLifecycle: true});
+    const packet = f.capture(item, descriptor, {captureGeometry() {}});
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return packet;
+  };
+  const acceptedA = capture(a, firstA.descriptor), acceptedB = capture(b, firstB.descriptor);
+  const savedA = acceptedA.uniforms.map(bytes => bytes.slice()), savedB = acceptedB.uniforms.map(bytes => bytes.slice());
+  assert.ok(values(acceptedA).includes(.375)); assert.ok(values(acceptedB).includes(.375));
+  assert.ok(values(acceptedA).includes(2)); assert.ok(values(acceptedB).includes(11));
+  material.applicationGain = .875;
+  if (family === 'Sprite') material.rotation = .375;
+  if (family === 'Points') material.size = 19;
+  if (family === 'LineDashed') material.dashSize = .875;
+  a.object.position.x = 7; if (a.object.isSprite) a.object.center.set(.375, .875);
+  f.scene.updateMatrixWorld(); f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, firstA.descriptor); assert.equal(compare(b).descriptor, firstB.descriptor);
+  assert.ok(values(capture(a, firstA.descriptor)).includes(.875)); capture(b, firstB.descriptor);
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const revalidatedA = compare(a), revalidatedB = compare(b);
+  // The pinned material key reduces numeric values to zero/nonzero, so the
+  // sprite rotation edit becomes structural when needsUpdate rechecks it.
+  assert.equal(revalidatedA.descriptor === firstA.descriptor, revalidatedA.reference === firstA.reference);
+  assert.equal(revalidatedA.reference, revalidatedB.reference);
+  assert.equal(revalidatedA.reference === firstA.reference, family !== 'Sprite');
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, revalidatedA.descriptor, 'version-only invalidation retains source construction');
+  material.applicationVariant = 1; material.needsUpdate = true; f.renderer.info.calls++;
+  const changedA = compare(a), changedB = compare(b);
+  assert.notEqual(changedA.descriptor, revalidatedA.descriptor); assert.equal(changedA.reference, changedB.reference);
+  capture(a, changedA.descriptor); capture(b, changedB.descriptor);
+  a.object.dispatchEvent({type: 'dispose'}); f.renderer.info.calls++;
+  const rebuiltA = compare(a);
+  assert.notEqual(rebuiltA.descriptor, changedA.descriptor); assert.equal(rebuiltA.reference, changedB.reference);
+  assert.equal(compare(b).descriptor, changedB.descriptor, 'one disposed object does not retire its sibling');
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+});
+
+test('primitive extensions reject unknown object subclasses and effectful accessors before setup', t => {
+  const f = fixture(t); let effects = 0;
+  class Extension extends T.PointsNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  class UnknownPoints extends T.Points {}
+  const opaque = primitiveItem(f, UnknownPoints, new Extension());
+  assert.throws(() => f.compile(opaque), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  const ordinary = primitiveItem(f, T.Points, new Extension());
+  Object.defineProperty(ordinary.material, 'applicationValue', {get() { effects++; return .5; }});
+  assert.throws(() => f.compile(ordinary), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
+});
+
 test('extension selection and unsupported application accessors stay effect-free', t => {
   const f = fixture(t); let effects = 0;
   class Inherited extends T.MeshBasicNodeMaterial {}

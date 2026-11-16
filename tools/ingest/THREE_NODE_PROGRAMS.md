@@ -46,6 +46,22 @@ Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
 
+Inherited and registered `SpriteNodeMaterial`, `PointsNodeMaterial`,
+`LineBasicNodeMaterial` and `LineDashedNodeMaterial` extensions also execute on
+ordinary `Sprite`, `Points`, `Line` and `LineSegments` objects. Their source setup
+methods, program keys and node updates use the existing shared construction
+owner. Sprite quad attributes, point/line streams, per-object uniforms, native
+topology and source material disposal keep their existing owners. Point sizes
+retain the pinned distinction between one-pixel point primitives and sized
+sprite quads; line dashes and sprite anchors remain source shader behavior.
+
+Equivalent primitive owners share source construction but retain their own
+captured uniform bytes. Material invalidation rechecks source keys, and disposing
+one object does not release a builder still used by another. Unknown object
+subclasses and effectful material accessors remain outside this profile. The
+focused extension suite compares pinned source shaders, cache-key/setup effects,
+uniform bytes, invalidation and disposal.
+
 Inherited and registered Physical materials also support transmission and
 dispersion through the existing framebuffer-copy, mipmap and sampled-texture
 owners. Their original setup and node updates retain source identities and

@@ -218,6 +218,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   const primitivePrototypes = [three.PointsNodeMaterial, three.LineBasicNodeMaterial, three.LineDashedNodeMaterial,
     three.Line2NodeMaterial]
     .filter(Boolean).map(Type => Type.prototype);
+  const primitiveExtensionPrototypes = [three.SpriteNodeMaterial, three.PointsNodeMaterial,
+    three.LineBasicNodeMaterial, three.LineDashedNodeMaterial].filter(Boolean).map(Type => Type.prototype);
   const litPrototypes = [three.MeshToonNodeMaterial.prototype, three.MeshLambertNodeMaterial.prototype,
     three.MeshPhongNodeMaterial.prototype, three.ShadowNodeMaterial.prototype, ...standardPrototypes,
     ...(three.VolumeNodeMaterial ? [three.VolumeNodeMaterial.prototype] : [])];
@@ -1571,6 +1573,12 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // key already includes batch texture UUIDs; selection and draw ordinals
     // continue through the existing batch owner.
     const batchExtension = extension && Object.getPrototypeOf(object) === three.BatchedMesh.prototype;
+    // Primitive extensions keep the source material builder and per-object
+    // bindings. Sprite's built-in interleaved quad and ordinary point/line
+    // streams use the same named-attribute histories as rigid meshes.
+    const primitiveExtension = extension && primitiveExtensionPrototypes.includes(prototype) &&
+      [three.Sprite, three.Points, three.Line, three.LineSegments].some(Type =>
+        Type && Object.getPrototypeOf(object) === Type.prototype);
     // Named instance streams share source construction by geometry layout.
     // Each render object's ordinary geometry owner still selects and captures
     // its own attributes, including interleaved version/range history.
@@ -1584,7 +1592,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Skinning reads ordinary named vertex inputs as well as its bone palette.
     // Keep interleaved positions and normalized weights with the same public
     // attribute owner rather than constructing a second deformation uploader.
-    const sharedVertexExtension = ordinaryGeometryExtension || skinExtension;
+    const sharedVertexExtension = ordinaryGeometryExtension || skinExtension || primitiveExtension;
     const namedGeometry = geometrySetup || sharedVertexExtension &&
       Object.values(object.geometry.attributes).some(attribute =>
         attribute.isStorageBufferAttribute || attribute.isInterleavedBufferAttribute || attribute.normalized);
@@ -1596,9 +1604,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         three.MeshPhysicalNodeMaterial.prototype].includes(prototype)
       : extension
       ? [three.NodeMaterial.prototype, three.MeshBasicNodeMaterial.prototype, three.MeshNormalNodeMaterial.prototype,
-        three.MeshMatcapNodeMaterial.prototype, ...litPrototypes].includes(prototype)
+        three.MeshMatcapNodeMaterial.prototype, ...litPrototypes, ...primitiveExtensionPrototypes].includes(prototype)
       : [three.MeshStandardNodeMaterial.prototype, three.MeshPhysicalNodeMaterial.prototype].includes(prototype)) ||
-        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension && !batchExtension ||
+        Object.getPrototypeOf(object) !== three.Mesh.prototype && !instanceExtension && !skinExtension && !batchExtension && !primitiveExtension ||
         object.geometry.isInstancedBufferGeometry && !instancedGeometryExtension ||
         // Morph.js owns the target atlas, influence uniforms and captured
         // per-instance weight texture. The source instance UUID key above
@@ -1619,7 +1627,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           attribute.isInterleavedBufferAttribute && !instancedGeometryExtension && !sharedVertexExtension ||
           !instancedGeometryExtension && (attribute.isInstancedBufferAttribute || attribute.data?.isInstancedInterleavedBuffer) ||
           attribute.isStorageInstancedBufferAttribute ||
-          attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension) ||
+          attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension && !primitiveExtension) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
