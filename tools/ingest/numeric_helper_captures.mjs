@@ -10,6 +10,59 @@ import {discoverNumericArrayParameters} from './numeric_loop_discovery.mjs';
 const contains = (outer, inner) => outer.start <= inner.start && inner.end <= outer.end;
 const varScope = scope => ['Program', 'FunctionDeclaration', 'FunctionExpression',
   'ArrowFunctionExpression', 'StaticBlock'].includes(scope.type);
+
+// This is codegen-only normalization. Original lexical functions keep their
+// source, identity and initialization point. The caller proves the immutable
+// binding and schedules native registration after its declaration executes.
+function helperHeaderEdits(source, tokens, fn, name, parameters = []) {
+  if (fn.type !== 'FunctionDeclaration') {
+    const params = [...fn.params.map(param => source.slice(param.start, param.end)), ...parameters];
+    const expression = fn.body.type !== 'BlockStatement';
+    return [{start:fn.start, end:fn.body.start,
+      text:`function ${name}(${params.join(',')}) ${expression ? '{ return (' : ''}`},
+    ...(expression ? [{start:fn.body.end, end:fn.end, text:'); }'}] : [])];
+  }
+  if (!parameters.length) return [];
+  const start = fn.params.length ? fn.params.at(-1).end :
+    tokens.find(token => token.type.label === '(' && token.start >= fn.id.end && token.end <= fn.body.start)?.end;
+  if (start === undefined) throw new Error('Missing helper parameter delimiter');
+  return [{start, end:start, text:(fn.params.length ? ',' : '') + parameters.join(',')}];
+}
+
+function rewrite(source, start, end, edits, overrides = []) {
+  const selected = edits.filter(edit => edit.start >= start && edit.end <= end &&
+    !overrides.some(override => contains(override, edit)));
+  selected.push(...overrides);
+  let text = source.slice(start, end);
+  for (const edit of selected.sort((a,b) => b.start - a.start || b.end - a.end))
+    text = text.slice(0, edit.start - start) + edit.text + text.slice(edit.end - start);
+  return text;
+}
+
+function originalSpan(source, node, edits, span) {
+  function offset(generated) {
+    let delta = 0;
+    for (const edit of edits) {
+      const start = edit.start - node.start + delta;
+      if (generated < start) break;
+      if (generated < start + edit.text.length)
+        return edit.start + Math.min(generated - start, edit.end - edit.start);
+      delta += edit.text.length - (edit.end - edit.start);
+    }
+    return node.start + generated - delta;
+  }
+  const start = offset(span.start), end = offset(span.end);
+  const prefix = source.slice(0, start), line = prefix.split('\n').length;
+  return {start, end, line, column:start - prefix.lastIndexOf('\n') - 1};
+}
+
+/** Produce a compiler declaration and retain its original diagnostic spans. */
+export function numericHelperSource(source, tokens, fn, name) {
+  const edits = helperHeaderEdits(source, tokens, fn, name);
+  return {source:rewrite(source, fn.start, fn.end, edits),
+    originalSpan:span => originalSpan(source, fn, edits, span)};
+}
+
 function assigned(node, visit) {
   if (!node) return;
   if (node.type === 'Identifier') visit(node);
@@ -88,38 +141,21 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
       return {refusal:'HELPER_CAPTURE_WRITE'};
     const parameters = captures.map(() => fresh('helper_capture'));
     const replacements = new Map(captures.map((name, index) => [name, parameters[index]]));
-    function editsFor(record, declaration) {
+    function editsFor(record, declarationName) {
       const edits = record.references.filter(value => replacements.has(value.name)).map(value =>
         ({start:value.start, end:value.end, text:replacements.get(value.name)}));
       for (const call of record.calls) {
         const start = call.arguments.length ? call.arguments.at(-1).end : call.end - 1;
         edits.push({start, end:start, text:(call.arguments.length ? ',' : '') + parameters.join(',')});
       }
-      if (declaration) {
-        const fn = record.node;
-        // The numeric compiler still rejects defaults, destructuring, async and
-        // generator declarations. Never normalize their semantics into a kernel.
-        const start = fn.params.length ? fn.params.at(-1).end :
-          tokens.find(token => token.type.label === '(' && token.start >= fn.id.end && token.end <= fn.body.start)?.end;
-        if (start === undefined) throw new Error('Missing helper parameter delimiter');
-        edits.push({start, end:start, text:(fn.params.length ? ',' : '') + parameters.join(',')});
-      }
+      if (declarationName) edits.push(...helperHeaderEdits(source, tokens, record.node, declarationName, parameters));
       return edits.sort((a,b) => a.start - b.start || a.end - b.end);
     }
-    const entryEdits = editsFor(entry, root.type === 'FunctionDeclaration');
-    const helperEdits = new Map([...reachable].map(([name, record]) => [name, editsFor(record, true)]));
-    function rewrite(start, end, edits, overrides = []) {
-      const selected = edits.filter(edit => edit.start >= start && edit.end <= end &&
-        !overrides.some(override => contains(override, edit)));
-      selected.push(...overrides);
-      let text = source.slice(start, end);
-      for (const edit of selected.sort((a,b) => b.start - a.start || b.end - a.end))
-        text = text.slice(0, edit.start - start) + edit.text + text.slice(edit.end - start);
-      return text;
-    }
+    const entryEdits = editsFor(entry, root.type === 'FunctionDeclaration' ? root.id.name : null);
+    const helperEdits = new Map([...reachable].map(([name, record]) => [name, editsFor(record, name)]));
     const convertedHelpers = new Map(helperSources);
     for (const [name, record] of reachable)
-      convertedHelpers.set(name, rewrite(record.node.start, record.node.end, helperEdits.get(name)));
+      convertedHelpers.set(name, rewrite(source, record.node.start, record.node.end, helperEdits.get(name)));
     // Propose storage slots from the converted helper graph, including aliases,
     // forwarding helpers and inline numeric callbacks. This is only discovery:
     // the numeric compiler must close every body for each emitted layout, and
@@ -139,26 +175,13 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
       for (const name of discoverNumericArrayParameters(declaration, declarations))
         if (parameters.includes(name)) arrayParameters.add(name);
     const captureKinds = parameters.map(name => arrayParameters.has(name) ? 'array' : 'number');
-    function originalOffset(node, edits, generated) {
-      let delta = 0;
-      for (const edit of edits) {
-        const start = edit.start - node.start + delta;
-        if (generated < start) break;
-        if (generated < start + edit.text.length)
-          return edit.start + Math.min(generated - start, edit.end - edit.start);
-        delta += edit.text.length - (edit.end - edit.start);
-      }
-      return node.start + generated - delta;
-    }
     return {
       captures, parameters, captureKinds, arrayParameters, helperSources:convertedHelpers,
-      rewrite:(start = root.start, end = root.end, overrides = []) => rewrite(start, end, entryEdits, overrides),
+      rewrite:(start = root.start, end = root.end, overrides = []) => rewrite(source, start, end, entryEdits, overrides),
       originalSpan(name, span) {
         const record = name ? reachable.get(name) : entry;
         const edits = name ? helperEdits.get(name) : entryEdits;
-        const start = originalOffset(record.node, edits, span.start), end = originalOffset(record.node, edits, span.end);
-        const prefix = source.slice(0, start), line = prefix.split('\n').length;
-        return {start, end, line, column:start - prefix.lastIndexOf('\n') - 1};
+        return originalSpan(source, record.node, edits, span);
       },
     };
   };

@@ -235,12 +235,12 @@ test('crossModule false retains existing local-only behavior and private runtime
   assert.equal(localReport.registeredKernels,undefined);assert.equal(localReport.importedCalls,undefined);
 });
 
-test('non-ES and source-map output contracts remain unchanged with no runtime assets', () => {
-  for(const output of [{format:'cjs'},{format:'iife'},{sourcemap:true},{sourcemap:'inline'}]) {
+test('non-ES output contracts remain unchanged with no runtime assets', () => {
+  for(const output of [{format:'cjs'},{format:'iife'}]) {
     const h=hooks(GRAPH,{output}), report=h.finish();
     assert.equal(report.compiledKernels,0);assert.equal(report.runtimeAssets.length,0);
     assert.ok(Object.values(h.results).every(result=>result===null));
-    for(const unit of report.units)assert.equal(unit.refusal.code,output.format?'NON_ES_OUTPUT':'SOURCE_MAP_SPECIALIZATION_UNAVAILABLE');
+    for(const unit of report.units)assert.equal(unit.refusal.code,'NON_ES_OUTPUT');
   }
 });
 

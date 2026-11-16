@@ -76,9 +76,9 @@ export function numericKernelRollupPlugin(options = {}) {
     },
     renderChunk(code, chunk, output) {
       let result;
-      if (output.format !== "es" || output.sourcemap) {
+      if (output.format !== "es") {
         // Preserve the application's requested output contract. This pass does
-        // not yet emit source maps and must not silently corrupt existing ones.
+        // not rewrite CommonJS or wrapper formats into ES modules.
         result = {
           changed: false,
           report: {
@@ -90,8 +90,7 @@ export function numericKernelRollupPlugin(options = {}) {
             rewrittenCalls: 0,
             candidates: [],
             refusal: {
-              code:
-                output.format !== "es" ? "NON_ES_OUTPUT" : "SOURCE_MAP_SPECIALIZATION_UNAVAILABLE",
+              code: "NON_ES_OUTPUT",
             },
           },
         };
@@ -100,6 +99,7 @@ export function numericKernelRollupPlugin(options = {}) {
           ...settings,
           sourceName: chunk.name,
           runtimeModule: () => relativeImport(chunk.fileName, runtime(this)),
+          sourcemap: !!output.sourcemap,
         });
       }
       units.set(chunk.fileName, {
@@ -132,7 +132,8 @@ export function numericKernelRollupPlugin(options = {}) {
       chunk.importedBindings[dispatchName] = [...new Set([
         ...(chunk.importedBindings[dispatchName] ?? []), ...bindings,
       ])];
-      return { code: result.code, map: null };
+      // Rollup composes this with its linked modules and other output plugins.
+      return { code: result.code, map: result.map ?? null };
     },
     generateBundle(_output, bundle) {
       const chunks = Object.values(bundle).filter((item) => item.type === "chunk");

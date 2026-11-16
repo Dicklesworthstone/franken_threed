@@ -54,6 +54,42 @@ keeps loop islands off unless `loopIslands:true` is also explicit. Post-link
 compilation sees helpers linked into the same ES chunk; unresolved imported
 helpers across separate chunks retain their existing identity-dispatch route.
 
+## Immutable const helpers
+
+The same source analysis accepts top-level `const` arrow functions and function
+expressions as helpers, including concise numeric returns and transitive helper
+graphs:
+
+```js
+const scale = (value, factor) => value * factor;
+const integrate = (out, velocity, dt) => {
+  for (let i = 0; i < out.length; i++) out[i] += scale(velocity[i], dt);
+};
+```
+
+Both whole-function kernels and extracted callback loops use these helpers.
+Forwarded array parameters, borrowed views, live numeric/array captures and
+source-ordered aliasing use the existing guarded transaction. Normalization is
+limited to compiler input; original helper objects, declarations, names and
+initialization order remain in JavaScript.
+
+Each native kernel becomes available only after every reachable const helper
+declaration has executed. Earlier calls use the original source, preserving
+zero-trip loops, temporal-dead-zone errors and partial writes before those
+errors. This also covers top-level await, module cycles and multiple declarators
+in one statement. The normal numeric guards still apply after initialization.
+
+Mutable helper bindings, async/generator functions, default/rest parameters,
+recursive or observed private function names, `this`, `arguments` and unsupported
+effects retain JavaScript. Function-expression private names may be normalized
+only when they match the proven binding or are unused. Helper loop diagnostics
+still point to the authored source, including after capture conversion.
+
+`node --test tools/ingest/numeric_const_helpers.test.mjs` executes native Wasm and
+real linked application builds, compares source results and side effects, and
+checks initialization, aliasing, captures and transactional fallback. This
+extends numeric specialization; it does not establish a measured speedup.
+
 ## One source-ordered transaction
 
 A captured array can be used only through helper arguments; it need not be

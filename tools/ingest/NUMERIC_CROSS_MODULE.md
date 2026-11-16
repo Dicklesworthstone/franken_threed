@@ -120,10 +120,17 @@ separates `compiledKernels`/`registeredKernels` from `importedCalls`; a rewritte
 lookup is **not evidence of a native call or a speedup**. Runtime diagnostics
 remain opt-in and add no application exports. Memory packing is not zero-copy.
 
-Non-ES outputs and outputs requesting source maps remain unspecialized. Reports
-retain explicit pre-specialization source coordinates and map preliminary chunk
-names to final bundle names. Runtime imports and imported-binding metadata are
-kept consistent for producer-only, consumer-only, and mixed chunks.
+Non-ES outputs remain unspecialized. ES builds can request external, inline or
+hidden source maps while keeping native specialization. The transform emits
+character-level mappings that Rollup composes with its original module maps and
+other build plugins. Original statements, retained loop fallbacks and later
+application code keep their original file/line/column locations; generated
+runtime scaffolding does not claim an application source location. These are
+JavaScript source maps, not Wasm instruction debugging metadata.
+
+Reports retain explicit pre-specialization chunk coordinates and map preliminary
+chunk names to final bundle names. Runtime imports and imported-binding metadata
+are kept consistent for producer-only, consumer-only, and mixed chunks.
 
 ## Validation
 

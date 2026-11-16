@@ -24,12 +24,13 @@
  */
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
+import MagicString from "magic-string";
 import { compileNumericCandidate } from "./numeric_candidate.mjs";
 import { NumericKernelCompileError } from "./numeric_kernel.mjs";
 import { hasNumericLoop, discoverNumericArrayParameters } from "./numeric_loop_discovery.mjs";
 import { discoverNumericStorageHints } from "./numeric_storage_hints.mjs";
 import { planNumericLoopIslands, numericLoopScopeBindings } from "./numeric_loop_islands.mjs";
-import { createNumericHelperCapturePlanner } from "./numeric_helper_captures.mjs";
+import { createNumericHelperCapturePlanner, numericHelperSource } from "./numeric_helper_captures.mjs";
 
 function span(node) {
   return {
@@ -154,8 +155,8 @@ export function numericApplicationSettings(options = {}) {
 
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
- * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean, loopIslands?: boolean}} options
- * @returns {{code: string, changed: boolean, report: object}}
+ * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean, loopIslands?: boolean, sourcemap?: boolean}} options
+ * @returns {{code: string, changed: boolean, report: object, map?: object | null}}
  */
 export function specializeNumericModule(
   source,
@@ -167,6 +168,7 @@ export function specializeNumericModule(
     maxIterations = 1000000,
     crossModule = false,
     loopIslands = false,
+    sourcemap = false,
   } = {},
 ) {
   if (typeof source !== "string")
@@ -189,6 +191,8 @@ export function specializeNumericModule(
     throw new TypeError("crossModule must be a boolean");
   if (typeof loopIslands !== "boolean")
     throw new TypeError("loopIslands must be a boolean");
+  if (typeof sourcemap !== "boolean")
+    throw new TypeError("sourcemap must be a boolean");
   const report = {
     version: 1,
     sourceName: String(sourceName),
@@ -215,6 +219,26 @@ export function specializeNumericModule(
     report.refusal = { code: "MODULE_PARSE_UNSUPPORTED", message: error.message };
     return unchanged();
   }
+  const constHelpers = new Map(), constInitializations = new WeakSet();
+  for (const statement of ast.body) {
+    const declaration = statement.declaration ?? statement;
+    if (declaration.type !== "VariableDeclaration" || declaration.kind !== "const") continue;
+    for (const variable of declaration.declarations) {
+      const fn = variable.init;
+      if (variable.id.type !== "Identifier" ||
+          !["FunctionExpression", "ArrowFunctionExpression"].includes(fn?.type) ||
+          fn.async || fn.generator || fn.params.some(param => param.type !== "Identifier")) continue;
+      // A private expression name is a different lexical binding. It may be
+      // erased only when unused; recursive/self-name access retains source JS.
+      if (fn.id && fn.id.name !== variable.id.name) {
+        let selfReference = false;
+        walk.full(fn.body, node => { if (node.type === "Identifier" && node.name === fn.id.name) selfReference = true; });
+        if (selfReference) continue;
+      }
+      constHelpers.set(variable.id.name, {fn, initializedAfter:statement.end});
+      constInitializations.add(variable);
+    }
+  }
   const names = new Set(),
     mutations = new Set(),
     calls = [];
@@ -223,7 +247,7 @@ export function specializeNumericModule(
     if (node.type === "Identifier") names.add(node.name);
     if (node.type === "AssignmentExpression") patternNames(node.left, mutations);
     if (node.type === "UpdateExpression") patternNames(node.argument, mutations);
-    if (node.type === "VariableDeclarator" && node.init) patternNames(node.id, mutations);
+    if (node.type === "VariableDeclarator" && node.init && !constInitializations.has(node)) patternNames(node.id, mutations);
     if (node.type === "ForInStatement" || node.type === "ForOfStatement")
       patternNames(node.left, mutations);
     if (node.type === "CallExpression" && node.callee.type === "Identifier") {
@@ -296,8 +320,9 @@ export function specializeNumericModule(
       }
     }
   }
-  // Only hoisted declarations have a known initialized binding throughout module
-  // evaluation. Const/arrow helpers need a separate TDZ/initialization proof.
+  // Hoisted declarations are initialized throughout module evaluation. Const
+  // helpers need a later registration point: until all reachable initializers
+  // execute, an undefined token retains the original call and its TDZ behavior.
   // Keep every original declaration/export intact; helper closure is codegen,
   // not function replacement or source evaluation. The compiler rejects free
   // variables, shadowed callees, recursion and any unclosed transitive helper.
@@ -305,6 +330,7 @@ export function specializeNumericModule(
   const helperSources = new Map();
   const helperSpans = new Map();
   const helperDeclarations = new Map();
+  const helperInitializers = new Map(), helperOriginalSpans = new Map();
   for (const statement of ast.body) {
     const fn = ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(statement.type)
       ? statement.declaration
@@ -313,6 +339,15 @@ export function specializeNumericModule(
     helperSources.set(fn.id.name, source.slice(fn.start, fn.end));
     helperSpans.set(fn.id.name, span(fn));
     helperDeclarations.set(fn.id.name, fn);
+  }
+  for (const [name, {fn, initializedAfter}] of constHelpers) {
+    if (mutations.has(name)) continue;
+    const normalized = numericHelperSource(source, tokens, fn, name);
+    helperSources.set(name, normalized.source);
+    helperSpans.set(name, span(fn));
+    helperDeclarations.set(name, fn);
+    helperInitializers.set(name, initializedAfter);
+    helperOriginalSpans.set(name, normalized.originalSpan);
   }
   // Include every identifier token, including binding/property positions skipped
   // by a semantic walker. Generated bindings cannot collide in nested scopes.
@@ -496,9 +531,10 @@ export function specializeNumericModule(
     const mathResolver = artifact.manifest.mathIntrinsics ? "() => Math" : "null";
     const captureKinds = lifted?.arrayParameters.size ? `, captureKinds:${JSON.stringify(lifted.captureKinds)}` : "";
     const captureOptions = lifted ? `, {parameterCount:${fn.params.length}, captureCount:${lifted.captures.length}${captureKinds}, resolve:() => [${lifted.captures.join(",")}]}` : "";
-    registrations.push(
-      `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`,
-    );
+    const registration = `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`;
+    const initializedAfter = Math.max(0, ...artifact.helpers.map(helper => helperInitializers.get(helper.name) ?? 0));
+    if (initializedAfter) edits.push({start:initializedAfter, end:initializedAfter, text:`;\n${registration}\n`});
+    else registrations.push(registration);
     helpers.push(
       `function ${helperName}(callee, ...args) { return ${dispatchName}(${tokenName}, callee, args); }`,
     );
@@ -538,6 +574,8 @@ export function specializeNumericModule(
       item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan, functionName }) => {
         if (lifted) return {kind, depth, ...(functionName ? {functionName} : {}),
           sourceSpan: lifted.originalSpan(functionName, sourceSpan)};
+        if (helperOriginalSpans.has(functionName)) return {kind, depth, functionName,
+          sourceSpan:helperOriginalSpans.get(functionName)(sourceSpan)};
         const owner = functionName ? helperSpans.get(functionName) : span(fn);
         return {
           kind, depth, ...(functionName ? { functionName } : {}),
@@ -580,6 +618,7 @@ export function specializeNumericModule(
         ...helper,
         sourceSpan: helperSpans.get(helper.name),
       }));
+      if (initializedAfter) item.helperBindingSemantics = "immutable-module-bindings-after-initialization";
     }
     item.storageSemantics = "same-type-alias-preserving-v1";
     item.guardFallback = "retained-original-js";
@@ -602,7 +641,7 @@ export function specializeNumericModule(
   if (loopIslands) {
     const planned = planNumericLoopIslands(source, {
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
-      maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations, helperCapturePlan,
+      maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations, helperInitializers, helperCapturePlan,
       replaceableCalls: report.candidates.flatMap(item => item.calls),
       excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
     });
@@ -716,9 +755,28 @@ export function specializeNumericModule(
   // Apply disjoint token edits backwards. Nested calls retain their own edits
   // and all original argument expressions, comments, spreads and evaluation order.
   edits.sort((a, b) => b.start - a.start || b.end - a.end);
-  let code = source;
-  for (const edit of edits) code = code.slice(0, edit.start) + edit.text + code.slice(edit.end);
-  code += "\n" + helpers.join("\n") + "\n";
+  const transformed = new MagicString(source);
+  for (const edit of edits) {
+    if (edit.start === edit.end) {
+      // Preserve the backwards token edits' order for same-position insertions.
+      transformed.prependLeft(edit.start, edit.text);
+    } else if (edit.retainedOffset !== undefined) {
+      // The original loop is the production fallback. Its individual source
+      // coordinates remain useful even when the native guard declines a call.
+      const end = edit.retainedOffset + edit.end - edit.start;
+      if (edit.text.slice(edit.retainedOffset, end) !== source.slice(edit.start, edit.end))
+        throw new Error("Numeric loop source-map boundary lost its original statement");
+      transformed.prependLeft(edit.start, edit.text.slice(0, edit.retainedOffset));
+      // Adjacent independently admitted loops may share this boundary. Earlier
+      // suffixes precede the next loop's prefix, which was inserted first by
+      // the descending edit walk.
+      transformed.prependLeft(edit.end, edit.text.slice(end));
+    } else {
+      transformed.overwrite(edit.start, edit.end, edit.text);
+    }
+  }
+  transformed.append("\n" + helpers.join("\n") + "\n");
   report.route = report.compiledKernels ? "mixed-js-and-guarded-numeric-wasm" : "shared-numeric-dispatch-with-retained-fallback";
-  return { code, changed: true, report };
+  return { code: transformed.toString(), changed: true, report,
+    map: sourcemap ? transformed.generateMap({hires: true, includeContent: true, source: String(sourceName)}) : null };
 }

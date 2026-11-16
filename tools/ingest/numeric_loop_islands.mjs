@@ -227,7 +227,7 @@ function outputOnlyScalars(loop, scalarOutputs) {
 export function planNumericLoopIslands(source, {
   ast, fresh, sourceName = '<module>', maxKernels = 64, maxMemoryPages = 1024,
   maxIterations = 1000000, excludedSpans = [], reservedEdits = [],
-  helperSources = new Map(), helperDeclarations = new Map(), replaceableCalls = [], helperCapturePlan = null,
+  helperSources = new Map(), helperDeclarations = new Map(), helperInitializers = new Map(), replaceableCalls = [], helperCapturePlan = null,
 }) {
   const report = {version:1, scope:'closed-loop-statements-in-original-lexical-environment',
     compiledKernels:0, candidates:[], accelerated:false};
@@ -363,7 +363,13 @@ export function planNumericLoopIslands(source, {
     const captureKinds = lifted?.arrayParameters.size ? `, captureKinds:${JSON.stringify(lifted.captureKinds)}` : '';
     const captureOptions = lifted ? `, ${moduleMath ? '() => Math' : 'null'}, {parameterCount:${parameters.length - lifted.captures.length}, captureCount:${lifted.captures.length}${captureKinds}, resolve:() => [${lifted.captures.join(',')}]}`
       : moduleMath ? ', () => Math' : '';
-    registrations.push(`var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${captureOptions});`);
+    const registration = `var ${token} = ${createName}([${artifact.wasm.join(',')}], ${JSON.stringify(alternatives)}${captureOptions});`;
+    const initializedAfter = Math.max(0, ...artifact.helpers.map(helper => helperInitializers.get(helper.name) ?? 0));
+    // var is hoisted, but native execution becomes available only after every
+    // reachable lexical helper initializes. Earlier calls keep the original
+    // loop, including zero trips and partial effects before a helper TDZ error.
+    if (initializedAfter) edits.push({start:initializedAfter, end:initializedAfter, text:`;\n${registration}\n`});
+    else registrations.push(registration);
     // An extra block prevents a dangling else from rebinding to our predicate.
     // The original statement (including lexical declarations and comments) is
     // unchanged in the fallback. Capture failures have no source effects.
@@ -379,16 +385,19 @@ export function planNumericLoopIslands(source, {
       const result=fresh('loop_result'), values=[...inputs,
         ...scalarOutputs.map(name => outputOnly.has(name) ? `(${name}, 0)` : name)].join(',');
       const publish=scalarOutputs.map((name,i) => `${name} = ${result}[${i}];`).join('\n');
-      edits.push({start:node.start,end:node.end,text:
+      const prefix =
         `{ const ${result} = ${stateDispatchName}(${token}, () => [${values}], ${scalarOutputs.length}, ${mathResolver});\n` +
-        `if (${result} === null) {\n${source.slice(node.start,node.end)}\n} else {\n${publish}\n} }`});
+        `if (${result} === null) {\n`;
+      edits.push({start:node.start,end:node.end,retainedOffset:prefix.length,text:
+        prefix + `${source.slice(node.start,node.end)}\n} else {\n${publish}\n} }`});
     } else {
       if (!dispatchName) {
         dispatchName=fresh('dispatch_loop');
         runtimeImports.push(`dispatchNumericLoop as ${dispatchName}`);
       }
-      edits.push({start:node.start,end:node.end,text:
-        `{ if (!${dispatchName}(${token}, () => [${captures.join(',')}], ${mathResolver})) {\n${source.slice(node.start,node.end)}\n} }`});
+      const prefix = `{ if (!${dispatchName}(${token}, () => [${captures.join(',')}], ${mathResolver})) {\n`;
+      edits.push({start:node.start,end:node.end,retainedOffset:prefix.length,text:
+        prefix + `${source.slice(node.start,node.end)}\n} }`});
     }
     accepted.push(node); report.compiledKernels++;
     for (const edit of nestedEdits) absorbedEdits.add(edit);
@@ -408,7 +417,7 @@ export function planNumericLoopIslands(source, {
       ...(artifact.manifest.mathIntrinsics ? {mathIntrinsics:[...artifact.manifest.mathIntrinsics]} : {}),
       ...(artifact.manifest.mathImports ? {mathImports:[...artifact.manifest.mathImports]} : {}),
       ...(artifact.helpers.length ? {
-        helperBindingSemantics:'immutable-module-declarations',
+        helperBindingSemantics:initializedAfter ? 'immutable-module-bindings-after-initialization' : 'immutable-module-declarations',
         helpers:artifact.helpers.map(helper => ({...helper, sourceSpan:span(helperDeclarations.get(helper.name))})),
         ...(moduleMath ? {helperMathBinding:'live-module-lexical-environment'} : {}),
       } : {}),

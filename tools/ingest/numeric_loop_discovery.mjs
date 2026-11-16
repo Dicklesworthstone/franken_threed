@@ -35,7 +35,7 @@ export function hasNumericLoop(body, immutableHelpers = null, includeBulk = fals
         'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
       if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier') {
         const helper = immutableHelpers.get(node.callee.name);
-        if (helper?.type === 'FunctionDeclaration') pending.push(helper.body);
+        if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(helper?.type)) pending.push(helper.body);
       }
       for (const value of Object.values(node)) {
         if (Array.isArray(value)) {
@@ -147,7 +147,7 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       }
       if (node.type === 'CallExpression' && !node.optional && node.callee.type === 'Identifier' && !scope?.has(node.callee.name)) {
         const callee = immutableHelpers.get(node.callee.name);
-        if (callee?.type === 'FunctionDeclaration') {
+        if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(callee?.type)) {
           record.calls.push({callee, arguments:node.arguments.map(visibleReferences)});
           if (!graph.has(callee)) pending.push(callee);
         }

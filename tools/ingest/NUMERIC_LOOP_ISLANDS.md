@@ -120,8 +120,9 @@ spans, captures, scalar outputs, loop counts, retained reasons and variant sizes
 `outputOnlyScalars` identifies the bindings whose incoming values are proved
 irrelevant; their initialization is still checked. A `LoopSequence` record
 identifies a fused region. For linked builds, source
-coordinates refer to the rendered chunk before specialization/hash substitution,
-not an invented source map. Runtime assets remain content-addressed and movable
+coordinates refer to the rendered chunk before specialization/hash substitution.
+Separately requested Rollup source maps preserve the original JavaScript loop
+inside its guarded fallback, including scalar-publication loops. Runtime assets remain content-addressed and movable
 with the emitted package; actual runtime imports appear in Rollup metadata.
 
 ## Verification and limits

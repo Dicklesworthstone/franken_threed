@@ -37,7 +37,7 @@ function observeWasm(t) {
   t.after(() => {
     WebAssembly.Instance = NativeInstance;
   });
-  WebAssembly.Instance = (...args) => {
+  WebAssembly.Instance = function (...args) {
     const instance = Reflect.construct(NativeInstance, args);
     counts.instances++;
     return {
@@ -134,7 +134,7 @@ test("dynamic chunks specialize their local calls and remain loadable after relo
     "entry.mjs": `export const load = () => import('./lazy.mjs');`,
     "lazy.mjs": `${UPDATE}\nexport function tick(a, v, dt) { integrate(a, v, dt); }`,
   });
-  const result = await buildApplication(app.entry, app.out, { specializeNumeric: true });
+  const result = await buildApplication(app.entry, app.out, { specializeNumeric: {crossModule: false} });
   assert.equal(result.numericSpecialization.compiledKernels, 1);
   assert.ok(result.chunks.some((chunk) => chunk.isDynamicEntry));
   assert.ok(
@@ -235,8 +235,8 @@ test("actual Rollup plugin supports repeated generation and preserves requested 
       second.output.map((item) => item.fileName),
     );
     const mapped = await bundle.generate({ format: "es", sourcemap: true });
-    assert.equal(plugin.api.getReport().compiledKernels, 0);
-    assert.deepEqual(plugin.api.getReport().runtimeAssets, []);
+    assert.equal(plugin.api.getReport().compiledKernels, 1);
+    assert.equal(plugin.api.getReport().runtimeAssets.length, 2);
     assert.ok(mapped.output.find((item) => item.type === "chunk").map);
   } finally {
     await bundle.close();

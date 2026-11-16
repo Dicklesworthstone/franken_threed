@@ -67,7 +67,7 @@ test("lifecycle emits self-contained hashed runtime assets and executable native
   t.after(() => {
     WebAssembly.Instance = native;
   });
-  WebAssembly.Instance = (...args) => {
+  WebAssembly.Instance = function (...args) {
     const instance = Reflect.construct(native, args);
     return {
       exports: {
@@ -92,7 +92,7 @@ test("lifecycle emits self-contained hashed runtime assets and executable native
   }
   assert.equal(record.imports.length, 1);
   assert.deepEqual(record.importedBindings[record.imports[0]], [
-    "createNumericDispatch",
+    "registerNumericDispatch",
     "dispatchNumericCall",
   ]);
   const { module } = await materialize(run.bundle, "app.mjs");
@@ -183,8 +183,8 @@ test("a new output generation resets kernel/asset/report state", () => {
   assert.deepEqual(report.runtimeAssets, []);
 });
 
-test("source map and non-ES contracts are retained rather than silently changed", () => {
-  for (const output of [{ format: "cjs" }, { format: "es", sourcemap: true }]) {
+test("non-ES output contracts are retained rather than silently changed", () => {
+  for (const output of [{ format: "cjs" }, { format: "iife" }]) {
     const run = lifecycle();
     assert.equal(run.chunk(CODE, "app.mjs", output).result, null);
     const report = run.finish();
@@ -192,8 +192,19 @@ test("source map and non-ES contracts are retained rather than silently changed"
     assert.deepEqual(report.runtimeAssets, []);
     assert.equal(
       report.units[0].refusal.code,
-      output.format === "cjs" ? "NON_ES_OUTPUT" : "SOURCE_MAP_SPECIALIZATION_UNAVAILABLE",
+      "NON_ES_OUTPUT",
     );
+  }
+});
+
+test("mapped ES chunks keep native kernels and include the original chunk source", () => {
+  for (const sourcemap of [true, "inline", "hidden"]) {
+    const run = lifecycle();
+    const {result} = run.chunk(CODE, "app.mjs", {format: "es", sourcemap});
+    assert.ok(result.map.mappings);
+    assert.deepEqual(result.map.sourcesContent, [CODE]);
+    assert.equal(run.finish().compiledKernels, 1);
+    assert.equal(run.plugin.api.getReport().runtimeAssets.length, 2);
   }
 });
 

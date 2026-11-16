@@ -29,7 +29,7 @@ async function load(source, options = {}) {
 function observeWasm(t) {
   const NativeInstance = WebAssembly.Instance;
   const counts = { instances: 0, calls: 0 };
-  WebAssembly.Instance = (...args) => {
+  WebAssembly.Instance = function (...args) {
     const instance = Reflect.construct(NativeInstance, args);
     counts.instances++;
     return {

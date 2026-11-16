@@ -131,7 +131,7 @@ test('real Rollup metadata lists only the native loop runtime bindings it actual
     const repeated=await bundle.generate({format:'es',entryFileNames:'chunks/[name]-[hash].mjs'});
     assert.deepEqual(repeated.output,result.output);
     const mapped=await bundle.generate({format:'es',sourcemap:true});
-    assert.equal(plugin.api.getReport().compiledLoopIslands,0);assert.deepEqual(plugin.api.getReport().runtimeAssets,[]);
+    assert.equal(plugin.api.getReport().compiledLoopIslands,1);assert.equal(plugin.api.getReport().runtimeAssets.length,2);
     assert.ok(mapped.output.find(item=>item.type==='chunk').map);
   }finally{await bundle.close();}
 });
