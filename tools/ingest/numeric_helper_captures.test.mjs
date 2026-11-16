@@ -91,8 +91,10 @@ test('callback loops keep helper scope independent of local state and publish va
 });
 
 for(const loopIslands of [false,true]) test(`helper capture TDZ keeps zero trips and original partial exceptions (${loopIslands?'loop':'function'})`, async () => {
+  // A mutable callback keeps this lane on loop extraction now that immutable
+  // const expressions can also qualify as whole-function roots.
   const app=await application(`function h(x){return x+gain;}
-    ${loopIslands?'export const update=a=>':'export function update(a)'}{for(let i=0;i<a.length;i++){a[i]+=1;a[i]=h(a[i]);}}
+    ${loopIslands?'export let update=a=>':'export function update(a)'}{for(let i=0;i<a.length;i++){a[i]+=1;a[i]=h(a[i]);}}
     export const run=a=>update(a);
     export const early=run(new Float64Array());
     export const partial=new Float64Array([3,4]);export let error;

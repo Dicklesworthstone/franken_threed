@@ -387,31 +387,43 @@ export function specializeNumericModule(
   // Keep previously eligible local-call kernels ahead of newly discovered
   // export-only kernels when the unit's compilation budget is small.
   const calledNames = new Set(calls.map(call => call.callee.name));
-  const priority = statement => calledNames.has((statement.declaration ?? statement).id?.name) ? 0 : 1;
-  const orderedCandidates = crossModule ? [...ast.body].sort((a, b) => priority(a) - priority(b)) : ast.body;
-  const directLoops = new Set(orderedCandidates.filter(statement => {
+  const declarationCandidates = ast.body.flatMap(statement => {
     const fn = statement.declaration ?? statement;
-    return fn.type === "FunctionDeclaration" && hasNumericLoop(fn.body, null, false);
-  }));
+    return fn.type === "FunctionDeclaration" && fn.id ? [{fn, name:fn.id.name}] : [];
+  });
+  const priority = candidate => calledNames.has(candidate.name) ? 0 : 1;
+  const orderedCandidates = crossModule
+    ? declarationCandidates.sort((a, b) => priority(a) - priority(b)) : declarationCandidates;
+  const directLoops = new Set(orderedCandidates.filter(({fn}) => hasNumericLoop(fn.body, null, false)));
   // Do not let a new delegating root consume the last slot before a previously
   // eligible loop function. Within both groups, retain the prior call priority.
-  const candidates = [...orderedCandidates.filter(statement => directLoops.has(statement)),
-    ...orderedCandidates.filter(statement => !directLoops.has(statement))];
-  for (const statement of candidates) {
-    const fn = ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(statement.type)
-      ? statement.declaration
-      : statement;
-    if (fn?.type !== "FunctionDeclaration" || !fn.id) continue;
+  // Existing declarations keep their compilation-budget priority. Immutable
+  // expression roots reuse helper normalization only for code generation; the
+  // actual const initializer, lexical function and its public shape stay put.
+  const expressionCandidates = [...constHelpers].map(([name, {fn}]) => ({fn, name}));
+  if (crossModule) expressionCandidates.sort((a, b) => priority(a) - priority(b));
+  const candidates = [...orderedCandidates.filter(candidate => directLoops.has(candidate)),
+    ...orderedCandidates.filter(candidate => !directLoops.has(candidate)), ...expressionCandidates];
+  const expressionRegions = [];
+  const inside = (region, node) => region.start <= node.start && region.end >= node.end;
+  for (const candidate of candidates) {
+    const {fn, name} = candidate, expressionRoot = fn.type !== "FunctionDeclaration";
     // Include roots whose only iteration lives in reachable immutable helpers.
     // Discovery never substitutes for scalar closure or callee-identity guards.
-    if (!directLoops.has(statement) && !hasNumericLoop(fn.body, helperDeclarations, true)) continue;
-    const sites = calls.filter((call) => call.callee.name === fn.id.name);
+    if (!directLoops.has(candidate) && !hasNumericLoop(fn.body, helperDeclarations, true)) continue;
+    // A helper in a compiled declaration already executes inside that native
+    // transaction. Do not add another dispatch inside its original source, or
+    // spend a second root on a private expression used only by that graph.
+    const nativeRegions = expressionRoot ? report.candidates.filter(item => item.route === "guarded-numeric-wasm")
+      .flatMap(item => [item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan)]) : [];
+    const sites = calls.filter(call => call.callee.name === name &&
+      !nativeRegions.some(region => region && inside(region, call)));
     // Uncalled delegating wrappers offer no route in local-call mode. Avoid
     // adding irrelevant candidates solely because one of their callees loops.
-    if (!directLoops.has(statement) && !sites.length && !(crossModule && exportedBindings.has(fn.id.name))) continue;
-    const loops = fn.body.body.filter((node) => node.type === "ForStatement");
+    if (!directLoops.has(candidate) && !sites.length && !(crossModule && exportedBindings.has(name))) continue;
+    const loops = fn.body.type === "BlockStatement" ? fn.body.body.filter(node => node.type === "ForStatement") : [];
     const item = {
-      functionName: fn.id.name,
+      functionName: name,
       sourceSpan: span(fn),
       route: "retained-js",
       reason: null,
@@ -420,11 +432,11 @@ export function specializeNumericModule(
     report.candidates.push(item);
     // Rebinding before this module's evaluation is possible through an ESM
     // cycle. Do not capture an altered function and associate it with old code.
-    if (mutations.has(fn.id.name)) {
+    if (mutations.has(name)) {
       item.reason = "MUTABLE_FUNCTION_BINDING";
       continue;
     }
-    if (!sites.length && !(crossModule && exportedBindings.has(fn.id.name))) {
+    if (!sites.length && !(crossModule && exportedBindings.has(name))) {
       item.reason = "NO_LOCAL_DIRECT_CALLS";
       continue;
     }
@@ -436,11 +448,12 @@ export function specializeNumericModule(
     // a subscript itself. Infer those slots across argument positions, then
     // demand the same whole-graph compiler proof and per-invocation guards.
     const arrays = discoverNumericArrayParameters(fn, helperDeclarations);
-    const lifted = helperCapturePlan(fn);
+    const lifted = helperCapturePlan(fn, [ast], expressionRoot ? name : null);
     if (lifted?.refusal) { item.reason = lifted.refusal; continue; }
     const parameterTypes = [...fn.params.map((param) => (arrays.has(param.name) ? "f64[]" : "f64")),
       ...(lifted?.captureKinds.map(kind => kind === "array" ? "f64[]" : "f64") ?? [])];
-    const kernelSource = lifted ? lifted.rewrite() : source.slice(fn.start, fn.end);
+    const kernelSource = lifted ? lifted.rewrite() : expressionRoot
+      ? helperSources.get(name) : source.slice(fn.start, fn.end);
     const candidateHelpers = lifted?.helperSources ?? helperSources;
     let artifact;
     try {
@@ -448,7 +461,7 @@ export function specializeNumericModule(
         parameterTypes,
         helperSources: candidateHelpers,
         allowMath: true,
-        sourceName: `${sourceName}:${fn.id.name}`,
+        sourceName: `${sourceName}:${name}`,
         maxMemoryPages,
         maxIterations,
       });
@@ -506,7 +519,7 @@ export function specializeNumericModule(
           parameterTypes: types,
           helperSources: candidateHelpers,
           allowMath: true,
-          sourceName: `${sourceName}:${fn.id.name}`,
+          sourceName: `${sourceName}:${name}`,
           maxMemoryPages,
           maxIterations,
         });
@@ -531,20 +544,22 @@ export function specializeNumericModule(
     const mathResolver = artifact.manifest.mathIntrinsics ? "() => Math" : "null";
     const captureKinds = lifted?.arrayParameters.size ? `, captureKinds:${JSON.stringify(lifted.captureKinds)}` : "";
     const captureOptions = lifted ? `, {parameterCount:${fn.params.length}, captureCount:${lifted.captures.length}${captureKinds}, resolve:() => [${lifted.captures.join(",")}]}` : "";
-    const registration = `var ${tokenName} = ${createName}(${fn.id.name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`;
-    const initializedAfter = Math.max(0, ...artifact.helpers.map(helper => helperInitializers.get(helper.name) ?? 0));
+    const registration = `var ${tokenName} = ${createName}(${name}, [${artifact.wasm.join(",")}], ${JSON.stringify(alternatives)}, ${mathResolver}, true${captureOptions});`;
+    const initializedAfter = Math.max(helperInitializers.get(name) ?? 0,
+      ...artifact.helpers.map(helper => helperInitializers.get(helper.name) ?? 0));
     if (initializedAfter) edits.push({start:initializedAfter, end:initializedAfter, text:`;\n${registration}\n`});
     else registrations.push(registration);
     helpers.push(
       `function ${helperName}(callee, ...args) { return ${dispatchName}(${tokenName}, callee, args); }`,
     );
     for (const call of sites) {
-      edits.push({ start: call.callee.start, end: call.callee.end, text: helperName });
+      edits.push({ start: call.callee.start, end: call.callee.end, text: helperName, sourceCallStart:call.start });
       const pos = callParen(call);
       edits.push({
         start: pos,
         end: pos,
         text: `${source.slice(call.callee.start, call.callee.end)},`,
+        sourceCallStart:call.start,
       });
       item.calls.push(span(call));
     }
@@ -574,8 +589,8 @@ export function specializeNumericModule(
       item.loops = artifact.controlLoops.map(({ kind, depth, sourceSpan, functionName }) => {
         if (lifted) return {kind, depth, ...(functionName ? {functionName} : {}),
           sourceSpan: lifted.originalSpan(functionName, sourceSpan)};
-        if (helperOriginalSpans.has(functionName)) return {kind, depth, functionName,
-          sourceSpan:helperOriginalSpans.get(functionName)(sourceSpan)};
+        if (helperOriginalSpans.has(functionName ?? name)) return {kind, depth, ...(functionName ? {functionName} : {}),
+          sourceSpan:helperOriginalSpans.get(functionName ?? name)(sourceSpan)};
         const owner = functionName ? helperSpans.get(functionName) : span(fn);
         return {
           kind, depth, ...(functionName ? { functionName } : {}),
@@ -622,13 +637,38 @@ export function specializeNumericModule(
     }
     item.storageSemantics = "same-type-alias-preserving-v1";
     item.guardFallback = "retained-original-js";
+    if (expressionRoot) {
+      item.bindingSemantics = "immutable-module-expression-after-initialization";
+      expressionRegions.push(item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan));
+    }
     if (crossModule) {
       item.dispatchSemantics = "shared-original-function-identity-v1";
-      item.exportReachable = exportedBindings.has(fn.id.name);
+      item.exportReachable = exportedBindings.has(name);
       report.registeredKernels++;
     }
     report.compiledKernels++;
     report.rewrittenCalls += sites.length;
+  }
+  // A newly admitted expression may contain an earlier declaration's call
+  // site. Keep the original root and helper bodies byte-for-byte intact: the
+  // native root already owns those calls, and fallback must use original JS.
+  const absorbedExpressionCalls = report.candidates.flatMap(item => item.calls)
+    .filter(call => expressionRegions.some(region => region && inside(region, call)));
+  if (absorbedExpressionCalls.length) {
+    const absorbed = new Set(absorbedExpressionCalls.map(call => call.start));
+    // A semicolon-free concise arrow may end at the call's end coordinate.
+    // Its registration shares that offset but is not part of the call edit.
+    for (let index = edits.length - 1; index >= 0; index--)
+      if (absorbed.has(edits[index].sourceCallStart)) edits.splice(index, 1);
+    for (const item of report.candidates) {
+      const calls = item.calls.filter(call => absorbed.has(call.start));
+      if (calls.length) {
+        item.absorbedCalls = calls;
+        item.calls = item.calls.filter(call => !absorbed.has(call.start));
+      }
+    }
+    report.rewrittenCalls -= absorbedExpressionCalls.length;
+    report.absorbedCalls = absorbedExpressionCalls.length;
   }
   // Consumer-only chunks need no kernel or Wasm bytes of their own. The source
   // dependency still initializes on the normal ESM schedule; do not import or
@@ -643,7 +683,8 @@ export function specializeNumericModule(
       ast, fresh, sourceName, maxKernels: maxKernels - report.compiledKernels,
       maxMemoryPages, maxIterations, reservedEdits: edits, helperSources, helperDeclarations, helperInitializers, helperCapturePlan,
       replaceableCalls: report.candidates.flatMap(item => item.calls),
-      excludedSpans: report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
+      excludedSpans: [...report.candidates.filter(item => item.route === "guarded-numeric-wasm").map(item => item.sourceSpan),
+        ...expressionRegions.filter(Boolean)],
     });
     // Replace smaller direct-call token edits only after a larger original
     // statement has passed full closure. Its JS fallback is already embedded
@@ -662,7 +703,7 @@ export function specializeNumericModule(
         }
       }
       report.rewrittenCalls -= absorbed.size;
-      report.absorbedCalls = absorbed.size;
+      report.absorbedCalls = (report.absorbedCalls ?? 0) + absorbed.size;
     }
     report.functionKernels = report.compiledKernels;
     report.loopIslands = planned.report;
@@ -672,7 +713,8 @@ export function specializeNumericModule(
     runtimeImports.push(...planned.runtimeImports);
   }
   if (crossModule) {
-    const sites = calls.filter(call => importedBindings.has(call.callee.name));
+    const sites = calls.filter(call => importedBindings.has(call.callee.name) &&
+      !expressionRegions.some(region => region && inside(region, call)));
     if (sites.length) {
       const importedDispatchName = fresh("imported_dispatch"), helperName = fresh("imported_call");
       runtimeImports.push(`dispatchImportedNumericCall as ${importedDispatchName}`);

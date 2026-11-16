@@ -90,6 +90,34 @@ clamped-buffer variants remain available when selected by producer-side AOT
 storage hints. No source allocation or application callback is executed by the
 compiler to obtain those hints.
 
+## Immutable arrow and function-expression kernels
+
+Top-level `const` bindings can be whole-function producers as well as helpers:
+
+```js
+export const integrate = (positions, velocity, dt) => {
+  for (let i = 0; i < positions.length; i++) {
+    positions[i] += velocity[i] * dt;
+  }
+};
+```
+
+Closed concise arrows, block-bodied arrows and function expressions use the same
+numeric compiler, typed-array guards and transactional fallback as declarations.
+Their original function objects, source text, inferred names, arity and exports
+remain intact. Only code generation normalizes the expression into a declaration.
+Native registration occurs after the root and all reachable immutable helper
+initializers execute. Earlier calls retain JavaScript, including calls within the
+same declaration; temporal-dead-zone errors and top-level-await ordering stay
+source-owned.
+
+The whole body must satisfy the existing numeric admission rules. Lexical
+`this`/`arguments`, recursive private names, async/generator functions and mutable
+bindings do not gain a native route from this syntax support. Imported direct
+calls reuse the same original-identity registration across modules and emitted
+worker graphs. Existing declaration kernels retain their compilation-budget
+priority. This expands eligibility; it does not establish a speedup.
+
 ## Scope and costs
 
 Only direct, nonoptional calls through named/default imports or proven static
@@ -135,7 +163,8 @@ are kept consistent for producer-only, consumer-only, and mixed chunks.
 ## Validation
 
 ```sh
-node --test tools/ingest/numeric_cross_module.test.mjs \
+node --test tools/ingest/numeric_const_roots.test.mjs \
+  tools/ingest/numeric_cross_module.test.mjs \
   tools/ingest/numeric_cross_chunk.test.mjs \
   tools/ingest/numeric_namespace_runtime.test.mjs \
   tools/ingest/numeric_namespace_imports.integration.test.mjs

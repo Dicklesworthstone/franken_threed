@@ -253,6 +253,27 @@ test('ordinary application builds and packed HTML execute specialized workers wi
   assert.deepEqual(absent.value,expected.value);assert.equal(absent.calls,0);
 });
 
+test('native worker module graphs dispatch immutable expression roots with their original source and transfer ownership',async t=>{
+  const source=`export const advance=(out,velocity,gain)=>{
+    let i=0;while(i<out.length){out[i]+=velocity[i]*gain;velocity[i]+=1;i++;}
+  };`;
+  const f=fixture({...workerFiles,'kernel.mjs':source});
+  const native=emitGraph(f,'const-native',{specializeNumeric:true});
+  const original=emitGraph(f,'const-original');
+  const candidate=native.graph.numericUnits.flatMap(unit=>unit.candidates)
+    .find(item=>item.functionName==='advance');
+  assert.equal(candidate.bindingSemantics,'immutable-module-expression-after-initialization');
+  fs.renameSync(f.source,path.join(f.root,'source-unavailable'));
+  const actual=await launch(t,native.entry),reference=await launch(t,original.entry);
+  for(const alias of [false,true]) {
+    const result=await send(actual,packet(Float32Array,alias));
+    const expected=await send(reference,packet(Float32Array,alias));
+    assert.deepEqual(result.value,expected.value);
+    assert.equal(result.calls,alias?4:2);assert.equal(expected.calls,0);
+    assert.equal(result.value.out.buffer===result.value.velocity.buffer,alias);
+  }
+});
+
 test('classic-only document launchers use the same module-worker opt-in and build report', async t => {
   const f=fixture({...workerFiles,
     'index.html':"<script>globalThis.start=()=>new Worker('./worker.mjs',{type:'module'});</script>",

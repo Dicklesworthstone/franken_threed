@@ -124,7 +124,7 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
     return analyzed.get(name);
   }
 
-  return (root, ancestors = [ast]) => {
+  return (root, ancestors = [ast], rootName = null) => {
     const entry = inspect(root, ancestors), reachable = new Map(), pending = entry.calls.map(call => call.callee.name);
     while (pending.length) {
       const name = pending.pop();
@@ -151,7 +151,7 @@ export function createNumericHelperCapturePlanner({source, ast, tokens, helperSo
       if (declarationName) edits.push(...helperHeaderEdits(source, tokens, record.node, declarationName, parameters));
       return edits.sort((a,b) => a.start - b.start || a.end - b.end);
     }
-    const entryEdits = editsFor(entry, root.type === 'FunctionDeclaration' ? root.id.name : null);
+    const entryEdits = editsFor(entry, rootName ?? (root.type === 'FunctionDeclaration' ? root.id.name : null));
     const helperEdits = new Map([...reachable].map(([name, record]) => [name, editsFor(record, name)]));
     const convertedHelpers = new Map(helperSources);
     for (const [name, record] of reachable)
