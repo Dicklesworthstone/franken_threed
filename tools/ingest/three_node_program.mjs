@@ -1546,8 +1546,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   }
   function builderScope(context) {
     const target = renderer.getRenderTarget?.() ?? null;
+    // RenderContexts includes the MRT node identity even for a canvas draw.
+    // Changing its outputs in place does not select a different source context.
     const attachment = context.sourceRenderContext ?? `${target === null ? 'default' :
-      [target.textures.length, target.texture.format, target.texture.type, target.samples, target.depthBuffer, target.stencilBuffer].join(':')}-default-0`;
+      [target.textures.length, target.texture.format, target.texture.type, target.samples, target.depthBuffer, target.stencilBuffer].join(':')}-${renderer.getMRT?.()?.id ?? 'default'}-0`;
     return {attachment, chain: JSON.stringify([context.passId ?? null, attachment, sourceId(context.scene ?? null)])};
   }
   function inspectSceneLightsNode(node) {
@@ -1632,7 +1634,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
-        (context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null ||
+        !extension && ((context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null) ||
         renderer.getOutputRenderTarget?.()?.multiview) return null;
     if (sharedVertexExtension) for (const [name, attribute] of Object.entries(object.geometry.attributes)) {
       if (attribute.isStorageBufferAttribute) inspectThreeNodeStorageAttribute(three, attribute, fail);
@@ -1790,6 +1792,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       state.environment = environment;
       state.materialEnvironment = materialEnvironment(prepared, environment);
       state.environmentGraph = environmentGraphKey(prepared, context);
+      state.mrtSignature = inspectThreeMRT(three, renderer, prepared)?.key ?? null;
       return record.entry.descriptor;
     }
     if (!record) {
@@ -1871,6 +1874,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       previousState.environment = environment;
       previousState.materialEnvironment = materialEnvironment(preparedMaterial, environment);
       previousState.environmentGraph = environmentGraphKey(preparedMaterial, context);
+      // Source RenderContexts shares equal attachment layouts, and retains an
+      // MRT node's constructed graph until its real material/context key changes.
+      // Accept this draw's current targets/graph metadata without replaying setup;
+      // capture still rejects mutations made by later node-update callbacks.
+      previousState.mrtSignature = mrtKey;
       return previous.descriptor;
     }
     let key = keyOf(preparedMaterial, object, context, lights, environment, instanceSignature, skinSignature, morphSignature, fogKey, clippingKey);

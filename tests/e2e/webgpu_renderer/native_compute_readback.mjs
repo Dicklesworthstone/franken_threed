@@ -1,5 +1,6 @@
 // Ranged and reusable readback of real GPU reductions. This compares pinned
 // source semantics and native copy sizes, not hardware throughput.
+// Pass --pipeline-cache to run only bounded pipeline residency and GPU readback.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
@@ -10,6 +11,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const cacheOnly = process.argv.includes('--pipeline-cache');
 const {chromium} = createRequire(process.env.PLAYWRIGHT_MODULE_DIR ?? '/opt/node-tools/node_modules/')('playwright');
 const {rollup} = createRequire(path.join(repo, 'tools/package.json'))('rollup');
 const pin = JSON.parse(await readFile(path.join(repo, 'upstream/pin.json'), 'utf8')).oracle;
@@ -20,11 +22,13 @@ for (const file of ['build/three.core.js', 'build/three.webgpu.js']) {
     {cwd: path.join(repo, pin.target_checkout_dir), maxBuffer: 16 * 1024 * 1024});
   assert.equal(digest(await readFile(path.join(repo, pin.target_checkout_dir, file))), digest(source));
 }
-const bundle = await rollup({input: path.join(repo, 'tools/ingest/three_renderer.mjs'), treeshake: false,
-  onwarn(warning, warn) { if (warning.code !== 'CIRCULAR_DEPENDENCY') warn(warning); }});
 let rendererSource;
-try { rendererSource = (await bundle.generate({format: 'es', inlineDynamicImports: true})).output[0].code; }
-finally { await bundle.close(); }
+if (!cacheOnly) {
+  const bundle = await rollup({input: path.join(repo, 'tools/ingest/three_renderer.mjs'), treeshake: false,
+    onwarn(warning, warn) { if (warning.code !== 'CIRCULAR_DEPENDENCY') warn(warning); }});
+  try { rendererSource = (await bundle.generate({format: 'es', inlineDynamicImports: true})).output[0].code; }
+  finally { await bundle.close(); }
+}
 const server = http.createServer(async (request, response) => {
   try {
     const pathname = new URL(request.url, 'http://localhost').pathname;
@@ -50,6 +54,41 @@ async function capture(mode) {
     page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()); });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     const result = await page.evaluate(async mode => {
+      if (mode === 'pipeline-cache') {
+        const {createGpuCompute} = await import('/tools/ingest/gpu_compute.mjs');
+        const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice(), errors = [];
+        device.addEventListener('uncapturederror', event => errors.push(event.error.message));
+        const owner = createGpuCompute(device, {maxPipelines: 2}), key = {};
+        const source = new Uint32Array([91, 92, 93, 94]), buffer = owner.upload(key, source);
+        const bindings = [{index: 0, entries: [{binding: 0, resource: {buffer}}]}];
+        let retained, cachePeak = 0, heldReadback;
+        try {
+          for (let variant = 0; variant < 12; variant++) {
+            const shader = {code: `
+              @group(0) @binding(0) var<storage, read_write> values: array<u32>;
+              @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                values[id.x] = ${variant * 10 + 1}u + id.x;
+              }`};
+            const pipeline = variant % 2 ? owner.prepareSync(shader) : await owner.prepare(shader);
+            retained ??= pipeline;
+            owner.dispatch(pipeline, bindings, [1]);
+            const observed = Array.from(new Uint32Array(await owner.read(key)));
+            const expected = Array.from({length: 4}, (_, index) => variant * 10 + index + 1);
+            if (JSON.stringify(observed) !== JSON.stringify(expected))
+              throw new Error(`Pipeline variant ${variant}: ${JSON.stringify(observed)} != ${JSON.stringify(expected)}`);
+            cachePeak = Math.max(cachePeak, owner.cachedPipelineCount);
+            if (owner.cachedPipelineCount > 2) throw new Error('Pipeline cache exceeded its residency budget');
+          }
+          owner.dispatch(retained, bindings, [1]);
+          heldReadback = Array.from(new Uint32Array(await owner.read(key)));
+          if (JSON.stringify(heldReadback) !== '[1,2,3,4]') throw new Error('An evicted prepared pipeline lost its execution identity');
+          if (JSON.stringify(Array.from(source)) !== '[91,92,93,94]') throw new Error('Compute changed the source CPU array');
+          await owner.whenIdle();
+        } finally { owner.dispose(); device.destroy(); }
+        return {errors, variants: 12, cacheLimit: 2, cachePeak, heldReadback,
+          adapter: {vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+            device: adapter.info.device, description: adapter.info.description}};
+      }
       const T = await import('/upstream/three.js/build/three.webgpu.js'), N = T.TSL;
       const Renderer = mode === 'source' ? T.WebGPURenderer : (await import('/renderer.mjs')).createWebGPURendererClass(T);
       const adapter = await navigator.gpu.requestAdapter(), device = await adapter.requestDevice();
@@ -149,15 +188,25 @@ async function capture(mode) {
 }
 
 try {
-  const source = await capture('source'), candidate = await capture('candidate');
-  assert.equal(candidate.route, 'general-webgpu'); assert.equal(candidate.nativeBackend, true);
-  assert.deepEqual(candidate.observations, source.observations);
-  assert.deepEqual(candidate.copies, source.copies); assert.deepEqual(candidate.allocations, source.allocations);
-  assert.deepEqual(candidate.allocations, [8, 32, 8, 0, 32]);
-  assert.equal(candidate.copies.length, 7); assert.equal(candidate.copies.reduce((sum, copy) => sum + copy.size, 0), 36);
-  assert.ok(candidate.copies.every(copy => copy.size <= 8));
-  console.log(JSON.stringify({case: 'native_compute_readback', status: 'pass', exactComparison: true,
-    sourceBytes: candidate.sourceBytes, bytesCopied: 36, readbacks: candidate.copies.length,
-    reusableCapacity: 32, reductions: 3, gpuErrors: 0, route: candidate.route,
-    browserVersion: candidate.browserVersion, sourcePin: pin.source_commit}));
+  if (cacheOnly) {
+    const cache = await capture('pipeline-cache');
+    assert.equal(cache.cachePeak, cache.cacheLimit);
+    console.log(JSON.stringify({case: 'compute_pipeline_cache', status: 'pass', ...cache}));
+  } else {
+    const source = await capture('source'), candidate = await capture('candidate');
+    assert.equal(candidate.route, 'general-webgpu'); assert.equal(candidate.nativeBackend, true);
+    assert.deepEqual(candidate.observations, source.observations);
+    assert.deepEqual(candidate.copies, source.copies); assert.deepEqual(candidate.allocations, source.allocations);
+    assert.deepEqual(candidate.allocations, [8, 32, 8, 0, 32]);
+    assert.equal(candidate.copies.length, 7); assert.equal(candidate.copies.reduce((sum, copy) => sum + copy.size, 0), 36);
+    assert.ok(candidate.copies.every(copy => copy.size <= 8));
+    const cache = await capture('pipeline-cache');
+    assert.equal(cache.cachePeak, cache.cacheLimit);
+    console.log(JSON.stringify({case: 'native_compute_readback', status: 'pass', exactComparison: true,
+      sourceBytes: candidate.sourceBytes, bytesCopied: 36, readbacks: candidate.copies.length,
+      reusableCapacity: 32, reductions: 3, gpuErrors: 0, route: candidate.route,
+      pipelineCache: {variants: cache.variants, cacheLimit: cache.cacheLimit, cachePeak: cache.cachePeak,
+        heldReadback: cache.heldReadback, adapter: cache.adapter},
+      browserVersion: candidate.browserVersion, sourcePin: pin.source_commit}));
+  }
 } finally { await new Promise(resolve => server.close(resolve)); }

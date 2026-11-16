@@ -46,6 +46,21 @@ references; it never destroys caller-owned views, samplers or textures. Owner
 disposal, abort, device loss and terminal GPU validation failure clear the cache.
 No per-dispatch queue fence, CPU readback or duplicate buffer allocation is added.
 
+`maxPipelines` also bounds a working set, rather than the number of shaders that
+may ever execute. Preparing a new variant evicts the least recently requested
+completed pipeline when the cache is full. Its cached bind groups and layout
+references leave with it. Already prepared handles held by callers remain valid;
+weak admission avoids retaining every evicted pipeline for the owner's lifetime.
+`cachedPipelineCount` reports current cache entries, including pending entries.
+
+Unresolved asynchronous compilations have a separate bound at the same limit.
+Eviction cannot cancel native compiler work or erase validation obligations.
+Synchronous preparation that overtakes the same asynchronous key preserves both
+handles, and late completion cannot republish an evicted entry. Failed native
+compilation releases its pending slot for retry. Rejected or synchronously thrown
+queue completion terminates the owner, frees its resources and preserves the
+original error for later calls; it does not report successful completion.
+
 Complete group/entry shape validation precedes GPU binding allocation, including
 sparse arrays, duplicate slots and later malformed groups. Buffer alignment,
 shader-layout compatibility and resource-device validation remain WebGPU checks.
@@ -71,3 +86,14 @@ That is a deterministic API-call count, not a hardware throughput or latency
 measurement. The byte model is not a WGSL interpreter. These tests do not claim
 full renderer integration, actual shader execution, browser pixel parity,
 repository-wide validation or a measured GPU speedup.
+
+The existing browser readback runner also has a focused pipeline-cache case:
+
+```sh
+node tests/e2e/webgpu_renderer/native_compute_readback.mjs --pipeline-cache
+```
+
+On a capable WebGPU host, it executes twelve distinct WGSL variants through a
+two-entry cache, checks exact readback words and reuses an evicted prepared
+handle. The ordinary runner includes this case alongside its source/candidate
+readback comparisons. Browser execution is separate from the recording tests.

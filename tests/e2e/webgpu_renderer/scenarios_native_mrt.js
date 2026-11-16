@@ -43,6 +43,43 @@ function attachments(T, renderer, packedNormals = false) {
 }
 
 export const nativeMRTScenarios = {
+  native_pipeline_mrt_extensions(T, renderer) {
+    const N = T.TSL, result = attachments(T, renderer, true), normal = N.uniform(new T.Color(.2, .8, .35));
+    class GBufferMaterial extends T.MeshStandardNodeMaterial {
+      constructor(source, gain) {
+        super(); this.copy(source); this.gbufferGain = gain; this.gbufferVariant = 0;
+      }
+      customProgramCacheKey() { return super.customProgramCacheKey() + ':' + this.gbufferVariant; }
+      setupOutput(builder, output) {
+        return super.setupOutput(builder,
+          N.vec4(output.rgb.mul(N.materialReference('gbufferGain', 'float')), output.a));
+      }
+    }
+    const materials = result.objects.map((object, index) => {
+      const material = new GBufferMaterial(object.material, index ? .625 : .875);
+      object.material = material; return material;
+    });
+    materials[1].mrtNode = N.mrt({normal: N.vec4(normal, 1)});
+    renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = .95;
+    // The scene pass combines floating-point color with normalized-byte normals.
+    // Custom output setup and material-local MRT overrides both reach the
+    // source compositor, including reconstruction after a custom key changes.
+    const pipeline = new T.RenderPipeline(renderer, result.composite);
+    const driver = drive(T, renderer, pipeline, frame => {
+      if (frame === 8) {
+        materials[0].gbufferGain = .5; materials[1].gbufferGain = 1.125;
+        normal.value.setRGB(.8, .2, .65); result.phase.value = .8;
+        result.objects[0].rotation.y = .35;
+      }
+      if (frame === 18) {
+        materials[0].gbufferGain = 1.25; materials[1].gbufferGain = .75;
+        for (const material of materials) { material.gbufferVariant++; material.needsUpdate = true; }
+        result.scenePass.setResolutionScale(.75); result.phase.value = 1.3;
+        result.objects[1].rotation.y = -.35; result.foreground.position.x = .3;
+      }
+    });
+    return {...result, ...driver, materials};
+  },
   native_pipeline_mrt(T, renderer) {
     const N = T.TSL, result = attachments(T, renderer);
     renderer.toneMapping = T.ACESFilmicToneMapping; renderer.toneMappingExposure = .95;

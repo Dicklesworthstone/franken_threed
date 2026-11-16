@@ -37,7 +37,7 @@ Replacing a built-in material mapping also selects that path. The extension
 profile covers ordinary meshes and `SkinnedMesh` objects (including ordinary
 morph targets), CPU- or storage-backed `InstancedMesh`, exact `BatchedMesh`, and ordinary meshes with
 named storage vertex inputs or CPU-backed `InstancedBufferGeometry`, with opaque or transparent,
-single-output materials and Float32 geometry attributes (plus Uint8/Uint16/Uint32 skin indices
+single-output or MRT materials and Float32 geometry attributes (plus Uint8/Uint16/Uint32 skin indices
 and the ordinary/skinned-mesh normalized inputs described below),
 ordinary material maps, analytic scene lights and ready material/scene
 environments, ordinary Fog/FogExp2 and source shadow receivers. Standard and Physical subclasses retain inherited material
@@ -45,6 +45,28 @@ properties, including the pinned accessors installed by Physical construction.
 Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
+
+Inherited and registered node materials can write multiple render targets through
+`renderer.setMRT()`, a material's `mrtNode`, or authored typed `outputStruct`
+graphs. They reuse the existing attachment, integer-output, queue and readback
+owners. Material hooks and node updates still receive the original public
+objects; accepted draws keep independent uniform snapshots while native pipeline
+preparation is pending.
+
+Builder reuse follows the pinned source's render-context identity: attachment
+layout and MRT-node identity select a context, while target allocation size does
+not. Switching compatible targets therefore reuses the source graph. Mutating an
+MRT graph does not invent a reconstruction boundary that the source lacks;
+material keys, versions and disposal retain their original effects. Each accepted
+draw refreshes its validation snapshot, and a later node-update callback that
+changes MRT state still fails before publication.
+
+`three_node_material_mrt.test.mjs` compares inherited/registered Basic, Standard
+and Physical source WGSL, uniforms, callback identities, graph sharing and
+reconstruction. The same source comparisons cover MRT with inherited/registered
+sprite, point and line extensions. Public-renderer recording cases exercise
+queued mixed float and integer attachments, snapshots and resize. These checks establish source and
+command behavior; browser pixel parity and hardware performance remain separate.
 
 Inherited and registered `SpriteNodeMaterial`, `PointsNodeMaterial`,
 `LineBasicNodeMaterial` and `LineDashedNodeMaterial` extensions also execute on
