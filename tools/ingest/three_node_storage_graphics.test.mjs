@@ -13,12 +13,26 @@ import {createThreeStorageTextures} from './three_storage_textures.mjs';
 const unsupported = `const unexpected = () => { throw new Error('Unexpected graph context in storage-input fixture'); };`;
 const contexts = {
   './three_node_attributes.mjs': `${unsupported}
-    export const createThreeNodeAttributes = () => ({dispose() {}, register: unexpected, capture: unexpected, validate: unexpected});`,
+    export const createThreeNodeAttributes = () => ({dispose() {}, register: unexpected, capture: unexpected, validate: unexpected});
+    export const inspectThreeNodeStorageAttribute = unexpected, inspectThreeNodeSharedAttribute = unexpected;`,
   './three_node_shadows.mjs': `${unsupported}
-    export const registerThreeNativeShadow = unexpected, updateThreeNativeShadow = unexpected;`,
+    export const registerThreeNativeShadow = unexpected, updateThreeNativeShadow = unexpected;
+    export const inspectThreeNativeShadowFilter = unexpected, inspectThreeNativeShadowGraph = unexpected;
+    export const withThreeNativeComputePrerequisites = unexpected;
+    export const captureThreeNativeShadowGraphs = () => nodes => {
+      if (nodes.length) unexpected();
+      return {roots: new Map(), children: new Map()};
+    };
+    export const installThreeNativeShadowTargets = renderer => {
+      if (typeof renderer._targets?.capture === 'function') unexpected();
+    };`,
   './three_node_passes.mjs': `${unsupported}
     export const inspectThreePipelineContext = () => null, inspectThreeMRT = () => null;
-    export const inspectThreeNativePass = unexpected, updateThreeNativePass = unexpected;`,
+    export const inspectThreeNativePass = unexpected, updateThreeNativePass = unexpected, inspectThreeNativeCamera = unexpected;
+    export const inspectThreeLightingContext = (three, context) => {
+      if (context != null) unexpected();
+      return null;
+    };`,
 };
 register('data:text/javascript,' + encodeURIComponent(`
   const contexts = ${JSON.stringify(contexts)};
@@ -73,6 +87,8 @@ class Texture3DNode extends TextureNode {
 }
 class Material extends Events {
   constructor() { super(); this.isMaterial = true; this.version = 0; this.lights = false; this.fog = false; this.alphaToCoverage = false; }
+  get alphaTest() { return this._alphaTest ?? 0; }
+  set alphaTest(value) { this._alphaTest = value; }
   onBeforeCompile() {}
   onBeforeRender() {}
   customProgramCacheKey() { return 'fixture'; }
@@ -83,7 +99,7 @@ class NodeMaterial extends Material {
 }
 class MeshBasicNodeMaterial extends NodeMaterial { constructor() { super(); this.isMeshBasicNodeMaterial = true; } }
 class BufferGeometry extends Events { constructor() { super(); this.id = ++id; this.attributes = {}; this.morphAttributes = {}; } }
-class Mesh { constructor(geometry, material) { this.geometry = geometry; this.material = material; } }
+class Mesh extends Events { constructor(geometry, material) { super(); this.geometry = geometry; this.material = material; } }
 class WGSLNodeBuilder {
   constructor(object, renderer) { Object.assign(this, {object, renderer, context: {}}); }
   build() {
@@ -109,6 +125,7 @@ class WGSLNodeBuilder {
 }
 const THREE = {REVISION: '186', Texture, StorageTexture, StorageArrayTexture, Storage3DTexture, DataArrayTexture, Texture3DNode,
   Node, TextureNode, Material, NodeMaterial, MeshBasicNodeMaterial, BufferGeometry, Mesh, WGSLNodeBuilder,
+  RenderObjectRefreshType: {NONE: 0, SHARED: 1, FULL: 2},
   UnsignedByteType: 'u8', HalfFloatType: 'f16', FloatType: 'f32', IntType: 'i32', UnsignedIntType: 'u32',
   RGBAFormat: 'rgba', RedFormat: 'r', RGFormat: 'rg', RedIntegerFormat: 'ri', RGIntegerFormat: 'rgi', RGBAIntegerFormat: 'rgbai', RGBIntegerFormat: 'rgbi',
   NoColorSpace: '', LinearSRGBColorSpace: 'linear', SRGBColorSpace: 'srgb',
@@ -117,14 +134,23 @@ const THREE = {REVISION: '186', Texture, StorageTexture, StorageArrayTexture, St
   CubeReflectionMapping: 'cube', CubeRefractionMapping: 'cube-refraction', CubeUVReflectionMapping: 'cubeuv',
   EquirectangularReflectionMapping: 'equirect', EquirectangularRefractionMapping: 'equirect-refraction', DoubleSide: 2,
 };
-for (const name of ['MeshToonNodeMaterial', 'MeshLambertNodeMaterial', 'MeshPhongNodeMaterial', 'MeshStandardNodeMaterial', 'MeshPhysicalNodeMaterial', 'ShadowNodeMaterial'])
+for (const name of ['MeshNormalNodeMaterial', 'MeshMatcapNodeMaterial', 'MeshToonNodeMaterial', 'MeshLambertNodeMaterial', 'MeshPhongNodeMaterial', 'MeshStandardNodeMaterial', 'MeshPhysicalNodeMaterial', 'ShadowNodeMaterial', 'SpriteNodeMaterial'])
   THREE[name] = class extends NodeMaterial {};
 for (const name of ['MeshBasicMaterial', 'MeshToonMaterial', 'MeshLambertMaterial', 'MeshPhongMaterial', 'MeshStandardMaterial', 'MeshPhysicalMaterial', 'ShadowMaterial'])
   THREE[name] = class extends Material {};
+for (const name of ['anisotropy', 'clearcoat', 'iridescence', 'dispersion', 'retroreflectivity', 'sheen', 'transmission'])
+  Object.defineProperty(THREE.MeshPhysicalMaterial.prototype, name, {
+    get() { return this[`_${name}`] ?? 0; }, set(value) { this[`_${name}`] = value; },
+  });
 for (const name of ['AmbientLight', 'AmbientLightNode', 'DirectionalLight', 'DirectionalLightNode', 'HemisphereLight', 'HemisphereLightNode',
   'PointLight', 'PointLightNode', 'SpotLight', 'SpotLightNode', 'StandardNodeLibrary', 'BufferNode', 'UniformArrayNode', 'BufferAttributeNode',
-  'PMREMNode', 'MaterialReferenceNode', 'ShadowNode', 'OutputStructNode', 'MRTNode', 'Fog', 'FogExp2', 'Color', 'Camera'])
+  'PMREMNode', 'MaterialReferenceNode', 'ShadowNode', 'OutputStructNode', 'MRTNode', 'Fog', 'FogExp2', 'Color', 'Camera',
+  'AnalyticLightNode', 'LightingContextNode', 'ComputeNode', 'VarNode'])
   THREE[name] = class {};
+THREE.TSL = {lights: nodes => {
+  assert.deepEqual(nodes, [], 'the storage fixture has no analytic lights');
+  return new Node();
+}};
 THREE.DepthTexture = class extends Texture {}; THREE.CubeTexture = class extends Texture {};
 THREE.CubeDepthTexture = class extends THREE.DepthTexture {}; THREE.RenderTarget = class {};
 

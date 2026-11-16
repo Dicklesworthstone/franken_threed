@@ -6,6 +6,10 @@ import * as T from '../../upstream/three.js/build/three.webgpu.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
 import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
 import SourceAttributeUtils from '../../upstream/three.js/src/renderers/webgpu/utils/WebGPUAttributeUtils.js';
+import SourceAttributes from '../../upstream/three.js/src/renderers/common/Attributes.js';
+import SourceRenderer from '../../upstream/three.js/src/renderers/common/Renderer.js';
+import SourceWebGPUBackend from '../../upstream/three.js/src/renderers/webgpu/WebGPUBackend.js';
+import {AttributeType} from '../../upstream/three.js/src/renderers/common/Constants.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {createThreeNodePrograms} from './three_node_program.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
@@ -630,7 +634,7 @@ test('compute lifecycle accessor rejection does not invoke application getters',
 });
 
 for (const attachment of [false, true])
-test(`inherited compute refuses ${attachment ? 'the pending parent attachment' : 'earlier draw storage aliases'}`, async t => {
+test(`inherited compute refuses ${attachment ? 'the pending parent attachment' : 'a changed earlier draw storage upload'}`, async t => {
   const f = fixture(t, {background: false}), state = inheritedKernel(f);
   if (attachment) {
     const target = new T.RenderTarget(16, 16); t.after(() => target.dispose());
@@ -639,11 +643,170 @@ test(`inherited compute refuses ${attachment ? 'the pending parent attachment' :
   } else {
     const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
     material.colorNode = state.values.element(0).xyz; reader.renderOrder = -1; reader.frustumCulled = false; f.scene.add(reader);
+    reader.onAfterRender = () => { state.attribute.needsUpdate = true; };
     t.after(() => material.dispose());
   }
   await f.renderer.init();
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
   assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const inherited of [false, true])
+test(`${inherited ? 'inherited' : 'ordinary'} geometry compute updates unchanged storage already read by a parent draw`, async t => {
+  const f = fixture(t, {background: false}), state = inherited ? inheritedKernel(f) : sharedKernel(f);
+  const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
+  material.colorNode = state.values.element(0).xyz; reader.renderOrder = -1; reader.frustumCulled = false; f.scene.add(reader);
+  t.after(() => material.dispose());
+  let dispatches = 0;
+  f.device.onCompute = pass => new Float32Array(storage(pass)[0].data).fill(++dispatches * .25);
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  state.attribute.array.fill(99);
+  await drain(f.renderer);
+  assert.equal(f.computes.length, 2);
+  assert.deepEqual(f.events, [state.kernel.name, 'render', state.kernel.name, 'render']);
+  const gpu = storage(f.computes[0])[0];
+  assert.equal(storage(f.computes[1])[0], gpu);
+  assert.deepEqual(draws(f).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), [.25, .25, .5, .5]);
+  assert.equal(f.device.writes.filter(write => write.buffer === gpu).length, 1,
+    'earlier captured draws must not replay their CPU payload over the computed allocation');
+  assert.ok(state.attribute.array.every(value => value === 99), 'compute never publishes GPU bytes into the public array');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('overlapping geometry compute matches pinned source upload, callback and submit boundaries', async t => {
+  const candidate = fixture(t, {background: false}), reference = fixture(t, {background: false});
+  const states = [candidate, reference].map(f => {
+    const state = sharedKernel(f), material = new T.MeshBasicNodeMaterial();
+    const reader = new T.Mesh(f.object.geometry, material);
+    material.colorNode = state.values.element(0).xyz; reader.renderOrder = -1; reader.frustumCulled = false; f.scene.add(reader);
+    t.after(() => material.dispose());
+    // The recording device models the same deterministic write on each side.
+    // The source renderer/NodeFrame/backend below decide when it executes;
+    // this checks queue-visible bytes, not WGSL arithmetic or driver validity.
+    f.device.onCompute = pass => {
+      const words = new Float32Array(storage(pass)[0].data); words[0] += .125;
+    };
+    return {...state, reader};
+  });
+  await candidate.renderer.init(); await reference.renderer.init();
+  const actual = states[0], expected = states[1], source = sourceGeometryPrograms(t, reference);
+  const backend = new SourceWebGPUBackend(); backend.device = reference.device;
+  const attributes = new SourceAttributes({
+    createStorageAttribute: attribute => backend.attributeUtils.createAttribute(attribute, 128 | 32 | 8 | 4),
+    updateAttribute: attribute => backend.attributeUtils.updateAttribute(attribute),
+  }, {createStorageAttribute() {}});
+  const upload = () => attributes.update(expected.attribute, AttributeType.STORAGE);
+  const resourceGroup = {}, compiled = new Set(), renderContext = {camera: reference.camera,
+    textures: null, depthTexture: null, occlusionQueryCount: 0};
+  source.nodes.nodeFrame = reference.renderer._nodes.nodeFrame;
+  source.nodes.needsRefresh = () => T.RenderObjectRefreshType.FULL;
+  const renderer = {_initialized: true, _isDeviceLost: false, _currentRenderBundle: null,
+    _currentRenderContext: renderContext, backend, info: reference.renderer.info, inspector: {beginCompute() {}, finishCompute() {}},
+    _nodes: source.nodes, _objects: {get: object => source.use(object).owner}, _geometries: {updateForRender() {}},
+    _bindings: {updateForRender: upload, updateForCompute() {
+      upload(); backend.get(resourceGroup).group = {entries: [{binding: 0, resource: {buffer: backend.get(expected.attribute).buffer}}]};
+    }, getForCompute: () => [resourceGroup], deleteForCompute() {}},
+    _pipelines: {has: node => compiled.has(node), delete: node => compiled.delete(node), updateForRender() {}, isReady: () => true,
+      getForCompute(node) {
+        const state = source.nodes.getForCompute(node); compiled.add(node);
+        backend.get(state).pipeline = {compute: {module: {label: node.name, code: state.computeShader}}};
+        return state;
+      }}};
+  backend.renderer = renderer;
+  reference.renderer.compute = (...args) => SourceRenderer.prototype.compute.apply(renderer, args);
+  const sourceDrawValues = [], sourceShaders = [];
+  for (let turn = 0; turn < 2; turn++) {
+    candidate.renderer._nodes.nodeFrame.update(); reference.renderer._nodes.nodeFrame.update();
+    candidate.renderer.render(candidate.scene, candidate.camera); await drain(candidate.renderer);
+    reference.renderer.info.calls++;
+    const encoder = reference.device.createCommandEncoder(), pass = encoder.beginRenderPass({label: 'source-parent'});
+    Object.assign(backend.get(renderContext), {encoder, currentPass: pass, renderBundles: []});
+    backend.draw = () => {
+      pass.setPipeline({vertex: {entryPoint: 'main', buffers: []}});
+      pass.setBindGroup(0, {entries: [{binding: 0, resource: {buffer: backend.get(expected.attribute).buffer}}]});
+      pass.draw(3);
+    };
+    for (const object of [expected.reader, reference.object]) {
+      SourceRenderer.prototype._renderObjectDirect.call(renderer, object, object.material, reference.scene,
+        reference.camera, N.lights([]), null, null, null);
+      sourceShaders.push(source.use(object).state);
+    }
+    backend.finishRender(renderContext);
+    const gpu = backend.get(expected.attribute).buffer;
+    sourceDrawValues.push(...reference.device.snapshots.at(-1).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]));
+  }
+  const gpu = storage(candidate.computes[0])[0], canonical = code => code.replace(/NodeBuffer_\d+/g, 'NodeBuffer');
+  assert.deepEqual(draws(candidate).map(draw => new Float32Array(draw.contents.get(gpu).buffer)[0]), sourceDrawValues);
+  assert.deepEqual(sourceDrawValues, [.125, .125, .25, .25]);
+  assert.deepEqual(candidate.events, reference.events);
+  assert.equal(canonical(candidate.computes[0].pipeline.compute.module.code), canonical(reference.computes[0].pipeline.compute.module.code));
+  const programs = candidate.captures.flatMap(frame => frame.draws).map(draw => draw.binding.nodeProgram);
+  for (let i = 0; i < programs.length; i++) {
+    assert.equal(canonical(programs[i].vertex), canonical(sourceShaders[i].vertexShader));
+    assert.equal(canonical(programs[i].fragment), canonical(sourceShaders[i].fragmentShader));
+  }
+  assert.deepEqual(actual.attribute.array, expected.attribute.array);
+  assert.ok(actual.attribute.array.every(value => value === 0));
+  assert.equal(candidate.renderer._nodeCaptureBytes, 0);
+});
+
+for (const mutation of ['dynamic', 'layout', 'multiple-versions'])
+test(`geometry compute retains its overlap refusal for ${mutation} storage histories`, async t => {
+  const f = fixture(t, {background: false}), state = sharedKernel(f), material = new T.MeshBasicNodeMaterial();
+  const reader = new T.Mesh(f.object.geometry, material);
+  material.colorNode = state.values.element(0).xyz; reader.renderOrder = -2; reader.frustumCulled = false; f.scene.add(reader);
+  t.after(() => material.dispose());
+  if (mutation === 'dynamic') state.attribute.setUsage(T.DynamicDrawUsage);
+  else if (mutation === 'layout') reader.onAfterRender = () => { state.attribute.array = new Float32Array(8); state.attribute.count = 2; };
+  else {
+    reader.onAfterRender = () => { state.attribute.needsUpdate = true; };
+    const later = new T.Mesh(f.object.geometry, material); later.renderOrder = -1; later.frustumCulled = false; f.scene.add(later);
+  }
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(f.device.writes.length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('geometry compute rechecks the storage identity selected by a late uniform getter', async t => {
+  const f = fixture(t, {background: false}), earlier = new T.StorageBufferAttribute(1, 4);
+  const original = new T.StorageBufferAttribute(1, 4), values = N.storage(original, 'vec4', 1);
+  const step = N.uniform(.125).setGroup(N.uniformGroup('lateResourceSelection', -1));
+  const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
+  material.colorNode = N.storage(earlier, 'vec4', 1).element(0).xyz;
+  reader.renderOrder = -1; reader.frustumCulled = false; f.scene.add(reader);
+  let computeBuilder;
+  const kernel = N.Fn(builder => {
+    computeBuilder = builder;
+    const amount = step.toVar();
+    values.element(0).addAssign(N.vec4(amount, 0, 0, 0));
+  })().compute(1);
+  f.material.geometryNode = kernel;
+  t.after(() => material.dispose());
+  await f.renderer.init(); await f.renderer.compileComputeAsync(kernel);
+  const writes = f.device.writes.length;
+  const uniforms = computeBuilder.getBindings().flatMap(group => group.bindings).find(binding => binding.isUniformBuffer);
+  const update = uniforms.update;
+  let changes = 0, readingBinding = false;
+  uniforms.update = function () {
+    readingBinding = true;
+    try { return update.call(this); } finally { readingBinding = false; }
+  };
+  Object.defineProperty(step, 'value', {configurable: true, get() {
+    if (readingBinding && changes === 0) {
+      changes++; values.value = earlier; earlier.needsUpdate = true;
+    }
+    return .125;
+  }});
+  // The warmed graph enumerates the original storage before binding.update()
+  // reads the uniform; the actual captured storage now names the earlier draw.
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
+  assert.equal(changes, 1); assert.equal(values.value, earlier);
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.device.writes.length, writes, 'late binding changes are refused before any queue write');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
@@ -683,7 +846,7 @@ test('queued geometry kernels retain uniforms and draw the shared buffer at each
 });
 
 for (const vertex of [false, true])
-test(`geometry compute refuses overlap with an earlier ${vertex ? 'vertex stream' : 'shader storage'} before compute uploads`, async t => {
+test(`geometry compute refuses changed history of an earlier ${vertex ? 'vertex stream' : 'shader storage'} before compute uploads`, async t => {
   const f = fixture(t, {background: false}), {attribute, values} = sharedKernel(f);
   const material = new T.MeshBasicNodeMaterial(), geometry = new T.PlaneGeometry(), reader = new T.Mesh(geometry, material);
   reader.frustumCulled = false; reader.renderOrder = -1; f.scene.add(reader);
@@ -692,11 +855,35 @@ test(`geometry compute refuses overlap with an earlier ${vertex ? 'vertex stream
     const position = new T.StorageBufferAttribute(geometry.attributes.position.count, 3), positions = N.storage(position, 'vec3', position.count);
     geometry.setAttribute('position', position);
     f.material.geometryNode = N.Fn(() => { positions.element(N.instanceIndex).assign(N.vec3(0)); })().compute(position.count);
-  } else material.colorNode = values.element(0).xyz;
+    reader.onAfterRender = () => { position.needsUpdate = true; };
+  } else {
+    material.colorNode = values.element(0).xyz;
+    reader.onAfterRender = () => { attribute.needsUpdate = true; };
+  }
   await f.renderer.init();
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
   assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(f.device.writes.length, 0);
   assert.ok(attribute.array.every(value => value === 0)); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('geometry compute shares an earlier generated vertex allocation without replaying its upload', async t => {
+  const f = fixture(t, {background: false}), geometry = new T.PlaneGeometry(), material = new T.MeshBasicNodeMaterial();
+  const attribute = new T.StorageBufferAttribute(geometry.attributes.position.count, 3);
+  const values = N.storage(attribute, 'vec3', attribute.count);
+  geometry.setAttribute('position', attribute);
+  const reader = new T.Mesh(geometry, material); reader.frustumCulled = false; reader.renderOrder = -1; f.scene.add(reader);
+  f.material.geometryNode = N.Fn(() => { values.element(N.instanceIndex).assign(N.vec3(.25)); })().compute(attribute.count).setName('shared-vertices');
+  t.after(() => { geometry.dispose(); material.dispose(); });
+  f.device.onCompute = pass => new Float32Array(storage(pass)[0].data).fill(.25);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const gpu = storage(f.computes[0])[0];
+  const first = draws(f).find(draw => [...draw.streams.values()].includes(gpu));
+  assert.ok(first, 'the earlier draw borrows the exact compute-written vertex buffer');
+  assert.equal(new Float32Array(first.contents.get(gpu).buffer)[0], .25);
+  assert.deepEqual(f.events, ['shared-vertices', 'render']);
+  assert.equal(f.device.writes.filter(write => write.buffer === gpu).length, 1);
+  assert.equal(attribute.itemSize, 4); assert.ok(attribute.array.every(value => value === 0));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('geometry compute checks final sampled texture identities against earlier draw reads', async t => {

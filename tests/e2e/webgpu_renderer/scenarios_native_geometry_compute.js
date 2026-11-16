@@ -100,7 +100,61 @@ function scenario(T, renderer, shared) {
   return {scene, camera};
 }
 
+// The first draw reads storage before a later object's geometryNode updates it.
+// Source WebGPU submits that compute encoder before the pending parent render,
+// so both draws must observe the updated allocation, including on cold setup.
+function overlappingStorageScenario(T, renderer) {
+  const N = T.TSL, scene = new T.Scene();
+  const camera = new T.OrthographicCamera(-2.4, 2.4, 1.8, -1.8, .1, 20);
+  camera.position.z = 5;
+  const attribute = new T.StorageBufferAttribute(new Float32Array(4), 4);
+  const writable = N.storage(attribute, 'vec4', 1).element(0);
+  const readable = N.storage(attribute, 'vec4', 1).toReadOnly().element(0);
+  const shift = N.uniform(0), tint = N.uniform(.25), tick = N.uniform(0);
+  const kernel = N.Fn(() => {
+    writable.assign(N.vec4(shift, shift.mul(-.5), tint, writable.w.add(tick)));
+  })().compute(1);
+  let initializations = 0;
+  kernel.onInit(() => { initializations++; });
+  for (let index = 0; index < 2; index++) {
+    const material = new T.MeshBasicNodeMaterial({side: T.DoubleSide});
+    material.positionNode = N.positionLocal.add(N.vec3(readable.xy, 0));
+    material.colorNode = N.vec3(index ? .75 : .25, readable.z, N.uv().y.mul(.5).add(.25));
+    if (index === 1) material.geometryNode = kernel;
+    const mesh = new T.Mesh(new T.PlaneGeometry(1.25, 1, 4, 3), material);
+    mesh.position.set(index ? .85 : -.85, index ? -.25 : .25, 0);
+    mesh.renderOrder = index; mesh.frustumCulled = false; scene.add(mesh);
+  }
+  const render = renderer.render.bind(renderer), read = renderer.readRenderTargetPixelsAsync.bind(renderer);
+  const target = renderer.getRenderTarget(); let frame = 0, firstPixels = null;
+  renderer.render = (...args) => {
+    if (args[0] === scene && args[1] === camera) {
+      renderer._nodes.nodeFrame.update(); frame++; tick.value = 1;
+      shift.value = ((frame % 5) - 2) / 8;
+      tint.value = .25 + (frame % 3) / 8;
+    }
+    return render(...args);
+  };
+  renderer.readRenderTargetPixelsAsync = async (...args) => {
+    const pixels = await read(...args);
+    if (args[0] !== target) return pixels;
+    const values = new Float32Array(await renderer.getArrayBufferAsync(attribute));
+    const expected = [shift.value, -.5 * shift.value, tint.value, frame];
+    if (initializations !== 1 || values.length !== 4 ||
+        values.some((value, index) => value !== expected[index]))
+      throw Error(`Overlapping geometry compute must publish one shared update per frame (${frame})`);
+    if (attribute.array.some(value => value !== 0))
+      throw Error('Overlapping geometry compute must retain GPU-only results');
+    if (frame === 1) firstPixels = pixels.slice();
+    if (frame === 8 && firstPixels && pixels.every((value, index) => value === firstPixels[index]))
+      throw Error('Overlapping storage reads must display the live computed values');
+    return pixels;
+  };
+  return {scene, camera};
+}
+
 export const geometryComputeScenarios = {
   native_geometry_compute_fn(T, renderer) { return scenario(T, renderer, false); },
   native_geometry_compute_shared(T, renderer) { return scenario(T, renderer, true); },
+  native_geometry_compute_overlap(T, renderer) { return overlappingStorageScenario(T, renderer); },
 };

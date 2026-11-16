@@ -224,9 +224,15 @@ export function withThreeShadowMaterial(three, renderer, material, original, run
 export function withThreeNativeCapture(renderer, run, target = null) {
   let stack = captures.get(renderer);
   if (!stack) captures.set(renderer, stack = []);
-  const scope = {textures: new Set(), buffers: new Set(), draws: 0, unknown: false,
+  const scope = {textures: new Set(), buffers: new Set(), storageUploads: new Map(), draws: 0, unknown: false,
     attachments: new Set([...(target?.textures ?? []), target?.depthTexture].filter(Boolean))}; stack.push(scope);
-  try { return run(texture => scope.textures.add(texture), buffer => scope.buffers.add(buffer)); }
+  const bufferUse = (buffer, uploadIdentity = null) => {
+    if (!scope.buffers.has(buffer)) {
+      scope.buffers.add(buffer);
+      if (uploadIdentity !== null) scope.storageUploads.set(buffer, uploadIdentity);
+    } else if (scope.storageUploads.get(buffer) !== uploadIdentity) scope.storageUploads.delete(buffer);
+  };
+  try { return run(texture => scope.textures.add(texture), bufferUse); }
   finally { stack.pop(); if (!stack.length) captures.delete(renderer); }
 }
 
@@ -280,18 +286,24 @@ export function assertThreeNativeTextureWrite(renderer, texture) {
       reject('A nested write cannot overwrite a texture sampled by an earlier draw in its pending parent pass');
 }
 
-export function assertThreeNativeComputeOutsideCapture(renderer, resources = null) {
+export function assertThreeNativeComputeOutsideCapture(renderer, resources = null, storageUploadIdentity = null) {
   assertOutsideObjectHook(renderer);
   const stack = captures.get(renderer);
   const disjoint = computePrerequisites.get(renderer);
   // The pinned backend submits a separate compute encoder before its pending
   // render encoder. Geometry prerequisites retain that order. Restrict their
-  // extension beyond the first draw to known, disjoint resources; overlapping
-  // GPU/host upload histories still need their own source-equivalence proof.
+  // extension beyond the first draw to known resources. Shared storage is legal
+  // only when every earlier draw and this dispatch select the very same static
+  // upload record: compute then updates their one allocation before the pending
+  // parent encoder submits. A new/dynamic upload or unknown geometry owner has
+  // no such proof; texture/attachment histories retain their separate boundary.
   if (stack && (disjoint === undefined || stack.some(scope => scope.unknown ||
       !disjoint && (scope.draws || scope.textures.size) ||
-      resources?.some(resource => scope.buffers.has(resource) || scope.textures.has(resource) || scope.attachments.has(resource))))) {
+      resources?.some(resource => scope.textures.has(resource) || scope.attachments.has(resource) ||
+        scope.buffers.has(resource) && (!scope.storageUploads.has(resource) ||
+          scope.storageUploads.get(resource) !== storageUploadIdentity?.(resource)))))) {
     const error = new Error('THREE_COMPUTE_REENTRY: Compute inside native draw capture requires a separate submission boundary; compute before rendering the scene');
     error.name = 'ThreeComputeError'; error.code = 'THREE_COMPUTE_REENTRY'; throw error;
   }
+  return stack !== undefined;
 }

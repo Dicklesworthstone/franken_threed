@@ -968,7 +968,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
     // ordinary named input to storage after the initial binding inspection.
     if (typeof getStorage !== 'function') fail('SOURCE', 'Native storage vertex streams require the renderer storage owner');
     storageOwner ??= storageInputs();
-    recordBuffer(attribute);
     // Geometries.updateAttribute admits only the first vertex upload in this
     // source render. Later shader bindings may independently update the same
     // allocation; their ordered history is reconciled after all draw updates.
@@ -1043,9 +1042,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       markThreeNativeDrawCaptured(renderer, true);
       const vertexStart = vertexStorageUses.length;
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
-      for (const attribute of [...Object.values(draw.geometry.attributes), draw.geometry.index, draw.geometry.indirect])
-        if (attribute) recordBuffer(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
-      for (const binding of captured.storage) recordBuffer(binding.attribute);
       for (const binding of captured.textures) recordTexture(binding.texture);
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
@@ -1203,6 +1199,27 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         }));
       }
       if (draw.nodeBundle) draw.bundleStorageOwner = storageOwner;
+      // Record real graphics leases rather than the source's mutable version.
+      // A later geometry kernel may share exactly these static upload records;
+      // ordinary/index/indirect geometry keeps its conservative owner boundary.
+      let vertexProofs = null;
+      for (const lease of draw.nodeVertexStorage ?? []) {
+        const proof = storageOwner.uploadIdentity?.(lease);
+        if (proof) (vertexProofs ??= new Map()).set(proof.attribute, proof.identity);
+      }
+      for (const attribute of Object.values(draw.geometry.attributes)) {
+        if (!attribute) continue;
+        const source = attribute.isInterleavedBufferAttribute ? attribute.data : attribute;
+        recordBuffer(source, vertexProofs?.get(source) ?? null);
+      }
+      if (vertexProofs) for (const [attribute, identity] of vertexProofs) recordBuffer(attribute, identity);
+      for (const attribute of [draw.geometry.index, draw.geometry.indirect])
+        if (attribute) recordBuffer(attribute.isInterleavedBufferAttribute ? attribute.data : attribute);
+      for (let index = 0; index < draw.nodeStorage.length; index++) {
+        const proof = storageOwner.uploadIdentity?.(draw.nodeStorage[index].lease);
+        if (proof) recordBuffer(proof.attribute, proof.identity);
+        else if (captured.storage[index]) recordBuffer(captured.storage[index].attribute);
+      }
       if (updateContext.fogRenderContext !== undefined && !captured.fogResources)
         programs.retainFogResources(draw.binding.nodeProgram, updateContext, Object.freeze({
           textures: draw.nodeTextures, storage: draw.nodeStorage, vertexStorage: draw.nodeVertexStorage,

@@ -112,7 +112,8 @@ function createThreeCompute(renderer, three) {
     if (charged > maxSnapshotBytes - snapshotBytes) fail('BUDGET', 'Queued compute uploads exceed the snapshot byte budget');
     const data = copy ? new array.constructor(array) : array;
     const admission = !uniform && copy ? gpu.captureUpload(key, data, version) : null;
-    const record = {key, source: array, byteLength: array.byteLength, scalar: array.constructor,
+    const proof = uniform ? null : Object.freeze({attribute: key, identity: dynamic ? null : Object.freeze({})});
+    const record = {key, proof, source: array, byteLength: array.byteLength, scalar: array.constructor,
       itemSize: key.itemSize, count: key.count, version, uniform, dynamic, data, charged, ranges, admission, refs: 0};
     snapshotBytes += charged; payloads.add(record);
     if (!uniform) captured.set(key, record);
@@ -255,6 +256,9 @@ function createThreeCompute(renderer, three) {
       record.refs++; readLeases.set(next, {...value, released: false});
       return next;
     },
+    uploadIdentity(lease) {
+      return readRecord(lease).proof;
+    },
     refreshIndirect(lease) {
       const previous = readRecord(lease);
       if (!readLeases.get(lease).indirect) fail('INDIRECT', 'Expected a captured indirect argument use');
@@ -388,8 +392,10 @@ function createThreeCompute(renderer, three) {
         binding.textureNode?.isSampleCompare?.() === true && renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE),
       store: binding.store, access: binding.access, mipLevel: binding.mipLevel};
   }
-  function captureTexture(binding) {
-    return textureOwner.captureBinding(textureBinding(binding));
+  function captureTexture(binding, resources = null) {
+    const selection = textureBinding(binding);
+    resources?.push(selection.texture);
+    return textureOwner.captureBinding(selection);
   }
   function textureSignature(groups) {
     return JSON.stringify(groups.map(group => group.bindings.map(binding =>
@@ -455,7 +461,16 @@ function createThreeCompute(renderer, three) {
       ? binding.attribute : binding.isSampledTexture || binding.isSampler ? textureBinding(binding).texture : null)).filter(Boolean);
     const dispatch = override ?? node.dispatchSize ?? node.count;
     if (dispatch?.isIndirectStorageBufferAttribute) resources.push(dispatch);
-    assertThreeNativeComputeOutsideCapture(renderer, resources);
+    const storageUploadIdentity = attribute => {
+      const previous = captured.get(attribute), array = attribute.array;
+      if (previous && !previous.dynamic && attribute.usage !== three.DynamicDrawUsage &&
+          previous.version === attribute.version && previous.byteLength === array?.byteLength &&
+          previous.scalar === array?.constructor && previous.itemSize === attribute.itemSize && previous.count === attribute.count)
+        return previous.proof.identity;
+      return null;
+    };
+    const parentCapture = assertThreeNativeComputeOutsideCapture(renderer, resources, storageUploadIdentity);
+    const acceptedResources = parentCapture ? [] : null;
     const held = new Set(), textureUses = [], epoch = listeners.get(node);
     let released = false;
     entry.uses++;
@@ -470,12 +485,15 @@ function createThreeCompute(renderer, three) {
       const groups = entry.groups.map((group, index) => ({index, entries: group.bindings.map((binding, slot) => {
         if (binding.isSampledTexture || binding.isSampler) {
           binding.update?.();
-          const texture = captureTexture(binding);
+          const texture = captureTexture(binding, acceptedResources);
           textureUses.push(texture);
           return {binding: slot, texture, layout: {binding: slot, visibility: 4, ...textureOwner.layout(texture)}};
         }
         let record;
-        if (binding.isStorageBuffer) record = hold(attributeRecord(binding.attribute, deferred));
+        if (binding.isStorageBuffer) {
+          record = hold(attributeRecord(binding.attribute, deferred));
+          acceptedResources?.push(record.key);
+        }
         else {
           binding.update?.();
           const array = binding.buffer instanceof ArrayBuffer ? new Uint8Array(binding.buffer) : binding.buffer;
@@ -492,7 +510,10 @@ function createThreeCompute(renderer, three) {
         bindGroupLayouts: groups.map(group => ({entries: group.entries.map(binding => binding.layout)}))} : entry.shader;
       const size = override ?? node.dispatchSize ?? node.count;
       let direct, indirect;
-      if (size?.isIndirectStorageBufferAttribute) indirect = hold(attributeRecord(size, deferred));
+      if (size?.isIndirectStorageBufferAttribute) {
+        indirect = hold(attributeRecord(size, deferred));
+        acceptedResources?.push(indirect.key);
+      }
       else if (Array.isArray(size)) {
         if (size.length < 1 || size.length > 3) fail('DISPATCH', 'Expected one to three workgroup dimensions');
         direct = [size[0], size[1] ?? 1, size[2] ?? 1];
@@ -504,6 +525,17 @@ function createThreeCompute(renderer, three) {
       }
       if (direct && direct.some(n => !Number.isSafeInteger(n) || n < 0 || n > (device.limits?.maxComputeWorkgroupsPerDimension ?? 65535)))
         fail('DISPATCH', 'Workgroup counts must fit the device limits');
+      // Uniform/binding access can run source getters. Recheck the records that
+      // were actually captured before accepting any queue effects, so a late
+      // host update cannot reuse the earlier unchanged-history admission.
+      assertThreeNativeComputeOutsideCapture(renderer, acceptedResources ?? resources, attribute => {
+        let identity = null;
+        for (const record of held) if (!record.uniform && record.key === attribute) {
+          if (record.dynamic || identity !== null && identity !== record.proof.identity) return null;
+          identity = record.proof.identity;
+        }
+        return identity;
+      });
       const operation = operations ? {scope: operations, node, dispatchSize: Array.isArray(size) ? size.slice() : size} : null;
       const preparation = textureOwner.preparation(textureUses);
       // Decide from the captured payloads: an unchanged alias can retain a

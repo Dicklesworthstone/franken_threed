@@ -1495,8 +1495,20 @@ are used. Registered source texture producers may run compute prerequisites
 before the first draw or texture read in every active parent capture. Completed
 child passes already precede their parent in the FIFO. Render-triggered geometry
 compute may also follow earlier native draws when its live resources are disjoint
-from their captured readers and the pending attachments. Unproven overlap and
-ordinary callback compute still require separate public submissions.
+from their captured readers and the pending attachments. It can also update a
+storage buffer read by an earlier native draw when both uses select the same
+static upload record and layout. The graphics and compute owners prove that
+identity from their actual leases, then recheck the captured compute bindings
+before accepting queue effects. The source submits compute before its pending
+render encoder, so both draws consume the resulting shared GPU allocation.
+There is no extra CPU refresh, copy or submission for this overlap.
+
+Changed or dynamic upload histories, unknown geometry owners, texture and target
+overlap, and ordinary callback compute still require separate public submissions.
+The geometry-compute suite checks shared shader-storage and generated-vertex
+readers, queued calls and these rejection boundaries. The browser scenario
+`native_geometry_compute_overlap` additionally compares source/candidate pixels
+and live GPU values; it requires the existing browser-capable test environment.
 Leases release their captured bytes on success and failure; the compute owner
 retains GPU lifetime. Several host versions of a shader-storage attribute within
 one logical render upload in source order to that same allocation. Pinned r186
