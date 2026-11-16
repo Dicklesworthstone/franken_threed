@@ -55,6 +55,37 @@ sRGB views. The downsample profile is the same linear fullscreen pass used by
 the existing glTF texture path; this is not a promise of byte-identical native
 WebGL generateMipmap output, which needs native conformance measurements.
 
+## Packed HDR source data
+
+`RGBFormat` with `UnsignedInt5999Type` or `UnsignedInt101111Type` uses
+`rgb9e5ufloat` or `rg11b10ufloat`, respectively. DataTexture, DataArrayTexture,
+Data3DTexture and data-backed CubeTexture inputs retain their original Uint32
+words: each RGB texel occupies four bytes, including row offsets, layer updates,
+authored 2D/cube mip levels and residency budgets. No CPU expansion to three
+floats, precision conversion or source-array rewrite occurs. Color space must
+be `NoColorSpace` or `LinearSRGBColorSpace`.
+
+Both packed formats provide filterable floating-point samples without the
+`float32-filterable` feature. Sampled RGB11F uploads do not require
+`rg11b10ufloat-renderable`; generated RGB11F mip chains require that feature on
+the supplied device. RGB9E5 is never allocated with render-attachment usage and
+requires authored mip levels when mip filtering is requested. Source arrays and
+volumes keep their existing base-upload/mip-generation contract.
+
+Native node graphics retain the pinned source's texture declarations and
+sampling code. Queued draws own their captured packed words; unrequested CPU
+edits remain GPU-stale, and partial array layers compose from the preceding
+accepted version. Native 2D requests upload the full image and preserve
+`updateRanges`, matching the pinned native uploader. WebGL partial packed RGB
+updates remain outside the RGBA row-update profile.
+
+This is new WebGPU texture execution with retained JavaScript command
+preparation and source shader construction, not a Rust rewrite or a speedup
+measurement. The focused `three_texture_packed_hdr.test.mjs` and
+`three_renderer_packed_hdr.test.mjs` suites check uploaded words, source WGSL,
+queued histories and allocation capabilities with recording devices. They do
+not establish browser pixel parity.
+
 ## Source history and lifetime
 
 Texture objects sharing a Source and complete upload/sampling description share

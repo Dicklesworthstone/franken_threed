@@ -1022,9 +1022,10 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       !texture.isCubeTexture && !target;
     if (integerType && ((!storage && !integerData && !target) || texture.normalized === true || texture.colorSpace !== three.NoColorSpace))
       fail('TEXTURE', 'Native integer graphics inputs require unnormalized storage, data or target-owned textures with NoColorSpace');
-    const packedTarget = target && three.UnsignedInt101111Type !== undefined &&
-      texture.type === three.UnsignedInt101111Type && texture.format === three.RGBFormat;
-    if (!depth && !integerType && (!packedTarget && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
+    const packed = three.RGBFormat !== undefined && texture.format === three.RGBFormat &&
+      (three.UnsignedInt101111Type !== undefined && texture.type === three.UnsignedInt101111Type ||
+        three.UnsignedInt5999Type !== undefined && texture.type === three.UnsignedInt5999Type);
+    if (!depth && !integerType && (!packed && ![three.UnsignedByteType, three.HalfFloatType, three.FloatType].includes(texture.type) ||
         [three.RedIntegerFormat, three.RGIntegerFormat, three.RGBAIntegerFormat, three.RGBIntegerFormat].includes(texture.format)))
       fail('TEXTURE', 'Native graphics texture formats must have floating-point samples');
     if (depth && texture.compareFunction !== null && typeof renderer.hasCompatibility !== 'function')

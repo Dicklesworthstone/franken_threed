@@ -6,6 +6,8 @@
  *
  * DataTextures: R/RG/RGBA, manual/generated mipmaps and RGBA row ranges
  * across normalized byte, half/float and signed/unsigned integer storage.
+ * Packed RGB9E5/RGB11F data retains one Uint32 word per texel. Sampling does
+ * not require renderability; RGB11F mip generation checks its device feature.
  * Decoded image/canvas/ImageData: browser external-copy sRGB profile.
  * CubeTextures admit six matching byte/image faces with authored or generated
  * mips. VideoTextures copy ready HTMLVideoElement frames into stable 2D residency,
@@ -260,11 +262,16 @@ function textureInspector(T,{
     // Normalized/float and integer formats have distinct shader sample types.
     // Copy integer bits verbatim; never normalize or cast them through Float32.
     const integral=integerChannels.has(t.format),kind=integral?integerTypes.get(t.type):null;
-    const bpc=integral?(kind?.Kind.BYTES_PER_ELEMENT??0):t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
+    const packed=t.format===T.RGBFormat&&T.RGBFormat!==undefined
+      ?T.UnsignedInt5999Type!==undefined&&t.type===T.UnsignedInt5999Type?'rgb9e5ufloat'
+        :T.UnsignedInt101111Type!==undefined&&t.type===T.UnsignedInt101111Type?'rg11b10ufloat':null:null;
+    const bpc=packed?4:integral?(kind?.Kind.BYTES_PER_ELEMENT??0):t.type===T.UnsignedByteType?1:t.type===T.HalfFloatType?2:t.type===T.FloatType?4:0;
     if(!bpc||t.internalFormat!==null||t.compareFunction!=null)
       fail('FORMAT','Expected supported non-depth storage without internal overrides');
-    const channels=integral?integerChannels.get(t.format):new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
-    if(!channels)fail('FORMAT','Expected R, RG or RGBA normalized, float or integer storage');
+    // channels/bpc describe the physical array elements, not shader components:
+    // both packed RGB formats occupy one four-byte word, never three floats.
+    const channels=packed?1:integral?integerChannels.get(t.format):new Map([[T.RedFormat,1],[T.RGFormat,2],[T.RGBAFormat,4]]).get(t.format);
+    if(!channels)fail('FORMAT','Expected R, RG or RGBA storage, or packed RGB9E5/RGB11F data');
     if(integral&&t.colorSpace!==T.NoColorSpace)fail('COLOR','Integer textures carry data, not color-space transfers');
     if(![T.NoColorSpace,T.LinearSRGBColorSpace,T.SRGBColorSpace].includes(t.colorSpace)||
         (t.colorSpace===T.SRGBColorSpace&&(channels!==4||bpc!==1)))fail('COLOR','Unsupported transfer function or channel format');
@@ -291,10 +298,10 @@ function textureInspector(T,{
     if(integral&&t.generateMipmaps)fail('MIPS','Integer textures require authored mip levels, not filtered mip generation');
     // generateMipmap on half-float/float storage: render-pass box filtering, as for
     // bytes; float32 needs float32-filterable (WebGL: OES_texture_float_linear).
-    if(!integral&&bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
+    if(!integral&&!packed&&bpc===4&&t.generateMipmaps&&!float32Filterable)fail('MIPS','Generated float32 mipmaps need the float32-filterable device feature');
     // Float32 linear filtering needs the device's float32-filterable feature (WebGL
     // OES_texture_float_linear); never silently degrade to nearest.
-    const filterable=!integral&&(bpc!==4||float32Filterable);
+    const filterable=!integral&&(!!packed||bpc!==4||float32Filterable);
     if(!filterable&&(mag[0]==='linear'||filter[0]==='linear'||filter[1]==='linear'))
       fail('SAMPLER','Linear filtering of float32 textures needs the float32-filterable device feature');
     const capturedImages=new WeakSet(),pendingImages=new WeakSet();let imagesPending=false;
@@ -336,6 +343,10 @@ function textureInspector(T,{
     // include the base level in mipmaps. Do not drop or duplicate either base.
     const levels=nativeAllocation==='default'?1:manual?t.mipmaps.length+Number(cube):t.generateMipmaps?full:1;
     if(levels>full||(filter[2]&&levels!==full))fail('MIPS','Mipmapped filtering requires a complete source pyramid');
+    const renderable=!packed||packed==='rg11b10ufloat'&&features.has('rg11b10ufloat-renderable');
+    if(packed&&!renderable&&!manual&&levels>1)
+      fail('MIPS',packed==='rgb9e5ufloat'?'RGB9E5 mipmaps require authored source levels':
+        'Generated RGB11F mipmaps need the rg11b10ufloat-renderable device feature');
     const uploads=[];
     if(nativeAllocation){ /* Source readiness controls allocation, not image validation or upload. */ }
     else if(cube){
@@ -372,7 +383,7 @@ function textureInspector(T,{
       const extent=mediaDefault?{width:1,height:1}:dimensions(image,data,video,volume);
       if(extent.width!==Math.max(1,width>>level)||extent.height!==Math.max(1,height>>level))fail('MIPS','Invalid face or authored mip dimensions');
       if(data){
-        const a=image.data,Kind=integral?kind.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
+        const a=image.data,Kind=packed?Uint32Array:integral?kind.Kind:bpc===1?Uint8Array:bpc===2?Uint16Array:Float32Array;
         if(!(a instanceof Kind)||!(a.buffer instanceof ArrayBuffer)||a.buffer.resizable)fail('STORAGE',`Expected fixed, unshared ${Kind.name} source`);
         try{new Uint8Array(a.buffer,0,0);}catch{fail('STORAGE','Source pixels are detached');}
         const row=image.width*channels*bpc,pitch=Math.ceil(row/t.unpackAlignment)*t.unpackAlignment;
@@ -401,7 +412,7 @@ function textureInspector(T,{
         fail('RANGE','Partial layer uploads require tightly packed source rows');
     }
     const prefix=channels===4?'rgba':channels===2?'rg':'r';
-    const baseFormat=integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float';
+    const baseFormat=packed??(integral?prefix+kind.suffix:bpc===1?prefix+'8unorm':bpc===2?prefix+'16float':prefix+'32float');
     // r186's cube default helper constructs an ordinary byte CubeTexture; its
     // format argument keys the cache but is not forwarded to createTexture.
     const cubeDefault=cube&&nativeAllocation==='default';
@@ -413,7 +424,7 @@ function textureInspector(T,{
     const key=JSON.stringify([width,height,levels,format,viewFormat,sampler,t.flipY,t.premultiplyAlpha,t.unpackAlignment,t.generateMipmaps&&!manual,manual,data,...(nativeAllocation==='default'?['native-default',viewDimension,layers]:layered?[viewDimension,layers]:cube?['cube']:video?['video']:[])]);
     return {source:t.source,width,height,levels,layers,cube,volume,array,layered,layerUpdates,viewDimension,video,videoReady,nativeMedia:nativeMedia&&video,nativeAllocation,
       native2D:nativeMedia&&!layered&&!cube,native2DData:nativeMedia&&data&&!layered&&!cube,imagesPending,bytes,format,viewFormat,sampler,key,data,images,uploads,manual,channels,bpc,
-      integral,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
+      integral,packed,renderable:cubeDefault||renderable,sampleType:integral?kind.sampleType:filterable?'float':'unfilterable-float',
       flipY:t.flipY,premultiplyAlpha:t.premultiplyAlpha,alignment:t.unpackAlignment};
   }
   return describe;
@@ -669,7 +680,7 @@ export function createGpuThreeTextures(device,{
               ...(d.layered?{dimension:d.volume?'3d':'2d'}:{}),
               // COPY_SRC lets captured sampled inputs feed native texture copies.
               // The allocation, upload versions and disposal owner stay shared.
-              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral||d.blockUploads?1|2|4:1|2|4|16}));
+              viewFormats:d.format===d.viewFormat?[]:[d.viewFormat],mipLevelCount:d.levels,usage:d.integral||d.blockUploads||d.renderable===false?1|2|4:1|2|4|16}));
             resource={texture,source:d.source,key:d.key,bytes:d.bytes,sourceVersion:-1,refs:0};
             // Own immediately so a subsequent native view/sampler failure retires it.
             let keys=sources.get(d.source);if(!keys)sources.set(d.source,keys=new Map());keys.set(d.key,resource);textureBytes+=d.bytes;
@@ -731,7 +742,7 @@ export function createGpuThreeTextures(device,{
         fail('COPY','Sampled writes require 2D, array or volume storage');
       if(d.volume&&generateMipmaps)
         fail('COPY','Ordinary volume copies do not generate mipmaps in the pinned native backend');
-      if(generateMipmaps&&d.levels>1&&(d.integral||d.sampleType==='unfilterable-float'))
+      if(generateMipmaps&&d.levels>1&&(d.integral||d.sampleType==='unfilterable-float'||d.renderable===false))
         fail('COPY','Generated sampled mips require filterable floating-point samples');
       busy=true;
       try{return checked(()=>{

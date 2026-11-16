@@ -89,8 +89,9 @@ export function device({features = [], limits = {}, fence = Promise.resolve()} =
     popErrorScope() { assert.ok(scopes.length); scopes.pop(); const error = this.scopeError; this.scopeError = null; return Promise.resolve(error); },
     createTexture(desc) {
       const [width, height, layers = 1] = desc.size, dimension = desc.dimension ?? '2d';
-      const channels = desc.format.startsWith('rgba') ? 4 : desc.format.startsWith('rg') ? 2 : 1;
-      const bpc = desc.format.includes('32') ? 4 : desc.format.includes('16') ? 2 : 1;
+      const packed = ['rgb9e5ufloat', 'rg11b10ufloat'].includes(desc.format);
+      const channels = packed ? 1 : desc.format.startsWith('rgba') ? 4 : desc.format.startsWith('rg') ? 2 : 1;
+      const bpc = packed || desc.format.includes('32') ? 4 : desc.format.includes('16') ? 2 : 1;
       const tex = {desc, dimension, width, height, layers, channels, bpc, destroyed: false, levels: [],
         extent(level) { return [Math.max(1, width >> level), Math.max(1, height >> level), dimension === '3d' ? Math.max(1, layers >> level) : layers]; },
         createView(v = {}) {

@@ -632,7 +632,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     // This policy belongs to the copy call, not the residency descriptor:
     // r186 reads generateMipmaps even when updateTexture kept an older upload.
     const generateMipmaps = level === 0 && texture.generateMipmaps === true;
-    if (generateMipmaps && shape.levels > 1 && (shape.integral || shape.sampleType === 'unfilterable-float'))
+    if (generateMipmaps && shape.levels > 1 && (shape.integral || shape.sampleType === 'unfilterable-float' || shape.renderable === false))
       fail('COPY', 'Generated sampled mips require filterable floating-point samples');
     const lease = captureBinding({texture, isSampledTexture: true}, {copyDestination: true}), previous = lease.record;
     lease.generateMipmaps = generateMipmaps;
