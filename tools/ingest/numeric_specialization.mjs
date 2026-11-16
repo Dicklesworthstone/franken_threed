@@ -134,6 +134,24 @@ function indexedLayouts(fn, parameters) {
   return layouts;
 }
 
+/** Shared opt-in application settings for document chunks and worker ESM. */
+export function numericApplicationSettings(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options))
+    throw new TypeError("Numeric specialization options must be an object");
+  for (const key of Object.keys(options)) {
+    if (!["maxKernels", "maxMemoryPages", "maxIterations", "crossModule", "loopIslands"].includes(key))
+      throw new TypeError(`Unknown numeric specialization option: ${key}`);
+  }
+  // Source-transform callers retain their conservative defaults. Application
+  // builds explicitly opt in and connect native calls across their ESM graph.
+  const settings = { ...options,
+    crossModule: options.crossModule === undefined ? true : options.crossModule,
+    loopIslands: options.loopIslands === undefined ? options.crossModule !== false : options.loopIslands,
+  };
+  specializeNumericModule("", settings);
+  return settings;
+}
+
 /**
  * @param {string} source ESM source (or an ES-format rendered Rollup chunk)
  * @param {{sourceName?: string, runtimeModule?: string | (() => string), maxKernels?: number, maxMemoryPages?: number, maxIterations?: number, crossModule?: boolean, loopIslands?: boolean}} options

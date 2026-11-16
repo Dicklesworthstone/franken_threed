@@ -17,7 +17,7 @@ import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRoot
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
-import { moduleWorkerRollupPlugin, findWorkerUrlOperands } from "./module_workers.mjs";
+import { moduleWorkerRollupPlugin, findWorkerUrlOperands, workerNumericReport } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsJsonSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
@@ -741,6 +741,16 @@ export async function bundleWithRollup(entryPath, options = {}) {
     specialization === undefined || specialization === false
       ? null
       : numericKernelRollupPlugin(specialization === true ? {} : specialization);
+  const workerNumericUnits = options._workerNumericUnits ?? new Map();
+  const withWorkerReport = report => {
+    if (!numericPlugin || !workerNumericUnits.size) return report;
+    const workers = workerNumericReport(workerNumericUnits);
+    return {...report, scope: 'guarded-numeric-calls-in-document-chunks-and-worker-esm', workers,
+      compiledKernels: report.compiledKernels + workers.compiledKernels,
+      rewrittenCalls: report.rewrittenCalls + workers.rewrittenCalls,
+      registeredKernels: (report.registeredKernels ?? 0) + workers.registeredKernels,
+      compiledLoopIslands: (report.compiledLoopIslands ?? 0) + workers.compiledLoopIslands};
+  };
   // The existing application opt-in covers source-pinned library kernels too.
   // Both passes share caller budgets, but retain their own default ceilings.
   // Library kernels are accounted separately from generic inferred functions.
@@ -784,15 +794,23 @@ export async function bundleWithRollup(entryPath, options = {}) {
     // Classic-only documents use the retained script/resource closure in the
     // application builder. External and empty-src modules also emit no chunks.
     if (localModuleScripts.length === 0) {
+      // Classic document scripts may have emitted specialized module workers.
+      // They have no Rollup entry chunk but still need the ordinary build report.
+      const numericReport = numericPlugin && workerNumericUnits.size ? withWorkerReport({
+        version: 1, enabled: true, accelerated: false, compiledKernels: 0,
+        rewrittenCalls: 0, units: [], runtimeAssets: [], reportFile: 'f3d-numeric-specialization.json',
+      }) : null;
+      const reportSource = numericReport ? JSON.stringify(numericReport, null, 2) + '\n' : null;
       return {
         code: "",
         modules: [],
         isMultiChunk: false,
         entryFiles: [],
-        files: {},
+        files: numericReport ? {[numericReport.reportFile]: reportSource} : {},
         outputChunks: [],
         chunks: [],
-        assets: [],
+        assets: numericReport ? [{fileName: numericReport.reportFile, source: reportSource}] : [],
+        ...(numericReport ? {numericSpecialization: numericReport} : {}),
       };
     }
 
@@ -858,6 +876,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
         // document chunk. Do not apply the page import map or renderer route.
         moduleWorkerRollupPlugin({
           _moduleSources: moduleSources,
+          specializeNumeric: specialization,
+          _workerNumericUnits: workerNumericUnits,
           documentRoot,
           unavailableGlobals: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
@@ -912,7 +932,7 @@ export async function bundleWithRollup(entryPath, options = {}) {
           : "[name].js",
     });
 
-    let numericReport = numericPlugin?.api.getReport();
+    let numericReport = withWorkerReport(numericPlugin?.api.getReport());
     if (numericReport && marchingPlugin) {
       numericReport = {
         ...numericReport,

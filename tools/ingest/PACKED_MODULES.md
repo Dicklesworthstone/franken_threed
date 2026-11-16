@@ -467,6 +467,9 @@ encoded worker resources also consume a cumulative byte budget, independently
 of the final HTML size check. Open URL expressions, opaque host mutation and
 location reflection remain outside this standalone route.
 
+Build-then-pack output also supports the existing numeric Wasm opt-in inside
+worker ESM; see [Numeric specialization in module workers](MODULE_WORKERS.md).
+
 ## Retained Draco, KTX2 and Meshopt workers
 
 Application builds retain finite glTF model and sidecar discovery through

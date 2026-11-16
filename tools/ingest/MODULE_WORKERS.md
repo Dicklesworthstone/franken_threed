@@ -22,8 +22,8 @@ time. No worker is executed by the compiler.
 
 Worker imports use installed-package resolution without inheriting the page's
 import map. The existing explicit Three.js package override is retained. Renderer
-substitution and numeric specialization are not applied across this realm
-boundary. Explicit HTTP/HTTPS/data imports stay external; the compiler does not
+substitution is not applied across this realm boundary. Numeric specialization
+is opt-in, as described below. Explicit HTTP/HTTPS/data imports stay external; the compiler does not
 fetch them. Origin-root and other non-file worker/asset URLs stay host-owned.
 
 The graph is bounded to 4096 realm-specific module instances, 4096 assets and
@@ -36,6 +36,36 @@ inputs are registered and graph emission state is reset at each Rollup build.
 Nested closure hashing has its own work bound. Shared build accounting is
 conservative: overlapping graph plans can be charged again even when identical
 emitted files are reused.
+
+## Numeric Wasm inside module workers
+
+The application compiler's existing numeric opt-in also applies to local ESM
+inside worker graphs, including module workers launched by classic page scripts:
+
+```sh
+node tools/ingest/cli.mjs app.html --build-app dist --specialize-numeric
+```
+
+The Node API accepts the same `specializeNumeric: true` or numeric option object.
+Eligible functions, cross-module calls and closed loop islands use the existing
+guarded Wasm compiler. Each worker realm loads its own lazy dispatcher; source
+code still owns messaging, transfers, asynchronous boundaries and public function
+identities. Missing Wasm, failed guards and work-budget exhaustion select the
+existing source implementation without publishing partial numeric updates.
+
+Compiler runtime modules join the worker's normal content-addressed closure and
+size limits. Their bytes and the numeric settings affect emitted identities;
+application frontend transforms and resolvers cannot rewrite those compiler
+inputs. Explicit opt-out preserves the ordinary worker output. The build report
+includes worker-specific units and adds their kernel/call counts to application
+totals; those counts describe generated code, not executed calls or speedup.
+
+`node --test tools/ingest/numeric_workers.integration.test.mjs` checks actual
+isolated Node worker threads, transferable and overlapping typed arrays, lazy
+imports, module identity, real Wasm calls, fallback, relocated application builds
+and packed worker modules. Browser Worker/SharedWorker host behavior retains its
+separate validation requirements. Classic worker scripts themselves remain
+ordinary JavaScript; their imported ESM can use this numeric path.
 
 ## Worker resource loading
 

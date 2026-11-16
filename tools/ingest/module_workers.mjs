@@ -1,7 +1,8 @@
 /** Relocate classic/module Worker and SharedWorker graphs without crossing realms.
  * Worker modules remain native ESM: cycles, live bindings and top-level await
- * are left to the host linker. No application import map, renderer substitution,
- * numeric specialization or worker execution here. Classic scripts stay classic:
+ * are left to the host linker. No application import map or renderer substitution.
+ * Opt-in numeric specialization shares the document compiler and lazy Wasm host;
+ * each worker realm owns its runtime and source state. Classic scripts stay classic:
  * importScripts retains synchronous ordering, repeated evaluation and globals.
  * Relative static GET fetches use the originating worker entry's URL, not an
  * importing module's directory. Realm-specific closures keep nested entry URLs
@@ -18,6 +19,12 @@ import {moduleSourcesFor} from './module_sources.mjs';
 import {assertUnbundledModule} from './commonjs_modules.mjs';
 import {createDynamicImportClassifier} from './ast_analyzer.mjs';
 import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
+import {numericApplicationSettings, specializeNumericModule} from './numeric_specialization.mjs';
+
+const numericDispatchUrl = new URL('./numeric_dispatch.mjs', import.meta.url).href;
+const numericRuntimeUrls = new Set([
+  numericDispatchUrl, new URL('./numeric_kernel_runtime.mjs', import.meta.url).href,
+]);
 
 export class ModuleWorkerBuildError extends Error {
   constructor(code, message, url = null) {
@@ -357,12 +364,14 @@ export function buildWorkerGraph(entryUrl, {
   workerType = 'module',
   resolveModule, maxModules = 4096, maxAssets = 4096, maxBytes = 64 * 1024 * 1024,
   requireClosedRuntimeUrls = false,
-  documentRoot, transformModule, _moduleSources,
+  documentRoot, transformModule, _moduleSources, specializeNumeric,
 } = {}) {
   documentRoot = normalizeDocumentRoot(documentRoot);
   if (resolveModule === undefined)
     resolveModule = (specifier, referrer) => resolveLocal(specifier, referrer, documentRoot);
   const moduleSources = moduleSourcesFor({transformModule, _moduleSources});
+  const numericSettings = specializeNumeric === undefined || specializeNumeric === false ? null
+    : numericApplicationSettings(specializeNumeric === true ? {} : specializeNumeric);
   if (!['classic', 'module'].includes(workerType)) fail('OPTIONS', 'Expected classic or module workerType');
   if (typeof resolveModule !== 'function' || ![maxModules, maxAssets, maxBytes].every(n => Number.isSafeInteger(n) && n > 0))
     fail('OPTIONS', 'Expected a synchronous resolver and positive graph limits');
@@ -455,9 +464,21 @@ export function buildWorkerGraph(entryUrl, {
   if (entry.external) fail('ENTRY', 'Worker graph entry must be a local file', entryUrl);
   for (let index = 0; index < queue.length; index++) {
     const record = queue[index], bytes = read(record.url);
-    const source = record.nativeResource ? null : moduleSources.read(record.url,
-      {sourceType: record.sourceType, source: bytes}).code;
-    if (!record.nativeResource && record.sourceType === 'module') assertUnbundledModule(record.url, moduleSources);
+    // Runtime modules are compiler inputs, not application frontend inputs. The
+    // normal closure copies/hashes their exact bytes, sharing one instance per
+    // realm and charging their complete size to the worker's existing budgets.
+    const compilerOwned = numericSettings !== null && numericRuntimeUrls.has(record.url);
+    let source = record.nativeResource ? null : compilerOwned ? bytes.toString('utf8')
+      : moduleSources.read(record.url, {sourceType: record.sourceType, source: bytes}).code;
+    if (!record.nativeResource && record.sourceType === 'module' && !compilerOwned) {
+      assertUnbundledModule(record.url, moduleSources);
+      if (numericSettings) {
+        const result = specializeNumericModule(source, {...numericSettings,
+          sourceName: record.url, runtimeModule: numericDispatchUrl});
+        record.numericReport = {...result.report, inputSha256: digest(source)};
+        source = result.code;
+      }
+    }
     analyzedBytes += source === null ? bytes.length : Buffer.byteLength(source);
     if (analyzedBytes > maxBytes) fail('BUDGET', 'Realm-expanded worker sources exceed maxBytes', record.url);
     if (record.nativeResource) {
@@ -480,7 +501,14 @@ export function buildWorkerGraph(entryUrl, {
     function dependency(choice, declaration) {
       const value = choice.specifier ?? text(choice.argument), asUrl = choice.base === 'module';
       let resolved;
-      try { resolved = asUrl ? resolveDocumentUrl(value, record.url, documentRoot) : resolveModule(value, record.url); }
+      try {
+        // Generated imports cannot be redirected by an application's package
+        // resolver. The only private dependencies are this exact runtime pair.
+        const runtimeUrl = numericSettings && (value === numericDispatchUrl ? value
+          : compilerOwned ? new URL(value, record.url).href : null);
+        resolved = runtimeUrl && numericRuntimeUrls.has(runtimeUrl) ? runtimeUrl
+          : asUrl ? resolveDocumentUrl(value, record.url, documentRoot) : resolveModule(value, record.url);
+      }
       catch (cause) {
         if (cause.code?.startsWith('F3D_DOCUMENT_')) throw cause;
         fail('RESOLUTION', cause.message, record.url);
@@ -505,7 +533,7 @@ export function buildWorkerGraph(entryUrl, {
     const workers = sitesIn(ast, changed, {classic: true, relative: true, withConstructors: true});
     const workerConstructors = new Set(workers.map(site => site.constructorNode));
     const workerURLs = new Set(workers.map(site => site.urlNode.start));
-    if (requireClosedRuntimeUrls) {
+    if (requireClosedRuntimeUrls && !compilerOwned) {
       // Unrecognized native URL consumers and escaped host functions can still
       // use relative URLs. Keep those workers at their original document route
       // rather than relocate only the calls this bounded transform recognizes.
@@ -706,7 +734,22 @@ export function buildWorkerGraph(entryUrl, {
     type: 'asset', fileName: record.fileName, source: record.source,
   }));
   return {entryFile: entry.fileName, files, moduleCount: modules.size, assetCount: assets.size, outputBytes,
+    ...(numericSettings ? {numericUnits: [...modules.values()].filter(record => record.numericReport).map(record => ({
+      key: record.key, realm: record.realm, fileName: record.fileName,
+      ...record.numericReport, coordinateSpace: 'normalized-worker-module-before-specialization-and-relocation',
+    }))} : {}),
     watchFiles: [...inputs.keys()], entries: [...roots.values()].map(root => ({url: root.url, workerType: root.workerType, fileName: root.fileName}))};
+}
+
+/** Build-time counts, never a claim about executed native calls or speedup. */
+export function workerNumericReport(units) {
+  const records = [...units.values()].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  return {scope: 'native-worker-esm-with-guarded-numeric-wasm', accelerated: false,
+    compiledKernels: records.reduce((sum, record) => sum + record.compiledKernels, 0),
+    rewrittenCalls: records.reduce((sum, record) => sum + record.rewrittenCalls, 0),
+    registeredKernels: records.reduce((sum, record) => sum + (record.registeredKernels ?? 0), 0),
+    compiledLoopIslands: records.reduce((sum, record) => sum + (record.loopIslands?.compiledKernels ?? 0), 0),
+    units: records};
 }
 
 /** Run before the ordinary URL-asset transform in bundleWithRollup. */
@@ -717,9 +760,20 @@ export function moduleWorkerRollupPlugin(options = {}) {
   let totalBytes = 0, totalModules = 0, totalAssets = 0;
   const maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
   const maxModules = options.maxModules ?? 4096, maxAssets = options.maxAssets ?? 4096;
+  const numericUnits = options._workerNumericUnits ?? new Map();
+  const ownedNumericUnits = new Map();
   return {
     name: 'f3d-module-workers',
-    buildStart() { emitted.clear(); references.clear(); filesByName.clear(); closedRealmEntries.clear(); totalBytes = totalModules = totalAssets = 0; },
+    api: {getNumericReport: () => workerNumericReport(numericUnits)},
+    buildStart() {
+      emitted.clear(); references.clear(); filesByName.clear(); closedRealmEntries.clear();
+      totalBytes = totalModules = totalAssets = 0;
+      // A build may share the collector with its classic-document pass. Clear
+      // only this plugin's previous records, never another pass's fresh units.
+      for (const [key, unit] of ownedNumericUnits)
+        if (numericUnits.get(key) === unit) numericUnits.delete(key);
+      ownedNumericUnits.clear();
+    },
     resolveFileUrl({referenceId, relativePath}) {
       if (!references.has(referenceId)) return null;
       const relative = relativePath.startsWith('.') ? relativePath : './' + relativePath;
@@ -776,6 +830,9 @@ export function moduleWorkerRollupPlugin(options = {}) {
           for (const file of graph.files) {
             let ref = filesByName.get(file.fileName);
             if (!ref) { ref = this.emitFile(file); filesByName.set(file.fileName, ref); }
+          }
+          for (const unit of graph.numericUnits ?? []) {
+            numericUnits.set(unit.key, unit); ownedNumericUnits.set(unit.key, unit);
           }
           for (const entry of graph.entries) {
             const ref = filesByName.get(entry.fileName);

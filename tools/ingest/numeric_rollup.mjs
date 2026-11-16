@@ -11,7 +11,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import * as acorn from "acorn";
-import { specializeNumericModule } from "./numeric_specialization.mjs";
+import { numericApplicationSettings, specializeNumericModule } from "./numeric_specialization.mjs";
 
 const REPORT_FILE = "f3d-numeric-specialization.json";
 const hash = (source) => crypto.createHash("sha256").update(source).digest("hex");
@@ -22,12 +22,6 @@ const relativeImport = (from, to) => {
 
 /** @returns {import('rollup').Plugin} */
 export function numericKernelRollupPlugin(options = {}) {
-  if (!options || typeof options !== "object" || Array.isArray(options))
-    throw new TypeError("Numeric specialization options must be an object");
-  for (const key of Object.keys(options)) {
-    if (!["maxKernels", "maxMemoryPages", "maxIterations", "crossModule", "loopIslands"].includes(key))
-      throw new TypeError(`Unknown numeric specialization option: ${key}`);
-  }
   // Application specialization is already opt-in. Connect its separate output
   // chunks by default; explicit false retains the old within-chunk behavior.
   // Explicit legacy crossModule:false also preserves its old defaults unless
@@ -35,12 +29,8 @@ export function numericKernelRollupPlugin(options = {}) {
   // Closed loops inside retained callbacks/methods participate in the same
   // opt-in application build; users need not extract functions by hand.
   // The standalone source-transform API keeps its own conservative defaults.
-  const settings = { ...options,
-    crossModule: options.crossModule === undefined ? true : options.crossModule,
-    loopIslands: options.loopIslands === undefined ? options.crossModule !== false : options.loopIslands,
-  };
   // Validate budgets even for applications with no candidates.
-  specializeNumericModule("", settings);
+  const settings = numericApplicationSettings(options);
   let units, assets, finalReport;
 
   function runtime(context) {

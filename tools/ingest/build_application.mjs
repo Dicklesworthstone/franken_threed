@@ -1019,6 +1019,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   const retainedModuleUrls = new Map(); // exact source URL -> relative output URL
   const classicWorkerSources = new Map(), classicScriptRewrites = new Map();
   const documentWorkerGlobals = new Set();
+  const workerNumericUnits = new Map();
 
   if (isHtml) {
     const rawHtml = fs.readFileSync(resolvedEntryAbs, "utf8"), documentUrl = pathToFileURL(resolvedEntryAbs).href;
@@ -1048,6 +1049,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
       if (sourceType === "script") scripts.push({match, attrs, source, file, original});
     }
     const plugin = moduleWorkerRollupPlugin({_moduleSources: moduleSources, sourceType: "script",
+      specializeNumeric: options.specializeNumeric, _workerNumericUnits: workerNumericUnits,
       documentUrl, documentBaseUrl: parsed.baseUrl, documentRoot, unavailableGlobals: documentWorkerGlobals,
       resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
         packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, documentRoot})});
@@ -1392,6 +1394,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     workerHostBindings: documentWorkerGlobals,
     retainedModuleUrls,
     specializeNumeric: options.specializeNumeric,
+    _workerNumericUnits: workerNumericUnits,
     prepareStandaloneLoaders: options.prepareStandaloneLoaders,
     ...(rendererRoute?.routed ? { rendererRoute: { targets: rendererRoute.targets, exactSites: rendererRoute.exactSites,
       postprocessingTransforms: rendererRoute.postprocessingTransforms,
