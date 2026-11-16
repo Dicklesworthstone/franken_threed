@@ -5,7 +5,8 @@ import {normalClasses,normalMethod,deriveGeometryNormalKernels,compileGeometryNo
 const blobs={geometry:'db7bfe67f8b159c9126da0c55e1cb5db66eca529',
   attributes:'958fb453e027aee4a048001b3232c92d6fd6716b',vector:'b2e4c4e65cc50afc89b6cd8f8e706a0d1001d71a',
   'interleaved-attributes':'f1b91a0893fd596669b02a31538e80d53aa73f93',
-  'interleaved-buffer':'d74d26e5f2dd1ad84f443c26aa688074a3f9e2ef'};
+  'interleaved-buffer':'d74d26e5f2dd1ad84f443c26aa688074a3f9e2ef',
+  'math-utils':'57534a9227d042e86d99cb4b38de718bb4a08c7b'};
 const coreHash='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
 export function geometryNormalSourceRole(source) {
   const blob=sourceBlob(source);
@@ -16,12 +17,14 @@ const fresh=(source,name)=>{let candidate='__f3d_geometry_'+name;while(source.in
 
 /** Return original-coordinate edits so independently pinned library transforms
  * can share one core module without weakening either source fingerprint. */
-export function specializeGeometryNormals(source,{runtimeModule,objectsModule,vectorSource,attributeSource,
+export function specializeGeometryNormals(source,{runtimeModule,objectsModule,vectorSource,attributeSource,mathUtilsSource,
   maxMemoryPages=2048,maxIterations=100000000}={}) {
   const role=geometryNormalSourceRole(source);
   if(!role)return {changed:false,edits:[],header:'',tail:''};
   const classes=normalClasses(source),edits=[],imports=[],tail=[],report={sourceBlob:sourceBlob(source),
     upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',role,compiledMethods:[],accelerationClaim:false};
+  const normalizationPinned=role==='core' || geometryNormalSourceRole(mathUtilsSource??'')==='math-utils';
+  const normalizationProof=normalizationPinned?'()=>denormalize':'null';
   const registerVector=fresh(source,'register_vector'),registerAttributes=fresh(source,'register_attributes');
   if(role==='core' || role==='vector') {
     const register=fresh(source,'allocation'),ctor=normalMethod(classes.get('Vector3'),'constructor');
@@ -32,7 +35,8 @@ export function specializeGeometryNormals(source,{runtimeModule,objectsModule,ve
   }
   if(role==='core' || role==='attributes') {
     imports.push(`import {registerGeometryNormalAttributes as ${registerAttributes}} from ${JSON.stringify(runtimeModule)};`);
-    tail.push(`${registerAttributes}(BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute]);`);
+    tail.push(`${registerAttributes}(BufferAttribute,[Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute,`+
+      `Int8BufferAttribute,Uint8BufferAttribute,Uint8ClampedBufferAttribute,Int16BufferAttribute,Int32BufferAttribute],"contiguous",${normalizationProof});`);
   }
   if(['core','interleaved-attributes','interleaved-buffer'].includes(role)) {
     const register=fresh(source,'interleaved_allocation');
@@ -44,16 +48,19 @@ export function specializeGeometryNormals(source,{runtimeModule,objectsModule,ve
     }
     if(role!=='interleaved-buffer') {
       if(role!=='core')imports.push(`import {registerGeometryNormalAttributes as ${registerAttributes}} from ${JSON.stringify(runtimeModule)};`);
-      tail.push(`${registerAttributes}(InterleavedBufferAttribute,[],"interleaved");`);
+      tail.push(`${registerAttributes}(InterleavedBufferAttribute,[],"interleaved",${normalizationProof});`);
     }
   }
   if(role==='core' || role==='geometry') {
-    if(role==='core'){vectorSource=source;attributeSource=source;}
+    if(role==='core'){vectorSource=source;attributeSource=source;mathUtilsSource=source;}
     if(role!=='core' && (geometryNormalSourceRole(vectorSource??'')!=='vector' ||
         geometryNormalSourceRole(attributeSource??'')!=='attributes')) {
       return {changed:false,edits:[],header:'',tail:'',report:{...report,reason:'DEPENDENCY_PIN_MISMATCH'}};
     }
-    const sources=deriveGeometryNormalKernels(source,vectorSource,attributeSource);
+    // A changed helper cannot authorize normalized decoding, but the original
+    // unnormalized float kernels remain useful without that dependency.
+    if(role!=='core' && geometryNormalSourceRole(mathUtilsSource??'')!=='math-utils')mathUtilsSource=undefined;
+    const sources=deriveGeometryNormalKernels(source,vectorSource,attributeSource,mathUtilsSource);
     const variants=compileGeometryNormalKernels(sources,{maxMemoryPages,maxIterations});
     const tryName=fresh(source,'try_normals'),create=fresh(source,'create_normals'),token=fresh(source,'normals');
     imports.push(`import {tryGeometryNormals as ${tryName},createGeometryNormalDispatch as ${create}} from ${JSON.stringify(runtimeModule)};var ${token};`);

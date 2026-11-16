@@ -232,6 +232,26 @@ source text need an appropriate build contract or the specialization opt-out,
 as with other source-changing bundler transforms. Full application compatibility
 and the renderer/performance release gates remain separate requirements.
 
+### Source-derived normals for quantized geometry
+
+The same `--specialize-numeric` build option compiles the pinned
+`BufferGeometry.computeVertexNormals()` loops for contiguous or interleaved
+Float32/Float64 positions and signed/unsigned 8-, 16- and 32-bit positions,
+including Uint8Clamped storage and the pinned typed attribute subclasses.
+Normalized integer inputs use the actual `MathUtils.denormalize` division and
+signed minimum clamp before the original f64 cross products. Normalized Float32
+keeps its identity conversion; normalized Float64 retains the source exception.
+
+Normal outputs remain Float32/Float64, with the original typed-store boundaries
+and separate source-derived `normalizeNormals()` pass. Public arrays, objects,
+strides, offsets, callbacks and upload requests keep their source behavior.
+The normalized flag is rechecked each call. Modified helper inputs, constructor
+or accessor hooks, mixed-type overlap and failed execution budgets resume the
+original source loop without partial Wasm publication. Source and built-core
+imports share this implementation. `geometry_normals.test.mjs` compares actual
+Wasm execution with pinned Three.js, including integer extrema, aliasing,
+observable fallback and emitted applications. This is not a measured speedup.
+
 ### Source-derived tangent generation
 
 The same `--specialize-numeric` build option compiles the pinned

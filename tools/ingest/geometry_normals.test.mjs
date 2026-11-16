@@ -16,12 +16,13 @@ const file=name=>pathToFileURL(path.join(upstream,name)).href;
 const reference=await import(file('build/three.core.js'));
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'f3d-geometry-normals-'));
 const exports=['BufferGeometry','BufferAttribute','Float32BufferAttribute','Uint16BufferAttribute','Uint32BufferAttribute','Vector3',
-  'InterleavedBuffer','InterleavedBufferAttribute'];
+  'InterleavedBuffer','InterleavedBufferAttribute','Int8BufferAttribute','Uint8BufferAttribute','Uint8ClampedBufferAttribute',
+  'Int16BufferAttribute','Int32BufferAttribute'];
 async function fixture(name,{core=false,settings=true}={}) {
   const entry=path.join(root,name+'.mjs'),out=path.join(root,name);
   const source=core?`export {${exports.join(',')}} from 'three';`
     :`export {BufferGeometry} from ${JSON.stringify(file('src/core/BufferGeometry.js'))};
-      export {BufferAttribute,Float32BufferAttribute,Uint16BufferAttribute,Uint32BufferAttribute} from ${JSON.stringify(file('src/core/BufferAttribute.js'))};
+      export {${exports.filter(name=>name==='BufferAttribute' || name.endsWith('BufferAttribute') && name!=='InterleavedBufferAttribute').join(',')}} from ${JSON.stringify(file('src/core/BufferAttribute.js'))};
       export {InterleavedBuffer} from ${JSON.stringify(file('src/core/InterleavedBuffer.js'))};
       export {InterleavedBufferAttribute} from ${JSON.stringify(file('src/core/InterleavedBufferAttribute.js'))};
       export {Vector3} from ${JSON.stringify(file('src/math/Vector3.js'))};`;
@@ -122,14 +123,14 @@ test('interleaved shifted views preserve alias offsets while mixed-type writes r
 
 test('interleaved normal guards retain native property effects and the no-Wasm execution path',()=>{
   const api=sourceBuild.module;
-  for(const mode of ['method','count','data','normalized','no-wasm']) {
+  for(const mode of ['method','count','data','normalized-getter','no-wasm']) {
     const a=interleavedGeometry(api),b=interleavedGeometry(reference),actual=[],expected=[];
     for(const [g,trace] of [[a,actual],[b,expected]]) {
       const attribute=g.attributes.position;
       if(mode==='method') {const get=attribute.getX;attribute.getX=function(i){trace.push(i);return get.call(this,i);};}
       if(mode==='count')Object.defineProperty(attribute,'count',{get(){trace.push('count');return this.data.count;}});
       if(mode==='data')attribute.data=new Proxy(attribute.data,{get(target,key,receiver){trace.push(String(key));return Reflect.get(target,key,receiver);}});
-      if(mode==='normalized')attribute.normalized=true;
+      if(mode==='normalized-getter')Object.defineProperty(attribute,'normalized',{get(){trace.push('normalized');return true;}});
     }
     const wasm=globalThis.WebAssembly;
     try {
@@ -147,6 +148,132 @@ test('pinned source loops derive ten validated native kernels without an alterna
   assert.ok(derived.computeSource.includes('(pC_x - pB_x)'));assert.ok(derived.computeSource.includes('(pA_x - pB_x)'));
   assert.ok(derived.normalizeSource.includes('(1 / __arg'));
   assert.equal(specializeGeometryNormals(sources[0]+'\n// modified source').changed,false);
+});
+
+const integerPositions=[
+  [Int8Array,'Int8BufferAttribute',-128,127], [Uint8Array,'Uint8BufferAttribute',0,255],
+  [Uint8ClampedArray,'Uint8ClampedBufferAttribute',0,255], [Int16Array,'Int16BufferAttribute',-32768,32767],
+  [Uint16Array,'Uint16BufferAttribute',0,65535], [Int32Array,'Int32BufferAttribute',-2147483648,2147483647],
+  [Uint32Array,'Uint32BufferAttribute',0,4294967295], [Float32Array,'Float32BufferAttribute',-1.25,2.5],
+];
+function quantizedGeometry(api,[Type,Class,low,high],{interleaved=false,indexed=true,normalized=true,subclass=false,existing=false}={}) {
+  const g=new api.BufferGeometry(),count=indexed?4:3,stride=interleaved?5:3,offset=interleaved?1:0;
+  const backing=new Type(count*stride+2).fill(91),array=new Type(backing.buffer,Type.BYTES_PER_ELEMENT,count*stride);
+  const points=[low,0,0, high,0,0, low,high,low, 0,high,high];
+  for(let i=0;i<count;i++)array.set(points.slice(i*3,i*3+3),i*stride+offset);
+  const position=interleaved?new api.InterleavedBufferAttribute(new api.InterleavedBuffer(array,stride),3,offset,normalized)
+    :subclass?new api[Class](array,3,normalized):new api.BufferAttribute(array,3,normalized);
+  g.setAttribute('position',position);
+  if(indexed)g.setIndex(new api.Uint16BufferAttribute([0,1,2,2,1,3],1));
+  if(existing)g.setAttribute('normal',new api.BufferAttribute(new Float64Array(count*3).fill(7),3));
+  return g;
+}
+
+test('quantized position normals execute real Wasm with exact source bytes across integer types and layouts',()=>{
+  for(const {module:api} of [sourceBuild,coreBuild])for(const descriptor of integerPositions)
+    for(const interleaved of [false,true])for(const indexed of [false,true])for(const normalized of [false,true]) {
+      const options={interleaved,indexed,normalized,existing:indexed};
+      const a=quantizedGeometry(api,descriptor,options),b=quantizedGeometry(reference,descriptor,options);
+      const attribute=a.attributes.position,array=attribute.array,bytes=new Uint8Array(array.buffer).slice();
+      a.computeVertexNormals();b.computeVertexNormals();compare(a,b);
+      assert.equal(a.attributes.position,attribute);assert.equal(attribute.array,array);
+      assert.deepEqual(new Uint8Array(array.buffer),bytes,'normal computation does not publish position bytes');
+      assert.equal(attribute.data?.version??attribute.version,0);
+      assert.deepEqual(api.diagnostics(a).compute,{wasmCalls:1,fallbackCalls:0,lastFailure:null});
+      // The optional conversion is captured anew on every call, not baked into
+      // the geometry or its first dispatched storage variant.
+      attribute.normalized=!normalized;b.attributes.position.normalized=!normalized;
+      a.computeVertexNormals();b.computeVertexNormals();compare(a,b);
+      assert.equal(api.diagnostics(a).compute.wasmCalls,2);assert.equal(api.diagnostics(a).normalize.wasmCalls,2);
+    }
+});
+
+test('source typed BufferAttribute subclasses keep constructor identity and select integer normal kernels',()=>{
+  for(const {module:api} of [sourceBuild,coreBuild])for(const descriptor of integerPositions) {
+    const a=quantizedGeometry(api,descriptor,{subclass:true}),b=quantizedGeometry(reference,descriptor,{subclass:true});
+    assert.equal(a.attributes.position.constructor,api[descriptor[1]]);
+    a.computeVertexNormals();b.computeVertexNormals();compare(a,b);
+    assert.equal(api.diagnostics(a).compute.wasmCalls,1);assert.equal(api.diagnostics(a).compute.fallbackCalls,0);
+  }
+});
+
+test('normalized position constructor and interleaved array observations retain exact source effects',()=>{
+  const api=sourceBuild.module;
+  for(const mode of ['constructor-getter','constructor-data','prototype-constructor','interleaved-array','float64','truthy']) {
+    const options={interleaved:mode==='interleaved-array'},a=quantizedGeometry(api,integerPositions[0],options);
+    const b=quantizedGeometry(reference,integerPositions[0],options),actual=[],expected=[];
+    const saved=Object.getOwnPropertyDescriptor(Int8Array.prototype,'constructor');
+    try {
+      for(const [g,trace] of [[a,actual],[b,expected]]) {
+        const position=g.attributes.position;
+        if(mode==='constructor-getter')Object.defineProperty(position.array,'constructor',{get(){trace.push('constructor');return Uint8Array;}});
+        if(mode==='constructor-data')Object.defineProperty(position.array,'constructor',{value:Uint8Array});
+        if(mode==='interleaved-array')Object.defineProperty(position,'array',{get(){trace.push('array');return new Uint8Array(0);}});
+        if(mode==='float64')position.array=new Float64Array(position.array);
+        if(mode==='truthy')position.normalized=1;
+      }
+      if(mode==='prototype-constructor')Object.defineProperty(Int8Array.prototype,'constructor',{value:Uint8Array,configurable:true,writable:true});
+      if(mode==='float64') {
+        assert.throws(()=>a.computeVertexNormals(),/Invalid component type/);
+        assert.throws(()=>b.computeVertexNormals(),/Invalid component type/);
+      }else {a.computeVertexNormals();b.computeVertexNormals();}
+      compare(a,b);assert.deepEqual(actual,expected);
+      assert.equal(api.diagnostics(a).compute.wasmCalls,0);assert.equal(api.diagnostics(a).compute.fallbackCalls,1);
+    }finally{Object.defineProperty(Int8Array.prototype,'constructor',saved);}
+  }
+});
+
+test('normalized signed decoding respects replaced Math.max and typed constructor globals without early effects',()=>{
+  const api=sourceBuild.module;
+  for(const mode of ['math','global']) {
+    const a=quantizedGeometry(api,integerPositions[0]),b=quantizedGeometry(reference,integerPositions[0]);
+    const max=Math.max,Type=Object.getOwnPropertyDescriptor(globalThis,'Int8Array');let calls=0;
+    try {
+      if(mode==='math')Math.max=function(...values){calls++;return max(...values);};
+      else Object.defineProperty(globalThis,'Int8Array',{get(){calls++;return Type.value;},configurable:true});
+      a.computeVertexNormals();const actual=calls;calls=0;b.computeVertexNormals();compare(a,b);assert.equal(actual,calls);
+      assert.equal(api.diagnostics(a).compute.wasmCalls,0);assert.equal(api.diagnostics(a).compute.fallbackCalls,1);
+    }finally{Math.max=max;Object.defineProperty(globalThis,'Int8Array',Type);}
+  }
+});
+
+test('normalized position decoding requires the actual pinned MathUtils helper',()=>{
+  const [geometry,vector,attribute,mathUtils]=['core/BufferGeometry.js','math/Vector3.js','core/BufferAttribute.js','math/MathUtils.js']
+    .map(name=>fs.readFileSync(path.join(upstream,'src',name),'utf8'));
+  const options={vectorSource:vector,attributeSource:attribute,runtimeModule:'runtime',objectsModule:'objects'};
+  const approved=specializeGeometryNormals(geometry,{...options,mathUtilsSource:mathUtils});
+  const changed=specializeGeometryNormals(geometry,{...options,mathUtilsSource:mathUtils+'\n// changed helper'});
+  assert.equal(approved.report.wasmVariants,38);assert.equal(changed.report.wasmVariants,10);
+  assert.ok(!specializeGeometryNormals(attribute,{...options,mathUtilsSource:mathUtils+'\n// changed helper'}).tail.includes('()=>denormalize'));
+});
+
+test('normalized admission does not call an application replacement of Map.values',()=>{
+  const api=sourceBuild.module,a=quantizedGeometry(api,integerPositions[0]),b=quantizedGeometry(reference,integerPositions[0]);
+  const values=Map.prototype.values;let calls=0;
+  try {
+    Map.prototype.values=function(...args){calls++;return values.apply(this,args);};
+    a.computeVertexNormals();const actual=calls;calls=0;b.computeVertexNormals();compare(a,b);
+    assert.equal(actual,calls);assert.equal(actual,0);
+    assert.equal(api.diagnostics(a).compute.wasmCalls,1);
+  }finally{Map.prototype.values=values;}
+});
+
+test('normalized integer positions overlapping float normals preserve the source partial writes',()=>{
+  const api=sourceBuild.module;
+  const make=m=>{
+    const g=new m.BufferGeometry(),buffer=new ArrayBuffer(128);
+    const positions=new m.InterleavedBuffer(new Int16Array(buffer,8,48),12);
+    const normals=new m.InterleavedBuffer(new Float32Array(buffer,0,32),8);
+    positions.array.fill(91);
+    for(let i=0;i<4;i++)positions.array.set([-128+i*30,127-i*17,i*9],i*12+1);
+    g.setAttribute('position',new m.InterleavedBufferAttribute(positions,3,1,true));
+    g.setAttribute('normal',new m.InterleavedBufferAttribute(normals,3,4));
+    g.setIndex(new m.Uint16BufferAttribute([0,1,2,2,1,3],1));return g;
+  };
+  const a=make(api),b=make(reference);a.computeVertexNormals();b.computeVertexNormals();compare(a,b);
+  assert.deepEqual(new Uint8Array(a.attributes.position.array.buffer),new Uint8Array(b.attributes.position.array.buffer));
+  assert.equal(api.diagnostics(a).compute.wasmCalls,0);assert.equal(api.diagnostics(a).compute.fallbackCalls,1);
+  assert.equal(api.diagnostics(a).compute.lastFailure,'KERNEL_ARRAY_ALIAS');
 });
 
 test('emitted source and standard package routes execute both methods with identical public shape',()=>{

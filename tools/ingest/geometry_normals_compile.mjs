@@ -1,9 +1,9 @@
 /** Inline the pinned normal loops' actual Vector3/BufferAttribute method bodies.
  * The result is ordinary numeric source fed to the existing checked Wasm
  * compiler. No alternative normal algorithm, reassociation or f32 fusion is
- * introduced. Guards establish non-normalized native accessors and their
- * integer record layouts. Only accessor addresses acquire stride/offset data;
- * the same ten kernels retain every source arithmetic and typed-store boundary.
+ * introduced. Guards establish native accessors and their integer record
+ * layouts. Normalized position decoding comes from the pinned MathUtils
+ * switch, before the original f64 vector arithmetic and typed-store boundaries.
  */
 import * as acorn from 'acorn';
 import {compileNumericKernel} from './numeric_kernel.mjs';
@@ -14,7 +14,36 @@ export function normalClasses(source) {
 }
 export const normalMethod=(cls,name)=>cls.body.body.find(node=>node.key?.name===name)?.value;
 
-export function deriveGeometryNormalKernels(geometrySource,vectorSource,attributeSource) {
+/** Preserve the source's constructor-specific division and signed clamping.
+ * Consumers prove the constructor dispatch before invoking these scalar helpers.
+ * Float64Array is deliberately absent: normalized Float64 input throws upstream.
+ */
+export function deriveAttributeDenormalizers(mathUtilsSource) {
+  const ast=acorn.parse(mathUtilsSource,{ecmaVersion:'latest',sourceType:'module'});
+  const fn=ast.body.find(node=>node.type==='FunctionDeclaration' && node.id.name==='denormalize');
+  const dispatch=fn?.body.body[0],types={Float32Array:'f32[]',Uint32Array:'u32[]',Uint16Array:'u16[]',
+    Uint8Array:'u8[]',Uint8ClampedArray:'u8c[]',Int32Array:'i32[]',Int16Array:'i16[]',Int8Array:'i8[]'};
+  if(dispatch?.type!=='SwitchStatement' || fn.params.length!==2)throw new TypeError('Missing verified denormalize switch');
+  const result=new Map(),pending=[];
+  for(const entry of dispatch.cases) {
+    if(!entry.test)continue;
+    const constructor=entry.test.name,type=types[constructor];
+    if(!type)throw new TypeError('Unknown verified denormalize constructor');
+    pending.push({constructor,type});
+    if(!entry.consequent.length)continue;
+    if(entry.consequent.length!==1 || entry.consequent[0].type!=='ReturnStatement')
+      throw new TypeError('Unsupported verified denormalize branch');
+    const value=entry.consequent[0].argument,parameter=fn.params[0].name;
+    const expression=mathUtilsSource.slice(value.start,value.end);
+    for(const item of pending)result.set(item.type,{constructor:item.constructor,parameter,expression,
+      source:`function __f3d_denormalize(${parameter}){return ${expression};}`});
+    pending.length=0;
+  }
+  if(pending.length || result.size!==Object.keys(types).length)throw new TypeError('Incomplete verified denormalize switch');
+  return result;
+}
+
+export function deriveGeometryNormalKernels(geometrySource,vectorSource,attributeSource,mathUtilsSource) {
   const geometry=normalClasses(geometrySource).get('BufferGeometry');
   const vector=normalClasses(vectorSource).get('Vector3');
   const attribute=normalClasses(attributeSource).get('BufferAttribute');
@@ -74,8 +103,11 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
         requirements.attribute.add(name);
         const method=normalMethod(attribute,name),scope=new Map(env).set('this',receiver)
           .set(method.params[0].name,expression(node.arguments[0],env));
-        // The source's normalized branch is excluded by the runtime guard.
-        return expression(method.body.body[0].declarations[0].init,scope);
+        const load=expression(method.body.body[0].declarations[0].init,scope);
+        // Output normals and indices retain unnormalized access. Only position
+        // loads gain the source's optional constructor-dependent conversion.
+        return mathUtilsSource && receiver.name==='positionAttribute'
+          ?`(positionNormalized?__f3d_denormalize(${load}):${load})`:load;
       }
       if (receiver?.kind==='vector' && name==='length') {
         requirements.vector.add(name);
@@ -142,7 +174,7 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
     ['normalAttribute',attr('normalAttribute','normals','normalCount',3,'normalStride','normalOffset')]]);
   // The sole object-truthiness branch is the already captured index choice.
   const segment=computeBody.slice(first,end),branch=segment.find(node=>node.type==='IfStatement');
-  const computeSource='function computeNormals(positions,indices,normals,positionCount,normalCount,indexCount,indexed,positionStride,positionOffset,normalStride,normalOffset){'+
+  const computeSource='function computeNormals(positions,indices,normals,positionCount,normalCount,indexCount,indexed,positionStride,positionOffset,normalStride,normalOffset,positionNormalized){'+
     segment.map(node=>node===branch
       ?`if(indexed)${emit(node.consequent,new Map(computeEnv))}else ${emit(node.alternate,new Map(computeEnv))}`
       :emit(node,computeEnv)).join('')+'}';
@@ -153,16 +185,22 @@ export function deriveGeometryNormalKernels(geometrySource,vectorSource,attribut
     'scratch[0]=__scratch_x;scratch[1]=__scratch_y;scratch[2]=__scratch_z;}';
   return {computeSource,normalizeSource,computeSpan:{start:segment[0].start,end:segment.at(-1).end},
     normalizeSpan:{start:normalizationLoop.start,end:normalizationLoop.end},scratchName,
-    requirements:{vector:[...requirements.vector],attribute:[...requirements.attribute]}};
+    requirements:{vector:[...requirements.vector],attribute:[...requirements.attribute]},
+    denormalizers:mathUtilsSource?deriveAttributeDenormalizers(mathUtilsSource):null};
 }
 
 export function compileGeometryNormalKernels(sources,{maxMemoryPages=2048,maxIterations=100000000}={}) {
   const settings={maxMemoryPages,maxIterations,generalControl:true,allowMath:true};
   const variants=[];
-  for(const positionType of ['f32[]','f64[]'])for(const normalType of ['f32[]','f64[]'])for(const indexType of ['u16[]','u32[]']) {
-    const parameterTypes=[positionType,indexType,normalType,'f64','f64','f64','f64','f64','f64','f64','f64'];
-    const artifact=compileNumericKernel(sources.computeSource,{...settings,parameterTypes,sourceName:'pinned BufferGeometry.computeVertexNormals'});
-    variants.push({method:'compute',types:[positionType,indexType,normalType],base64:Buffer.from(artifact.wasm).toString('base64')});
+  const positionTypes=sources.denormalizers?['f64[]',...sources.denormalizers.keys()]:['f32[]','f64[]'];
+  for(const positionType of positionTypes)for(const normalType of ['f32[]','f64[]'])for(const indexType of ['u16[]','u32[]']) {
+    const parameterTypes=[positionType,indexType,normalType,'f64','f64','f64','f64','f64','f64','f64','f64','f64'];
+    // Float64 storage is admitted only when positionNormalized is false.
+    const helper=sources.denormalizers?.get(positionType)?.source??'function __f3d_denormalize(value){return value;}';
+    const artifact=compileNumericKernel(sources.computeSource,{...settings,parameterTypes,
+      helperSources:new Map([['__f3d_denormalize',helper]]),sourceName:'pinned BufferGeometry.computeVertexNormals'});
+    variants.push({method:'compute',types:[positionType,indexType,normalType],normalized:!!sources.denormalizers,
+      base64:Buffer.from(artifact.wasm).toString('base64')});
   }
   for(const normalType of ['f32[]','f64[]']) {
     const artifact=compileNumericKernel(sources.normalizeSource,{...settings,parameterTypes:[normalType,'f64[]','f64','f64','f64'],sourceName:'pinned BufferGeometry.normalizeNormals'});
