@@ -38,7 +38,7 @@ const functionSource = Function.prototype.toString;
 const mathHost = globalThis;
 const MATH_SEMANTICS = 'f64-operator-order+guarded-math-v1';
 const ARRAY_METHOD_SEMANTICS = 'f64-operator-order+guarded-array-methods-v1';
-const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'copyWithin', 'fill', 'set', 'subarray',
+const ARRAY_METHOD_NAMES = Object.freeze(['Symbol.iterator', 'keys', 'values', 'entries', 'copyWithin', 'fill', 'set', 'subarray',
   'reduce', 'reduceRight', 'forEach', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex']);
 // Transcendentals use the host's exact Number implementation. These are the
 // only host imports admitted by the numeric ABI; generated operands are f64.
@@ -93,7 +93,10 @@ const nativeArrayIterator = typeof arrayIterator === 'function' &&
   apply(functionSource, arrayIterator, []) === 'function values() { [native code] }';
 const iteratorParents = [];
 for (let current = iteratorPrototype; current; current = prototype(current))
-  iteratorParents.push({object:current, parent:prototype(current)});
+  iteratorParents.push({object:current, parent:prototype(current), iterator:descriptor(current, iteratorKey)});
+const iteratorSelf = iteratorParents.find(entry => entry.iterator)?.iterator?.value;
+const nativeIteratorSelf = typeof iteratorSelf === 'function' &&
+  apply(functionSource, iteratorSelf, []) === 'function [Symbol.iterator]() { [native code] }';
 
 /** Descriptor-only preflight, including IteratorClose's inherited return hook.
  * Typed-array and ordinary array iterators share their next prototype. Check
@@ -101,12 +104,17 @@ for (let current = iteratorPrototype; current; current = prototype(current))
  * changed next/return hook before falling back to the source loop.
  */
 export function numericArrayIterationIntact() {
-  if (!nativeIteratorNext || !nativeArrayIterator ||
+  if (!nativeIteratorNext || !nativeArrayIterator || !nativeIteratorSelf ||
       dataValue(Array.prototype, iteratorKey) !== arrayIterator ||
       dataValue(iteratorPrototype, 'next') !== iteratorNext) return false;
   for (let i = 0; i < iteratorParents.length; i++) {
     const entry = iteratorParents[i];
     if (prototype(entry.object) !== entry.parent || descriptor(entry.object, 'return')) return false;
+    // Explicit keys/values/entries calls return an iterator which for-of must
+    // itself iterate. Never skip a replacement or a shadowing accessor here.
+    const current = descriptor(entry.object, iteratorKey);
+    if (entry.iterator ? !current || !hasOwn(current, 'value') || current.value !== entry.iterator.value : current)
+      return false;
   }
   return true;
 }
@@ -493,7 +501,8 @@ export function instantiateNumericKernel(bytes, {
   let disposed = false;
   const stats = { wasmCalls: 0, fallbackCalls: 0, copiedBytes: 0, lastGuardFailure: null };
 
-  const requiresArrayIteration = manifest.typedArrayMethods?.includes('Symbol.iterator') === true;
+  const requiresArrayIteration = manifest.typedArrayMethods?.some(name =>
+    name === 'Symbol.iterator' || name === 'keys' || name === 'values' || name === 'entries') === true;
   function checkArrayIteration() {
     if (requiresArrayIteration && !numericArrayIterationIntact())
       refuse('KERNEL_ARRAY_ITERATOR', 'The native array iterator protocol has changed');

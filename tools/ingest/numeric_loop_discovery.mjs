@@ -71,7 +71,8 @@ export function discoverNumericArrayParameters(fn, immutableHelpers = new Map())
       else if (value?.type === 'ConditionalExpression') pending.push(value.consequent, value.alternate);
       else if (value?.type === 'CallExpression' && !value.optional &&
           value.callee.type === 'MemberExpression' && !value.callee.optional &&
-          !value.callee.computed && value.callee.property.name === 'subarray') pending.push(value.callee.object);
+          !value.callee.computed && ['subarray', 'keys', 'values', 'entries'].includes(value.callee.property.name))
+        pending.push(value.callee.object);
     }
     return names;
   }

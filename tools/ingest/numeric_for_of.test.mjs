@@ -125,11 +125,141 @@ test('value-loop bindings keep their TDZ, constness and nonescaping numeric cont
     'function f(a){for(var value of a){}return 1;}',
     'function f(a){let value=0;for(value of a){}return value;}',
     'function f(a){for(const [value] of a){}return 1;}',
-    'function f(a){for(const value of a.values()){}return 1;}',
+    'function f(a){for(const value of a.values(0)){}return 1;}',
     'function f(a){for(const value in a){}return 1;}',
   ];
   for (const source of refused) assert.throws(() => compileNumericKernel(source,
     {parameterTypes:['f64[]'],generalControl:true}), {code:'KERNEL_NOT_CLOSED'}, source);
+});
+
+function explicitValues(values) { let total = -0; for (const value of values.values()) total += value; return total; }
+function explicitKeys(values) { let total = -0; for (const index of values.keys()) total += index; return total; }
+function explicitEntries(values) {
+  let total = -0;
+  for (const [index, value] of values.entries()) total += value * (index + 1);
+  return total;
+}
+
+for (const [Type,type] of layouts) test(Type.name + ': explicit keys, values and entries execute native source-order loops', () => {
+  for (const [fn,method] of [[explicitValues,'values'],[explicitKeys,'keys'],[explicitEntries,'entries']]) {
+    const artifact = compile(fn,[type]), kernel = engine(artifact);
+    assert.deepEqual(artifact.manifest.typedArrayMethods,[method]);
+    assert.deepEqual(artifact.controlLoops.map(loop => loop.kind),['for-of']);
+    for (const values of [[], [1,2,-3,4.5], [-0,0], [NaN,Infinity,-Infinity],
+      [Number.MIN_VALUE,Number.MAX_VALUE,2 ** 32 - 1]]) {
+      const input = new Type(values), expected = input.slice();
+      assert.ok(Object.is(kernel.run(input),fn(input)));
+      assert.deepEqual(input,expected);
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,5);
+    assert.equal(kernel.diagnostics.fallbackCalls,0);
+    if (method === 'keys') {
+      assert.equal(artifact.manifest.parameters[0].read,false);
+      assert.equal(kernel.diagnostics.copiedBytes,0,'key iteration must not stage unused elements');
+    }
+  }
+});
+
+test('entry bindings cannot retarget the captured view or the private iteration index', () => {
+  function update(a,b,replacement) {
+    let view = a, total = 0;
+    for (let [index,value] of view.entries()) {
+      view = replacement;
+      value += 0.5;
+      b[index] += value;
+      total += index + value;
+      index = 99;
+    }
+    return total;
+  }
+  const kernel = engine(compile(update,['f32[]','f32[]','f32[]']));
+  const data = new Float32Array([1,2,3,4,5]), expected = data.slice();
+  const replacement = new Float32Array([100]);
+  assert.equal(kernel.run(data.subarray(0,4),data.subarray(1),replacement),
+    update(expected.subarray(0,4),expected.subarray(1),replacement));
+  assert.deepEqual(data,expected);
+  assert.equal(kernel.diagnostics.wasmCalls,1);
+  assert.equal(kernel.diagnostics.fallbackCalls,0);
+});
+
+test('borrowed iterator receivers preserve range effects, nested loops and abrupt control', () => {
+  function mark(out,bound) { out[0] = out[0] * 10 + bound; return bound; }
+  function update(a,b,out,choose) {
+    for (const [index,value] of (choose ? a : b).subarray(mark(out,1),mark(out,4)).entries()) {
+      if (value < 0) continue;
+      for (let key of out.subarray(1,3).keys()) {
+        out[key+1] += value + index;
+        key = 100;
+      }
+      if (value > 4) break;
+    }
+    return out[0];
+  }
+  const artifact = compile(update,['f64[]','f64[]','f64[]','f64'],{},[mark]), kernel = engine(artifact);
+  assert.deepEqual(artifact.manifest.typedArrayMethods,['entries','keys','subarray']);
+  assert.equal(artifact.manifest.maxLoopDepth,2);
+  for (const choose of [0,1]) {
+    const a = new Float64Array([0,-3,2,8,9]), b = new Float64Array([0,3,7,1]);
+    const out = new Float64Array(3), expected = out.slice();
+    assert.equal(kernel.run(a,b,out,choose),update(a,b,expected,choose));
+    assert.equal(out[0],14); assert.deepEqual(out,expected);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,2);
+});
+
+test('entry elisions, nested lexical scopes and helper early returns stay numeric', () => {
+  function helper(a) {
+    let index = 7, total = 0;
+    for (const [index] of a.entries()) total += index;
+    for (const [,value] of a.entries()) { if (value < 0) continue; total += value; }
+    for (const [] of a.entries()) total += 1;
+    for (const value of a.values()) if (value > 4) return total + value + index;
+    return total + index;
+  }
+  function root(a,out) { out[0] += helper(a); return out[0]; }
+  const kernel = engine(compile(root,['f64[]','f64[]'],{},[helper]));
+  for (const values of [[],[1,2,-3,5],[1,2,3]]) {
+    const a = new Float64Array(values), out = new Float64Array([1]), expected = out.slice();
+    assert.equal(kernel.run(a,out),root(a,expected)); assert.deepEqual(out,expected);
+  }
+  assert.equal(kernel.diagnostics.wasmCalls,3);
+});
+
+test('entry-loop helpers share fuel and failed bounds preserve whole-source partial effects', () => {
+  function subtotal(a) { let total=0; for (const [i,value] of a.entries()) total+=i+value; return total; }
+  function update(a,out) { out[0]+=10; for (const key of a.keys()) out[key]+=subtotal(a); return out[0]; }
+  const a = new Float64Array([1,2,3]);
+  for (const options of [{maxIterations:4},{}]) {
+    let calls=0;
+    const artifact=compile(update,['f64[]','f64[]'],options,[subtotal]);
+    const kernel=engine(artifact,{fallback(...args) { calls++; return update(...args); }});
+    // The short view forces a late bounds failure after staged stores when
+    // fuel is sufficient. Source ignored out-of-bounds writes remain intact.
+    const out=new Float64Array([1]),expected=out.slice();
+    assert.equal(kernel.run(a,out),update(a,expected)); assert.deepEqual(out,expected);
+    assert.equal(calls,1); assert.equal(kernel.diagnostics.wasmCalls,0);
+    assert.equal(kernel.diagnostics.fallbackCalls,1);
+  }
+});
+
+test('entry destructuring retains TDZ, constness and unsupported iterator effects', () => {
+  const refused = [
+    'function f(a){for(const [a,value] of a.entries()){}return 1;}',
+    'function f(a){for(const [i,value] of a.entries()){i++;}return 1;}',
+    'function f(a){for(const [i,value] of a.entries()){value++;}return 1;}',
+    'function f(a){for(const [i,value] of a.entries()){}return i;}',
+    'function f(a){for(var [i,value] of a.entries()){}return 1;}',
+    'function f(a){for(const entry of a.entries()){}return 1;}',
+    'function f(a){for(const [i,value=0] of a.entries()){}return 1;}',
+    'function f(a){for(const [i,...values] of a.entries()){}return 1;}',
+    'function f(a){for(const [i,value,extra] of a.entries()){}return 1;}',
+    'function f(a){for(const [i,value] of a.entries(1)){}return 1;}',
+    'function f(a){for(const key of a["keys"]()){}return 1;}',
+    'function f(a){for(const key of a.keys?.()){}return 1;}',
+    'function f(a){for(const value of a?.values()){}return 1;}',
+  ];
+  for (const source of refused) assert.throws(() => compileNumericKernel(source,
+    {parameterTypes:['f64[]'],generalControl:true}),{code:'KERNEL_NOT_CLOSED'},source);
 });
 
 function consume(values, out) {
@@ -160,6 +290,69 @@ test('own, concrete and shared typed-array iterator getters run only in the orig
     assert.equal(result,7); assert.equal(out[0],7); assert.equal(calls,1);
     assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
   }
+});
+
+test('explicit iterator method getters retain source observations at every prototype level', () => {
+  for (const [fn,name] of [[explicitValues,'values'],[explicitKeys,'keys'],[explicitEntries,'entries']]) {
+    const artifact=compile(fn,['f64[]']), method=Object.getOwnPropertyDescriptor(typedPrototype,name).value;
+    for (const location of ['own','concrete','shared']) {
+      const input=new Float64Array([1,2,3]), expected=fn(input);
+      const object=location==='own' ? input : location==='concrete' ? Float64Array.prototype : typedPrototype;
+      const original=Object.getOwnPropertyDescriptor(object,name), kernel=engine(artifact,{fallback:fn});
+      let reads=0,result;
+      Object.defineProperty(object,name,{configurable:true,get() { reads++; return method; }});
+      try { result=kernel.run(input); } finally { restore(object,name,original); }
+      assert.equal(result,expected); assert.equal(reads,1);
+      assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
+    }
+  }
+});
+
+test('returned iterator self-method shadows invoke no speculative getter', () => {
+  const self=Object.getOwnPropertyDescriptor(iteratorParent,Symbol.iterator).value;
+  for (const fn of [explicitValues,explicitKeys,explicitEntries]) for (const object of [iteratorPrototype,iteratorParent]) {
+    const kernel=engine(compile(fn,['f64[]']),{fallback:fn}), input=new Float64Array([1,2,3]);
+    const original=Object.getOwnPropertyDescriptor(object,Symbol.iterator), expected=fn(input);
+    let reads=0,result;
+    Object.defineProperty(object,Symbol.iterator,{configurable:true,get() { reads++; return self; }});
+    try { result=kernel.run(input); } finally { restore(object,Symbol.iterator,original); }
+    assert.equal(result,expected); assert.equal(reads,1);
+    assert.equal(kernel.diagnostics.lastGuardFailure,'KERNEL_ARRAY_ITERATOR');
+    assert.equal(kernel.diagnostics.copiedBytes,0);
+  }
+});
+
+test('entry pair destructuring observes its own Array iterator and early-close hooks', () => {
+  const input=new Float64Array([1,2,3]);
+  const kernel=engine(compile(explicitEntries,['f64[]']),{fallback:explicitEntries});
+  const original=Object.getOwnPropertyDescriptor(Array.prototype,Symbol.iterator);
+  const expected=explicitEntries(input);
+  let reads=0,result;
+  Object.defineProperty(Array.prototype,Symbol.iterator,{configurable:true,get() { reads++; return original.value; }});
+  try { result=kernel.run(input); } finally { restore(Array.prototype,Symbol.iterator,original); }
+  assert.equal(result,expected); assert.equal(reads,3);
+  assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
+
+  function indices(a,out) { out[0]++; for (const [index] of a.entries()) out[0]+=index; return out[0]; }
+  const partial=engine(compile(indices,['f64[]','f64[]']),{fallback:indices});
+  const out=new Float64Array(1), reference=out.slice(), expectedPartial=indices(input,reference);
+  const previous=Object.getOwnPropertyDescriptor(iteratorParent,'return');
+  let closes=0;
+  Object.defineProperty(iteratorParent,'return',{configurable:true,value() { closes++; return {done:true}; }});
+  try { result=partial.run(input,out); } finally { restore(iteratorParent,'return',previous); }
+  assert.equal(result,expectedPartial); assert.deepEqual(out,reference); assert.equal(closes,3);
+  assert.equal(partial.diagnostics.wasmCalls,0); assert.equal(partial.diagnostics.fallbackCalls,1);
+});
+
+test('throwing iterator access preserves exception identity and preceding source writes', () => {
+  function update(a,out) { out[0]+=1; for (const [index,value] of a.entries()) out[0]+=index+value; return out[0]; }
+  const kernel=engine(compile(update,['f64[]','f64[]']),{fallback:update});
+  const input=new Float64Array([1,2,3]), out=new Float64Array(1), failure={};
+  let reads=0,caught;
+  Object.defineProperty(input,'entries',{configurable:true,get() { reads++; throw failure; }});
+  try { kernel.run(input,out); } catch (error) { caught=error; }
+  assert.equal(caught,failure); assert.equal(reads,1); assert.equal(out[0],1);
+  assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
 });
 
 test('shared iterator next mutation is checked before any host argument iteration', () => {
@@ -207,6 +400,23 @@ test('protocol guards run again after a host memory-growth hook', () => {
   try { result = kernel.run(input); }
   finally { WebAssembly.Memory.prototype.grow = original; restore(iteratorPrototype,'next',nativeNext); }
   assert.equal(result,10000); assert.equal(growths,1); assert.equal(reads,1);
+  assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
+});
+
+test('explicit iterator self-method is rechecked after memory growth', () => {
+  const kernel=engine(compile(explicitEntries,['f64[]']),{fallback:explicitEntries});
+  const input=new Float64Array(10000).fill(1), expected=explicitEntries(input);
+  const grow=WebAssembly.Memory.prototype.grow;
+  const original=Object.getOwnPropertyDescriptor(iteratorParent,Symbol.iterator);
+  let reads=0,growths=0,result;
+  WebAssembly.Memory.prototype.grow=function(pages) {
+    const value=grow.call(this,pages); growths++;
+    Object.defineProperty(iteratorParent,Symbol.iterator,{configurable:true,get() { reads++; return original.value; }});
+    return value;
+  };
+  try { result=kernel.run(input); }
+  finally { WebAssembly.Memory.prototype.grow=grow; restore(iteratorParent,Symbol.iterator,original); }
+  assert.equal(result,expected); assert.equal(growths,1); assert.equal(reads,1);
   assert.equal(kernel.diagnostics.wasmCalls,0); assert.equal(kernel.diagnostics.fallbackCalls,1);
 });
 
@@ -262,6 +472,39 @@ test('callback value loops publish scalar reductions at the original boundary ac
   assert.equal(tick.tick(.5),oracle.tick(.5));
   assert.deepEqual(events,expected);
   assert.equal(diagnostics()[0].variants.reduce((sum,variant)=>sum+(variant.kernel?.wasmCalls??0),0),2);
+});
+
+test('automatic entries discovery compiles helpers and callback islands through borrowed receivers', async () => {
+  const source=`function integrate(values,out,scale) {
+    for (const [index,value] of values.entries()) out[index]+=value*scale;
+  }
+  export function run(values,out,scale) { integrate(values,out,scale); }
+  export function make(values,out,events) {
+    let total=0;
+    return {tick(scale,choose) { events.push('before');
+      for (let [index,value] of (choose ? values : out).subarray(1).entries()) {
+        if(value<0) continue; total+=value*scale+index; index=100; value=0;
+      }
+      events.push(total); return total;
+    }};
+  }`;
+  const {result,app,reference,diagnostics}=await application(source,{loopIslands:true});
+  assert.equal(result.report.functionKernels,1); assert.equal(result.report.loopIslands.compiledKernels,1);
+  for (const Type of [Float32Array,Float64Array]) {
+    const values=new Type([1,-2,3,4]), out=new Type([1,2,3,4]), expected=out.slice();
+    app.run(values,out,.5); reference.run(values,expected,.5); assert.deepEqual(out,expected);
+    const events=[],expectedEvents=[],tick=app.make(values,out,events),oracle=reference.make(values,expected,expectedEvents);
+    for (const choose of [0,1]) assert.equal(tick.tick(2,choose),oracle.tick(2,choose));
+    assert.deepEqual(events,expectedEvents); assert.deepEqual(out,expected);
+  }
+  const calls=diagnostics().flatMap(item=>item.variants).reduce((sum,item)=>sum+(item.kernel?.wasmCalls??0),0);
+  assert.equal(calls,6);
+  const input=new Float64Array([1,2,3]),out=new Float64Array(3);
+  const wasm=globalThis.WebAssembly;
+  try { globalThis.WebAssembly=undefined; app.run(input,out,2); }
+  finally { globalThis.WebAssembly=wasm; }
+  // Already initialized kernels remain usable; original source still agrees.
+  assert.deepEqual(out,new Float64Array([2,4,6]));
 });
 
 test('registration with alternative layouts does not iterate arrays before source fallback', () => {

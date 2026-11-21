@@ -125,6 +125,34 @@ calls, spread arguments and coercing operands remain outside this profile.
 
 ## Typed-array value iteration
 
+Direct native `values()`, `keys()` and `entries()` loops use this same execution
+path, including closed helpers and captured-state callback islands:
+
+```js
+for (const [index, value] of positions.subarray(start, end).entries()) {
+  positions[index + start] = value * scale;
+}
+for (const index of positions.keys()) total += index;
+for (const value of positions.values()) total += value;
+```
+
+An `entries()` pair must be destructured into fresh `const`/`let` numeric locals;
+either field can be omitted. The pair cannot escape, and the compiler preserves
+each local's mutability independently of the private iteration counter. Keys
+observe only the captured view length and do not copy unused array elements.
+Conditional and borrowed subarray receivers are evaluated once at loop entry;
+their range effects precede iteration, and later overlapping writes remain
+visible in source order. Explicit calls take no arguments and use direct method
+names. Other iterator expressions retain JavaScript.
+
+Native execution also guards the returned iterator's `Symbol.iterator`, its
+`next`/`return` protocol, and the ordinary Array iterator used by entry-pair
+destructuring. Descriptor-only checks preserve changed methods, getters and
+early-close effects through the original source fallback. Guards run before
+initialization/packing and again after host memory growth. These additional
+method requirements remain explicit in each kernel's manifest; older runtimes
+reject unfamiliar requirements instead of skipping their guards.
+
 `for (const value of values)` and `for (let value of values)` run natively in
 closed functions, numeric helpers and extracted callback loops. Automatic
 discovery recognizes a parameter used only as an iterable; no indexed access or
@@ -139,15 +167,15 @@ reassigned only for `let`; each yielded element consumes one shared work credit.
 Nested helpers, `continue`, `break` and early returns use the same source-ordered
 control and transactional publication as indexed loops.
 
-Artifacts record `Symbol.iterator` in `typedArrayMethods`. Descriptor checks
+Implicit loops record `Symbol.iterator` in `typedArrayMethods`. Descriptor checks
 preserve the native iterator method, shared iterator `next` and prototype chain,
 and the absence of inherited `return` hooks. Checks run before lazy initialization
 and packing, including after memory growth. A changed protocol invokes the
 original JavaScript without reading a getter or calling a close hook speculatively.
 Initialization checks apply to every artifact because host ABI validation also
 uses native array iteration; repeated per-call checks apply to artifacts that
-require `Symbol.iterator`. Custom iterables, ordinary arrays, async iteration,
-destructuring and assignment into an existing loop binding remain on the original
+require native iteration. Custom iterables, ordinary arrays, async iteration,
+nested/default/rest destructuring and assignment into an existing loop binding remain on the original
 path.
 
 ## Numeric switch dispatch

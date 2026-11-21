@@ -16,7 +16,7 @@
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach,
   compileTypedArraySearch, isNumericBooleanSearchCall, isNumericBooleanExpression } from './numeric_typed_array_ops.mjs';
-import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, createArrayValueIteration, arrayIterationShape, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { BITWISE_OPS, INTEGER_ARRAY_LAYOUTS, emitBitwiseBinary, emitBitwiseNot,
   emitToUint32, emitToUint8Clamp } from './numeric_integer.mjs';
@@ -364,21 +364,19 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
         // through test/body/update, but a body's shadow cannot leak into update.
         let initial, predicate, beforeBody = [], update;
         if (node.type === 'ForOfStatement') {
-          const declaration = node.left, binding = declaration?.declarations?.[0];
-          if (node.await || declaration?.type !== 'VariableDeclaration' ||
-              !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 ||
-              binding.id.type !== 'Identifier' || binding.init)
-            fail('Helper value iteration requires one lexical binding and a closed typed-array view', node);
-          environment.set(binding.id.name, null);
-          const reference = arrayReferences.declare(node.right, false);
+          const shape = arrayIterationShape(node, fail);
+          for (const {id} of shape.bindings) environment.set(id.name, null);
+          const reference = arrayReferences.declare(shape.source, false);
           if (!reference) fail('Helper value iteration requires a closed typed-array view', node.right);
-          const iterator = createArrayValueIteration(reference.binding, allocateLocal);
-          const local = allocateLocal();
-          environment.set(binding.id.name, {index:local, mutable:declaration.kind === 'let'});
-          control.methods.add('Symbol.iterator');
+          const iterator = createArrayValueIteration(reference.binding, allocateLocal, shape.kind);
+          for (const {id, value} of shape.bindings) {
+            const local = allocateLocal();
+            environment.set(id.name, {index:local, mutable:shape.mutable});
+            beforeBody.push(...iterator[value], ...set(local));
+          }
+          control.methods.add(shape.method);
           initial = [...reference.bytes, ...iterator.initial];
           predicate = iterator.predicate;
-          beforeBody = [...iterator.value, ...set(local)];
           update = iterator.update;
         } else {
           initial = node.init?.type === 'VariableDeclaration'

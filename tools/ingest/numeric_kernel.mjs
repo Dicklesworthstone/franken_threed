@@ -14,7 +14,7 @@
 import * as acorn from 'acorn';
 import { compileTypedArrayOperation, compileTypedArrayReduction, compileTypedArrayForEach,
   compileTypedArraySearch, isNumericBooleanSearchCall } from './numeric_typed_array_ops.mjs';
-import { createArrayReferenceCompiler, createArrayValueIteration, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
+import { createArrayReferenceCompiler, createArrayValueIteration, arrayIterationShape, arrayPointer, arrayLength, reboundArrayParameters } from './numeric_array_references.mjs';
 import { compileNumericSwitch, numericSwitchBindings } from './numeric_switch.mjs';
 import { createScalarHelperCompiler } from './numeric_helpers.mjs';
 import { createMathIntrinsicCompiler, MATH_IMPORT_ARITIES } from './numeric_intrinsics.mjs';
@@ -604,23 +604,23 @@ export function compileNumericKernel(source, {
       // Per-iteration environments need no heap identity: captures are refused.
       let initial, predicate, beforeBody = [], update;
       if (node.type === 'ForOfStatement') {
-        const declaration = node.left, binding = declaration?.declarations?.[0];
-        if (node.await || declaration?.type !== 'VariableDeclaration' ||
-            !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 ||
-            binding.id.type !== 'Identifier' || binding.init || (callbackReturnDepth === null && params.has(binding.id.name)))
-          fail('Value iteration requires one fresh lexical binding and a closed typed-array view', node);
+        const shape = arrayIterationShape(node, fail);
+        if (callbackReturnDepth === null && shape.bindings.some(({id}) => params.has(id.name)))
+          fail('Typed-array iteration bindings must not shadow a parameter', node);
         // for-of's binding is in TDZ even while its iterable is evaluated.
-        temporaries.set(binding.id.name, null);
-        const reference = arrayReferences.declare(node.right, false);
+        for (const {id} of shape.bindings) temporaries.set(id.name, null);
+        const reference = arrayReferences.declare(shape.source, false);
         if (!reference) fail('Value iteration requires a closed typed-array view', node.right);
-        const iterator = createArrayValueIteration(reference.binding, () => temporaryBase + temporaryCount++);
-        const local = temporaryBase + temporaryCount++;
-        temporaries.set(binding.id.name, local);
-        if (declaration.kind === 'let') mutableLocals.add(local);
-        control.methods.add('Symbol.iterator');
+        const iterator = createArrayValueIteration(reference.binding, () => temporaryBase + temporaryCount++, shape.kind);
+        for (const {id, value} of shape.bindings) {
+          const local = temporaryBase + temporaryCount++;
+          temporaries.set(id.name, local);
+          if (shape.mutable) mutableLocals.add(local);
+          beforeBody.push(...iterator[value], ...set(local));
+        }
+        control.methods.add(shape.method);
         initial = [...reference.bytes, ...iterator.initial];
         predicate = iterator.predicate;
-        beforeBody = [...iterator.value, ...set(local)];
         update = iterator.update;
       } else {
         initial = node.init?.type === 'VariableDeclaration'

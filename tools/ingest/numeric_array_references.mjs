@@ -21,19 +21,55 @@ const number = value => {
 export const arrayPointer = array => [...get(array.index), ...(array.reference ? [0xab] : [])];
 export const arrayLength = array => [...get(array.lengthIndex), ...(array.reference ? [0xab] : [])];
 
-/** Value iteration over a private borrowed reference captured at loop entry.
+/** Closed for-of syntax shared by roots and helpers. Entry pairs cannot escape:
+ * their two numeric fields become lexical locals, including omitted fields.
+ * Defaults, rest patterns and arbitrary iterator objects retain JavaScript.
+ * The caller installs ALL bindings in TDZ before evaluating `source`.
+ */
+export function arrayIterationShape(node, fail) {
+  const declaration = node.left, binding = declaration?.declarations?.[0];
+  if (node.await || declaration?.type !== 'VariableDeclaration' ||
+      !['const', 'let'].includes(declaration.kind) || declaration.declarations.length !== 1 || binding.init)
+    fail('Typed-array iteration requires a lexical declaration and a closed view', node);
+  let source = node.right, method = 'Symbol.iterator';
+  if (source.type === 'CallExpression' && source.callee.type === 'MemberExpression' &&
+      ['keys', 'values', 'entries'].includes(source.callee.property.name)) {
+    const callee = source.callee;
+    if (source.optional || callee.optional || callee.computed || source.arguments.length)
+      fail('Typed-array iterators require direct zero-argument keys, values or entries calls', source);
+    method = callee.property.name;
+    source = callee.object;
+  }
+  const kind = method === 'Symbol.iterator' ? 'values' : method;
+  let bindings;
+  if (kind === 'entries') {
+    if (binding.id.type !== 'ArrayPattern' || binding.id.elements.length > 2 ||
+        binding.id.elements.some(item => item && item.type !== 'Identifier'))
+      fail('Typed-array entries require a nonescaping index/value binding pattern', binding.id);
+    bindings = binding.id.elements.flatMap((id, index) => id ? [{id, value:index ? 'value' : 'key'}] : []);
+  } else {
+    if (binding.id.type !== 'Identifier')
+      fail('Typed-array keys and values require one lexical identifier', binding.id);
+    bindings = [{id:binding.id, value:kind === 'keys' ? 'key' : 'value'}];
+  }
+  return {source, method, kind, bindings, mutable:declaration.kind === 'let'};
+}
+
+/** Iteration over a private borrowed reference captured at loop entry.
  * Only the index advances: reassigning the source variable cannot retarget the
  * iterator, while writes to its staged storage remain visible on later steps.
  * The host guards the native iterator protocol before any speculative work.
  */
-export function createArrayValueIteration(array, allocateLocal) {
+export function createArrayValueIteration(array, allocateLocal, kind = 'values') {
   const index = allocateLocal();
   const integer = INTEGER_ARRAY_LAYOUTS[array.type];
   const alignment = integer?.alignment ?? (array.type === 'f64[]' ? 3 : 2);
-  array.mark({read:true});
+  // keys() observes only the captured length, so it needs no element copies.
+  if (kind !== 'keys') array.mark({read:true});
   return {
     initial: [...number(0), ...set(index)],
     predicate: [...get(index), ...arrayLength(array), 0xb8, 0x63],
+    key: get(index),
     value: [...arrayPointer(array), ...get(index), 0xab, 0x41, alignment, 0x74, 0x6a,
       ...(integer ? [integer.load, alignment, 0, integer.signed ? 0xb7 : 0xb8]
         : array.type === 'f32[]' ? [0x2a, 2, 0, 0xbb] : [0x2b, 3, 0])],
