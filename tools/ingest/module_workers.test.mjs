@@ -642,6 +642,90 @@ test("relocated worker dependencies close finite imports and data without changi
   });
 });
 
+test("imported worker selectors execute relocated and build-then-pack graphs without inheriting document maps", async (t) => {
+  const root = fixture({
+    "index.html": `<base href="site/base.html"><script type="importmap">{
+      "imports":{"worker-routes":"../page-config.mjs"}}</script>
+      <script type="module" src="../modules/app.mjs"></script>`,
+    "page-config.mjs": `throw new Error('a page import map must not redirect worker configuration');`,
+    "modules/app.mjs": `export const start=()=>new Worker('./tasks/main.mjs',{type:'module'});`,
+    "site/tasks/main.mjs": `import '../../shared/runner.mjs';`,
+    "shared/runner.mjs": `import {first,second,never,json,log} from 'worker-routes';
+      const initial=log.slice(), load=flag=>import((log.push('select:'+flag),flag?first:second));
+      const a=await load(true), b=await load(false), again=await load(true);
+      const unopened=()=>import(never);
+      const config=await import(json,(log.push('options'),{with:{type:'json'}}));
+      const sameConfig=await import(json,{with:{type:'json'}});
+      a.bump();postMessage({initial,first,second,same:a===again,distinct:a!==b,
+        sameConfig:config===sameConfig,values:[a.value,b.value,config.default.value],log});`,
+    "node_modules/worker-routes/package.json": '{"name":"worker-routes","type":"module","exports":"./index.mjs"}',
+    "node_modules/worker-routes/index.mjs": `export {default as first,second,never,json,log} from './values.mjs';`,
+    "node_modules/worker-routes/values.mjs": `export const log=[];await Promise.resolve(log.push('ready'));
+      export default (log.push('first'),'./lazy.mjs?one#view');
+      export const second='./lazy.mjs?two#view',never='./never.mjs',json='./settings.json';`,
+    "shared/lazy.mjs": `export let value=7;export const bump=()=>++value;`,
+    "shared/never.mjs": `throw new Error('unselected imports must stay lazy');`,
+    "shared/settings.json": '{"value":42}',
+  });
+  const output=root+'-output', relocated=output+'-relocated', packed=root+'-packed.html';
+  workerHost(t,pathToFileURL(path.join(relocated,'site/base.html')));
+  const reference=await new Worker(pathToFileURL(path.join(root,'site/tasks/main.mjs')),{type:'module'}).result;
+  assert.deepEqual(reference,{initial:['ready','first'],first:'./lazy.mjs?one#view',second:'./lazy.mjs?two#view',
+    same:true,distinct:true,sameConfig:true,values:[8,7,42],
+    log:['ready','first','select:true','select:false','select:true','options']});
+  const built=await buildApplication(path.join(root,'index.html'),output);
+  assert.ok(built.emittedFiles.some(file=>file.startsWith('f3d-workers/')),'imported selectors close the ordinary worker graph');
+  packHtml(path.join(output,'index.html'),packed);
+  fs.renameSync(root,root+'-source-unavailable');fs.renameSync(output,relocated);
+  const application=await import(pathToFileURL(path.join(relocated,built.entryFiles[0])).href);
+  assert.deepEqual(await application.start().result,reference);
+  const html=fs.readFileSync(packed,'utf8'), standaloneUrl=/<script type="module" src="([^"]+)"/.exec(html)[1];
+  fs.renameSync(relocated,relocated+'-unavailable');
+  const standalone=await import(standaloneUrl);
+  assert.deepEqual(await standalone.start().result,reference);
+});
+
+test("imported worker selectors use one frontend snapshot and remain part of worker budgets and watch inputs", () => {
+  const root=fixture({
+    'worker.mjs':`import {entry} from './config.ts'; export const load=()=>import(entry);`,
+    'config.ts':`export const entry: string='./lazy.mjs';`,
+    'lazy.mjs':`export const result=42;`,
+  });
+  const entry=pathToFileURL(path.join(root,'worker.mjs')).href, visits=new Map();
+  const transformModule=(source,{url})=>{
+    visits.set(url,(visits.get(url)??0)+1);return source.replace(': string','');
+  };
+  const graph=buildModuleWorkerGraph(entry,{transformModule});
+  assert.equal(graph.moduleCount,3);
+  for(const filename of ['worker.mjs','config.ts','lazy.mjs']) {
+    assert.ok(graph.watchFiles.includes(path.join(root,filename)));
+    assert.equal(visits.get(pathToFileURL(path.join(root,filename)).href),1);
+  }
+  const size=fs.statSync(path.join(root,'worker.mjs')).size+fs.statSync(path.join(root,'config.ts')).size;
+  assert.throws(()=>buildModuleWorkerGraph(entry,{transformModule,maxBytes:size-1}),{code:'F3D_WORKER_BUDGET'});
+  assert.throws(()=>buildModuleWorkerGraph(entry,{transformModule(source,{url}){
+    if(url.endsWith('/config.ts'))throw new Error('frontend failed');return source;
+  }}),{code:'F3D_SOURCE_TRANSFORM'});
+});
+
+test("imported worker selectors keep mutable, namespace and open exports outside relocation", () => {
+  for(const [imported, config, selected] of [
+    ["{entry}","export let entry='./lazy.mjs';",'entry'],
+    ["{entry}","export const entry=readFromNetwork();",'entry'],
+    ["* as config","export const entry='./lazy.mjs';",'config.entry'],
+    ["{entry}","export * from './actual.mjs';",'entry'],
+    ["{entry}","export const table={path:'./lazy.mjs'};export const entry=table.path;",'entry'],
+  ]) {
+    const root=fixture({'worker.mjs':`import ${imported} from './config.mjs';import(${selected});`,
+      'config.mjs':config,'actual.mjs':"export const entry='./lazy.mjs';",'lazy.mjs':'export const value=42;'});
+    assert.throws(()=>buildModuleWorkerGraph(pathToFileURL(path.join(root,'worker.mjs')).href),{code:'F3D_WORKER_DYNAMIC_IMPORT'});
+  }
+  const root=fixture({'worker.mjs':`import {entry} from './config.mjs';import(entry);`,
+    'config.mjs':'export const entry = ;'});
+  assert.throws(()=>buildModuleWorkerGraph(pathToFileURL(path.join(root,'worker.mjs')).href),error=>
+    error.code==='F3D_WORKER_PARSE'&&error.url.endsWith('/config.mjs'));
+});
+
 test("worker dependency closure refuses mutable, escaped and shadowed selectors before publication", () => {
   const sources = [
     use=>`let target='./resource.mjs';${use('target')}`,

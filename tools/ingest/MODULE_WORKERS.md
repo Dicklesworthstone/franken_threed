@@ -26,6 +26,28 @@ substitution is not applied across this realm boundary. Numeric specialization
 is opt-in, as described below. Explicit HTTP/HTTPS/data imports stay external; the compiler does not
 fetch them. Origin-root and other non-file worker/asset URLs stay host-owned.
 
+Worker lazy imports may select paths imported from configuration modules or
+installed ESM packages. The same bounded primitive-string proof used by the
+document compiler follows immutable named/default exports and explicit
+reexports, without evaluating configuration code:
+
+```js
+import { first, second } from './routes.mjs';
+const load = useFirst => import(useFirst ? first : second);
+```
+
+Both targets are included in normal emitted worker graphs and remain packable
+into standalone HTML. The selected strings resolve from the consuming worker
+module, independently of the configuration module's location. Initializers,
+selectors, top-level await, lazy evaluation, query identities and JSON import
+options keep their native order and identity. Reads share the worker frontend
+snapshot and physical-input budgets; all inspected dependencies remain watched.
+Invalid source, frontend failures and exhausted worker budgets keep their error
+codes. Mutable bindings, namespace selections, star reexports, opaque values and
+unresolved imports retain the existing open-worker boundary. This extension
+applies to `import()`; worker constructors, fetch and other resource consumers
+keep their existing local-selector requirements.
+
 The graph is bounded to 4096 realm-specific module instances, 4096 assets and
 64 MiB of physical inputs, realm-expanded source work or relocated output. The plugin also enforces shared limits across worker entries
 in one build. Missing dependencies, unsupported open dynamic imports and budget

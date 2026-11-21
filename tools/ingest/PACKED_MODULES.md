@@ -379,8 +379,8 @@ source-owned. The analysis inspects at most 128 exact module URLs and 2 MiB of s
 per build pass, with a combined depth of at most 64 local aliases/export hops. It never evaluates
 configuration modules. Namespace selection, star reexports, mutable bindings,
 opaque values, JSON/CommonJS imports and unresolved external modules do not prove
-a finite selector. This does not extend imported selectors to ordinary worker
-relocation or every loader/fetch discovery consumer.
+a finite selector. Ordinary worker graphs share this proof for lazy imports;
+loader/fetch discovery keeps its existing local-selector requirements.
 
 Parameters, mutable bindings, unproved imported values, opaque property/call results,
 array patterns, rest/default/nested/computed patterns and escaped tables are

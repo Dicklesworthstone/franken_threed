@@ -16,6 +16,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 import {moduleSourcesFor} from './module_sources.mjs';
+import {createImportedStringResolver} from './module_string_constants.mjs';
 import {assertUnbundledModule} from './commonjs_modules.mjs';
 import {createDynamicImportClassifier} from './ast_analyzer.mjs';
 import {isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl} from './document_urls.mjs';
@@ -435,6 +436,33 @@ export function buildWorkerGraph(entryUrl, {
     inputs.set(filename, bytes);
     return bytes;
   }
+  let selectorFailure = null;
+  const importedStrings = createImportedStringResolver({
+    readModule(url) {
+      if (path.extname(fileURLToPath(url)).toLowerCase() === '.json') return null;
+      try {
+        const bytes = read(url);
+        if (numericSettings !== null && numericRuntimeUrls.has(url)) return bytes.toString('utf8');
+        const source = moduleSources.read(url, {sourceType: 'module', source: bytes}).code;
+        assertUnbundledModule(url, moduleSources);
+        return source;
+      } catch (cause) {
+        // A failed proof may retain source execution; exhausted worker budgets,
+        // bad syntax and frontend failures must retain their original errors.
+        selectorFailure ??= cause instanceof SyntaxError
+          ? new ModuleWorkerBuildError('PARSE', cause.message, url) : cause;
+        return null;
+      }
+    },
+    resolveModule(specifier, referrer) {
+      try { return resolveModule(specifier, referrer); }
+      catch (cause) {
+        selectorFailure ??= cause.code?.startsWith('F3D_DOCUMENT_') ? cause
+          : new ModuleWorkerBuildError('RESOLUTION', cause.message, referrer);
+        return null;
+      }
+    },
+  });
   function asset(url) {
     url = normalize(url);
     if (remote(url)) return {external: url};
@@ -498,6 +526,13 @@ export function buildWorkerGraph(entryUrl, {
     }
     const ast = parse(source, record.url, record.sourceType), changed = changedGlobals(ast), edits = [];
     const classify = createDynamicImportClassifier(ast);
+    const resolveImported = importedStrings(record.url);
+    const classifyImport = createDynamicImportClassifier(ast, (...args) => {
+      selectorFailure = null;
+      const candidates = resolveImported(...args);
+      if (selectorFailure) throw selectorFailure;
+      return candidates;
+    });
     const root = roots.get(record.realm);
     record.changed = changed;
     function replace(choice, target, fetch = false) {
@@ -571,7 +606,7 @@ export function buildWorkerGraph(entryUrl, {
     // operands first so executable dependencies cannot also become raw assets.
     walk.simple(ast, {
       ImportExpression(node) {
-        const choices = urlChoices(node.source, changed, true, [], 0, classify);
+        const choices = urlChoices(node.source, changed, true, [], 0, classifyImport);
         if (!choices) fail('DYNAMIC_IMPORT', 'Use bounded string/URL import choices in a relocated worker', record.url);
         imports.set(node, choices);
         for (const choice of choices) if (choice.base === 'module') workerURLs.add(choice.urlNode.start);
