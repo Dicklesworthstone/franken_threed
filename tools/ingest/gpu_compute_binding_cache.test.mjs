@@ -7,13 +7,29 @@ import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 // recorder. This is not a WGSL interpreter or a hardware performance benchmark.
 function gpu() {
   let lose;
+  const scopes = [], uncaptured = [];
   const calls = {groups: [], layouts: [], buffers: [], submits: [], passes: [], fences: 0};
   const device = {
     limits: {maxBindGroups: 4, maxBindingsPerBindGroup: 16, maxBufferSize: 4096,
       maxStorageBufferBindingSize: 4096, maxUniformBufferBindingSize: 4096, maxComputeWorkgroupsPerDimension: 65535},
     lost: new Promise(resolve => { lose = resolve; }),
-    pushErrorScope() {},
-    popErrorScope() { const error = this.error; this.error = null; return Promise.resolve(error ?? null); },
+    pushErrorScope(filter) { scopes.push({filter, error: null}); },
+    popErrorScope() {
+      const scope = scopes.pop(), error = this.error; this.error = null;
+      assert.ok(scope, 'error scopes must be balanced');
+      return scope.result ?? Promise.resolve(scope.error ?? error ?? null);
+    },
+    raiseError(filter, error) {
+      const scope = scopes.findLast(scope => scope.filter === filter);
+      if (scope) scope.error = error; else uncaptured.push({filter, error});
+    },
+    deferScope(filter) {
+      const scope = scopes.findLast(scope => scope.filter === filter);
+      if (!scope) return error => uncaptured.push({filter, error});
+      let resolve;
+      scope.result = new Promise(yes => { resolve = yes; });
+      return resolve;
+    },
     createBuffer(descriptor) {
       const buffer = {...descriptor, bytes: new Uint8Array(descriptor.size), destroyed: false,
         destroy() { this.destroyed = true; }, unmap() {}, mapAsync() { return Promise.resolve(); },
@@ -80,7 +96,7 @@ function gpu() {
       onSubmittedWorkDone() { calls.fences++; return Promise.resolve(); },
     },
   };
-  return {device, calls, lose};
+  return {device, calls, lose, scopes, uncaptured};
 }
 function setup(options) {
   const state = gpu();
@@ -123,7 +139,6 @@ test('a completed readback does not wait for validation of later uploads', async
   await owner.validationSnapshot();
   let finishMapping, finishLaterValidation;
   const mapping = new Promise(resolve => { finishMapping = resolve; });
-  const laterValidation = new Promise(resolve => { finishLaterValidation = resolve; });
   const createBuffer = device.createBuffer;
   device.createBuffer = descriptor => {
     const buffer = createBuffer(descriptor);
@@ -133,7 +148,11 @@ test('a completed readback does not wait for validation of later uploads', async
   let completed = false, result;
   const reading = owner.read(aKey).then(value => { completed = true; result = value; });
   try {
-    device.popErrorScope = () => laterValidation;
+    const writeBuffer = device.queue.writeBuffer;
+    device.queue.writeBuffer = (...args) => {
+      finishLaterValidation = device.deferScope('validation');
+      return writeBuffer(...args);
+    };
     owner.upload(aKey, new Uint32Array([21, 22, 23, 24]), 1);
     finishMapping();
     await new Promise(resolve => setImmediate(resolve));
@@ -151,9 +170,12 @@ test('a completed readback does not wait for validation of later uploads', async
 test('readback waits for its own copy validation and never publishes rejected bytes', async () => {
   const {owner, aKey, device, calls} = setup();
   await owner.validationSnapshot();
-  let finishValidation, scope = 0;
-  const validation = new Promise(resolve => { finishValidation = resolve; });
-  device.popErrorScope = () => ++scope === 2 ? validation : Promise.resolve(null);
+  let finishValidation;
+  const submit = device.queue.submit;
+  device.queue.submit = commands => {
+    finishValidation = device.deferScope('validation');
+    return submit(commands);
+  };
   const output = new Uint32Array([90, 91, 92, 93]);
   let settled = false;
   const reading = owner.read(aKey, output.buffer);
@@ -283,9 +305,13 @@ test('failed native compilation frees its pending slot and permits retry', async
 test('evicting a synchronous pipeline retains its outstanding validation obligation', async () => {
   const {device} = gpu(), owner = createGpuCompute(device, {maxPipelines: 1});
   let finish;
-  device.popErrorScope = () => new Promise(resolve => { finish = resolve; });
+  const createPipeline = device.createComputePipeline;
+  device.createComputePipeline = descriptor => {
+    finish = device.deferScope('validation');
+    return createPipeline(descriptor);
+  };
   const first = owner.prepareSync({code: 'unvalidated'});
-  device.popErrorScope = () => Promise.resolve(null);
+  device.createComputePipeline = createPipeline;
   const second = owner.prepareSync({code: 'replacement'});
   finish({message: 'evicted pipeline was invalid'});
   await assert.rejects(owner.whenIdle(), {code: 'GPU_COMPUTE_VALIDATION'});
@@ -578,6 +604,104 @@ test('scoped GPU validation failure clears cached groups', async () => {
   owner.dispatch(pipeline, group(a), [1]);
   await assert.rejects(owner.whenIdle(), {code: 'GPU_COMPUTE_VALIDATION'});
   assert.equal(owner.cachedBindGroupCount, 0); assert.equal(a.destroyed, true);
+});
+
+for (const [filter, code] of [['out-of-memory', 'GPU_COMPUTE_OUT_OF_MEMORY'], ['internal', 'GPU_COMPUTE_INTERNAL']]) {
+  test(`${filter} storage allocation failure retires the compute owner`, async () => {
+    const {owner, pipeline, a, device, calls, scopes, uncaptured} = setup();
+    owner.dispatch(pipeline, group(a), [1]);
+    await owner.validationSnapshot();
+    const createBuffer = device.createBuffer, key = {};
+    device.createBuffer = descriptor => {
+      device.raiseError(filter, {message: 'storage allocation failed'});
+      return createBuffer(descriptor);
+    };
+    owner.upload(key, new Uint32Array([5, 6, 7, 8]));
+    assert.equal(scopes.length, 0, 'all error scopes close before yielding');
+    assert.deepEqual(uncaptured, [], 'allocation failure belongs to its compute operation');
+    await assert.rejects(owner.validationSnapshot(), {code});
+    assert.equal(owner.bufferCount, 0); assert.equal(owner.allocatedBytes, 0);
+    assert.equal(owner.cachedBindGroupCount, 0); assert.equal(owner.cachedPipelineCount, 0);
+    assert.ok(calls.buffers.every(buffer => buffer.destroyed));
+    assert.throws(() => owner.getBuffer(key), {code});
+    assert.throws(() => owner.dispatch(pipeline, group(a), [1]), {code});
+    await assert.rejects(owner.whenIdle(), {code});
+    owner.dispose();
+  });
+
+  for (const synchronous of [false, true]) test(`${filter} invalidates ${synchronous ? 'source-synchronous' : 'asynchronous'} pipeline preparation before async success`, async () => {
+    const {device, calls, scopes, uncaptured} = gpu(), owner = createGpuCompute(device);
+    let finish, settled = false;
+    const createPipeline = device.createComputePipeline;
+    device.createComputePipeline = descriptor => {
+      finish = device.deferScope(filter);
+      return createPipeline(descriptor);
+    };
+    const pipeline = synchronous ? owner.prepareSync({code: 'failed pipeline'}) : null;
+    const preparing = owner.prepare({code: 'failed pipeline'});
+    preparing.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false, 'a returned native handle is not validated preparation');
+      assert.equal(scopes.length, 0, 'pending error results do not leave scopes installed');
+      finish({message: 'pipeline allocation failed'});
+      await assert.rejects(preparing, {code});
+      assert.deepEqual(uncaptured, []);
+      assert.equal(owner.cachedPipelineCount, 0);
+      assert.equal(owner.cachedBindGroupCount, 0);
+      assert.equal(calls.submits.length, 0);
+      if (pipeline) assert.throws(() => owner.dispatch(pipeline, [], [1]), {code});
+      assert.throws(() => owner.prepareSync({code: 'failed pipeline'}), {code});
+    } finally {
+      finish?.(null); owner.dispose(); await preparing.catch(() => {});
+    }
+  });
+
+  test(`${filter} readback submission failure never publishes mapped bytes`, async () => {
+    const {owner, aKey, device, calls, scopes, uncaptured} = setup();
+    await owner.validationSnapshot();
+    let finish, settled = false;
+    const createEncoder = device.createCommandEncoder;
+    device.createCommandEncoder = () => {
+      finish = device.deferScope(filter);
+      return createEncoder();
+    };
+    const output = new Uint32Array([90, 91, 92, 93]);
+    const reading = owner.read(aKey, output.buffer);
+    reading.then(() => { settled = true; }, () => { settled = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false, 'completed mapping must still join its submission errors');
+      assert.deepEqual([...output], [90, 91, 92, 93]);
+      assert.equal(scopes.length, 0);
+      finish({message: 'readback command allocation failed'});
+      await assert.rejects(reading, {code});
+      assert.deepEqual(uncaptured, []);
+      assert.deepEqual([...output], [90, 91, 92, 93]);
+      assert.ok(calls.buffers.every(buffer => buffer.destroyed));
+      assert.equal(owner.allocatedBytes, 0); assert.equal(owner.bufferCount, 0);
+    } finally {
+      finish?.(null); owner.dispose(); await reading.catch(() => {});
+    }
+  });
+}
+
+test('a failed error scope retires compute without waiting for another scope result', async () => {
+  const {device, scopes, uncaptured} = gpu(), owner = createGpuCompute(device);
+  let finishValidation;
+  const createPipeline = device.createComputePipeline;
+  device.createComputePipeline = descriptor => {
+    finishValidation = device.deferScope('validation');
+    device.raiseError('out-of-memory', {message: 'pipeline allocation failed first'});
+    return createPipeline(descriptor);
+  };
+  owner.prepareSync({code: 'failed before validation settled'});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(uncaptured, []); assert.equal(scopes.length, 0);
+    assert.equal(owner.cachedPipelineCount, 0, 'a different pending result cannot delay terminal cleanup');
+    await assert.rejects(owner.whenIdle(), {code: 'GPU_COMPUTE_OUT_OF_MEMORY'});
+  } finally { finishValidation(null); owner.dispose(); }
 });
 
 test('synchronous creation errors are not inserted into the cache', () => {

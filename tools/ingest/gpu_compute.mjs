@@ -136,13 +136,22 @@ export function createGpuCompute(device, {maxBytes = 256 * 1024 * 1024, maxBuffe
   // is shared with rendering, uploads and other asynchronous pipeline builds.
   function checked(run, validations = null) {
     live();
+    device.pushErrorScope?.('out-of-memory');
+    device.pushErrorScope?.('internal');
     device.pushErrorScope?.('validation');
     try { return run(); }
     finally {
       if (device.popErrorScope) {
-        const validation = watch(device.popErrorScope().then(error => {
-          if (error) throw new GpuComputeError('VALIDATION', error.message);
-        }));
+        // Allocation and driver failures can return invalid native objects just
+        // like validation failures. Pop every scope in the issuing turn; none
+        // may capture another owner's later operations while results settle.
+        const scopes = [['VALIDATION', device.popErrorScope()],
+          ['INTERNAL', device.popErrorScope()], ['OUT_OF_MEMORY', device.popErrorScope()]];
+        // Reject on the first failed result even if another scope is delayed.
+        // Waiting for all raw results before checking errors can strand cleanup.
+        const validation = watch(Promise.all(scopes.map(([code, result]) => Promise.resolve(result).then(error => {
+          if (error) throw new GpuComputeError(code, error.message);
+        }))));
         validations?.push(validation);
       }
     }
