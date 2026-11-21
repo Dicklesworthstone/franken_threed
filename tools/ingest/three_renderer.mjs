@@ -947,8 +947,18 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (webgl && depth) fail('UNSUPPORTED', 'WebGL framebuffer snapshots currently require a color FramebufferTexture');
       if (depth) {
         const shape = this._renderTarget ? this._targets.capture(this._renderTarget).shape : null;
-        if (this._activeMipmapLevel !== 0 || shape && (shape.cube || shape.array || shape.volume))
-          fail('COPY', 'Depth framebuffer snapshots require base-level ordinary 2D attachments');
+        if (shape && (shape.cube || shape.array || shape.volume))
+          fail('COPY', 'Depth framebuffer snapshots require ordinary 2D attachments');
+        if (this._activeMipmapLevel !== 0) {
+          if (!shape) fail('COPY', 'Canvas depth snapshots require mip zero');
+          const mip = inspectThreeRenderTargetMip(shape, this._activeMipmapLevel, 0,
+            {generateMipmaps: this._renderTarget.texture.generateMipmaps});
+          // ViewportDepthTextureNode sizes from the whole public target. A
+          // caller copying a private mip depth image must supply its actual
+          // extent; copying the larger base image is invalid in the source.
+          if (texture.image.width !== mip.width || texture.image.height !== mip.height)
+            fail('COPY', 'Depth framebuffer snapshots must match the selected mip extent');
+        }
       }
       let region;
       if (webgl) {
@@ -976,7 +986,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
         ? this._renderTarget || (!webgl ? this._getNativeFrameBufferTarget() : null) : null;
       const source = sourceTarget ? this._targets.capture(sourceTarget) : null;
       const format = depth ? undefined : source?.shape.format ?? this._framebufferFormat();
-      const sourceLevel = webgl ? this._activeMipmapLevel : 0, sourceFace = webgl ? this._activeCubeFace : 0;
+      const sourceLevel = webgl || depth ? this._activeMipmapLevel : 0, sourceFace = webgl ? this._activeCubeFace : 0;
       const [width, height] = source ? [Math.max(1, source.shape.width >> sourceLevel), Math.max(1, source.shape.height >> sourceLevel)] : this._bufferSize();
       const canvasTarget = this.getCanvasTarget(), canvas = canvasTarget.domElement;
       const canvasFrameToken = webgl ? this._webglFrameToken ?? null : null;
@@ -1023,7 +1033,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
                 if (copied !== false) this._device.queue.submit([encoder.finish()]);
               });
             };
-            if (source) this._targets.withFramebufferTexture(source, encode, {depth});
+            if (source) this._targets.withFramebufferTexture(source, encode, {depth, mipLevel: depth ? sourceLevel : 0});
             else this._session.withFramebufferTexture(encode, {width, height, depth, frameToken: canvasFrameToken});
           };
           const request = {framebufferCopy: true, releaseFramebuffer: release, issue: () => {

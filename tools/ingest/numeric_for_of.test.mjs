@@ -499,12 +499,14 @@ test('automatic entries discovery compiles helpers and callback islands through 
   }
   const calls=diagnostics().flatMap(item=>item.variants).reduce((sum,item)=>sum+(item.kernel?.wasmCalls??0),0);
   assert.equal(calls,6);
+  const cold=await application(source,{loopIslands:true});
   const input=new Float64Array([1,2,3]),out=new Float64Array(3);
   const wasm=globalThis.WebAssembly;
-  try { globalThis.WebAssembly=undefined; app.run(input,out,2); }
+  try { globalThis.WebAssembly=undefined; cold.app.run(input,out,2); }
   finally { globalThis.WebAssembly=wasm; }
-  // Already initialized kernels remain usable; original source still agrees.
   assert.deepEqual(out,new Float64Array([2,4,6]));
+  assert.equal(cold.diagnostics()[0].kernel,null);
+  assert.equal(cold.diagnostics()[0].retainedCalls,1);
 });
 
 test('registration with alternative layouts does not iterate arrays before source fallback', () => {

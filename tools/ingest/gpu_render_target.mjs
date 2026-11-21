@@ -745,7 +745,7 @@ export function createGpuRenderTarget(device, options = {}) {
         if (depthFormat !== null) {
           depth = device.createTexture({label: `${label} mip ${mipLevel} depth`,
             size: {width: Math.max(1, Math.floor(width / 2 ** mipLevel)), height: Math.max(1, Math.floor(height / 2 ** mipLevel)), depthOrArrayLayers: depthLayers},
-            format: depthFormat, dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 16});
+            format: depthFormat, dimension: '2d', sampleCount: 1, mipLevelCount: 1, usage: 1 | 16});
         }
         const frames = faces.map((view, index) => Object.freeze({colorView: colorViews[index][0],
           ...(multiple ? {colorViews: Object.freeze(colorViews[index])} : {}), ...(volume ? {depthSlice: index} : {}),
@@ -799,16 +799,21 @@ export function createGpuRenderTarget(device, options = {}) {
     if ((kind === 'depth' || kind === 'sampled') && !sampleDepth) fail('DEPTH', 'Enable sampleDepth before borrowing the depth texture');
     if (kind === 'framebuffer-depth' && depthFormat === null) fail('DEPTH', 'A framebuffer depth copy requires a depth attachment');
     if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous submitted-use callback');
-    const extraBytes = kind === 'frame' ? frameAllocationBytes(mipLevel, face) : 0;
+    const frameDepth = kind === 'frame' || kind === 'framebuffer-depth';
+    const extraBytes = frameDepth ? frameAllocationBytes(mipLevel, face) : 0;
     if (!current) return false;
     // Budget rejection is retryable and happens before marking this owner busy.
     if (extraBytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
     busy = true; let active = true;
     try {
-      const frame = kind === 'frame' ? selectedFrame(frameAt(mipLevel, extraBytes, face), slots, mipLevel, face) : null;
+      const selected = frameDepth ? frameAt(mipLevel, extraBytes, face) : null;
+      const frame = kind === 'frame' ? selectedFrame(selected, slots, mipLevel, face) : null;
+      // Each nonzero color mip has its own one-level depth image. Copies use
+      // mip zero of that image, not mip zero of the target's base depth image.
+      const depth = frameDepth && mipLevel > 0 ? current.mipDepths.get(mipLevel) ?? null : current.depth;
       const colors = current.colors.map((_, index) => colorTexture(current, index, slots));
       const handles = Object.freeze({colors: Object.freeze(current.colors.slice()),
-        historyColors: Object.freeze(colorFormats.map((_, index) => current.historyColors.get(index) ?? null)), depth: current.depth});
+        historyColors: Object.freeze(colorFormats.map((_, index) => current.historyColors.get(index) ?? null)), depth});
       // A renderer may acquire sampled inputs before its destination frame.
       // This capability stays inside the same synchronous native borrow. The
       // source owner verifies disjoint read/write selections before using it.
@@ -821,7 +826,8 @@ export function createGpuRenderTarget(device, options = {}) {
         if (bytes > maxBytes - allocated()) fail('BUDGET', 'Mip depth allocation exceeds maxBytes');
         const frame = selectedFrame(frameAt(mipLevel, bytes, face), choice, mipLevel, face);
         for (const index of colorFormats.keys()) current.mipsDirty.add(colorTexture(current, index, choice));
-        const result = run(frame, colorTexture(current, 0, choice), handles);
+        const frameHandles = mipLevel > 0 ? Object.freeze({...handles, depth: current.mipDepths.get(mipLevel) ?? null}) : handles;
+        const result = run(frame, colorTexture(current, 0, choice), frameHandles);
         if (result?.then) { Promise.resolve(result).catch(() => {}); fail('ASYNC_USE', 'A history frame cannot cross an await'); }
         live();
         // Submit filtering after the nested render, while the same physical
@@ -853,7 +859,7 @@ export function createGpuRenderTarget(device, options = {}) {
         : kind === 'sampled' ? callback(colors[0], current.depth)
         : kind === 'attachments' ? callback(Object.freeze(colors), sampleDepth ? current.depth : null,
           handles.historyColors, nestedFrame)
-        : callback(kind === 'depth' || kind === 'framebuffer-depth' ? current.depth : colors[colorIndex]);
+        : callback(kind === 'depth' || kind === 'framebuffer-depth' ? depth : colors[colorIndex]);
       if (result && typeof result.then === 'function') {
         Promise.resolve(result).catch(() => {});
         fail('ASYNC_USE', 'Submit all work before returning; borrowed textures cannot cross an await');
@@ -970,7 +976,7 @@ export function createGpuRenderTarget(device, options = {}) {
     },
     withAttachments(callback, {colorSlots = null} = {}) { return borrow(callback, 'attachments', 0, 0, 0, colorSlots); },
     withDepthTexture(callback) { return borrow(callback, 'depth'); },
-    withFramebufferDepthTexture(callback) { return borrow(callback, 'framebuffer-depth'); },
+    withFramebufferDepthTexture(callback, {mipLevel = 0} = {}) { return borrow(callback, 'framebuffer-depth', mipLevel); },
     withSampledTextures(callback, {colorSlots = null} = {}) { return borrow(callback, 'sampled', 0, 0, 0, colorSlots); },
     writePixels(data, options = {}, colorSlots = null) {
       exclusive();

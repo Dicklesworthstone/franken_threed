@@ -38,10 +38,36 @@ function viewport(T, renderer, {samples = 0, arrayCamera = false} = {}) {
   return result;
 }
 
+function publicMipDepth(T, renderer, stencil = false) {
+  const result = stage(T), producer = stage(T);
+  const target = new T.RenderTarget(64, 32, {stencilBuffer: stencil}); target.texture.generateMipmaps = true;
+  const snapshot = new T.DepthTexture(32, 16, stencil ? T.UnsignedInt248Type : T.UnsignedIntType);
+  if (stencil) snapshot.format = T.DepthStencilFormat;
+  const mesh = new T.Mesh(new T.BoxGeometry(1.5, 1.4, 1), new T.MeshBasicMaterial({color: 0x448833}));
+  mesh.position.z = 1; producer.scene.add(mesh);
+  const material = new T.MeshBasicNodeMaterial({depthTest: false, depthWrite: false});
+  material.colorNode = depthColor(T, T.TSL.texture(snapshot));
+  result.scene.add(new T.Mesh(new T.PlaneGeometry(4, 3), material));
+  const render = renderer.render.bind(renderer); let frame = 0;
+  renderer.render = (...args) => {
+    if (args[0] !== result.scene) return render(...args);
+    const mip = [1, 2, 3, 0][Math.floor(frame / 7) % 4];
+    frame++; mesh.position.x = -.6 + frame * .035; mesh.rotation.y = frame * .025;
+    const output = renderer.getRenderTarget();
+    renderer.setRenderTarget(target, 0, mip); render(producer.scene, producer.camera);
+    snapshot.image.width = 64 >> mip; snapshot.image.height = 32 >> mip; snapshot.needsUpdate = true;
+    renderer.copyFramebufferToTexture(snapshot);
+    renderer.setRenderTarget(output); return render(...args);
+  };
+  return result;
+}
+
 export const nativeDepthSnapshotScenarios = {
   native_viewport_depth: (T, renderer) => viewport(T, renderer),
   native_viewport_depth_msaa: (T, renderer) => viewport(T, renderer, {samples: 4}),
   native_viewport_depth_array_camera: (T, renderer) => viewport(T, renderer, {arrayCamera: true}),
+  native_public_depth_mips: (T, renderer) => publicMipDepth(T, renderer),
+  native_public_depth_mip_stencil: (T, renderer) => publicMipDepth(T, renderer, true),
 
   native_public_depth_float(T, renderer) {
     const result = stage(T), producer = stage(T);

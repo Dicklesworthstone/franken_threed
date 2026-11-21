@@ -1485,7 +1485,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
       }
       budget(bytes);
     },
-    withFramebufferTexture(entry, callback, {depth = false} = {}) {
+    withFramebufferTexture(entry, callback, {depth = false, mipLevel = 0} = {}) {
       assertCurrent(entry);
       if (depth) {
         if (typeof callback !== 'function') fail('CALLBACK', 'Expected a synchronous depth-copy callback');
@@ -1494,12 +1494,17 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         ensure(entry);
         const group = entry.historyGroup;
         if (entry.busy || group?.busy || group?.frame) fail('REENTRANT', 'Cannot reenter a framebuffer depth borrow');
+        budget(entry.storage.frameAllocationBytes(mipLevel, 0));
+        const allocatedBefore = entry.storage.allocatedBytes;
         entry.busy = true; if (group) group.busy = true;
         try {
           return entry.storage.withFramebufferDepthTexture(native => {
             const result = callback(native); assertCurrent(entry); return result;
-          });
+          }, {mipLevel});
         } finally {
+          const delta = entry.storage.allocatedBytes - allocatedBefore;
+          if (group) { group.charged += delta; group.mipDepthBytes += delta; } else entry.charged += delta;
+          allocatedBytes += delta;
           entry.busy = false; if (group) group.busy = false;
           for (const member of group?.entries ?? [entry]) { if (!member.alive) release(member); else collect(member); }
         }

@@ -6,6 +6,52 @@ import {gpuTargetMipmapFixture, deferred} from './fixtures/animation/gpu_target_
 const make = (f, options = {}) => createGpuRenderTarget(f.device, {width: 8, height: 4, sampleDepth: true, ...options});
 const released = f => { for (const texture of f.textures) assert.equal(texture.destroyed, 1); };
 
+for (const depthFormat of ['depth16unorm', 'depth24plus', 'depth32float', 'depth24plus-stencil8'])
+test(`framebuffer depth copies borrow each private mip image (${depthFormat})`, async () => {
+  const f = gpuTargetMipmapFixture(), target = make(f, {sampleDepth: false, generateMipmaps: true, depthFormat});
+  const depths = new Map();
+  for (const mipLevel of [0, 1, 2, 3, 1]) {
+    target.withFrame((frame, color, handles) => {
+      const depth = frame.depthView.texture;
+      assert.equal(handles.depth, depth, 'draw-boundary copies receive the attached mip depth');
+      assert.equal(color.mipLevelCount, 4);
+      if (depths.has(mipLevel)) assert.equal(depth, depths.get(mipLevel));
+      else depths.set(mipLevel, depth);
+    }, {mipLevel});
+    target.withFramebufferDepthTexture(depth => {
+      assert.equal(depth, depths.get(mipLevel));
+      assert.equal(depth.width, Math.max(1, 8 >> mipLevel));
+      assert.equal(depth.height, Math.max(1, 4 >> mipLevel));
+      assert.equal(depth.mipLevelCount, 1); assert.equal(depth.sampleCount, 1);
+      assert.ok(depth.usage & 1, 'the actual private depth image permits copying');
+    }, {mipLevel});
+  }
+  assert.equal(new Set(depths.values()).size, 4);
+  assert.equal(target.diagnostics.mipGenerations, 0, 'depth snapshots do not regenerate color');
+  const fence = deferred(); f.controls.completion = fence; target.resize(4, 2);
+  assert.ok([...depths.values()].every(depth => depth.destroyed === 0));
+  fence.resolve(); await target.whenIdle();
+  assert.ok([...depths.values()].every(depth => depth.destroyed === 1));
+  target.dispose(); released(f);
+});
+
+test('private mip depth copies charge lazy allocations and reject unavailable mips before borrowing', async () => {
+  const f = gpuTargetMipmapFixture(), target = make(f, {sampleDepth: false, generateMipmaps: true});
+  const before = target.allocatedBytes, count = f.textures.length;
+  target.withFramebufferDepthTexture(depth => assert.equal(depth.width, 4), {mipLevel: 1});
+  assert.equal(target.allocatedBytes, before + 4 * 2 * 4); assert.equal(f.textures.length, count + 1);
+  target.withFramebufferDepthTexture(() => {}, {mipLevel: 1});
+  assert.equal(target.allocatedBytes, before + 4 * 2 * 4);
+  for (const mipLevel of [-1, .5, 4])
+    assert.throws(() => target.withFramebufferDepthTexture(() => assert.fail('invalid mip'), {mipLevel}), {code: 'GPU_TARGET_MIP'});
+  assert.equal(target.failed, false); await target.whenIdle(); target.dispose(); released(f);
+
+  const tight = gpuTargetMipmapFixture(), limited = make(tight, {sampleDepth: false, generateMipmaps: true, maxBytes: before + 31});
+  assert.throws(() => limited.withFramebufferDepthTexture(() => assert.fail('over budget'), {mipLevel: 1}), {code: 'GPU_TARGET_BUDGET'});
+  assert.equal(limited.allocatedBytes, before); assert.equal(limited.failed, false);
+  limited.dispose(); released(tight);
+});
+
 for (const depthFormat of ['depth16unorm', 'depth24plus', 'depth32float']) for (const sampleCount of [1, 4])
   test(`sample the rendered ${depthFormat} attachment with ${sampleCount} sample(s), not a replacement`, async () => {
     const f = gpuTargetMipmapFixture(), target = make(f, {depthFormat, sampleCount});

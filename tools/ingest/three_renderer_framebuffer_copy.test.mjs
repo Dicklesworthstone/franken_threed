@@ -6,6 +6,7 @@ import * as THREE from '../../upstream/three.js/build/three.webgpu.js';
 import {createWebGPURendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {RectAreaLightTexturesLib} from './fixtures/three_rect_area_light.mjs';
+import SourceTextures from '../../upstream/three.js/src/renderers/common/Textures.js';
 const N = THREE.TSL;
 
 async function fixture(t, options = {}, initialize = true) {
@@ -340,6 +341,64 @@ for (const samples of [0, 4]) test(`public depth snapshots preserve private targ
   assert.equal(depth.type, THREE.UnsignedIntType, 'depth destination type remains authored');
   assert.ok(meshDraws(f.events.slice(at + 1)).some(draw => sampled(draw).includes(copy.destination.texture)));
   assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+});
+
+test('public mip depth snapshots retain each accepted source image and match the pinned framebuffer copy', async t => {
+  const f = await fixture(t), {renderer, scene, camera} = f;
+  const target = new THREE.RenderTarget(16, 16); target.texture.generateMipmaps = true;
+  t.after(() => target.dispose()); f.mesh(new THREE.MeshBasicMaterial());
+  const depth = new THREE.DepthTexture(8, 8); t.after(() => depth.dispose());
+  const levels = [1, 2, 0, 4];
+  for (const mipLevel of levels) {
+    renderer.setRenderTarget(target, 0, mipLevel); renderer.render(scene, camera);
+    depth.image.width = depth.image.height = Math.max(1, 16 >> mipLevel);
+    depth.needsUpdate = true; renderer.copyFramebufferToTexture(depth);
+  }
+  renderer.setRenderTarget(target, 0, 3); await renderer.waitForGPU();
+  const recorded = copies(f.events); assert.equal(recorded.length, levels.length);
+  assert.equal(renderer.getActiveMipmapLevel(), 3); assert.equal(target.depthTexture, null);
+  const sourceTarget = new THREE.RenderTarget(16, 16), backend = new THREE.WebGPUBackend(), reference = [];
+  const sourceTextures = new SourceTextures({}, backend, {memory: {renderTargets: 0}});
+  sourceTextures.updateTexture = () => {};
+  const command = (source, destination, size) => ({source: {mipLevel: source.mipLevel, origin: {...source.origin}},
+    destination: {mipLevel: destination.mipLevel, origin: {...destination.origin}}, size: {...size}});
+  backend.device = {queue: {submit() {}}, createCommandEncoder() { return {
+    copyTextureToTexture(source, destination, size) { reference.push(command(source, destination, size)); }, finish() { return {}; },
+  }; }};
+  for (const [index, copy] of recorded.entries()) {
+    const mipLevel = levels[index], before = f.events.slice(0, f.events.indexOf(copy));
+    const producer = before.findLast(event => event.draws.some(draw => draw.indexed));
+    assert.equal(producer.desc.colorAttachments[0].view.descriptor.baseMipLevel, mipLevel);
+    assert.equal(copy.source.texture, producer.desc.depthStencilAttachment.view.texture);
+    assert.equal(copy.source.texture.width, Math.max(1, 16 >> mipLevel));
+    assert.equal(copy.source.texture.height, Math.max(1, 16 >> mipLevel));
+    assert.equal(copy.destination.texture.width, copy.source.texture.width);
+    assert.equal(copy.destination.texture.height, copy.source.texture.height);
+    sourceTextures.updateRenderTarget(sourceTarget, mipLevel);
+    const context = sourceTextures.get(sourceTarget);
+    assert.equal(context.depthTexture, context.depthTextureMips[mipLevel]);
+    assert.equal(Math.max(1, context.depthTexture.image.width), copy.source.texture.width);
+    assert.equal(Math.max(1, context.depthTexture.image.height), copy.source.texture.height);
+    backend.get(context.depthTexture).texture = copy.source.texture;
+    backend.get(depth).texture = copy.destination.texture;
+    backend.copyFramebufferToTexture(depth, context, new THREE.Vector4(0, 0, copy.size.width, copy.size.height));
+    assert.deepEqual(command(copy.source, copy.destination, copy.size), reference[index]);
+    assert.equal(copy.source.mipLevel, 0, 'the selected private image has its own mip zero');
+  }
+  assert.equal(new Set(recorded.map(copy => copy.source.texture)).size, levels.length);
+  assert.equal(new Set(recorded.map(copy => copy.destination.texture)).size, levels.length);
+  assert.equal(renderer._targets.capture(target).references, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.depth.bindings, 0);
+});
+
+test('mip depth snapshots reject base-sized destinations before capturing a copy', async t => {
+  const f = await fixture(t), {renderer} = f;
+  const target = new THREE.RenderTarget(16, 16); target.texture.generateMipmaps = true;
+  t.after(() => target.dispose()); renderer.setRenderTarget(target, 0, 1);
+  const depth = new THREE.DepthTexture(16, 16); t.after(() => depth.dispose());
+  assert.throws(() => renderer.copyFramebufferToTexture(depth), {code: 'F3D_RENDERER_COPY'});
+  assert.equal(copies(f.events).length, 0); assert.equal(f.canvas.acquisitions ?? 0, 0);
+  assert.equal(renderer._getSampledTextureInputs().diagnostics.depth?.bindings ?? 0, 0);
 });
 
 for (const [samples, stencil] of [[0, false], [4, false], [4, true]])

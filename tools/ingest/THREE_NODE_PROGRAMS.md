@@ -497,12 +497,22 @@ depth type/format remains authored. Matching `depth24plus`, `depth32float` and
 source diagnostic and omit the copy. Raw copies cover complete equal-sized
 subresources, use all aspects and require equal sample counts.
 
-This profile covers base-level ordinary 2D attachments. Cube, layered, volume
-and nonzero-mip depth snapshots remain outside it. Disposal rejects pending
-copies, while submitted storage survives its completion fence. Lazy canvas
-depth borrows retain that storage without acquiring a presentation texture.
-Deferred captures retain their accepted mip/face selectors independently of
-later public selection changes.
+This profile covers ordinary 2D attachments, including correctly sized public
+depth snapshots of selected nonzero mip levels. Each admitted nonzero mip has
+its own single-level private depth image; both its render attachment and its
+snapshot use that image, and the copy reads image mip zero. Snapshot dimensions
+must match the selected mip, including dimensions that have reached one texel.
+Nonzero mips retain the target owner's single-sample, private-depth restriction.
+The stock `viewportDepthTexture()` node still requests the full public target
+extent, so its oversized nonzero-mip copies remain outside this profile. Cube,
+layered and volume depth snapshots remain outside it as well.
+
+Disposal rejects pending copies, while submitted storage survives its completion
+fence. Lazy canvas depth borrows retain that storage without acquiring a
+presentation texture. Deferred captures retain their accepted mip/face selectors
+and texture generations independently of later public selection changes.
+Private mip depth allocations share the existing memory budget and retirement
+accounting, including when a copy first allocates the selected image.
 
 The depth owner, complete framebuffer-copy facade and canvas suites pass 66
 tests; adjacent canvas-session, target and color-framebuffer suites pass 56.
