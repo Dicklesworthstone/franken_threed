@@ -2,12 +2,14 @@
  * passes; the public result belongs to the source render-context signature.
  * Only the PREVIOUS submitted query frame is mapped when its successor ends.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export function createThreeOcclusionQueries({getDevice, maxContexts = 1024, maxQueries = 16384,
   maxPending = 64, fail = (code, message) => { throw new Error(`THREE_OCCLUSION_${code}: ${message}`); }} = {}) {
   if (typeof getDevice !== 'function' || [maxContexts, maxQueries, maxPending].some(value => !Number.isSafeInteger(value) || value < 1))
     fail('OPTIONS', 'Expected a device accessor and positive occlusion limits');
   const contexts = new Map(), ownedContexts = new WeakSet(), records = new Set(), pending = new Set();
-  let disposed = false, terminal = null, watchedDevice = null;
+  let disposed = false, terminal = null, watchedDevice = null, releaseDeviceLoss = null;
   const stopped = new AbortController();
   const live = () => { if (terminal) throw terminal; if (disposed) fail('DISPOSED', 'Occlusion owner is disposed'); };
   function destroy(record) {
@@ -19,6 +21,7 @@ export function createThreeOcclusionQueries({getDevice, maxContexts = 1024, maxQ
   }
   function stop(error) {
     terminal ??= error;
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     stopped.abort(terminal);
     for (const record of records) destroy(record);
     contexts.clear();
@@ -39,7 +42,8 @@ export function createThreeOcclusionQueries({getDevice, maxContexts = 1024, maxQ
     if (watchedDevice && value !== watchedDevice) fail('DEVICE', 'Occlusion history cannot migrate between devices');
     if (!watchedDevice) {
       watchedDevice = value;
-      value.lost.then(info => stop(new Error(`THREE_OCCLUSION_LOST: ${info?.message || 'WebGPU device lost'}`)), stop).catch(() => {});
+      releaseDeviceLoss = subscribeGpuDeviceLoss(value.lost,
+        info => stop(new Error(`THREE_OCCLUSION_LOST: ${info?.message || 'WebGPU device lost'}`)), stop);
     }
     return value;
   }

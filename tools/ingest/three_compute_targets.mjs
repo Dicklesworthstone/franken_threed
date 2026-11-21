@@ -4,6 +4,8 @@
  * or own/destroy the renderer's target storage. All native views are borrowed
  * through submission, including every source in a multi-target dispatch.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class ThreeComputeTargetError extends Error {
   constructor(code, message) {
     super(`THREE_COMPUTE_TARGET_${code}: ${message}`);
@@ -20,20 +22,22 @@ export function createThreeComputeTargets({targets, device, signal = null,
     fail('OPTIONS', 'Expected the renderer target owner, GPUDevice and positive resource limits');
   const records = new Map(), leases = new WeakSet(), samplers = new Map(), views = new WeakMap(), pending = new Set();
   const validations = new Set();
-  let terminal = null, disposed = false, active = null, rejectStop;
+  let terminal = null, disposed = false, active = null, rejectStop, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStop = reject; }); stopped.catch(() => {});
   function stop(error) {
     if (terminal) return;
     // Preserve driver/producer errors from other realms, including DOMException.
     terminal = error && (typeof error === 'object' || typeof error === 'function')
       ? error : new ThreeComputeTargetError('ABORTED', String(error ?? 'Renderer lifetime ended'));
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const record of records.values()) record.releaseGeneration?.();
     records.clear(); samplers.clear(); rejectStop(terminal);
     signal?.removeEventListener('abort', onAbort);
   }
   const onAbort = () => stop(signal.reason);
   if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, {once: true});
-  device.lost?.then(info => stop(new ThreeComputeTargetError('LOST', info?.message ?? 'WebGPU device lost')), stop);
+  if (!terminal && device.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stop(new ThreeComputeTargetError('LOST', info?.message ?? 'WebGPU device lost')), stop);
   const live = () => {
     if (disposed) fail('DISPOSED', 'Compute target inputs are disposed');
     if (terminal) throw terminal;

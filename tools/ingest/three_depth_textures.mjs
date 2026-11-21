@@ -5,6 +5,8 @@
  * readers share its GPU storage until their submitted-work fences release it;
  * dispose invalidates queued uses.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class ThreeDepthTextureError extends Error {
   constructor(code, message) {
     super(`THREE_DEPTH_TEXTURE_${code}: ${message}`);
@@ -31,7 +33,7 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
     fail('OPTIONS', 'Expected pinned depth textures, a GPUDevice and positive resource limits');
   const current = new Map(), entries = new Set(), watches = new Map(), leases = new Map(), tokens = new WeakSet();
   const samplers = new Map(), pending = new Set(), validations = new Set();
-  let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped;
+  let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const live = () => { if (disposed) fail('DISPOSED', 'Depth texture owner is disposed'); if (terminal) throw terminal; };
   function collect(entry) {
@@ -47,6 +49,7 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
     if (terminal) return;
     terminal = error && (typeof error === 'object' || typeof error === 'function')
       ? error : new ThreeDepthTextureError('ABORTED', String(error ?? 'Renderer lifetime ended'));
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     rejectStopped(terminal);
     for (const entry of entries) discard(entry);
     for (const [texture, listener] of watches) texture.removeEventListener('dispose', listener);
@@ -54,7 +57,8 @@ export function createThreeDepthTextures({three, device, getSamples = () => 1, s
   }
   const abort = () => stop(signal.reason ?? new ThreeDepthTextureError('ABORTED', 'Renderer lifetime ended'));
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, {once: true});
-  device.lost?.then(info => stop(new ThreeDepthTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
+  if (!terminal && device.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stop(new ThreeDepthTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
   function track(task, validation = false) {
     pending.add(task); if (validation) validations.add(task);
     task.catch(stop);

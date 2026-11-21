@@ -2,6 +2,8 @@
  * logical call across its actual native passes: the first pass writes start,
  * each subsequent pass replaces end. No clock estimate or timing-only pass.
  * Pending queries and published frames are bounded independently. */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class ThreeTimestampError extends Error {
   constructor(code, message) {
     super(`THREE_TIMESTAMP_${code}: ${message}`);
@@ -18,7 +20,7 @@ export function createThreeTimestampQueries({getDevice, enabled, signal = null, 
       !Number.isSafeInteger(maxFrames) || maxFrames < 1) fail('OPTIONS', 'Expected device/tracking accessors and positive query limits');
   const records = new Set(), contexts = new WeakMap();
   const states = new Map(types.map(type => [type, {pending: new Set(), skipped: new Set(), frames: [], values: new Map(), last: 0, seen: false, resolving: null}]));
-  let terminal = null, watchedDevice = null, rejectStopped;
+  let terminal = null, watchedDevice = null, rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const live = () => { if (terminal) throw terminal; };
   const stateOf = type => { if (!states.has(type)) fail('TYPE', 'Timestamp type must be render or compute'); return states.get(type); };
@@ -29,6 +31,7 @@ export function createThreeTimestampQueries({getDevice, enabled, signal = null, 
   function stop(error) {
     if (terminal) return;
     terminal = error; rejectStopped(error);
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const record of records) destroy(record);
     for (const state of states.values()) { state.pending.clear(); state.skipped.clear(); state.frames = []; state.values.clear(); }
     signal?.removeEventListener('abort', abort);
@@ -41,7 +44,8 @@ export function createThreeTimestampQueries({getDevice, enabled, signal = null, 
     if (watchedDevice && watchedDevice !== value) fail('DEVICE', 'Timestamp queries cannot migrate between devices');
     if (!watchedDevice) {
       watchedDevice = value;
-      value.lost?.then(info => stop(new ThreeTimestampError('LOST', info?.message ?? 'WebGPU device lost')), stop).catch(() => {});
+      if (value.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(value.lost,
+        info => stop(new ThreeTimestampError('LOST', info?.message ?? 'WebGPU device lost')), stop);
     }
     return value;
   }

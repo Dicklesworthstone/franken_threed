@@ -3,6 +3,8 @@
  * logical pixel bytes at the call, then occupy the same FIFO as compute/copies.
  * These are F3D extensions, not a replacement for source Texture.needsUpdate.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class ThreeStorageTransferError extends Error {
   constructor(code, message) {
     super(`THREE_STORAGE_TRANSFER_${code}: ${message}`);
@@ -50,7 +52,7 @@ function sourceBytes(data) {
 export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 * 1024 * 1024, maxReadbackBytes = 128 * 1024 * 1024, maxPendingTransfers = 64} = {}) {
   if (!renderer || !positive(maxSnapshotBytes) || !positive(maxReadbackBytes) || !positive(maxPendingTransfers)) fail('OPTIONS', 'Expected renderer and positive transfer budgets');
   const pending = new Set(), captures = new Set(), readbacks = new Set();
-  let snapshotBytes = 0, readbackBytes = 0, terminal = null, disposed = false, watched = null;
+  let snapshotBytes = 0, readbackBytes = 0, terminal = null, disposed = false, watched = null, releaseDeviceLoss = null;
   let rejectStopped;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const signal = renderer._targetLifetime?.signal;
@@ -66,6 +68,7 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
   function stop(error) {
     if (terminal) return;
     terminal = error instanceof Error ? error : new ThreeStorageTransferError('ABORTED', String(error ?? 'Transfers stopped'));
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const request of captures) release(request);
     for (const request of readbacks) releaseReadback(request);
     rejectStopped(terminal); signal?.removeEventListener('abort', abort);
@@ -83,7 +86,8 @@ export function createStorageTextureTransfers(renderer, {maxSnapshotBytes = 128 
     if (watched && watched !== device) fail('DEVICE', 'Storage transfers cannot migrate between devices');
     if (!watched) {
       watched = device;
-      device.lost?.then(info => stop(new ThreeStorageTransferError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
+      if (device.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+        info => stop(new ThreeStorageTransferError('DEVICE_LOST', info?.message ?? 'Device lost')), stop);
     }
     return device;
   }

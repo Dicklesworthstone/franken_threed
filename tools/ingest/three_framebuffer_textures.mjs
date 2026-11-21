@@ -4,6 +4,7 @@
  * copies and their mips are encoded together at the captured draw boundary.
  */
 import {createGpuRenderTarget} from './gpu_render_target.mjs';
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
 
 export class ThreeFramebufferTextureError extends Error {
   constructor(code, message) {
@@ -24,12 +25,12 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
     fail('OPTIONS', 'Expected pinned texture constructors, a GPUDevice, framebuffer format and positive budgets');
   const current = new Map(), entries = new Set(), leases = new Map(), tokens = new WeakSet(), watches = new Map(), samplers = new Map(), pending = new Set();
   const copyPipelines = new Map();
-  let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped;
+  let bytes = 0, active = null, terminal = null, disposed = false, rejectStopped, releaseDeviceLoss = null;
   const stopped = new Promise((_, reject) => { rejectStopped = reject; }); stopped.catch(() => {});
   const live = () => { if (disposed) fail('DISPOSED', 'Framebuffer textures are disposed'); if (terminal) throw terminal; };
   function track(task) {
     pending.add(task); task.finally(() => pending.delete(task)).catch(() => {});
-    task.catch(error => { terminal ??= error; });
+    task.catch(stop);
   }
   function retire(entry) {
     if (entry.retiring || entry.borrowed) return;
@@ -53,6 +54,7 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
   }
   function stop(error) {
     terminal ??= error;
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     rejectStopped(terminal);
     for (const entry of entries) discard(entry);
     for (const [texture, listener] of watches) texture.removeEventListener('dispose', listener);
@@ -60,7 +62,8 @@ export function createThreeFramebufferTextures({three, device, getFormat, signal
   }
   const abort = () => stop(signal.reason ?? new ThreeFramebufferTextureError('ABORTED', 'Renderer lifetime ended'));
   if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, {once: true});
-  device.lost?.then(info => stop(new ThreeFramebufferTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
+  if (!terminal && device.lost?.then) releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
+    info => stop(new ThreeFramebufferTextureError('LOST', info?.message ?? 'WebGPU device lost')), stop);
   function inspect(texture, format = getFormat(), layoutOnly = false) {
     live();
     if (!(texture instanceof three.FramebufferTexture) || texture.isFramebufferTexture !== true ||

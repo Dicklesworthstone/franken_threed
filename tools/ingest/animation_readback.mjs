@@ -4,6 +4,8 @@
  * WebGPU: texture-to-buffer row pitch is 256-byte aligned. The returned RGBA
  * array is tightly packed and owns its memory after staging is unmapped.
  */
+import {subscribeGpuDeviceLoss} from './gpu_device_loss.mjs';
+
 export class AnimationReadbackError extends Error {
   constructor(code, message, options) {
     super(`${code}: ${message}`, options);
@@ -183,7 +185,8 @@ export function createGpuAnimationReadback(device, options = {}) {
     terminal = null,
     reservedBytes = 0,
     bufferBytes = 0,
-    issuing = false;
+    issuing = false,
+    releaseDeviceLoss = null;
   const pending = new Set();
   function live() {
     if (terminal) throw terminal;
@@ -192,10 +195,11 @@ export function createGpuAnimationReadback(device, options = {}) {
   function stop(cause) {
     if (terminal || disposed) return;
     terminal = cause;
+    releaseDeviceLoss?.(); releaseDeviceLoss = null;
     for (const r of pending) r.cancel(cause);
   }
   if (device.lost && typeof device.lost.then === "function")
-    device.lost.then(
+    releaseDeviceLoss = subscribeGpuDeviceLoss(device.lost,
       (info) => stop(error("DEVICE_LOST", info?.message ?? "Device lost")),
       (cause) => stop(error("DEVICE_LOST", "Device loss notification failed", { cause })),
     );
@@ -354,6 +358,7 @@ export function createGpuAnimationReadback(device, options = {}) {
     dispose() {
       if (disposed) return;
       disposed = true;
+      releaseDeviceLoss?.(); releaseDeviceLoss = null;
       for (const r of pending) r.cancel(error("DISPOSED", "Readback service disposed"));
     },
   });

@@ -328,3 +328,89 @@ test('renderer, program and compute churn releases CPU arenas while the borrowed
     cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
   });
 });
+
+test('disposed query, readback and transfer owners release their source graphs on a live borrowed device', () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    import * as T from '../../upstream/three.js/build/three.webgpu.js';
+    import {createThreeTimestampQueries} from './three_timestamp_queries.mjs';
+    import {createThreeOcclusionQueries} from './three_occlusion_queries.mjs';
+    import {createThreeFramebufferTextures} from './three_framebuffer_textures.mjs';
+    import {createThreeDepthTextures} from './three_depth_textures.mjs';
+    import {createThreeComputeTargets} from './three_compute_targets.mjs';
+    import {createStorageTextureTransfers} from './three_storage_texture_transfer.mjs';
+    import {createGpuAnimationReadback} from './animation_readback.mjs';
+    let lose, subscriptions = 0, queries = 0;
+    const lost = new Promise(resolve => { lose = resolve; }), then = lost.then.bind(lost);
+    lost.then = (...args) => { subscriptions++; return then(...args); };
+    const device = {lost, features: new Set(['timestamp-query']),
+      limits: {maxTextureDimension2D: 4096, maxBufferSize: 65536},
+      pushErrorScope() {}, popErrorScope: async () => null,
+      queue: {submit() {}, onSubmittedWorkDone: async () => {}},
+      createQuerySet() {
+        let destroyed = false; queries++;
+        return {destroy() { if (!destroyed) { destroyed = true; queries--; } }};
+      },
+      createBuffer: () => ({destroy() {}}), createCommandEncoder: () => ({}),
+      destroy() { assert.fail('borrowed device'); }};
+    function group(signal) {
+      // The accessors model their real renderer captures; no recording log is
+      // allowed to retain the renderer, target table or source textures.
+      const renderer = {_device: device, _initialized: true, isWebGPURenderer: true,
+        _storageTextures: {}, _targetLifetime: {signal}, format: 'rgba8unorm'};
+      const getDevice = () => renderer._device;
+      const timestamps = createThreeTimestampQueries({getDevice, enabled: () => true, signal});
+      const occlusion = createThreeOcclusionQueries({getDevice});
+      const framebuffer = createThreeFramebufferTextures({three: T, device, signal, getFormat: () => renderer.format});
+      const depth = createThreeDepthTextures({three: T, device, signal});
+      const targets = {captureNativeTexture() {}, validateNativeTextures() {}, withNativeTextures() {}, assertCurrent() {}};
+      const compute = createThreeComputeTargets({targets, device, signal});
+      const transfers = createStorageTextureTransfers(renderer), readback = createGpuAnimationReadback(device);
+      const color = new T.FramebufferTexture(2, 2), depthTexture = new T.DepthTexture(2, 2);
+      return {renderer, targets, color, depthTexture, timestamps, occlusion, framebuffer, depth, compute, transfers, readback};
+    }
+    async function activate(g) {
+      g.timestamps.begin('render', 'r:1:f1').writes();
+      g.occlusion.begin(g.occlusion.context(null), {requested: true}).cancel();
+      g.framebuffer.captureBinding({texture: g.color, isSampledTexture: true});
+      g.depth.captureBinding({texture: g.depthTexture, isSampledTexture: true});
+      await g.transfers.whenIdle();
+    }
+    function dispose(g) {
+      for (const owner of [g.timestamps, g.occlusion, g.framebuffer, g.depth, g.compute, g.transfers, g.readback]) {
+        owner.dispose(); owner.dispose();
+      }
+    }
+    const refs = [];
+    async function cycle() {
+      for (let index = 0; index < 20; index++) {
+        const g = group(new AbortController().signal);
+        await activate(g); dispose(g);
+        for (const value of Object.values(g)) refs.push(new WeakRef(value));
+      }
+      const cancellation = new AbortController(); cancellation.abort(new Error('already cancelled'));
+      const g = group(cancellation.signal);
+      // Already-cancelled owners must never install a dormant subscription.
+      g.occlusion.dispose(); g.readback.dispose();
+      for (const value of Object.values(g)) refs.push(new WeakRef(value));
+    }
+    await cycle();
+    assert.equal(queries, 0);
+    for (let turn = 0; turn < 20; turn++) { await new Promise(setImmediate); global.gc(); }
+    assert.equal(refs.filter(ref => ref.deref()).length, 0, 'disposed renderer and texture captures must not await device loss');
+    assert.equal(subscriptions, 1, 'all disposable owners share the existing native loss observer');
+    const live = group(new AbortController().signal); await activate(live);
+    lose({reason: 'unknown', message: 'device removed'}); await new Promise(setImmediate);
+    assert.throws(() => live.timestamps.begin('render', 'r:2:f2'), {code: 'THREE_TIMESTAMP_LOST'});
+    await assert.rejects(live.occlusion.whenIdle(), /THREE_OCCLUSION_LOST/);
+    await assert.rejects(live.framebuffer.whenIdle(), {code: 'THREE_FRAMEBUFFER_TEXTURE_LOST'});
+    await assert.rejects(live.depth.whenIdle(), {code: 'THREE_DEPTH_TEXTURE_LOST'});
+    await assert.rejects(live.compute.whenIdle(), {code: 'THREE_COMPUTE_TARGET_LOST'});
+    await assert.rejects(live.transfers.whenIdle(), {code: 'THREE_STORAGE_TRANSFER_DEVICE_LOST'});
+    await assert.rejects(live.readback.whenIdle(), {code: 'ANIMATION_READBACK_DEVICE_LOST'});
+    assert.equal(queries, 0); dispose(live);
+  `;
+  execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], {
+    cwd: fileURLToPath(new URL('.', import.meta.url)), encoding: 'utf8', timeout: 20000,
+  });
+});
