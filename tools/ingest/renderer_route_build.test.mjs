@@ -161,7 +161,7 @@ export const pluginState=alias;
   assert.equal(result.chunks.some(chunk=>chunk.fileName.startsWith('f3d-renderer-runtime-')),false);
 });
 
-for (const inline of [false, true]) test(`mixed source-selected WebGL and native construction preserve option effects with inline=${inline}`, async () => {
+for (const inline of [false, true]) test(`unproved mixed constructor resources retain source option effects with inline=${inline}`, async () => {
   const body = `import * as THREE from 'three/webgpu';
 import {WebGPURenderer as Renderer} from 'three/webgpu';
 const events = globalThis.__f3d_mixed_options;
@@ -182,11 +182,12 @@ export const dispose = () => native.dispose();
     '<script type="module" src="./main.js"></script>', '<script type="module">\n' + body + '</script>'));
   const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
   const source = await buildApplication(reference.entry, reference.out);
-  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.routed, false);
+  assert.equal(result.rendererRoute.reason, 'mixed-renderer-resource-ownership-unproved');
   assert.deepEqual(result.rendererRoute.decisions.map(value => value.route), ['general-webgpu', 'exact-backend']);
   assert.deepEqual(result.rendererRoute.decisions[1].reasons, ['explicit-source-selection']);
-  assert.equal(result.rendererRoute.exactConstructionSites.length, 1);
-  assert.ok(result.rendererRoute.exactConstructionSites[0].sourceSpan.start.offset > 0);
+  assert.deepEqual(result.rendererRoute.exactConstructionSites, []);
+  assert.ok(result.rendererRoute.decisions[1].sourceSpan.start.offset > 0);
   const document = globalThis.document, previousEvents = globalThis.__f3d_mixed_options;
   globalThis.document = {createElementNS: () => ({width: 32, height: 24, style: {}})};
   try {
@@ -195,7 +196,7 @@ export const dispose = () => native.dispose();
     const observed = globalThis.__f3d_mixed_options.slice();
     globalThis.__f3d_mixed_options = [];
     const emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
-    assert.deepEqual(emitted.nativeFlags, [true, false]);
+    assert.deepEqual(emitted.nativeFlags, [false, false]);
     assert.deepEqual(expected.nativeFlags, [false, false]);
     assert.deepEqual(emitted.instances, [true, true]);
     assert.deepEqual(emitted.sourceFlags, [true, true]);
@@ -203,13 +204,14 @@ export const dispose = () => native.dispose();
       'source-selected option getters and extra arguments keep the exact source evaluation order');
     assert.equal(observed[0], 'extra argument');
     assert.ok(observed.includes('sourceOption'), 'source options are not rejected by native validation');
-    emitted.dispose();
+    // Both source constructors remain uninitialized; there are no GPU owners to
+    // dispose, and pinned dispose() itself starts asynchronous initialization.
   } finally {
     globalThis.document = document; globalThis.__f3d_mixed_options = previousEvents;
   }
 });
 
-test('source-selected constructions in lazy modules retain the same routed export identity', async () => {
+test('mixed constructions in lazy modules retain their source export identity without a resource proof', async () => {
   const a = app(`import * as THREE from 'three/webgpu';
 const native = new THREE.WebGPURenderer();
 export const nativeFlag = native.isF3DRenderer;
@@ -220,16 +222,18 @@ const exact = new Renderer({forceWebGL: true});
 export const nativeFlag = exact.isF3DRenderer === true;
 export const sameClass = exact instanceof Renderer;`);
   const result = await buildApplication(a.entry, a.out, {routeWebGPURenderer: true});
-  assert.equal(result.rendererRoute.routed, true);
-  assert.equal(result.rendererRoute.exactConstructionSites[0].moduleId, pathToFileURL(path.join(a.dir, 'exact.js')).href);
+  assert.equal(result.rendererRoute.routed, false);
+  assert.equal(result.rendererRoute.reason, 'mixed-renderer-resource-ownership-unproved');
+  assert.deepEqual(result.rendererRoute.exactConstructionSites, []);
+  assert.equal(result.rendererRoute.decisions.find(site => site.route === 'exact-backend').moduleId,
+    pathToFileURL(path.join(a.dir, 'exact.js')).href);
   const previous = globalThis.document;
   globalThis.document = {createElementNS: () => ({width: 32, height: 24, style: {}})};
   try {
     const emitted = await import(pathToFileURL(path.join(a.out, result.entryFiles[0])).href);
-    assert.equal(emitted.nativeFlag, true);
+    assert.equal(emitted.nativeFlag, undefined);
     const exact = await emitted.load();
     assert.equal(exact.nativeFlag, false); assert.equal(exact.sameClass, true);
-    emitted.dispose();
   } finally { globalThis.document = previous; }
 });
 

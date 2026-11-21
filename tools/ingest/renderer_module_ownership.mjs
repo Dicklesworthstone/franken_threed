@@ -18,6 +18,12 @@ const BUILDS = new Map([
   ['three.tsl.js', '6e6b92d8ce467818944f73815a96abadc6392fb34de577d479a23810b6aeeed0'],
   ['three.webgpu.nodes.js', 'a6a3a3b59fff0496783cd77162f1733141af31d4b596a5a77004b4f1790d53f6'],
 ]);
+
+/** Immutable build bytes shared by the linked and resource-group proofs. */
+export function isPinnedRendererBuild(module) {
+  const expected = BUILDS.get(new URL(module.id).pathname.split('/').at(-1));
+  return Boolean(expected && module.content_hash === 'sha256:' + expected);
+}
 const constructionProfile = sites => sites.map(site => JSON.stringify([
   site.constructor_name, site.force_webgl, site.force_webgl_unresolved, Boolean(site.canvas_option),
 ])).sort();

@@ -78,7 +78,7 @@ function fileslice(f, name, span) {
   return fs.readFileSync(path.join(f.dir, name), 'utf8').slice(span.start.offset, span.end.offset);
 }
 
-test('imported consumers preserve original explicit source constructor sites in mixed builds', async () => {
+test('mixed imported consumers retain source until shared resource ownership is proved', async () => {
   const f = fixture({
     'setup.mjs': 'export function setup(r) { r.setSize(24,16,false); }',
     'main.mjs': `import {WebGPURenderer} from 'three'; import {setup} from './setup.mjs';
@@ -86,11 +86,12 @@ test('imported consumers preserve original explicit source constructor sites in 
       const source=new WebGPURenderer({forceWebGL:true}); setup(source);`,
   });
   const result = await buildApplication(f.entry, path.join(f.dir, 'out'), {routeWebGPURenderer: true});
-  assert.equal(result.rendererRoute.routed, true);
+  assert.equal(result.rendererRoute.routed, false);
+  assert.equal(result.rendererRoute.reason, 'mixed-renderer-resource-ownership-unproved');
   assert.deepEqual(result.rendererRoute.decisions.map(site => site.route), ['general-webgpu', 'exact-backend']);
-  assert.equal(result.rendererRoute.exactConstructionSites.length, 1);
-  assert.equal(fileslice(f, 'main.mjs', result.rendererRoute.exactConstructionSites[0].sourceSpan),
-    'new WebGPURenderer({forceWebGL:true})', JSON.stringify(result.rendererRoute.exactConstructionSites[0]));
+  assert.deepEqual(result.rendererRoute.exactConstructionSites, []);
+  assert.equal(fileslice(f, 'main.mjs', result.rendererRoute.decisions[1].sourceSpan),
+    'new WebGPURenderer({forceWebGL:true})', JSON.stringify(result.rendererRoute.decisions[1]));
 });
 
 test('WebGL-authored modular applications retain native-context requirements across helpers', async () => {

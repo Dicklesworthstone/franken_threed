@@ -14,10 +14,10 @@ node tools/ingest/cli.mjs path/to/index.html --build-app out --route-webgpu-rend
 
 The build decides the route from the whole module graph with the existing route
 decider. It substitutes when at least one `WebGPURenderer` construction site routes
-to general-webgpu and all remaining sites either share that route or explicitly
-select the source WebGL backend. Other exact-backend requirements and GL escapes
-remain conservative, and every import of `build/three.webgpu.js` must be the
-admitted pinned r186 build. The substituted
+to general-webgpu and the remaining sites either share that route or have proved
+independent resource ownership as described below. Exact-backend requirements and
+GL escapes remain conservative, and every import of `build/three.webgpu.js` must
+be the admitted pinned r186 build. The substituted
 module re-exports the upstream namespace (every other class keeps its upstream
 identity) and replaces only `WebGPURenderer`. Otherwise the build is unchanged
 and the printed/returned `rendererRoute.reason` says why.
@@ -32,17 +32,19 @@ still selects the native route. If adapter/device initialization fails after
 native construction, that error remains visible: the exposed renderer is never
 silently replaced with another owner.
 
-Mixed applications preserve each explicit `forceWebGL: true` construction through
-its genuine upstream constructor. The compiler resolves the original callee once
+For an admitted mixed application, each exact construction uses its genuine
+upstream constructor, including explicit `forceWebGL: true` sites and a WebGPU
+site connected to a source WebGL owner. The compiler resolves the original callee once
 before the untouched argument list; it does not pre-read, clone or validate source
 options through the native facade. Option getters, extra arguments, constructor
-errors and source prototypes retain their source behavior. Renamed constructors,
-inline scripts and lazy modules use the same source module instance retained by
-their routed export. `instanceof` that export recognizes actual native and source
+errors and source prototypes retain their source behavior. Renamed constructors
+and inline modules use the same source module instance retained by their routed
+export. `instanceof` that export recognizes actual native and source
 instances without accepting flag-shaped objects or broadening subclass checks.
 
-Per-site `rendererRoute.decisions` continue to identify source-selected calls as
-`exact-backend`; `exactConstructionSites` records their original source spans.
+Per-site `rendererRoute.decisions` identify source-selected and source-connected
+calls as `exact-backend`; `exactConstructionSites` records WebGPU calls preserved
+through the original constructor after export substitution.
 Applications containing only explicit source selections remain unchanged.
 Runtime-valued `forceWebGL` selections retain the existing facade dispatch.
 Ordinary source selections dispatch before native option validation or getter
@@ -51,6 +53,33 @@ and inherited/custom option containers retain the genuine source constructor;
 opaque receivers remain under the compiler's conservative construction routing.
 Opaque renderer access, unknown extensions, native-context observations and
 prototype mutation still prevent the mixed build route.
+
+Mixed routes require a separate, bounded resource proof. One closed application
+module may construct independent source and native renderers using the verified
+pinned Three builds. Locally allocated canvases, scenes, cameras, materials,
+geometries and render targets carry their ownership through immutable aliases,
+records, arrays, conditional selections, constructor arguments, renderer methods
+and later property assignments. Any shared object conservatively joins its users,
+including CPU assets. A shared canvas, target texture or scene descendant therefore
+keeps the connected renderers on the source route while a third independent
+renderer may still use the native backend. Route decisions record `groupId` and
+the `connected-group-constraint` reason when a source requirement propagates.
+
+This additional proof covers at most 128 KiB and 12,000 syntax nodes in one static
+application module. Data access is restricted to a small verified public field
+set; method functions cannot be extracted or used as mutable storage. Unknown
+properties, shared material defines, implicit Sprite geometry, getters, mutable
+bindings, imported application helpers, dynamic modules, unknown callback
+parameters, native observations and exported connected resources retain the
+whole source application. HTML must also exclude untracked scripts, event handlers
+and child browsing contexts. Dynamic DOM code/markup mutation is refused. These
+requirements apply equally to mixed explicit `forceWebGL: true` selections;
+selecting a backend alone does not prove that its canvas and resources are
+independent. A failed proof reports `mixed-renderer-resource-ownership-unproved`.
+Getter/argument order and constructor identity are preserved by retaining the
+original application in those cases. Production and provenance regressions are in
+`renderer_resource_groups.test.mjs`. This is expanded compatibility routing, with
+no browser rendering parity or measured performance claim.
 
 Construction routing follows local renderer and canvas aliases before choosing
 an owner. Exports, external stores, returned renderer factories, unknown consumers,
@@ -64,8 +93,9 @@ can also retain closed renderer ownership across modules. The compiler links a
 private analysis copy and applies the existing lexical ownership proof to it;
 the original application modules, evaluation effects and construction spans
 remain intact in production emission. Both WebGPU-authored and WebGL-authored
-applications can use this route, including mixed explicit `forceWebGL: true`
-sites that retain their genuine source constructor.
+applications can use this route when their construction decisions share the
+native route. Mixed source/native modules additionally require the resource proof
+above; its current single-module boundary retains multi-module mixed applications.
 
 The linked proof also composes with the source-verified controls and
 `RendererInspector` contracts described below. Renderer factories, navigation

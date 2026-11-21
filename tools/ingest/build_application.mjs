@@ -52,6 +52,7 @@ import { moduleWorkerRollupPlugin, workerGlobalBindings } from "./module_workers
 import { analyzeDocumentFetch, collectDocumentFetchAssets } from "./document_fetch_assets.mjs";
 import { gltfAssetUris } from "./pack_gltf.mjs";
 import { evaluateGraphRoutes, isInternalLibraryModule } from "./route_bridge.mjs";
+import { resolveClosedRendererGroups } from "./renderer_resource_groups.mjs";
 import { decideRendererRoute } from "../compat/route_decider.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
 import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
@@ -1512,7 +1513,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
  */
 async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSources, documentRoot) {
   const graph = await buildModuleGraph(entryAbs, { packageRootUrl, _moduleSources: moduleSources, documentRoot });
-  const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
+  let decisions = evaluateGraphRoutes(graph, decideRendererRoute, {
     packageRootUrl,
     generalWebGPUAvailable: enabled.webgpu,
     generalWebGLAvailable: enabled.webgl,
@@ -1542,15 +1543,25 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSou
   const sourceSelected = decision => decision.constructorName === "WebGPURenderer" &&
     decision.route === "exact-backend" && decision.reasons.length === 1 &&
     decision.reasons[0] === "explicit-source-selection";
+  // A separate exact renderer need not force a closed native renderer onto its
+  // backend. Only a proved local allocation graph may replace that global veto;
+  // shared or unknown resource ownership continues to choose the source route.
+  const mixed = decisions.some(decision => decision.route === 'general-webgpu') &&
+    decisions.some(decision => decision.route === 'exact-backend');
+  const grouped = mixed ? resolveClosedRendererGroups(graph, moduleSources, decisions, packageRootUrl) : null;
+  if (grouped) decisions = grouped;
+  const keepSource = decision => sourceSelected(decision) || Boolean(grouped &&
+    decision.constructorName === 'WebGPURenderer' && decision.route === 'exact-backend');
   for (const { exportName, urls } of candidates) {
     const gl = exportName === "WebGLRenderer";
     const sites = decisions.filter((d) => d.constructorName === exportName);
     let reason = null;
-    if (sites.length === 0) reason = gl ? "no-webgl-renderer-construction" : "no-webgpu-renderer-construction";
+    if (mixed && !grouped) reason = 'mixed-renderer-resource-ownership-unproved';
+    else if (sites.length === 0) reason = gl ? "no-webgl-renderer-construction" : "no-webgpu-renderer-construction";
     else if (!sites.some((d) => d.route === "general-webgpu") ||
-        sites.some((d) => d.route !== "general-webgpu" && (gl || !sourceSelected(d))))
+        sites.some((d) => d.route !== "general-webgpu" && (gl || !keepSource(d))))
       reason = "construction-site-not-general-webgpu";
-    else if (decisions.some((d) => d.route === "exact-backend" && (gl || !sourceSelected(d))))
+    else if (!grouped && decisions.some((d) => d.route === "exact-backend" && (gl || !sourceSelected(d))))
       reason = "exact-backend-renderer-present";
     else if (urls.length === 0) reason = gl ? "no-three-module-import" : "no-three-webgpu-import";
     else if (!urls.every((id) => isInternalLibraryModule(id, packageRootUrl)))
@@ -1561,13 +1572,14 @@ async function decideRendererRoutes(entryAbs, packageRootUrl, enabled, moduleSou
     else for (const url of urls) targets.push({ url, exportName });
   }
   const exactSites = targets.some(target => target.exportName === "WebGPURenderer")
-    ? decisions.filter(sourceSelected).map(decision => {
+    ? decisions.filter(keepSource).map(decision => {
       const module = graph.modules[decision.moduleId];
       const siteIndex = module.renderer_construction_sites.findIndex(site =>
         site.source_span.start.offset === decision.sourceSpan.start.offset &&
         site.source_span.end.offset === decision.sourceSpan.end.offset);
       if (siteIndex < 0) throw new Error("Source-selected renderer construction lost its original site");
-      return {moduleId: decision.moduleId, sourceSpan: decision.sourceSpan, siteIndex, sourceHash: module.content_hash};
+      return {moduleId: decision.moduleId, sourceSpan: decision.sourceSpan, siteIndex, sourceHash: module.content_hash,
+        ...(grouped && !sourceSelected(decision) ? {connectedGroup: decision.groupId} : {})};
     }) : [];
   const postprocessingTransforms = targets.some(target => target.exportName === 'WebGLRenderer')
     ? Object.entries(graph.modules).filter(([, mod]) => mod.postprocessing_transform)

@@ -672,7 +672,8 @@ export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTr
       const analysis = analyzeModuleAst(code, id), ast = this.parse(code), spans = new Map();
       for (const site of sites) {
         const current = analysis.renderer_construction_sites[site.siteIndex];
-        if (current?.constructor_name !== 'WebGPURenderer' || current.force_webgl !== true)
+        if (current?.constructor_name !== 'WebGPURenderer' ||
+            current.force_webgl !== true && typeof site.connectedGroup !== 'string')
           throw new Error(`Source-selected renderer construction changed before emission: ${id}`);
         spans.set(current.source_span.start.offset, current.source_span.end.offset);
       }
