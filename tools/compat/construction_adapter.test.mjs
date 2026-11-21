@@ -67,6 +67,32 @@ test("Resource identity separates actual Three classes and ignores mutable insta
   assert.equal(resolveResourceId({ resourceId: "shared" }), "shared");
 });
 
+test("Mutable promotion rejects an incompatible renderer before constructor or canvas effects", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  let sourceCalls = 0;
+  const router = new RendererConstructionRouter({connectedGroups: groups, implementations: {
+    [ExecutionRoute.RETAINED_UPSTREAM]: class RetainedRenderer {},
+    [ExecutionRoute.EXACT_BACKEND]: class SourceRenderer { constructor() { sourceCalls++; } },
+  }});
+  const target = new RenderTarget();
+  const first = router.routeAndConstruct({constructorName: "WebGPURenderer", options: {canvas: {}},
+    hostCapabilities: {hasWebGPU: true, hasWebGL: true}, sharedResources: [[target, false]]});
+  const canvas = {};
+  assert.equal(router.getInstanceRoute(first), ExecutionRoute.RETAINED_UPSTREAM);
+
+  assert.throws(() => router.routeAndConstruct({constructorName: "WebGLRenderer", options: {canvas},
+    sharedResources: [[target, true]]}), /Connected group conflict/);
+  assert.equal(sourceCalls, 0);
+  assert.equal(router.getCanvasLock(canvas), undefined);
+  assert.equal(groups.isResourceMutable(resolveResourceId(target)), false);
+
+  // A rejected prospective write must not poison ordinary independent uploads.
+  const second = router.routeAndConstruct({constructorName: "WebGLRenderer", options: {canvas},
+    sharedResources: [[target, false]]});
+  assert.equal(router.getInstanceRoute(second), ExecutionRoute.EXACT_BACKEND);
+  assert.equal(sourceCalls, 1);
+});
+
 test("Contract: Constructor throw retains irreversible canvas lock (binds-then-throws)", () => {
   const connectedGroups = new ConnectedCompatibilityGroups();
   const router = new RendererConstructionRouter({

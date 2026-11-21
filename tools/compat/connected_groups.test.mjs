@@ -113,3 +113,109 @@ test("ConnectedCompatibilityGroups: previewRoute detects conflict with committed
   // Graph state must remain unmutated
   assert.equal(groups.getGroupMembers("rt-shared").length, 2);
 });
+
+test("Read-only users stay independent until a resource becomes writable", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  groups.registerRenderer("source", ExecutionRoute.EXACT_BACKEND);
+  groups.registerRenderer("native", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordResourceSharing("source", "image", false);
+  groups.recordResourceSharing("native", "image", false);
+
+  assert.equal(groups.resolveGroupRoutes().get("native").route, ExecutionRoute.GENERAL_WEBGPU);
+  assert.deepEqual(groups.getGroupMembers("source"), ["source"]);
+  assert.deepEqual(groups.getGroupMembers("native"), ["native"]);
+
+  // A newly discovered writer must join both earlier readers, not just itself.
+  groups.registerRenderer("writer", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordResourceSharing("writer", "image", true);
+  const decisions = groups.resolveGroupRoutes();
+  for (const id of ["source", "native", "writer"]) {
+    assert.equal(decisions.get(id).route, ExecutionRoute.EXACT_BACKEND);
+    assert.equal(decisions.get(id).groupId, decisions.get("source").groupId);
+  }
+  assert.ok(decisions.get("native").reasons.includes(EscapeReason.CONNECTED_GROUP_CONSTRAINT));
+});
+
+test("Resource promotion and later read-only uses preserve mutable GPU history", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  groups.registerRenderer("source", ExecutionRoute.EXACT_BACKEND);
+  groups.recordResourceSharing("source", "image", false);
+  groups.registerResource("image", true);
+  groups.registerRenderer("reader", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordResourceSharing("reader", "image", false);
+
+  assert.equal(groups.isResourceMutable("image"), true);
+  assert.equal(groups.resolveGroupRoutes().get("reader").route, ExecutionRoute.EXACT_BACKEND);
+  assert.deepEqual(new Set(groups.getGroupMembers("reader")), new Set(["source", "image", "reader"]));
+});
+
+test("Previewing a write includes earlier read-only users without promoting the resource", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  groups.registerRenderer("source", ExecutionRoute.EXACT_BACKEND);
+  groups.recordCommittedRoute("source", ExecutionRoute.EXACT_BACKEND);
+  groups.recordResourceSharing("source", "image", false);
+  const initial = {route: ExecutionRoute.GENERAL_WEBGPU, reasons: []};
+
+  assert.equal(groups.previewRoute(initial, [{id: "image", isMutable: false}]).route,
+    ExecutionRoute.GENERAL_WEBGPU);
+  const preview = groups.previewRoute(initial, [{id: "image", isMutable: true}]);
+  assert.equal(preview.route, ExecutionRoute.EXACT_BACKEND);
+  assert.equal(groups.previewRoute(initial, [{id: "image"}]).route, preview.route,
+    "omitted mutability is conservatively writable, as in recordResourceSharing");
+  assert.ok(preview.reasons.includes(EscapeReason.CONNECTED_GROUP_CONSTRAINT));
+  assert.equal(groups.isResourceMutable("image"), false);
+  assert.deepEqual(groups.getGroupMembers("source"), ["source"]);
+  assert.deepEqual(groups.getGroupMembers("image"), ["image"]);
+
+  groups.registerRenderer("writer", preview.route);
+  groups.recordResourceSharing("writer", "image", true);
+  assert.equal(groups.resolveGroupRoutes().get("writer").route, preview.route);
+});
+
+test("A later read-only declaration cannot hide an existing mutable group from preview", () => {
+  for (const priorRoute of [ExecutionRoute.EXACT_BACKEND, ExecutionRoute.GENERAL_WEBGPU]) {
+    const groups = new ConnectedCompatibilityGroups();
+    groups.registerRenderer("owner", priorRoute);
+    groups.recordCommittedRoute("owner", priorRoute);
+    groups.recordResourceSharing("owner", "history", true);
+    const resources = [{id: "history", isMutable: false}];
+    if (priorRoute === ExecutionRoute.EXACT_BACKEND) {
+      assert.equal(groups.previewRoute({route: ExecutionRoute.GENERAL_WEBGPU, reasons: []}, resources).route,
+        ExecutionRoute.EXACT_BACKEND);
+    } else {
+      assert.throws(() => groups.previewRoute({route: ExecutionRoute.EXACT_BACKEND, reasons: []}, resources),
+        /Connected group conflict/);
+    }
+  }
+});
+
+test("Promotion previews reject committed conflicts across all prospective resource groups", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  groups.registerRenderer("source", ExecutionRoute.EXACT_BACKEND);
+  groups.recordCommittedRoute("source", ExecutionRoute.EXACT_BACKEND);
+  groups.recordResourceSharing("source", "source-image", false);
+  groups.registerRenderer("native", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordCommittedRoute("native", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordResourceSharing("native", "native-image", false);
+  const resources = [{id: "source-image", isMutable: true}, {id: "native-image", isMutable: true}];
+
+  for (const pending of [resources, [...resources].reverse()]) {
+    assert.throws(() => groups.previewRoute({route: ExecutionRoute.GENERAL_WEBGPU, reasons: []}, pending),
+      /Connected group conflict: renderer 'native'/);
+    assert.equal(groups.isResourceMutable("source-image"), false);
+    assert.equal(groups.isResourceMutable("native-image"), false);
+    assert.deepEqual(groups.getGroupMembers("source"), ["source"]);
+    assert.deepEqual(groups.getGroupMembers("native"), ["native"]);
+  }
+});
+
+test("Direct promotion detects an already committed incompatible residency", () => {
+  const groups = new ConnectedCompatibilityGroups();
+  groups.registerRenderer("source", ExecutionRoute.EXACT_BACKEND);
+  groups.registerRenderer("native", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordCommittedRoute("native", ExecutionRoute.GENERAL_WEBGPU);
+  groups.recordResourceSharing("source", "image", false);
+  groups.recordResourceSharing("native", "image", false);
+  groups.registerResource("image", true);
+  assert.throws(() => groups.resolveGroupRoutes(), /Connected group conflict/);
+});

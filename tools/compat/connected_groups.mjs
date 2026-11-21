@@ -22,6 +22,10 @@ export class ConnectedCompatibilityGroups {
     this._rank = new Map();
     /** @type {Map<string, { type: 'renderer' | 'resource', preferredRoute?: string, forcedRoute?: string, isMutable?: boolean, reasons: string[] }>} */
     this._nodes = new Map();
+    // Read-only residencies stay independent, but their users must remain known:
+    // a later write promotes the resource and couples every earlier residency.
+    /** @type {Map<string, Set<string>>} */
+    this._resourceUsers = new Map();
     /** @type {Map<string, Set<string>>} group id -> set of node ids */
     this._groupMembers = new Map();
     /** @type {Map<string, string>} rendererId -> committed/locked route */
@@ -71,10 +75,14 @@ export class ConnectedCompatibilityGroups {
       });
       this._parent.set(resourceId, resourceId);
       this._rank.set(resourceId, 0);
+      this._resourceUsers.set(resourceId, new Set());
     } else {
       const node = this._nodes.get(resourceId);
       if (isMutable && !node.isMutable) {
         node.isMutable = true;
+        for (const rendererId of this._resourceUsers.get(resourceId) ?? []) {
+          this.union(rendererId, resourceId);
+        }
       }
     }
   }
@@ -147,7 +155,10 @@ export class ConnectedCompatibilityGroups {
   recordResourceSharing(rendererId, resourceId, isMutable = true) {
     this.registerRenderer(rendererId);
     this.registerResource(resourceId, isMutable);
-    if (isMutable) {
+    this._resourceUsers.get(resourceId).add(rendererId);
+    // A read of an already-written resource shares that GPU history too. A
+    // per-use read-only flag cannot undo the resource's known mutable state.
+    if (this.isResourceMutable(resourceId)) {
       this.union(rendererId, resourceId);
     }
   }
@@ -277,13 +288,19 @@ export class ConnectedCompatibilityGroups {
     let primaryGroupId;
 
     const checkedRoots = new Set();
-    for (const { id: resId, isMutable } of resources) {
-      if (!isMutable || !this._nodes.has(resId)) continue;
+    for (const { id: resId, isMutable = true } of resources) {
+      if (!this._nodes.has(resId) || !isMutable && !this.isResourceMutable(resId)) continue;
       const root = this.find(resId);
       if (!primaryGroupId) primaryGroupId = root;
-      if (checkedRoots.has(root)) continue;
       checkedRoots.add(root);
+      // Preview the same unions registerResource will perform on promotion,
+      // without publishing mutability or connecting any group before preflight.
+      for (const rendererId of this._resourceUsers.get(resId) ?? []) {
+        checkedRoots.add(this.find(rendererId));
+      }
+    }
 
+    for (const root of checkedRoots) {
       const members = this.getGroupMembers(root);
       for (const memberId of members) {
         const node = this._nodes.get(memberId);
