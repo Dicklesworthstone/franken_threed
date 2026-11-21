@@ -1090,6 +1090,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       this._renderTarget = renderTarget;
       this._activeCubeFace = activeCubeFace;
       this._activeMipmapLevel = activeMipmapLevel;
+      // Explicit selections remain effects even when they select the same view.
+      this._renderTargetSelectionVersion = (this._renderTargetSelectionVersion ?? 0) + 1;
     }
     /** F3D extensions: call-time upload snapshots and ordered GPU-only copies.
      * Regions use this surface's origin (WebGPU top-left, WebGL bottom-left),
@@ -2188,6 +2190,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           const pendingBefore = this._pending.length;
           let pendingAfterCapture = null;
           const previousNativeRenderDepth = this._nativeRenderDepth;
+          const previousSelection = {target: this._renderTarget, face: this._activeCubeFace,
+            mip: this._activeMipmapLevel, version: this._renderTargetSelectionVersion};
           this._nativeRenderDepth = request.nativeRenderDepth;
           request.depthClearValue = this.getClearDepth(); request.stencilClearValue = this._clearStencil;
           try {
@@ -2242,6 +2246,14 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           } finally {
             this._restoreSceneLifecycle(request.sceneLifecycle);
             this._nativeRenderDepth = previousNativeRenderDepth;
+            // Accepted capture borrows its original view through both scene
+            // hooks. Restore later application state only when no callback
+            // made an explicit selection, including a same-view selection.
+            if (this._renderTargetSelectionVersion === previousSelection.version) {
+              this._renderTarget = previousSelection.target;
+              this._activeCubeFace = previousSelection.face;
+              this._activeMipmapLevel = previousSelection.mip;
+            }
             request.nodeCaptureDeferred = false;
             const parent = this._pending.indexOf(request);
             if (parent !== -1 && this._pending.length > pendingBefore) {

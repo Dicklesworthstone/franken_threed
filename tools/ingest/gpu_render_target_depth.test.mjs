@@ -62,7 +62,7 @@ for (const depthFormat of ['depth16unorm', 'depth24plus', 'depth32float']) for (
       assert.equal(depth.format, depthFormat);
       assert.equal(depth.sampleCount, sampleCount);
       assert.equal(depth.mipLevelCount, 1);
-      assert.equal(depth.usage, 4 | 16);
+      assert.equal(depth.usage, 1 | 4 | 16);
       assert.equal(depth.createView({aspect: 'depth-only'}).texture, written);
     }), true);
     target.withTexture(color => { assert.notEqual(color, written); assert.equal(color.sampleCount, 1); });
@@ -79,7 +79,7 @@ test('default render-only depth and depthless owners do not acquire sampled-dept
   for (const depthFormat of [null, 'depth24plus']) {
     const f = gpuTargetMipmapFixture(), target = make(f, {depthFormat, sampleDepth: false});
     target.withFrame(frame => {
-      if (depthFormat) assert.equal(frame.depthView.texture.usage, 16);
+      if (depthFormat) assert.equal(frame.depthView.texture.usage, 1 | 16);
       else assert.equal(frame.depthView, undefined);
     });
     assert.throws(() => target.withDepthTexture(() => assert.fail('no sampled depth')), {code: 'GPU_TARGET_DEPTH'});

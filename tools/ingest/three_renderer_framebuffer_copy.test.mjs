@@ -503,3 +503,68 @@ for (const acceptedMip of [0, 1]) test(`deferred depth capture retains accepted 
   } else await assert.rejects(pending, {code: 'F3D_RENDERER_COPY'});
   assert.equal(renderer.getActiveMipmapLevel(), 1 - acceptedMip);
 });
+
+for (const changed of ['target', 'face', 'mip']) test(`deferred scene capture preserves a later ${changed} selection after observing its accepted view`, async t => {
+  const f = await fixture(t, {}, false), {renderer, scene, camera} = f;
+  const target = new THREE.CubeRenderTarget(16), other = new THREE.RenderTarget(8, 8);
+  target.texture.generateMipmaps = true; other.texture.generateMipmaps = true;
+  t.after(() => { target.dispose(); other.dispose(); });
+  const accepted = [target, 1, 0], later = changed === 'target' ? [other, 0, 0]
+    : changed === 'face' ? [target, 4, 0] : [target, 1, 1];
+  const selection = () => [renderer.getRenderTarget(), renderer.getActiveCubeFace(), renderer.getActiveMipmapLevel()];
+  const observed = [];
+  scene.onBeforeRender = () => observed.push(['before', ...selection()]);
+  scene.onAfterRender = () => observed.push(['after', ...selection()]);
+  f.mesh(new THREE.MeshBasicMaterial()); renderer.setRenderTarget(...accepted);
+  const pending = renderer.renderAsync(scene, camera);
+  renderer.setRenderTarget(...later);
+  assert.deepEqual(selection(), later);
+  await pending; await renderer.waitForGPU();
+  assert.deepEqual(observed, [['before', ...accepted], ['after', ...accepted]], 'capture never exposes a later selector to source hooks');
+  assert.deepEqual(selection(), later, 'temporary capture selection must not replace application state');
+  assert.equal(meshDraws(f.events).length, 1);
+  const pass = f.events.find(event => event.draws.some(draw => draw.indexed));
+  assert.equal(pass.desc.colorAttachments[0].view.texture.width, 16, 'the accepted render keeps its original destination');
+});
+
+for (const phase of ['onBeforeRender', 'onAfterRender']) for (const sameView of [false, true])
+test(`deferred ${phase} preserves an explicit ${sameView ? 'same-view' : 'different-view'} selection`, async t => {
+  const f = await fixture(t, {}, false), {renderer, scene, camera} = f;
+  const target = new THREE.RenderTarget(16, 16), later = new THREE.RenderTarget(8, 8), selected = new THREE.CubeRenderTarget(16);
+  selected.texture.generateMipmaps = true;
+  t.after(() => { target.dispose(); later.dispose(); selected.dispose(); });
+  const desired = sameView ? [target, 0, 0] : [selected, 3, 1];
+  let calls = 0;
+  scene[phase] = () => {
+    calls++;
+    assert.equal(renderer.getRenderTarget(), target, 'the hook starts in the captured context');
+    renderer.setRenderTarget(...desired);
+  };
+  f.mesh(new THREE.MeshBasicMaterial()); renderer.setRenderTarget(target);
+  const pending = renderer.renderAsync(scene, camera); renderer.setRenderTarget(later);
+  await pending; await renderer.waitForGPU();
+  assert.equal(calls, 1);
+  assert.deepEqual([renderer.getRenderTarget(), renderer.getActiveCubeFace(), renderer.getActiveMipmapLevel()], desired);
+  assert.equal(meshDraws(f.events).length, 1);
+});
+
+for (const phase of ['onBeforeRender', 'onAfterRender']) for (const select of [false, true])
+test(`throwing deferred ${phase} ${select ? 'retains its explicit selection' : 'releases its borrowed selection'}`, async t => {
+  const f = await fixture(t, {}, false), {renderer, scene, camera} = f;
+  const target = new THREE.RenderTarget(16, 16), later = new THREE.RenderTarget(8, 8);
+  t.after(() => { target.dispose(); later.dispose(); });
+  const failure = new Error('authored hook failed'); let calls = 0;
+  scene[phase] = () => {
+    calls++;
+    assert.equal(renderer.getRenderTarget(), target);
+    if (select) renderer.setRenderTarget(target, 0, 0);
+    throw failure;
+  };
+  f.mesh(new THREE.MeshBasicMaterial()); renderer.setRenderTarget(target);
+  const pending = renderer.renderAsync(scene, camera); renderer.setRenderTarget(later);
+  await assert.rejects(pending, error => error === failure);
+  assert.equal(calls, 1);
+  assert.equal(renderer.getRenderTarget(), select ? target : later);
+  assert.equal(renderer.getActiveCubeFace(), 0); assert.equal(renderer.getActiveMipmapLevel(), 0);
+  assert.equal(meshDraws(f.events).length, phase === 'onAfterRender' ? 1 : 0, 'authored exceptions preserve source partial effects');
+});
