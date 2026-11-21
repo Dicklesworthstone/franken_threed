@@ -19,6 +19,7 @@ import { parseHtmlEntries } from "./html_parser.mjs";
 import { getBaseUrl, resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { IngestionResolutionError, SCHEMA_VERSION } from "./types.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { commonjsFormat } from "./commonjs_modules.mjs";
 import { normalizeDocumentRoot, documentRelativePath } from "./document_urls.mjs";
 
@@ -161,6 +162,14 @@ export async function buildModuleGraph(entryPath, options = {}) {
     });
   }
 
+  const importedStrings = createImportedStringResolver({
+    readModule: url => path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+      commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
+    resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
+      mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+    }),
+  });
+
   // Process module queue
   while (queue.length > 0) {
     const item = queue.shift();
@@ -227,7 +236,8 @@ export async function buildModuleGraph(entryPath, options = {}) {
     // input unparsed: its rejection belongs to the original import() boundary.
     const sourceFormat = !nativeResource ? commonjsFormat(sourceUrl, moduleSources, {inline: item.isInline}) : 'module';
     const commonJS = sourceFormat !== 'module';
-    const analysis = analyzeModuleAst(nativeResource || commonJS ? "" : sourceCode, sourceUrl, item.offsets || {});
+    const analysis = analyzeModuleAst(nativeResource || commonJS ? "" : sourceCode, sourceUrl,
+      item.offsets || {}, null, importedStrings(sourceUrl));
     if (!nativeResource && !commonJS) sourceInputs.set(moduleId, {code: sourceCode, sourceUrl, offsets: item.offsets || {}});
     if (moduleType === "json") analysis.staticExports.push({type: "default", local_name: null, localName: null});
 

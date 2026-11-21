@@ -91,6 +91,40 @@ async function equivalent(t, lane, files, expected) {
 }
 
 for (const lane of ["document", "worker"]) {
+  test(`${lane}: imported primitive selectors retain lazy modules, reexports, effects and JSON identity offline`, async (t) => {
+    await equivalent(t, lane, {
+      "main.mjs": `import {entry, alternate, json, log} from './relay.mjs';
+        export async function run(){const initial=log.slice();
+          const load=flag=>import((log.push('select:'+flag),flag?entry:alternate));
+          const first=await load(true), second=await load(false), again=await load(true);
+          const config=await import(json,(log.push('options'),{with:{type:'json'}}));
+          const other=await import(json,{with:{type:'json'}});
+          first.bump(); return [initial,entry,alternate,first===again,config===other,
+            first.value,second.value,config.default.value,log];}`,
+      "relay.mjs": `export {entry, default as alternate, json, log} from './config.mjs';`,
+      "config.mjs": `export const log=[]; await Promise.resolve(log.push('ready'));
+        export const entry=(log.push('entry'),'./a.mjs'); export default './b.mjs';
+        export const json='./settings.json';`,
+      "a.mjs": `export let value=7; export const bump=()=>++value;`,
+      "b.mjs": `export const value=23;`,
+    }, {ok: true, value: [["ready", "entry"], "./a.mjs", "./b.mjs", true, true, 8, 23, 42,
+      ["ready", "entry", "select:true", "select:false", "select:true", "options"]]});
+  });
+}
+
+test('document: imported selector cycles preserve early TDZ rejection and later module loading', async (t) => {
+  await equivalent(t, 'document', {
+    'main.mjs': `import {entry,early} from './config.mjs';
+      export function load(){return import(entry);}
+      export async function run(){return [await early,(await load()).value,entry];}`,
+    'config.mjs': `import {load} from './app.mjs';
+      export const early=(async()=>{try{await load();return 'unexpected';}catch(error){return error.name;}})();
+      export const entry='./lazy.mjs';`,
+    'lazy.mjs': `export const value=42;`,
+  }, {ok: true, value: ['ReferenceError',42,'./lazy.mjs']});
+});
+
+for (const lane of ["document", "worker"]) {
   test(`${lane}: JSON static/reexport/lazy identity, BOM, duplicate keys and signed zero`, async (t) => {
     await equivalent(t, lane, {
       "main.mjs": `import config from './settings.json' with {type:'json'};

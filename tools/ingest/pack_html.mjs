@@ -18,6 +18,7 @@ import * as acorn from "acorn";
 import * as walk from "acorn-walk";
 import { embedGltfAssets } from "./pack_gltf.mjs";
 import { createDynamicImportClassifier } from "./ast_analyzer.mjs";
+import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { isThreeLoaderResourceModule } from "./three_loader_resources.mjs";
 import { analyzeDocumentFetch, isLocalDocumentFetchUrl } from "./document_fetch_assets.mjs";
 import { documentRelativePath, isRootRelativeDocumentUrl, normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
@@ -445,6 +446,15 @@ export function packHtml(
       fail("UNRESOLVED_IMPORT", `Bare import ${JSON.stringify(specifier)} has no closed mapping`);
     return local(normalized, from);
   }
+  const importedStrings = createImportedStringResolver({
+    readModule: url => JS_TYPES.has(moduleMime(url)) ? text(read(url)) : null,
+    resolveModule,
+  });
+  const workerImportedStrings = createImportedStringResolver({
+    readModule: url => JS_TYPES.has(moduleMime(url)) ? text(read(url)) : null,
+    resolveModule: (specifier, from) => /^(\.?\.?\/|[a-z][\w+.-]*:)/i.test(specifier)
+      ? local(specifier, from) : null,
+  });
   function keyFor(url) {
     const value = new URL(url);
     const logical =
@@ -765,7 +775,8 @@ export function packHtml(
       if (worker?.kind === "classic") for (const name of names) worker.hostUses.add(name);
       else if (!worker) for (const name of names) documentWorkerUses.add(name);
     }
-    const classifyImport = createDynamicImportClassifier(ast);
+    const classifyImport = createDynamicImportClassifier(ast,
+      (worker ? workerImportedStrings : importedStrings)(from));
     // Rewrite finite URL results at their use, keeping declarations, selectors,
     // native URL construction and caller options in their original order.
     function rewriteURLs(node, origin, emit, code, depth = 0, budget = { count: 0 }) {

@@ -212,12 +212,12 @@ export function classifyDynamicImportArgument(sourceNode, resolveReference = nul
  * shadow outer constants. Runtime selection, TDZ failures and initializer
  * effects stay in the source; this proves possible URLs, not a constant value.
  */
-export function createDynamicImportClassifier(ast) {
+export function createDynamicImportClassifier(ast, resolveImportedString = null) {
   // Sloppy scripts can introduce bindings with direct eval/with. Their existing
   // literal-only path remains conservative; ES modules are always strict.
   if (ast.sourceType === "script") return node => classifyDynamicImportArgument(node);
   const scopes = new WeakMap(), enclosing = new WeakMap(), values = new WeakMap(), selections = new WeakMap();
-  const parents = new WeakMap(), destructured = new WeakMap(), nodes = [];
+  const parents = new WeakMap(), destructured = new WeakMap(), imported = new WeakMap(), nodes = [];
   const functions = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
   const lexical = new Set(["Program", "BlockStatement", "StaticBlock", "CatchClause",
     "ForStatement", "ForInStatement", "ForOfStatement", "SwitchStatement", ...functions]);
@@ -263,7 +263,13 @@ export function createDynamicImportClassifier(ast) {
           node.kind === "const" && pattern.type === "Identifier" ? declaration.init : null);
       }
     } else if (node.type === "ImportDeclaration") {
-      put(ast, node.specifiers.map(specifier => specifier.local.name));
+      for (const specifier of node.specifiers) {
+        const name = specifier.type === "ImportDefaultSpecifier" ? "default" :
+          specifier.type === "ImportSpecifier" ? specifier.imported.name ?? specifier.imported.value : null;
+        const admitted = resolveImportedString && name !== null && !node.attributes?.length;
+        put(ast, [specifier.local.name], admitted ? specifier : null);
+        if (admitted) imported.set(specifier, {source: node.source.value, name});
+      }
     } else if (node.type === "ExportNamedDeclaration" && !node.source) {
       // Acorn-walk does not visit export specifier identifiers as expressions.
       // They still expose a local table to arbitrary module consumers.
@@ -304,6 +310,14 @@ export function createDynamicImportClassifier(ast) {
     const cache = node.type === "Identifier" ? values : selections;
     if (cache.has(key)) return cache.get(key);
     cache.set(key, null);
+    if (imported.has(key)) {
+      const {source, name} = imported.get(key);
+      const candidates = resolveImportedString(source, name, depth);
+      if (!Array.isArray(candidates) || !candidates.length || candidates.length > 128 ||
+          candidates.some(value => typeof value !== "string" || value.length > 65536)) return null;
+      cache.set(key, candidates);
+      return candidates;
+    }
     depth++;
     const result = new Set();
     for (const source of sources) {
@@ -1769,7 +1783,7 @@ function isImportMetaUrl(node) {
  * @param {Object} [offsets] - Line/column offsets for inline scripts
  * @returns {Object} Structured module AST analysis
  */
-export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract = null) {
+export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract = null, resolveImportedString = null) {
   let ast;
   try {
     ast = acorn.parse(code, {
@@ -1979,7 +1993,7 @@ export function analyzeModuleAst(code, moduleUrl, offsets = {}, consumerContract
   // 3. Classes and prototype writes
   // 4. new URL(..., import.meta.url) asset patterns
   // 5. Renderer construction sites and WebGL escapes
-  const classifyImport = createDynamicImportClassifier(ast);
+  const classifyImport = createDynamicImportClassifier(ast, resolveImportedString);
   const inspectorImports = verifiedInspectorExtensionImports(code, ast);
   const rendererResources = analyzeRendererResourceEscapes(ast, offsets, consumerContract);
   walk.ancestor(ast, {

@@ -19,6 +19,7 @@ import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
 import { moduleWorkerRollupPlugin, findWorkerUrlOperands, workerNumericReport } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
+import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsJsonSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
 import { transformThreePostProcessing } from "./postprocessing_contracts.mjs";
 import { transformThreeGpuComputation } from "./gpu_computation_contracts.mjs";
@@ -112,6 +113,13 @@ export function f3dRollupPlugin(options = {}) {
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
   const retainedModuleUrls = options.retainedModuleUrls || new Map();
+  const importedStrings = createImportedStringResolver({
+    readModule: url => path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+      commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
+    resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
+      mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+    }),
+  });
   const emittedAssetsByPath = new Map();
   const emittedChunksByUrl = new Map();
   const emittedJsonByUrl = new Map();
@@ -387,7 +395,7 @@ export function f3dRollupPlugin(options = {}) {
       const edits = [];
 
       // 1. Asset reference replacements: new URL(..., import.meta.url)
-      const analysis = analyzeModuleAst(code, id);
+      const analysis = analyzeModuleAst(code, id, {}, null, importedStrings(referrerUrl));
       const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
       const workerUrls = new Set(documentRoot && code.includes("Worker")
         ? findWorkerUrlOperands(code, {unavailableGlobals: options.workerHostBindings}).map(node => node.start) : []);
@@ -452,7 +460,7 @@ export function f3dRollupPlugin(options = {}) {
       if (ast) {
         if (options.documentUrl && code.includes("fetch"))
           documentFetchSites.push(...analyzeDocumentFetch(ast).sites);
-        const classifyImport = createDynamicImportClassifier(ast);
+        const classifyImport = createDynamicImportClassifier(ast, importedStrings(referrerUrl));
         const inspectorImports = new Map(analysis.dynamicImports.filter(request => request.runtime_fallback === true)
           .map(request => [request.source_span.start.offset, request]));
         if (options.prepareStandaloneLoaders && options.documentUrl && id.startsWith("file:")) {

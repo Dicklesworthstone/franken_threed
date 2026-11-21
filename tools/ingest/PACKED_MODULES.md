@@ -356,7 +356,33 @@ unchanged; analysis does not freeze objects or replace runtime reads. This
 shared rule also reaches module worker URLs, finite document fetches, Three
 loader resources and finite CommonJS requires.
 
-Parameters, mutable or imported bindings, opaque property/call results,
+Resolved static imports can also carry finite primitive strings across module
+boundaries. Named/default exports, explicit reexports and local immutable aliases
+share the ordinary import-map/package resolution and normalized source snapshot:
+
+```js
+// routes.mjs
+export const viewer = './viewer.mjs';
+export default './editor.mjs';
+
+// app.mjs
+import editor, { viewer } from './routes.mjs';
+export const open = preview => import(preview ? viewer : editor);
+```
+
+The URL strings still resolve from the importing application module. Module
+ingestion and the ordinary application build include every finite target, and
+direct standalone document/module-worker packing uses the same proof. Only the
+consumed import operand receives a mapping; exported strings, initialization
+effects, top-level await, live module identity and early cyclic TDZ errors remain
+source-owned. The analysis inspects at most 128 exact module URLs and 2 MiB of source
+per build pass, with a combined depth of at most 64 local aliases/export hops. It never evaluates
+configuration modules. Namespace selection, star reexports, mutable bindings,
+opaque values, JSON/CommonJS imports and unresolved external modules do not prove
+a finite selector. This does not extend imported selectors to ordinary worker
+relocation or every loader/fetch discovery consumer.
+
+Parameters, mutable bindings, unproved imported values, opaque property/call results,
 array patterns, rest/default/nested/computed patterns and escaped tables are
 not assumed constant. Lexical shadowing is respected, including
 function defaults and switch discriminants. Alias cycles and excessive expansion
