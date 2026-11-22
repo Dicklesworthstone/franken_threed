@@ -149,6 +149,44 @@ export const dispose=()=>view.renderer.dispose();
   } finally { await emitted?.dispose(); globalThis.document=previous; }
 });
 
+test('imported renderer factory callbacks route emitted applications with source effects and canvas identity', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+import {setup} from './setup.js';
+const events=[];
+const canvas=document.createElement('canvas');
+function create(canvas) {
+  events.push('factory');
+  return new THREE.WebGPURenderer({canvas,get antialias(){events.push('antialias');return false;}});
+}
+const renderer=setup(create,canvas,events);
+export const observed=events;
+export const flags=[renderer.isF3DRenderer===true,renderer.isWebGPURenderer,renderer instanceof THREE.WebGPURenderer,renderer.domElement===canvas];
+export const size=renderer.getSize(new THREE.Vector2()).toArray();
+export const dispose=()=>renderer.dispose();
+`);
+  fs.writeFileSync(path.join(a.dir,'setup.js'), `export function setup(make,canvas,events){
+    events.push('setup'); const renderer=make(canvas); events.push('configured');
+    renderer.setSize(48,32,false); return renderer;
+  }`);
+  const result=await buildApplication(a.entry,a.out,{routeWebGPURenderer:true});
+  const referenceOut=path.join(a.dir,'reference'), reference=await buildApplication(a.entry,referenceOut);
+  assert.equal(result.rendererRoute.routed,true);
+  assert.deepEqual(result.rendererRoute.decisions.map(site=>site.route),['general-webgpu']);
+  const previous=globalThis.document;
+  globalThis.document={createElement:()=>({width:300,height:150,style:{}})};
+  let emitted, original;
+  try {
+    original=await import(pathToFileURL(path.join(referenceOut,reference.entryFiles[0])).href);
+    emitted=await import(pathToFileURL(path.join(a.out,result.entryFiles[0])).href);
+    assert.deepEqual(emitted.flags,[true,true,true,true]);
+    assert.deepEqual(original.flags,[false,true,true,true]);
+    assert.deepEqual(emitted.observed,original.observed);
+    assert.equal(emitted.observed[0],'setup'); assert.equal(emitted.observed[1],'factory');
+    assert.equal(emitted.observed.at(-1),'configured');
+    assert.deepEqual(emitted.size,original.size); assert.deepEqual(emitted.size,[48,32]);
+  } finally { await emitted?.dispose(); globalThis.document=previous; }
+});
+
 test('publishing a renderer state record keeps its genuine source owner in the built application', async () => {
   const a=app(`import * as THREE from 'three/webgpu';
 const state={renderer:new THREE.WebGPURenderer()};

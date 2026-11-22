@@ -97,6 +97,19 @@ applications can use this route when their construction decisions share the
 native route. Mixed source/native modules additionally require the resource proof
 above; its current single-module boundary retains multi-module mixed applications.
 
+Closed synchronous setup helpers may also accept a renderer factory callback.
+Every call must supply the same immutable function for that parameter, and the
+parameter may only be called directly. Inline factories and named local or
+statically imported factories use the existing return, canvas and resource
+ownership proof, including nested closed helpers. The original callback calls,
+constructor options and application effects remain in the emitted JavaScript.
+The proof admits at most 64 callback parameters and rechecks the complete helper
+graph for escapes and recursion after resolving them. Exported or escaping
+callers/factories, reassignment, callback aliases/forwarding, mixed or missing
+targets, spread calls, async/generator callbacks and opaque canvas inputs retain
+the exact route. `ast_routing.test.mjs`, `renderer_module_ownership.test.mjs` and
+`renderer_route_build.test.mjs` cover these boundaries and production emission.
+
 The linked proof also composes with the source-verified controls and
 `RendererInspector` contracts described below. Renderer factories, navigation
 helpers and Inspector attachment helpers may live in separate static modules.

@@ -113,6 +113,20 @@ test('imported factories and consumers retain one owned renderer and original so
     const renderer = create(); draw(renderer, scene, camera);`, 'create.mjs': create, 'draw.mjs': consume});
 });
 
+test('imported setup helpers close immutable renderer factory callbacks without rewriting source', async () => {
+  const sources = {
+    'entry.mjs': `import {create} from './create.mjs'; import {setup} from './setup.mjs';
+      const canvas=document.createElement('canvas'); const renderer=setup(create,canvas); renderer.render(scene,camera);`,
+    'create.mjs': `import {WebGPURenderer} from 'three/webgpu';
+      export function create(canvas){return new WebGPURenderer({canvas});}`,
+    'setup.mjs': `export function setup(make,canvas){function invoke(canvas){return make(canvas);}return invoke(canvas);}`,
+  };
+  await closes(sources);
+  for (const extra of ['export {setup};', 'export {create};', 'setup(plugin,canvas);', 'plugin(canvas);'])
+    await remainsExact({...sources, 'entry.mjs': sources['entry.mjs'] + extra});
+  await remainsExact({...sources, 'setup.mjs': `export function setup(make,canvas){plugin(make);return make(canvas);}`});
+});
+
 test('aliases, static namespace selection, default exports and reexport chains stay closed', async () => {
   for (const [main, barrel, factory] of [
     [`import {make as construct} from './barrel.mjs'; const renderer=construct(); renderer.render(scene,camera);`,

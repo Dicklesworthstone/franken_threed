@@ -393,6 +393,56 @@ test("factory results remain resources at exports, opaque calls, containers, thr
   }
 });
 
+test('closed setup helpers retain ownership through synchronous renderer factory parameters', () => {
+  for (const source of [
+    'function setup(make){const renderer=make();renderer.render(scene,camera);} setup(()=>new WebGPURenderer());',
+    'function setup(make){return make();} const factory=()=>new WebGPURenderer(); setup(factory).render(scene,camera);',
+    'function setup(make,canvas){return make(canvas);} function factory(canvas){return new WebGPURenderer({canvas});}' +
+      'setup(factory,document.createElement("canvas")).render(scene,camera);setup(factory,document.createElement("canvas")).render(scene,camera);',
+    'function setup(make,canvas){function nested(canvas){return make(canvas);}return nested(canvas);}' +
+      'function factory(canvas){return new WebGPURenderer({canvas});}setup(factory,document.createElement("canvas")).render(scene,camera);',
+    'function setup(first,second){first().render(scene,camera);second().render(scene,camera);}' +
+      'function factory(){return new WebGPURenderer();}setup(factory,factory);',
+  ]) {
+    const result = analyzeModuleAst(source, moduleUrl);
+    assert.deepEqual(result.routingFacts.escapes, [], source);
+    assert.equal(decision(result).route, 'general-webgpu', source);
+  }
+});
+
+test('factory callback parameters require every caller and every callable reference to stay closed', () => {
+  const factory = 'function factory(canvas){return new WebGPURenderer({canvas});}';
+  const canvas = 'const canvas=document.createElement("canvas");';
+  for (const [setup, use] of [
+    ['export function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'globalThis.setup=setup;setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'plugin(factory);setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'export {factory};setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas);setup(unknown,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas);setup();'],
+    ['function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas);setup(factory,host.canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'plugin(canvas);setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'setup=unknown;setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'factory=unknown;setup(factory,canvas);'],
+    ['function setup(make,canvas){plugin(make);return make(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){const alias=make;return alias(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){make=unknown;return make(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){return make.call(null,canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(...[canvas]);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){return arguments[0](canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){register(()=>make(canvas));}', 'setup(factory,canvas);'],
+    ['async function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){if(flag)return setup(make,canvas);return make(canvas);}', 'setup(factory,canvas);'],
+    ['function setup(make,canvas){return make(canvas);}', 'setup(factory,canvas).getContext();'],
+  ]) assert.equal(decision(analyzeModuleAst(factory + canvas + setup + use, moduleUrl)).route, 'exact-backend', setup + use);
+  for (const selected of [
+    'async function factory(){return new WebGPURenderer();}',
+    'function factory(){if(flag)return setup(factory);return new WebGPURenderer();}',
+    'function factory(){return flag?new WebGPURenderer():unknown();}',
+  ]) assert.equal(decision(analyzeModuleAst('function setup(make){return make();}' + selected +
+    'setup(factory).render(scene,camera);', moduleUrl)).route, 'exact-backend', selected);
+});
+
 test("escaped, reassigned, recursive, async and dynamically selected factories stay conservative", () => {
   for (const source of [
     "export function make() { return new WebGPURenderer(); } make().render(scene,camera);",

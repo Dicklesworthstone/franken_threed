@@ -1133,48 +1133,98 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   }
   for (const node of nodes) {
     if (node.type === "ReturnStatement") helperReturns.get(functionOf(node))?.push(node.argument);
-    const helper = localHelper(node);
-    if (helper) {
-      if (!helperCalls.has(helper)) helperCalls.set(helper, []);
-      helperCalls.get(helper).push(node);
-      const owner = functionOf(node);
-      if (owner) {
-        if (!helperEdges.has(owner)) helperEdges.set(owner, new Set());
-        helperEdges.get(owner).add(helper);
+  }
+  const callbackParameters = new Map();
+  const collectHelperCalls = () => {
+    helperCalls.clear(); helperEdges.clear();
+    for (const node of nodes) {
+      const helper = localHelper(node);
+      if (helper) {
+        if (!helperCalls.has(helper)) helperCalls.set(helper, []);
+        helperCalls.get(helper).push(node);
+        const owner = functionOf(node);
+        if (owner) {
+          if (!helperEdges.has(owner)) helperEdges.set(owner, new Set());
+          helperEdges.get(owner).add(helper);
+        }
       }
     }
-  }
-  const closedHelpers = new Set(helperCalls.keys());
-  for (const helper of closedHelpers) {
-    const parent = parents.get(helper), declaration = parent?.type === "VariableDeclarator" ? parents.get(parent) : helper;
-    const owner = parents.get(declaration);
-    if (owner?.type === "ExportNamedDeclaration" || owner?.type === "ExportDefaultDeclaration" ||
-        !(helper.type === "FunctionDeclaration" || parent?.type === "VariableDeclarator" && parent.id.type === "Identifier" ||
-          parent?.type === "CallExpression" && parent.callee === helper)) closedHelpers.delete(helper);
-  }
-  for (const node of nodes) {
-    // Acorn's reference walk omits export specifier identifiers. They still
-    // publish a callable factory to consumers outside this lexical proof.
-    if (node.type === "ExportNamedDeclaration" && !node.source)
-      for (const specifier of node.specifiers) closedHelpers.delete(helperTargets.get(binding(specifier.local)));
-    if (node.type !== "Identifier") continue;
-    const helper = helperTargets.get(binding(node));
-    if (!closedHelpers.has(helper)) continue;
-    const parent = parents.get(node);
-    const declaration = node === helper.id || parent?.type === "VariableDeclarator" && parent.id === node && parent.init === helper;
-    if (!declaration && !(parent?.type === "CallExpression" && parent.callee === node && localHelper(parent) === helper))
-      closedHelpers.delete(helper);
-  }
-  // Recursive call graphs do not establish a finite return/provenance proof.
-  const acyclic = new Map(), activeHelpers = new Set();
-  const closes = (helper, depth = 0) => {
-    if (depth > 64 || activeHelpers.has(helper)) return false;
-    if (acyclic.has(helper)) return acyclic.get(helper);
-    activeHelpers.add(helper);
-    const result = [...(helperEdges.get(helper) ?? [])].every(child => closes(child, depth + 1));
-    activeHelpers.delete(helper); acyclic.set(helper, result); return result;
   };
-  for (const helper of closedHelpers) if (!closes(helper)) closedHelpers.delete(helper);
+  const passedHelper = (node, helper, closed) => {
+    const call = parents.get(node), owner = call?.type === "CallExpression" && localHelper(call);
+    const index = call?.arguments?.indexOf(node) ?? -1;
+    return index >= 0 && closed.has(owner) && owner.params[index] &&
+      callbackParameters.get(binding(owner.params[index]))?.target === helper;
+  };
+  const closeHelpers = () => {
+    const closed = new Set(helperCalls.keys()), acyclic = new Map(), active = new Set();
+    // Callback edges participate in the same finite return/provenance proof.
+    const closes = (helper, depth = 0) => {
+      if (depth > 64 || active.has(helper)) return false;
+      if (acyclic.has(helper)) return acyclic.get(helper);
+      active.add(helper);
+      const result = [...(helperEdges.get(helper) ?? [])].every(child => closes(child, depth + 1));
+      active.delete(helper); acyclic.set(helper, result); return result;
+    };
+    for (const helper of closed) if (!closes(helper)) closed.delete(helper);
+    let previous;
+    do {
+      previous = closed.size;
+      for (const helper of closed) {
+        const parent = parents.get(helper), declaration = parent?.type === "VariableDeclarator" ? parents.get(parent) : helper;
+        const owner = parents.get(declaration);
+        if (owner?.type === "ExportNamedDeclaration" || owner?.type === "ExportDefaultDeclaration" ||
+            !(helper.type === "FunctionDeclaration" || parent?.type === "VariableDeclarator" && parent.id.type === "Identifier" ||
+              parent?.type === "CallExpression" && parent.callee === helper || passedHelper(helper, helper, closed)))
+          closed.delete(helper);
+      }
+      for (const node of nodes) {
+        // Export specifiers are omitted by Acorn's ordinary reference walk.
+        if (node.type === "ExportNamedDeclaration" && !node.source)
+          for (const specifier of node.specifiers) closed.delete(helperTargets.get(binding(specifier.local)));
+        if (node.type !== "Identifier") continue;
+        const cell = binding(node), helper = helperTargets.get(cell);
+        if (!closed.has(helper)) continue;
+        const parent = parents.get(node);
+        const declaration = node === helper.id || callbackParameters.get(cell)?.parameter === node ||
+          parent?.type === "VariableDeclarator" && parent.id === node && parent.init === helper;
+        if (!declaration && !(parent?.type === "CallExpression" && parent.callee === node && localHelper(parent) === helper) &&
+            !passedHelper(node, helper, closed)) closed.delete(helper);
+      }
+    } while (closed.size !== previous);
+    return closed;
+  };
+  collectHelperCalls();
+  let closedHelpers = closeHelpers();
+  // A factory argument stays local only when every invocation of its owner
+  // supplies one known synchronous function, and the parameter is solely used
+  // as a direct call target. No callback aliases, forwarding or heap simulation.
+  for (const owner of closedHelpers) for (const parameter of owner.params) {
+    if (callbackParameters.size >= 64) break;
+    const cell = binding(parameter);
+    if (helperWrites.has(cell)) continue;
+    const uses = nodes.filter(node => node.type === "Identifier" && node !== parameter && binding(node) === cell);
+    if (!uses.length || uses.some(node => {
+      const call = parents.get(node);
+      return call?.type !== "CallExpression" || call.callee !== node || call.arguments.some(value => value.type === "SpreadElement");
+    })) continue;
+    const index = owner.params.indexOf(parameter), targets = helperCalls.get(owner).map(call => {
+      const argument = call.arguments[index];
+      return argument && localHelper({type: "CallExpression", callee: argument, arguments: []});
+    });
+    const target = targets[0];
+    if (!target || targets.some(value => value !== target)) continue;
+    callbackParameters.set(cell, {owner, target, parameter}); helperTargets.set(cell, target);
+  }
+  if (callbackParameters.size) for (;;) {
+    collectHelperCalls(); closedHelpers = closeHelpers();
+    let removed = false;
+    for (const [cell, {owner, target}] of callbackParameters) {
+      if (closedHelpers.has(owner) && closedHelpers.has(target)) continue;
+      callbackParameters.delete(cell); helperTargets.delete(cell); removed = true;
+    }
+    if (!removed) break;
+  }
   const markCanvas = (node, depth = 0) => {
     if (!node) return;
     if (depth > 64) { report(node, "canvas-alias-limit"); return; }
