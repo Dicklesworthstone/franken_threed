@@ -1,3 +1,5 @@
+import {isOrdinaryPassDeformation} from './three_pass_deformation.mjs';
+
 /** Per-request values for ordinary fixed-path materials.
  * Source identities remain cache/disposal keys; only callback-free value data is
  * copied. Geometry, texture objects and their upload histories remain live.
@@ -37,7 +39,7 @@ const selectorArray = (array, limit) => {
  * uniforms stay live. Hooks that could change selection during projection keep
  * their existing live-source path instead of being moved ahead of source work.
  */
-function captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, maxNodes, maxMaterials, maxValues}) {
+function captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, maxNodes, maxMaterials, maxValues}) {
   const materials = new Map(), objects = new Map(), seen = new Set(), instances = new Set(), stack = [root];
   let values = 0;
   const claim = count => {
@@ -90,22 +92,26 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     const morphs = data(data(object, 'geometry'), 'morphAttributes');
     return morphs && dataOnly(morphs) && Object.values(morphs).every(value => Array.isArray(value) && value.length === 0);
   };
-  const ordinaryObject = object => {
+  const ordinaryObject = (object, capturedDeformation = false) => {
     if (!(object instanceof three.Object3D) || !dataOnly(object)) return false;
-    const prototype = object instanceof three.Camera ? three.Camera.prototype : three.Object3D.prototype;
+    const skinned = data(object, 'isSkinnedMesh') === true;
+    const prototype = object instanceof three.Camera ? three.Camera.prototype :
+      skinned && allowDeformations ? three.SkinnedMesh?.prototype : three.Object3D.prototype;
+    if (!prototype) return false;
     if (data(object, 'updateMatrixWorld') !== prototype.updateMatrixWorld ||
         data(object, 'updateMatrix') !== three.Object3D.prototype.updateMatrix ||
         data(object, 'onBeforeRender') !== three.Object3D.prototype.onBeforeRender ||
         data(object, 'onAfterRender') !== three.Object3D.prototype.onAfterRender ||
-        data(object, 'isSkinnedMesh') || data(object, 'isBatchedMesh') ||
+        skinned && !allowDeformations || data(object, 'isBatchedMesh') ||
         data(object, 'isInstancedMesh') && !ordinaryInstances(object)) return false;
+    if (allowDeformations && !capturedDeformation && !isOrdinaryPassDeformation(three, object, {maxValues})) return false;
     if (data(object, 'isLOD') && data(object, 'update') !== three.LOD?.prototype.update) return false;
-    const type = [three.Mesh, three.Line, three.Points, three.Sprite].find(Type => Type && object instanceof Type);
+    const type = [three.SkinnedMesh, three.Mesh, three.Line, three.Points, three.Sprite].find(Type => Type && object instanceof Type);
     if (type && data(object, 'intersectsFrustum') !== type.prototype.intersectsFrustum) return false;
     const layers = data(object, 'layers');
     if (!(layers instanceof three.Layers) || !dataOnly(layers) || data(layers, 'test') !== three.Layers.prototype.test ||
         data(layers, 'mask') === accessor ||
-        !data(object, 'isInstancedMesh') && (data(object, 'boundingSphere') !== undefined || data(object, 'computeBoundingSphere') !== undefined)) return false;
+        !data(object, 'isInstancedMesh') && !skinned && (data(object, 'boundingSphere') !== undefined || data(object, 'computeBoundingSphere') !== undefined)) return false;
     return true;
   };
   const ordinaryGeometry = geometry => {
@@ -173,9 +179,29 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
     objects.set(object, selected);
     for (const source of Array.isArray(selected) ? selected : [selected]) if (!captureMaterial(source)) return null;
   }
+  if (allowDeformations) for (const [object, selected] of objects) {
+    const skinned = data(object, 'isSkinnedMesh') === true;
+    const morphs = data(data(object, 'geometry'), 'morphAttributes');
+    const morphed = morphs && Object.values(morphs).some(group => group.length > 0);
+    if (!skinned && !morphed) continue;
+    const reserved = new Set([
+      ...(skinned ? ['bindMatrix', 'bindMatrixInverse', 'boneTexture'] : []),
+      ...(morphed ? ['morphTargetInfluences', 'morphTargetBaseInfluence', 'morphTargetsTexture', 'morphTargetsTextureSize'] : []),
+    ]);
+    for (const source of Array.isArray(selected) ? selected : [selected]) {
+      const material = source && overrideMaterial && data(source, 'allowOverride') === true ? overrideMaterial : source;
+      if (material && data(material, 'isShaderMaterial') === true) {
+        const uniforms = data(material, 'uniforms');
+        // These values are installed from the accepted object packet. Authored
+        // overrides need their original per-draw upload order and stay outside
+        // this callback-free deformation capture, as in PMREM scene capture.
+        if (!uniforms || uniforms === accessor || !dataOnly(uniforms) || Object.keys(uniforms).some(name => reserved.has(name))) return null;
+      }
+    }
+  }
   let selection;
   const cameraSafe = () => {
-    if (selection?.instanceFrame?.geometrySafe?.() === false) return false;
+    if (selection?.instanceFrame?.geometrySafe?.() === false || selection?.instanceFrame?.deformationSafe?.() === false) return false;
     const perspective = data(camera, 'isPerspectiveCamera') === true;
     if (!camera || !ordinaryObject(camera) || data(camera, 'isArrayCamera') || data(camera, 'isMultiViewCamera') ||
         !perspective && data(camera, 'isOrthographicCamera') !== true || data(camera, 'children')?.length !== 0) return false;
@@ -188,7 +214,7 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
       // original source objects and captured resources remain guarded.
       const captured = selection?.instanceFrame;
       const geometry = captured?.geometries.has(object) ? captured.geometries.get(object) : data(object, 'geometry');
-      if (!ordinaryObject(object) || !ordinaryGeometry(geometry)) return false;
+      if (!ordinaryObject(object, captured?.deformationObjects?.has(object)) || !ordinaryGeometry(geometry)) return false;
       const children = captured?.hierarchy.get(object) ?? selectorArray(data(object, 'children'), maxNodes);
       if (!children || children.some(child => !seen.has(child))) return false;
     }
@@ -199,15 +225,15 @@ function captureSelections(three, root, {camera, overrideMaterial, exclusions, a
   // required pass scope rejects it before destination retention; ordinary
   // rendering must not newly fail because optional instance capture is enabled.
   if (instances.size && [...seen].some(object => data(object, 'isLOD') && data(object, 'autoUpdate'))) return null;
-  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances, overrideMaterial} : null;
+  selection = objects.size ? {materials, objects, values, cameraSafe, excludedObjects, instances, overrideMaterial, allowDeformations} : null;
   return selection;
 }
 
 export function captureThreeMaterialState(three, root, {overrideMaterial = null, nodeFrame = null,
-  selectionOnly = false, camera = null, exclusions = null, allowInstances = false, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
+  selectionOnly = false, camera = null, exclusions = null, allowInstances = false, allowDeformations = false, maxNodes = 16384, maxMaterials = 16384, maxValues = 1048576} = {}) {
   if (![maxNodes, maxMaterials, maxValues].every(n => Number.isSafeInteger(n) && n >= 0) || !maxNodes || !maxMaterials)
     fail('LIMIT', 'Invalid material snapshot capacity');
-  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, maxNodes, maxMaterials, maxValues});
+  if (selectionOnly) return captureSelections(three, root, {camera, overrideMaterial, exclusions, allowInstances, allowDeformations, maxNodes, maxMaterials, maxValues});
   const materials = new Map(), objects = new Map(), seen = new Set(), copies = new WeakMap(), stack = [root];
   const valuePrototypes = new Set(['Color', 'Vector2', 'Vector3', 'Vector4', 'Quaternion', 'Euler', 'Matrix3', 'Matrix4', 'Plane']
     .map(name => three[name]?.prototype).filter(Boolean));

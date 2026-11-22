@@ -304,13 +304,17 @@ export async function createGpuThreeScene(device,scene,{
   function geometryAdmission(g,object){
     const fixed=fixedGeometry(object),view=fixed?.geometry??executionGeometry(g),groups=fixed?.groups??view?.groups;
     const list=colorMaterials(object);
+    // Captured effect passes retain the source morph-atlas generation and bone
+    // palette. ShaderLib consumes those accepted inputs directly; rebuilding
+    // deformation from later CPU attributes would lose source upload history.
+    if(programRoute()&&passMaterialFrame?.instanceFrame?.deformations?.has(object))programDeformed.add(object);
     const programs=list.every(m=>m?.isShaderMaterial)||(programRoute()&&list.every(m=>!m||programCapable(m)));
     if(!(g instanceof three.BufferGeometry)||(view.isInstancedBufferGeometry&&!programs&&!capturedNodeObject(object)))fail('GEOMETRY','Expected source BufferGeometry');
     // InstancedBufferGeometry (renderInstances over geometry.instanceCount) draws through programs.
     if(view.isInstancedBufferGeometry)programGeometries_.add(g);
     // Captured fixed views already proved rigid. A later geometry replacement
     // cannot redirect an accepted draw into the live deformation owner.
-    if(!fixed&&hasThreeDeformation(object)&&!programToneMapping()&&!programDepthMode()&&!capturedNodeObject(object)){
+    if(!fixed&&hasThreeDeformation(object)&&!programDeformed.has(object)&&!programToneMapping()&&!programDepthMode()&&!capturedNodeObject(object)){
       try{inspectThreeDeformation(object,{...deformationOptions,three,sourceAttributeCallbacks});}
       catch(error){
         // WebGL surface: what the core deformer refuses, the object's ShaderLib
@@ -1681,7 +1685,10 @@ export async function createGpuThreeScene(device,scene,{
         if(object.isSprite&&!programRoute()&&spriteCount(object)===0)return;
         function push(original,sourceGroup){
               const originalState=materialState(original);
-              if(!originalState||!originalState.visible||!shadowPass&&!colorPhaseEnabled(original))return;
+              // Required animated passes already projected their material
+              // selection. A later visible flag belongs to the next call.
+              const projected=passMaterialFrame?.instanceFrame?.deformations?.has(object);
+              if(!originalState||!projected&&!originalState.visible||!shadowPass&&!colorPhaseEnabled(original))return;
               if(shadowPass&&originalState.transparent){
                 if(shadowBlend==='skip')return;
                 fail('SHADOW','BLEND casters require the explicit skip policy');

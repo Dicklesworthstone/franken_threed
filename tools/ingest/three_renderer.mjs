@@ -1324,7 +1324,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (passCameraRequired) {
         if (this.shadowMap.enabled || this.sortObjects && (this._opaqueSort || this._transparentSort))
           fail('UNSUPPORTED', 'Pinned pass capture requires a callback-free scene without shadows or custom sorting');
-        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true, allowInstances: true,
+        requiredMaterialFrame = captureThreeMaterialState(THREE, scene, {camera, overrideMaterial, selectionOnly: true, allowInstances: true, allowDeformations: true,
           exclusions: getThreePassExcludedObjects(this),
           maxNodes: sceneLimits.maxNodes ?? 16384, maxMaterials: maxBindings,
           maxValues: MAX_MATERIAL_CAPTURE_VALUES - this._materialCaptureValues});
@@ -1462,8 +1462,8 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             !(this.sortObjects && (this._opaqueSort || this._transparentSort))) {
           // Keep one camera value per accepted draw, including SSAA's distinct
           // projections. Callback-free rigid draws also retain their accepted
-          // geometry selector and world matrix in private views below; live or
-          // deformed paths keep their existing source update order.
+          // geometry selector and world matrix in private views below. Required
+          // passes also capture admitted deformation at this source boundary.
           if (scene.matrixWorldAutoUpdate === true) scene.updateMatrixWorld();
           if (camera.parent === null && camera.matrixWorldAutoUpdate === true) camera.updateMatrixWorld();
           webglSourceCamera = camera;
@@ -1474,6 +1474,10 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           if (materialFrame.instanceFrame) {
             materialFrame.values += materialFrame.instanceFrame.values;
             this._materialCaptureValues += materialFrame.instanceFrame.values;
+            // Animated pass packets already performed the source matrix and
+            // skeleton work at acceptance. Rewalking the live hierarchy while
+            // queued would overwrite later public bone/bind-matrix edits.
+            if (passCameraRequired && materialFrame.instanceFrame.deformations?.size) matricesUpdated = true;
           }
         }
         if (webglSourceCamera && materialFrame?.cameraSafe()) {

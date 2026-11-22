@@ -1,3 +1,5 @@
+import {threeMorphTargets, bindThreeMorphTargets, linkThreeMorphTargets} from './three_program.mjs';
+
 /** Private geometry selectors for queued WebGL draws. The shared upload owner
  * supplies GPU-visible raw bytes; these views never read later CPU edits and
  * never run application upload callbacks. Public BufferGeometry identities and
@@ -52,10 +54,21 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
         data(source, 'addEventListener') !== three.EventDispatcher.prototype.addEventListener ||
         data(source, 'removeEventListener') !== three.EventDispatcher.prototype.removeEventListener)
       fail('Queued geometry requires ordinary resource lifecycle methods');
-    const attributes = data(source, 'attributes'), groups = data(source, 'groups'), range = data(source, 'drawRange');
+    const attributes = data(source, 'attributes'), morphs = data(source, 'morphAttributes'), groups = data(source, 'groups'), range = data(source, 'drawRange');
     if (!dataOnly(attributes) || !Array.isArray(groups) || Object.getPrototypeOf(groups) !== Array.prototype ||
-        !dataOnly(groups) || !dataOnly(range)) fail('Queued geometry requires ordinary selectors');
-    const values = Object.keys(attributes).length * 16 + groups.length * 3 + 4;
+        !dataOnly(groups) || !dataOnly(range) || !dataOnly(morphs)) fail('Queued geometry requires ordinary selectors');
+    const morphAttributes = {}, morphEntries = [];
+    for (const [name, list] of Object.entries(morphs)) {
+      if (!Array.isArray(list) || Object.getPrototypeOf(list) !== Array.prototype || !dataOnly(list))
+        fail('Queued morph geometry requires ordinary target selectors');
+      morphAttributes[name] = list.map(source => {
+        const entry = attribute(source); morphEntries.push(entry);
+        // The accepted atlas owns the numeric data. Shader assembly only needs
+        // these fixed selectors; never duplicate its packing or upload rules.
+        return Object.create(source, {itemSize: {value: entry.fields.itemSize}, count: {value: entry.count}});
+      });
+    }
+    const values = (Object.keys(attributes).length + morphEntries.length) * 16 + groups.length * 3 + 4;
     if (values > maxValues) fail('Pending geometry selector capacity exceeded');
     const selected = Object.entries(attributes).map(([name, value]) => [name, attribute(value)]);
     const index = data(source, 'index') == null ? null : attribute(data(source, 'index'));
@@ -68,7 +81,13 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
       return {start: data(group, 'start'), count: data(group, 'count'), materialIndex: data(group, 'materialIndex')};
     });
     const all = [...selected.map(([, entry]) => entry), ...(index ? [index] : [])];
+    const morphCount = (morphAttributes.position ?? morphAttributes.normal ?? morphAttributes.color)?.length ?? 0;
+    const morphStride = morphAttributes.color ? 3 : morphAttributes.normal ? 2 : morphAttributes.position ? 1 : 0;
+    const morphWidth = (selected.find(([name]) => name === 'position')?.[1].count ?? 0) * morphStride;
+    const morphBytes = Math.min(morphWidth, 8192) * Math.ceil(morphWidth / 8192) * morphCount * 16;
+    if (!Number.isSafeInteger(morphBytes) || morphBytes > maxBytes) fail('Queued morph atlas capacity exceeded');
     return {source, attributes: selected, index, all, values, groups: selectedGroups, drawRange: {start, count},
+      morphAttributes, morphEntries, morphBytes, morphTargetsRelative: data(source, 'morphTargetsRelative') === true,
       instanced: data(source, 'isInstancedBufferGeometry') === true, instanceCount: data(source, 'instanceCount')};
   }
   function validate(shapes) {
@@ -87,7 +106,8 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
     if (!state || state.closed) return;
     state.retired = true;
     if (force || !state.refs) {
-      state.closed = true; retireWire(state); state.view.dispatchEvent({type: 'dispose'}); states.delete(state);
+      state.closed = true; retireWire(state); bindThreeMorphTargets(three, state.view, null);
+      state.view.dispatchEvent({type: 'dispose'}); states.delete(state);
     }
   }
   function clearPreview(wire) {
@@ -226,11 +246,15 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
     }
     const state = source.state, arrays = new Map(); state.refs++;
     for (const entry of shape.all) arrays.set(entry.owner, {array: accepted.get(entry.owner), count: entry.count});
+    const morph = shape.morphSelected && shape.morphBytes ? threeMorphTargets(three, shape.source) : null;
     let released = false;
     return {view: state.view,
       install() {
         if (released || state.closed) fail('Queued geometry was released before submission');
-        state.view.attributes = state.attributes; state.view.index = state.index; state.view.morphAttributes = {};
+        state.view.attributes = state.attributes; state.view.index = state.index;
+        state.view.morphAttributes = morph ? shape.morphAttributes : {};
+        state.view.morphTargetsRelative = shape.morphTargetsRelative;
+        bindThreeMorphTargets(three, state.view, morph);
         state.view.groups = shape.groups; state.view.drawRange = shape.drawRange; state.view.instanceCount = shape.instanceCount;
         state.view.isInstancedBufferGeometry = shape.instanced;
         state.acceptedEdge = edge;
@@ -240,8 +264,13 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
         }
       },
       safe() {
-        return shape.all.every(({owner, fields}) => data(owner, 'onUploadCallback') ===
-          (fields.interleaved ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype).onUploadCallback);
+        return [...shape.all, ...shape.morphEntries].every(({owner, fields}) => data(owner, 'onUploadCallback') ===
+          (fields.interleaved ? three.InterleavedBuffer.prototype : three.BufferAttribute.prototype).onUploadCallback) &&
+          shape.morphEntries.every(({source, fields}) => {
+            const prototype = fields.interleaved ? three.InterleavedBufferAttribute.prototype :
+              fields.isFloat16BufferAttribute ? three.Float16BufferAttribute.prototype : three.BufferAttribute.prototype;
+            return ['getX', 'getY', 'getZ', 'getW'].every(key => data(source, key) === prototype[key]);
+          });
       },
       release() { if (!released) { released = true; state.refs--; if (state.retired) retire(state); } },
     };
@@ -253,7 +282,8 @@ export function createThreePassGeometry(three, history, {maxGeometries = 4096, m
       // Keep the prepared geometry identity when a callback-bearing draw moves
       // back to original live attributes. Upload history supplies the same raw
       // versions, and callbacks still receive the original public geometry.
-      for (const key of ['attributes', 'index', 'morphAttributes', 'groups', 'drawRange', 'instanceCount']) state.view[key] = source[key];
+      for (const key of ['attributes', 'index', 'morphAttributes', 'morphTargetsRelative', 'groups', 'drawRange', 'instanceCount']) state.view[key] = source[key];
+      linkThreeMorphTargets(three, state.view, source);
       state.view.isInstancedBufferGeometry = source.isInstancedBufferGeometry === true;
       state.acceptedEdge = null;
       return state.view;

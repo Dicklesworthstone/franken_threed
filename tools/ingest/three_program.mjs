@@ -137,10 +137,33 @@ const BUILTIN = new Set(['modelMatrix', 'modelViewMatrix', 'projectionMatrix', '
 
 // ---- WebGLMorphtargets (retained-JS port) -----------------------------------
 const morphCaches = new WeakMap();
+const morphBindings = new WeakMap();
 const morphAttributeOf = g => g.morphAttributes.position || g.morphAttributes.normal || g.morphAttributes.color;
+/** Queued private geometry borrows an accepted atlas generation. Its lifecycle
+ * never disposes the source atlas; the pass owner retains the accepted input. */
+export function bindThreeMorphTargets(T, geometry, entry) {
+  let bindings = morphBindings.get(T);
+  if (!bindings) {
+    if (entry === null) return;
+    morphBindings.set(T, bindings = new WeakMap());
+  }
+  if (entry === null) bindings.delete(geometry);
+  else bindings.set(geometry, {entry});
+}
+/** A private geometry reused by a live draw must consult the original source
+ * history lazily. Clearing its snapshot must not rebuild unchanged-count data
+ * from CPU edits that the pinned renderer has not uploaded. */
+export function linkThreeMorphTargets(T, geometry, source) {
+  if (geometry === source) { bindThreeMorphTargets(T, geometry, null); return; }
+  let bindings = morphBindings.get(T);
+  if (!bindings) morphBindings.set(T, bindings = new WeakMap());
+  bindings.set(geometry, {source});
+}
 /** The geometry's morph DataArrayTexture (Float32 RGBA texels: position, normal,
  * color per vertex), built once per geometry and target count, as r186 does. */
 export function threeMorphTargets(T, geometry, maxTextureSize = 8192) {
+  const binding = morphBindings.get(T)?.get(geometry);
+  if (binding) return binding.entry ?? threeMorphTargets(T, binding.source, maxTextureSize);
   let cache = morphCaches.get(T);
   if (!cache) morphCaches.set(T, cache = new WeakMap());
   const morphAttribute = morphAttributeOf(geometry), count = morphAttribute !== undefined ? morphAttribute.length : 0;

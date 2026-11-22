@@ -1256,8 +1256,8 @@ orthographic cameras also retain their accepted matrices. Public reversed-depth
 transitions still update the original camera, including its projection inverse.
 Custom projection methods and callback-bearing scenes keep their established
 ordinary rendering path; required supersampling capture explicitly refuses
-them. Shadows, custom sorting, skinning, morphs and batching remain outside
-this supersampling capture profile.
+them. Shadows, custom sorting and batching remain outside this supersampling
+capture profile.
 
 Rigid `InstancedMesh` objects with ordinary Float32 matrix and RGB color streams
 now participate in these captures, including the verified AO and outline scene
@@ -1275,6 +1275,34 @@ remain stale. Default upload callbacks, fixed storage and one instance per
 attribute record are required for captured streams. Recording-facade tests
 exercise actual SSAA samples, queued counts/colors, partial uploads and disposal;
 browser pixels for this extension remain unverified.
+
+Ordinary `SkinnedMesh` and per-mesh morph targets now participate in required
+scene captures for the verified passes. SSAA samples, TAA histories and Outline
+depth/mask draws retain their accepted bone worlds, inverse binds, bind matrices,
+morph influences and geometry generations. Private skeletons use the pinned
+matrix-based `Skeleton.update()` implementation. Source skeleton palettes update
+once per selected skeleton per render, including projected meshes with invisible
+materials; bone textures are created only for selected draws. Hidden, excluded
+and culled meshes leave those public skeleton effects untouched.
+
+Morph atlases share the ordinary source program's first-use history. Target
+attribute edits and `needsUpdate` at an unchanged target count retain the old
+atlas; count changes and geometry disposal establish a new generation. Queued
+draws keep earlier generations and per-object weights through later animation,
+source replacement and disposal. Accepted material visibility and jittered
+camera projections also remain independent of later calls. Submission updates
+private poses without rewriting later public bind-matrix state.
+
+`three_renderer_postprocessing_deformation.test.mjs` exercises the actual pinned
+SSAA, TAA and Outline passes, comparing atlas bytes and morph weights with
+`WebGLMorphtargets` and palettes with source skeleton math. It covers shared
+skeletons, attached/detached binds, combined skinning/morphs, queued disposal and
+renderer cancellation. The checks use a recording device; rasterized pixel
+equivalence and hardware performance remain unmeasured. Private bone textures
+retire after their final pending use, so later drained batches may need fresh
+residency. Instanced morph textures, automatic LOD, custom deformation hooks,
+renderer-uniform overrides and palette aliases into geometry/material inputs
+remain explicit boundaries for this capture profile.
 
 The verified `EffectComposer.setSize()` body runs inside the existing target
 owner's resize scope. Queued fullscreen draws retain their sampled target
