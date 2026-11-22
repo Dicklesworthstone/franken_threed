@@ -1,8 +1,8 @@
 # Sampled inputs in native texture copies
 
 On the initialized native WebGPU surface, `renderer.copyTextureToTexture()`
-can copy an admitted sampled texture into an ordinary sampled 2D, array or
-volume texture, a `StorageTexture`, `StorageArrayTexture`, `Storage3DTexture`,
+can copy an admitted sampled texture into an ordinary sampled 2D, array,
+volume or cube texture, a `StorageTexture`, `StorageArrayTexture`, `Storage3DTexture`,
 or a native render-target color attachment. This is a native texture copy,
 not a seeding compute kernel, readback/re-upload, or conversion shader.
 
@@ -27,6 +27,17 @@ and layer from the accepted GPU image. Warm writes reuse that private allocation
 no copied texel is materialized into the public CPU image. Aliases continue to
 observe their own accepted pixels, and unrequested CPU or sampler edits cannot
 erase a GPU patch.
+
+Ordinary `CubeTexture` destinations accept selected faces and allocated mip
+levels from sampled textures, native target colors and storage textures. Their
+six native layers retain the cube sampling view and existing upload orientation;
+copy coordinates address those native faces without another flip. Detachment
+seeds all six faces at every level, preserving other regions and `Source`
+aliases. Base-level writes capture the current `generateMipmaps` policy and
+regenerate the existing six-face pyramid after the copy; higher-level writes
+preserve authored contents. Copies within one cube require disjoint mip levels
+or face ranges. A later explicit upload replaces the source faces normally;
+unrequested CPU edits cannot overwrite copied GPU pixels.
 
 `DataArrayTexture` destinations accept explicit layer ranges and existing
 generated mip levels. Array layer counts stay fixed at every level. A base-level
@@ -92,3 +103,10 @@ The existing byte recorder verifies untouched slices, complete pyramid seeds,
 alias isolation, partial layer uploads, queued generation policy, allocation
 limits and retirement. Mip passes are recorded rather than rasterized; fresh
 browser pixels and hardware performance remain unverified.
+
+Nine ordinary-cube destination regressions additionally cover all three source
+owners, full pyramid seeds, face orientation, queued upload/generation history,
+self-copy legality, rejected-call cleanup and source backend copy descriptors.
+The actual renderer FIFO case uses pinned `CubeTexture` objects and verifies
+that disposal cancels a queued face copy. These are recording-device checks;
+they do not establish browser pixel parity or hardware performance.

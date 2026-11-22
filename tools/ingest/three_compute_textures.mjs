@@ -622,8 +622,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function captureCopyDestination(texture, level = 0) {
     const shape = describe({texture, isSampledTexture: true}, {copyDestination: true});
     if (!Number.isSafeInteger(level) || level < 0 || level >= shape.levels ||
-        !['2d', '2d-array', '3d'].includes(shape.viewDimension) || shape.blockUploads || shape.nativeMedia)
-      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D, array or volume mip level');
+        !['2d', '2d-array', '3d', 'cube'].includes(shape.viewDimension) || shape.blockUploads || shape.nativeMedia)
+      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D, array, volume or cube mip level');
+    // Cube sampling uses a cube view of six ordinary native array layers.
+    // copyShape exposes those layers to the shared subresource planner; the
+    // existing GPU seed preserves all faces/mips when a Source alias detaches.
     // The pinned native mip generator builds 2D layer views; it has no 3D
     // shader entry. Keep ordinary volume copies on their source-valid base
     // allocation instead of treating our general pool's reducer as that API.

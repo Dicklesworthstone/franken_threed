@@ -23,6 +23,9 @@ function setup(t) {
  * device records byte copies; no GPU shader or browser-pixel claim is made. */
 function cubeSetup(t, {native = true, producers = false, storageOptions = {}, poolOptions = {}} = {}) {
   const f = cubeCopyFixture(), {T, storage: stub} = copyFixtures(), {device} = f;
+  T.CubeTexture = class CubeTexture extends T.Texture {
+    constructor(faces) { super(); this.isCubeTexture = true; this.image = faces; }
+  };
   const storage = producers ? createThreeStorageTextures(T, {getDevice: () => device, ...storageOptions}) : stub;
   device.lost = new Promise(() => {});
   device.createSampler = descriptor => ({descriptor});
@@ -236,6 +239,17 @@ function mipTexture(T, width, height, value = 1) {
     return {width: w, height: h, data: rgba(Array(w * h).fill(value + level))};
   });
   return texture;
+}
+
+function sampledCube(T, width = 4, {mips = false, generated = false} = {}) {
+  const faces = (size, level) => Array.from({length: 6}, (_, face) =>
+    new T.DataTexture(rgba(Array(size * size).fill(1 + face + level * 10)), size, size));
+  const cube = new T.CubeTexture(faces(width, 0));
+  if (mips) for (let size = width >> 1, level = 1; size > 0; size >>= 1, level++)
+    cube.mipmaps.push(new T.CubeTexture(faces(size, level)));
+  cube.generateMipmaps = generated;
+  cube.minFilter = mips || generated ? T.NearestMipmapNearestFilter : T.NearestFilter;
+  return cube;
 }
 
 // The existing byte-copy fixture cannot execute mip shaders. Record only their
@@ -977,4 +991,157 @@ test(`actual renderer FIFO retains pinned ${type} copy versions and later layer 
   inputs.release(lease); await renderer.waitForGPU();
   const owned = f.textures.slice(); renderer.dispose();
   assert.ok(owned.every(texture => texture.destroyed === 1), 'all old and current copy allocations retire once');
+});
+
+for (const producer of ['sampled', 'storage', 'target'])
+test(`${producer} producers write ordinary CubeTexture faces and authored mips without changing sibling pixels`, async t => {
+  const f = cubeSetup(t, {producers: true}), destination = sampledCube(f.T, 4, {mips: true});
+  const source = producer === 'sampled' ? sampledCube(f.T, 4, {mips: true})
+    : producer === 'storage' ? gpuSource(f, {dimension: '2d-array', depth: 6, mips: true})
+      : f.target({dimension: 'cube'});
+  const nativeSource = producer === 'sampled' ? sampledNative(f, source)
+    : producer === 'storage' ? storageNative(f, source) : targetNative(f, source);
+  pattern(nativeSource, 41);
+  destination.flipY = true;
+  const original = sampledNative(f, destination), before = original.levels.map(level => level.data.slice());
+  const alias = sampledCube(f.T, 4, {mips: true}); alias.source = destination.source;
+  alias.mipmaps = destination.mipmaps; alias.flipY = true;
+  assert.equal(sampledNative(f, alias), original);
+  f.renderer.copyTextureToTexture(producer === 'target' ? source.texture : source, destination,
+    box(1, 0, 1, 1, 2, 3), point(0, 0, 2), 1, 1);
+  const copied = sampledNative(f, destination);
+  assert.notEqual(copied, original); assert.equal(copied.levels[0].depth, 6);
+  const expected = before.map(data => data.slice());
+  for (let face = 0; face < 3; face++) for (let y = 0; y < 2; y++) {
+    const from = (((1 + face) * 2 + y) * 2 + 1) * 4, to = (((2 + face) * 2 + y) * 2) * 4;
+    expected[1].set(nativeSource.levels[1].data.subarray(from, from + 4), to);
+  }
+  assert.deepEqual(copied.levels.map(level => level.data), expected, 'native face indices are not flipped again by the copy');
+  assert.deepEqual(original.levels.map(level => level.data), before);
+  assert.equal(sampledNative(f, alias), original);
+  assert.equal(f.commands.at(-1).from.texture, nativeSource, 'the producer is borrowed directly');
+  assert.deepEqual(f.commands.slice(-4, -1).map(command => command.size), [[4, 4, 6], [2, 2, 6], [1, 1, 6]]);
+  const lease = f.inputs.captureBinding({texture: destination, isSampledTexture: true});
+  assert.equal(f.inputs.resolve(lease).view.dimension, 'cube');
+  f.inputs.release(lease); await f.renderer.waitForGPU();
+});
+
+test('ordinary cube copies preserve GPU history until an explicit source upload replaces every face', async t => {
+  const f = cubeSetup(t), destination = sampledCube(f.T, 2), source = new f.T.DataTexture(rgba([31]), 1, 1);
+  let updates = 0; destination.onUpdate = () => updates++;
+  f.renderer.copyTextureToTexture(source, destination, null, point(1, 0, 5));
+  const first = sampledNative(f, destination), before = first.levels[0].data.slice(), allocated = f.textures.length;
+  for (const face of destination.image) face.image.data.fill(99);
+  f.renderer.copyTextureToTexture(source, destination, null, point(0, 1, 2));
+  const expected = before.slice(); expected.set(rgba([31]), (2 * 4 + 2) * 4);
+  assert.equal(sampledNative(f, destination), first); assert.equal(f.textures.length, allocated);
+  assert.deepEqual(first.levels[0].data, expected); assert.equal(updates, 1);
+  const held = f.inputs.captureBinding({texture: destination, isSampledTexture: true});
+  destination.needsUpdate = true;
+  const replacement = sampledNative(f, destination);
+  assert.notEqual(replacement, first); assert.ok(replacement.levels[0].data.every(value => value === 99));
+  assert.deepEqual(first.levels[0].data, expected); assert.equal(updates, 2);
+  f.inputs.release(held); await f.renderer.waitForGPU();
+});
+
+test('ordinary cube self-copies allow disjoint faces and mips and reject same-subresource feedback', async t => {
+  const f = cubeSetup(t), cube = sampledCube(f.T, 2, {mips: true});
+  f.renderer.copyTextureToTexture(cube, cube, box(0, 0, 0, 2, 2, 2), point(0, 0, 4));
+  const native = sampledNative(f, cube);
+  assert.deepEqual(native.levels[0].data.subarray(4 * 16), native.levels[0].data.subarray(0, 2 * 16));
+  assert.equal(f.commands.at(-1).from.texture, f.commands.at(-1).to.texture);
+  f.renderer.copyTextureToTexture(cube, cube, box(0, 0, 1, 1, 1, 2), point(0, 0, 1), 0, 1);
+  assert.deepEqual(native.levels[1].data.subarray(4, 12), rgba([2, 3]));
+  const submitted = f.commands.length;
+  for (const [region, position] of [[box(0, 0, 1, 1, 1, 2), point(0, 0, 2)],
+    [box(0, 0, 0, 1, 1, 1), point(1, 1, 0)]])
+    assert.throws(() => f.renderer.copyTextureToTexture(cube, cube, region, position), {code: 'THREE_STORAGE_COPY_FEEDBACK'});
+  assert.equal(f.commands.length, submitted); await f.renderer.waitForGPU();
+});
+
+test('queued ordinary cube copies retain each accepted face, source version and mip-generation policy', async t => {
+  const f = cubeSetup(t), passes = recordMipPasses(f), destination = sampledCube(f.T, 4, {generated: true});
+  const source = new f.T.DataTexture(rgba([31]), 1, 1);
+  sampledNative(f, destination); assert.equal(passes.length, 12);
+  f.renderer._preparing = true;
+  const position = point(0, 0, 2);
+  f.renderer.copyTextureToTexture(source, destination, null, position);
+  destination.generateMipmaps = false; source.image.data.set(rgba([41])); source.needsUpdate = true;
+  position.z = 3; f.renderer.copyTextureToTexture(source, destination, null, position);
+  position.z = 99; destination.generateMipmaps = true; source.image.data.fill(199);
+  f.flush(); const native = sampledNative(f, destination);
+  assert.deepEqual(native.levels[0].data.subarray(2 * 64, 2 * 64 + 4), rgba([31]));
+  assert.deepEqual(native.levels[0].data.subarray(3 * 64, 3 * 64 + 4), rgba([41]));
+  assert.deepEqual(passes.slice(12).map(pass => {
+    const view = pass.colorAttachments[0].view.view; return [view.baseArrayLayer, view.baseMipLevel];
+  }), Array.from({length: 6}, (_, face) => [[face, 1], [face, 2]]).flat());
+  assert.equal(native.levels.length, 3); await f.renderer.waitForGPU();
+});
+
+test('ordinary cube copy descriptors match the pinned native backend for face ranges and independently selected mips', async t => {
+  const f = cubeSetup(t), source = sampledCube(f.T, 4, {mips: true}), destination = sampledCube(f.T, 8, {mips: true});
+  const region = new Pinned.Box3(new Pinned.Vector3(0, 0, 1), new Pinned.Vector3(2, 2, 4));
+  const position = new Pinned.Vector3(0, 0, 2), oracle = [];
+  const backend = {get: texture => ({texture}), textureUtils: {generateMipmaps() { assert.fail(); }},
+    device: {createCommandEncoder() { return {copyTextureToTexture(from, to, size) {
+      oracle.push({from: {...from, origin: {...from.origin}}, to: {...to, origin: {...to.origin}}, size: {...size}});
+    }, finish() { return []; }}; }, queue: {submit() {}}}};
+  Pinned.WebGPUBackend.prototype.copyTextureToTexture.call(backend, source, destination, region, position, 1, 2);
+  f.renderer.copyTextureToTexture(source, destination, region, position, 1, 2);
+  const actual = f.commands.at(-1), expected = oracle[0];
+  assert.deepEqual(actual.from.origin, Object.values(expected.from.origin));
+  assert.deepEqual(actual.to.origin, Object.values(expected.to.origin));
+  assert.deepEqual(actual.size, Object.values(expected.size));
+  assert.equal(actual.from.mipLevel, expected.from.mipLevel); assert.equal(actual.to.mipLevel, expected.to.mipLevel);
+  await f.renderer.waitForGPU();
+});
+
+test('rejected ordinary cube copies leave no provisional destinations, snapshots or GPU allocations', t => {
+  for (const mode of ['face', 'level', 'budget', 'layers', 'queue']) {
+    const f = cubeSetup(t, {poolOptions: mode === 'budget' ? {maxTextureBytes: 95} : {}});
+    const destination = sampledCube(f.T, 2), source = new f.T.DataTexture(rgba([31]), 1, 1);
+    if (mode === 'layers') f.device.limits.maxTextureArrayLayers = 5;
+    if (mode === 'queue') { f.renderer._preparing = true; f.renderer._enqueue = () => { throw failure('QUEUE_FULL'); }; }
+    assert.throws(() => f.renderer.copyTextureToTexture(source, destination, null,
+      point(0, 0, mode === 'face' ? 6 : 0), 0, mode === 'level' ? 1 : 0), undefined, mode);
+    assert.equal(f.inputs.isCopyDestination(destination), false, mode);
+    assert.equal(f.inputs.diagnostics.snapshotBytes, 0, mode);
+    assert.equal(f.textures.length, 0, mode); assert.equal(f.commands.length, 0, mode);
+  }
+});
+
+test('actual renderer FIFO writes pinned CubeTexture faces and cancels disposed queued cubes', async t => {
+  const f = cubeSetup(t), initialization = geometryDevice();
+  for (const [key, value] of Object.entries(initialization)) if (!(key in f.device)) f.device[key] = value;
+  for (const [key, value] of Object.entries(initialization.queue)) if (!(key in f.device.queue)) f.device.queue[key] = value;
+  for (const [key, value] of Object.entries(initialization.limits)) if (!(key in f.device.limits)) f.device.limits[key] = value;
+  const context = {configure() {}, unconfigure() {}, getCurrentTexture() { assert.fail('Copies must not acquire the canvas'); }};
+  const canvas = {width: 16, height: 16, style: {}, getContext: () => context};
+  const Renderer = createWebGPURendererClass(Pinned), renderer = new Renderer({canvas, device: f.device});
+  t.after(() => renderer.dispose()); await renderer.init();
+  const faces = Array.from({length: 6}, (_, face) => new Pinned.DataTexture(rgba(Array(4).fill(face + 1)), 2, 2));
+  const destination = new Pinned.CubeTexture(faces); destination.generateMipmaps = false;
+  destination.minFilter = destination.magFilter = Pinned.NearestFilter; destination.needsUpdate = true;
+  const source = new Pinned.DataTexture(rgba([31]), 1, 1); source.needsUpdate = true;
+  const gate = deferred(), position = new Pinned.Vector3(1, 0, 2);
+  renderer._enqueue({transfer: true, awaitSubmission: true, issue: () => gate.promise, resolve() {}, reject: assert.fail});
+  assert.equal(renderer.copyTextureToTexture(source, destination, null, position), undefined);
+  position.set(0, 1, 5); source.image.data.set(rgba([41])); source.needsUpdate = true;
+  renderer.copyTextureToTexture(source, destination, null, position);
+  source.image.data.fill(199); position.z = 99; for (const face of faces) face.image.data.fill(199);
+  assert.equal(f.commands.length, 0); gate.resolve(); while (renderer._drain) await renderer._drain;
+  const inputs = renderer._getSampledTextureInputs(), lease = inputs.captureBinding({texture: destination, isSampledTexture: true});
+  const native = inputs.withTexture(lease, value => value);
+  const expected = rgba(Array.from({length: 6}, (_, face) => Array(4).fill(face + 1)).flat());
+  expected.set(rgba([31]), (2 * 4 + 1) * 4); expected.set(rgba([41]), (5 * 4 + 2) * 4);
+  assert.deepEqual(native.levels[0].data, expected); assert.equal(inputs.resolve(lease).view.dimension, 'cube');
+  assert.ok(faces.every(face => face.image.data.every(value => value === 199)));
+  inputs.release(lease); await renderer.waitForGPU();
+  const blocked = deferred(), submitted = f.commands.length;
+  renderer._enqueue({transfer: true, awaitSubmission: true, issue: () => blocked.promise, resolve() {}, reject: assert.fail});
+  renderer.copyTextureToTexture(source, destination, null, new Pinned.Vector3(0, 0, 0));
+  destination.dispose(); blocked.resolve(); while (renderer._drain) await renderer._drain;
+  assert.equal(f.commands.length, submitted); await assert.rejects(renderer.waitForGPU(), {code: 'THREE_COMPUTE_TEXTURE_STALE'});
+  const owned = f.textures.slice(); renderer.dispose();
+  assert.ok(owned.every(texture => texture.destroyed === 1));
 });

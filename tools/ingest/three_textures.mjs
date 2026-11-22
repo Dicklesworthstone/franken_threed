@@ -738,8 +738,8 @@ export function createGpuThreeTextures(device,{
     writeTexture(t,run,{validation=null,generateMipmaps=false}={}){
       live();if(busy)fail('REENTRANT','Cannot write during a texture operation');
       if(typeof run!=='function')fail('OPTIONS','Expected a synchronous native texture write');
-      const {r,d}=check(t);if(!['2d','2d-array','3d'].includes(d.viewDimension))
-        fail('COPY','Sampled writes require 2D, array or volume storage');
+      const {r,d}=check(t);if(!['2d','2d-array','3d','cube'].includes(d.viewDimension))
+        fail('COPY','Sampled writes require 2D, array, volume or cube storage');
       if(d.volume&&generateMipmaps)
         fail('COPY','Ordinary volume copies do not generate mipmaps in the pinned native backend');
       if(generateMipmaps&&d.levels>1&&(d.integral||d.sampleType==='unfilterable-float'||d.renderable===false))
