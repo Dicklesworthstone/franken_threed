@@ -26,6 +26,7 @@ function fixture(t, {background = true} = {}) {
     maxTextureArrayLayers: 256, maxBindingsPerBindGroup: 1000});
   device.createTexture = desc => ({dimension: '2d', depthOrArrayLayers: 1, sampleCount: 1, ...desc,
     width: desc.size.width ?? desc.size[0], height: desc.size.height ?? desc.size[1],
+    depthOrArrayLayers: desc.size.depthOrArrayLayers ?? desc.size[2] ?? 1,
     createView(options = {}) { return {texture: this, ...options}; }, destroy() { this.destroyed = true; }});
   device.createSampler = desc => ({...desc}); device.queue.writeTexture = () => {};
   device.createRenderPipeline = desc => ({...desc, getBindGroupLayout: index => ({index})});
@@ -897,6 +898,145 @@ test('geometry compute checks final sampled texture identities against earlier d
   await f.renderer.init();
   assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
   assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+function sharedTextureKernel(t, f, {dimension = '2d', mipmaps = false} = {}) {
+  const texture = dimension === '3d' ? new T.Storage3DTexture(4, 4, 2)
+    : dimension === '2d-array' ? new T.StorageArrayTexture(4, 4, 2) : new T.StorageTexture(4, 4);
+  Object.assign(texture, {generateMipmaps: mipmaps, minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+  const sample = dimension === '3d' ? N.texture3D(texture, N.vec3(.5)) : N.texture(texture, N.vec2(.5));
+  const output = N.storageTexture(texture).toWriteOnly();
+  if (dimension === '2d-array') { sample.depthNode = N.int(1); output.depthNode = N.int(1); }
+  const step = N.uniform(.25).setName('sharedTextureStep');
+  const kernel = N.Fn(() => {
+    N.textureStore(output, dimension === '3d' ? N.uvec3(0, 0, 1) : N.uvec2(0), N.vec4(step, 0, .5, 1));
+  })().compute(1).setName('shared-storage-texture');
+  f.material.geometryNode = kernel; f.material.colorNode = sample.rgb;
+  const material = new T.MeshBasicNodeMaterial(), reader = new T.Mesh(f.object.geometry, material);
+  material.colorNode = sample.rgb; reader.frustumCulled = false; reader.renderOrder = -1; f.scene.add(reader);
+  t.after(() => { kernel.dispose(); texture.dispose(); material.dispose(); });
+  return {texture, sample, output, step, kernel, reader};
+}
+const drawTexture = draw => [...draw.groups.values()].flatMap(({group}) => group.entries)
+  .find(entry => entry.resource?.texture)?.resource.texture;
+const computeTexture = pass => [...pass.groups.values()].flatMap(group => group.entries)
+  .find(entry => entry.resource?.texture)?.resource.texture;
+
+for (const dimension of ['2d', '2d-array', '3d'])
+test(`geometry compute shares one ${dimension} storage texture with earlier pending sampled draws`, async t => {
+  const f = fixture(t, {background: false}), state = sharedTextureKernel(t, f, {dimension}), observed = [];
+  let updates = 0;
+  f.device.queue.writeTexture = () => { throw Error('GPU-authored storage cannot acquire a CPU upload'); };
+  f.device.onCompute = pass => { computeTexture(pass).recordedValue = ++updates * .25; };
+  const submit = f.device.queue.submit;
+  f.device.queue.submit = commands => {
+    submit(commands);
+    for (const passes of commands) for (const pass of passes) for (const draw of pass.draws)
+      if (draw.pipeline.vertex.entryPoint === 'main') observed.push(drawTexture(draw).recordedValue);
+  };
+  await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); f.renderer._nodes.nodeFrame.update();
+  state.step.value = .5; f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(f.events, ['shared-storage-texture', 'render', 'shared-storage-texture', 'render']);
+  assert.deepEqual(observed, [.25, .25, .5, .5], 'both pending draws see compute before their parent submission');
+  const native = computeTexture(f.computes[0]);
+  assert.equal(computeTexture(f.computes[1]), native);
+  assert.ok(draws(f).every(draw => drawTexture(draw) === native));
+  assert.equal(native.dimension, dimension === '3d' ? '3d' : '2d');
+  assert.equal(native.depthOrArrayLayers, dimension === '2d' ? 1 : 2);
+  assert.equal(native.mipLevelCount, 1);
+  const source = sourceCode(f), compute = new T.WGSLNodeBuilder(null, f.renderer);
+  compute.compute = state.kernel; compute.build();
+  const program = packets(f)[0].binding.nodeProgram;
+  assert.equal(program.vertex, source.vertexShader); assert.equal(program.fragment, source.fragmentShader);
+  assert.equal(f.computes[0].pipeline.compute.module.code, compute.computeShader);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('warm native bundles retain the sampled storage residency after their material map is replaced', async t => {
+  const f = fixture(t, {background: false}), state = sharedTextureKernel(t, f);
+  const replacement = new T.StorageTexture(4, 4), bundle = new T.BundleGroup();
+  Object.assign(replacement, {generateMipmaps: false, minFilter: T.NearestFilter, magFilter: T.NearestFilter});
+  state.reader.material.colorNode = null; state.reader.material.map = state.texture;
+  bundle.renderOrder = -1; bundle.add(state.reader); f.scene.add(bundle);
+  t.after(() => replacement.dispose());
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  const native = computeTexture(f.computes[0]);
+  assert.ok(draws(f).every(draw => drawTexture(draw) === native));
+  state.reader.material.map = replacement; state.step.value = .5; f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(f.captures.at(-1).draws[0].bundleWarm, true);
+  assert.ok(draws(f).every(draw => drawTexture(draw) === native), 'warm texture bindings keep their captured allocation');
+  assert.equal(computeTexture(f.computes[1]), native);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const mutation of ['mip-chain', 'resize', 'version', 'source', 'dispose', 'recreate'])
+test(`shared geometry texture compute refuses ${mutation} before writing a pending parent residency`, async t => {
+  const f = fixture(t, {background: false}), state = sharedTextureKernel(t, f, {mipmaps: mutation === 'mip-chain'});
+  let identity, retained;
+  state.reader.onAfterRender = () => {
+    const owner = f.renderer._getSampledTextureInputs();
+    identity = owner.storageIdentityOf(state.texture);
+    retained = owner.captureBinding({texture: state.texture, isSampledTexture: true});
+    if (mutation === 'resize') state.texture.image.width = 8;
+    else if (mutation === 'version') state.texture.needsUpdate = true;
+    else if (mutation === 'source') state.texture.source = new T.TextureSource({...state.texture.image});
+    else if (mutation === 'dispose' || mutation === 'recreate') {
+      state.texture.dispose();
+      if (mutation === 'recreate') {
+        const owner = f.renderer._getSampledTextureInputs();
+        const lease = owner.captureBinding({texture: state.texture, isSampledTexture: true});
+        assert.notEqual(owner.capturedStorageIdentity(lease)?.identity, identity);
+        owner.release(lease);
+      }
+    }
+  };
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(f.device.writes.length, 0);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+  if (mutation !== 'dispose' && mutation !== 'recreate')
+    assert.equal(retained.entry.alive, true, 'rejected preparation cannot retire the earlier reader residency');
+  f.renderer._getSampledTextureInputs().release(retained);
+  if (mutation === 'mip-chain') assert.equal(identity, null, 'mip generation retains its source binding-order boundary');
+});
+
+test('shared storage texture permission does not allow compute from arbitrary object callbacks', async t => {
+  const f = fixture(t, {background: false}), state = sharedTextureKernel(t, f);
+  state.reader.onAfterRender = () => f.renderer.compute(state.kernel);
+  await f.renderer.init();
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_REENTRY'});
+  assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('shared texture compute rechecks late binding selection before retiring an earlier draw residency', async t => {
+  const f = fixture(t, {background: false}), state = sharedTextureKernel(t, f);
+  const other = new T.StorageTexture(4, 4); t.after(() => other.dispose());
+  state.output.value = other;
+  const step = N.uniform(.125).setGroup(N.uniformGroup('lateTextureSelection', -1));
+  let computeBuilder;
+  const kernel = N.Fn(builder => {
+    computeBuilder = builder;
+    const value = step.toVar();
+    N.textureStore(state.output, N.uvec2(0), N.vec4(value));
+  })().compute(1);
+  f.material.geometryNode = kernel; t.after(() => kernel.dispose());
+  await f.renderer.init(); await f.renderer.compileComputeAsync(kernel);
+  const group = computeBuilder.getBindings().flatMap(group => group.bindings).find(binding => binding.isUniformBuffer);
+  const update = group.update;
+  let reading = false, changes = 0;
+  group.update = function() { reading = true; try { return update.call(this); } finally { reading = false; } };
+  Object.defineProperty(step, 'value', {configurable: true, get() {
+    if (reading && changes === 0) {
+      changes++; state.output.value = state.texture; state.texture.image.width = 8;
+    }
+    return .125;
+  }});
+  const writes = f.device.writes.length;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_COMPUTE_REENTRY'});
+  assert.equal(changes, 1); assert.equal(f.computes.length, 0); assert.equal(draws(f).length, 0);
+  assert.equal(f.device.writes.length, writes); assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
 test('geometry compute conservatively refuses sampling its pending parent attachment', async t => {

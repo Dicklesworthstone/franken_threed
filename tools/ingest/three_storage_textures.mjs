@@ -158,7 +158,9 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     if (entry && entry.shape.key !== shape.key) { retire(entry); entry = null; }
     if (!entry) {
       if (entries.size >= maxTextures) fail('BUDGET', 'Storage texture count exceeds maxTextures');
-      entry = {texture, shape, alive: true, native: null, view: null, charged: 0, mipsDirty: false, views: new Map(), samplers: new Map()};
+      entry = {texture, shape, alive: true, native: null, view: null, charged: 0, mipsDirty: false, views: new Map(), samplers: new Map(),
+        source: texture.source, version: texture.version};
+      entry.proof = Object.freeze({texture, identity: Object.freeze({})});
       entry.onDispose = () => retire(entry);
       texture.addEventListener('dispose', entry.onDispose); entries.set(texture, entry);
     }
@@ -169,6 +171,25 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     if (!entry?.alive || entries.get(entry.texture) !== entry || inspectThreeStorageTexture(entry.texture, three).key !== entry.shape.key)
       fail('STALE', 'Storage texture was resized, disposed or reconfigured before its queued use');
     return entry;
+  }
+  // Storage textures have no CPU upload history. One live residency therefore
+  // supplies an opaque identity for source compute-before-render ordering.
+  // Merely recognizing isStorageTexture is insufficient: a resize or disposal
+  // must never authorize a dispatch against an earlier draw's allocation.
+  function identityOf(texture) {
+    live();
+    const entry = entries.get(texture);
+    // Source storage version changes request a second native allocation. Its
+    // mip generation is also binding-order-sensitive, so only unchanged,
+    // single-level storage may cross this pending-parent boundary.
+    return entry?.alive && entry.source === texture.source && entry.version === texture.version &&
+      entry.shape.mipLevelCount === 1 && inspectThreeStorageTexture(texture, three).key === entry.shape.key
+      ? entry.proof.identity : null;
+  }
+  function capturedIdentity(snapshot) {
+    const entry = snapshot?.entry;
+    return entry && entries.get(entry.texture) === entry && identityOf(entry.texture) === entry.proof.identity
+      ? entry.proof : null;
   }
   function checkExtent(shape) {
     const d = device(), {width, height, depth, viewDimension} = shape;
@@ -226,8 +247,8 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     });
     return entry;
   }
-  function captureBinding(binding) {
-    const entry = capture(binding.texture), d = device();
+  function bindingSnapshot(binding, entry) {
+    const d = device();
     // r186 SampledTexture extends Sampler, so both flags are true.
     if (binding.isSampler && !binding.isSampledTexture) return {entry, kind: 'sampler', sampler: samplerOf(binding.texture, three, entry.shape, d)};
     if (!binding.isSampledTexture) fail('BINDING', 'Expected a sampled or storage texture binding');
@@ -242,6 +263,13 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
         access !== 'read-only' && binding.texture.mipmapsAutoUpdate === true)
       fail('MIPS', 'Integer storage mipmaps require explicit compute writes; disable mipmapsAutoUpdate');
     return {entry, kind: 'storage', access, mipLevel, autoMips: binding.texture.mipmapsAutoUpdate};
+  }
+  function captureBinding(binding) { return bindingSnapshot(binding, capture(binding.texture)); }
+  function layoutOf(binding) {
+    live();
+    // Graphics and compute program reflection must not replace the residency
+    // of a texture an earlier pending draw already captured.
+    return layout(bindingSnapshot(binding, {shape: inspectThreeStorageTexture(binding.texture, three)}));
   }
   function captureCopy(sourceTexture, destinationTexture, region = null, position = null, sourceLevel = 0, destinationLevel = 0) {
     const source = capture(sourceTexture), destination = capture(destinationTexture);
@@ -379,7 +407,7 @@ export function createThreeStorageTextures(three, {getDevice, signal = null, max
     try { await Promise.race([Promise.all([...pending, watchedDevice.queue.onSubmittedWorkDone()]), cancelled]); live(); }
     finally { stopped.signal.removeEventListener('abort', abort); }
   }
-  return {capture, assertCurrent, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
+  return {capture, assertCurrent, identityOf, capturedIdentity, ensure, validateAllocations, withTexture, captureBinding, captureCopy, copy, layoutOf, layout, resolve, validateDispatch, written, bindingsFor, whenIdle,
     // A queue-free snapshot for cross-owner consumers. Capture synchronously:
     // awaiting whenIdle here would insert a fence into every GPU-only copy.
     get validation() { return validationSnapshot(); },

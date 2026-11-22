@@ -54,6 +54,58 @@ Compute-authored indices, integer vertex fetch and repeated instance divisors
 must not be inferred from Float32 vertex-buffer support. Shader storage reads
 through authored node-material slots use the separate profile below.
 
+## Geometry-triggered compute with shared storage textures
+
+A `material.geometryNode` kernel can update a GPU-authored storage texture that
+an earlier native draw in the same pending render already samples. Ordinary
+draws and warm `BundleGroup` draws keep their actual texture residency; the
+kernel and all those draws share one native allocation. This ownership proof
+covers 2D, 2D-array and 3D storage residencies with a single mip level. Shader
+generation remains source-controlled: the pinned `StorageTextureNode` 3D
+coordinate limitation documented in `THREE_NODE_PROGRAMS.md` is unchanged.
+The recording checks below establish residency and ordering, without claiming
+real 3D shader execution or pixel parity.
+
+```js
+const field = new THREE.StorageTexture(1, 1);
+field.generateMipmaps = false;
+const destination = TSL.storageTexture(field).toWriteOnly();
+const nextColor = TSL.uniform(new THREE.Vector4(0.2, 0.4, 0.8, 1));
+const updateField = TSL.Fn(() => {
+  TSL.textureStore(destination, TSL.uvec2(0), nextColor);
+})().compute(1);
+
+earlierMaterial.colorNode = TSL.texture(field).rgb;
+laterMaterial.colorNode = TSL.texture(field).rgb;
+laterMaterial.geometryNode = updateField;
+renderer.render(scene, camera);
+```
+
+The pinned renderer submits geometry compute through a separate encoder before
+the unfinished parent render submits. Both draws therefore observe the update,
+including the draw captured before the kernel ran. This preserves source queue
+ordering; it does not interleave a compute pass between two completed draws.
+No texture copy, CPU upload or readback is introduced.
+
+The permission requires the exact same live storage residency, source object,
+texture version, format and extent. Resize, disposal/recreation, a replacement
+source or `needsUpdate` during parent capture fails before dispatch. A late
+binding update is rechecked before it can retire an earlier draw's residency.
+Warm shared bundle refreshes retain their captured texture even if the live
+material map is replaced.
+
+Mip chains retain their existing refusal because source mip generation depends
+on later sampled-binding updates. Overlapping CPU-authored sampled textures,
+pending render attachments, untracked parent draws and arbitrary object-hook
+compute also retain their separate submission boundary. This permission does
+not allow conflicting sampled/writable aliases within one compute dispatch.
+
+`three_renderer_geometry_compute.test.mjs` checks the production renderer's
+exact source graphics/kernel WGSL, 2D/array/volume allocation sharing, two queued
+frames, warm bundle selection, changed residency refusals and late binding
+selection. The recording device checks resource identity and submission order;
+it does not execute WGSL arithmetic.
+
 ## Ranged and reusable compute readback
 
 `renderer.getArrayBufferAsync(attribute, target = null, offset = 0, count = -1)`

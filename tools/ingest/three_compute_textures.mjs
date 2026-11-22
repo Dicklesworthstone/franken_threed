@@ -201,7 +201,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     return {texture: {sampleType: shape.sampleType, viewDimension: shape.viewDimension, multisampled: false}};
   }
   function layoutOf(binding) {
-    if (isStorage(binding)) return storage.layout(storage.captureBinding(binding));
+    if (isStorage(binding)) return storage.layoutOf?.(binding) ?? storage.layout(storage.captureBinding(binding));
     if (isTarget(binding)) return targets().layoutOf(binding);
     if (isFramebuffer(binding)) return framebuffers().layoutOf(binding);
     if (isDetachedDepth(binding)) return depths().layoutOf(binding);
@@ -732,6 +732,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   }
   return {
     layoutOf, captureBinding, captureShared, captureCopyDestination,
+    // Only GPU-authored storage can share compute-before-parent residency.
+    // CPU uploads, render targets and framebuffer histories keep their existing
+    // ordering boundaries; an ordinary sampled lease never acquires this proof.
+    storageIdentityOf(texture) { live(); return texture?.isStorageTexture === true ? storage.identityOf(texture) : null; },
+    capturedStorageIdentity(snapshot) { live(); return storage.capturedIdentity(snapshot); },
     /** Retained synchronous GPU bakers own an accepted input independently of
      * later source disposal. Ordinary leases keep their existing invalidation
      * rules; this read shares the same captured payload and native residency. */

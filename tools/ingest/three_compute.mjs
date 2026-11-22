@@ -392,15 +392,25 @@ function createThreeCompute(renderer, three) {
         binding.textureNode?.isSampleCompare?.() === true && renderer.hasCompatibility(three.Compatibility.TEXTURE_COMPARE),
       store: binding.store, access: binding.access, mipLevel: binding.mipLevel};
   }
-  function captureTexture(binding, resources = null) {
+  function captureTexture(binding, resources = null, validateSelection = null) {
     const selection = textureBinding(binding);
+    validateSelection?.(selection.texture);
     resources?.push(selection.texture);
     return textureOwner.captureBinding(selection);
+  }
+  function textureLayout(binding) {
+    const selection = textureBinding(binding);
+    // Reject incompatible pending readers during cold program preparation and
+    // warm signature checks. Layout reflection stays read-only; actual binding
+    // capture follows later and must preserve the same accepted residency.
+    assertThreeNativeComputeOutsideCapture(renderer, [selection.texture], null,
+      texture => textureOwner.storageIdentityOf?.(texture) ?? null);
+    return textureOwner.layoutOf(selection);
   }
   function textureSignature(groups) {
     return JSON.stringify(groups.map(group => group.bindings.map(binding =>
       binding.isSampledTexture || binding.isSampler
-        ? textureOwner.layoutOf(textureBinding(binding)) : null)));
+        ? textureLayout(binding) : null)));
   }
   class NativeComputeNodeBuilder extends three.WGSLNodeBuilder {
     getUniformFromNode(node, ...args) {
@@ -426,7 +436,7 @@ function createThreeCompute(renderer, three) {
       const groups = builder.getBindings();
       for (const group of groups) for (const binding of group.bindings) {
         if (binding.isStorageBuffer) validateAttribute(binding.attribute);
-        else if (binding.isSampledTexture || binding.isSampler) textureOwner.layoutOf(textureBinding(binding));
+        else if (binding.isSampledTexture || binding.isSampler) textureLayout(binding);
         else if (!binding.isUniformBuffer) fail('BINDING', 'Expected storage/uniform buffers or admitted texture bindings');
       }
       forget(node);
@@ -469,7 +479,8 @@ function createThreeCompute(renderer, three) {
         return previous.proof.identity;
       return null;
     };
-    const parentCapture = assertThreeNativeComputeOutsideCapture(renderer, resources, storageUploadIdentity);
+    const storageTextureIdentity = texture => textureOwner.storageIdentityOf?.(texture) ?? null;
+    const parentCapture = assertThreeNativeComputeOutsideCapture(renderer, resources, storageUploadIdentity, storageTextureIdentity);
     const acceptedResources = parentCapture ? [] : null;
     const held = new Set(), textureUses = [], epoch = listeners.get(node);
     let released = false;
@@ -485,7 +496,10 @@ function createThreeCompute(renderer, three) {
       const groups = entry.groups.map((group, index) => ({index, entries: group.bindings.map((binding, slot) => {
         if (binding.isSampledTexture || binding.isSampler) {
           binding.update?.();
-          const texture = captureTexture(binding, acceptedResources);
+          // A binding update can retarget or resize its source. Recheck before
+          // the texture owner may retire any earlier draw's captured residency.
+          const texture = captureTexture(binding, acceptedResources, parentCapture ? selected =>
+            assertThreeNativeComputeOutsideCapture(renderer, [selected], storageUploadIdentity, storageTextureIdentity) : null);
           textureUses.push(texture);
           return {binding: slot, texture, layout: {binding: slot, visibility: 4, ...textureOwner.layout(texture)}};
         }
@@ -533,6 +547,15 @@ function createThreeCompute(renderer, three) {
         for (const record of held) if (!record.uniform && record.key === attribute) {
           if (record.dynamic || identity !== null && identity !== record.proof.identity) return null;
           identity = record.proof.identity;
+        }
+        return identity;
+      }, resource => {
+        let identity = null;
+        for (const use of textureUses) {
+          const proof = textureOwner.capturedStorageIdentity?.(use);
+          if (proof?.texture !== resource) continue;
+          if (identity !== null && identity !== proof.identity) return null;
+          identity = proof.identity;
         }
         return identity;
       });

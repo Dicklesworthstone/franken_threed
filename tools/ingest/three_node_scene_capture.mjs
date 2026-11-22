@@ -1042,7 +1042,6 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
       markThreeNativeDrawCaptured(renderer, true);
       const vertexStart = vertexStorageUses.length;
       const captured = programs.captureDraw(draw.binding.nodeProgram, {...updateContext, beforeDone});
-      for (const binding of captured.textures) recordTexture(binding.texture);
       draw.nodeUniforms = captured.uniforms;
       draw.nodeAttributes = captured.attributes ?? null;
       draw.nodeSharedGeometry = !draw.nodeBundle && updateContext.fogRenderContext !== undefined &&
@@ -1128,6 +1127,17 @@ export function captureThreeNodeScene(three, root, camera, {getPrograms, rendere
         storageUses.push(lease);
         return Object.freeze({group: binding.group, binding: binding.binding, lease});
       }));
+      }
+      // Record the actual retained residency, including warm bundle bindings.
+      // A public Texture flag alone cannot prove that a later geometry compute
+      // shares the allocation sampled by this already captured draw.
+      for (const [index, binding] of draw.nodeTextures.entries()) {
+        const layout = draw.binding.nodeProgram.groups.find(group => group.index === binding.group)
+          ?.entries.find(entry => entry.binding === binding.binding);
+        if (layout?.sampler) continue;
+        const proof = textureOwner.capturedStorageIdentity?.(binding.lease);
+        if (proof) recordTexture(proof.texture, proof.identity);
+        else if (captured.textures[index]) recordTexture(captured.textures[index].texture);
       }
       if (draw.nodeBundle) { draw.bundleTextureOwner = textureOwner; draw.bundleStorageOwner = storageOwner; }
       // r186 reads geometry.instanceCount before Mesh.count, after node/binding

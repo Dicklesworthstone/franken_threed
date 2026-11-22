@@ -413,12 +413,23 @@ Geometry kernels use the existing render prerequisite FIFO. Disjoint earlier
 native draws are admitted; a background or companion mesh does not itself block
 the update. Live compute storage, indirect and texture bindings are checked
 before upload capture against earlier parent readers and pending attachments.
-Overlapping resources, untracked fixed draws and arbitrary object-hook compute
-remain explicit refusals. This overlap check is conservative: pinned WebGPU
-submits compute through an independent encoder before the unfinished parent
-render encoder. This change does not introduce interleaved draw/compute passes
-or claim support for every source-valid aliasing combination. Accepted child
-kernels survive a later parent capture failure, with no parent draw submitted.
+Unchanged storage buffers can share their accepted static upload allocation.
+GPU-authored 2D, array and 3D storage textures can likewise share one unchanged,
+single-mip residency, including a texture sampled by an earlier warm bundle.
+The proof comes from the actual retained binding, so a live material-map edit
+cannot replace a shared bundle refresh's captured texture. Binding updates are rechecked
+before capture can replace an allocation and again against the final leases.
+
+Pinned WebGPU submits compute through an independent encoder before the
+unfinished parent render encoder. Earlier pending draws consequently observe
+the same updated storage contents as later draws. This does not introduce
+interleaved draw/compute passes. Texture source/version changes, resize,
+disposal/recreation, mip chains, CPU texture histories, pending attachments,
+untracked fixed draws and arbitrary object-hook compute retain explicit
+refusals. Mip chains remain separate because source mip generation depends on
+sampled-binding update order. Accepted child kernels survive a later parent
+capture failure, with no parent draw submitted. See `COMPUTE_GEOMETRY.md` for
+shared storage texture usage and the exact ownership boundary.
 
 Eighteen `three_renderer_geometry_compute.test.mjs` cases cover exact pinned
 vertex/fragment and compute WGSL, constructor/cache stability, shared-frame

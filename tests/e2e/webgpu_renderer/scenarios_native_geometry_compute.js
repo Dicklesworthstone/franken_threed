@@ -153,8 +153,70 @@ function overlappingStorageScenario(T, renderer) {
   return {scene, camera};
 }
 
+// Texture reads obey the same queue boundary as buffer reads. The first mesh
+// samples an existing allocation before the second mesh triggers its next
+// compute write; both pending draws must see that write after submission.
+// Keep a single mip: the source regenerates upper levels at later sample uses.
+async function overlappingTextureScenario(T, renderer) {
+  const N = T.TSL, scene = new T.Scene();
+  scene.background = new T.Color(0x172334);
+  const camera = new T.OrthographicCamera(-2.4, 2.4, 1.8, -1.8, .1, 20);
+  camera.position.z = 5;
+  const texture = new T.StorageTexture(4, 4), source = texture.source;
+  texture.type = T.UnsignedByteType; texture.format = T.RGBAFormat;
+  texture.colorSpace = T.NoColorSpace; texture.generateMipmaps = false;
+  texture.minFilter = texture.magFilter = T.NearestFilter;
+  const counters = new T.StorageBufferAttribute(new Uint32Array(16), 1);
+  const counter = N.storage(counters, 'uint', 16).element(N.instanceIndex);
+  const tint = N.uniform(.125), tick = N.uniform(0, 'uint');
+  const kernel = N.Fn(() => {
+    const x = N.instanceIndex.mod(4), y = N.instanceIndex.div(4);
+    N.textureStore(texture, N.uvec2(x, y),
+      N.vec4(x.toFloat().mul(.125).add(.125), tint, y.toFloat().mul(.125).add(.25), 1));
+    counter.addAssign(tick);
+  })().compute(16);
+  let initializations = 0;
+  kernel.onInit(() => { initializations++; });
+  await renderer.computeAsync(kernel);
+  for (let index = 0; index < 2; index++) {
+    const material = new T.MeshBasicNodeMaterial();
+    material.colorNode = N.texture(texture, N.uv()).rgb;
+    if (index === 1) material.geometryNode = kernel;
+    const mesh = new T.Mesh(new T.PlaneGeometry(1.5, 1.5), material);
+    mesh.position.x = index ? .9 : -.9;
+    mesh.renderOrder = index; mesh.frustumCulled = false; scene.add(mesh);
+  }
+  const render = renderer.render.bind(renderer), read = renderer.readRenderTargetPixelsAsync.bind(renderer);
+  const target = renderer.getRenderTarget(); let frame = 0, firstPixels = null;
+  renderer.render = (...args) => {
+    if (args[0] === scene && args[1] === camera) {
+      renderer._nodes.nodeFrame.update(); frame++; tick.value = 1;
+      tint.value = .125 + (frame % 4) * .125;
+    }
+    return render(...args);
+  };
+  renderer.readRenderTargetPixelsAsync = async (...args) => {
+    const pixels = await read(...args);
+    if (args[0] !== target) return pixels;
+    const values = new Uint32Array(await renderer.getArrayBufferAsync(counters));
+    if (initializations !== 1 || values.length !== 16 || values.some(value => value !== frame))
+      throw Error(`Shared texture geometry compute must run once per frame (${frame})`);
+    if (texture.source !== source || texture.image.data !== undefined || counters.array.some(value => value !== 0))
+      throw Error('Shared texture compute must retain source identity and GPU-only results');
+    const colors = new Set();
+    for (let i = 0; i < pixels.length; i += 4) colors.add(pixels[i] * 65536 + pixels[i + 1] * 256 + pixels[i + 2]);
+    if (colors.size < 16) throw Error('Shared texture draws must display the computed grid');
+    if (frame === 1) firstPixels = pixels.slice();
+    if (frame === 8 && firstPixels && pixels.every((value, index) => value === firstPixels[index]))
+      throw Error('Pending texture consumers must display the next computed image');
+    return pixels;
+  };
+  return {scene, camera};
+}
+
 export const geometryComputeScenarios = {
   native_geometry_compute_fn(T, renderer) { return scenario(T, renderer, false); },
   native_geometry_compute_shared(T, renderer) { return scenario(T, renderer, true); },
   native_geometry_compute_overlap(T, renderer) { return overlappingStorageScenario(T, renderer); },
+  native_geometry_compute_texture_overlap(T, renderer) { return overlappingTextureScenario(T, renderer); },
 };
