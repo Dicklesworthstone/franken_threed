@@ -28,7 +28,7 @@ async function fixture(options={},withBundleGroup=false) {
       transformed=transformed.slice(0,edit.start)+edit.text+transformed.slice(edit.end);
     return {code:matrix.header+batch.header+transformed+matrix.tail+batch.tail,map:null};
   };
-  const source='export {Object3D,Group,Scene,Bone,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial} from '+
+  const source='export {Object3D,Group,Scene,Bone,Mesh,InstancedMesh,Matrix4,Euler,Vector3,Quaternion,BufferGeometry,MeshBasicMaterial,Camera,SkinnedMesh,Light,AmbientLight,DirectionalLight,HemisphereLight,LightProbe,PointLight,RectAreaLight,SpotLight,Line,LineLoop,LineSegments,Points,Sprite,LOD} from '+
     JSON.stringify(path.join(upstream,'build/three.core.js'))+';'+
     (withBundleGroup?'export {BundleGroup} from '+JSON.stringify(path.join(upstream,'build/three.webgpu.js'))+';':'')+
     'export {transformBatchDiagnostics as diagnostics} from '+JSON.stringify('\0f3d-transform-batch-adapter')+';'+
@@ -518,5 +518,83 @@ test('selective budget and late pivot failures preserve partial source updates w
       assert.throws(()=>root.updateWorldMatrix(true,true),failure==='pivot'?/pivot failure/:TypeError);
     }
     assert.deepEqual(traces[0],traces[1]);same(broken,referenceBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
+  }
+});
+
+test('ordinary lights, primitives and LOD retain one whole-scene transform transaction',()=>{
+  const {api}=native;
+  const kinds=['Light','AmbientLight','DirectionalLight','HemisphereLight','LightProbe','PointLight','RectAreaLight','SpotLight',
+    'Line','LineLoop','LineSegments','Points','Sprite','LOD'];
+  for(const kind of kinds)for(const method of ['updateMatrixWorld','updateWorldMatrix']) {
+    const make=library=>{
+      const scene=new library.Scene(),child=new library[kind](),leaf=new library.Object3D();
+      scene.add(new library.Mesh(new library.BufferGeometry(),new library.MeshBasicMaterial()),child);child.add(leaf);
+      let i=0;scene.traverse(node=>{
+        node.position.set(++i/7,-i/11,2);node.rotation.set(i/13,-0.4,0.2);node.scale.set(-1,0.7,2);
+        node.pivot=new library.Vector3(0.4,1,-0.3);
+      });
+      leaf.matrixAutoUpdate=false;leaf.matrix.makeTranslation(2,-1,3);
+      return scene;
+    };
+    const actual=make(api),expected=make(reference),elements=actual.children[1].matrixWorld.elements;
+    for(let frame=0;frame<3;frame++) {
+      for(const root of [actual,expected]) {
+        root.children[1].position.z+=0.2;root.children[1].pivot.x-=0.1;
+        if(method==='updateMatrixWorld')root.updateMatrixWorld(frame===1);
+        else root.updateWorldMatrix(false,true,frame===1);
+      }
+      same(actual,expected);
+      assert.equal(api.diagnostics(actual).wasmCalls,frame+1,kind+' '+method);
+      assert.equal(api.diagnostics(actual).fallbackCalls,0,kind+' '+method);
+      assert.equal(actual.children[1].matrixWorld.elements,elements);
+    }
+  }
+});
+
+test('changed light methods and opaque primitive prototypes retain source effects once',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const failure of ['override','opaque']) {
+    const traces=[[],[]],roots=[];
+    for(const [index,library]of [api,reference].entries()) {
+      const scene=new library.Scene(),child=failure==='override'?new library.PointLight():new library.LineSegments();
+      child.position.set(3,-2,1);scene.add(new library.Object3D(),child);roots.push(scene);
+      if(failure==='override') {
+        const original=child[method];
+        Object.defineProperty(child,method,{get(){
+          traces[index].push('method');return function(...args){
+            traces[index].push('call');return original.apply(this,args);
+          };
+        }});
+      }else {
+        const parent=Object.getPrototypeOf(child);
+        Object.setPrototypeOf(child,new Proxy(parent,{
+          get(target,key,receiver){traces[index].push(String(key));return Reflect.get(target,key,receiver);},
+          getOwnPropertyDescriptor(){throw new Error('Unknown prototype must not be inspected');},
+          getPrototypeOf(){throw new Error('Unknown prototype must not be traversed');},
+        }));
+      }
+      if(method==='updateMatrixWorld')scene.updateMatrixWorld();else scene.updateWorldMatrix(false,true);
+    }
+    same(roots[0],roots[1]);assert.deepEqual(traces[0],traces[1]);
+    if(failure==='override')assert.deepEqual(traces[0],['method','call']);
+    assert.equal(api.diagnostics(roots[0]).wasmCalls,0);
+    assert.equal(api.diagnostics(roots[0]).lastFailure,'TRANSFORM_BATCH_GUARD');
+  }
+});
+
+test('camera and skinned-mesh world-update side effects stay on their original route',()=>{
+  const {api}=native;
+  for(const kind of ['Camera','SkinnedMesh'])for(const method of ['updateMatrixWorld','updateWorldMatrix']) {
+    const roots=[api,reference].map(library=>{
+      const scene=new library.Scene(),child=new library[kind]();
+      child.position.set(3,-2,1);child.rotation.set(0.3,-0.4,0.1);
+      scene.add(new library.Object3D(),child);
+      if(method==='updateMatrixWorld')scene.updateMatrixWorld();else scene.updateWorldMatrix(false,true);
+      return scene;
+    });
+    same(roots[0],roots[1]);assert.equal(api.diagnostics(roots[0]).wasmCalls,0);
+    assert.equal(api.diagnostics(roots[0]).lastFailure,'TRANSFORM_BATCH_GUARD');
+    const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
+    assert.deepEqual(roots[0].children[1][field].elements,roots[1].children[1][field].elements);
   }
 });

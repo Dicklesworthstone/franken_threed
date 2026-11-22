@@ -16,6 +16,13 @@ witnesses. Mixed source/core graphs do not merge distinct class families.
 Modified arithmetic owners or an unregistered constructor keep the original
 JavaScript traversal, without inspecting an unknown constructor.
 
+Ordinary lights (including light probes and rectangle lights), lines and their
+loop/segment variants, points, sprites and LOD objects can share the same
+transaction with meshes and groups. Their pinned class modules register the
+inherited Object3D transform methods; method identity, prototype ancestry and
+source-family guards still apply on every call. Camera and SkinnedMesh classes
+retain their original traversal, including their additional world-update effects.
+
 The selective method keeps its ancestor updates and owner update in their
 original JavaScript positions. Only its descendant loop is replaced, and only
 when the source's `updateChildren === true` branch runs. Each descendant is

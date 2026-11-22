@@ -13,12 +13,16 @@ const upstream=fileURLToPath(new URL('../../upstream/three.js/',import.meta.url)
 const matrixSource=fs.readFileSync(path.join(upstream,'src/math/Matrix4.js'),'utf8');
 const paths={Object3D:'core/Object3D',Group:'objects/Group',Scene:'scenes/Scene',Bone:'objects/Bone',
   Mesh:'objects/Mesh',InstancedMesh:'objects/InstancedMesh',Matrix4:'math/Matrix4',Vector3:'math/Vector3',
-  Quaternion:'math/Quaternion',BufferGeometry:'core/BufferGeometry',MeshBasicMaterial:'materials/MeshBasicMaterial'};
-async function fixture(options={},changedMatrix=false,withCore=false) {
+  Quaternion:'math/Quaternion',BufferGeometry:'core/BufferGeometry',MeshBasicMaterial:'materials/MeshBasicMaterial',
+  Light:'lights/Light',AmbientLight:'lights/AmbientLight',DirectionalLight:'lights/DirectionalLight',
+  HemisphereLight:'lights/HemisphereLight',LightProbe:'lights/LightProbe',PointLight:'lights/PointLight',
+  RectAreaLight:'lights/RectAreaLight',SpotLight:'lights/SpotLight',Line:'objects/Line',LineLoop:'objects/LineLoop',
+  LineSegments:'objects/LineSegments',Points:'objects/Points',Sprite:'objects/Sprite',LOD:'objects/LOD'};
+async function fixture(options={},changedMatrix=false,withCore=false,production=false) {
   const entry='\0source-world-transform',plugin=marchingCubesRollupPlugin(options),reports=[];
   // Isolate the two production transforms here; application tests exercise the
   // complete compiler and its resolved dependency seam after relocation.
-  plugin.transform=(code,id)=>{
+  if(!production)plugin.transform=(code,id)=>{
     if(!transformBatchSourceRole(code))return null;
     if(changedMatrix && id.endsWith('/src/math/Matrix4.js'))return {code:code+`
       Matrix4 = new Proxy(Matrix4, {getOwnPropertyDescriptor(...args) {
@@ -169,4 +173,30 @@ test('unregistered imported matrices and exhausted source budgets retain correct
     assert.equal(api.diagnostics(actual).lastFailure,api===modified.api?'TRANSFORM_BATCH_GUARD':'KERNEL_EXECUTION_FAILED');
   }
   assert.equal(globalThis.__f3dSourceMatrixDescriptorCalls,0,'Binding an unknown constructor must not invoke Proxy traps');
+});
+
+test('production source imports admit pinned inherited classes in mixed scenes',async()=>{
+  const kinds=['Light','AmbientLight','DirectionalLight','HemisphereLight','LightProbe','PointLight','RectAreaLight','SpotLight',
+    'Line','LineLoop','LineSegments','Points','Sprite','LOD'];
+  for(const kind of kinds) {
+    const source=fs.readFileSync(path.join(upstream,'src',paths[kind]+'.js'),'utf8');
+    assert.equal(transformBatchSourceRole(source),kind);
+    assert.equal(specializeTransformBatch(source+'\n').changed,false,'Modified '+kind+' must remain source-owned');
+  }
+  const {api}=await fixture({},false,false,true);
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']) {
+    const make=library=>{
+      const scene=new library.Scene(),branch=new library.Group();scene.add(branch,new library.Object3D());
+      for(const [i,kind]of kinds.entries()) {
+        const child=new library[kind]();child.position.set(i/3,-i/7,1);child.rotation.set(i/11,-0.2,0.4);
+        child.scale.set(-1,2,0.5);branch.add(child);
+      }
+      return scene;
+    };
+    const actual=make(api),expected=make(reference);
+    update(actual,method);update(expected,method);same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,1,method);
+    assert.equal(api.diagnostics(actual).fallbackCalls,0,method);
+    assert.equal(api.diagnostics(actual).objects,kinds.length+2,method);
+  }
 });

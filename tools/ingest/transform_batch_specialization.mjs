@@ -9,9 +9,27 @@ const sourceBlobs={Object3D:'a0a09156f7e781130de6a361cf2c443b8c27d925',
   Group:'5acef7bc677d6830b514a56e6a0b8bd24d3e27fd',Scene:'21bcb96007df7bc1bfa98c5c6d613205de96795d',
   Bone:'6078326b104657e9357e4cbeea51ab59e5d50f3d',Mesh:'b80d3de8f403a696145ab131581b17263e510c59',
   InstancedMesh:'d55dc5d1311200f9ea7815c7cb7669a593f73948',
+  Light:'60f8757d2a01fca713cee8550b7825bca6424aa5',
+  AmbientLight:'b03496a0b01931757a0762d7ba738d3a635be828',
+  DirectionalLight:'ce9682fffec79b7adf967f9e51d4c80bb4628ecb',
+  HemisphereLight:'adb332b2ec1b5283ebf44989ba3670a068e9309d',
+  LightProbe:'967fe25b73d82cebc2c97c061da2583993c2114e',
+  PointLight:'d760abfa45f6ad53dda2ad3e390991f6c8ad599b',
+  RectAreaLight:'623327ce7d62aa6357822739f2684c082f34b790',
+  SpotLight:'287437f654378a8e63a63d20a25723721dc1614e',
+  Line:'c2f120c882c9000c88d7c58f9727a64eb0a3a953',
+  LineLoop:'d9ed8452d3c6085fe2b77abadd58a08097215f1b',
+  LineSegments:'527a130cb358d0ae070b3353404b99667d4edfa7',
+  Points:'1ab25da930fbd65c0ddbc3b82ff218ef662feffd',
+  Sprite:'23b6644228abb940bf8f8f3df5e1e3e12b381278',
+  LOD:'aa21d0980944cc7987850f1ecce87c7815a65a51',
   Vector3:'b2e4c4e65cc50afc89b6cd8f8e706a0d1001d71a',Quaternion:'c9faca31665218cee87a7110e2badc7ba868beca',
   Matrix4:'6522a6b57300d20bf6a36fbcbb3862e81291d060'};
-const nodeClasses=['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4'];
+// Pinned inherited-transform classes only. Camera and SkinnedMesh overrides
+// have additional observable work and remain outside the descendant batch.
+const nodeClasses=['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4',
+  'Light','AmbientLight','DirectionalLight','HemisphereLight','LightProbe','PointLight','RectAreaLight','SpotLight',
+  'Line','LineLoop','LineSegments','Points','Sprite','LOD'];
 const unchanged=()=>({changed:false,edits:[],header:'',tail:''});
 export function transformBatchSourceRole(source) {
   const blob=sourceBlob(source);

@@ -135,7 +135,9 @@ export function marchingCubesRollupPlugin(options={}) {
           if(skeleton.report)skeletonReports.push({id,...skeleton.report});
           if(skeleton.changed){edits.push(...skeleton.edits);headers.push(skeleton.header);tail+=skeleton.tail;}
         }
-        if(['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4','Vector3','Quaternion'].some(name=>code.includes('class '+name))) {
+        if(['Object3D','Group','Scene','Bone','Mesh','InstancedMesh','Matrix4','Vector3','Quaternion',
+          'Light','AmbientLight','DirectionalLight','HemisphereLight','LightProbe','PointLight','RectAreaLight','SpotLight',
+          'Line','LineLoop','LineSegments','Points','Sprite','LOD'].some(name=>code.includes('class '+name))) {
           const batch=specializeTransformBatch(code,{...sources,runtimeModule:TRANSFORMS,maxMemoryPages,maxIterations});
           if(batch.report)transformReports.push({id,...batch.report});
           if(batch.changed){edits.push(...batch.edits);headers.push(batch.header);}
