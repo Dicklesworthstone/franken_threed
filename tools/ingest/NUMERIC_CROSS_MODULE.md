@@ -2,9 +2,9 @@
 
 An admitted numeric function no longer needs its callers in the same output
 chunk. Exported closed functions register their **original function identity**
-with the emitted dispatcher. Direct calls through named/default imports and
-static module-namespace members look up that identity and reuse the producer's
-lazy Wasm instance. This is not
+with the emitted dispatcher. Direct calls through named/default imports,
+static module namespaces and immutable awaited-import bindings look up that
+identity and reuse the producer's lazy Wasm instance. This is not
 function replacement, import rebinding, or runtime code generation.
 
 ## Application builds
@@ -82,6 +82,31 @@ shadowed by parameters, body vars, block declarations, catch bindings or loop
 bindings stay on their original member-call path. Parameter initializers and
 switch discriminants retain their own lexical lookup rules.
 
+The same dispatch is available after a dynamic import:
+
+```js
+export async function loadSimulation(preview) {
+  const kernels = await import(preview ? './preview.mjs' : './simulation.mjs');
+  return (positions, velocity, dt) => kernels.integrate(positions, velocity, dt);
+}
+```
+
+The receiver must be a lexical `const` initialized directly by `await import(...)`.
+Top-level await, nested async functions, block/loop scopes and closures over that
+binding are supported. Import operands stay in place and execute once, including
+finite choices imported from configuration modules. Module evaluation, promise
+resolution, suspension, rejection and binding initialization retain their source
+order; registration alone does not instantiate Wasm. A call before the binding
+initializes still throws its original temporal-dead-zone error before arguments.
+
+A dynamic import can resolve to an arbitrary value when a module exports a
+callable `then`. Dispatch therefore proves only the immutable receiver binding,
+not namespace identity or property purity. The original property access still
+executes once before arguments, including getters/proxy traps and their exact
+exceptions. Native admission uses the resulting function identity. Registry
+misses and every guard failure retain the selected function and actual receiver,
+including when an argument replaces the receiver's method.
+
 Native type selection and all existing ownership, bounds, Math, alias, scalar,
 and transaction guards still apply on every invocation. Same-type aliases use
 ordered shared scratch storage. Late bounds failures and exhausted native work
@@ -120,11 +145,12 @@ priority. This expands eligibility; it does not establish a speedup.
 
 ## Scope and costs
 
-Only direct, nonoptional calls through named/default imports or proven static
-namespace imports are rewritten. Arbitrary object methods, dynamic member names,
-optional calls, constructors, tagged calls and indirect callback invocation
-remain JavaScript. A dynamically loaded chunk can use its static namespace
-imports; a namespace obtained from `await import(...)` is outside this proof.
+Only direct, nonoptional calls through named/default imports, proven static
+namespace imports or the immutable awaited-import bindings above are rewritten.
+Arbitrary object methods, dynamic member names, optional calls, constructors,
+tagged calls and indirect callback invocation remain JavaScript. Mutable
+awaited-import bindings, destructured imports, import promise callbacks and
+direct `(await import(...)).method(...)` expressions remain outside this proof.
 Uninstrumented outside callers still call the original function normally.
 
 The pass works on the source unit it receives. A bundler may normalize a static

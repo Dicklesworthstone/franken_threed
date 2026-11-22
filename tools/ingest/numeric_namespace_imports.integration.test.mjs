@@ -171,6 +171,156 @@ test('unavailable Wasm keeps namespace receivers and original numeric execution'
   } finally {globalThis.WebAssembly=Native;}
 });
 
+test('awaited imports in nested closures and top-level scope share lazy native producers',async()=>{
+  const files=graph({
+    'state.mjs':`export let evaluations=0;export function enter(){evaluations++;}`,
+    'producer.mjs':`import {enter} from './state.mjs';enter();${UPDATE}
+      export {advance,advance as 'advance vertices'};
+      export function context(...args){return [this,args];}`,
+    'bridge.mjs':`export {advance,'advance vertices',context} from './producer.mjs';`,
+    'consumer.mjs':`
+      import * as state from './state.mjs';export {state};
+      export async function load(bridge,events){
+        events.push('before');
+        const kernels=await import((events.push('selector'),bridge?'./bridge.mjs':'./producer.mjs'));
+        events.push('resumed');
+        return {kernels,
+          frame(out,input,dt){return kernels['advance vertices'](out,input,dt);},
+          context(...args){return kernels.context(...args);}};
+      }`,
+    'top.mjs':`const kernels=await import('./producer.mjs');export {kernels};
+      export function frame(out,input,dt){return kernels.advance(out,input,dt);}`,
+  });
+  const consumer=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  assert.equal(consumer.state.evaluations,0);assert.equal(original.state.evaluations,0);
+  let producer;
+  for(const bridge of [false,true]) {
+    const events=[],expectedEvents=[];
+    const pending=consumer.load(bridge,events),referencePending=original.load(bridge,expectedEvents);
+    events.push('caller');expectedEvents.push('caller');
+    const app=await pending,reference=await referencePending;
+    assert.deepEqual(events,['before','selector','caller','resumed']);assert.deepEqual(events,expectedEvents);
+    producer??=app.kernels.advance;
+    assert.equal(app.kernels.advance,producer);
+    assert.equal(app.kernels.advance.toString(),reference.kernels.advance.toString());
+    if(!bridge) assert.equal(diagnostics(producer).initialized,false);
+    for(const Type of [Float32Array,Float64Array]) {
+      const values=new Type([1,2,3,4,5]),expected=values.slice();
+      for(let frame=0;frame<2;frame++) {
+        app.frame(values.subarray(1),values.subarray(0,4),0.5);
+        reference.frame(expected.subarray(1),expected.subarray(0,4),0.5);
+        assert.deepEqual(values,expected);
+      }
+    }
+    const marker={},actual=app.context(marker,7),expected=reference.context(marker,7);
+    assert.equal(actual[0],app.kernels);assert.equal(expected[0],reference.kernels);
+    assert.deepEqual(actual[1],expected[1]);assert.equal(actual[1][0],marker);
+  }
+  const top=await files.load('top.mjs'),reference=await files.original('top.mjs');
+  const out=new Float64Array([1]),expected=out.slice(),input=new Float64Array([2]);
+  top.frame(out,input,3);reference.frame(expected,input,3);
+  assert.deepEqual(out,expected);assert.equal(top.kernels.advance,producer);
+  assert.equal(calls(producer),9);assert.equal(consumer.state.evaluations,1);
+  assert.equal(original.state.evaluations,1);
+  const sites=files.reports['consumer.mjs'].importedCalls;
+  assert.equal(sites.length,2);
+  assert.ok(sites.every(site=>site.receiverSemantics==='original-dynamic-import-value'&&site.moduleSpecifier===null));
+  assert.equal(files.reports['top.mjs'].importedCalls[0].moduleSpecifier,'./producer.mjs');
+});
+
+test('awaited-import proofs retain lexical lookup, TDZ, import failures and unsupported calls',async()=>{
+  const files=graph({
+    'producer.mjs':SUM,
+    'consumer.mjs':`
+      const kernels=await import('./producer.mjs');export {kernels};
+      export function parameter(value=kernels.sum(3)){var kernels;return value;}
+      export function discriminant(n){switch(kernels.sum(n)){case 6:const kernels={};return 6;default:return 0;}}
+      export async function nested(n){const kernels=await import('./producer.mjs');
+        return ()=>kernels.sum(n);}
+      export async function header(n){for(const kernels=await import('./producer.mjs');;)
+        return kernels.sum(n);}
+      export function shadow(kernels,n){return kernels.sum(n);}
+      export function caught(value){try{throw value;}catch(kernels){return kernels.sum(3);}}
+      export function hoisted(){if(false){var kernels;}return kernels.sum(3);}
+      export async function mutable(n){let kernels=await import('./producer.mjs');return kernels.sum(n);}
+      export async function optional(n){const kernels=await import('./producer.mjs');return kernels.sum?.(n);}
+      export async function dynamic(key,n){const kernels=await import('./producer.mjs');return kernels[key](n);}
+      export async function tdz(events){try{return kernels.sum((events.push('argument'),3));}
+        finally{events.push('finally');}const kernels=await import('./producer.mjs');}
+      export async function failed(path,events){
+        const kernels=await import((events.push('selector'),path));events.push('resumed');return kernels.sum(3);}`,
+  });
+  const app=await files.load('consumer.mjs'),reference=await files.original('consumer.mjs');
+  assert.equal(app.parameter(),reference.parameter());
+  assert.equal(app.discriminant(3),reference.discriminant(3));
+  assert.equal((await app.nested(3))(),(await reference.nested(3))());
+  assert.equal(await app.header(3),await reference.header(3));
+  assert.equal(calls(app.kernels.sum),4);
+  for(const name of ['shadow','caught','hoisted','mutable','optional','dynamic'])
+    assert.equal(app[name].toString(),reference[name].toString(),`${name} must retain its original body`);
+  const receiver={sum(n){assert.equal(this,receiver);return n+1;}};
+  assert.equal(app.shadow(receiver,3),4);assert.equal(app.caught(receiver),4);
+  assert.throws(()=>app.hoisted(),TypeError);assert.throws(()=>reference.hoisted(),TypeError);
+  assert.equal(await app.mutable(3),await reference.mutable(3));
+  assert.equal(await app.optional(3),await reference.optional(3));
+  assert.equal(await app.dynamic('sum',3),await reference.dynamic('sum',3));
+  for(const target of [app,reference]) {
+    const tdzEvents=[];await assert.rejects(target.tdz(tdzEvents),ReferenceError);
+    assert.deepEqual(tdzEvents,['finally']);
+    const failedEvents=[];await assert.rejects(target.failed('./absent.mjs',failedEvents),{code:'ERR_MODULE_NOT_FOUND'});
+    assert.deepEqual(failedEvents,['selector']);
+  }
+  assert.equal(calls(app.kernels.sum),4);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,6);
+});
+
+test('then-export import values preserve proxy reads, selected callees, receiver identity and exceptions',async()=>{
+  const files=graph({
+    'producer.mjs':SUM,
+    'thenable.mjs':`
+      import {sum} from './producer.mjs';
+      export function then(resolve){
+        const state={target:sum,events:[],failure:{kind:'getter'}};
+        const value=new Proxy(state,{get(target,key,receiver){
+          if(key==='run'){target.events.push('get');return target.target;}
+          if(key==='explode'){target.events.push('explode');throw target.failure;}
+          return Reflect.get(target,key,receiver);}});
+        resolve(value);
+      }`,
+    'consumer.mjs':`
+      export async function load(){const kernels=await import('./thenable.mjs');
+        return {kernels,
+          run(...args){return kernels.run(...args);},
+          swap(replacement,...args){return kernels.run(...(kernels.events.push('arguments'),kernels.target=replacement,args));},
+          argument(produce){return kernels.run(produce());},
+          getter(produce){return kernels.explode(produce());},
+          absent(produce){return kernels.absent(produce());}};
+      }`,
+  });
+  const app=await (await files.load('consumer.mjs')).load();
+  const reference=await (await files.original('consumer.mjs')).load();
+  const native=app.kernels.target,marker={};
+  assert.equal(diagnostics(native).initialized,false);
+  function replacement(receiver) {
+    return function(...args){assert.equal(this,receiver);receiver.events.push('replacement');return [marker,args];};
+  }
+  assert.equal(app.swap(replacement(app.kernels),3),reference.swap(replacement(reference.kernels),3));
+  assert.equal(calls(native),1);
+  assert.deepEqual(app.kernels.events,['get','arguments']);
+  assert.deepEqual(app.kernels.events,reference.kernels.events);
+  assert.deepEqual(app.run(7),reference.run(7));
+  assert.deepEqual(app.kernels.events,['get','arguments','get','replacement']);
+  const failure={kind:'argument'};
+  for(const target of [app,reference]) {
+    assert.throws(()=>target.argument(()=>{target.kernels.events.push('argument');throw failure;}),error=>error===failure);
+    assert.throws(()=>target.getter(()=>{throw new Error('argument must not execute');}),error=>error===target.kernels.failure);
+    assert.throws(()=>target.absent(()=>{target.kernels.events.push('absent argument');return 3;}),TypeError);
+  }
+  assert.deepEqual(app.kernels.events,reference.kernels.events);
+  assert.equal(calls(native),1);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,5);
+});
+
 test('ordinary lazy builds relocate after namespace normalization and retain no-Wasm execution',async()=>{
   const files=graph({
     'producer.mjs':`${UPDATE}export {advance};`,
@@ -198,6 +348,56 @@ test('ordinary lazy builds relocate after namespace normalization and retain no-
         app.frame(a,input,1/60);reference.frame(expected,input.slice(),1/60);assert.deepEqual(a,expected);
       }
       assert.equal(calls,${wasm?4:0});
+    `],{encoding:'utf8',timeout:20000});
+    assert.equal(execution.status,0,execution.stderr);
+  }
+});
+
+test('bounded imported module choices dispatch awaited kernels after relocation with cold no-Wasm fallback',async()=>{
+  const files=graph({
+    'routes.mjs':`export const primary='./primary.mjs';export default './secondary.mjs';`,
+    'state.mjs':`export let evaluations=0;export function enter(){evaluations++;}`,
+    'kernel.mjs':`import {enter} from './state.mjs';enter();
+      export function advance(out,input,dt){for(const [index,value] of input.entries())out[index]+=value*dt;}`,
+    'primary.mjs':`export {advance} from './kernel.mjs';export const gain=0.5;`,
+    'secondary.mjs':`export {advance} from './kernel.mjs';export const gain=1;`,
+    'entry.mjs':`
+      import secondary,{primary} from './routes.mjs';import * as state from './state.mjs';export {state};
+      export async function frame(alternate,out,input,events){
+        events.push('before');const kernels=await import((events.push('select'),alternate?secondary:primary));
+        events.push('resumed');kernels.advance(out,input,kernels.gain);return kernels;
+      }`,
+  });
+  const source=path.join(files.root,'original'),output=path.join(files.root,'build');
+  const built=await buildApplication(path.join(source,'entry.mjs'),output,{specializeNumeric:true});
+  assert.ok(built.numericSpecialization.compiledKernels>0);
+  const relocated=path.join(files.root,'relocated'),oracle=path.join(files.root,'source-moved');
+  fs.renameSync(output,relocated);fs.renameSync(source,oracle);
+  for(const wasm of [true,false]) {
+    const execution=spawnSync(process.execPath,['--max-old-space-size=512','--input-type=module','--eval',`
+      import assert from 'node:assert/strict';let calls=0,instances=0;
+      if(${wasm}){
+        const Native=WebAssembly.Instance;
+        WebAssembly.Instance=function(...args){instances++;const instance=Reflect.construct(Native,args);
+          return {exports:{...instance.exports,run(...values){const result=instance.exports.run(...values);calls++;return result;}}};};
+      }else globalThis.WebAssembly=undefined;
+      const app=await import(${JSON.stringify(asURL(relocated,built.entryFiles[0]))});
+      const reference=await import(${JSON.stringify(asURL(oracle,'entry.mjs'))});
+      assert.equal(app.state.evaluations,0);assert.equal(reference.state.evaluations,0);assert.equal(instances,0);
+      let originalKernel;
+      for(const Type of [Float32Array,Float64Array])for(const alternate of [false,true]){
+        const values=new Type([1,-2,3,4,5,6]),expected=values.slice(),events=[],expectedEvents=[];
+        const pending=app.frame(alternate,values.subarray(1,5),values.subarray(0,4),events);
+        const referencePending=reference.frame(alternate,expected.subarray(1,5),expected.subarray(0,4),expectedEvents);
+        events.push('caller');expectedEvents.push('caller');
+        const kernels=await pending;await referencePending;
+        originalKernel??=kernels.advance;assert.equal(kernels.advance,originalKernel);
+        assert.deepEqual(values,expected);assert.deepEqual(events,expectedEvents);
+        assert.deepEqual(events,['before','select','caller','resumed']);
+        assert.deepEqual([...values],alternate?[1,-1,2,6,11,6]:[1,-1.5,2.25,5.125,7.5625,6]);
+      }
+      assert.equal(app.state.evaluations,1);assert.equal(reference.state.evaluations,1);
+      assert.equal(calls,${wasm?4:0});assert.equal(instances,${wasm?2:0});
     `],{encoding:'utf8',timeout:20000});
     assert.equal(execution.status,0,execution.stderr);
   }
