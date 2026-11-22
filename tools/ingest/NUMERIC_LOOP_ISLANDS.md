@@ -227,6 +227,16 @@ including observable scratch state and zero per-instance multiply dispatches on
 the admitted path. This is implementation evidence, not a measured speedup or
 closure of every instanced animation pattern.
 
+Source imports such as `three/src/objects/InstancedMesh.js` use this same
+transaction when the mesh module and its resolved Matrix4 dependency are pinned.
+The mesh binds its actual imported Matrix4 through a class identity witness;
+replacement constructors are never inspected to infer compatibility. The existing
+non-derived EventDispatcher allocation witness also rejects Proxy objects returned
+by changed superclasses. Mixed source/built scratch matrices, changed numeric
+dependencies and unknown attribute allocations retain the original loop. The
+`instanced_matrix_update_source.test.mjs` suite covers real Wasm execution, source
+fallback effects and relocated production builds with and without Wasm.
+
 ```bash
 node --test tools/ingest/numeric_loop*.test.mjs
 ```

@@ -5,7 +5,7 @@ import {geometryNormalSourceRole,specializeGeometryNormals} from './geometry_nor
 import {specializeMatrixMultiply} from './matrix_multiply_specialization.mjs';
 import {specializeTransformBatch,transformBatchSourceRole} from './transform_batch_specialization.mjs';
 import {specializeEulerUpdateBase,specializeEulerUpdateLoops} from './euler_update_specialization.mjs';
-import {specializeInstancedMatrixBase,specializeInstancedMatrixLoops} from './instanced_matrix_update_specialization.mjs';
+import {instancedMatrixSourceRole,specializeInstancedMatrixBase,specializeInstancedMatrixLoops} from './instanced_matrix_update_specialization.mjs';
 import {geometryTransformSourceRole,specializeGeometryTransforms} from './geometry_transforms_specialization.mjs';
 import {specializeQuaternionFlat} from './quaternion_flat_specialization.mjs';
 import {geometryBoundsSourceRole,specializeGeometryBounds} from './geometry_bounds_specialization.mjs';
@@ -147,8 +147,8 @@ export function marchingCubesRollupPlugin(options={}) {
           if(euler.report)eulerReports.push({id,...euler.report});
           if(euler.changed){edits.push(...euler.edits);headers.push(euler.header);}
         }
-        if(code.includes('class Object3D')) {
-          const instance=specializeInstancedMatrixBase(code,{runtimeModule:INSTANCE_UPDATES,maxMemoryPages,maxIterations});
+        if(['InstancedMesh','Matrix4'].some(name=>code.includes('class '+name))) {
+          const instance=specializeInstancedMatrixBase(code,{...sources,runtimeModule:INSTANCE_UPDATES,maxMemoryPages,maxIterations});
           if(instance.report)instanceReports.push({id,...instance.report});
           if(instance.changed){edits.push(...instance.edits);headers.push(instance.header);}
         }
@@ -180,7 +180,8 @@ export function marchingCubesRollupPlugin(options={}) {
           return [key,undefined];
         })).then(values=>finish(Object.fromEntries(values)));
       }
-      if(code.includes('class Skeleton')&&skeletonUpdateSourceRole(code)==='skeleton') {
+      if((code.includes('class Skeleton')&&skeletonUpdateSourceRole(code)==='skeleton') ||
+          (code.includes('class InstancedMesh')&&instancedMatrixSourceRole(code)==='InstancedMesh')) {
         return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{
           let matrixSource;
           if(resolved&&!resolved.external)try {

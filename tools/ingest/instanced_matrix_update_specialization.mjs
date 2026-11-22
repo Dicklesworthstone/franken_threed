@@ -6,8 +6,11 @@ import * as walk from 'acorn-walk';
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 import {numericLoopScopeBindings} from './numeric_loop_islands.mjs';
+import {sourceBlob} from './marching_cubes_specialization.mjs';
 
 const CORE_HASH='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
+const SOURCE_BLOBS={InstancedMesh:'d55dc5d1311200f9ea7815c7cb7669a593f73948',
+  Matrix4:'6522a6b57300d20bf6a36fbcbb3862e81291d060'};
 export const INSTANCE_MATRIX_STRIDE=39;
 const fresh=(source,name)=>{let value='__f3d_instance_update_'+name;while(source.includes(value))value+='_';return value;};
 const property=node=>node?.type!=='MemberExpression'||node.optional?null:
@@ -15,9 +18,25 @@ const property=node=>node?.type!=='MemberExpression'||node.optional?null:
     node.computed&&node.property.type==='Literal'&&typeof node.property.value==='string'?node.property.value:null;
 const identifier=(node,name)=>node?.type==='Identifier'&&(name===undefined||node.name===name);
 
-export function specializeInstancedMatrixBase(source,{runtimeModule,maxMemoryPages=2048,maxIterations=100000000}={}) {
-  if(createHash('sha256').update(source).digest('hex')!==CORE_HASH)return {changed:false,edits:[],header:''};
-  const classes=normalClasses(source),matrix=classes.get('Matrix4'),mesh=classes.get('InstancedMesh');
+export function instancedMatrixSourceRole(source) {
+  if(typeof source!=='string')return null;
+  const blob=sourceBlob(source);
+  for(const [role,expected] of Object.entries(SOURCE_BLOBS))if(blob===expected)return role;
+  return createHash('sha256').update(source).digest('hex')===CORE_HASH?'core':null;
+}
+
+export function specializeInstancedMatrixBase(source,{runtimeModule,matrixSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const role=instancedMatrixSourceRole(source),unchanged={changed:false,edits:[],header:''};
+  if(!role)return unchanged;
+  const classes=normalClasses(source),register=fresh(source,'class');
+  if(role==='Matrix4') {
+    const cls=classes.get(role);
+    return {changed:true,header:'import {registerInstancedMatrixClass as '+register+'} from '+JSON.stringify(runtimeModule)+';\n',
+      edits:[{start:cls.end,end:cls.end,text:'\n'+register+'(null,"Matrix4",Matrix4);\n'}]};
+  }
+  if(role!=='core'&&instancedMatrixSourceRole(matrixSource)!=='Matrix4')return unchanged;
+  const matrixText=role==='core'?source:matrixSource;
+  const matrix=(role==='core'?classes:normalClasses(matrixText)).get('Matrix4'),mesh=classes.get('InstancedMesh');
   const rotation=normalMethod(matrix,'makeRotationFromEuler'),multiply=normalMethod(matrix,'multiplyMatrices');
   const branch=rotation.body.body.find(node=>node.type==='IfStatement'),orders=[];
   for(let current=branch;current?.type==='IfStatement';current=current.alternate)orders.push(current.test.right.value);
@@ -30,7 +49,7 @@ export function specializeInstancedMatrixBase(source,{runtimeModule,maxMemoryPag
         edits.push({start:value.start,end:value.end,text:'state[offset+22]'});
     },Literal(value){if(rotationOrder&&orders.includes(value.value))
       edits.push({start:value.start,end:value.end,text:String(orders.indexOf(value.value))});}});
-    let text=source.slice(node.start,node.end);
+    let text=matrixText.slice(node.start,node.end);
     for(const edit of edits.sort((a,b)=>b.start-a.start))text=text.slice(0,edit.start-node.start)+edit.text+text.slice(edit.end-node.start);
     return text;
   }
@@ -45,14 +64,15 @@ export function specializeInstancedMatrixBase(source,{runtimeModule,maxMemoryPag
     ['a','b','c','d','e','f'].map((name,index)=>'const '+name+'=state[offset+'+(16+index)+'];').join('')+rotate+'\n'+product+'}}';
   const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64','f64'],generalControl:true,
     maxMemoryPages,maxIterations,sourceName:'pinned Matrix4.makeRotationFromEuler / multiplyMatrices instanced loop'});
-  const token=fresh(source,'kernel'),create=fresh(source,'create'),register=fresh(source,'class'),owner=fresh(source,'owner');
+  const token=fresh(source,'kernel'),create=fresh(source,'create'),owner=fresh(source,'owner'),bind=fresh(source,'bind');
   const constructor=normalMethod(mesh,'constructor'),superCall=constructor.body.body.find(node=>node.expression?.callee?.type==='Super');
   return {changed:true,header:'import {createInstancedMatrixKernel as '+create+',registerInstancedMatrixClass as '+register+
-    ',registerInstancedMatrixOwner as '+owner+'} from '+JSON.stringify(runtimeModule)+';\nvar '+token+'='+create+'('+
+    ',registerInstancedMatrixOwner as '+owner+',bindInstancedMatrixClass as '+bind+'} from '+JSON.stringify(runtimeModule)+';\nvar '+token+'='+create+'('+
     JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+','+JSON.stringify(orders)+','+maxMemoryPages+');\n',
     edits:[{start:superCall.end,end:superCall.end,text:'\n'+owner+'(this,'+token+');\n'},
-      ...[matrix,mesh].map(cls=>({start:cls.end,end:cls.end,text:'\n'+register+'('+token+','+JSON.stringify(cls.id.name)+','+cls.id.name+');\n'}))],
-    report:{kind:'pinned-instanced-matrix-kernel',sourceDerived:true,wasmBytes:artifact.wasm.length,
+      ...(role==='core'?[matrix,mesh]:[mesh]).map(cls=>({start:cls.end,end:cls.end,text:'\n'+register+'('+token+','+JSON.stringify(cls.id.name)+','+cls.id.name+');\n'})),
+      ...(role==='core'?[]:[{start:mesh.end,end:mesh.end,text:'\n'+bind+'('+token+',"Matrix4",Matrix4);\n'}])],
+    report:{kind:'pinned-instanced-matrix-kernel',role,sourceDerived:true,wasmBytes:artifact.wasm.length,
       upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',retainedMath:['cos','sin'],accelerationClaim:false}};
 }
 

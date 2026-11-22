@@ -15,7 +15,7 @@ const immutable=descriptor(ArrayBuffer.prototype,'immutable')?.get;
 const own=(object,key)=>{const d=descriptor(object,key);return d&&hasOwn(d,'value')?d:null;};
 const data=(object,key)=>object&&own(object,key)?.value;
 const math=data(host,'Math'),cos=data(math,'cos'),sin=data(math,'sin');
-const records=new WeakMap(),owners=new WeakMap(),arrays=new WeakSet(),statistics=new WeakMap();
+const records=new WeakMap(),owners=new WeakMap(),sourceClasses=new WeakMap(),arrays=new WeakSet(),statistics=new WeakMap();
 const lookup=(map,key)=>apply(get,map,[key]);
 const methods=['makeRotationFromEuler','multiply','premultiply','multiplyMatrices','fromArray','toArray','getMatrixAt','setMatrixAt'];
 
@@ -27,9 +27,18 @@ export function createInstancedMatrixKernel(base64,orders,maxMemoryPages){
 export function registerInstancedMatrixClass(token,name,Class){
   const record=lookup(records,token),proto=data(Class,'prototype'),values=create(null);
   for(let i=0;i<methods.length;i++)values[methods[i]]=data(proto,methods[i]);
-  record.classes[name]={proto,parent:prototype(proto),methods:values};
+  const entry={name,proto,parent:prototype(proto),methods:values};
+  if(record)record.classes[name]=entry;else apply(set,sourceClasses,[Class,entry]);
 }
-export function registerInstancedMatrixOwner(object,token){apply(set,owners,[object,lookup(records,token)]);}
+export function bindInstancedMatrixClass(token,name,Class){
+  const record=lookup(records,token),entry=lookup(sourceClasses,Class);
+  if(record&&entry?.name===name)record.classes[name]=entry;
+}
+export function registerInstancedMatrixOwner(object,token){
+  // InstancedMesh is derived. A changed superclass can return a Proxy; only
+  // the existing non-derived EventDispatcher allocation proves ordinary this.
+  if(isNumericObject(object))apply(set,owners,[object,lookup(records,token)]);
+}
 export function registerInstancedMatrixArray(array){apply(add,arrays,[array]);return array;}
 function method(object,key,cls){
   if(!cls||prototype(object)!==cls.proto||prototype(cls.proto)!==cls.parent)return false;
