@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
+import * as SourceThree from '../../upstream/three.js/src/Three.WebGPU.js';
 import SourceRenderObject from '../../upstream/three.js/src/renderers/common/RenderObject.js';
 import SourceRenderObjects from '../../upstream/three.js/src/renderers/common/RenderObjects.js';
 import SourceNodeManager from '../../upstream/three.js/src/renderers/common/nodes/NodeManager.js';
@@ -13,14 +14,17 @@ function environment(value) {
   texture.colorSpace = T.LinearSRGBColorSpace; texture.needsUpdate = true;
   return texture;
 }
-function fixture(t, Material = T.MeshStandardNodeMaterial) {
+function fixture(t, Material = T.MeshStandardNodeMaterial, Three = T) {
+  const T = Three;
   const renderer = {library: new T.StandardNodeLibrary(), contextNode: T.TSL.context(),
     debug: {diagnostics: {keywords: false}, onNodeBuilderCreated: null}, depth: true, lighting: {enabled: true},
     shadowMap: {enabled: false, type: T.PCFShadowMap}, _currentSourceMaterial: null,
     backend: {isWebGPUBackend: true, hasFeature: () => false,
       utils: {getTextureSampleData: () => ({samples: 1, primarySamples: 1, isMSAA: false})}},
     hasFeature: () => false, getRenderTarget: () => null, getOutputRenderTarget: () => null,
-    getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: new T.NodeFrame()}, info: {calls: 1}};
+    getMRT: () => null, currentSamples: 1, _nodes: {nodeFrame: new T.NodeFrame()}, info: {calls: 1},
+    getPixelRatio: () => 1, getSize: value => value.set(64, 48), getViewport: value => value.set(0, 0, 64, 48),
+    getDrawingBufferSize: value => value.set(64, 48)};
   renderer.backend.createNodeBuilder = object => new T.WGSLNodeBuilder(object, renderer);
   const programs = createThreeNodePrograms({three: T, renderer});
   const nodes = new SourceNodeManager(renderer, renderer.backend);
@@ -37,7 +41,8 @@ function fixture(t, Material = T.MeshStandardNodeMaterial) {
     object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
     return {object, material};
   };
-  const context = item => ({...item, scene, camera, lights: [], renderId: renderer.info.calls, frameId: 1});
+  const context = item => ({...item, scene, camera, lights: lights.getLights(), sourceLightsNode: lights,
+    renderId: renderer.info.calls, frameId: renderer.info.calls});
   const compile = item => programs.compile(item.material, item.object, context(item));
   const capture = (item, descriptor = compile(item)) => programs.captureDraw(descriptor, context(item));
   const reference = item => {
@@ -50,6 +55,132 @@ const sampled = packet => packet.textures.filter(binding => binding.isSampledTex
 const referenceTextures = reference => reference.bindings.flatMap(group => group.bindings)
   .filter(binding => binding.isSampledTexture).map(binding => binding.textureNode.value);
 const values = packet => packet.uniforms.flatMap(bytes => [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)]);
+
+function keyedItem(f, material, ObjectType = T.Mesh, Three = T) {
+  const geometry = new Three.PlaneGeometry();
+  geometry.setAttribute('lineDistance', new Three.Float32BufferAttribute([0, .25, .5, .75], 1));
+  const object = ObjectType === Three.Sprite ? new ObjectType(material) : new ObjectType(geometry, material);
+  f.scene.add(object); f.scene.updateMatrixWorld();
+  object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, object.matrixWorld);
+  object.normalMatrix.getNormalMatrix(object.modelViewMatrix);
+  return {object, material};
+}
+
+for (const [family, ObjectType] of [
+  ...['Basic', 'Normal', 'Matcap', 'Toon', 'Lambert', 'Phong', 'Standard', 'Physical'].map(name => ['Mesh' + name, T.Mesh]),
+  ['Sprite', T.Sprite], ['Points', T.Points], ['LineBasic', T.Line], ['LineDashed', T.LineSegments],
+]) for (const node of [false, true])
+test(`${family}${node ? 'Node' : ''}Material custom keys preserve source construction, replacement and removal`, t => {
+  const f = fixture(t), Material = T[family + (node ? 'Node' : '') + 'Material'];
+  const source = keyedItem(f, new Material(), ObjectType), candidate = keyedItem(f, new Material(), ObjectType);
+  const key = function () { this.userData.calls++; return this.userData.variant; };
+  for (const item of [source, candidate]) {
+    item.material.userData = {calls: 0, variant: 'first'}; item.material.customProgramCacheKey = key;
+  }
+  let reference, descriptor;
+  for (const [label, change, calls, rebuilt] of [
+    ['cold', () => {}, 1, true], ['warm', () => {}, 0, false],
+    ['same key', material => { material.needsUpdate = true; }, 1, false],
+    ['changed key', material => { material.userData.variant = 'second'; material.needsUpdate = true; }, 2, true],
+    ['unmarked key', material => { material.userData.variant = 'unmarked'; }, 0, false],
+    ['removed key', material => { delete material.customProgramCacheKey; }, 0, false],
+    ['invalidated removal', material => { material.needsUpdate = true; }, 0, true],
+  ]) {
+    for (const item of [source, candidate]) { item.material.userData.calls = 0; change(item.material); }
+    f.renderer.info.calls++;
+    const nextReference = f.reference(source), nextDescriptor = f.compile(candidate);
+    assert.equal(source.material.userData.calls, calls, label + ': source hook calls');
+    assert.equal(candidate.material.userData.calls, calls, label + ': original candidate receiver');
+    assert.equal(nextReference.object !== reference?.object, rebuilt, label + ': source lifetime');
+    assert.equal(nextDescriptor !== descriptor, rebuilt, label + ': candidate lifetime');
+    assert.equal(nextDescriptor.vertex, nextReference.state.vertexShader, label + ': complete vertex shader');
+    assert.equal(nextDescriptor.fragment, nextReference.state.fragmentShader, label + ': complete fragment shader');
+    reference = nextReference; descriptor = nextDescriptor;
+  }
+});
+
+for (const family of ['Basic', 'Toon', 'Lambert', 'Phong', 'Standard', 'Physical'])
+test(`mapped and lit ${family} custom keys share source programs and retain independent draw inputs`, t => {
+  // Use a single source module graph for NodeManager's fog factory and builder.
+  const T = SourceThree, f = fixture(t, T.MeshStandardNodeMaterial, T);
+  const ambient = new T.AmbientLight(0xffffff, .125), light = new T.DirectionalLight(0xffffff, 2);
+  light.position.set(1, 2, 3); f.scene.add(ambient, light, light.target); f.lights.setLights([light, ambient]);
+  f.scene.fog = new T.Fog(new T.Color(.125, .25, .5), 1.5, 8.5);
+  const key = function () { this.userData.calls++; return 'mapped:' + this.userData.variant; };
+  const items = [.25, .75].map(value => {
+    const material = new T['Mesh' + family + 'Material']();
+    material.map = new T.DataTexture(new Uint8Array([64, 128, 192, 255]), 1, 1);
+    material.map.needsUpdate = true; material.color.setRGB(value, .5, .625);
+    material.customProgramCacheKey = key; material.userData = {calls: 0, variant: 'shared'};
+    return keyedItem(f, material, T.Mesh, T);
+  });
+  let firstReference, firstDescriptor, firstPacket, saved;
+  for (const [index, item] of items.entries()) {
+    const reference = f.reference(item), expectedCalls = item.material.userData.calls;
+    item.material.userData.calls = 0;
+    const descriptor = f.compile(item), packet = f.capture(item, descriptor);
+    assert.equal(item.material.userData.calls, expectedCalls);
+    assert.equal(descriptor.vertex, reference.state.vertexShader); assert.equal(descriptor.fragment, reference.state.fragmentShader);
+    assert.ok(sampled(packet).includes(item.material.map)); assert.ok(values(packet).includes(index ? .75 : .25));
+    if (index === 0) {
+      firstReference = reference; firstDescriptor = descriptor; firstPacket = packet; saved = packet.uniforms.map(bytes => bytes.slice());
+    } else {
+      assert.equal(reference.state, firstReference.state, 'actual source builder sharing');
+      assert.equal(descriptor.vertex, firstDescriptor.vertex); assert.equal(descriptor.fragment, firstDescriptor.fragment);
+      assert.notEqual(descriptor, firstDescriptor, 'bindings remain per render object');
+    }
+  }
+  items[1].material.color.setRGB(.875, .375, .125); light.intensity = .75; f.scene.fog.near = 2.5;
+  f.renderer.info.calls++; const changed = f.capture(items[1]);
+  assert.ok(values(changed).includes(.875)); assert.deepEqual(firstPacket.uniforms, saved);
+  items[1].material.userData.variant = 'separate'; items[1].material.needsUpdate = true; f.renderer.info.calls++;
+  const replacement = f.compile(items[1]), sourceReplacement = f.reference(items[1]);
+  assert.notEqual(sourceReplacement.state, firstReference.state); assert.notEqual(replacement, firstDescriptor);
+  assert.equal(replacement.fragment, sourceReplacement.state.fragmentShader);
+  assert.equal(f.compile(items[0]), firstDescriptor, 'another owner retains the old source construction');
+});
+
+test('a custom key may remove itself during source construction without losing its retained owner', t => {
+  const f = fixture(t), source = keyedItem(f, new T.MeshToonNodeMaterial()), candidate = keyedItem(f, new T.MeshToonNodeMaterial());
+  const key = function () { this.userData.calls++; delete this.customProgramCacheKey; return 'initial'; };
+  for (const item of [source, candidate]) { item.material.userData.calls = 0; item.material.customProgramCacheKey = key; }
+  const reference = f.reference(source), descriptor = f.compile(candidate);
+  assert.equal(source.material.userData.calls, 1); assert.equal(candidate.material.userData.calls, 1);
+  assert.equal(descriptor.vertex, reference.state.vertexShader); assert.equal(descriptor.fragment, reference.state.fragmentShader);
+  f.renderer.info.calls++;
+  assert.equal(f.reference(source).object, reference.object); assert.equal(f.compile(candidate), descriptor);
+});
+
+for (const lazy of [false, true])
+test(`custom keys preserve ${lazy ? 'lazy' : 'ComputeNode'} geometry construction and source invalidation`, t => {
+  const f = fixture(t), source = keyedItem(f, new T.MeshBasicNodeMaterial()), candidate = keyedItem(f, new T.MeshBasicNodeMaterial());
+  const setups = new Map([[source.object, 0], [candidate.object, 0]]);
+  const note = object => setups.set(object, setups.get(object) + 1);
+  class GeometryStep extends T.ComputeNode {
+    setup(builder) { if (builder.object) note(builder.object); return super.setup(builder); }
+  }
+  for (const item of [source, candidate]) {
+    item.material.userData = {calls: 0, variant: 'first'};
+    item.material.customProgramCacheKey = function () { this.userData.calls++; return this.userData.variant; };
+    item.material.geometryNode = lazy
+      ? T.TSL.Fn(({object}) => { note(object); return T.TSL.Fn(() => {})().compute(1); })()
+      : new GeometryStep(T.TSL.Fn(() => {})(), [64]);
+    if (!lazy) item.material.geometryNode.count = 1;
+  }
+  let previous;
+  for (const [variant, calls, rebuilt] of [['first', 1, true], ['first', 1, false], ['second', 2, true]]) {
+    for (const item of [source, candidate]) {
+      item.material.userData.calls = 0; item.material.userData.variant = variant; item.material.needsUpdate = true;
+    }
+    f.renderer.info.calls++;
+    const reference = f.reference(source), descriptor = f.compile(candidate);
+    assert.equal(source.material.userData.calls, calls); assert.equal(candidate.material.userData.calls, calls);
+    assert.equal(setups.get(candidate.object), setups.get(source.object), 'geometry setup follows source builder lifetime');
+    assert.equal(descriptor.vertex, reference.state.vertexShader); assert.equal(descriptor.fragment, reference.state.fragmentShader);
+    assert.equal(descriptor !== previous, rebuilt); previous = descriptor;
+  }
+  assert.equal(setups.get(candidate.object), 2);
+});
 
 for (const Material of [T.MeshStandardMaterial, T.MeshPhysicalMaterial, T.MeshStandardNodeMaterial, T.MeshPhysicalNodeMaterial]) {
   test(`${Material.name} source cache identity and shared PMREM nodes retain per-material uniforms`, t => {
@@ -266,12 +397,29 @@ test('installing a custom key without invalidation retains the accepted source c
   assert.equal(source.material.userData.calls, 2); assert.equal(candidate.material.userData.calls, 2);
 });
 
-test('custom key effects cannot publish a graph outside the admitted material profile', t => {
+test('custom key effects construct authored graphs at the same source boundary', t => {
+  const f = fixture(t), source = f.add(0x3800), candidate = f.add(0x3800);
+  const key = function () { this.userData.calls++; this.colorNode = T.TSL.vec3(1, 0, 0); return 'authored'; };
+  for (const item of [source, candidate]) { item.material.userData.calls = 0; item.material.customProgramCacheKey = key; }
+  const reference = f.reference(source), descriptor = f.compile(candidate);
+  assert.equal(source.material.userData.calls, 1); assert.equal(candidate.material.userData.calls, 1);
+  assert.equal(descriptor.vertex, reference.state.vertexShader); assert.equal(descriptor.fragment, reference.state.fragmentShader);
+  assert.ok(candidate.material.colorNode); assert.equal(f.programs.diagnostics.programs, 1);
+});
+
+test('custom key effects cannot enter an unsupported geometry setup profile', t => {
   const f = fixture(t), item = f.add(0x3800); let calls = 0;
-  item.material.customProgramCacheKey = function () { calls++; this.colorNode = T.TSL.vec3(1, 0, 0); return 'authored'; };
+  item.material.customProgramCacheKey = function () { calls++; this.geometryNode = T.TSL.Fn(() => {})().compute(1); return 'geometry'; };
   assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
-  assert.equal(calls, 1); assert.ok(item.material.colorNode, 'callback effects remain visible after rejection');
+  assert.equal(calls, 1); assert.ok(item.material.geometryNode, 'completed callback effects remain visible');
   assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+test('late keys on an unshared material require a fresh source construction instead of replaying setup', t => {
+  const f = fixture(t), item = keyedItem(f, new T.MeshBasicNodeMaterial()); f.compile(item);
+  let calls = 0; item.material.customProgramCacheKey = () => { calls++; return 'late'; };
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_MATERIAL_CACHE'}); assert.equal(calls, 0);
+  item.material.dispose(); f.renderer.info.calls++; f.compile(item); assert.equal(calls, 1);
 });
 
 for (const field of ['context', 'shadows']) test(`custom key ${field} mutations use the source dynamic-cache boundary`, t => {

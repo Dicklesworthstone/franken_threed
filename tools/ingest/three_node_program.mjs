@@ -1558,12 +1558,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           .some(name => materialDataProperty(node, name) !== three.LightsNode.prototype[name]))
       fail('LIGHTS', 'Shared native material construction requires the selected source LightsNode');
   }
-  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature, validationOnly = false, retainGeometry = false) {
+  function sharedConstruction(material, prepared, object, context, lights, rendererContextSignature, validationOnly = false, retainGeometry = false, retainMaterial = false) {
     // Source sharing retains construction effects while each render object
     // captures its own uniforms and selected geometry attributes.
-    const extension = materialExtension(material);
-    const lazyGeometry = !extension && lazyGeometrySetup(material);
-    const geometrySetup = !extension && (retainGeometry || customGeometrySetup(material) || lazyGeometry);
+    // Ordinary materials with application keys use the same RenderObject and
+    // NodeBuilderState ownership as registered materials. Keep that profile
+    // after the key is removed, including removal inside its own callback.
+    const registeredExtension = materialExtension(material);
+    const lazyGeometry = !registeredExtension && lazyGeometrySetup(material);
+    const geometrySetup = !registeredExtension && (retainGeometry || customGeometrySetup(material) || lazyGeometry);
+    // Custom keys already compose with the separate shared geometry owner.
+    // Preserve that profile and its restrictions before admitting the wider
+    // ordinary-material profile; a key does not turn a geometry constructor
+    // into a registered material extension.
+    const extension = registeredExtension || !geometrySetup &&
+      (retainMaterial || hasThreeCustomProgramCacheKey(three, material));
     const prototype = materialPrototype(prepared);
     // r186 keys InstancedMesh builders by object UUID: their instance nodes
     // close over that object's matrix/color attributes. Reuse the existing
@@ -1644,7 +1653,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const {attachment, chain} = builderScope(context);
     // Admission runs during projection, before the source light list is ready.
     // Only actual program construction may initialize NodeManager's call key.
-    if (validationOnly) return {chain, geometrySetup, namedGeometry};
+    if (validationOnly) return {chain, geometrySetup, namedGeometry, materialProfile: !!extension};
     let contextId = builderContexts.get(attachment);
     if (contextId === undefined) builderContexts.set(attachment, contextId = builderContexts.size);
     const {hash, hashArray} = three.NodeUtils;
@@ -1675,7 +1684,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     }
     const dynamic = hash(object.receiveShadow ? hash(callKey.key, 1) : callKey.key,
       renderer.contextNode.id, renderer.contextNode.version);
-    return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry};
+    return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry, materialProfile: !!extension};
   }
   function keyOf(material, object, {camera, scene, colorAttachmentCount = renderer.getRenderTarget?.()?.textures.length ?? 1, lightsNode = null, lightingEnabled = renderer.lighting?.enabled !== false} = {}, lights = [], environment = null, instanceSignature = null, skinSignature = null, morphSignature = null, fogKey = null, clippingKey = '0/0', filtering = null, side = material.side, version = material.version, rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode)) {
     // Match the source's graph cache key. Uniform values never participate.
@@ -1743,17 +1752,21 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const priorPasses = cache.get(object)?.get(material);
     const previous = priorPasses?.get(chain) ?? priorPasses?.get(context.passId ?? null);
     const geometryProfile = record?.geometrySetup || previous?.sharedBuilder?.geometrySetup || false;
+    const materialProfile = record?.materialProfile || previous?.sharedBuilder?.materialProfile ||
+      hasThreeCustomProgramCacheKey(three, material);
     // A per-object graph has no retained source builder key to adopt. Changing
     // its converter family must not replay setup or cache-key callbacks before
     // the application releases that previous material construction.
     if (!record && materialExtension(material) && previous && !previous.sharedBuilder)
       fail('MATERIAL_CACHE', 'Changing an existing native material to a registered extension requires material.dispose()');
+    if (!record && hasThreeCustomProgramCacheKey(three, material) && previous && !previous.sharedBuilder)
+      fail('MATERIAL_CACHE', 'Installing a custom key after unshared native construction requires material.dispose()');
     if (!record && (customGeometrySetup(material) || lazyGeometrySetup(material)) && previous && !previous.sharedBuilder)
       fail('MATERIAL_CACHE', 'Adding shared geometry setup to an existing native material requires material.dispose()');
     const profile = () => {
       const prepared = inspect(material, object, context);
       const construction = sharedConstruction(material, prepared, object, context, sourceLights(prepared, context, materialExtension(material)),
-        inspectThreeLightingContext(three, renderer.contextNode), false, geometryProfile);
+        inspectThreeLightingContext(three, renderer.contextNode), false, geometryProfile, materialProfile);
       if (!construction || construction.chain !== chain)
         fail('HOOK', 'Custom native material construction must retain its shared source profile');
       return construction;
@@ -1811,7 +1824,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
 
     function remember(key, version, dynamic, entry) {
       const sourceMaterial = renderer._currentSourceMaterial ?? null;
-      const next = {key, version, dynamic, entry, geometrySetup: construction.geometrySetup, dispose() {
+      const next = {key, version, dynamic, entry, geometrySetup: construction.geometrySetup,
+        materialProfile: construction.materialProfile, dispose() {
         if (!customKeyRecords.delete(next)) return;
         if (passes?.get(chain) === next) passes.delete(chain);
         material.removeEventListener('dispose', next.dispose);
@@ -1830,8 +1844,9 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
   function compileProgram(material, object, context = {}, sourceKey = null) {
     const extension = materialExtension(material);
     const retainedBuilder = sourceKey && (sourceKey.entry?.sharedBuilder ?? sharedBuilders.get(sourceKey.key));
+    const sourceMaterialProfile = !!extension || sourceKey?.materialProfile === true;
     const preparedMaterial = inspect(material, object, context, retainedBuilder?.preparedPrototype ?? null);
-    const lights = sourceLights(preparedMaterial, context, extension), environment = sourceEnvironment(preparedMaterial, context);
+    const lights = sourceLights(preparedMaterial, context, sourceMaterialProfile), environment = sourceEnvironment(preparedMaterial, context);
     const lightKey = lightingSignature(preparedMaterial, lights);
     const instances = inspectInstances(object), instanceSignature = instances?.signature ?? null;
     const batchSignature = inspectThreeNativeBatch(three, object, fail);
@@ -1840,7 +1855,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const rendererContextSignature = inspectThreeLightingContext(three, renderer.contextNode);
     const rendererContextCache = inspectThreeLightingContext(three, renderer.contextNode, 'GRAPH', false);
     const construction = sharedConstruction(material, preparedMaterial, object, context, lights, rendererContextSignature,
-      false, sourceKey?.geometrySetup === true);
+      false, sourceKey?.geometrySetup === true, sourceKey?.materialProfile === true);
     const fogKey = fogSignature(preparedMaterial, context), alphaHash = preparedMaterial.alphaHash === true;
     const volumeKey = volumeSignature(preparedMaterial), sssKey = sssSignature(preparedMaterial), geometryKey = geometrySignature(preparedMaterial);
     const backdropKey = backdropSignature(preparedMaterial);
@@ -1955,7 +1970,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     const builder = sharedBuilder?.builder ?? new three.WGSLNodeBuilder(object, renderer);
     const captureShadowGraphs = sharedBuilder?.captureShadowGraphs ?? captureThreeNativeShadowGraphs(three, builder);
     const authored = authoredLightsNode(preparedMaterial);
-    const environmentNode = sharedBuilder ? sharedBuilder.environmentNode : extension ? sceneEnvironmentNode(context.scene)
+    const environmentNode = sharedBuilder ? sharedBuilder.environmentNode : sourceMaterialProfile ? sceneEnvironmentNode(context.scene)
       : environmentGraph(preparedMaterial, context) || environmentNodeFor(environment);
     let graphicsNode = sharedBuilder?.graphicsNode;
     if (!sharedBuilder) {
@@ -1968,11 +1983,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         [key, (context.clippingContext?.[key] ?? []).map(plane => plane.clone())]));
       // Keep the scene entrance distinct from material.lightsNode, just as the
       // pinned NodeManager does. NodeMaterial selects the authored graph itself.
-      if (extension) builder.lightsNode = construction.lightsNode;
+      if (sourceMaterialProfile) builder.lightsNode = construction.lightsNode;
       else if (lightingMaterial(preparedMaterial)) builder.lightsNode = context.lightsNode ?? three.TSL.lights(authored
         ? context.lightingEnabled === false ? [] : context.lights ?? [] : lights);
       if (environmentNode) builder.environmentNode = environmentNode;
-      builder.fogNode = extension ? sceneFogNode(context)
+      builder.fogNode = sourceMaterialProfile ? sceneFogNode(context)
         : fogGraph(preparedMaterial, context) || fogNodeFor(sourceFog(preparedMaterial, context));
       // Compute setup writes do not become graphics bindings.
       const computeChildren = new Set(), graphicsNodes = new Set(), generatedNodes = new Set(), addChain = builder.addChain;
@@ -1991,7 +2006,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         fail('STORAGE', 'Custom geometry setup must retain its selected rigid Float32 geometry');
       graphicsNode = node => node.isComputeNode || !computeChildren.has(node) || graphicsNodes.has(node) || generatedNodes.has(node);
       if (construction) sharedBuilder = {key: sharedKey, builder, captureShadowGraphs, environmentNode, graphicsNode,
-        preparedPrototype: materialPrototype(preparedMaterial), geometrySetup: construction.geometrySetup, references: 0};
+        preparedPrototype: materialPrototype(preparedMaterial), geometrySetup: construction.geometrySetup,
+        materialProfile: construction.materialProfile, references: 0};
     }
     const lightsNode = authored ?? builder.lightsNode;
     assertInstances(object, instanceSignature);
@@ -2015,7 +2031,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       fail('CHANGED', 'Native backdrop graphs changed during source construction');
     if (inspectThreeNodeClipping(three, context, maxNodes, fail) !== clippingKey)
       fail('CHANGED', 'Native clipping layout changed during source graph construction');
-    if (lightingSignature(currentPrepared, sourceLights(currentPrepared, context, extension)) !== lightKey)
+    if (lightingSignature(currentPrepared, sourceLights(currentPrepared, context, sourceMaterialProfile)) !== lightKey)
       fail('CHANGED', 'Native light selection or registration changed during source graph construction');
     // Initial source setup has generated its atlas. Later versions are
     // prepared at a source-ordered boundary outside draw resource capture.

@@ -567,10 +567,10 @@ Native programs preserve ordinary `onBeforeCompile` functions carried by
 materials that also support a WebGL route. Their bodies remain inert on WebGPU,
 as in the pinned source, and the public function identity remains unchanged.
 Replacing the hook alone retains the prepared program; `needsUpdate` keeps its
-normal invalidation behavior. Ordinary rigid Standard/Physical materials also
+normal invalidation behavior. Supported ordinary and node material families also
 support custom program cache keys through the source lifecycle described below.
-Other material profiles, effectful legacy-hook stringification and opaque
-legacy-hook proxies retain their explicit admission boundary.
+Effectful legacy-hook stringification and opaque legacy-hook proxies retain their
+explicit admission boundary.
 Source-WGSL comparisons cover ordinary and node Basic/Standard
 materials; this does not add new WebGL shader-hook translation.
 
@@ -2417,15 +2417,26 @@ retain their existing preparation paths; their cross-material builder-sharing
 semantics remain incomplete. GPU modules and pipelines keep their separate
 existing owners. This is source graph compatibility, not a measured speedup.
 
-Custom `customProgramCacheKey` functions are supported on this same rigid PBR
-profile, including ordinary materials converted by `StandardNodeLibrary`.
+### Native material program keys
+
+Custom `customProgramCacheKey` functions are supported on ordinary and node
+Basic, Normal, Matcap, Toon, Lambert, Phong, Standard and Physical materials,
+and on Sprite, Points, LineBasic and LineDashed materials. Ordinary classes keep
+their pinned `StandardNodeLibrary` conversions. These materials reuse the
+registered-material construction profile above, including its existing maps,
+scene lights, ordinary fog, geometry and attachment owners. Direct custom
+`ComputeNode` and lazy `Fn` geometry constructors retain their separate shared
+construction profile and its existing resource restrictions.
+
 The original material is the callback receiver. The callback runs once when a
 source render object is constructed, zero times during a warm draw, and once
 when `needsUpdate` or a dynamic source context requests a key comparison. A
 changed key retires that render object before a second callback constructs its
 replacement. A version change with an unchanged complete key preserves the
 existing builder and its captured environment. Changing the callback or its
-return value without source invalidation does not force a rebuild.
+return value without source invalidation does not force a rebuild. Removing a
+key, including removal inside its own callback, retains the accepted source
+owner. A later source invalidation compares the restored default key normally.
 
 For example, changing `material.envMap` and advancing a custom variant key
 together with `material.needsUpdate = true` selects a new environment graph.
@@ -2450,15 +2461,32 @@ The following draw constructs its key again. Earlier and current queued draws
 retain their own captured uniforms through deferred GPU preparation; disposing
 an override's original source material follows the same rule.
 
-The callback must keep the rigid PBR profile above and cannot replace its
-selected geometry. Authored graphs, maps other than the admitted material
-environment, lights, clipping, deformation and other excluded construction
-profiles remain explicitly unsupported for custom keys. Accessor-backed key
-properties are not admitted. A callback that leaves this domain keeps its
-JavaScript effects and fails before publishing a new GPU descriptor.
+The callback must keep its admitted shared construction profile and cannot
+replace its selected geometry. Authored color/output graphs and existing
+material maps can be selected by the callback before source construction.
+Custom material lighting/context and geometry combinations, authored scene fog
+or environment nodes, clipping, wireframe, ArrayCamera and multiview retain the
+shared owner's existing admission boundaries. Accessor-backed key properties
+are not admitted. A callback that leaves this domain keeps its JavaScript
+effects and fails before publishing a new GPU descriptor.
+
+Installing a key after an existing shared source construction retains that
+construction until its normal invalidation boundary. A material previously
+constructed through an unshared native profile instead requires
+`material.dispose()` before installing its new key: that older owner has no
+source construction key to adopt. The rejection occurs before invoking the
+new callback. This remaining transition boundary is explicit rather than
+replaying earlier setup or inventing a key for an already constructed graph.
+
 Focused comparisons with pinned `RenderObjects`/`NodeManager` and the recording
 GPU test these calls, key coercion/order, variant sharing, errors and queued
-uniforms. They do not establish pixel parity, full dynamic-graph closure or
+uniforms. The material-family cases compare complete source WGSL, including
+key replacement/removal, mapped and lit scenes, ordinary fog, shared source
+builders and independent per-object bindings. Public renderer regressions keep
+four distinct mapped/fogged draws queued across key changes and removal, and
+retain accepted draws after an application key throws. Direct and lazy geometry
+regressions also preserve their original source setup counts and invalidation.
+These checks do not establish new pixel parity, full dynamic-graph closure or
 hardware performance.
 
 Ten focused tests compare real pinned `RenderObject`, `RenderObjects` and

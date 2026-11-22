@@ -615,6 +615,52 @@ test('custom PBR cache keys run at native draw capture and preserve queued unifo
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+for (const Material of [T.MeshBasicMaterial, T.MeshToonNodeMaterial, T.MeshPhongMaterial, T.MeshPhysicalNodeMaterial])
+test(`${Material.name} custom keys retain queued mapped, lit and fogged draws through key removal`, async t => {
+  const f = fixture(t), material = new Material(), events = [];
+  const map = new T.DataTexture(new Uint8Array([64, 128, 192, 255]), 1, 1); map.needsUpdate = true;
+  material.map = map; f.mesh.material = material;
+  const ambient = new T.AmbientLight(0xffffff, .25), light = new T.DirectionalLight(0xffffff, 2);
+  light.position.set(1, 2, 3); f.scene.add(ambient, light, light.target);
+  f.scene.fog = new T.Fog(0x223344, 1, 20);
+  t.after(() => { material.dispose(); map.dispose(); light.dispose(); });
+  let selected = 0;
+  const colors = [[.125, .25, .375], [.5, .625, .75], [.25, .75, .5], [.875, .375, .125]];
+  material.customProgramCacheKey = function () {
+    assert.equal(this, material); events.push(selected); this.color.setRGB(...colors[selected]);
+    return selected < 2 ? 'shared' : 'replacement';
+  };
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  selected = 1; material.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  selected = 2; material.needsUpdate = true; f.renderer.render(f.scene, f.camera);
+  assert.deepEqual(events, [0, 1, 2, 2]);
+  delete material.customProgramCacheKey; material.color.setRGB(...colors[3]); f.renderer.render(f.scene, f.camera);
+  material.color.setRGB(99, 99, 99); await drain(f.renderer);
+  assert.deepEqual(events, [0, 1, 2, 2], 'queued preparation and removal do not replay application keys');
+  const actual = draws(f.device); assert.equal(actual.length, colors.length);
+  for (const [index, color] of colors.entries()) {
+    assert.ok(hasColor(actual[index], color), `draw ${index} retains its accepted color`);
+    assert.match(actual[index].pipeline.fragment.module.code, /texture(?:Sample|Load)/);
+    assert.match(actual[index].pipeline.fragment.module.code, /smoothstep/);
+  }
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('a failing Basic key comparison leaves earlier accepted native draws intact', async t => {
+  const f = fixture(t), material = new T.MeshBasicNodeMaterial(), failure = new Error('application cache key');
+  f.mesh.material = material; t.after(() => material.dispose());
+  let failKey = false, calls = 0;
+  material.customProgramCacheKey = function () { calls++; if (failKey) throw failure; return 'same'; };
+  await f.renderer.init(); material.color.setRGB(.25, .5, .75); f.renderer.render(f.scene, f.camera);
+  failKey = true; material.needsUpdate = true;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), error => error === failure);
+  failKey = false; material.color.setRGB(.75, .25, .5); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  assert.equal(calls, 3); const actual = draws(f.device); assert.equal(actual.length, 2);
+  assert.ok(hasColor(actual[0], [.25, .5, .75])); assert.ok(hasColor(actual[1], [.75, .25, .5]));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('native compilation invokes custom keys after source object selection hooks', async t => {
   const f = fixture(t), events = [];
   const a = new T.MeshStandardMaterial(), b = new T.MeshPhysicalMaterial();
