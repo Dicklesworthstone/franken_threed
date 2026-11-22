@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as T from '../../upstream/three.js/build/three.webgpu.js';
-import {createWebGPURendererClass} from './three_renderer.mjs';
+import {createWebGPURendererClass, createWebGLRendererClass} from './three_renderer.mjs';
 import {geometryDevice} from './fixtures/gpu_geometry_device.mjs';
 import {captureComputeStorage} from './gpu_compute_attributes.mjs';
 import {SunLight, SunLightNode} from './fixtures/three_sun_light.mjs';
@@ -88,6 +88,128 @@ function fixture(t) {
   return {renderer, device, scene, camera, receiver, caster, noncaster, material, casterMaterial,
     light, deformation, acquired: () => acquired};
 }
+
+const softShadowWarning = 'THREE.WebGPURenderer: PCFSoftShadowMap has been removed. Using PCFShadowMap instead.';
+function warningLog(t, observe = () => {}) {
+  const previous = T.getConsoleFunction(), messages = [];
+  T.setConsoleFunction((...args) => { messages.push(args); observe(...args); });
+  t.after(() => T.setConsoleFunction(previous));
+  return messages;
+}
+
+for (const kind of ['DirectionalLight', 'SpotLight'])
+test(`${kind}: deprecated PCFSoft selection warns once per reset and executes native PCF shadows`, async t => {
+  const f = fixture(t), warnings = warningLog(t), observed = [];
+  if (kind === 'SpotLight') {
+    f.scene.remove(f.light, f.light.target);
+    f.light = new T.SpotLight(0xffe6cc, 2); f.light.position.set(-3, 4, 5);
+    f.light.castShadow = true; f.light.shadow.mapSize.set(32, 16); f.scene.add(f.light, f.light.target);
+  }
+  f.scene.onBeforeRender = renderer => observed.push(renderer.shadowMap.type);
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(warnings, [['warn', softShadowWarning]]);
+  assert.equal(f.renderer.shadowMap.type, T.PCFShadowMap);
+  assert.ok(observed.length > 0 && observed.every(type => type === T.PCFShadowMap));
+  assert.equal(f.device.submissions.length, 0, 'compilation does not render a shadow map');
+  await f.renderer.compileAsync(f.scene, f.camera);
+  f.renderer.render(f.scene, f.camera);
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+  f.renderer._nodes.nodeFrame.update(); f.renderer.render(f.scene, f.camera);
+  assert.equal(f.renderer.shadowMap.type, T.PCFShadowMap);
+  assert.deepEqual(warnings, [['warn', softShadowWarning], ['warn', softShadowWarning]]);
+  // A later application write is not consumed by preparation of accepted draws.
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+  await drain(f.renderer);
+  assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+  assert.equal(warnings.length, 2);
+  assert.equal(f.renderer.info.f3d.presentedRenders, 2);
+  const receivers = receiverDraws(f.device);
+  assert.equal(receivers.length, 2);
+  for (const draw of receivers) assert.match(shader(draw), /textureSampleCompare/);
+  const shadows = targetPasses(f.device).filter(pass => pass.draws.length);
+  assert.equal(shadows.length, 2, 'both accepted frames contain real caster passes');
+  const depths = new Set(shadows.map(pass => pass.desc.depthStencilAttachment.view.texture));
+  assert.ok(receivers.every(draw => textureResources(draw).some(resource => depths.has(resource.texture))));
+});
+
+for (const method of ['compileAsync', 'renderAsync'])
+test(`${method} normalizes the current source shadow setting only after initialization`, async t => {
+  const warnings = warningLog(t);
+  for (const reset of [false, true]) {
+    const f = fixture(t), init = f.renderer.init.bind(f.renderer);
+    let resume;
+    const gate = new Promise(resolve => { resume = resolve; });
+    f.renderer.init = async () => { await gate; return init(); };
+    f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+    const previousWarnings = warnings.length, pending = f.renderer[method](f.scene, f.camera);
+    assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+    assert.equal(warnings.length, previousWarnings);
+    if (reset) f.renderer.shadowMap.type = T.BasicShadowMap;
+    resume(); await pending;
+    assert.equal(f.renderer.shadowMap.type, reset ? T.BasicShadowMap : T.PCFShadowMap);
+    assert.equal(warnings.length, previousWarnings + Number(!reset));
+    if (!reset) assert.deepEqual(warnings.at(-1), ['warn', softShadowWarning]);
+  }
+});
+
+test('native shadow normalization preserves warning effects and entry ordering', async t => {
+  const f = fixture(t), events = [], failure = new Error('application warning handler');
+  let throwWarning = false;
+  const warnings = warningLog(t, () => {
+    events.push(['warning', f.renderer.shadowMap.type, f.renderer.info.calls]);
+    if (throwWarning) throw failure;
+  });
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), /before the backend is initialized/);
+  assert.equal(warnings.length, 0); assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+  await f.renderer.init();
+  throwWarning = true;
+  assert.throws(() => f.renderer.render(f.scene, f.camera), error => error === failure);
+  assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+  assert.equal(f.renderer.info.calls, 0); assert.equal(f.device.submissions.length, 0);
+  await assert.rejects(f.renderer.compileAsync(f.scene, f.camera), error => error === failure);
+  assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+  throwWarning = false;
+  f.scene.onBeforeRender = renderer => events.push(['scene', renderer.shadowMap.type]);
+  await f.renderer.compileAsync(f.scene, f.camera);
+  assert.deepEqual(events.slice(0, 4), [
+    ['warning', T.PCFSoftShadowMap, 0], ['warning', T.PCFSoftShadowMap, 0],
+    ['warning', T.PCFSoftShadowMap, 0], ['scene', T.PCFShadowMap],
+  ]);
+  const count = warnings.length;
+  f.renderer._isDeviceLost = true; f.renderer.shadowMap.type = T.PCFSoftShadowMap;
+  f.renderer.render(f.scene, f.camera); await f.renderer.compileAsync(f.scene, f.camera);
+  assert.equal(warnings.length, count); assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap);
+});
+
+test('native output renders normalize a callback reset while direct clears and WebGL selection retain their boundary', async t => {
+  const f = fixture(t), warnings = warningLog(t);
+  await f.renderer.init(); f.renderer.shadowMap.enabled = false;
+  f.renderer.outputColorSpace = T.LinearSRGBColorSpace;
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap; f.renderer.clear();
+  assert.equal(f.renderer.shadowMap.type, T.PCFSoftShadowMap); assert.equal(warnings.length, 0);
+  await drain(f.renderer);
+  // The source converts output through a nested QuadMesh render. A reset by an
+  // object callback is normalized at that render, before Scene.onAfterRender.
+  f.renderer.outputColorSpace = T.SRGBColorSpace;
+  f.caster.onAfterRender = renderer => { renderer.shadowMap.type = T.PCFSoftShadowMap; };
+  let after;
+  f.scene.onAfterRender = renderer => { after = renderer.shadowMap.type; };
+  f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.equal(after, T.PCFShadowMap); assert.equal(f.renderer.shadowMap.type, T.PCFShadowMap);
+  assert.equal(warnings.length, 2);
+  f.renderer.shadowMap.type = T.PCFSoftShadowMap; f.renderer.clear(); await drain(f.renderer);
+  assert.equal(f.renderer.shadowMap.type, T.PCFShadowMap); assert.equal(warnings.length, 3);
+  const WebGL = createWebGLRendererClass(T);
+  const legacy = new WebGL({canvas: {...f.renderer.domElement, style: {}}, device: f.device});
+  t.after(() => legacy.dispose()); await legacy.init();
+  legacy.shadowMap.type = T.PCFSoftShadowMap;
+  const empty = new T.Scene();
+  await legacy.compileAsync(empty, f.camera); legacy.render(empty, f.camera); await drain(legacy);
+  assert.equal(legacy.shadowMap.type, T.PCFSoftShadowMap, 'the WebGL shadow owner still owns its normalization');
+  assert.equal(warnings.length, 3);
+});
 
 function recordCompute(device) {
   device.computePasses = [];

@@ -1995,6 +1995,12 @@ and dynamic mode changes, with zero GPU validation errors.
 
 ## Native source shadows
 
+The native facade accepts `PCFSoftShadowMap` with the pinned renderer's
+compatibility behavior: compile and render warn, then replace the public
+selection with `PCFShadowMap` before scene callbacks. Assigning the deprecated
+selection again produces another warning. The resulting caster passes and
+receivers use the ordinary native PCF shadow owner.
+
 Directional and spot VSM shadows now run the pinned ShadowNode depth pass,
 vertical moment blur and horizontal moment blur through the native command
 owner. The two moment targets use native RG16F storage, and receivers sample the

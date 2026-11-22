@@ -173,6 +173,16 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
     fail('OPTIONS', 'Expected positive draw and binding capacities');
   const {NoToneMapping, SRGBColorSpace} = THREE;
   const sourceError = THREE.error ?? (message => console.error('THREE.' + message));
+  const normalizeNativeShadowMap = renderer => {
+    if (!renderer._shaderEncodedOutput && THREE.PCFSoftShadowMap !== undefined &&
+        renderer.shadowMap.type === THREE.PCFSoftShadowMap) {
+      // The retained renderer normalizes at compile/render entry, before scene
+      // callbacks. Warn first: a custom source console callback may throw.
+      (THREE.warn ?? (message => console.warn('THREE.' + message)))(
+        'WebGPURenderer: PCFSoftShadowMap has been removed. Using PCFShadowMap instead.');
+      renderer.shadowMap.type = THREE.PCFShadowMap;
+    }
+  };
   // A retained addon may replace the exported renderer prototype's init before
   // construction (r186 Inspector Settings does this to select WebGL). Preserve
   // that method on a genuine source renderer, before allocating any native
@@ -1284,6 +1294,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       if (this._isDeviceLost === true && this._initialized) return;
       if (this._deferredError) { const error = this._deferredError; this._deferredError = null; throw error; }
       if (!(scene instanceof THREE.Object3D) || !(camera instanceof THREE.Camera)) fail('SOURCE', 'Expected a source scene and camera');
+      if (this._initialized) normalizeNativeShadowMap(this);
       this._beforeRender();
       this.info.calls++;
       this.info.render.calls++;
@@ -1769,6 +1780,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
             this._activeCubeFace = layers > 1 ? layer : previousFace;
             const quad = this._outputQuad(internal, layer);
             if (captureCameras) {
+              if (this._initialized) normalizeNativeShadowMap(this);
               this.info.calls++; this.info.render.calls++; this.info.render.frameCalls++;
             }
             const releaseOutputQuad = this._retainOutputQuad(quad);
@@ -2158,6 +2170,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
       // Source compilation initializes before its synchronous scene lifecycle.
       // Once admitted, retries consume its capture without replaying hooks.
       if (!this._shaderEncodedOutput && !this._initialized) await this.init();
+      normalizeNativeShadowMap(this);
       // Capture before initialization or another compile can yield. Preparation
       // and later draws address the same stable execution root.
       if (!this._shaderEncodedOutput) this._nodes.nodeFrame.update();
@@ -2199,6 +2212,7 @@ export function createWebGPURendererClass(THREE, classOptions = {}) {
           this._nativeRenderDepth = request.nativeRenderDepth;
           request.depthClearValue = this.getClearDepth(); request.stencilClearValue = this._clearStencil;
           try {
+            normalizeNativeShadowMap(this);
             if (request.captureCameras)
               this._captureNativeDepthInitialization(destination === this ? null : destination.target, request.mipLevel, request.face, request.clearOnly);
             if (request.sceneLifecycle) this._beginSceneLifecycle(request.sceneLifecycle, {
