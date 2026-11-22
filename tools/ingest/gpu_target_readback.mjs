@@ -158,10 +158,10 @@ export async function readGpuTargetPixels(session, {x = 0, y = 0, width, height,
         device.queue.submit([encoder.finish()]);
       } catch (cause) { error = cause; }
       const invalid = device.popErrorScope(), oom = device.popErrorScope();
-      validation = Promise.all([invalid, oom]).then(errors => {
-        const cause = errors.find(Boolean);
+      // A known failure must release staging even if another scope stalls.
+      validation = Promise.all([invalid, oom].map(scope => Promise.resolve(scope).then(cause => {
         if (cause) fail('GPU', cause.message ?? 'GPU rejected the readback copy');
-      });
+      })));
       validation.catch(() => {});
     }, {colorIndex});
     if (error) throw error;
@@ -319,10 +319,10 @@ export async function readGpuTargetDepth(session, {x = 0, y = 0, width, height, 
         device.queue.submit([encoder.finish()]);
       } catch (cause) { error = cause; }
       const invalid = device.popErrorScope(), oom = device.popErrorScope();
-      validation = Promise.all([invalid, oom]).then(errors => {
-        const cause = errors.find(Boolean);
+      // Reject each scope independently; only successful reads wait for all.
+      validation = Promise.all([invalid, oom].map(scope => Promise.resolve(scope).then(cause => {
         if (cause) fail('GPU', cause.message ?? 'GPU rejected depth readback');
-      });
+      })));
       validation.catch(() => {});
     });
     if (error) throw error;

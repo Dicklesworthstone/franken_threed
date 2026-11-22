@@ -22,9 +22,9 @@ function fixture({pending = false, mapError = null, bufferFailure = 0} = {}) {
     },
     createBuffer(descriptor) {
       if (bufferFailure && buffers.length + 1 === bufferFailure) throw new Error('allocation failed');
-      const buffer = {descriptor, bytes: new ArrayBuffer(descriptor.size), destroyed: false, unmapped: false,
+      const buffer = {descriptor, bytes: new ArrayBuffer(descriptor.size), destroyed: false, destructions: 0, unmapped: false,
         mapAsync() { return mapError ? Promise.reject(mapError) : mapping; }, getMappedRange() { return this.bytes; },
-        unmap() { this.unmapped = true; }, destroy() { this.destroyed = true; }};
+        unmap() { this.unmapped = true; }, destroy() { this.destroyed = true; this.destructions++; }};
       buffers.push(buffer); return buffer;
     },
     createShaderModule(descriptor) { shaders.push(descriptor); return descriptor; },
@@ -187,6 +187,43 @@ test('GPU validation failure preserves output and evicts the failed pipeline', a
   await target.readDepthPixels({width: 1, height: 1}); assert.equal(f.pipelines.length, 2);
   target.dispose();
 });
+
+for (const failedScope of ['validation', 'out-of-memory'])
+  test(failedScope + ' releases depth staging and its pipeline without waiting for another scope or mapping', async () => {
+    const f = fixture({pending: true}), target = f.target(), output = new Float32Array(1).fill(-1);
+    await target.validation;
+    let resolveSibling, rejectSibling;
+    const sibling = new Promise((resolve, reject) => { resolveSibling = resolve; rejectSibling = reject; });
+    const scopes = [], push = f.device.pushErrorScope, pop = f.device.popErrorScope;
+    f.device.pushErrorScope = kind => scopes.push(kind);
+    f.device.popErrorScope = () => scopes.pop() === failedScope
+      ? Promise.resolve({message: 'depth read rejected'}) : sibling;
+    let outcome = null;
+    const pending = target.readDepthPixels({width: 1, height: 1, output, maxInFlightBytes: 40})
+      .then(value => { outcome = {value}; }, error => { outcome = {error}; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(outcome?.error?.code, 'GPU_READBACK_GPU');
+      assert.match(outcome.error.message, /depth read rejected/);
+      assert.equal(output[0], -1); assert.equal(target.diagnostics.pendingReadbacks, 0);
+      assert.ok(f.buffers.every(buffer => buffer.destructions === 1));
+      assert.equal(scopes.length, 0);
+      f.device.pushErrorScope = push; f.device.popErrorScope = pop;
+      const retry = target.readDepthPixels({width: 1, height: 1, output, maxInFlightBytes: 40});
+      assert.equal(f.pipelines.length, 2);
+      f.complete(); await retry;
+      assert.equal(output[0], depth(0, 0));
+      output[0] = -2; rejectSibling(new Error('late sibling failure'));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(output[0], -2);
+      assert.ok(f.buffers.every(buffer => buffer.destructions === 1));
+      await target.readDepthPixels({width: 1, height: 1, output, maxInFlightBytes: 40});
+      assert.equal(f.pipelines.length, 2, 'Late failure cannot evict a valid replacement pipeline');
+      assert.ok(f.buffers.every(buffer => buffer.destructions === 1));
+    } finally {
+      target.dispose(); resolveSibling(null); f.complete(); await pending;
+    }
+  });
 
 test('mapping and partial allocation failures clean up every successfully allocated buffer', async () => {
   for (const options of [{mapError: new Error('mapping failed')}, {bufferFailure: 2}, {bufferFailure: 3}]) {

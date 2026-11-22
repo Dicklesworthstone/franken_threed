@@ -302,10 +302,11 @@ export function createGpuAnimationReadback(device, options = {}) {
         }
         issuing = false;
       }
-      const validation = Promise.all(scopes).then((results) => {
-        const invalid = results.find(Boolean);
+      // Observe failures independently so a delayed sibling scope cannot keep
+      // staging or the request's admission credit alive after a known failure.
+      const validation = Promise.all(scopes.map(scope => scope.then(invalid => {
         if (invalid) throw error("GPU", invalid.message ?? "GPU readback validation failed");
-      });
+      })));
       validation.catch(() => {});
       if (issueError !== undefined) throw issueError;
       await Promise.race([Promise.all([mapping, validation, completion]), cancelledPromise]);

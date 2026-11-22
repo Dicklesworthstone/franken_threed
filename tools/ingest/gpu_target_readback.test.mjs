@@ -84,6 +84,40 @@ for (const kind of ['validation', 'mapping', 'loss', 'abort']) test(`${kind} fai
   assert.equal(f.buffers[0].destroyed, 1); assert.equal(f.unmaps, 1);
 });
 
+for (const failedScope of ['validation', 'out-of-memory'])
+  test(failedScope + ' releases color staging without waiting for another scope or mapping', async () => {
+    const f = fixture(), sibling = deferred(), mapping = deferred(), controller = new AbortController();
+    const output = new Uint8Array(24).fill(211), pop = f.device.popErrorScope;
+    f.mapping = mapping;
+    f.device.popErrorScope = () => {
+      const kind = f.calls.scopes.pop(); f.calls.popped.push(kind);
+      return kind === failedScope ? Promise.resolve({message: 'readback rejected'}) : sibling.promise;
+    };
+    let outcome = null;
+    const pending = readGpuTargetPixels(f.session, {...region, output, signal: controller.signal, maxInFlightBytes: 512})
+      .then(value => { outcome = {value}; }, error => { outcome = {error}; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(outcome?.error?.code, 'GPU_READBACK_GPU');
+      assert.match(outcome.error.message, /readback rejected/);
+      assert.ok(output.every(value => value === 211));
+      assert.equal(f.buffers[0].destroyed, 1); assert.equal(f.unmaps, 1);
+      assert.equal(f.calls.scopes.length, 0);
+      // The failed request's byte reservation is available even while its
+      // sibling scope and native mapping remain unresolved.
+      f.device.popErrorScope = pop; f.mapping = null;
+      await readGpuTargetPixels(f.session, {...region, output, maxInFlightBytes: 512});
+      output.fill(177);
+      sibling.reject(new Error('late sibling failure')); mapping.resolve();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(output.every(value => value === 177));
+      assert.ok(f.buffers.every(buffer => buffer.destroyed === 1));
+      assert.equal(f.unmaps, 2);
+    } finally {
+      controller.abort(); sibling.resolve(null); mapping.resolve(); await pending;
+    }
+  });
+
 test('pre-aborted reads do not allocate staging', async () => {
   const f = fixture(), controller = new AbortController(); controller.abort(Error('cancelled'));
   await assert.rejects(readGpuTargetPixels(f.session, {...region, signal: controller.signal}), /cancelled/);

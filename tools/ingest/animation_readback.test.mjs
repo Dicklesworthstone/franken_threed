@@ -411,6 +411,44 @@ test("validation failure rejects rather than reporting successful zero-filled pi
   clean(g, r);
   assert.equal(g.events.includes("range"), false);
 });
+for (const failedScope of ["validation", "out-of-memory"])
+  test(failedScope + " releases staging and drains whenIdle before sibling scope or mapping completion", async () => {
+    const g = gpu({ hold: true }),
+      r = createGpuAnimationReadback(g.device, { maxPending: 1, maxBytes: 536 }),
+      sibling = deferred(),
+      controller = new AbortController(),
+      pop = g.device.popErrorScope;
+    g.device.popErrorScope = () => g.scopes.pop() === failedScope
+      ? Promise.resolve({ message: "readback rejected" }) : sibling.promise;
+    let outcome = null, drained = false;
+    const pending = r.readPixels(texture(), { signal: controller.signal }).then(
+      value => { outcome = { value }; }, error => { outcome = { error }; },
+    );
+    const idle = r.whenIdle().then(() => { drained = true; });
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(outcome?.error?.code, "ANIMATION_READBACK_GPU");
+      assert.match(outcome.error.message, /readback rejected/);
+      assert.equal(drained, true);
+      clean(g, r);
+      assert.equal(g.events.includes("range"), false);
+      // The service remains reusable after a request failure. The old mapping
+      // and scope must neither occupy its only credit nor cancel a newer read.
+      g.device.popErrorScope = pop;
+      const retry = r.readPixels(texture());
+      g.buffers[1].gate.resolve();
+      assert.equal((await retry).data.length, 24);
+      sibling.reject(new Error("late sibling failure"));
+      g.buffers[0].gate.reject(new Error("late mapping failure"));
+      await new Promise(resolve => setImmediate(resolve));
+      clean(g, r);
+      assert.equal(r.failed, false);
+    } finally {
+      controller.abort(); sibling.resolve(null); g.buffers[0].gate.resolve();
+      await pending; await idle; r.dispose();
+    }
+  });
+
 test("whenIdle drains only requests present at call and tolerates their cancellation", async () => {
   const g = gpu({ hold: true }),
     r = createGpuAnimationReadback(g.device),
