@@ -110,6 +110,33 @@ targets, spread calls, async/generator callbacks and opaque canvas inputs retain
 the exact route. `ast_routing.test.mjs`, `renderer_module_ownership.test.mjs` and
 `renderer_route_build.test.mjs` cover these boundaries and production emission.
 
+Immediately awaited async setup helpers can also keep renderer and canvas
+ownership closed while initializing the renderer. Every reference must be a
+directly awaited local call in the closed, acyclic helper graph. Every return
+must be absent, bare, a literal primitive, or a `void` expression; identifiers
+(including potentially shadowed `undefined`), regular expressions and other
+object or unknown results remain conservative. Nested eligible setup helpers
+and closed synchronous factory callbacks are supported:
+
+```js
+const renderer = new THREE.WebGPURenderer();
+async function initialize(renderer) {
+  await renderer.init();
+  renderer.setSize(width, height);
+}
+await initialize(renderer);
+renderer.render(scene, camera);
+```
+
+Setup Promise aliases, unawaited calls, exported or escaping helpers, async factory
+callbacks and resource-returning async factories retain the exact route.
+Awaiting an owned object also retains the exact route because Promise resolution
+can expose it to an inherited `then`. The `renderer.init()` Promise may be
+awaited directly or through proven local aliases and closed synchronous helpers;
+the renderer value produced by that await cannot itself be awaited again. The original async calls, awaited effects,
+results and rejection behavior remain in JavaScript. This extends source route
+eligibility and makes no acceleration or browser parity claim.
+
 The linked proof also composes with the source-verified controls and
 `RendererInspector` contracts described below. Renderer factories, navigation
 helpers and Inspector attachment helpers may live in separate static modules.

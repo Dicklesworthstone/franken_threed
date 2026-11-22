@@ -1100,19 +1100,34 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
   const reassignedHelpers = new Set();
   for (const [cell, fn] of helperTargets)
     if (fn && helperWrites.has(cell)) reassignedHelpers.add(fn);
+  // Async setup helpers may consume owned resources, but their Promise result
+  // must never assimilate an object. Keep this syntax-only: identifiers (even
+  // `undefined`) can be shadowed, and regular-expression literals are objects.
+  const primitiveAsyncResult = node => !node ||
+    node.type === "Literal" && (node.value === null || ["string", "number", "boolean", "bigint"].includes(typeof node.value)) ||
+    node.type === "UnaryExpression" && node.operator === "void";
   const localHelper = call => {
     if (call.type !== "CallExpression" || call.arguments.some(value => value.type === "SpreadElement")) return null;
     const callee = call.callee;
     const fn = functions.has(callee.type) ? callee : callee.type === "Identifier" && !helperWrites.has(binding(callee))
       ? helperTargets.get(binding(callee)) : null;
     if (!fn || reassignedHelpers.has(fn)) return null;
+    // Every local reference to an async helper must consume its Promise here.
+    // Callback inference uses synthetic calls with no parent and remains opaque.
+    if (fn.async && !(parents.get(call)?.type === "AwaitExpression" && parents.get(call).argument === call)) return null;
     if (!helperSafety.has(fn)) {
       const names = new Set(fn.params.filter(value => value.type === "Identifier").map(value => value.name));
-      let safe = !fn.async && !fn.generator && names.size === fn.params.length && !names.has(fn.id?.name);
+      let safe = !fn.generator && names.size === fn.params.length && !names.has(fn.id?.name) &&
+        (!fn.async || fn.body.type === "BlockStatement" || primitiveAsyncResult(fn.body));
       // `arguments` can expose the original call frame without referring to a
       // parameter. A var/function redeclaration of a parameter also needs a
       // shared binding model that this lexical proof deliberately does not use.
       walk.full(fn.body, value => {
+        if (fn.async && value.type === "ReturnStatement") {
+          let owner = parents.get(value);
+          while (owner && !functions.has(owner.type)) owner = parents.get(owner);
+          if (owner === fn && !primitiveAsyncResult(value.argument)) safe = false;
+        }
         if (value.type === "Identifier" && value.name === "arguments" ||
             value.type === "VariableDeclaration" && value.kind === "var" && value.declarations.some(declaration =>
               [...collectPatternIdentifiers(declaration.id)].some(name => names.has(name))) ||
@@ -1582,6 +1597,46 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
       return visit(node.object);
     return closedDomValue(node);
   };
+  // Resource taint intentionally follows init() Promises. Distinguish their
+  // unawaited aliases from the renderer values obtained after awaiting them.
+  // AwaitExpression is deliberately absent: another await would assimilate the
+  // renderer again, potentially invoking an inherited then method.
+  // These facts are fixed now; memoize shared alias subgraphs instead of
+  // walking both copies of every conditional branch exponentially.
+  const initPromiseOrigins = new WeakMap();
+  const closedInitPromise = (node, visiting = new Set(), depth = 0) => {
+    if (!node || depth > 64) return false;
+    if (initPromiseOrigins.has(node)) return initPromiseOrigins.get(node);
+    const result = resolveInitPromise(node, visiting, depth);
+    initPromiseOrigins.set(node, result);
+    return result;
+  };
+  const resolveInitPromise = (node, visiting, depth) => {
+    const visit = value => closedInitPromise(value, visiting, depth + 1);
+    const field = recordField(node);
+    if (field) return visit(field);
+    if (node.type === "SequenceExpression") return visit(node.expressions.at(-1));
+    if (node.type === "ChainExpression") return visit(node.expression);
+    if (node.type === "ConditionalExpression" || node.type === "LogicalExpression")
+      return visit(node.consequent ?? node.left) && visit(node.alternate ?? node.right);
+    if (node.type === "Identifier") {
+      const cell = binding(node);
+      if (!origins.has(cell) || visiting.has(cell)) return false;
+      visiting.add(cell);
+      const result = origins.get(cell).every(visit);
+      visiting.delete(cell); return result;
+    }
+    if (node.type === "CallExpression") {
+      const helper = localHelper(node);
+      if (closedHelpers.has(helper) && !helper.async) {
+        const results = helperReturns.get(helper);
+        return results.length > 0 && results.every(visit);
+      }
+      return node.callee.type === "MemberExpression" && kind(node.callee.object) & RENDERER &&
+        staticPropertyNames(node.callee)?.every(name => name === "init");
+    }
+    return false;
+  };
   for (const node of nodes) {
     // A retained component contract also depends on its inherited methods and
     // host methods. Keep reflective mutation/code generation outside this slice,
@@ -1678,7 +1733,7 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         const value = kind(argument.type === "SpreadElement" ? argument.argument : argument);
         const helper = localHelper(node);
         if (value & RESOURCE && !isCanvasAttachment(node, argument) && !isControlsCanvasInput(node, argument, index) && !isPassInput(node, argument, index) && !isComputationInput(node, argument, index) && !isInspectorInput(node, argument, index) &&
-            !(helper && index < helper.params.length))
+            !(helper && (!helper.async || closedHelpers.has(helper)) && index < helper.params.length))
           report(node, "opaque-call-argument");
       }
     } else if (node.type === "AssignmentExpression") {
@@ -1714,6 +1769,13 @@ function analyzeRendererResourceEscapes(ast, offsets, consumerContract = null) {
         closedHelpers.has(helper) && helperReturns.get(helper).every(value => closedReturn(value));
       if (kind(node.argument ?? node.body) & RESOURCE && !localReturn)
         report(node, node.type === "ThrowStatement" ? "thrown-resource" : "returned-resource");
+    } else if (node.type === "AwaitExpression" && kind(node.argument) & RESOURCE) {
+      // Await also performs Promise resolution. A raw renderer/canvas (including
+      // a nested closure's capture) can expose itself to an inherited `then`.
+      // Keep known init() Promise aliases, but not resource-valued calls such as
+      // setMRT() or the renderer result of an earlier await.
+      if (!closedInitPromise(node.argument))
+        report(node, "awaited-resource");
     } else if (node.type === "AssignmentPattern" && kind(node.right) & RESOURCE) {
       report(node, "resource-default-value");
     } else if (node.type === "PropertyDefinition" && kind(node.value) & RESOURCE) {

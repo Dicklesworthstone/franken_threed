@@ -353,6 +353,88 @@ export const load = () => import('./lazy.js');
   }
 });
 
+test('an immediately awaited async setup helper initializes and renders through the emitted native owner', async () => {
+  const a = app(`import * as THREE from 'three/webgpu';
+const host=globalThis.__f3d_async_setup_host;
+const renderer=new THREE.WebGPURenderer({device:host.device,antialias:false});
+renderer.outputColorSpace=THREE.LinearSRGBColorSpace;
+const scene=new THREE.Scene();
+scene.add(new THREE.Mesh(new THREE.PlaneGeometry(),new THREE.MeshBasicMaterial()));
+const camera=new THREE.PerspectiveCamera(60,1,.1,10);camera.position.z=2;
+async function initialize(r) {
+  host.order.push('setup');
+  await r.init();
+  host.order.push('ready');
+  r.setSize(32,24,false);
+  await r.compileAsync(scene,camera);
+  r.render(scene,camera);
+  await r.renderAsync(scene,camera);
+  host.order.push('rendered');
+}
+host.order.push('before');
+const result=await initialize(renderer);
+host.order.push('after');
+export const observed={native:renderer.isF3DRenderer===true,route:renderer.info.f3d?.route,
+  drawCalls:renderer.info.render.drawCalls,size:renderer.getSize(new THREE.Vector2()).toArray(),voidResult:result===undefined};
+export const dispose=()=>renderer.dispose();
+`);
+  const result=await buildApplication(a.entry,a.out,{routeWebGPURenderer:true});
+  assert.equal(result.rendererRoute.routed,true);
+  assert.deepEqual(result.rendererRoute.decisions.map(site=>site.route),['general-webgpu']);
+  const device=geometryDevice();device.features=new Set();device.limits.maxTextureDimension2D=8192;
+  device.createSampler=descriptor=>descriptor;
+  device.createTexture=descriptor=>({...descriptor,dimension:'2d',sampleCount:1,depthOrArrayLayers:1,
+    width:descriptor.size.width??descriptor.size[0],height:descriptor.size.height??descriptor.size[1],
+    createView(options={}){return {texture:this,...options};},destroy(){}});
+  let configuration;
+  const canvas={width:16,height:16,style:{},getContext:()=>({
+    configure(value){configuration=value;},unconfigure(){},
+    getCurrentTexture:()=>device.createTexture({size:[canvas.width,canvas.height],format:configuration.format,usage:16}),
+  })};
+  const previous={document:globalThis.document,host:globalThis.__f3d_async_setup_host};
+  const host=globalThis.__f3d_async_setup_host={device,order:[]};
+  globalThis.document={createElementNS:()=>canvas};
+  let emitted;
+  try {
+    emitted=await import(pathToFileURL(path.join(a.out,result.entryFiles[0])).href);
+    assert.deepEqual(emitted.observed,{native:true,route:'general-webgpu',drawCalls:2,size:[32,24],voidResult:true});
+    assert.deepEqual(host.order,['before','setup','ready','rendered','after']);
+    assert.equal(device.snapshots.flat().length,2,'Both renders submit a draw even when its bundle is encoded once');
+    assert.ok(device.submissions.length>0);
+  } finally {
+    await emitted?.dispose();globalThis.document=previous.document;
+    if(previous.host===undefined)delete globalThis.__f3d_async_setup_host;
+    else globalThis.__f3d_async_setup_host=previous.host;
+  }
+});
+
+for(const returnsRenderer of [true,false]) {
+  test(`${returnsRenderer?'async renderer return':'raw resource await'} preserves the emitted exact owner`, async () => {
+    const a=app(`import * as THREE from 'three/webgpu';
+const renderer=new THREE.WebGPURenderer();
+const events=[];
+async function initialize(r) {
+  events.push('setup');r.setSize(20,30,false);
+  ${returnsRenderer?"return r;":"await r;events.push('resumed');"}
+}
+const result=await initialize(renderer);events.push('complete');
+export const observed={native:renderer.isF3DRenderer===true,events,
+  identity:result===${returnsRenderer?'renderer':'undefined'},size:renderer.getSize(new THREE.Vector2()).toArray()};
+`);
+    const result=await buildApplication(a.entry,a.out,{routeWebGPURenderer:true});
+    assert.equal(result.rendererRoute.routed,false);
+    assert.ok(result.rendererRoute.decisions.some(site=>site.route==='exact-backend'));
+    assert.equal(result.chunks.some(chunk=>chunk.fileName.startsWith('f3d-renderer-runtime-')),false);
+    const previousDocument=globalThis.document;
+    globalThis.document={createElementNS:()=>({width:300,height:150,style:{}})};
+    try {
+      const emitted=await import(pathToFileURL(path.join(a.out,result.entryFiles[0])).href);
+      assert.deepEqual(emitted.observed,{native:false,identity:true,size:[20,30],
+        events:returnsRenderer?['setup','complete']:['setup','resumed','complete']});
+    } finally {globalThis.document=previousDocument;}
+  });
+}
+
 test('an emitted registered transparent material compiles and renders through the native owner', async () => {
   const a = app(`import * as THREE from 'three/webgpu';
 const host = globalThis.__f3d_transparent_application;

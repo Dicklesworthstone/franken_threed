@@ -379,6 +379,148 @@ test("closed local factories retain renderer ownership through calls, returns an
   }
 });
 
+test("immediately awaited async setup helpers keep renderer ownership for primitive and void results", () => {
+  const declaration = "const renderer=new WebGPURenderer();";
+  for (const setup of [
+    "async function setup(r){await r.init();} await setup(renderer);",
+    "const setup=async(r)=>{await r.init();}; await setup(renderer);",
+    "const setup=async function initialize(r){await r.init();return;}; await setup(renderer);",
+    "await (async(r)=>{await r.init();})(renderer);",
+    "async function prepare(r){await r.init();return;} async function setup(r){await prepare(r);r.setSize(640,480);return true;} const ready=await setup(renderer);",
+    "async function setup(r){await ready;await r.init();return false;} await setup(renderer);",
+    "async function setup(r){await r.init();return null;} await setup(renderer);",
+    "async function setup(r){await r.init();return 'ready';} await setup(renderer);",
+    "async function setup(r){await r.init();return 1;} await setup(renderer);",
+    "async function setup(r){await r.init();return 1n;} await setup(renderer);",
+    "async function setup(r){await r.init();return void 0;} await setup(renderer);",
+    "const setup=async(r)=>void r.setSize(640,480); await setup(renderer);",
+    "async function setup(r){if(flag)return false;await r.init();return true;} await setup(renderer);",
+    "async function setup(r){function identity(value){return value;} identity(r).setSize(640,480);await r.init();} await setup(renderer);",
+  ]) {
+    const source = declaration + setup + "renderer.render(scene,camera);";
+    const result = analyzeModuleAst(source, moduleUrl);
+    assert.deepEqual(result.routingFacts.escapes, [], source);
+    assert.equal(decision(result).route, "general-webgpu", source);
+  }
+  for (const source of [
+    "async function setup(canvas){const r=new WebGPURenderer({canvas});await r.init();r.render(scene,camera);} await setup(document.createElement('canvas'));",
+    "function factory(){return new WebGPURenderer();} async function setup(make){const r=make();await r.init();r.render(scene,camera);} await setup(factory);",
+  ]) {
+    const result = analyzeModuleAst(source, moduleUrl);
+    assert.deepEqual(result.routingFacts.escapes, [], source);
+    assert.equal(decision(result).route, "general-webgpu", source);
+  }
+});
+
+test("async setup promises cannot return resources or unproven object results", () => {
+  for (const result of [
+    "r", "r.domElement", "await r.init()", "r.init()", "new WebGPURenderer()",
+    "Promise.resolve(r)", "{renderer:r}", "[r]", "new Proxy(r,{})",
+    "unknown()", "undefined", "/ready/", "flag ? true : r", "(0,r)",
+  ]) {
+    const source = "const renderer=new WebGPURenderer();async function setup(r){await r.init();return " +
+      result + ";} await setup(renderer);renderer.render(scene,camera);";
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+  }
+  for (const source of [
+    "const r=new WebGPURenderer();async function setup(r,undefined){return undefined;} await setup(r,r);",
+    "const r=new WebGPURenderer();async function setup(r){return void plugin(r);} await setup(r);",
+    "const r=new WebGPURenderer();async function setup(r){throw r;} await setup(r);",
+    "const r=new WebGPURenderer();const setup=async(r)=>r; await setup(r);",
+    "const r=new WebGPURenderer();async function setup(r){if(flag)return;return r;} await setup(r);",
+    "const r=new WebGPURenderer();async function setup(r){try{return;}finally{return r;}} await setup(r);",
+    "async function make(){return new WebGPURenderer();} async function setup(){const r=await make();r.render(scene,camera);} await setup();",
+    "Object.prototype.then=function(resolve){plugin(this);resolve();};async function make(){return new WebGPURenderer();}const r=await make();r.render(scene,camera);",
+    "Object.defineProperty(Object.prototype,'then',{get(){plugin(this);}});async function make(){return new WebGPURenderer();}const r=await make();r.render(scene,camera);",
+    "globalThis.installThenable();async function make(){return new WebGPURenderer();}const r=await make();r.render(scene,camera);",
+    "async function make(){await foreignPromise;return new WebGPURenderer();}const r=await make();r.render(scene,camera);",
+  ]) assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+});
+
+test("async setup calls require immediate await and a closed local call graph", () => {
+  const setup = "async function setup(r){await r.init();}";
+  const declaration = "const r=new WebGPURenderer();";
+  for (const use of [
+    "setup(r);", "const promise=setup(r);await promise;", "setup(r).then(done);",
+    "setup(r).catch(failed);", "await Promise.all([setup(r)]);",
+    "await setup(r);setup(r);", "const alias=setup;await alias(r);",
+    "register(setup);await setup(r);", "export {setup};await setup(r);",
+    "await setup(r);setup=unknown;", "await setup.call(null,r);", "await setup(...[r]);",
+  ]) {
+    const source = declaration + setup + use + "r.render(scene,camera);";
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+  }
+  for (const helper of [
+    "export async function setup(r){await r.init();}",
+    "async function setup(r){if(flag)await setup(r);await r.init();}",
+    "async function other(r){await setup(r);} async function setup(r){await other(r);}",
+    "async function setup(r){plugin(r);await r.init();}",
+    "async function setup(r){plugin(arguments);await r.init();}",
+    "async function setup(r=unknown){await r.init();}",
+    "async function setup(...args){await args[0].init();}",
+    "async function* setup(r){await r.init();}",
+  ]) {
+    const source = declaration + helper + "await setup(r);r.render(scene,camera);";
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+  }
+  const callback = declaration + "async function initialize(r){await r.init();}" +
+    "function setup(callback,r){callback(r);}setup(initialize,r);r.render(scene,camera);";
+  assert.equal(decision(analyzeModuleAst(callback, moduleUrl)).route, "exact-backend", callback);
+});
+
+test("awaiting owned objects cannot expose async setup resources through thenable assimilation", () => {
+  for (const body of [
+    "await r;", "await r.domElement;", "await r.setMRT(null);",
+    "function identity(value){return value;} await identity(r);",
+    "await (flag?r:foreignPromise);", "await (0,r);",
+    "const value=await r.init();await value;", "await (await r.init());",
+    "let promise=r.init();promise=r;await promise;",
+    "await (flag?r.init():r);", "let a=r,b;a=b;b=a;await a;",
+    "(async()=>{await r;})();", "register(async()=>{await r;});",
+    "const box={r};await box;", "const box={r};await box.r;",
+    "const box={nested:{r}};await box;", "const box={r};const {r:alias}=box;await alias;",
+    "let alias;alias=r;await alias;",
+  ]) {
+    const source = "const renderer=new WebGPURenderer();async function setup(r){" +
+      body + "} await setup(renderer);renderer.render(scene,camera);";
+    assert.equal(decision(analyzeModuleAst(source, moduleUrl)).route, "exact-backend", source);
+  }
+});
+
+test("renderer init Promise aliases stay closed without treating their awaited renderer results as promises", () => {
+  for (const use of [
+    "const promise=r.init();await promise;",
+    "const promise=r.init();const alias=promise;await alias;",
+    "function initialize(r){return r.init();} const promise=initialize(r);await promise;",
+    "function initialize(r){return r.init();} await initialize(r);",
+    "function identity(value){return value;} const promise=r.init();await identity(promise);",
+    "await (flag?r.init():r.init());",
+    "await (0,r.init());",
+    "const box={promise:r.init()};await box.promise;",
+    "const box={promise:r.init()};const {promise}=box;await promise;",
+  ]) {
+    for (const wrapped of [false, true]) {
+      const source = "const r=new WebGPURenderer();" + (wrapped
+        ? "async function setup(r){" + use + "} await setup(r);"
+        : use) + "r.render(scene,camera);";
+      const result = analyzeModuleAst(source, moduleUrl);
+      assert.deepEqual(result.routingFacts.escapes, [], source);
+      assert.equal(decision(result).route, "general-webgpu", source);
+    }
+  }
+});
+
+test("shared init Promise alias subgraphs remain bounded during await ownership analysis", () => {
+  const aliases = ["const p0=renderer.init();"];
+  for (let index = 1; index <= 24; index++)
+    aliases.push("const p" + index + "=flag?p" + (index - 1) + ":p" + (index - 1) + ";");
+  const source = "const renderer=new WebGPURenderer();" + aliases.join("") +
+    "await p24;renderer.render(scene,camera);";
+  const result = analyzeModuleAst(source, moduleUrl);
+  assert.deepEqual(result.routingFacts.escapes, []);
+  assert.equal(decision(result).route, "general-webgpu");
+});
+
 test("factory results remain resources at exports, opaque calls, containers, throws and native reads", () => {
   for (const use of [
     "plugin(make());", "const renderer=make(); plugin(renderer);", "export const renderer=make();",
