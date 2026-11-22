@@ -3,6 +3,7 @@ import test from 'node:test';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {createGpuThreeTextures,createThreeTextureBindings} from './three_textures.mjs';
+import {createThreeComputeTextures} from './three_compute_textures.mjs';
 import {textureDevice} from './fixtures/gpu_texture_device.mjs';
 const root=process.env.F3D_THREE_ROOT??path.resolve('upstream/three.js');
 const T=await import(pathToFileURL(path.join(root,'build/three.core.js')));
@@ -325,7 +326,7 @@ const rgbaStorageTypes = [
   ['IntType', Int32Array, true, 'INT'], ['UnsignedIntType', Uint32Array, true, 'UNSIGNED_INT'],
 ];
 for (const [name, Kind, integral, glType] of rgbaStorageTypes)
-test(`partial ${integral ? 'integer ' : ''}${name} uploads match pinned source bytes and histories`, async t => {
+test(`partial ${integral ? 'integer ' : ''}${name} uploads and queued captures match pinned source bytes and histories`, async t => {
   const {WebGLTextures} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLTextures.js')));
   const {WebGLProperties} = await import(pathToFileURL(path.join(root, 'src/renderers/webgl/WebGLProperties.js')));
   const bpc = Kind.BYTES_PER_ELEMENT, width = 3, height = 3, pitch = Math.ceil(width * 4 * bpc / 8) * 8;
@@ -336,7 +337,9 @@ test(`partial ${integral ? 'integer ' : ''}${name} uploads match pinned source b
     const texture = new T.DataTexture(data, width, height, integral ? T.RGBAIntegerFormat : T.RGBAFormat, T[name]);
     texture.unpackAlignment = 8; texture.needsUpdate = true; return texture;
   };
-  const a = makeTexture(), b = makeTexture(), d = textureDevice(), p = pool(d, {webglVersioning: true});
+  const a = makeTexture(), b = makeTexture(), captured = makeTexture(), d = textureDevice(), p = pool(d, {webglVersioning: true});
+  const capturedDevice = textureDevice(), snapshots = createThreeComputeTextures({storage: {async whenIdle() {}, validateDispatch() {}},
+    poolFactory: options => pool(capturedDevice, {...options, webglVersioning: true})});
   const bytes = texture => new Uint8Array(texture.image.data.buffer, texture.image.data.byteOffset, texture.image.data.byteLength);
   const parameters = new Map(), uploads = [], properties = WebGLProperties();
   let bound, next = 1;
@@ -358,20 +361,24 @@ test(`partial ${integral ? 'integer ' : ''}${name} uploads match pinned source b
     {maxTextures: 16, maxTextureSize: 8192},
     {convert: value => value === T[name] ? gl[glType] : value === a.format ? integral ? gl.RGBA_INTEGER : gl.RGBA : value},
     {memory: {textures: 0}});
-  t.after(() => { a.dispose(); b.dispose(); p.dispose(); });
-  const callbacks = [[], []];
-  for (const [index, texture] of [a, b].entries()) texture.onUpdate = source =>
+  t.after(() => { a.dispose(); b.dispose(); captured.dispose(); p.dispose(); snapshots.dispose(); });
+  const callbacks = [[], [], []];
+  for (const [index, texture] of [a, b, captured].entries()) texture.onUpdate = source =>
     callbacks[index].push([source.version, source.source.version, source.updateRanges.length]);
   const consume = () => {
     p.prepare([a]); uploader.setTexture2D(b, 0);
     assert.deepEqual(p.nativeTexture(a).levels[0], properties.get(b).__webglTexture.data);
+    const lease = snapshots.captureBinding({texture: captured, isSampledTexture: true});
+    try { assert.deepEqual(snapshots.resolve(lease).texture.levels[0], properties.get(b).__webglTexture.data); }
+    finally { snapshots.release(lease); }
     assert.deepEqual(d.textureWrites.map(write => ({origin: write.destination.origin ?? [0, 0, 0], size: write.size})), uploads);
     assert.deepEqual(a.updateRanges, b.updateRanges); assert.deepEqual(callbacks[0], callbacks[1]);
+    assert.deepEqual(captured.updateRanges, b.updateRanges); assert.deepEqual(callbacks[2], callbacks[1]);
   };
-  for (const texture of [a, b]) { bytes(texture).fill(0x37); texture.addUpdateRange(16, 4); }
+  for (const texture of [a, b, captured]) { bytes(texture).fill(0x37); texture.addUpdateRange(16, 4); }
   consume(); assert.ok(p.nativeTexture(a).levels[0].slice(0, width * 4 * bpc).every(value => value === 0));
   for (let frame = 0; frame < 18; frame++) {
-    for (const texture of [a, b]) {
+    for (const texture of [a, b, captured]) {
       const data = bytes(texture);
       for (let i = 0; i < data.length; i++) data[i] = (frame * 29 + i * 17) & 255;
       texture.addUpdateRange(24, 0); texture.addUpdateRange(4, 4); texture.addUpdateRange(0, 3);
@@ -382,8 +389,22 @@ test(`partial ${integral ? 'integer ' : ''}${name} uploads match pinned source b
     consume();
   }
   const before = d.textureWrites.length;
-  for (const texture of [a, b]) { texture.addUpdateRange(4, 0); texture.needsUpdate = true; }
+  for (const texture of [a, b, captured]) { texture.addUpdateRange(4, 0); texture.needsUpdate = true; }
   consume(); assert.equal(d.textureWrites.length, before);
+  const queued = [], sourceVersions = [];
+  for (const [value, start] of [[0x51, 4], [0x72, 28]]) {
+    for (const texture of [b, captured]) {
+      bytes(texture).fill(value); texture.clearUpdateRanges(); texture.addUpdateRange(start, 4); texture.needsUpdate = true;
+    }
+    queued.push(snapshots.captureBinding({texture: captured, isSampledTexture: true}));
+    uploader.setTexture2D(b, 0); sourceVersions.push(properties.get(b).__webglTexture.data.slice());
+  }
+  bytes(captured).fill(0x99);
+  try {
+    for (const [index, lease] of queued.entries())
+      assert.deepEqual(snapshots.resolve(lease).texture.levels[0], sourceVersions[index], 'queued uploads preserve each accepted source version');
+  } finally { for (const lease of queued) snapshots.release(lease); }
+  assert.ok(bytes(captured).every(value => value === 0x99), 'capturing does not rewrite caller pixels');
 });
 
 for (const [name, Kind, integral] of rgbaStorageTypes)

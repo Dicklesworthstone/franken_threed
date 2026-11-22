@@ -78,6 +78,29 @@ test('textured scene bakes retain distinct marked uploads, stale unmarked bytes 
   for (const output of outputs) output.dispose();
 });
 
+for (const [type, Kind, values] of [[T.HalfFloatType, Uint16Array, [0x3400, 0x3800, 0x3a00, 0x3c00]],
+  [T.FloatType, Float32Array, [.25, .5, .75, 1]]])
+test(`queued HDR scene bakes preserve ${Kind.name} partial map uploads and source lifetime`, async t => {
+  const {renderer, device} = fixture(t); await renderer.init();
+  const data = new Kind(16).fill(values[0]), map = new T.DataTexture(data, 2, 2, T.RGBAFormat, type);
+  map.needsUpdate = true;
+  const root = room(map), generator = new Generator(renderer), outputs = [];
+  const bake = () => outputs.push(generator.fromScene(root, .02, .1, 20, {size: 16}));
+  bake();
+  data.fill(values[1]); map.addUpdateRange(4, 4); map.needsUpdate = true; bake();
+  data.fill(values[2]); map.clearUpdateRanges(); map.addUpdateRange(12, 4); map.needsUpdate = true; bake();
+  data.fill(values[3]); root.material.map = null; map.dispose();
+  root.geometry.dispose(); root.material.dispose(); generator.dispose(); await drain(renderer);
+  const expected = [new Kind(16).fill(values[0]), new Kind(16).fill(values[0]), new Kind(16).fill(values[0])];
+  expected[1].fill(values[1], 4, 8); expected[2].set(expected[1]); expected[2].fill(values[2], 12, 16);
+  assert.deepEqual(sceneWrites(device).map(write => write.bytes), expected.map(array => new Uint8Array(array.buffer)));
+  assert.ok(data.every(value => value === values[3])); assert.equal(map.image.data, data);
+  assert.equal(renderer._sampledTextureInputs.diagnostics.snapshotBytes, 0);
+  assert.equal(renderer._sampledTextureInputs.diagnostics.versions, 0);
+  assert.equal(renderer._passSnapshots.rootCount, 0);
+  for (const output of outputs) output.dispose();
+});
+
 test('map transforms are captured independently of upload versions and installs retain each accepted generation', async t => {
   const {renderer} = fixture(t); await renderer.init();
   const map = texture(), root = room(map), owner = createThreePassSnapshots(T), camera = new T.PerspectiveCamera();

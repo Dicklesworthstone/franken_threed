@@ -158,8 +158,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
     const rowBytes = width * channels * bpc, pitch = Math.ceil(rowBytes / alignment) * alignment;
     const spans = [];
     if (ranges.length) {
-      if (layers.length || shape.layered || shape.integral || channels !== 4 || bpc !== 1 || shape.flipY)
-        fail('RANGES', 'Partial rows require unflipped RGBA byte base pixels');
+      if (layers.length || shape.layered || channels !== 4 || shape.flipY)
+        fail('RANGES', 'Partial rows require unflipped RGBA base pixels');
       for (const {start, count} of ranges) {
         if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count < 0 ||
             start + count > width * height * 4 || Math.floor(start / 4) % width + Math.ceil(count / 4) > width)
@@ -177,8 +177,11 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
         else merged.push({...next});
       }
       for (const {start, count} of merged) {
-        const pixel = Math.floor(start / 4), offset = Math.floor(pixel / width) * pitch + pixel % width * 4;
-        if (count) spans.push([offset, Math.ceil(count / 4) * 4]);
+        // Source ranges count RGBA components, while UNPACK_ROW_LENGTH and
+        // UNPACK_SKIP_PIXELS address whole pixels for every admitted scalar
+        // type. Convert to byte spans only after source rounding/coalescing.
+        const pixel = Math.floor(start / 4), offset = Math.floor(pixel / width) * pitch + pixel % width * 4 * bpc;
+        if (count) spans.push([offset, Math.ceil(count / 4) * 4 * bpc]);
       }
     } else {
       if (!shape.array || !positive(shape.layers) || pitch !== rowBytes)
