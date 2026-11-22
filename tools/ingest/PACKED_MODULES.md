@@ -253,6 +253,11 @@ the default. Node builds emit an ESM package with its own `type: "module"`, so
 moving the output beneath a CommonJS project does not change its entry format.
 The build and graph reports include the selected target.
 
+Native ESM `node:worker_threads` workers with module-relative URL entries also
+include their transitive modules, nested workers, JSON and static file assets.
+See [Node worker threads](MODULE_WORKERS.md#node-worker-threads) for the native
+constructor/transfer behavior and supported closure boundaries.
+
 Node package resolution selects `node`, `node-addons`, `module-sync`, and the
 applicable `import` or `require` condition, in each package's declared key order.
 It honors private `#imports`, self references and the explicit Three.js package

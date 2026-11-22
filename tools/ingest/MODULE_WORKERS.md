@@ -68,6 +68,47 @@ Nested closure hashing has its own work bound. Shared build accounting is
 conservative: overlapping graph plans can be charged again even when identical
 emitted files are reused.
 
+## Node worker threads
+
+Node application builds (`--target node` or `{target: 'node'}`) close native ESM
+worker entries imported from `node:worker_threads` or `worker_threads`:
+
+```js
+import { Worker as Thread } from 'node:worker_threads';
+const simulation = new Thread(new URL('./simulation.mjs', import.meta.url), {
+  workerData: input,
+  transferList: [input.buffer],
+});
+```
+
+Named import aliases and namespace imports are recognized with their lexical
+scope. Nested Node workers use the same closure. Static and bounded lazy ESM,
+Node package conditions, native builtins, JSON modules and module-relative file
+assets are emitted through the existing worker graph. Node's filesystem entry
+rules remove worker URL query/fragment suffixes and resolve symlinks; imported
+ESM query/fragment instances remain distinct. `buildWorkerGraph` and
+`moduleWorkerRollupPlugin` also accept `target: 'node'` directly.
+
+The native constructor and every option expression remain in place. Node owns
+workerData cloning, transfer lists, environment and argument handling, events,
+errors, termination and each worker realm. No worker, messaging or fetch shim is
+added. Relative fetch strings retain Node's native behavior, while explicit
+`new URL('./data.bin', import.meta.url)` resources are relocated for file APIs.
+Missing worker entries retain native asynchronous errors. No browser renderer
+or mandatory GPU/Wasm startup is introduced; existing numeric specialization
+remains opt-in.
+
+This closure uses the same ordinary Node module conditions as the application
+target. Explicit runtime `execArgv` or alternate loader, condition and symlink
+flags require a matching frontend and receive a build diagnostic; benign literal
+flags remain native. Opaque options must use this same default resolution profile.
+The mutable default-object `threads.Worker` form also receives a diagnostic;
+use a named or namespace import, or normalize it in the project frontend.
+CommonJS worker graphs and unresolved module-relative entry/import choices keep
+an explicit build boundary. CWD-relative filename strings, generated/eval
+workers and opaque constructor origins remain native host routes and are not
+claimed as closed by this pass.
+
 ## Numeric Wasm inside module workers
 
 The application compiler's existing numeric opt-in also applies to local ESM

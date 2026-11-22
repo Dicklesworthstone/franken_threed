@@ -17,7 +17,7 @@ import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRoot
 import { numericKernelRollupPlugin } from "./numeric_rollup.mjs";
 import { marchingCubesRollupPlugin } from "./marching_cubes_rollup.mjs";
 import { resolveModuleSpecifier, urlToFilePath } from "./resolver.mjs";
-import { moduleWorkerRollupPlugin, findWorkerUrlOperands, workerNumericReport } from "./module_workers.mjs";
+import { moduleWorkerRollupPlugin, findWorkerUrlOperands, findNodeWorkerUrlOperands, workerNumericReport } from "./module_workers.mjs";
 import { moduleSourcesFor } from "./module_sources.mjs";
 import { createImportedStringResolver } from "./module_string_constants.mjs";
 import { commonjsEntry, commonjsPlugins, commonjsSourceUrl, commonjsJsonSourceUrl, commonjsFormat, commonjsError } from "./commonjs_modules.mjs";
@@ -399,8 +399,10 @@ export function f3dRollupPlugin(options = {}) {
       // 1. Asset reference replacements: new URL(..., import.meta.url)
       const analysis = analyzeModuleAst(code, id, {}, null, importedStrings(referrerUrl));
       const assetRefs = analysis && analysis.assetReferences ? analysis.assetReferences : [];
-      const workerUrls = new Set(documentRoot && code.includes("Worker")
-        ? findWorkerUrlOperands(code, {unavailableGlobals: options.workerHostBindings}).map(node => node.start) : []);
+      const workerUrls = new Set(target === 'node' && code.includes('worker_threads')
+        ? findNodeWorkerUrlOperands(code).map(node => node.start)
+        : documentRoot && code.includes("Worker")
+          ? findWorkerUrlOperands(code, {unavailableGlobals: options.workerHostBindings}).map(node => node.start) : []);
 
       for (const ref of assetRefs) {
         // A root worker endpoint left on its host route is executable source,
@@ -889,7 +891,8 @@ export async function bundleWithRollup(entryPath, options = {}) {
           })}),
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
-        ...(target === 'browser' ? [moduleWorkerRollupPlugin({
+        moduleWorkerRollupPlugin({
+          target,
           _moduleSources: moduleSources,
           specializeNumeric: specialization,
           _workerNumericUnits: workerNumericUnits,
@@ -897,11 +900,12 @@ export async function bundleWithRollup(entryPath, options = {}) {
           unavailableGlobals: options.workerHostBindings,
           ...(isHtml ? { documentUrl: entryUrl, documentBaseUrl: mapBaseUrl } : {}),
           resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, {}, {
+            target,
             packageRootUrl: options.packageRootUrl,
             documentRoot,
             _moduleSources: moduleSources,
           }),
-        })] : []),
+        }),
         f3dRollupPlugin({
           target,
           _moduleSources: moduleSources,
