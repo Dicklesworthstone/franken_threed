@@ -9,7 +9,7 @@ const hasOwn=Object.hasOwn,freeze=Object.freeze,create=Object.create,source=Func
 const get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakSet.prototype.has,add=WeakSet.prototype.add;
 const setHas=Set.prototype.has,setAdd=Set.prototype.add,F64=Float64Array,U8=Uint8Array,SetType=Set;
 const decode=host.atob,charCode=String.prototype.charCodeAt,isInteger=Number.isSafeInteger;
-const kernels=new WeakMap(),plans=new WeakMap(),owners=new WeakMap(),numbers=new WeakMap(),dataObjects=new WeakSet(),statistics=new WeakMap();
+const kernels=new WeakMap(),plans=new WeakMap(),owners=new WeakMap(),numbers=new WeakMap(),sourceClasses=new WeakMap(),dataObjects=new WeakSet(),statistics=new WeakMap();
 const own=(object,key)=>{if(object==null)return null;const d=descriptor(object,key);return d && hasOwn(d,'value')?d:null;};
 const data=(object,key)=>own(object,key)?.value;
 const math=data(host,'Math'),cos=data(math,'cos'),sin=data(math,'sin');
@@ -28,10 +28,18 @@ export function createEulerUpdateKernel(base64,orders,maxMemoryPages){
 export function registerEulerUpdateClass(token,name,Class){
   const record=lookup(kernels,token),proto=data(Class,'prototype'),properties=create(null);
   for(const key of ['x','y','z','order','set','setFromEuler'])properties[key]=descriptor(proto,key);
-  record.classes[name]={proto,parent:prototype(proto),properties};
+  const entry={name,proto,parent:prototype(proto),properties};
+  if(record)record.classes[name]=entry;
+  else apply(set,sourceClasses,[Class,entry]);
 }
-export function registerEulerUpdateNumeric(object,token,name){
-  apply(set,numbers,[object,{record:lookup(kernels,token),name}]);
+/** An imported constructor is not inspected: only its prior, source-local
+ * registration can supply the class contract. Unknown/Proxy imports stay cold. */
+export function bindEulerUpdateClass(token,name,Class){
+  const record=lookup(kernels,token),entry=lookup(sourceClasses,Class);
+  if(record && entry?.name===name)record.classes[name]=entry;
+}
+export function registerEulerUpdateNumeric(object,token,name,Class=null){
+  apply(set,numbers,[object,{record:lookup(kernels,token),name,Class}]);
 }
 export function registerEulerUpdateOwner(object,rotation,quaternion,callback,token){
   apply(set,owners,[object,{record:lookup(kernels,token),rotation,quaternion,callback}]);
@@ -53,8 +61,9 @@ function sameDescriptor(actual,expected){
 }
 function numeric(object,name,record,writable=false){
   const witness=lookup(numbers,object);
-  if(!witness || witness.name!==name || record && witness.record!==record)return null;
-  const cls=witness.record?.classes[name];
+  if(!witness || witness.name!==name)return null;
+  const cls=witness.record?.classes[name]??lookup(sourceClasses,witness.Class);
+  if(record && cls!==record.classes[name])return null;
   if(!cls || prototype(object)!==cls.proto || prototype(cls.proto)!==cls.parent)return null;
   if(name==='Euler')for(const key of ['x','y','z']){
     if(descriptor(object,key) || !sameDescriptor(descriptor(cls.proto,key),cls.properties[key]))return null;

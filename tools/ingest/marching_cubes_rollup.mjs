@@ -142,10 +142,12 @@ export function marchingCubesRollupPlugin(options={}) {
           if(batch.report)transformReports.push({id,...batch.report});
           if(batch.changed){edits.push(...batch.edits);headers.push(batch.header);}
         }
-        if(code.includes('class Object3D')) {
-          const euler=specializeEulerUpdateBase(code,{runtimeModule:EULER_UPDATES,maxMemoryPages,maxIterations});
+        if(['Object3D','Euler','Quaternion'].some(name=>code.includes('class '+name))) {
+          const euler=specializeEulerUpdateBase(code,{...sources,runtimeModule:EULER_UPDATES,maxMemoryPages,maxIterations});
           if(euler.report)eulerReports.push({id,...euler.report});
           if(euler.changed){edits.push(...euler.edits);headers.push(euler.header);}
+        }
+        if(code.includes('class Object3D')) {
           const instance=specializeInstancedMatrixBase(code,{runtimeModule:INSTANCE_UPDATES,maxMemoryPages,maxIterations});
           if(instance.report)instanceReports.push({id,...instance.report});
           if(instance.changed){edits.push(...instance.edits);headers.push(instance.header);}
@@ -169,13 +171,14 @@ export function marchingCubesRollupPlugin(options={}) {
         return {code:headers.join('')+transformed+tail,map:null};
       };
       if(code.includes('class Object3D')&&transformBatchSourceRole(code)==='Object3D') {
-        return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{
-          let matrixSource;
+        return Promise.all([['matrixSource','../math/Matrix4.js'],['eulerSource','../math/Euler.js'],
+          ['quaternionSource','../math/Quaternion.js']].map(async([key,specifier])=>{
+          const resolved=await this.resolve(specifier,id,{skipSelf:true});
           if(resolved&&!resolved.external)try {
-            matrixSource=fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8');
-          }catch{/* An unknown matrix dependency retains the original descendant loop. */}
-          return finish({matrixSource});
-        });
+            return [key,fs.readFileSync(resolved.id.startsWith('file:')?new URL(resolved.id):resolved.id,'utf8')];
+          }catch{/* Unknown dependencies retain their source-owned update loops. */}
+          return [key,undefined];
+        })).then(values=>finish(Object.fromEntries(values)));
       }
       if(code.includes('class Skeleton')&&skeletonUpdateSourceRole(code)==='skeleton') {
         return this.resolve('../math/Matrix4.js',id,{skipSelf:true}).then(resolved=>{

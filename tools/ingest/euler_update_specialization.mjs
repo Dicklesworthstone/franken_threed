@@ -7,8 +7,11 @@ import * as walk from 'acorn-walk';
 import {normalClasses,normalMethod} from './geometry_normals_compile.mjs';
 import {compileNumericKernel} from './numeric_kernel.mjs';
 import {numericLoopScopeBindings} from './numeric_loop_islands.mjs';
+import {sourceBlob} from './marching_cubes_specialization.mjs';
 
 const CORE_HASH='9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6';
+const SOURCE_BLOBS={Object3D:'a0a09156f7e781130de6a361cf2c443b8c27d925',
+  Euler:'5a19278c75a36e01454ae988d59c178a8295a14a',Quaternion:'c9faca31665218cee87a7110e2badc7ba868beca'};
 const XYZ=['x','y','z'],OPERATORS=['+','-','*','/'];
 export const EULER_UPDATE_STRIDE=17;
 const fresh=(source,name)=>{let value='__f3d_euler_'+name;while(source.includes(value))value+='_';return value;};
@@ -17,9 +20,32 @@ const property=node=>node?.type!=='MemberExpression' || node.optional?null:
     node.computed && node.property.type==='Literal' && typeof node.property.value==='string'?node.property.value:null;
 const identifier=(node,name)=>node?.type==='Identifier' && (name===undefined || node.name===name);
 
-export function specializeEulerUpdateBase(source,{runtimeModule,maxMemoryPages=2048,maxIterations=100000000}={}) {
-  if(createHash('sha256').update(source).digest('hex')!==CORE_HASH)return {changed:false,edits:[],header:''};
-  const classes=normalClasses(source),object=classes.get('Object3D'),quaternion=classes.get('Quaternion');
+export function eulerUpdateSourceRole(source) {
+  if(typeof source!=='string')return null;
+  const blob=sourceBlob(source);
+  for(const [role,expected] of Object.entries(SOURCE_BLOBS))if(blob===expected)return role;
+  return createHash('sha256').update(source).digest('hex')===CORE_HASH?'core':null;
+}
+
+export function specializeEulerUpdateBase(source,{runtimeModule,eulerSource,quaternionSource,maxMemoryPages=2048,maxIterations=100000000}={}) {
+  const role=eulerUpdateSourceRole(source),unchanged={changed:false,edits:[],header:''};
+  if(!role)return unchanged;
+  const classes=normalClasses(source);
+  if(role==='Euler' || role==='Quaternion') {
+    const cls=classes.get(role),ctor=normalMethod(cls,'constructor');
+    const register=fresh(source,'class'),numeric=fresh(source,'numeric');
+    // The local class definition and its fresh instances are witnessed here.
+    // An Object3D module later binds its actual imports through that identity;
+    // it never probes a replaced constructor to infer compatible behavior.
+    return {changed:true,header:'import {registerEulerUpdateClass as '+register+',registerEulerUpdateNumeric as '+numeric+
+      '} from '+JSON.stringify(runtimeModule)+';\n',edits:[
+      {start:ctor.body.start+1,end:ctor.body.start+1,text:'\n'+numeric+'(this,null,'+JSON.stringify(role)+','+role+');\n'},
+      {start:cls.end,end:cls.end,text:'\n'+register+'(null,'+JSON.stringify(role)+','+role+');\n'},
+    ]};
+  }
+  if(role!=='core' && (eulerUpdateSourceRole(eulerSource)!=='Euler' || eulerUpdateSourceRole(quaternionSource)!=='Quaternion'))return unchanged;
+  const quaternionText=role==='core'?source:quaternionSource;
+  const object=classes.get('Object3D'),quaternion=(role==='core'?classes:normalClasses(quaternionText)).get('Quaternion');
   const method=normalMethod(quaternion,'setFromEuler');
   const branches=method.body.body.find(node=>node.type==='SwitchStatement').cases.filter(node=>node.test);
   const orders=branches.map(node=>node.test.value),base='offset';
@@ -34,7 +60,7 @@ export function specializeEulerUpdateBase(source,{runtimeModule,maxMemoryPages=2
       if(value.object.type==='ThisExpression' && ['_x','_y','_z','_w'].includes(property(value)))
         edits.push({start:value.start,end:value.end,text:'state['+base+'+'+(13+['_x','_y','_z','_w'].indexOf(property(value)))+']'});
     }});
-    let text=source.slice(node.start,node.end);
+    let text=quaternionText.slice(node.start,node.end);
     for(const edit of edits.sort((a,b)=>b.start-a.start))text=text.slice(0,edit.start-node.start)+edit.text+text.slice(edit.end-node.start);
     return text;
   }
@@ -50,8 +76,8 @@ export function specializeEulerUpdateBase(source,{runtimeModule,maxMemoryPages=2
   const artifact=compileNumericKernel(kernelSource,{parameterTypes:['f64[]','f64[]','f64'],generalControl:true,
     maxMemoryPages,maxIterations,sourceName:'pinned Euler.set / Object3D.onRotationChange / Quaternion.setFromEuler'});
   const token=fresh(source,'kernel'),create=fresh(source,'create_kernel'),register=fresh(source,'class');
-  const numeric=fresh(source,'numeric'),owner=fresh(source,'owner'),data=fresh(source,'data'),edits=[];
-  for(const name of ['Euler','Quaternion']) {
+  const numeric=fresh(source,'numeric'),owner=fresh(source,'owner'),data=fresh(source,'data'),bind=fresh(source,'bind'),edits=[];
+  for(const name of role==='core'?['Euler','Quaternion']:[]) {
     const cls=classes.get(name),ctor=normalMethod(cls,'constructor');
     edits.push({start:ctor.body.start+1,end:ctor.body.start+1,text:'\n'+numeric+'(this,'+token+','+JSON.stringify(name)+');\n'});
     edits.push({start:cls.end,end:cls.end,text:'\n'+register+'('+token+','+JSON.stringify(name)+','+name+');\n'});
@@ -60,11 +86,13 @@ export function specializeEulerUpdateBase(source,{runtimeModule,maxMemoryPages=2
   const userData=ctor.body.body.find(node=>node.expression?.left?.property?.name==='userData').expression.right;
   edits.push({start:userData.start,end:userData.end,text:data+'('+source.slice(userData.start,userData.end)+')'});
   edits.push({start:ctor.body.end-1,end:ctor.body.end-1,text:'\n'+owner+'(this,rotation,quaternion,onRotationChange,'+token+');\n'});
+  if(role==='Object3D')edits.push({start:object.end,end:object.end,text:'\n'+bind+'('+token+',"Euler",Euler);\n'+
+    bind+'('+token+',"Quaternion",Quaternion);\n'});
   return {changed:true,edits,header:'import {createEulerUpdateKernel as '+create+',registerEulerUpdateClass as '+register+
-    ',registerEulerUpdateNumeric as '+numeric+',registerEulerUpdateOwner as '+owner+',registerEulerUpdateData as '+data+
+    ',registerEulerUpdateNumeric as '+numeric+',registerEulerUpdateOwner as '+owner+',registerEulerUpdateData as '+data+',bindEulerUpdateClass as '+bind+
     '} from '+JSON.stringify(runtimeModule)+';\nvar '+token+'='+create+'('+JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+
     ','+JSON.stringify(orders)+','+maxMemoryPages+');\n',
-    report:{kind:'pinned-euler-kernel',sourceDerived:true,wasmBytes:artifact.wasm.length,
+    report:{kind:'pinned-euler-kernel',role,sourceDerived:true,wasmBytes:artifact.wasm.length,
       upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',retainedMath:['cos','sin'],accelerationClaim:false}};
 }
 

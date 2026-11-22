@@ -154,7 +154,7 @@ Names and source filenames do not select the implementation. Component
 `+`, `-`, `*` and `/` expressions can use different source axes. Scalar counts,
 the current child-array length, and own numeric control fields on witnessed
 literal objects are guarded at each invocation. The initial domain requires
-the pinned built core, its ordinary child arrays, three-argument `Euler.set`,
+the pinned built core or its verified source-module graph, ordinary child arrays, three-argument `Euler.set`,
 and source Euler values reached through witnessed data objects such as the
 original `Object3D.userData`.
 
@@ -178,6 +178,16 @@ loop, other variable names and expressions, all six rotation orders, identity,
 live inputs, aliases, observable guards, reentry and partial failures against
 the pinned source. It does not establish complete H1 application or hardware
 performance closure.
+
+Source imports such as `three/src/core/Object3D.js` use the same transaction.
+The compiler verifies the original Object3D, Euler and Quaternion modules and
+derives quaternion arithmetic from Object3D's resolved dependency. Each numeric
+class witnesses its own allocations; the owner binds its actual imported class
+identities without inspecting unknown constructors. Mixed output-owner families,
+changed modules or replacement dependencies retain the original loop. The source
+suite, `euler_update_source.test.mjs`, covers native execution, public identities,
+all rotation orders, mutable inputs, alias/callback fallback, bounded execution,
+and relocated production builds with and without Wasm.
 
 ### Source-shaped instance-matrix updates
 
