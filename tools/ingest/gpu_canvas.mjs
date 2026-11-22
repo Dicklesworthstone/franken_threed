@@ -138,9 +138,12 @@ export function createGpuCanvasTarget(device, canvas, options = {}) {
     let result, thrown;
     try { result = operation(); } catch (error) { thrown = error; }
     const invalid = device.popErrorScope(), oom = device.popErrorScope();
-    validation = Promise.all([validation, invalid, oom]).then(([, a, b]) => {
-      if (a || b) throw new GpuCanvasError('GPU', (a || b).message ?? 'Native canvas validation failed');
-    });
+    // A known error must stop this owner even when its sibling scope or an
+    // earlier native operation never finishes validation.
+    const checks = [invalid, oom].map(scope => Promise.resolve(scope).then(cause => {
+      if (cause) throw new GpuCanvasError('GPU', cause.message ?? 'Native canvas validation failed');
+    }));
+    validation = Promise.all([validation, ...checks]).then(() => {});
     validation.catch(stop);
     if (thrown) { stop(thrown); throw thrown; }
     return result;

@@ -439,9 +439,13 @@ export function createGpuRenderTarget(device, options = {}) {
     try { value = operation(); } catch (cause) { error = cause; }
     // Never keep a scope open over a host await on the borrowed device.
     const invalid = device.popErrorScope(), oom = device.popErrorScope();
-    validation = Promise.all([validation, invalid, oom]).then(([, a, b]) => {
+    // Check each newly completed scope before waiting for its sibling or an
+    // older operation. Either native error is already a terminal failure.
+    const checks = [invalid, oom].map(scope => Promise.resolve(scope).then(cause => {
+      if (cause) throw new GpuRenderTargetError('GPU', cause.message ?? 'Target allocation failed');
+    }));
+    validation = Promise.all([validation, ...checks]).then(() => {
       if (error) throw error;
-      if (a || b) throw new GpuRenderTargetError('GPU', (a || b).message ?? 'Target allocation failed');
     });
     validation.catch(stop);
     if (error) { stop(error); throw error; }

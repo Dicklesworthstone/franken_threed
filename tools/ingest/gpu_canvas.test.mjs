@@ -608,3 +608,65 @@ for (const sampleCount of [1, 4]) test(`combined stencil attachments charge eigh
   assert.ok(old.every(t => t.destroyed === 1)); assert.equal(t.diagnostics.attachmentBytes, cost);
   t.dispose(); assert.ok(f.textures.every(t => t.destroyed === 1));
 });
+
+for (const stalled of ['sibling', 'earlier', 'both']) for (const failedScope of [0, 1])
+test('known canvas scope ' + failedScope + ' errors stop waits blocked by ' + stalled + ' validation', async () => {
+  const f = fixture(), earlier = deferred(), sibling = deferred(), failure = deferred();
+  if (stalled === 'sibling') earlier.resolve(null);
+  if (stalled === 'earlier') sibling.resolve(null);
+  f.validation.push(earlier.promise, Promise.resolve(null));
+  const target = createGpuCanvasTarget(f.device, f.canvas);
+  target.withFrame(() => {}); target.resize(32, 16);
+  f.validation.push(...(failedScope === 0 ? [failure.promise, sibling.promise] : [sibling.promise, failure.promise]));
+  target.withFrame(() => {});
+  const owned = f.textures.slice(); let outcome, replacement;
+  const idle = target.whenIdle().then(() => { outcome = {status: 'fulfilled'}; },
+    error => { outcome = {status: 'rejected', error}; });
+  try {
+    failure.resolve({message: 'known canvas scope failure'});
+    await tick(); await tick();
+    assert.ok(outcome, 'known native errors must settle idle without waiting for unrelated scopes or queue fences');
+    assert.equal(outcome.status, 'rejected'); assert.equal(outcome.error.code, 'GPU_CANVAS_GPU');
+    assert.match(outcome.error.message, /known canvas scope failure/);
+    assert.equal(target.failed, true); assert.equal(target.diagnostics.attachmentBytes, 0);
+    assert.equal(target.diagnostics.retiredTargets, 0);
+    assert.ok(owned.every(texture => texture.destroyed === 1)); assert.equal(f.scopes.length, 0);
+    assert.equal(count(f, 'unconfigure'), 1); assert.equal(count(f, 'device-destroy'), 0);
+
+    replacement = createGpuCanvasTarget(f.device, f.canvas);
+    const fresh = f.textures.slice(owned.length);
+    target.dispose();
+    earlier.resolve({message: 'late earlier failure'}); sibling.resolve({message: 'late sibling failure'});
+    for (const fence of f.fences) fence.resolve();
+    await tick(); await tick();
+    assert.equal(count(f, 'unconfigure'), 1, 'stale validation cannot unconfigure the replacement owner');
+    assert.equal(replacement.failed, false); assert.ok(fresh.every(texture => texture.destroyed === 0));
+    assert.ok(owned.every(texture => texture.destroyed === 1), 'late completion cannot destroy retired textures again');
+    await replacement.whenIdle();
+  } finally {
+    earlier.resolve(null); sibling.resolve(null); failure.resolve(null);
+    for (const fence of f.fences) fence.resolve();
+    target.dispose(); replacement?.dispose(); await idle;
+  }
+});
+
+test('successful canvas validation still waits for both scopes and earlier operations', async () => {
+  const f = fixture(), earlier = deferred(), invalid = deferred(), oom = deferred();
+  f.validation.push(earlier.promise, Promise.resolve(null));
+  const target = createGpuCanvasTarget(f.device, f.canvas);
+  f.validation.push(invalid.promise, oom.promise); target.withFrame(() => {});
+  let completed = false;
+  const idle = target.whenIdle().then(() => { completed = true; });
+  for (const fence of f.fences) fence.resolve();
+  try {
+    invalid.resolve(null); await tick(); assert.equal(completed, false);
+    oom.resolve(null); await tick(); assert.equal(completed, false, 'an earlier operation remains part of successful validation');
+    earlier.resolve(null); await idle;
+    assert.equal(completed, true); assert.equal(target.failed, false);
+    assert.ok(f.textures.every(texture => texture.destroyed === 0));
+  } finally {
+    earlier.resolve(null); invalid.resolve(null); oom.resolve(null);
+    for (const fence of f.fences) fence.resolve();
+    await idle; target.dispose();
+  }
+});

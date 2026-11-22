@@ -222,3 +222,83 @@ test('a rejected retirement fence is terminal and does not leak either generatio
   const idle = t.whenIdle(); fence.reject(Error('queue failure'));
   await assert.rejects(idle, /queue failure/); gone(f.calls.textures);
 });
+
+for (const stalled of ['sibling', 'earlier', 'both']) for (const failedScope of [0, 1])
+test('known target scope ' + failedScope + ' errors stop waits blocked by ' + stalled + ' validation', async () => {
+  const f = fixture(), earlier = deferred(), sibling = deferred(), failure = deferred(), scopeResults = [];
+  const pop = f.device.popErrorScope;
+  f.device.popErrorScope = function () { const result = pop.call(this); return scopeResults.shift() ?? result; };
+  if (stalled === 'sibling') earlier.resolve(null);
+  if (stalled === 'earlier') sibling.resolve(null);
+  scopeResults.push(earlier.promise, Promise.resolve(null));
+  const target = make(f, {sampleCount: 4}); target.withFrame(() => {});
+  const fence = deferred(); f.controls.completion = fence;
+  scopeResults.push(...(failedScope === 0 ? [failure.promise, sibling.promise] : [sibling.promise, failure.promise]));
+  target.resize(32, 16);
+  const owned = f.calls.textures.slice(); let idleOutcome, validationOutcome, replacement;
+  const observe = (promise, publish) => promise.then(() => publish({status: 'fulfilled'}),
+    error => publish({status: 'rejected', error}));
+  const idle = observe(target.whenIdle(), result => { idleOutcome = result; });
+  const validation = observe(target.validation, result => { validationOutcome = result; });
+  try {
+    failure.resolve({message: 'known target scope failure'});
+    await new Promise(resolve => setImmediate(resolve));
+    for (const outcome of [idleOutcome, validationOutcome]) {
+      assert.ok(outcome, 'known native errors must settle idle and dependency validation before unrelated work');
+      assert.equal(outcome.status, 'rejected'); assert.equal(outcome.error.code, 'GPU_TARGET_GPU');
+      assert.match(outcome.error.message, /known target scope failure/);
+    }
+    assert.equal(target.failed, true); assert.equal(target.allocatedBytes, 0);
+    assert.equal(target.diagnostics.retiredTargets, 0); gone(owned);
+    assert.equal(f.calls.scopes.length, 0); assert.equal(f.calls.deviceDestroyed, 0);
+
+    replacement = make(f);
+    const fresh = f.calls.textures.slice(owned.length);
+    earlier.resolve({message: 'late earlier failure'}); sibling.resolve({message: 'late sibling failure'});
+    fence.resolve(); await new Promise(resolve => setImmediate(resolve));
+    gone(owned); assert.ok(fresh.every(texture => texture.destroyed === 0));
+    assert.equal(replacement.failed, false); await replacement.whenIdle();
+  } finally {
+    earlier.resolve(null); sibling.resolve(null); failure.resolve(null); fence.resolve();
+    target.dispose(); replacement?.dispose(); await idle; await validation;
+  }
+});
+
+test('successful target validation still waits for both scopes and earlier operations', async () => {
+  const f = fixture(), earlier = deferred(), invalid = deferred(), oom = deferred(), scopeResults = [earlier.promise, Promise.resolve(null)];
+  const pop = f.device.popErrorScope;
+  f.device.popErrorScope = function () { const result = pop.call(this); return scopeResults.shift() ?? result; };
+  const target = make(f); scopeResults.push(invalid.promise, oom.promise); target.resize(32, 16);
+  let completed = false;
+  const idle = target.whenIdle().then(() => { completed = true; });
+  try {
+    invalid.resolve(null); await new Promise(resolve => setImmediate(resolve)); assert.equal(completed, false);
+    oom.resolve(null); await new Promise(resolve => setImmediate(resolve)); assert.equal(completed, false);
+    earlier.resolve(null); await idle;
+    assert.equal(completed, true); assert.equal(target.failed, false);
+    assert.ok(f.calls.textures.slice(-2).every(texture => texture.destroyed === 0));
+  } finally {
+    earlier.resolve(null); invalid.resolve(null); oom.resolve(null); await idle; target.dispose();
+  }
+});
+
+test('known shared-depth validation failure stops borrowers while its sibling scope remains pending', async () => {
+  const f = fixture(), failure = deferred(), sibling = deferred(), scopeResults = [failure.promise, sibling.promise];
+  const pop = f.device.popErrorScope;
+  f.device.popErrorScope = function () { const result = pop.call(this); return scopeResults.shift() ?? result; };
+  const source = make(f, {sampleDepth: true}), borrower = make(f, {sampleDepth: true, depthSource: source});
+  let outcome;
+  const idle = borrower.whenIdle().then(() => { outcome = {status: 'fulfilled'}; },
+    error => { outcome = {status: 'rejected', error}; });
+  try {
+    failure.resolve({message: 'shared depth validation failed'});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(outcome, 'borrower must fail when its shared depth allocation is known invalid');
+    assert.equal(outcome.status, 'rejected'); assert.equal(outcome.error.code, 'GPU_TARGET_GPU');
+    assert.equal(source.failed, true); assert.equal(borrower.failed, true); gone(f.calls.textures);
+    sibling.resolve({message: 'late shared depth failure'});
+    await new Promise(resolve => setImmediate(resolve)); gone(f.calls.textures);
+  } finally {
+    failure.resolve(null); sibling.resolve(null); source.dispose(); borrower.dispose(); await idle;
+  }
+});
