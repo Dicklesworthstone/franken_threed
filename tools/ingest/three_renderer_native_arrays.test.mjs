@@ -326,3 +326,90 @@ test('array view retention respects every ordinary source framebuffer-copy disca
   assert.ok(resumed.every(pass => pass.desc.colorAttachments[0].storeOp === 'store' &&
     pass.desc.depthStencilAttachment.depthStoreOp === 'store' && pass.desc.depthStencilAttachment.stencilStoreOp === 'store'));
 });
+
+for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ArrayCamera extensions preserve queued camera and material histories across view counts`, async t => {
+  const f = fixture(t), setups = [], keys = [];
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      setups.push(builder.camera.cameras.length);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'QueuedArrayExtension'; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'QueuedArrayExtension');
+  const material = new (registered ? Application : Extension)();
+  material.applicationGain = .375;
+  const key = material.customProgramCacheKey;
+  material.customProgramCacheKey = function() { keys.push('key'); return key.call(this) + ':array'; };
+  f.mesh('queued extension', material).frustumCulled = false;
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera);
+  const first = f.renderer._pending[0].camera.cameras.flatMap(child => child.projectionMatrix.elements);
+  f.camera.cameras[0].fov = 35; f.camera.cameras[0].updateProjectionMatrix();
+  f.camera.cameras[0].position.z = 9; f.camera.cameras[0].updateMatrixWorld();
+  f.camera.cameras[0].viewport.set(2, 3, 25, 30); f.camera.cameras[1].layers.set(7);
+  material.applicationGain = .875; f.renderer.render(f.scene, f.camera);
+  const second = f.renderer._pending[1].camera.cameras.flatMap(child => child.projectionMatrix.elements);
+  const replacement = new T.ArrayCamera(f.camera.cameras.map(child => child.clone()));
+  replacement.cameras[0].layers.set(7); replacement.cameras[1].layers.set(0);
+  replacement.cameras[1].fov = 25; replacement.cameras[1].updateProjectionMatrix();
+  replacement.cameras[1].viewport = new T.Vector4(9, 8, 19, 18);
+  material.applicationGain = .625; f.renderer.render(f.scene, replacement);
+  assert.deepEqual(setups, [2], 'same-count camera identity switches reuse source construction');
+  assert.equal(keys.length, 1);
+  replacement.cameras = [replacement.cameras[1]];
+  material.applicationGain = .5; f.renderer.render(f.scene, replacement);
+  const single = f.renderer._pending[3].camera.cameras.flatMap(child => child.projectionMatrix.elements);
+  replacement.cameras = []; replacement.position.z = 4;
+  material.applicationGain = .25; f.renderer.render(f.scene, replacement);
+  assert.deepEqual(setups, [2, 1, 0]);
+  for (const child of f.camera.cameras) { child.projectionMatrix.elements.fill(99); child.viewport.set(0, 0, 0, 0); }
+  material.applicationGain = 0; material.dispose();
+  await drain(f.renderer);
+  const submitted = native(f.device), views = arrayDraws(f.device);
+  assert.equal(submitted.length, 6); assert.deepEqual(indices(f.device), [0, 1, 0, 1, 0]);
+  assert.equal(new Set(submitted.map(draw => draw.pipeline)).size, 3);
+  assert.deepEqual(views.map(draw => [...block(draw, 'cameraProjectionMatrices')]),
+    [first, first, second, second, single].map(value => [...new Float32Array(value)]));
+  assert.deepEqual(viewports(f.device).slice(0, 5),
+    [[0, 0, 30, 40, 0, 1], [30, 0, 30, 40, 0, 1], [2, 3, 25, 30, 0, 1],
+      [9, 8, 19, 18, 0, 1], [9, 8, 19, 18, 0, 1]]);
+  for (const [index, gain] of [.375, .375, .875, .625, .5, .25].entries())
+    assert.ok([...block(submitted[index], 'object')].includes(gain), 'submitted custom material bytes retain their accepted value');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ArrayCamera extensions retain source side order and parent node callbacks`, async t => {
+  const f = fixture(t), counts = {frame: 0, render: 0, object: 0, after: 0, beforeHook: 0, afterHook: 0}, cameras = [];
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(this.applicationColor), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial {
+    constructor() { super(); this.type = 'SideArrayExtension'; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'SideArrayExtension');
+  const material = new (registered ? Application : Extension)();
+  Object.assign(material, {transparent: true, opacity: .5, side: T.DoubleSide, forceSinglePass: false});
+  const value = N.uniform(.25).onObjectUpdate(frame => { cameras.push(frame.camera); counts.object++; return .25; });
+  value.updateAfterType = 'object'; value.updateAfter = frame => { cameras.push(frame.camera); counts.after++; };
+  material.applicationColor = N.vec3(value,
+    N.uniform(.5).onFrameUpdate(() => { counts.frame++; return .5; }),
+    N.uniform(.75).onRenderUpdate(() => { counts.render++; return .75; }));
+  const object = f.mesh('transparent extension', material);
+  object.onBeforeRender = (_r, _s, camera) => { cameras.push(camera); counts.beforeHook++; };
+  object.onAfterRender = (_r, _s, camera) => { cameras.push(camera); counts.afterHook++; };
+  const reference = object.clone(); reference.onBeforeRender = reference.onAfterRender = T.Object3D.prototype.onBeforeRender;
+  const expected = sourceOrder(reference, f.scene, f.camera);
+  await f.renderer.init(); f.renderer.render(f.scene, f.camera); await drain(f.renderer);
+  assert.deepEqual(indices(f.device), expected.map(item => item.index));
+  assert.deepEqual(native(f.device).map(draw => draw.pipeline.primitive.frontFace), expected.map(item => item.side === T.BackSide ? 'cw' : 'ccw'));
+  assert.deepEqual(viewports(f.device), expected.map(item => item.viewport));
+  assert.deepEqual(counts, {frame: 1, render: 1, object: 2, after: 2, beforeHook: 1, afterHook: 1});
+  assert.ok(cameras.every(camera => camera === f.camera));
+  assert.equal(f.renderer.info.render.drawCalls, 4); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

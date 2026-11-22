@@ -1642,7 +1642,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
           attribute.isStorageInstancedBufferAttribute ||
           attribute.isStorageBufferAttribute && !geometrySetup && !ordinaryGeometryExtension && !primitiveExtension) ||
         !extension && context.scene?.environment || context.scene?.environmentNode || !extension && context.scene?.fog || context.scene?.fogNode ||
-        context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
+        !extension && context.camera?.isArrayCamera || context.lightsNode || !extension && (context.lights?.length || lights.length ||
           context.lightingEnabled === false || renderer.lighting?.enabled === false) || rendererContextSignature !== null ||
         context.clippingContext?.unionPlanes?.length || context.clippingContext?.intersectionPlanes?.length ||
         !extension && ((context.colorAttachmentCount ?? 1) !== 1 || renderer.getMRT?.() != null) ||
@@ -1684,7 +1684,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
       if (fogNode) values.push(fogNode.getCacheKey());
       callKey.key = hashArray(values);
     }
-    const dynamic = hash(object.receiveShadow ? hash(callKey.key, 1) : callKey.key,
+    // RenderObject folds the view count into its dynamic key before shadow
+    // and renderer context state, retaining the source's camera reuse rules.
+    const cameraKey = context.camera?.isArrayCamera
+      ? hash(callKey.key, context.camera.cameras.length) : callKey.key;
+    const dynamic = hash(object.receiveShadow ? hash(cameraKey, 1) : cameraKey,
       renderer.contextNode.id, renderer.contextNode.version);
     return {contextId, dynamic, chain, lightsNode, geometrySetup, namedGeometry, materialProfile: !!extension};
   }

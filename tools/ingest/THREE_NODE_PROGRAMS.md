@@ -46,6 +46,10 @@ Authored scene fog/environment nodes, material lighting/context
 and geometry nodes remain outside this material-extension profile. Existing
 built-in material profiles retain their broader supported features.
 
+Inherited and registered materials and ordinary materials with custom program keys
+also compose with the native `ArrayCamera` route described below. They reuse the
+source builder by view count and preserve per-object bindings and queued packets.
+
 Inherited and registered node materials can write multiple render targets through
 `renderer.setMRT()`, a material's `mrtNode`, or authored typed `outputStruct`
 graphs. They reuse the existing attachment, integer-output, queue and readback
@@ -2093,6 +2097,30 @@ parent-camera fallback; a nonempty array with no matching child still runs its
 source node lifecycle without submitting a geometry draw. View-count changes
 construct a new uniform layout without invalidating earlier accepted packets.
 
+Inherited and registered Basic, Standard and Physical materials, and ordinary
+materials with custom program keys, use the same view owner. Shared construction
+follows the source dynamic key: view count precedes shadow and renderer-context
+state. Replacing a camera or its children at the same count retains the source
+builder and its construction-time matrix references; the selected child's live
+layers and viewport still govern its draw. Sequential two-, one- and zero-view
+transitions reconstruct source layouts, while disposing one object preserves a
+same-count builder retained by another.
+
+Concurrent retained builders with differing view counts remain outside this
+native profile. The pinned camera nodes share array backing, so building a new
+count can change the backing extent exposed by an older shared builder. The
+existing layout guard rejects that stale native capture before node callbacks
+and preserves already accepted packets. Custom or lazy geometry setup retains
+its separate admission boundary.
+
+The extension and native-array suites pass 287 test bodies using the actual
+production modules, exact-pinned builders and recording device in an in-memory
+V8 adapter. Fourteen new source/native cases fail against the earlier admission
+guard. Independent builder namespaces verify shader strings, packed bytes,
+key/setup boundaries and source matrix-reference reuse; submitted-command cases
+cover queued cameras, custom material values, disposal and side/callback order.
+This validation does not establish a Node test-runner or browser pixel result.
+
 The same route supports native `PassNode` scene output, ordinary/native mixed
 lists, and native instanced sprites. Framebuffer copy effects remain before or
 after the complete group of child views belonging to their source draw. Native
@@ -2482,8 +2510,8 @@ The callback must keep its admitted shared construction profile and cannot
 replace its selected geometry. Authored color/output graphs and existing
 material maps can be selected by the callback before source construction.
 Custom material lighting/context and geometry combinations, authored scene fog
-or environment nodes, clipping, ArrayCamera and multiview retain the
-shared owner's existing admission boundaries. Accessor-backed key properties
+or environment nodes, clipping and multiview retain the shared owner's existing
+admission boundaries. ArrayCamera follows the shared view-count profile above. Accessor-backed key properties
 are not admitted. A callback that leaves this domain keeps its JavaScript
 effects and fails before publishing a new GPU descriptor.
 

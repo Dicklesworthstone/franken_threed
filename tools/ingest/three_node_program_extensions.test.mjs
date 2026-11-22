@@ -36,7 +36,7 @@ function fixture(t, options = {}, Three = T) {
     renderId: renderer.info.calls, frameId: renderer.info.calls, ...options});
   const compile = (item, options) => programs.compile(item.material, item.object, context(item, options));
   const capture = (item, descriptor = compile(item), options) => programs.captureDraw(descriptor, context(item, options));
-  const referenceObject = (item, options = {}) => source.get(item.object, item.material, scene, camera, lights, renderContext, null, options.passId);
+  const referenceObject = (item, options = {}) => source.get(item.object, item.material, scene, options.camera ?? camera, lights, renderContext, null, options.passId);
   const reference = (item, options) => referenceObject(item, options).getNodeBuilderState();
   const referenceDraw = (item, options = {}) => {
     const object = referenceObject(item, options);
@@ -2268,5 +2268,183 @@ test('custom wireframes keep unsupported named attribute and geometry setup prof
   geometryMaterial.customProgramCacheKey = () => { effects++; return 'geometry'; };
   const customGeometry = f.add(geometryMaterial);
   assert.throws(() => f.compile(customGeometry), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
+});
+
+function extensionArrayCamera(Three, count, shift = 0) {
+  const camera = new Three.ArrayCamera(Array.from({length: count}, (_, index) => {
+    const child = new Three.PerspectiveCamera(50 + index * 10 + shift, .75, .1, 30);
+    child.position.set(index * 2 - 1 + shift / 10, 0, 4); child.lookAt(0, 0, 0);
+    child.coordinateSystem = Three.WebGPUCoordinateSystem;
+    child.updateProjectionMatrix(); child.updateMatrixWorld();
+    child.viewport = new Three.Vector4(index * 30, 0, 30, 40);
+    return child;
+  }));
+  camera.position.z = 4; camera.coordinateSystem = Three.WebGPUCoordinateSystem;
+  camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+  return camera;
+}
+
+function arrayReferenceUniforms(f, item, camera, descriptor, packet) {
+  const groups = f.referenceObject(item, {camera}).getBindings();
+  for (const layout of descriptor.groups) for (const member of layout.uniforms) {
+    const binding = groups[layout.index].bindings[member.binding]; binding.update();
+    const value = binding.buffer;
+    assert.equal(value.byteLength, member.byteLength, 'source and native array bindings have the same extent');
+    assert.deepEqual(packet.uniforms[layout.index].subarray(member.offset, member.offset + value.byteLength),
+      new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  }
+}
+
+for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical']) for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} ArrayCamera extensions retain source shared view-count construction`, t => {
+  const make = Three => {
+    const f = fixture(t, {}, Three), N = Three.TSL, trace = [];
+    class Extension extends Three[family + 'NodeMaterial'] {
+      constructor() { super(); this.applicationGain = .375; }
+      customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':application'; }
+      setupOutput(builder, output) {
+        trace.push(['setup', builder.object.name, builder.context.material === builder.material, builder.camera.cameras.length]);
+        return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+      }
+    }
+    class Application extends Three[family + 'Material'] {
+      constructor() { super(); this.type = 'ArrayCameraExtension'; this.applicationGain = .375; }
+      customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':application'; }
+    }
+    if (registered) f.renderer.library.addMaterial(Extension, 'ArrayCameraExtension');
+    const material = new (registered ? Application : Extension)(), items = [f.add(material), f.add(material)];
+    for (const [index, item] of items.entries()) { item.object.name = ['a', 'b'][index]; item.object.position.x = [2, 11][index]; }
+    f.scene.updateMatrixWorld();
+    return {f, material, items, trace, camera: extensionArrayCamera(Three, 2)};
+  };
+  // Source-module and bundled builders have independent Camera.js nodes.
+  // Sharing their global UniformArrays would hide cross-construction mistakes.
+  const candidate = make(T), oracle = make(SourceThree);
+  const compare = index => {
+    const expected = oracle.f.reference(oracle.items[index], {camera: oracle.camera});
+    const descriptor = candidate.f.compile(candidate.items[index], {camera: candidate.camera});
+    assert.deepEqual(candidate.trace.splice(0), oracle.trace.splice(0), 'application key and setup boundaries match the source');
+    equalShaders(descriptor, expected);
+    oracle.f.referenceDraw(oracle.items[index], {camera: oracle.camera, fullLifecycle: true});
+    const packet = candidate.f.capture(candidate.items[index], descriptor, {camera: candidate.camera});
+    arrayReferenceUniforms(oracle.f, oracle.items[index], oracle.camera, descriptor, packet);
+    return {reference: expected, descriptor, packet};
+  };
+  const first = [compare(0), compare(1)], accepted = first.map(value => value.packet.uniforms.map(bytes => bytes.slice()));
+  assert.equal(first[0].reference, first[1].reference);
+  assert.notEqual(first[0].descriptor, first[1].descriptor);
+  assert.ok(first.every(value => value.descriptor.cameraIndex && values(value.packet).includes(.375)));
+  const projection = () => oracle.f.referenceObject(oracle.items[0], {camera: oracle.camera}).getBindings()
+    .flatMap(group => group.bindings).find(binding => binding.nodeUniform?.name === 'cameraProjectionMatrices').buffer.slice();
+  const originalProjection = projection(), originalCameras = [candidate.camera, oracle.camera];
+  candidate.camera = extensionArrayCamera(T, 2, 20); oracle.camera = extensionArrayCamera(SourceThree, 2, 20);
+  candidate.material.applicationGain = oracle.material.applicationGain = .875;
+  candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+  for (let index = 0; index < 2; index++) {
+    const same = compare(index);
+    assert.equal(same.reference, first[index].reference);
+    assert.equal(same.descriptor, first[index].descriptor);
+    assert.ok(values(same.packet).includes(.875));
+  }
+  assert.deepEqual(projection(), originalProjection, 'same-count camera replacement retains the source construction-time matrix references');
+  for (const camera of originalCameras) { camera.cameras[0].fov += 5; camera.cameras[0].updateProjectionMatrix(); }
+  candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+  compare(0); assert.notDeepEqual(projection(), originalProjection, 'retained source matrix objects remain live');
+  candidate.material.needsUpdate = oracle.material.needsUpdate = true;
+  candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+  assert.equal(compare(0).descriptor, first[0].descriptor);
+  assert.equal(compare(1).descriptor, first[1].descriptor);
+  let previous = first;
+  for (const count of [1, 0, 2]) {
+    candidate.camera = extensionArrayCamera(T, count); oracle.camera = extensionArrayCamera(SourceThree, count);
+    candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+    const next = [compare(0), compare(1)];
+    assert.notEqual(next[0].reference, previous[0].reference);
+    assert.notEqual(next[0].descriptor, previous[0].descriptor);
+    assert.equal(next[0].reference, next[1].reference);
+    assert.equal(next[0].descriptor.cameraIndex !== null, count !== 0);
+    previous = next;
+  }
+  candidate.items[0].object.dispatchEvent({type: 'dispose'});
+  oracle.items[0].object.dispatchEvent({type: 'dispose'});
+  candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+  const rebuilt = compare(0);
+  assert.notEqual(rebuilt.descriptor, previous[0].descriptor);
+  assert.equal(rebuilt.reference, previous[1].reference, 'a surviving same-count object retains the shared source builder');
+  assert.equal(compare(1).descriptor, previous[1].descriptor);
+  candidate.material.dispose(); oracle.material.dispose();
+  assert.equal(candidate.f.programs.diagnostics.programs, 0);
+  assert.deepEqual(first.map(value => value.packet.uniforms), accepted, 'later construction never changes accepted camera or material bytes');
+});
+
+for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical'])
+test(`ordinary ${family} custom program keys compose with ArrayCamera view counts without authored slots`, t => {
+  const f = fixture(t), material = new T[family + 'Material'](), trace = [];
+  const key = material.customProgramCacheKey;
+  material.customProgramCacheKey = function() { trace.push('key'); return key.call(this) + ':views'; };
+  const item = f.add(material);
+  let previous;
+  for (const count of [2, 1, 0]) {
+    const camera = extensionArrayCamera(T, count);
+    const reference = f.reference(item, {camera}), expected = trace.splice(0);
+    const descriptor = f.compile(item, {camera});
+    assert.deepEqual(trace.splice(0), expected); equalShaders(descriptor, reference);
+    f.capture(item, descriptor, {camera});
+    assert.equal(descriptor.cameraIndex !== null, count !== 0);
+    assert.notEqual(descriptor, previous); previous = descriptor;
+    f.renderer.info.calls++;
+  }
+  assert.equal(material.colorNode, undefined);
+});
+
+test('ArrayCamera extensions preserve stale-layout rejection for mixed retained view counts', t => {
+  const make = Three => {
+    const f = fixture(t, {}, Three), updates = [];
+    class Extension extends Three.MeshBasicNodeMaterial {
+      constructor() {
+        super();
+        this.applicationGain = Three.TSL.uniform(.375).onObjectUpdate(frame => { updates.push(frame.object); return .375; });
+      }
+      setupOutput(builder, output) {
+        return super.setupOutput(builder, Three.TSL.vec4(output.rgb.mul(this.applicationGain), output.a));
+      }
+    }
+    const material = new Extension();
+    return {f, updates, items: [f.add(material), f.add(material)], two: extensionArrayCamera(Three, 2), one: extensionArrayCamera(Three, 1)};
+  };
+  const candidate = make(T), oracle = make(SourceThree);
+  const first = candidate.f.compile(candidate.items[0], {camera: candidate.two});
+  const survivor = candidate.f.compile(candidate.items[1], {camera: candidate.two});
+  const packet = candidate.f.capture(candidate.items[1], survivor, {camera: candidate.two}), saved = packet.uniforms.map(bytes => bytes.slice());
+  const sourceFirst = oracle.f.reference(oracle.items[0], {camera: oracle.two});
+  assert.equal(oracle.f.reference(oracle.items[1], {camera: oracle.two}), sourceFirst);
+  oracle.f.referenceDraw(oracle.items[1], {camera: oracle.two});
+  const sourceBinding = () => oracle.f.referenceObject(oracle.items[1], {camera: oracle.two}).getBindings()
+    .flatMap(group => group.bindings).find(binding => binding.nodeUniform?.name === 'cameraProjectionMatrices');
+  assert.equal(sourceBinding().buffer.byteLength, 128);
+  candidate.f.renderer.info.calls++; oracle.f.renderer.info.calls++;
+  const resized = candidate.f.compile(candidate.items[0], {camera: candidate.one});
+  assert.notEqual(resized, first); candidate.f.capture(candidate.items[0], resized, {camera: candidate.one});
+  oracle.f.reference(oracle.items[0], {camera: oracle.one});
+  assert.equal(oracle.f.reference(oracle.items[1], {camera: oracle.two}), sourceFirst);
+  assert.equal(sourceBinding().buffer.byteLength, 64, 'the source global camera array resized under its retained two-view builder');
+  const updates = candidate.updates.length;
+  assert.equal(candidate.f.compile(candidate.items[1], {camera: candidate.two}), survivor);
+  assert.throws(() => candidate.f.capture(candidate.items[1], survivor, {camera: candidate.two}), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(candidate.updates.length, updates, 'stale layouts fail before observable node callbacks');
+  assert.deepEqual(packet.uniforms, saved);
+});
+
+test('ArrayCamera keeps custom and lazy geometry setup outside material-extension admission', t => {
+  const f = fixture(t), camera = extensionArrayCamera(T, 2); let effects = 0;
+  for (const lazy of [false, true]) {
+    const material = new T.MeshBasicNodeMaterial();
+    material.geometryNode = lazy ? N.Fn(() => { effects++; }) : N.Fn(() => {})().compute(1);
+    if (!lazy) material.geometryNode.setup = builder => { effects++; return builder; };
+    material.customProgramCacheKey = () => { effects++; return 'geometry'; };
+    const item = f.add(material);
+    assert.throws(() => f.compile(item, {camera}), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  }
   assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
 });
