@@ -1,4 +1,4 @@
-/** One source-derived numeric transaction for a pinned Object3D descendant loop. */
+/** Source-derived numeric transactions for a pinned Object3D descendant loop. */
 import {createHash} from 'node:crypto';
 import * as walk from 'acorn-walk';
 import {sourceBlob} from './marching_cubes_specialization.mjs';
@@ -152,7 +152,8 @@ export function specializeTransformBatch(source,{runtimeModule,matrixSource,maxM
     maxMemoryPages,maxIterations,sourceName:'pinned Object3D.updateMatrixWorld subtree batch'});
   const token=fresh(source,'token'),create=fresh(source,'create');
   const objectAllocation=fresh(source,'object'),arrayAllocation=fresh(source,'children');
-  const attempt=fresh(source,'try_batch');
+  const attempt=fresh(source,'try_batch'),span=fresh(source,'try_span');
+  const enabled=fresh(source,'spans_enabled'),consumed=fresh(source,'consumed');
   const initialize=token+'='+create+'('+JSON.stringify(Buffer.from(artifact.wasm).toString('base64'))+','+
     TRANSFORM_BATCH_STRIDE+','+maxMemoryPages+(role==='Object3D'?',Matrix4':'')+');\n';
   for(const name of role==='core'?nodeClasses:['Object3D']) {
@@ -168,13 +169,22 @@ export function specializeTransformBatch(source,{runtimeModule,matrixSource,maxM
     const body=normalMethod(classes.get(name),'constructor').body;
     edits.push({start:body.start+1,end:body.start+1,text:'\n'+numericAllocation+'(this);\n'});
   }
-  edits.push({start:loop.start,end:loop.end,text:'if (!'+attempt+'(this,children,force,'+token+')) {\n'+source.slice(loop.start,loop.end)+'\n}'});
-  edits.push({start:selectiveLoop.start,end:selectiveLoop.end,text:'if (!'+attempt+'(this,children,force,'+token+',"updateWorldMatrix")) {\n'+
-    source.slice(selectiveLoop.start,selectiveLoop.end)+'\n}'});
+  function segmentedLoop(loop,methodName){
+    const [index,length]=loop.init.declarations.map(value=>value.id.name);
+    // Retain the source's loop header, including its once-captured child count.
+    // A committed span advances only this loop's index. The original child
+    // expression and call remain the sole effectful fallback, at the same index.
+    const prefix='if ('+enabled+') {const '+consumed+'='+span+'(this,children,force,'+token+','+JSON.stringify(methodName)+','+index+','+length+');'+
+      'if ('+consumed+'<0) '+enabled+'=false;else if ('+consumed+'>0) {'+index+'+='+consumed+'-1;continue;}}\n';
+    return 'if (!'+attempt+'(this,children,force,'+token+','+JSON.stringify(methodName)+')) {let '+enabled+'=true;\n'+
+      source.slice(loop.start,loop.body.start+1)+prefix+source.slice(loop.body.start+1,loop.end)+'\n}';
+  }
+  edits.push({start:loop.start,end:loop.end,text:segmentedLoop(loop,'updateMatrixWorld')});
+  edits.push({start:selectiveLoop.start,end:selectiveLoop.end,text:segmentedLoop(selectiveLoop,'updateWorldMatrix')});
   return {changed:true,edits,tail:'',header:
     'import {createTransformBatchDispatch as '+create+',registerTransformBatchClass as '+register+
     ',registerTransformObject as '+objectAllocation+',registerTransformNumeric as '+numericAllocation+
-    ',registerTransformChildren as '+arrayAllocation+',tryTransformBatch as '+attempt+'} from '+JSON.stringify(runtimeModule)+';\n'+
+    ',registerTransformChildren as '+arrayAllocation+',tryTransformBatch as '+attempt+',tryTransformBatchSpan as '+span+'} from '+JSON.stringify(runtimeModule)+';\n'+
     'var '+(role==='core'?initialize:token+';\n'),
     report:{upstreamCommit:'148ef33ecb6d2502ff796d4554abd1549c95d519',sourceDerived:true,scope:'guarded-ordinary-subtrees',
       role,compiledMethods:['Object3D.updateMatrixWorld','Object3D.updateWorldMatrix'],wasmBytes:artifact.wasm.length,accelerationClaim:false}};

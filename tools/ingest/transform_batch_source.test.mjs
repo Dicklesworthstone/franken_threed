@@ -17,7 +17,8 @@ const paths={Object3D:'core/Object3D',Group:'objects/Group',Scene:'scenes/Scene'
   Light:'lights/Light',AmbientLight:'lights/AmbientLight',DirectionalLight:'lights/DirectionalLight',
   HemisphereLight:'lights/HemisphereLight',LightProbe:'lights/LightProbe',PointLight:'lights/PointLight',
   RectAreaLight:'lights/RectAreaLight',SpotLight:'lights/SpotLight',Line:'objects/Line',LineLoop:'objects/LineLoop',
-  LineSegments:'objects/LineSegments',Points:'objects/Points',Sprite:'objects/Sprite',LOD:'objects/LOD'};
+  LineSegments:'objects/LineSegments',Points:'objects/Points',Sprite:'objects/Sprite',LOD:'objects/LOD',
+  Camera:'cameras/Camera',SkinnedMesh:'objects/SkinnedMesh'};
 async function fixture(options={},changedMatrix=false,withCore=false,production=false) {
   const entry='\0source-world-transform',plugin=marchingCubesRollupPlugin(options),reports=[];
   // Isolate the two production transforms here; application tests exercise the
@@ -141,7 +142,8 @@ test('source and built-core classes keep distinct identities and never borrow an
   foreign.position.set(7,8,9);expectedForeign.position.set(7,8,9);
   actual.add(foreign);expected.add(expectedForeign);
   actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
-  assert.equal(api.diagnostics(actual).wasmCalls,0);
+  assert.equal(api.diagnostics(actual).wasmCalls,1,'Own-family subtrees batch before the foreign-family barrier');
+  assert.equal(api.diagnostics(actual).objects,5);
   assert.equal(api.diagnostics(actual).lastFailure,'TRANSFORM_BATCH_GUARD');
   const core=new api.CoreGroup();core.add(new api.CoreObject3D(),new api.CoreObject3D());core.updateMatrixWorld();
   assert.equal(api.diagnostics(core).wasmCalls,1,'Each module family retains its own valid transaction');
@@ -161,7 +163,27 @@ test('source overrides, getters and partial failures run once at their original 
       else update(root,method);
     }
     same(actual,expected);assert.deepEqual(traces[0],traces[1]);assert.deepEqual(traces[0],['owner','method','child']);
-    assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.equal(api.diagnostics(actual).wasmCalls,1,'The preceding complete subtree is materialized before the getter');
+    assert.equal(api.diagnostics(actual).objects,3);
+  }
+});
+
+test('source module spans preserve camera and skin barriers between ordinary objects',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const kind of ['Camera','SkinnedMesh']){
+    const make=library=>{
+      const root=new library.Scene(),barrier=new library[kind]();
+      for(let i=0;i<9;i++){
+        const child=i===4?barrier:new library.Object3D();
+        child.position.set(i/3,-i/5,1);child.scale.set(1.5,2,0.7);root.add(child);
+      }
+      return {root,barrier};
+    };
+    const actual=make(api),expected=make(reference);
+    update(actual.root,method);update(expected.root,method);same(actual.root,expected.root);
+    const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
+    assert.deepEqual(actual.barrier[field].elements,expected.barrier[field].elements);
+    assert.deepEqual(api.diagnostics(actual.root),{wasmCalls:2,objects:8,fallbackCalls:1,lastFailure:null});
   }
 });
 

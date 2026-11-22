@@ -1,6 +1,6 @@
-/** A copying bulk baseline for source-pinned ordinary subtrees. All public Euler
- * callbacks and owner update effects stay in their original source positions.
- * Each call rebuilds guarded DFS order; this is not a persistent dirty plan. */
+/** Copying batches of source-pinned ordinary subtrees. Observable child updates
+ * separate transactions: publish the preceding span, run its original source
+ * operation, then guard the following span again. This is not a dirty plan. */
 import {instantiateNumericKernel} from './numeric_kernel_runtime.mjs';
 import {matrixNumericElements,matrixNumericPlatformIntact} from './matrix_multiply_adapter.mjs';
 const host=globalThis,apply=Reflect.apply,descriptor=Object.getOwnPropertyDescriptor,prototype=Object.getPrototypeOf;
@@ -68,37 +68,47 @@ function vector(object,keys,state,offset,seen){
   }
   return true;
 }
-function hierarchy(record,owner,children,methodName){
+function hierarchy(record,owner,children,methodName,start,end,partial,prepare){
   const entries=[],nodes=new S(),objectClass=record.classes.Object3D;
-  const count=data(children,'length');
-  if(!objectClass || count===0 || count>record.maxRows)return null;
+  if(!objectClass || start>=end || (!partial && end-start>record.maxRows))return null;
   apply(setAdd,nodes,[owner]);
-  const stack=[{owner,children,count,index:0,parent:-1}];
+  const stack=[{owner,children,count:end,index:start,parent:-1}];
+  let root=start,checkpoint=0;
+  const stop=()=>{
+    if(!partial)return null;
+    // A subtree is indivisible here. Its owner must run before any descendant
+    // callback, so none of a rejected root's rows may enter the preceding span.
+    entries.length=checkpoint;
+    return {entries,end:root};
+  };
   while(stack.length){
     const frame=stack[stack.length-1];
     if(frame.index===frame.count){stack.length--;continue;}
+    if(frame.parent<0){root=frame.index;checkpoint=entries.length;}
     const child=own(frame.children,frame.index++)?.value;
     if(entries.length>=record.maxRows || !apply(weakHas,objects,[child]) ||
-      apply(setHas,nodes,[child]) || data(child,'parent')!==frame.owner)return null;
+      apply(setHas,nodes,[child]) || data(child,'parent')!==frame.owner)return stop();
     apply(setAdd,nodes,[child]);
-    if(!method(child,methodName,objectClass[methodName],nodeKinds))return null;
+    if(!method(child,methodName,objectClass[methodName],nodeKinds))return stop();
     const descendants=data(child,'children');
-    if(!apply(weakHas,arrays,[descendants]))return null;
+    if(!apply(weakHas,arrays,[descendants]))return stop();
     const row=entries.length,descendantCount=data(descendants,'length');
     entries[row]={child,parent:frame.parent};
+    if(prepare && !prepare(entries[row],row,entries))return stop();
     // Source traversal is pre-order, with each child's local force inherited
     // from its own parent. A DFS stack bounds depth without native recursion.
     if(descendantCount)stack[stack.length]={owner:child,children:descendants,count:descendantCount,index:0,parent:row};
   }
-  return entries.length>=2?entries:null;
+  return {entries,end};
 }
-function input(record,owner,children,force,methodName){
-  if(!apply(weakHas,arrays,[children]) || data(owner,'children')!==children ||
+function input(record,owner,children,force,methodName,start,end,partial){
+  if(!apply(weakHas,arrays,[children]) || (!partial && data(owner,'children')!==children) ||
     (force!==undefined && typeof force!=='boolean'))return null;
+  // Segments use the source loop's captured array and length, even if a prior
+  // callback replaced owner.children, appended children, or shortened the array.
+  if(end===undefined)end=data(children,'length');
   const objectClass=record.classes.Object3D,matrixClass=record.classes.Matrix4;
-  const entries=hierarchy(record,owner,children,methodName);
-  if(!entries || !matrixClass)return null;
-  const count=entries.length;
+  if(!matrixClass)return null;
   const parent=matrixNumericElements(data(owner,'matrixWorld'),false),local=matrixNumericElements(data(owner,'matrix'),false);
   if(!parent || !local || parent===local)return null;
   const references=new S();
@@ -106,10 +116,14 @@ function input(record,owner,children,force,methodName){
   for(let i=0;i<fields.length;i++){
     const d=own(owner,fields[i]);if(!d)return null;apply(setAdd,references,[d.value]);
   }
-  const state=new F64(count*record.stride),parentState=new F64(16);
+  // Partial traversal validates numeric state as it discovers each node. A
+  // rejected first child must not rescan the entire suffix on every iteration.
+  // Full transactions retain their single, exactly sized typed allocation.
+  let state=partial?[]:null;
+  const parentState=new F64(16);
   for(let i=0;i<16;i++)parentState[i]=parent[i];
-  for(let i=0;i<count;i++){
-    const entry=entries[i],child=entry.child;
+  function prepare(entry,i,entries){
+    const child=entry.child;
     const automatic=data(child,'matrixAutoUpdate'),worldAutomatic=data(child,'matrixWorldAutoUpdate'),dirty=own(child,'matrixWorldNeedsUpdate');
     if(typeof automatic!=='boolean' || typeof worldAutomatic!=='boolean' || !dirty || typeof dirty.value!=='boolean')return null;
     const inheritedForce=entry.parent<0?force===true:entries[entry.parent].dirtyWrite;
@@ -124,6 +138,7 @@ function input(record,owner,children,force,methodName){
     if(worldWrite && !method(world,'multiplyMatrices',matrixClass.multiplyMatrices,matrixKinds))return null;
     apply(setAdd,references,[elements]);apply(setAdd,references,[worldElements]);
     const offset=i*record.stride;
+    if(partial)for(let j=0;j<record.stride;j++)state[offset+j]=0;
     state[offset]=automatic?1:0;state[offset+1]=worldAutomatic?1:0;state[offset+2]=dirty.value?1:0;
     state[offset+45]=entry.parent;
     if(automatic){
@@ -145,8 +160,19 @@ function input(record,owner,children,force,methodName){
     for(let j=0;j<16;j++){state[offset+13+j]=elements[j];state[offset+29+j]=worldElements[j];}
     entry.elements=elements;entry.worldElements=worldElements;entry.localWrite=automatic;
     entry.worldWrite=worldWrite;entry.dirtyWrite=update;entry.offset=offset;
+    return true;
   }
-  return {state,parent:parentState,entries,count,force:force===true?1:0};
+  const tree=hierarchy(record,owner,children,methodName,start,end,partial,partial?prepare:null);
+  if(!tree || tree.entries.length<2)return null;
+  const entries=tree.entries,count=entries.length;
+  if(partial){
+    state.length=count*record.stride;
+    state=new F64(state);
+  }else{
+    state=new F64(count*record.stride);
+    for(let i=0;i<count;i++)if(!prepare(entries[i],i,entries))return null;
+  }
+  return {state,parent:parentState,entries,count,end:tree.end,force:force===true?1:0};
 }
 function kernel(record){
   if(!record.attempted){
@@ -160,23 +186,29 @@ function kernel(record){
   }
   return record.kernel;
 }
-export function tryTransformBatch(owner,children,force,token,methodName='updateMatrixWorld'){
-  if(!apply(weakHas,objects,[owner]) || !apply(weakHas,arrays,[children]) || data(children,'length')===0)return false;
+function transaction(owner,children,force,token,methodName,start,end,partial){
+  if(!apply(weakHas,objects,[owner]) || !apply(weakHas,arrays,[children]) || (!partial && data(children,'length')===0))return 0;
   let stats=apply(mapGet,statistics,[owner]);
   if(!stats){stats={wasmCalls:0,objects:0,fallbackCalls:0,lastFailure:null};apply(mapSet,statistics,[owner,stats]);}
-  const fallback=reason=>{stats.fallbackCalls++;stats.lastFailure=reason;return false;};
+  const fallback=reason=>{
+    // The whole-loop attempt already records selection of the retained loop.
+    // A failed span neither replays earlier spans nor creates another call.
+    if(!partial)stats.fallbackCalls++;
+    stats.lastFailure=reason;
+    return reason==='TRANSFORM_BATCH_GUARD'?0:-1;
+  };
   const record=apply(mapGet,dispatches,[token]);
   if(!record || !matrixNumericPlatformIntact() ||
     (methodName!=='updateMatrixWorld' && methodName!=='updateWorldMatrix'))return fallback('TRANSFORM_BATCH_PLATFORM');
   let prepared,runtime;
   try{
-    prepared=input(record,owner,children,force,methodName);
+    prepared=input(record,owner,children,force,methodName,start,end,partial);
     if(!prepared)return fallback('TRANSFORM_BATCH_GUARD');
     const initialized=record.attempted;
     runtime=kernel(record);if(!runtime)return fallback(record.failure);
     // No source snapshots survive potentially reentrant native initialization.
     if(!matrixNumericPlatformIntact())return fallback('TRANSFORM_BATCH_PLATFORM');
-    if(!initialized && !(prepared=input(record,owner,children,force,methodName)))return fallback('TRANSFORM_BATCH_GUARD');
+    if(!initialized && !(prepared=input(record,owner,children,force,methodName,start,end,partial)))return fallback('TRANSFORM_BATCH_GUARD');
     runtime.run(prepared.state,prepared.parent,prepared.count,prepared.force);
   }catch{return fallback(runtime?.diagnostics.lastGuardFailure??'TRANSFORM_BATCH_EXECUTION');}
   // All writes target proven writable own data properties, with no aliases or
@@ -189,7 +221,16 @@ export function tryTransformBatch(owner,children,force,token,methodName='updateM
     }
     if(entry.dirtyWrite)entry.child.matrixWorldNeedsUpdate=false;
   }
-  stats.wasmCalls++;stats.objects+=prepared.count;stats.lastFailure=null;return true;
+  stats.wasmCalls++;stats.objects+=prepared.count;stats.lastFailure=null;
+  return partial?prepared.end-start:1;
+}
+export function tryTransformBatch(owner,children,force,token,methodName='updateMatrixWorld'){
+  return transaction(owner,children,force,token,methodName,0,undefined,false)>0;
+}
+/** Number of complete source siblings committed; zero retains this child, and
+ * -1 keeps the remainder of this source loop after a runtime/platform failure. */
+export function tryTransformBatchSpan(owner,children,force,token,methodName,start,end){
+  return transaction(owner,children,force,token,methodName,start,end,true);
 }
 export function transformBatchDiagnostics(object){
   return freeze({...apply(mapGet,statistics,[object])??{wasmCalls:0,objects:0,fallbackCalls:0,lastFailure:null}});

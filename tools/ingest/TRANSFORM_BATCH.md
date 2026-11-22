@@ -21,7 +21,23 @@ loop/segment variants, points, sprites and LOD objects can share the same
 transaction with meshes and groups. Their pinned class modules register the
 inherited Object3D transform methods; method identity, prototype ancestry and
 source-family guards still apply on every call. Camera and SkinnedMesh classes
-retain their original traversal, including their additional world-update effects.
+retain their original methods, including their additional world-update effects.
+
+An observable child no longer excludes all its ordinary siblings from batching.
+After the whole-subtree guard refuses, the original child loop can execute
+contiguous spans of complete, guarded subtrees. Each successful span publishes
+before the next camera, skinned mesh, getter, override or other source operation.
+Following spans reread the current parent matrix, child slots, topology and
+numeric state after that operation. A callback therefore sees completed earlier
+matrices and can change the later work without losing its effects.
+
+The loop retains its original captured child array and child count. Appending a
+child does not extend the current traversal; replacing `children` does not switch
+the in-progress loop to another array; shrinking it preserves any source error
+at a subsequently missing slot. Child force stays local to its own subtree.
+Exceptions stop at the same source operation. A failed speculative kernel
+publishes none of that span and retains the remaining source loop, without
+replaying already committed spans or callbacks.
 
 The selective method keeps its ancestor updates and owner update in their
 original JavaScript positions. Only its descendant loop is replaced, and only
@@ -45,10 +61,10 @@ nonfinite Numbers and signed zero keep their source arithmetic.
 
 Guarding uses existing allocation witnesses and own data descriptors. Unproved
 objects, accessors, proxies, altered methods, aliased state, unwritable outputs
-and unsupported numeric storage retain the original source loop. A failed
-speculative kernel publishes no child writes; the source loop then runs once,
-including its intermediate effects and exceptions. Already performed ancestor
-and owner effects are never replayed.
+and unsupported numeric storage retain their original source operations.
+Partial traversal checks numeric guards as each node is discovered, so a rejected
+first child does not repeatedly scan the remaining siblings. Already performed
+ancestor and owner effects are never replayed.
 
 ## Scope and checks
 
@@ -67,7 +83,8 @@ node --max-old-space-size=256 --test --test-concurrency=1 \
 
 The suite compares public matrices and observations against unmodified r186,
 including mixed update flags, parent/descendant selection, dynamic topology,
-pivot mutations, overrides, exceptions and budget failures. Its application
+pivot mutations, mixed native/custom barriers, callback mutations, exceptions
+and budget failures after previously committed spans. Its application
 case executes relocated output with and without WebAssembly. These are CPU/Wasm
 equivalence checks; browser/GPU parity and hardware throughput are separate
 requirements.

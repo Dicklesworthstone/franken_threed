@@ -259,7 +259,7 @@ test('parent effects and authored Euler callbacks retain order, identities and c
   assert.deepEqual(actual.children[0].toJSON().object.matrix,expected.children[0].toJSON().object.matrix);
 });
 
-test('observable methods, getters and proxy allocations retain the complete original child loop',()=>{
+test('observable methods, getters and proxy allocations retain source effects before guarded later spans',()=>{
   const {api}=native;
   const cases=[
     (p,trace)=>{const child=p.children[0],method=child.updateMatrixWorld;Object.defineProperty(child,'updateMatrixWorld',{get(){trace.push('method');return method;}});},
@@ -269,10 +269,12 @@ test('observable methods, getters and proxy allocations retain the complete orig
     (p,trace)=>{const children=p.children;p.children=new Proxy(children,{get(target,key,receiver){trace.push('children:'+String(key));return Reflect.get(target,key,receiver);},getOwnPropertyDescriptor(target,key){trace.push('descriptor:'+String(key));return Reflect.getOwnPropertyDescriptor(target,key);}});},
     (p,trace)=>{const child=p.children[0],method=child.updateMatrix;child.updateMatrix=function(){trace.push('override');return method.call(this);};}
   ];
-  for(const prepare of cases){
+  for(const [index,prepare]of cases.entries()){
     const actual=group(api),expected=group(reference),a=[],b=[];prepare(actual,a);prepare(expected,b);
     actual.updateMatrixWorld();expected.updateMatrixWorld();
-    assert.deepEqual(a,b);assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.deepEqual(a,b);
+    assert.equal(api.diagnostics(actual).wasmCalls,index===4?0:1);
+    assert.equal(api.diagnostics(actual).objects,index===4?0:2);
     for(let i=0;i<actual.children.length;i++)assert.deepEqual(actual.children[i].matrixWorld.elements,expected.children[i].matrixWorld.elements);
   }
 });
@@ -299,15 +301,16 @@ test('deep observable hooks refuse the ancestor transaction before effects and r
       });
     },
   ];
-  for(const prepare of cases){
+  for(const [index,prepare]of cases.entries()){
     const actual=subtree(api),expected=subtree(reference),a=[],b=[];
     prepare(actual,a);prepare(expected,b);actual.updateMatrixWorld();expected.updateMatrixWorld();
-    assert.deepEqual(a,b);assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.deepEqual(a,b);assert.equal(api.diagnostics(actual).wasmCalls,1);
+    assert.equal(api.diagnostics(actual).objects,index===1?4:2);
     same(actual,expected);
   }
 });
 
-test('deep and cross-branch aliases and invalid topology keep the original subtree execution',()=>{
+test('deep and cross-branch aliases and invalid topology preserve source state across separate spans',()=>{
   const {api}=native;
   const cases=[
     root=>{root.children[1].children[0].matrixWorld=root.children[0].children[0].matrixWorld;},
@@ -316,14 +319,15 @@ test('deep and cross-branch aliases and invalid topology keep the original subtr
     root=>{root.children[0].children[1].children[0].parent=null;},
     root=>{root.children[1].children[0]=root.children[0].children[0];},
   ];
-  for(const prepare of cases){
+  for(const [index,prepare]of cases.entries()){
     const actual=subtree(api),expected=subtree(reference);prepare(actual,api);prepare(expected,reference);
     actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
-    assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.equal(api.diagnostics(actual).wasmCalls,[2,1,2,1,1][index]);
+    assert.equal(api.diagnostics(actual).objects,[6,2,6,2,4][index]);
   }
 });
 
-test('parent/sibling matrix and TRS aliases, duplicate children and wrong parents reject bulk execution',()=>{
+test('parent/sibling aliases, duplicate children and wrong parents stay outside the same transaction',()=>{
   const {api}=native;
   const cases=[
     p=>{p.children[0].matrixWorld=p.children[0].matrix;},
@@ -338,7 +342,8 @@ test('parent/sibling matrix and TRS aliases, duplicate children and wrong parent
   for(const prepare of cases){
     const actual=group(api),expected=group(reference);prepare(actual);prepare(expected);
     actual.updateMatrixWorld();expected.updateMatrixWorld();same(actual,expected);
-    assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.equal(api.diagnostics(actual).wasmCalls,1);
+    assert.equal(api.diagnostics(actual).objects,2);
   }
 });
 
@@ -363,7 +368,8 @@ test('subtree budget exhaustion and a late unwritable descendant preserve source
   const broken=subtree(native.api),refBroken=subtree(reference);
   for(const root of [broken,refBroken])Object.defineProperty(root.children[1].children[0].matrix.elements,'5',{writable:false});
   assert.throws(()=>broken.updateMatrixWorld(),TypeError);assert.throws(()=>refBroken.updateMatrixWorld(),TypeError);
-  same(broken,refBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
+  same(broken,refBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,1);
+  assert.equal(native.api.diagnostics(broken).objects,4);
 });
 
 test('late Error dispatch and inherited error setters cannot run inside a budget-failure fallback',()=>{
@@ -487,11 +493,13 @@ test('selective descendant methods and pivot hooks fall back before observable s
     root=>{root.children[0].pivot=root.children[1].position;},
     root=>{root.children[0].children[0].matrix.elements=root.children[1].matrix.elements;},
   ];
-  for(const prepare of cases){
+  for(const [index,prepare]of cases.entries()){
     const actual=subtree(api),expected=subtree(reference),traces=[[],[]];
     prepare(actual,api,traces[0]);prepare(expected,reference,traces[1]);
     actual.updateWorldMatrix(true,true);expected.updateWorldMatrix(true,true);
-    assert.deepEqual(traces[0],traces[1]);same(actual,expected);assert.equal(api.diagnostics(actual).wasmCalls,0);
+    assert.deepEqual(traces[0],traces[1]);same(actual,expected);
+    assert.equal(api.diagnostics(actual).wasmCalls,index<5?1:2);
+    assert.equal(api.diagnostics(actual).objects,[2,2,2,4,4,6,6][index]);
   }
   // Only the selected traversal method matters. An unused hook is not read.
   for(const method of ['updateMatrixWorld','updateWorldMatrix']){
@@ -517,7 +525,8 @@ test('selective budget and late pivot failures preserve partial source updates w
       else Object.defineProperty(child.matrix.elements,'5',{writable:false});
       assert.throws(()=>root.updateWorldMatrix(true,true),failure==='pivot'?/pivot failure/:TypeError);
     }
-    assert.deepEqual(traces[0],traces[1]);same(broken,referenceBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,0);
+    assert.deepEqual(traces[0],traces[1]);same(broken,referenceBroken);assert.equal(native.api.diagnostics(broken).wasmCalls,1);
+    assert.equal(native.api.diagnostics(broken).objects,4);
   }
 });
 
@@ -596,5 +605,156 @@ test('camera and skinned-mesh world-update side effects stay on their original r
     assert.equal(api.diagnostics(roots[0]).lastFailure,'TRANSFORM_BATCH_GUARD');
     const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
     assert.deepEqual(roots[0].children[1][field].elements,roots[1].children[1][field].elements);
+  }
+});
+
+function segmentedTree(library,kind='Object3D',count=4){
+  const root=new library.Scene(),before=[],after=[],barrier=new library[kind]();
+  for(const list of [before,after])for(let i=0;i<count;i++){
+    const node=new library.Object3D();node.position.set(i/3+1,-i/7,2);
+    node.rotation.set(i/11,-0.2,0.4);node.scale.set(-1,2,0.5);list.push(node);
+  }
+  barrier.position.set(2,-3,1);barrier.scale.set(1.5,2,0.7);
+  root.add(...before,barrier,...after);
+  return {root,before,barrier,after,captured:root.children};
+}
+
+test('segmented batches keep large ordinary spans around Camera and SkinnedMesh source updates',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const kind of ['Camera','SkinnedMesh']){
+    const actual=segmentedTree(api,kind,128),expected=segmentedTree(reference,kind,128);
+    for(const [scene,library]of [[actual,api],[expected,reference]])
+      scene.barrier.add(new library.Object3D(),new library.Object3D());
+    const identities=actual.captured.map(node=>[node,node.matrix,node.matrix.elements,node.matrixWorld,node.matrixWorld.elements]);
+    for(let frame=0;frame<2;frame++){
+      for(const scene of [actual,expected]){
+        scene.root.position.x+=3;scene.barrier.rotation.y+=0.2;
+        updateSubtree(scene.root,method);
+      }
+      same(actual.root,expected.root);
+      const field=kind==='Camera'?'matrixWorldInverse':'bindMatrixInverse';
+      assert.deepEqual(actual.barrier[field].elements,expected.barrier[field].elements);
+      assert.equal(api.diagnostics(actual.root).wasmCalls,2*(frame+1));
+      assert.equal(api.diagnostics(actual.root).objects,256*(frame+1));
+      assert.equal(api.diagnostics(actual.barrier).wasmCalls,frame+1,'Native post-super work follows its batched children');
+    }
+    for(const [node,matrix,local,world,elements]of identities){
+      assert.equal(node.matrix,matrix);assert.equal(matrix.elements,local);
+      assert.equal(node.matrixWorld,world);assert.equal(world.elements,elements);
+    }
+  }
+});
+
+test('segmented batches materialize before hooks and reread later transforms, parent matrices and topology',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']){
+    const scenes=[segmentedTree(api),segmentedTree(reference)],traces=[[],[]];
+    for(const [index,scene]of scenes.entries()){
+      const library=index===0?api:reference,{root,before,barrier,after}=scene;
+      after[0].add(new library.Object3D());after[1].add(new library.Object3D());
+      const original=barrier[method];
+      barrier[method]=function(...args){
+        traces[index].push([args,before.map(node=>node.matrixWorld.elements.slice()),before.map(node=>node.matrixWorldNeedsUpdate)]);
+        root.matrixWorld.elements[12]+=50;root.matrixWorldNeedsUpdate=true;
+        after[0].position.x+=7;after[0].add(after[1].children[0]);
+        [root.children[5],root.children[6]]=[root.children[6],root.children[5]];
+        const replacement=new library.Object3D();replacement.position.y=9;replacement.parent=root;root.children[7]=replacement;
+        return original.apply(this,args);
+      };
+      updateSubtree(root,method);
+    }
+    same(scenes[0].root,scenes[1].root);assert.deepEqual(traces[0],traces[1]);
+    assert.equal(traces[0].length,1);assert.equal(scenes[0].root.matrixWorldNeedsUpdate,true);
+    assert.equal(api.diagnostics(scenes[0].root).wasmCalls,2);
+    assert.equal(api.diagnostics(scenes[0].root).objects,10);
+  }
+});
+
+test('segmented batches preserve the captured child array and count across callback mutations',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const change of ['append','shrink','replace-array','index-getter']){
+    const scenes=[segmentedTree(api),segmentedTree(reference)],traces=[[],[]];
+    for(const [index,scene]of scenes.entries()){
+      const library=index===0?api:reference,{root,barrier,after,captured}=scene,original=barrier[method];
+      barrier[method]=function(...args){
+        traces[index].push('hook');
+        if(change==='append'){
+          const added=new library.Object3D();added.position.x=100;root.add(added);scene.added=added;
+        }else if(change==='shrink')root.remove(after[3]);
+        else if(change==='replace-array')root.children=[];
+        else Object.defineProperty(captured,'5',{configurable:true,get(){traces[index].push('index');return after[0];}});
+        return original.apply(this,args);
+      };
+      if(change==='shrink')assert.throws(()=>updateSubtree(root,method),TypeError);
+      else updateSubtree(root,method);
+    }
+    same(scenes[0].root,scenes[1].root);assert.deepEqual(traces[0],traces[1]);
+    for(let i=0;i<scenes[0].captured.length;i++)same(scenes[0].captured[i],scenes[1].captured[i]);
+    assert.equal(traces[0].filter(value=>value==='hook').length,1);
+    assert.equal(api.diagnostics(scenes[0].root).wasmCalls,2,method+' '+change);
+    if(change==='append')assert.deepEqual(scenes[0].added.matrixWorld.elements,new api.Matrix4().elements,
+      'Children appended beyond the original cached length are not visited');
+  }
+});
+
+test('segmented batches preserve sibling-local force and exact fallback call arguments',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const force of [undefined,false,true]){
+    const scenes=[segmentedTree(api),segmentedTree(reference)],traces=[[],[]];
+    for(const [index,scene]of scenes.entries()){
+      const {root,before,barrier}=scene;configureManual(root);
+      let i=0;root.traverse(node=>{
+        if(node===root)return;node.matrixAutoUpdate=false;node.matrixWorldNeedsUpdate=false;
+        fill(node.matrix,++i);fill(node.matrixWorld,20+i);
+      });
+      before[0].matrixWorldNeedsUpdate=true;
+      const original=barrier[method];barrier[method]=function(...args){
+        traces[index].push(args);return original.apply(this,args);
+      };
+      updateSubtree(root,method,force);
+    }
+    same(scenes[0].root,scenes[1].root);assert.deepEqual(traces[0],traces[1]);
+    if(force!==true)assert.deepEqual(scenes[0].after[0].matrixWorld.elements,fill(new api.Matrix4(),26).elements);
+    assert.equal(api.diagnostics(scenes[0].root).wasmCalls,2);
+  }
+});
+
+test('segmented exceptions keep prior commits and stop before unvisited children without replay',()=>{
+  const {api}=native;
+  for(const method of ['updateMatrixWorld','updateWorldMatrix'])for(const failure of ['hook','readonly']){
+    const scenes=[segmentedTree(api),segmentedTree(reference)],traces=[[],[]];
+    for(const [index,scene]of scenes.entries()){
+      const {root,before,barrier,after}=scene,owner=root.updateMatrix,original=barrier[method];
+      root.updateMatrix=function(){traces[index].push('owner');return owner.call(this);};
+      barrier[method]=function(...args){
+        traces[index].push(['hook',before[3].matrixWorld.elements.slice()]);
+        if(failure==='hook')throw new Error('source barrier');return original.apply(this,args);
+      };
+      if(failure==='readonly')Object.defineProperty(after[2].matrix.elements,'5',{writable:false});
+      assert.throws(()=>updateSubtree(root,method),failure==='hook'?/source barrier/:TypeError);
+    }
+    same(scenes[0].root,scenes[1].root);assert.deepEqual(traces[0],traces[1]);
+    assert.equal(traces[0].length,2);
+    assert.equal(api.diagnostics(scenes[0].root).wasmCalls,failure==='hook'?1:2);
+    assert.deepEqual(scenes[0].after[3].matrixWorld.elements,new api.Matrix4().elements);
+  }
+});
+
+test('segmented kernel budget failure retains earlier spans and executes the remaining source once',async()=>{
+  const {api}=await fixture({maxIterations:4});
+  for(const method of ['updateMatrixWorld','updateWorldMatrix']){
+    const scenes=[segmentedTree(api,'Object3D',2),segmentedTree(reference,'Object3D',2)],traces=[[],[]];
+    for(const [index,scene]of scenes.entries()){
+      const library=index===0?api:reference,{root,before,barrier}=scene,owner=root.updateMatrix,original=barrier[method];
+      for(let i=0;i<20;i++){const child=new library.Object3D();child.position.x=i+10;root.add(child);}
+      root.updateMatrix=function(){traces[index].push('owner');return owner.call(this);};
+      barrier[method]=function(...args){
+        traces[index].push(['hook',before[1].matrixWorld.elements.slice()]);return original.apply(this,args);
+      };
+      updateSubtree(root,method);
+    }
+    same(scenes[0].root,scenes[1].root);assert.deepEqual(traces[0],traces[1]);
+    assert.deepEqual(api.diagnostics(scenes[0].root),{
+      wasmCalls:1,objects:2,fallbackCalls:1,lastFailure:'KERNEL_EXECUTION_FAILED'});
   }
 });
