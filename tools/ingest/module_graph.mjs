@@ -39,7 +39,7 @@ function sha256(content) {
  */
 function isExternalUrl(url) {
   if (typeof url !== "string") return false;
-  return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:");
+  return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("data:") || url.startsWith("node:");
 }
 
 // A module map is keyed by URL AND import type. Keep ordinary JavaScript IDs
@@ -98,19 +98,24 @@ function findCycles(adj) {
  * @param {string} entryPath - Path to entry file (HTML or JS)
  * @param {Object} [options]
  * @param {string} [options.packageRootUrl] - Base URL for Three.js fallback
+ * @param {'browser'|'node'} [options.target='browser'] - Runtime module-resolution host
  * @returns {Promise<Object>} The versioned module graph bundle
  */
 export async function buildModuleGraph(entryPath, options = {}) {
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
-  const resolvedEntryAbs = path.resolve(entryPath);
+  const target = moduleSources.target ?? 'browser';
+  let resolvedEntryAbs = path.resolve(entryPath);
   if (!fs.existsSync(resolvedEntryAbs)) {
     throw new Error(`Entry file does not exist: "${resolvedEntryAbs}"`);
   }
+  if (target === 'node') resolvedEntryAbs = fs.realpathSync(resolvedEntryAbs);
 
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
   if (documentRoot) documentRelativePath(entryUrl, documentRoot);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
+  if (target === 'node' && (isHtml || documentRoot))
+    throw new TypeError('The Node target requires a JavaScript entry without a browser document root');
 
   let importMap = { imports: {}, scopes: {} };
   let mapBaseUrl = entryUrl;
@@ -163,10 +168,10 @@ export async function buildModuleGraph(entryPath, options = {}) {
   }
 
   const importedStrings = createImportedStringResolver({
-    readModule: url => path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+    readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
     resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
-      mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+      target, mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
     }),
   });
 
@@ -260,6 +265,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
     for (const imp of staticRequests) {
       const targetType = imp.module_type ?? "javascript";
       const resolvedUrl = resolveModuleSpecifier(imp.specifier, sourceUrl, importMap, {
+        target,
         mapBaseUrl,
         documentRoot,
         _moduleSources: moduleSources,
@@ -312,6 +318,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         let resolvedUrl = null;
         try {
           resolvedUrl = resolveModuleSpecifier(dyn.specifier, sourceUrl, importMap, {
+            target,
             mapBaseUrl,
             documentRoot,
             _moduleSources: moduleSources,
@@ -370,6 +377,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
         for (const cand of candidates) {
           try {
             const resolvedUrl = resolveModuleSpecifier(cand, sourceUrl, importMap, {
+              target,
               mapBaseUrl,
               documentRoot,
               _moduleSources: moduleSources,
@@ -628,6 +636,7 @@ export async function buildModuleGraph(entryPath, options = {}) {
 
   const bundle = {
     schema_version: SCHEMA_VERSION,
+    target,
     entry_type: isHtml ? "html" : "module",
     entry_path: resolvedEntryAbs,
     root_entries: rootEntryIds,

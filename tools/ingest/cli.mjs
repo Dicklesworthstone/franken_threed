@@ -19,6 +19,8 @@ Usage:
 Options:
   --entry <path>        Path to HTML, ESM, or glTF/GLB entry (required)
   --build-app <dir>     Emit runnable application build to target directory (must be fresh)
+  --target <host>       Module deployment host: browser (default) or node
+                       Node keeps native builtins and uses Node package conditions
   --out-dir <dir>       Alias for --build-app
   --pack-html <file>    Export emitted HTML as one file, alone or after --build-app
                        With --build-app, embeds discovered pinned Three.js loader resources
@@ -74,6 +76,7 @@ async function main() {
   let output = null;
   let packageRoot = null;
   let documentRoot = null;
+  let target = 'browser';
   let transformModulePath = null;
   let buildAppDir = null;
   let packHtmlFile = null;
@@ -126,6 +129,12 @@ async function main() {
         process.exit(1);
       }
       buildAppDir = args[++i];
+    } else if (arg === "--target") {
+      if (i + 1 >= args.length || !['browser', 'node'].includes(args[i + 1])) {
+        console.error('Error: --target requires "browser" or "node".');
+        process.exit(1);
+      }
+      target = args[++i];
     } else if (
       arg === "--build-kernel" ||
       arg === "--parameter-types" ||
@@ -176,6 +185,12 @@ async function main() {
   if (!entry) {
     console.error("Error: --entry <path> is required.");
     printHelp();
+    process.exit(1);
+  }
+
+  if (target === 'node' && (/\.html?$/i.test(entry) || documentRoot || packHtmlFile ||
+      routeWebGPURenderer || routeWebGLRenderer || buildAnimationDir || buildKernelDir)) {
+    console.error('Error: --target node requires a JavaScript entry and cannot be combined with browser, animation or explicit-kernel output options.');
     process.exit(1);
   }
 
@@ -396,6 +411,7 @@ async function main() {
     if (buildAppDir) {
       const { buildApplication } = await import("./build_application.mjs");
       const appResult = await buildApplication(entry, buildAppDir, {
+        target,
         packageRootUrl: packageRoot,
         documentRoot,
         transformModule,
@@ -458,6 +474,7 @@ async function main() {
 
     const { buildModuleGraph } = await import("./module_graph.mjs");
     const bundle = await buildModuleGraph(entry, {
+      target,
       packageRootUrl: packageRoot,
       documentRoot,
       transformModule,

@@ -35,7 +35,14 @@ export function commonjsFormat(url, sources, {sourceType = 'module', required = 
   const key = JSON.stringify([url, sourceType, required, inline, declared]);
   if (cache.has(key)) return cache.get(key);
   const ast = parse(source.code, {ecmaVersion: 'latest', sourceType: 'module', allowReturnOutsideFunction: true});
-  const esm = ast.body.some(node => /^(Import|Export)/.test(node.type));
+  let esm = ast.body.some(node => /^(Import|Export)/.test(node.type));
+  if (sources.target === 'node' && !esm) {
+    // Syntax detection includes import.meta, top-level await and lexical
+    // redeclarations of CJS wrapper parameters. Parse, never execute, a wrapper.
+    try { parse('function moduleBody(exports, require, module, __filename, __dirname) {\n' +
+      source.code.replace(/^#![^\r\n]*/, '') + '\n}', {ecmaVersion: 'latest', sourceType: 'script'}); }
+    catch { esm = true; }
+  }
   let references = false;
   walk.ancestor(ast, {Identifier(node, ancestors) {
     const parent = ancestors.at(-2);
@@ -44,7 +51,7 @@ export function commonjsFormat(url, sources, {sourceType = 'module', required = 
       references = true;
   }});
   let type;
-  for (let directory = path.dirname(filename); required && path.basename(directory) !== 'node_modules';) {
+  for (let directory = path.dirname(filename); (required || sources.target === 'node') && path.basename(directory) !== 'node_modules';) {
     try { type = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8')).type; break; }
     catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
     const parent = path.dirname(directory);
@@ -53,10 +60,13 @@ export function commonjsFormat(url, sources, {sourceType = 'module', required = 
   }
   // Browser module/script contexts do not inherit Node package type. Explicit
   // ESM containing free CJS globals remains opaque, never a closed ESM proof.
-  const result = esm || extension === '.mjs' || inline
+  if (sources.target === 'node' && !source.frontendHandled && esm &&
+      (extension === '.cjs' || extension === '.js' && type === 'commonjs'))
+    throw commonjsError('MODULE_FORMAT', 'ES module syntax in an explicit CommonJS source must retain its source format error', url);
+  const result = esm || extension === '.mjs' || inline || sources.target === 'node' && type === 'module' && extension !== '.cjs'
     ? references ? 'mixed-commonjs' : 'module'
     : references || declared === 'commonjs' || !source.frontendHandled && extension === '.cjs' ||
-        required && declared !== 'module' && type !== 'module' ? 'commonjs' : 'module';
+        (required || sources.target === 'node' && !source.frontendHandled) && declared !== 'module' && type !== 'module' ? 'commonjs' : 'module';
   cache.set(key, result);
   return result;
 }
@@ -221,6 +231,9 @@ function retryableCommonjs(result, id, ast) {
 
 export function commonjsPlugins({moduleSources, resolveModule}) {
   const compiler = commonjs({strictRequires: true, sourceMap: true,
+    // The pinned compiler's native createRequire thunk keeps builtin loading
+    // and caught errors at the original synchronous require boundary.
+    requireNodeBuiltins: moduleSources.target === 'node',
     defaultIsModuleExports: true, requireReturnsDefault: id => id === EMPTY || id.startsWith(JSON_ENTRY),
     ignoreDynamicRequires: false, ignoreTryCatch: false});
   const transform = compiler.transform;
@@ -262,6 +275,8 @@ export function commonjsPlugins({moduleSources, resolveModule}) {
         ? pathToFileURL(path.resolve(path.dirname(fileURLToPath(from)), source)).href : source;
       const resolved = resolveModule(request, from, {requestKind: 'require', allowCommonJS: true});
       if (resolved === EMPTY) return resolved;
+      if (moduleSources.target === 'node' && resolved.startsWith('node:'))
+        return {id: resolved, external: true};
       if (!resolved.startsWith('file:'))
         throw commonjsError('EXTERNAL_REQUIRE', 'Synchronous require cannot load a live external module', resolved);
       if (path.extname(fileURLToPath(resolved)).toLowerCase() === '.json') {

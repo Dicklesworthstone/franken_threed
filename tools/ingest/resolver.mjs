@@ -13,9 +13,10 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { IngestionResolutionError } from "./types.mjs";
 import { resolvePackageExports } from "./package_exports.mjs";
-import { resolveInstalledPackage, resolveInstalledPackageIfPresent, resolvePackageBrowserMapping, resolveCommonJSFile } from "./node_package_resolver.mjs";
+import { resolveInstalledPackage, resolveInstalledPackageIfPresent, resolvePackageBrowserMapping, resolveCommonJSFile, normalizeModuleTarget, moduleConditions } from "./node_package_resolver.mjs";
 import { normalizeDocumentRoot, resolveDocumentUrl, documentRelativePath, isRootRelativeDocumentUrl } from "./document_urls.mjs";
 export { resolveExportTargetValue, resolvePackageExports } from "./package_exports.mjs";
+export { normalizeModuleTarget } from "./node_package_resolver.mjs";
 
 /**
  * Normalizes a base URL (strips fragment like #inline-module-1).
@@ -294,6 +295,7 @@ export function clearPackageJsonCache() {
  * @returns {string} - Canonical resolved file URL
  */
 export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, options = {}) {
+  const target = normalizeModuleTarget(options.target);
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const span = options.span || null;
   const referrerBase = getBaseUrl(referrerUrl);
@@ -301,6 +303,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
 
   let candidateUrl = null;
   const packageOptions = {
+    target,
     span, browserSkip: options.browserSkip, browserTrail: options.browserTrail,
     _moduleSources: options._moduleSources,
     requestKind: options.requestKind,
@@ -396,7 +399,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       specifier,
       referrerUrl,
       span,
-      options.requestKind === 'require' ? ['browser', 'require', 'default'] : undefined,
+      moduleConditions(target, options.requestKind),
     );
     candidateUrl = new URL(relativeTarget, pkgRootUrl).href;
   } else {
@@ -406,7 +409,7 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
 
   if (options.requestKind === 'require' && !mapped && browserTarget === null &&
       candidateUrl.startsWith('file:') && /^(?:\.{1,2}\/|\/|file:)/.test(specifier)) {
-    candidateUrl = resolveCommonJSFile(candidateUrl);
+    candidateUrl = resolveCommonJSFile(candidateUrl, {target});
     if (documentRoot && isRootRelativeDocumentUrl(specifier)) {
       const referrer = new URL(referrerBase);
       if (referrer.protocol === "file:" && !referrer.hostname) documentRelativePath(candidateUrl, documentRoot);
@@ -438,8 +441,20 @@ export function resolveModuleSpecifier(specifier, referrerUrl, importMap = {}, o
       );
     }
 
-    // Preserve normalized URL identity (including query and fragment)
-    return new URL(candidateUrl).href;
+    // Node resolves symlink aliases to one module identity. Browser URLs keep
+    // their separate identities even when the compiler reads the same file.
+    const canonical = new URL(candidateUrl);
+    if (target === 'node') {
+      if (!fs.statSync(filePath).isFile()) {
+        const error = new IngestionResolutionError(`Cannot import a directory: "${filePath}"`, specifier, referrerUrl, span);
+        error.code = 'ERR_UNSUPPORTED_DIR_IMPORT';
+        throw error;
+      }
+      const physical = pathToFileURL(fs.realpathSync(filePath));
+      physical.search = canonical.search; physical.hash = canonical.hash;
+      return physical.href;
+    }
+    return canonical.href;
   }
 
   return candidateUrl;

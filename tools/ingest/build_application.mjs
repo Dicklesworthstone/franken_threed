@@ -965,6 +965,7 @@ function pathExistsOrSymlink(targetPath) {
  * @param {string} entryPath - Path to HTML or JavaScript entry file
  * @param {string} outDir - Destination directory for emitted application (must be fresh)
  * @param {Object} [options]
+ * @param {'browser'|'node'} [options.target='browser'] - Deployment host; Node emits a cold ESM package
  * @param {string} [options.packageRootUrl] - Base URL or directory for package fallback
  * @param {Function} [options.transformModule] - Synchronous project frontend: (source, {url, sourceType}) => code | {code} | null
  * @param {boolean} [options.prepareStandaloneLoaders] - Embed finite pinned-loader resources for a following packHtml call; unknown routes remain networked
@@ -982,6 +983,7 @@ function pathExistsOrSymlink(targetPath) {
  */
 export async function buildApplication(entryPath, outDir, options = {}) {
   const moduleSources = moduleSourcesFor(options);
+  const target = moduleSources.target ?? 'browser';
   if (!entryPath || typeof entryPath !== "string") {
     throw new Error("buildApplication requires a valid entryPath string");
   }
@@ -989,15 +991,19 @@ export async function buildApplication(entryPath, outDir, options = {}) {
     throw new Error("buildApplication requires a valid outDir string");
   }
 
-  const resolvedEntryAbs = path.resolve(entryPath);
+  let resolvedEntryAbs = path.resolve(entryPath);
   if (!fs.existsSync(resolvedEntryAbs)) {
     throw new Error(`Entry path does not exist: ${entryPath}`);
   }
+  if (target === 'node') resolvedEntryAbs = fs.realpathSync(resolvedEntryAbs);
 
   const resolvedOutDir = path.resolve(outDir);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
   const entryDir = path.dirname(resolvedEntryAbs);
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
+  if (target === 'node' && (isHtml || documentRoot || options.routeWebGPURenderer ||
+      options.routeWebGLRenderer || options.prepareStandaloneLoaders))
+    throw new TypeError('The Node target requires a JavaScript entry without browser document, packing or renderer options');
   const applicationRoot = documentRoot ?? entryDir;
   const htmlFileName = isHtml ? documentRoot ? documentRelativePath(resolvedEntryAbs, documentRoot) : path.basename(resolvedEntryAbs) : null;
 
@@ -1389,6 +1395,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
         }, moduleSources, documentRoot)
       : null;
   const bundleResult = await bundleWithRollup(resolvedEntryAbs, {
+    target,
     _moduleSources: moduleSources,
     packageRootUrl: options.packageRootUrl,
     documentRoot,
@@ -1473,6 +1480,7 @@ export async function buildApplication(entryPath, outDir, options = {}) {
   }
 
   return {
+    target,
     entryPoint: resolvedEntryAbs,
     outDir: resolvedOutDir,
     isHtml,

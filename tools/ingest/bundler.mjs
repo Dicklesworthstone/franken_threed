@@ -87,7 +87,7 @@ function isExternalUrl(url) {
   if (!url || typeof url !== "string") return false;
   try {
     const protocol = new URL(url, "file:///").protocol;
-    return protocol === "http:" || protocol === "https:" || protocol === "data:";
+    return protocol === "http:" || protocol === "https:" || protocol === "data:" || protocol === "node:";
   } catch {
     return false;
   }
@@ -109,15 +109,16 @@ function isExternalUrl(url) {
 export function f3dRollupPlugin(options = {}) {
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
+  const target = moduleSources.target ?? 'browser';
   const importMap = options.importMap || { imports: {}, scopes: {} };
   const mapBaseUrl = options.mapBaseUrl;
   const inlineModules = options.inlineModules || new Map();
   const retainedModuleUrls = options.retainedModuleUrls || new Map();
   const importedStrings = createImportedStringResolver({
-    readModule: url => path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
+    readModule: url => url.startsWith('file:') && path.extname(urlToFilePath(url)).toLowerCase() !== '.json' &&
       commonjsFormat(url, moduleSources) === 'module' ? moduleSources.read(url).code : null,
     resolveModule: (specifier, from) => resolveModuleSpecifier(specifier, from, importMap, {
-      mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
+      target, mapBaseUrl, documentRoot, _moduleSources: moduleSources, packageRootUrl: options.packageRootUrl,
     }),
   });
   const emittedAssetsByPath = new Map();
@@ -326,6 +327,7 @@ export function f3dRollupPlugin(options = {}) {
         : mapBaseUrl;
 
       const resolvedUrl = resolveModuleSpecifier(source, referrerUrl, importMap, {
+        target,
         mapBaseUrl,
         documentRoot,
         _moduleSources: moduleSources,
@@ -476,7 +478,7 @@ export function f3dRollupPlugin(options = {}) {
           const requests = findThreeLoaderRequests(ast, {
             moduleUrl: id, source: code,
             resolveModule: (specifier) => resolveModuleSpecifier(specifier, referrerUrl, importMap, {
-              mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
+              target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources,
             }),
             packageRootUrl: options.packageRootUrl,
             onDefaultManagerExposure: () => { defaultManagerExposed = true; },
@@ -502,6 +504,7 @@ export function f3dRollupPlugin(options = {}) {
 
             for (const cand of uniqueBranches) {
               const resolvedUrl = resolveModuleSpecifier(cand, referrerUrl, importMap, {
+                target,
                 mapBaseUrl,
                 documentRoot,
                 _moduleSources: moduleSources,
@@ -745,6 +748,7 @@ export function rendererRoutePlugin({ targets, exactSites = [], postprocessingTr
 export async function bundleWithRollup(entryPath, options = {}) {
   const documentRoot = normalizeDocumentRoot(options.documentRoot);
   const moduleSources = moduleSourcesFor(options);
+  const target = moduleSources.target ?? 'browser';
   const specialization = options.specializeNumeric;
   const numericPlugin =
     specialization === undefined || specialization === false
@@ -778,10 +782,12 @@ export async function bundleWithRollup(entryPath, options = {}) {
       return transform.call(this, code, id);
     };
   }
-  const resolvedEntryAbs = path.resolve(entryPath);
+  const resolvedEntryAbs = target === 'node' ? fs.realpathSync(path.resolve(entryPath)) : path.resolve(entryPath);
   const entryUrl = pathToFileURL(resolvedEntryAbs).href;
   if (documentRoot) documentRelativePath(entryUrl, documentRoot);
   const isHtml = entryPath.endsWith(".html") || entryPath.endsWith(".htm");
+  if (target === 'node' && (isHtml || documentRoot || options.rendererRoute || options.prepareStandaloneLoaders))
+    throw new TypeError('The Node target requires a JavaScript entry without browser document or renderer options');
 
   let importMap = { imports: {}, scopes: {} };
   let mapBaseUrl = entryUrl;
@@ -879,11 +885,11 @@ export async function bundleWithRollup(entryPath, options = {}) {
         ...(marchingPlugin ? [marchingPlugin] : []),
         ...commonjsPlugins({moduleSources, resolveModule: (specifier, from, request) =>
           resolveModuleSpecifier(specifier, from, importMap, {
-            mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, ...request,
+            target, mapBaseUrl, documentRoot, packageRootUrl: options.packageRootUrl, _moduleSources: moduleSources, ...request,
           })}),
         // A worker is an independent ESM realm, not a raw URL asset and not a
         // document chunk. Do not apply the page import map or renderer route.
-        moduleWorkerRollupPlugin({
+        ...(target === 'browser' ? [moduleWorkerRollupPlugin({
           _moduleSources: moduleSources,
           specializeNumeric: specialization,
           _workerNumericUnits: workerNumericUnits,
@@ -895,8 +901,9 @@ export async function bundleWithRollup(entryPath, options = {}) {
             documentRoot,
             _moduleSources: moduleSources,
           }),
-        }),
+        })] : []),
         f3dRollupPlugin({
+          target,
           _moduleSources: moduleSources,
           commonJS: true,
           importMap,

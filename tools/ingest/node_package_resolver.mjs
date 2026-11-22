@@ -16,9 +16,24 @@ const EMPTY_BROWSER_MODULE = new URL("./browser_empty.mjs", import.meta.url).hre
 // binary resources never become JavaScript merely because a hook is present.
 const FRONTEND_SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".cjs"]);
 
+/** The deployment host is explicit; never infer it from the compiler process. */
+export function normalizeModuleTarget(target = 'browser') {
+  if (target !== 'browser' && target !== 'node')
+    throw new TypeError('Module target must be "browser" or "node"');
+  return target;
+}
+
+/** Default modern Node conditions, or the existing browser-bundler conditions.
+ * Manifest key order, rather than this array's order, selects each branch. */
+export function moduleConditions(target = 'browser', requestKind = 'import') {
+  return normalizeModuleTarget(target) === 'node'
+    ? ['node', 'node-addons', 'module-sync', requestKind, 'default']
+    : ['browser', requestKind, 'default'];
+}
+
 /** CommonJS file/directory lookup only. Export-map targets never use this
  * fallback: their selected filenames remain exact and authoritative. */
-export function resolveCommonJSFile(url) {
+export function resolveCommonJSFile(url, {target = 'browser', directoryOnly = false} = {}) {
   const original = new URL(url), visited = new Set();
   const file = filename => {
     for (const candidate of [filename, filename + '.js', filename + '.json', filename + '.node']) {
@@ -33,7 +48,7 @@ export function resolveCommonJSFile(url) {
     let value;
     try { value = JSON.parse(fs.readFileSync(path.join(filename, 'package.json'), 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
-    const main = typeof value?.browser === 'string' ? value.browser : value?.main;
+    const main = target === 'browser' && typeof value?.browser === 'string' ? value.browser : value?.main;
     if (typeof main === 'string' && main) {
       const target = path.resolve(filename, main);
       const found = file(target) ?? file(path.join(target, 'index'));
@@ -42,7 +57,7 @@ export function resolveCommonJSFile(url) {
     return file(path.join(filename, 'index'));
   };
   const filename = fileURLToPath(original);
-  const found = file(filename) ?? directory(filename);
+  const found = directoryOnly ? directory(filename) : file(filename) ?? directory(filename);
   if (!found) return original.href;
   const result = pathToFileURL(found);
   result.search = original.search; result.hash = original.hash;
@@ -63,6 +78,7 @@ export function resolveInstalledPackageIfPresent(specifier, referrerUrl, options
 /** Apply only the importing package's browser object. Import maps and the
  * Three.js pin remain the caller's responsibility. Null means no replacement. */
 export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {}) {
+  if (normalizeModuleTarget(options.target) === 'node') return null;
   if (!URL.canParse(referrerUrl) || new URL(referrerUrl).protocol !== "file:") return null;
   if (URL.canParse(specifier) && !specifier.startsWith("file:") && !isBuiltin(specifier)) return null;
   return resolvePackageRequest(specifier, referrerUrl, options, true);
@@ -70,9 +86,9 @@ export function resolvePackageBrowserMapping(specifier, referrerUrl, options = {
 
 function resolvePackageRequest(specifier, referrerUrl, {
   span = null, resolveExternal = null, browserSkip = null, browserTrail = [], _moduleSources = null,
-  requestKind = 'import', allowCommonJS = false,
+  requestKind = 'import', allowCommonJS = false, target: moduleTarget = 'browser',
 } = {}, browserOnly, missingPackageIsNull = false) {
-  const conditions = ['browser', requestKind, 'default'];
+  const conditions = moduleConditions(moduleTarget, requestKind);
   const fail = (code, message) => {
     const error = new IngestionResolutionError(
       `Cannot resolve package import "${specifier}" from "${referrerUrl}": ${message}`,
@@ -88,6 +104,8 @@ function resolvePackageRequest(specifier, referrerUrl, {
     fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid bare package specifier");
   if (specifier.startsWith("#") && (specifier === "#" || specifier.startsWith("#/") || specifier.endsWith("/")))
     fail("ERR_INVALID_MODULE_SPECIFIER", "Invalid package import name");
+  if (!browserOnly && moduleTarget === 'node' && (isBuiltin(specifier) || specifier.startsWith('node:')))
+    return specifier.startsWith('node:') ? specifier : 'node:' + specifier;
   if (!browserOnly && isBuiltin(specifier))
     fail("F3D_NODE_BUILTIN", "Node builtins need an explicit import-map host adapter; no browser polyfill is implied");
 
@@ -150,8 +168,8 @@ function resolvePackageRequest(specifier, referrerUrl, {
       // not switch implementations. Exact subpaths bypass entrypoint fields.
       const entryField = name => typeof value?.[name] === "string" && value[name] ? value[name] : null;
       const asTarget = filename => filename.startsWith("./") ? filename : "./" + filename;
-      const moduleEntry = requestKind === 'require' ? null : entryField("module");
-      const entry = entryField("browser") || moduleEntry || entryField("main") || "index.js";
+      const moduleEntry = moduleTarget === 'node' || requestKind === 'require' ? null : entryField("module");
+      const entry = (moduleTarget === 'browser' && entryField("browser")) || moduleEntry || entryField("main") || "index.js";
       const relative = subpath === "." ? asTarget(entry) : subpath;
       target = resolvePackageExports(".", relative, packageJsonPath, specifier, referrerUrl, span);
       // The module field explicitly declares ESM, including .js beside a
@@ -163,13 +181,22 @@ function resolvePackageRequest(specifier, referrerUrl, {
         new URL(target, pathToFileURL(directory + path.sep)));
       if (replacement !== null) return replacement;
     }
-    return finalize(directory, target, declaredEsmEntry, value?.exports == null && value?.type !== 'module');
+    const legacy = value?.exports == null;
+    if (moduleTarget === 'node' && legacy && subpath === '.') {
+      // Native ESM keeps the legacy package-main search, even for type:module:
+      // main extensions/main-directory index, then the package's own index.
+      // Starting at the directory must not select a sibling package-name.js.
+      target = resolveCommonJSFile(pathToFileURL(directory + path.sep).href,
+        {target: moduleTarget, directoryOnly: true});
+    }
+    return finalize(directory, target, declaredEsmEntry, legacy &&
+      (moduleTarget === 'node' ? requestKind === 'require' && subpath !== '.' : value?.type !== 'module'));
   }
 
   function finalize(directory, target, declaredEsmEntry = false, legacy = false) {
     const packageJsonPath = path.join(directory, "package.json");
     let url = new URL(target, pathToFileURL(directory + path.sep));
-    if (allowCommonJS && legacy && !declaredEsmEntry) url = new URL(resolveCommonJSFile(url));
+    if (allowCommonJS && legacy && !declaredEsmEntry) url = new URL(resolveCommonJSFile(url, {target: moduleTarget}));
     let filename;
     try { filename = fileURLToPath(url); }
     catch (error) { fail("ERR_INVALID_MODULE_SPECIFIER", `Invalid target in "${packageJsonPath}": ${error.message}`); }
@@ -200,6 +227,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
   // files. Apply one rewrite in the owner, then resolve a replacement dependency
   // in that owner's node_modules (not the original importing application's).
   function browserTarget(owner, request, requestUrl = null) {
+    if (moduleTarget === 'node') return null;
     const entries = owner?.value?.browser;
     if (!entries || typeof entries !== "object" || Array.isArray(entries)) return null;
     const packageJsonPath = path.join(owner.directory, "package.json");
@@ -243,7 +271,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
       const state = { browserSkip: packageJsonPath, browserTrail: [...browserTrail, visit] };
       return resolveExternal
         ? resolveExternal(target, packageUrl, state)
-        : resolveInstalledPackage(target, packageUrl, { span, _moduleSources, requestKind, allowCommonJS, ...state });
+        : resolveInstalledPackage(target, packageUrl, { span, _moduleSources, requestKind, allowCommonJS, target: moduleTarget, ...state });
     } catch (cause) {
       if (!(cause instanceof IngestionResolutionError)) throw cause;
       const error = new IngestionResolutionError(
@@ -268,7 +296,7 @@ function resolvePackageRequest(specifier, referrerUrl, {
     const packageUrl = pathToFileURL(packageJsonPath).href;
     const external = target => resolveExternal
       ? resolveExternal(target, packageUrl)
-      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail, _moduleSources, requestKind, allowCommonJS });
+      : resolveInstalledPackage(target, packageUrl, { span, browserSkip, browserTrail, _moduleSources, requestKind, allowCommonJS, target: moduleTarget });
     const target = resolvePackageImports(specifier, own.value.imports, packageJsonPath, referrerUrl, span, external, conditions);
     if (!target.startsWith("./")) return target;
     return browserTarget(own, target, new URL(target, pathToFileURL(own.directory + path.sep)))

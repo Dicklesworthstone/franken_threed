@@ -237,6 +237,49 @@ rather than changing its condition, warning, or initialization order. Native
 synchronous Three.js consumers can use the existing
 [`emitPortablePackage`](../compat-facade/portable-package.mjs) package route.
 
+## Node module applications
+
+The application builder has an explicit Node deployment target for headless
+Three.js utilities, exporters and other server-side ESM applications:
+
+```sh
+node tools/ingest/cli.mjs ./src/main.mjs --target node --build-app ./dist
+node ./dist/main.js
+```
+
+The equivalent API is `buildApplication(entry, output, { target: 'node' })`;
+`buildModuleGraph` and `bundleWithRollup` accept the same option. Browser remains
+the default. Node builds emit an ESM package with its own `type: "module"`, so
+moving the output beneath a CommonJS project does not change its entry format.
+The build and graph reports include the selected target.
+
+Node package resolution selects `node`, `node-addons`, `module-sync`, and the
+applicable `import` or `require` condition, in each package's declared key order.
+It honors private `#imports`, self references and the explicit Three.js package
+override. Legacy entry selection uses `main`; browser replacements and the
+bundler-specific `module` field do not redirect Node dependencies. Node symlink
+aliases resolve to the same canonical file while query and fragment instances
+remain distinct. These are the ordinary modern Node defaults; deployment with
+custom conditions or flags disabling those conditions requires a matching
+project frontend.
+
+Builtins remain native `node:` imports. Supported CommonJS calls use the pinned
+compiler's native `createRequire` thunk so builtin initialization and caught
+errors stay at their original synchronous call boundary. Finite lazy imports
+keep native module identity and rejection. No browser polyfills, browser
+renderer substitutions, GPU initialization or mandatory Wasm bootstrap are
+added. Numeric specialization remains an explicit, independently guarded
+opt-in. Existing JSON-module and static module-relative asset paths remain
+available after relocation.
+
+This is a Node ESM application output, not a replacement for the full Node
+loader. CommonJS dependencies use the same bounded compiler route described
+above; native addons, open runtime `require` graphs, module/cache introspection
+and synchronous ESM `require` still need a native route or project frontend.
+The retained portable Three.js package remains the synchronous `require('three')`
+route. HTML packing, browser document roots and renderer-routing options cannot
+be combined with the Node target. They fail before output is written.
+
 ## Native document fetch resources
 
 HTML application builds include finite local GET resources requested by document

@@ -6,15 +6,18 @@
 import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
+import {normalizeModuleTarget} from './node_package_resolver.mjs';
 
 const hash = source => 'sha256:' + createHash('sha256').update(source).digest('hex');
 
-export function createModuleSources(transformModule) {
+export function createModuleSources(transformModule, {target = 'browser'} = {}) {
+  target = normalizeModuleTarget(target);
   if (transformModule !== undefined && typeof transformModule !== 'function')
     throw new TypeError('transformModule must be a synchronous function');
   const records = new Map();
   const formats = new Map();
   return Object.freeze({
+    target,
     format(url) { return formats.get(new URL(url).href); },
     setFormat(url, format) { formats.set(new URL(url).href, format); },
     read(url, {sourceType = 'module', source} = {}) {
@@ -58,4 +61,12 @@ export function createModuleSources(transformModule) {
 
 // Internal propagation keeps analysis, route proofs and emission on exactly the
 // same transformed input. Public standalone graph/bundler calls start a snapshot.
-export const moduleSourcesFor = options => options._moduleSources ?? createModuleSources(options.transformModule);
+export function moduleSourcesFor(options) {
+  const target = normalizeModuleTarget(options.target);
+  if (options._moduleSources) {
+    if ((options._moduleSources.target ?? 'browser') !== target)
+      throw new TypeError('A module source snapshot cannot be shared across deployment targets');
+    return options._moduleSources;
+  }
+  return createModuleSources(options.transformModule, {target});
+}
