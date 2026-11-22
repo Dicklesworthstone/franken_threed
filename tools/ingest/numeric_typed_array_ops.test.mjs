@@ -320,6 +320,122 @@ test('nested reductions restore lexical bindings and share the outer work budget
   assert.equal(limited.run(a,b),reference(a,b));assert.equal(limited.diagnostics.fallbackCalls,1);
 });
 
+test('block reducers preserve mutable parameters, lexical state and aliased writes across every layout',()=>{
+  for(const [Type,type] of types)for(const method of ['reduce','reduceRight'])for(const helper of [false,true]) {
+    const fold=`function fold(a,b,seed){return a.${method}((sum,value,index,view)=>{
+      const slot=index,weight=b[slot];index+=7;value+=index/3;let contribution=0;
+      for(let pass=0;pass<3;pass++){
+        if(pass===1)continue;contribution+=value*weight;if(slot===2)break;
+      }
+      view[slot]=value;sum+=0.25;
+      if(slot===1)return sum+view[slot];
+      return sum+contribution+index;
+    },seed);}`;
+    const reference=Function('return ('+fold+')')();
+    const {kernel}=compile(helper?'function run(a,b,seed){return fold(a,b,seed);}':fold,[type,type,'f64'],
+      helper?{helperSources:new Map([['fold',fold]])}:{});
+    const a=new Type([-2.5,1/3,3,4]),b=a.slice();
+    assert.ok(Object.is(kernel.run(a.subarray(0,3),a.subarray(1),0.5),reference(b.subarray(0,3),b.subarray(1),0.5)));
+    same(a,b);
+    for(const seed of [-0,NaN])assert.ok(Object.is(kernel.run(new Type(),new Type(),seed),seed));
+    assert.equal(kernel.diagnostics.wasmCalls,3);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  }
+});
+
+test('block reducers isolate nested callback returns, switch exits and helper return values',()=>{
+  const sources=[`function fold(a,b){return a.reduce((sum,value,index)=>{
+    let total=b.reduceRight((inner,value,index)=>{
+      if(index===0)return inner+value;
+      let result=value;for(let k=0;k<2;k++)result+=index;
+      return inner+result;
+    },value);
+    b.forEach((value,index)=>{if(index===0)return;if(value>10)return total+=value;total+=1;});
+    if(b.some((value,index)=>{if(index===1)return false;return value>9;}))return sum+total;
+    switch(index){case 0:total+=1;break;case 1:{
+      let k=0;do{k++;if(k===1)continue;return sum+total+k;}while(k<2);break;
+    }default:total+=3;}
+    return sum+total;
+  },0);}`,
+  `function fold(a,b){return a.reduce((sum,value)=>sum+b.reduceRight((inner,value,index)=>{
+    const weight=index+1;if(value<0)return inner;return inner+value*weight;
+  },value),0);}`,
+  `function fold(a,b){let total=0;a.forEach((value,index)=>{
+    total+=b.reduce((sum,value)=>{if(value<0)return sum;const energy=value*value;return sum+energy;},value);
+    if(index===1)return;total+=1;
+  });return total+b.findIndex((value,index)=>{
+    const score=a.reduce((sum,value)=>{let next=sum;next+=value;return next;},value);
+    if(index===1)return false;return score>5;
+  });}`];
+  for(const fold of sources)for(const helper of [false,true]) {
+    const reference=Function('return ('+fold+')')();
+    const {kernel}=compile(helper?'function run(a,b){return fold(a,b);}':fold,['f64[]','f64[]'],
+      helper?{helperSources:new Map([['fold',fold]])}:{});
+    for(const values of [[2,3,4],[-2,3,12]]) {
+      const a=new Float64Array([1,2,3]),b=new Float64Array(values);
+      assert.ok(Object.is(kernel.run(a,b),reference(a,b)));
+    }
+    assert.equal(kernel.diagnostics.wasmCalls,2);assert.equal(kernel.diagnostics.fallbackCalls,0);
+  }
+});
+
+test('block reducers retain their original receiver when a captured local view is rebound',()=>{
+  for(const method of ['reduce','reduceRight']) {
+    const source=`function run(a,b){let view=a;return view.${method}((sum,value,index,receiver)=>{
+      view=b;const original=receiver;view[index]+=1;
+      if(index===1)return sum+original[index];
+      return sum+value+original[index];
+    },0);}`;
+    const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]','f64[]']);
+    const a=new Float64Array([1,2,3,4]),b=a.slice();
+    assert.equal(kernel.run(a.subarray(0,3),a.subarray(1)),reference(b.subarray(0,3),b.subarray(1)));
+    same(a,b);assert.equal(kernel.diagnostics.wasmCalls,1);
+  }
+});
+
+test('block reducer bounds and nested work failures discard the complete transaction and reset fuel',()=>{
+  const source=`function run(a,b,passes){a[0]+=1;return b.reduce((sum,value,index)=>{
+    a[index]+=value;for(let step=0;step<passes;step++){if(step===1)continue;a[index]+=value/3;}
+    if(index===1)return sum+a[index];return sum+value;
+  },0);}`;
+  const reference=Function('return ('+source+')')(),input=new Float32Array([1,2,3]);
+  const native=compile(source,['f32[]','f32[]','f64'],{maxIterations:9}).kernel;
+  const a=new Float32Array([4,5,6]),b=a.slice();
+  assert.equal(native.run(a,input,2),reference(b,input,2));same(a,b);assert.equal(native.diagnostics.wasmCalls,1);
+  const strict=compile(source,['f32[]','f32[]','f64'],{maxIterations:8}).kernel;
+  const untouched=new Float32Array([4,5,6]);
+  assert.throws(()=>strict.run(untouched,input,2),{code:'KERNEL_EXECUTION_FAILED'});same(untouched,new Float32Array([4,5,6]));
+  for(const short of [false,true]) {
+    const {kernel}=compile(source,['f32[]','f32[]','f64'],{maxIterations:8,runtime:{fallback:reference}});
+    const a=new Float32Array(short?[4]:[4,5,6]),b=a.slice();
+    assert.ok(Object.is(kernel.run(a,input,short?0:2),reference(b,input,short?0:2)));same(a,b);
+    assert.equal(kernel.diagnostics.fallbackCalls,1);
+    const next=new Float32Array([4,5,6]),expected=next.slice();
+    assert.equal(kernel.run(next,input,0),reference(expected,input,0));same(next,expected);
+    assert.equal(kernel.diagnostics.wasmCalls,1);
+  }
+});
+
+test('block reducer admission preserves numeric returns, lexical initialization and callback boundaries',()=>{
+  for(const callback of [
+    '(sum,value)=>{let next=value;sum+=next;}',
+    '(sum,value)=>{if(value)return sum;else return sum+value;}',
+    '(sum,value)=>{if(value)return;return sum+value;}',
+    '(sum,value)=>{if(value)return true;return sum+value;}',
+    '(sum,value)=>{let next=value;return a;}',
+    '(sum,value)=>{sum+=next;let next=value;return sum;}',
+    '(sum,value)=>{const next=value;next++;return sum+next;}',
+    '(sum,value)=>{let Math=value;return Math.abs(sum);}',
+    '(sum,value,index,view)=>{view=a;return sum+value;}',
+    '(sum,value)=>{var next=value;return sum+next;}',
+    '(sum,value)=>{throw value;return sum;}',
+    '(sum,value)=>{function nested(){return value;}return sum+nested();}',
+  ])for(const helper of [false,true]) {
+    const fold=`function fold(a){return a.reduce(${callback},0);}`;
+    assert.throws(()=>compile(helper?'function run(a){return fold(a);}':fold,['f64[]'],
+      helper?{helperSources:new Map([['fold',fold]])}:{}),callback);
+  }
+});
+
 test('helper reductions snapshot receivers and evaluate initial values before reading elements',()=>{
   const helpers=new Map([
     ['initial','function initial(a,b){a=b;a[0]+=10;return a[0];}'],
@@ -337,7 +453,7 @@ test('helper reductions snapshot receivers and evaluate initial values before re
 test('omitted seeds do not invoke singleton callbacks, preserving signed zero and earlier source writes',()=>{
   const helpers=new Map([['touch','function touch(a,value){a[0]+=1;return value;}']]);
   for(const method of ['reduce','reduceRight']) {
-    const source=`function run(out,input){out[0]+=2;return input.${method}((sum,x)=>touch(out,sum+x));}`;
+    const source=`function run(out,input){out[0]+=2;return input.${method}((sum,x)=>{const result=sum+x;return touch(out,result);});}`;
     const reference=Function([...helpers.values()].join(';')+';return ('+source+')')();
     const {kernel}=compile(source,['f64[]','f64[]'],{helperSources:helpers,runtime:{fallback:reference}});
     for(const values of [[-0],[NaN],[]]) {
@@ -363,7 +479,7 @@ test('late reduction bounds and helper work failures roll back the complete tran
 });
 
 for(const method of ['reduce','reduceRight'])test(`${method}: method replacements receive the original literal callback once`,()=>{
-  const source=`function run(a){a[0]+=1;return a.${method}((sum,x)=>sum+x,10);}`;
+  const source=`function run(a){a[0]+=1;return a.${method}((sum,x)=>{const result=sum+x;return result;},10);}`;
   const reference=Function('return ('+source+')')(),{kernel}=compile(source,['f64[]'],{runtime:{fallback:reference}});
   const parent=Object.getPrototypeOf(Float64Array.prototype);
   for(const where of ['own','arrayPrototype','typedPrototype']) {
@@ -375,7 +491,7 @@ for(const method of ['reduce','reduceRight'])test(`${method}: method replacement
     try {assert.equal(kernel.run(a),9);}
     finally {if(descriptor)Object.defineProperty(target,method,descriptor);else delete target[method];}
     assert.equal(a[0],2);assert.equal(gets,1);assert.equal(calls,1);
-    assert.equal(callback.length,2);assert.equal(callback.toString(),'(sum,x)=>sum+x');
+    assert.equal(callback.length,2);assert.equal(callback.toString(),'(sum,x)=>{const result=sum+x;return result;}');
   }
   assert.equal(kernel.diagnostics.wasmCalls,0);assert.equal(kernel.diagnostics.fallbackCalls,3);
   assert.equal(kernel.run(new Float64Array([1,2])),14);assert.equal(kernel.diagnostics.wasmCalls,1);

@@ -297,7 +297,7 @@ export function compileNumericKernel(source, {
   const loopControls = [];
   const controlLoops = [];
   let generalDepth = 0, maxGeneralDepth = 0, generalFuel = null;
-  let controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null;
+  let controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null, callbackResult = null;
   const mutableLocals = new Set();
   const scalarWrites = new Set();
   const reads = new Set();
@@ -420,11 +420,22 @@ export function compileNumericKernel(source, {
       expression:arg => expression(arg, depth + 1),
       allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
       compileCallback(callback, body, values) {
-        const parent = temporaries;
+        const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+          parentPredicate = callbackPredicate, parentResult = callbackResult;
         temporaries = new Map(parent); generalDepth++;
-        callback.params.forEach((param, index) => temporaries.set(param.name, values[index]));
-        try { return expression(body, depth + 1); }
-        finally { temporaries = parent; generalDepth--; }
+        callback.params.forEach((param, index) => {
+          temporaries.set(param.name, values[index]);
+          if (index < 3) mutableLocals.add(values[index]);
+        });
+        try {
+          if (body.type !== 'BlockStatement') return expression(body, depth + 1);
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+          callbackPredicate = null; callbackResult = values[0];
+          return [0x02, 0x40, ...compileBlock(body.body, true, depth + 1), 0x0b, ...get(callbackResult)];
+        } finally {
+          temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+          callbackPredicate = parentPredicate; callbackResult = parentResult;
+        }
       },
     });
   }
@@ -433,10 +444,10 @@ export function compileNumericKernel(source, {
       allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
       compileCallback(callback, body, values) {
         const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
-          parentPredicate = callbackPredicate;
+          parentPredicate = callbackPredicate, parentResult = callbackResult;
         temporaries = new Map(parent); generalDepth++;
         // The emitter adds a loop-exit block, loop and callback-return block.
-        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null;
+        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null; callbackResult = null;
         callback.params.forEach((param, index) => {
           temporaries.set(param.name, values[index]);
           if (index < 2) mutableLocals.add(values[index]);
@@ -445,7 +456,7 @@ export function compileNumericKernel(source, {
           : [{type:'ExpressionStatement', expression:body}], true, depth + 1); }
         finally {
           temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
-          callbackPredicate = parentPredicate;
+          callbackPredicate = parentPredicate; callbackResult = parentResult;
         }
       },
     });
@@ -455,9 +466,9 @@ export function compileNumericKernel(source, {
       allocateLocal:() => temporaryBase + temporaryCount++, control, fail, loopDepth:generalDepth,
       compileCallback(callback, body, values, predicate) {
         const parent = temporaries, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
-          parentPredicate = callbackPredicate;
+          parentPredicate = callbackPredicate, parentResult = callbackResult;
         temporaries = new Map(parent); generalDepth++;
-        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate;
+        controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate; callbackResult = null;
         callback.params.forEach((param, index) => {
           temporaries.set(param.name, values[index]);
           if (index < 2) mutableLocals.add(values[index]);
@@ -466,7 +477,7 @@ export function compileNumericKernel(source, {
           : [{type:'ReturnStatement', argument:body}], true, depth + 1); }
         finally {
           temporaries = parent; generalDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
-          callbackPredicate = parentPredicate;
+          callbackPredicate = parentPredicate; callbackResult = parentResult;
         }
       },
     });
@@ -822,7 +833,9 @@ export function compileNumericKernel(source, {
         }
         if (structuredLoops && statement.type === 'ReturnStatement') {
           if (callbackReturnDepth !== null) {
-            bytes.push(...(callbackPredicate === null ? compileEffects(statement.argument, depth + 1)
+            if (callbackResult !== null && !statement.argument) fail('Reduction callbacks require numeric returns', statement);
+            bytes.push(...(callbackResult !== null ? [...expression(statement.argument), ...set(callbackResult)]
+              : callbackPredicate === null ? compileEffects(statement.argument, depth + 1)
               : [...(statement.argument ? condition(statement.argument) : [0x41, 0]), 0xb8, ...set(callbackPredicate)]), 0x0c,
               ...u32(controlDepth - 1 - callbackReturnDepth));
             continue;

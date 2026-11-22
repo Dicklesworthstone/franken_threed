@@ -178,7 +178,7 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
           mark({ read, write }) { effect.read ||= read || write; effect.write ||= write; } });
       }
     });
-    let localCount = 0, loopDepth = 0, controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null;
+    let localCount = 0, loopDepth = 0, controlDepth = 0, callbackReturnDepth = null, callbackPredicate = null, callbackResult = null;
     const loopControls = [];
     function lookup(node, writing = false) {
       if (node?.type !== 'Identifier' || !environment.has(node.name)) fail('Scalar helpers cannot access captured or non-scalar bindings', node);
@@ -240,12 +240,20 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return compileTypedArrayReduction(node, {resolveArray,
         expression:arg => expression(arg, depth + 1), allocateLocal, control, fail, loopDepth, owner,
         compileCallback(callback, body, values) {
-          const parent = environment;
+          const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
+            parentPredicate = callbackPredicate, parentResult = callbackResult;
           environment = new Map(parent); loopDepth++;
           callback.params.forEach((param, index) => environment.set(param.name,
             index === 3 ? values[index] : {index:values[index], mutable:true}));
-          try { return expression(body, depth + 1); }
-          finally { environment = parent; loopDepth--; }
+          try {
+            if (body.type !== 'BlockStatement') return expression(body, depth + 1);
+            controlDepth += 3; callbackReturnDepth = controlDepth - 1;
+            callbackPredicate = null; callbackResult = values[0];
+            return [0x02, 0x40, ...block(body.body, depth + 1).bytes, 0x0b, ...get(callbackResult)];
+          } finally {
+            environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
+            callbackPredicate = parentPredicate; callbackResult = parentResult;
+          }
         },
       });
     }
@@ -253,16 +261,16 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return compileTypedArrayForEach(node, {resolveArray, allocateLocal, control, fail, loopDepth, owner,
         compileCallback(callback, body, values) {
           const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
-            parentPredicate = callbackPredicate;
+            parentPredicate = callbackPredicate, parentResult = callbackResult;
           environment = new Map(parent); loopDepth++;
-          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null;
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = null; callbackResult = null;
           callback.params.forEach((param, index) => environment.set(param.name,
             index === 2 ? values[index] : {index:values[index], mutable:true}));
           try { return block(body.type === 'BlockStatement' ? body.body
             : [{type:'ExpressionStatement', expression:body}], depth + 1).bytes; }
           finally {
             environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
-            callbackPredicate = parentPredicate;
+            callbackPredicate = parentPredicate; callbackResult = parentResult;
           }
         },
       });
@@ -271,16 +279,16 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
       return compileTypedArraySearch(node, {resolveArray, allocateLocal, control, fail, loopDepth, owner,
         compileCallback(callback, body, values, predicate) {
           const parent = environment, parentDepth = controlDepth, parentReturn = callbackReturnDepth,
-            parentPredicate = callbackPredicate;
+            parentPredicate = callbackPredicate, parentResult = callbackResult;
           environment = new Map(parent); loopDepth++;
-          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate;
+          controlDepth += 3; callbackReturnDepth = controlDepth - 1; callbackPredicate = predicate; callbackResult = null;
           callback.params.forEach((param, index) => environment.set(param.name,
             index === 2 ? values[index] : {index:values[index], mutable:true}));
           try { return block(body.type === 'BlockStatement' ? body.body
             : [{type:'ReturnStatement', argument:body}], depth + 1).bytes; }
           finally {
             environment = parent; loopDepth--; controlDepth = parentDepth; callbackReturnDepth = parentReturn;
-            callbackPredicate = parentPredicate;
+            callbackPredicate = parentPredicate; callbackResult = parentResult;
           }
         },
       });
@@ -446,10 +454,13 @@ export function createScalarHelperCompiler(helperSources, fail, intrinsics = nul
               bytes.push(...value, ...set(index));
             }
           } else if (statement.type === 'ReturnStatement') {
-            if (callbackReturnDepth !== null) bytes.push(...(callbackPredicate === null
-              ? effects(statement.argument, depth + 1)
-              : [...(statement.argument ? condition(statement.argument) : [0x41, 0]), 0xb8, ...set(callbackPredicate)]),
-              0x0c, ...u32(controlDepth - 1 - callbackReturnDepth));
+            if (callbackReturnDepth !== null) {
+              if (callbackResult !== null && !statement.argument) fail('Reduction callbacks require numeric returns', statement);
+              bytes.push(...(callbackResult !== null ? [...expression(statement.argument), ...set(callbackResult)]
+                : callbackPredicate === null ? effects(statement.argument, depth + 1)
+                : [...(statement.argument ? condition(statement.argument) : [0x41, 0]), 0xb8, ...set(callbackPredicate)]),
+                0x0c, ...u32(controlDepth - 1 - callbackReturnDepth));
+            }
             else {
               if (owner.resultType !== 'void' && !statement.argument) fail('Numeric helper returns cannot mix with void returns', statement);
               if (owner.resultType === 'boolean' && !booleanExpression(statement.argument))

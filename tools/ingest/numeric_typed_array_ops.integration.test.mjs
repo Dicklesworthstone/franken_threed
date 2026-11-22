@@ -74,8 +74,12 @@ test('borrowed bulk expressions discover conditional helper receivers and preser
 
 test('reduction-only functions discover callback array captures and inline helper graphs automatically',async t=>{
   const app=await application(t,`
-    export function weighted(a,weights,scale){return a.reduce((sum,value,index)=>sum+value*weights[index]*scale,0);}
-    export function measure(a,weights,scale){return weighted(a,weights,scale)+a.reduceRight((sum,value)=>sum-value,0);}
+    export function weighted(a,weights,scale){return a.reduce((sum,value,index)=>{
+      if(value<0)return sum;const weight=weights[index]*scale;return sum+value*weight;
+    },0);}
+    export function measure(a,weights,scale){return weighted(a,weights,scale)+a.reduceRight((sum,value)=>{
+      let contribution=value;if(contribution<0)contribution=-contribution;return sum-contribution;
+    },0);}
     export const identity=measure,weightedIdentity=weighted,run=(a,weights,scale)=>measure(a,weights,scale);
   `);
   const item=app.result.report.candidates.find(candidate=>candidate.functionName==='measure');
@@ -96,8 +100,14 @@ test('reducer-local names do not hide outer island array captures, scalar output
   const app=await application(t,`
     export function make(out,input,weights,trace){let total=1;return()=>{trace.push('before');
       for(let n=0;n<2;n++){
-        out[n]=input.reduce((total,value,index,out)=>total+value*weights[index]+out[index],0)+total;
-        total+=input.reduceRight(function(total,value,index,Math){return total+Math[index];},0)+Math.abs(out[n]);
+        out[n]=input.reduce((total,value,index,out)=>{
+          const local=weights;let term=value*local[index];
+          for(let pass=0;pass<2;pass++)term+=out[index]/2;
+          if(index===0)return total+term;return total+term;
+        },0)+total;
+        total+=input.reduceRight(function(total,value,index,Math){
+          const weights=Math;let term=weights[index];if(index===1)return total+term;return total+term;
+        },0)+Math.abs(out[n]);
       }
       trace.push([total,...out]);return total;
     };}
@@ -108,6 +118,36 @@ test('reducer-local names do not hide outer island array captures, scalar output
   const trace=[],expected=[],native=app.app.make(a,input,weights,trace),reference=app.reference.make(b,input,weights,expected);
   for(let frame=0;frame<3;frame++){assert.equal(native(),reference());equal(a,b);}
   assert.deepEqual(trace,expected);assert.equal(count(app),3);assert.equal(count(app,'fallbackCalls'),0);
+});
+
+test('block reducer islands publish captured state once and preserve partial source effects on failure',async t=>{
+  const app=await application(t,`
+    export function make(a,b,events){let total=0;return{read(){return total;},step(passes){
+      events.push(['before',total]);
+      for(let n=0;n<1;n++)total+=a.reduce((sum,value,index,view)=>{
+        view[index]+=1;total+=view[index];
+        for(let pass=0;pass<passes;pass++){if(pass===1)continue;view[index]+=b[0];}
+        if(passes<0)view.set(b,index);
+        if(index===1)return sum+view[index];return sum+value;
+      },0);
+      events.push(['after',total,...a]);return total;
+    }};}
+  `,{loopIslands:true,maxIterations:10});
+  assert.equal(regions(app).length,1);assert.deepEqual(regions(app)[0].scalarOutputs,['total']);
+  for(const Type of [Float32Array,Float64Array]) {
+    const a=new Type([1,2,3]),b=a.slice(),input=new Type([1/3,2/3]),events=[],expected=[];
+    const run=app.app.make(a,input,events),reference=app.reference.make(b,input,expected);
+    for(const passes of [1,3,0]) {
+      assert.equal(run.step(passes),reference.step(passes));equal(a,b);assert.equal(run.read(),reference.read());
+    }
+    let nativeError,sourceError;
+    try {run.step(-1);} catch(error) {nativeError=error;}
+    try {reference.step(-1);} catch(error) {sourceError=error;}
+    assert.ok(nativeError instanceof RangeError);assert.equal(nativeError.message,sourceError.message);
+    equal(a,b);assert.equal(run.read(),reference.read());
+    assert.equal(run.step(0),reference.step(0));equal(a,b);assert.deepEqual(events,expected);
+  }
+  assert.equal(count(app),6);assert.equal(count(app,'fallbackCalls'),4);
 });
 
 test('nonnumeric reduction seeds preserve identity on empty inputs and coerce only in source callbacks',async t=>{
@@ -129,10 +169,15 @@ test('relocated dynamic application builds execute forEach and reductions with n
   const source=`
     function measure(a,weights,initial){const view=a.subarray(1);view.fill(initial,0,1);
       view.forEach((value,index,view)=>{if(index===1)return;view[index]=value+weights[index];});
-      return view.reduce((sum,value,index,view)=>sum+value*weights[index]+view[index],initial)
-        +view.reduceRight(function(sum,value){return sum-value;});
+      return view.reduce((sum,value,index,view)=>{
+        let contribution=value*weights[index];
+        for(let pass=0;pass<2;pass++){if(pass===1)continue;contribution+=view[index];}
+        if(index===1)return sum+contribution;return sum+contribution+initial*0.25;
+      },initial)+view.reduceRight(function(sum,value){
+        let next=sum;next-=value;if(value<0)return next-1;return next;
+      });
     }
-    export const run=(a,weights,initial)=>measure(a,weights,initial);
+    export const run=(...args)=>measure(...args);
   `;
   fs.writeFileSync(path.join(src,'measure.mjs'),source);
   fs.writeFileSync(path.join(src,'entry.mjs'),"export const load=()=>import('./measure.mjs');");

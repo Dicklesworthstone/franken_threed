@@ -5,7 +5,8 @@ and `copyWithin` calls. Bulk-only functions do not need an artificial JavaScript
 loop to qualify. Immutable helper graphs, local borrowed references and ordinary
 application callbacks can use the same execution path.
 `reduce` and `reduceRight` also produce numeric results through inline callbacks
-within closed functions, helpers and admitted loop regions.
+with numeric state, branches and loops within closed functions, helpers and
+admitted loop regions.
 Discarded-result `forEach` calls admit inline numeric callbacks that update
 staged arrays and captured scalars, including ordinary animation closures.
 `some`, `every`, `find`, `findIndex`, `findLast` and `findLastIndex` admit inline
@@ -111,12 +112,19 @@ Native-call counts and measured timing remain separate from static reports.
 
 ## Ordered numeric reductions
 
-Inline arrow expressions and anonymous callbacks with a single numeric `return`
-can compute sums, weighted totals and other ordered scalar reductions:
+Inline arrow expressions and anonymous callbacks can compute sums, weighted
+totals and other ordered scalar reductions. Block callbacks may use initialized
+lexical locals, staged array writes, closed helpers, branches, loops and early
+numeric returns:
 
 ```js
 export function weightedSum(values, weights, seed) {
-  return values.reduce((total, value, index) => total + value * weights[index], seed);
+  return values.reduce((total, value, index) => {
+    const weight = weights[index];
+    if (weight <= 0) return total;
+    const contribution = value * weight;
+    return total + contribution;
+  }, seed);
 }
 ```
 
@@ -126,17 +134,31 @@ use the existing invocation guards. Callback names shadow enclosing bindings
 only inside their own body, including nested reductions. The receiver and length
 are captured before the initial value is evaluated; callback reads and helper
 writes observe staged storage in exact left-to-right or right-to-left order.
+The accumulator, value and index parameters may be reassigned. Each invocation
+receives a fresh value and index; changing that index does not retarget traversal.
+Callback-local numeric returns end only the current callback, including returns
+inside nested branches, switches and loops. Nested `forEach`, search and reduction
+callbacks keep their own return targets. Locals retain their lexical scopes and
+TDZ, and captured scalar writes publish with the enclosing transaction.
+
+A block callback requires a final explicit numeric `return`; all earlier returns
+must also be numeric. This bounded rule does not infer completeness from branch
+coverage or loop termination. Missing/bare returns, Boolean or reference results,
+`var` locals and rebinding the fourth receiver parameter retain JavaScript.
 
 An omitted seed uses the first or last element. An unseeded singleton invokes no
 callback; an empty unseeded input takes the original path for its source `TypeError`.
-Each callback invocation charges the existing shared work budget. A bounds or
-budget failure rolls back the complete transaction before the original source
-runs once, preserving preceding writes and errors.
+Each callback invocation charges the existing shared work budget; its loops,
+helpers and nested callbacks spend that same credit. A bounds or budget failure
+rolls back the complete transaction before the original source runs once,
+preserving preceding writes and errors. A source exception during that fallback
+keeps its partial callback writes and captured state; surrounding application
+effects are not replayed.
 
 Reduction results can appear in closed numeric expressions. Automatic extraction
 keeps the existing statement/loop boundaries; it does not create islands around
 arbitrary expressions. External callback identities, asynchronous callbacks,
-escaping reference results and arbitrary callback bodies remain in JavaScript.
+escaping reference results and unsupported callback effects remain in JavaScript.
 
 ## Numeric forEach callbacks
 
@@ -266,7 +288,10 @@ Rollup/CLI builds. Linked dynamic applications compare arrays and upload
 snapshots after every frame. Relocated output is tested in fresh processes both
 with and without Wasm. Reduction cases also cover both directions, seeds,
 empty/singleton inputs, callback shadowing, nested/helper effects and source
-callback identity under method overrides. The `forEach` tests additionally cover
+callback identity under method overrides. Block reductions additionally exercise
+mutable parameters, callback-local returns through nested control, captured-state
+publication, source exceptions after partial work, and real relocated builds.
+The `forEach` tests additionally cover
 callback-only returns, mutable parameters, lexical captures, nested-loop
 selection, staged mutation, scalar publication and source exceptions after
 partial work. Search tests cover all six methods and layouts, exact Boolean and undefined

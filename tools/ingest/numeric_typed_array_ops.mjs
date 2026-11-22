@@ -78,7 +78,11 @@ export function numericReductionCallbackBody(node) {
   if (!inlineCallback(node, 4)) return null;
   if (node.type === 'ArrowFunctionExpression' && node.body.type !== 'BlockStatement') return node.body;
   const statements = node.body.body;
-  return statements.length === 1 && statements[0].type === 'ReturnStatement' ? statements[0].argument : null;
+  if (statements.at(-1)?.type !== 'ReturnStatement' || !statements.at(-1).argument) return null;
+  // A final return rules out normal fallthrough without guessing branch or
+  // loop termination. The root/helper compiler checks EVERY return's numeric
+  // expression and owns callback-local exits, scopes and staged effects.
+  return statements.length === 1 ? statements[0].argument : node.body;
 }
 
 export function numericForEachCallbackBody(node) {
@@ -191,31 +195,31 @@ export function compileTypedArrayReduction(node, {
   const view = {type:receiver.type, reference:true, mutable:false,
     index:allocateLocal(), lengthIndex:allocateLocal(), sources:new Set([receiver]),
     mark:effect => receiver.mark(effect)};
-  const accumulator = allocateLocal(), value = allocateLocal(), index = allocateLocal();
+  const accumulator = allocateLocal(), value = allocateLocal(), index = allocateLocal(), counter = allocateLocal();
   const storage = layout(receiver.type);
-  const load = () => [...arrayPointer(view), ...get(index), 0xab, 0x41, storage.alignment, 0x74, 0x6a,
+  const load = () => [...arrayPointer(view), ...get(counter), 0xab, 0x41, storage.alignment, 0x74, 0x6a,
     storage.load, storage.alignment, 0,
     ...(receiver.type === 'f64[]' ? [] : receiver.type === 'f32[]' ? [0xbb] : [storage.signed ? 0xb7 : 0xb8])];
-  const advance = [...get(index), ...number(1), reverse ? 0xa1 : 0xa0, ...set(index)];
+  const advance = [...get(counter), ...number(1), reverse ? 0xa1 : 0xa0, ...set(counter)];
   // The receiver and its intrinsic length are captured BEFORE the initial-value
   // expression. The callback's array argument refers to this same snapshot even
   // when a later local reference is rebound by the enclosing source function.
   const code = [...arrayPointer(receiver), 0xb8, ...set(view.index),
     ...arrayLength(receiver), 0xb8, ...set(view.lengthIndex),
-    ...(reverse ? [...get(view.lengthIndex), ...number(1), 0xa1] : number(0)), ...set(index)];
+    ...(reverse ? [...get(view.lengthIndex), ...number(1), 0xa1] : number(0)), ...set(counter)];
   const initial = node.arguments.length === 2;
   if (initial) code.push(...expression(node.arguments[1]), ...set(accumulator));
   else code.push(...trapUnless([...get(view.lengthIndex), ...number(0), 0x64]),
     ...load(), ...set(accumulator), ...advance);
   const callbackCode = compileCallback(callback, body, [accumulator, value, index, view]);
   const count = [...get(view.lengthIndex), ...(!initial ? [...number(1), 0xa1] : [])];
-  const more = reverse ? [...get(index), ...number(0), 0x66]
-    : [...get(index), ...get(view.lengthIndex), 0x63];
+  const more = reverse ? [...get(counter), ...number(0), 0x66]
+    : [...get(counter), ...get(view.lengthIndex), 0x63];
   // A one-element unseeded reduction invokes no callback and keeps the loaded
   // Number untouched. Empty unseeded reductions trap before work/publication,
   // letting the original method produce its source TypeError in place.
   code.push(...control.charge(count), 0x02, 0x40, 0x03, 0x40,
-    ...more, 0x45, 0x0d, 1, ...load(), ...set(value),
+    ...more, 0x45, 0x0d, 1, ...load(), ...set(value), ...get(counter), ...set(index),
     ...callbackCode, ...set(accumulator), ...advance, 0x0c, 0, 0x0b, 0x0b, ...get(accumulator));
   return code;
 }
