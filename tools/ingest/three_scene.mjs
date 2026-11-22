@@ -427,14 +427,14 @@ export async function createGpuThreeScene(device,scene,{
     // Shadow ownership: the core's single projected map, or (WebGL surface) the
     // r186 WebGLShadowMap port drawing depth/distance programs for every caster.
     programShadowMode=wantsProgramShadows(activeNodes);
-    // Lights only the r186 programs shade (rect-area LTC, projected spot maps)
+    // Lights only the r186 programs shade (SH probes, rect-area LTC, projected spot maps)
     // put every lit material on the program route, as shadow maps do.
-    programLightMode=programShadowMode||(programRoute()&&activeNodes.some(o=>o.isLight&&(o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
+    programLightMode=programShadowMode||(programRoute()&&activeNodes.some(o=>o.isLight&&(o.isLightProbe||o.isRectAreaLight||(o.isSpotLight&&!!o.map))));
     // Transmissive materials (r186 renderTransmissionPass) re-render the opaque
     // list offscreen through programs: every draw takes the program route.
     programTransmissionMode=passOverride===null&&programRoute()&&!!programSupport.createTransmission&&activeNodes.some(o=>sourceMaterials(o).some(m=>materialState(m)?.transmission>0));
     for(const object of activeNodes){
-      if(!nativeLightMode&&!capturedNodeLight(object)&&(object.isLightProbe||object.isLightProbeGrid))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
+      if(!nativeLightMode&&!capturedNodeLight(object)&&(object.isLightProbeGrid||object.isLightProbe&&!programRoute()))fail('OBJECT',`Unsupported source renderable: ${object.type}`);
       if(object.isLight&&!programLightMode&&!nativeLightMode&&!capturedNodeLight(object))light(object);
       if(shadowEnabled&&object.isMesh&&object.castShadow&&!programShadowMode&&!capturedNodeObject(object)){
         if(object.customDepthMaterial!=null||object.customDistanceMaterial!=null||
@@ -461,6 +461,10 @@ export async function createGpuThreeScene(device,scene,{
     if(!shadowEnabled||!programRoute()||!programSupport.createShadows)return false;
     const lights=nodes.filter(o=>!excludedNodeObject(o)&&o.isLight&&o.castShadow);
     if(!lights.length)return false;
+    // Probe lighting selects ShaderLib even when a single shadow map could use
+    // the fixed path. Decide ownership before render's preparation check so a
+    // probe added to an already prepared shadow scene can transition safely.
+    if(nodes.some(o=>o.isLightProbe))return true;
     // The native single-map owner derives casters from color bindings. With an
     // override, preserve the ORIGINAL shadow materials through the program owner.
     if(passOverride!==null||programShadowSticky||lights.length>1||programToneMapping()||programDepthMode()||nodes.some(o=>o.castShadow&&

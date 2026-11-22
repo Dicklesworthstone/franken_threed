@@ -625,6 +625,25 @@ Existing shader, material and shadow-map profile limits remain in force. This is
 retained-JavaScript program preparation with owned WebGPU rendering, without a
 performance claim or a claim of complete physical-material/shadow coverage.
 
+## WebGL-authored spherical-harmonic light probes
+
+Ordinary `LightProbe` objects select the retained r186 ShaderLib programs for
+lit materials on the owned WebGPU backend. The source lighting path sums all
+nine spherical-harmonic coefficients from each visible, camera-layer-selected
+probe, scaled by its intensity. Ancestor visibility, live coefficient changes
+and light-state capture before object render callbacks retain source behavior.
+Adding a probe to an already prepared shadow scene also prepares the source
+program shadow owner before drawing the new lighting combination.
+`LightProbeGrid` volumes still require their separate per-object selection and
+texture ownership path and remain explicitly unsupported on this surface.
+
+`three_renderer_webgl_probes.test.mjs` compares Lambert, Phong, Standard and
+Physical material uniforms with the pinned `WebGLLights` implementation and
+checks the generated probe shader, visibility, layers, callback timing and live
+shadow-owner transitions.
+This is source and recording-device evidence; browser pixel equivalence and
+hardware performance have not been measured for these cases.
+
 ## Public PMREM generation for WebGL-authored applications
 
 After `await renderer.init()`, the public
