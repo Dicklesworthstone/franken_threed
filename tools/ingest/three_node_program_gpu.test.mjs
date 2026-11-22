@@ -864,6 +864,41 @@ test('native shader compilation failure cannot publish a successful pipeline and
   f.stage(record, []);
 });
 
+test('known native shader scope failure rejects shared registrations before stalled compilation and pipelines', async t => {
+  const f = rig(t), releasePipelines = f.holdPipelines(), scopeResolvers = [], stack = [];
+  const scopes = [0, 1].map(() => new Promise(resolve => { scopeResolvers.push(resolve); }));
+  let releaseInfo, heldModule = false, holdVertex = true, popped = 0;
+  const info = new Promise(resolve => { releaseInfo = resolve; }), create = f.device.createShaderModule;
+  f.device.pushErrorScope = kind => stack.push(kind);
+  f.device.popErrorScope = () => { assert.ok(stack.pop()); return heldModule ? scopes[popped++] : Promise.resolve(null); };
+  f.device.createShaderModule = descriptor => {
+    const module = create(descriptor), held = holdVertex && descriptor.code === f.program().vertex;
+    heldModule = held; if (held) holdVertex = false;
+    module.getCompilationInfo = () => held ? info : Promise.resolve({messages: []}); return module;
+  };
+  t.after(() => { for (const resolve of scopeResolvers) resolve(null); releaseInfo({messages: []}); releasePipelines(); });
+  const outcomes = [];
+  for (let index = 0; index < 3; index++)
+    f.add([]).then(value => outcomes.push({value}), error => outcomes.push({error}));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.shaderModules.length, 2); assert.equal(f.pipelines.length, 2); assert.deepEqual(stack, []);
+  scopeResolvers[0]({message: 'known native module failure'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(outcomes.length, 3, 'all shared callers must reject before the pending native work finishes');
+  const failure = outcomes[0].error;
+  assert.equal(failure?.code, 'GPU_PROGRAM_MODULE_DEVICE'); assert.match(failure.message, /known native module failure/);
+  assert.ok(outcomes.every(outcome => outcome.error === failure));
+  f.device.createRenderPipelineAsync = async descriptor => { f.pipelines.push(descriptor); return descriptor; };
+  const replacement = await f.add([]); f.stage(replacement, []);
+  assert.equal(f.shaderModules.length, 3, 'only the failed module is reconstructed');
+  assert.equal(f.pipelines.length, 4); assert.notEqual(replacement.pipelines.normal, f.pipelines[0]);
+  scopeResolvers[1]({message: 'late native scope failure'});
+  releaseInfo({messages: [{type: 'error', message: 'late native compilation failure'}]}); releasePipelines();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await f.add([])).pipelines.normal, replacement.pipelines.normal);
+  assert.equal(f.shaderModules.length, 3); assert.equal(f.pipelines.length, 4);
+});
+
 test('native source changes recompile only the changed stage while raster and binding variants reuse modules', async t => {
   const f = rig(t), first = await f.add([16]);
   const state = await f.add([32], {raster: {...f.raster, cullMode: 'none'}});

@@ -14,6 +14,7 @@ const {AttributeType} = await import(pathToFileURL(path.join(root,'src/renderers
 const attribute=(values,width=3,C=Float32Array)=>new BufferAttribute(new C(values),width);
 const geometry=()=>new BufferGeometry().setAttribute('position',attribute([0,0,0, 1,0,0, 0,1,0]));
 const bytes=b=>[...new Uint8Array(b.data)];
+function deferred(){let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};}
 function glReplica() {
   let bound;
   const gl={createBuffer:()=>({data:new ArrayBuffer(0)}),bindBuffer(_t,b){bound=b;},
@@ -262,6 +263,62 @@ test('rejected error scopes terminate residency even before whenIdle is called',
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(gpu.failed,true);assert.equal(gpu.bufferBytes,0);
   assert.throws(()=>gpu.update(),e=>e===error);gpu.dispose();
+});
+
+for (const stalled of ['sibling', 'earlier', 'both']) for (const failedScope of [0, 1])
+test(`known geometry scope ${failedScope} errors release uploads blocked by ${stalled} validation`,async()=>{
+  const d=geometryDevice(),g=geometry(),gpu=createGpuBufferGeometry(d,g);await gpu.whenIdle();
+  const earlier=deferred(),sibling=deferred(),failure=deferred(),fence=deferred();
+  if(stalled==='sibling')earlier.resolve(null);
+  if(stalled==='earlier')sibling.resolve(null);
+  const reports=[earlier.promise,Promise.resolve(null)];
+  d.popErrorScope=()=>{assert.ok(d.scopes.pop());return reports.shift()??Promise.resolve(null);};
+  d.completion=fence.promise;
+  g.attributes.position.needsUpdate=true;gpu.update();
+  reports.push(...(failedScope===0?[failure.promise,sibling.promise]:[sibling.promise,failure.promise]));
+  g.attributes.position.needsUpdate=true;gpu.update();
+  const owned=d.buffers.slice();for(const buffer of owned){buffer.destroys=0;buffer.destroy=()=>{buffer.destroyed=true;buffer.destroys++;};}
+  let outcome,replacement;
+  const idle=gpu.whenIdle().then(()=>{outcome={status:'fulfilled'};},error=>{outcome={status:'rejected',error};});
+  try{
+    failure.resolve({message:'known geometry upload failure'});
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.ok(outcome,'a known upload error must stop waiting for sibling scopes, earlier uploads and queue completion');
+    assert.equal(outcome.status,'rejected');assert.equal(outcome.error.code,'GEOMETRY_GPU_DEVICE');
+    assert.match(outcome.error.message,/known geometry upload failure/);
+    assert.equal(gpu.failed,true);assert.equal(gpu.bufferBytes,0);assert.equal(gpu.shadowBytes,0);
+    assert.equal(gpu.diagnostics.residentAttributes,0);assert.deepEqual(d.scopes,[]);
+    assert.ok(owned.every(buffer=>buffer.destroys===1));
+    assert.throws(()=>gpu.update(),error=>error===outcome.error);
+
+    replacement=createGpuBufferGeometry(d,g);const fresh=d.buffers.slice(owned.length);
+    gpu.dispose();earlier.resolve({message:'late earlier failure'});sibling.resolve({message:'late sibling failure'});
+    fence.resolve();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(replacement.failed,false);assert.ok(fresh.every(buffer=>!buffer.destroyed));
+    assert.ok(owned.every(buffer=>buffer.destroys===1),'late scope completion cannot release buffers twice');
+    await replacement.whenIdle();
+  }finally{
+    earlier.resolve(null);sibling.resolve(null);failure.resolve(null);fence.resolve();
+    gpu.dispose();replacement?.dispose();await idle;
+  }
+});
+
+test('successful geometry uploads still wait for every scope, earlier upload and queue completion',async()=>{
+  const d=geometryDevice(),g=geometry(),gpu=createGpuBufferGeometry(d,g);await gpu.whenIdle();
+  const earlier=deferred(),invalid=deferred(),oom=deferred(),fence=deferred();
+  const reports=[earlier.promise,Promise.resolve(null),invalid.promise,oom.promise];
+  d.popErrorScope=()=>{assert.ok(d.scopes.pop());return reports.shift()??Promise.resolve(null);};d.completion=fence.promise;
+  g.attributes.position.needsUpdate=true;gpu.update();g.attributes.position.needsUpdate=true;gpu.update();
+  let completed=false;const idle=gpu.whenIdle().then(()=>{completed=true;});
+  try{
+    invalid.resolve(null);await new Promise(resolve=>setImmediate(resolve));assert.equal(completed,false);
+    oom.resolve(null);await new Promise(resolve=>setImmediate(resolve));assert.equal(completed,false);
+    earlier.resolve(null);await new Promise(resolve=>setImmediate(resolve));assert.equal(completed,false);
+    fence.resolve();await idle;assert.equal(completed,true);assert.equal(gpu.failed,false);
+    assert.equal(gpu.bufferBytes,36);assert.ok(d.buffers.every(buffer=>!buffer.destroyed));
+  }finally{
+    earlier.resolve(null);invalid.resolve(null);oom.resolve(null);fence.resolve();await idle;gpu.dispose();
+  }
 });
 
 test('source counts cannot outgrow stale residency and unsupported deformation inputs are explicit',()=>{

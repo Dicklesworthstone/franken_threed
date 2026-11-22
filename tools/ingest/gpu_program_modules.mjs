@@ -41,10 +41,13 @@ export function gpuProgramModule(device, {code, label}) {
     const errors = info?.messages?.filter(message => message.type === 'error') ?? [];
     if (errors.length) throw failure(errors.map(error => error.message).join('\n'));
   });
-  const ready = Promise.all([...validation, compilation]).then(reports => {
-    if (caught) throw caught;
-    const reported = reports.find(Boolean);
+  // A reported scope error already invalidates this module. Reject and evict
+  // it even if another scope or compilation diagnostics never finishes.
+  const checks = validation.map(scope => scope.then(reported => {
     if (reported) throw failure(reported.message || 'Shader module creation failed');
+  }));
+  const ready = Promise.all([...checks, compilation]).then(() => {
+    if (caught) throw caught;
     return module;
   });
   const entry = Object.freeze({module, ready}), bytes = code.length * 2;

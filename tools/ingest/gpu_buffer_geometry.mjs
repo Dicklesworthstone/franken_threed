@@ -334,10 +334,11 @@ function createResidency(device, geometry, {
         catch (error) { reports.push(Promise.reject(error)); }
       }
     }
-    const errors = Promise.all(reports).then(values => {
-      const error = values.find(Boolean);
+    // A known upload failure must retire residency even if a sibling scope
+    // never settles. Successful uploads still wait for every scope below.
+    const errors = Promise.all(reports.map(report => report.then(error => {
       if (error) throw new BufferGeometryGpuError('GEOMETRY_GPU_DEVICE', error.message || 'GPU upload failed');
-    }).catch(error => { throw stop(error); });
+    }))).catch(error => { throw stop(error); });
     pending = Promise.all([pending, errors]).then(() => {}); pending.catch(() => {});
     if (failed) throw stop(caught);
     return result;
