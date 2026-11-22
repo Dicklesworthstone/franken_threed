@@ -215,3 +215,132 @@ test(`${Material.name} ${deformation} wireframes automatically use source native
   assert.equal(material.colorNode == null, true, 'wireframe needs no dummy authored node');
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
+
+for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} custom wireframes submit queued source edges, ranges and uniform values`, async t => {
+  let setups = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) {
+      setups++;
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T.MeshBasicMaterial { constructor() { super(); this.type = 'QueuedWireframeExtension'; } }
+  const material = new (registered ? Application : Extension)(); material.wireframe = true; material.applicationGain = .375;
+  const f = await fixture(t, {material});
+  if (registered) f.renderer.library.addMaterial(Extension, 'QueuedWireframeExtension');
+  const original = [...f.expectedIndex().array];
+  f.renderer.render(f.scene, f.camera);
+  material.wireframe = false; material.applicationGain = .875; f.geometry.setDrawRange(3, 3);
+  f.renderer.render(f.scene, f.camera);
+  f.geometry.index.array.set([2, 1, 0, 3, 2, 0]); f.geometry.index.needsUpdate = true;
+  material.wireframe = true; material.applicationGain = .625; f.geometry.setDrawRange(0, 3);
+  const changed = [...f.expectedIndex().array]; f.renderer.render(f.scene, f.camera);
+  f.geometry.index.array.fill(0); material.wireframe = false; material.applicationGain = .125; f.geometry.setDrawRange(0, 0);
+  await f.renderer.waitForGPU();
+  const submitted = draws(f.device);
+  assert.deepEqual(submitted.map(draw => [draw.pipeline.primitive.topology, draw.args[0], draw.args[2]]),
+    [['line-list', 12, 0], ['triangle-list', 3, 3], ['line-list', 6, 0]]);
+  assert.deepEqual(indices(submitted[0]).slice(0, original.length), original);
+  assert.deepEqual(indices(submitted[2]).slice(0, changed.length), changed);
+  const uniforms = draw => [...draw.groups].flatMap(([slot, {group, offsets}]) => {
+    const layouts = draw.pipeline.layout.bindGroupLayouts[slot].entries;
+    const dynamic = layouts.filter(entry => entry.buffer?.hasDynamicOffset).map(entry => entry.binding);
+    return group.entries.flatMap(entry => {
+      if (!entry.resource?.buffer || !layouts.find(layout => layout.binding === entry.binding)?.buffer) return [];
+      const bytes = draw.contents.get(entry.resource.buffer);
+      const offset = (entry.resource.offset ?? 0) + (offsets[dynamic.indexOf(entry.binding)] ?? 0);
+      const size = entry.resource.size ?? bytes.byteLength - offset;
+      return [...new Float32Array(bytes.buffer, bytes.byteOffset + offset, size / 4)];
+    });
+  });
+  for (const [index, gain] of [.375, .875, .625].entries()) assert.ok(uniforms(submitted[index]).includes(gain));
+  assert.equal(setups, 1, 'all topology descriptors retain one source shader construction');
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} custom wireframes compose with generated instance streams`, async t => {
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) { return super.setupOutput(builder, output.mul(N.vec4(.25, .5, .75, 1))); }
+  }
+  class Application extends T.MeshBasicMaterial { constructor() { super(); this.type = 'InstancedWireframeExtension'; } }
+  const geometry = new T.PlaneGeometry(), material = new (registered ? Application : Extension)(); material.wireframe = true;
+  // Capacity exceeds the source uniform-buffer limit, selecting generated vertex streams.
+  const mesh = new T.InstancedMesh(geometry, material, 1025); mesh.count = 2;
+  mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(2, 0, 0));
+  mesh.setMatrixAt(1, new T.Matrix4().makeTranslation(11, 0, 0)); mesh.instanceMatrix.needsUpdate = true;
+  const f = await fixture(t, {geometry, material, mesh}); t.after(() => mesh.dispose());
+  if (registered) f.renderer.library.addMaterial(Extension, 'InstancedWireframeExtension');
+  const expected = [...f.expectedIndex().array];
+  f.renderer.render(f.scene, f.camera);
+  mesh.setMatrixAt(0, new T.Matrix4().makeTranslation(7, 0, 0)); mesh.instanceMatrix.needsUpdate = true;
+  mesh.count = 1; f.renderer._nodes.nodeFrame.update();
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  const submitted = draws(f.device);
+  assert.deepEqual(submitted.map(draw => [draw.pipeline.primitive.topology, draw.args[0], draw.args[1]]),
+    [['line-list', 12, 2], ['line-list', 12, 1]]);
+  for (const draw of submitted) assert.deepEqual(indices(draw).slice(0, expected.length), expected);
+  const instanceValues = draw => [...draw.streams].flatMap(([slot, buffer]) => {
+    if (draw.pipeline.vertex.buffers[slot].stepMode !== 'instance') return [];
+    const bytes = draw.contents.get(buffer);
+    return [...new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4)];
+  });
+  assert.ok(instanceValues(submitted[0]).includes(2)); assert.ok(instanceValues(submitted[0]).includes(11));
+  assert.ok(instanceValues(submitted[1]).includes(7));
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('custom wireframe topology mutations inside source updates still fail before publication', async t => {
+  class Extension extends T.MeshBasicNodeMaterial {}
+  const material = new Extension(); material.wireframe = true;
+  const f = await fixture(t, {material}); let change = true;
+  material.colorNode = N.uniform(new T.Color(1, 1, 1)).onObjectUpdate(() => {
+    if (change) { material.wireframe = false; change = false; }
+    return new T.Color(1, 1, 1);
+  });
+  assert.throws(() => f.renderer.render(f.scene, f.camera), {code: 'THREE_NODE_PROGRAM_CHANGED'});
+  assert.equal(draws(f.device).length, 0); assert.equal(f.renderer._nodeCaptureBytes, 0);
+  f.renderer.render(f.scene, f.camera); await f.renderer.waitForGPU();
+  assert.equal(draws(f.device)[0].pipeline.primitive.topology, 'triangle-list');
+});
+
+test('custom wireframe draws rebuild resized and widened edge allocations without repeating shader setup', async t => {
+  let setups = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    setupOutput(builder, output) { setups++; return super.setupOutput(builder, output); }
+  }
+  const material = new Extension(); material.wireframe = true;
+  const f = await fixture(t, {material}), original = [...f.expectedIndex().array];
+  f.renderer.render(f.scene, f.camera);
+  f.geometry.setIndex(new T.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+  const resized = [...f.expectedIndex().array]; f.renderer.render(f.scene, f.camera);
+  await f.renderer.waitForGPU();
+  const first = draws(f.device);
+  assert.deepEqual(first.map(draw => draw.args[0]), [12, 6]);
+  assert.deepEqual(indices(first[0]).slice(0, original.length), original);
+  assert.deepEqual(indices(first[1]).slice(0, resized.length), resized);
+  const position = f.geometry.attributes.position, expanded = new Float32Array(65535 * 3);
+  expanded.set(position.array); f.geometry.setAttribute('position', new T.BufferAttribute(expanded, 3));
+  f.geometry.index.needsUpdate = true;
+  const widened = [...f.expectedIndex().array]; f.renderer.render(f.scene, f.camera);
+  await f.renderer.waitForGPU();
+  const last = draws(f.device).at(-1);
+  assert.equal(last.index.format, 'uint32'); assert.equal(last.args[0], 6);
+  assert.deepEqual(indices(last).slice(0, widened.length), widened);
+  assert.equal(setups, 1); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('ordinary wireframe material custom keys select native queued topology without dummy node slots', async t => {
+  const material = new T.MeshStandardMaterial({wireframe: true}), originalKey = material.customProgramCacheKey;
+  let keys = 0;
+  material.customProgramCacheKey = function() { keys++; return originalKey.call(this) + ':application'; };
+  const f = await fixture(t, {material});
+  f.renderer.render(f.scene, f.camera); const initialKeys = keys;
+  material.wireframe = false; f.geometry.setDrawRange(3, 3); f.renderer.render(f.scene, f.camera);
+  await f.renderer.waitForGPU();
+  assert.deepEqual(draws(f.device).map(draw => [draw.pipeline.primitive.topology, draw.args[0], draw.args[2]]),
+    [['line-list', 12, 0], ['triangle-list', 3, 3]]);
+  assert.ok(initialKeys > 0); assert.equal(keys, initialKeys);
+  assert.equal(material.colorNode, undefined); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});

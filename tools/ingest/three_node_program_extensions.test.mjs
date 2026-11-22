@@ -184,6 +184,27 @@ test('primitive extensions reject unknown object subclasses and effectful access
   assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
 });
 
+for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical'])
+test(`ordinary ${family} wireframes retain custom program-key boundaries without authored node slots`, t => {
+  const f = fixture(t), material = new T[family + 'Material']({wireframe: true}), trace = [];
+  const originalKey = material.customProgramCacheKey;
+  material.customProgramCacheKey = function() { trace.push('key'); return originalKey.call(this) + ':application'; };
+  const item = f.add(material);
+  const compare = () => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected); equalShaders(descriptor, reference);
+    f.capture(item, descriptor); return {reference, descriptor};
+  };
+  const first = compare(); assert.equal(first.descriptor.wireframe, true);
+  material.wireframe = false; f.renderer.info.calls++;
+  const filled = compare();
+  assert.equal(filled.reference, first.reference); assert.notEqual(filled.descriptor, first.descriptor);
+  assert.equal(filled.descriptor.wireframe, false);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  const invalidated = compare(); assert.notEqual(invalidated.reference, first.reference);
+  assert.equal(material.colorNode, undefined);
+});
+
 test('extension selection and unsupported application accessors stay effect-free', t => {
   const f = fixture(t); let effects = 0;
   class Inherited extends T.MeshBasicNodeMaterial {}
@@ -2136,4 +2157,116 @@ test('interleaved and normalized extension boundaries reject invalid source layo
     geometry.setAttribute('applicationData', attribute);
     assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_ATTRIBUTE'}); assert.equal(effects, 0);
   }
+});
+
+for (const family of ['MeshBasic', 'MeshStandard', 'MeshPhysical']) for (const registered of [false, true])
+test(`${registered ? 'registered' : 'inherited'} ${family} wireframes retain source shader sharing through topology changes`, t => {
+  const f = fixture(t), trace = [];
+  class Extension extends T[family + 'NodeMaterial'] {
+    constructor() { super(); this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+    setupOutput(builder, output) {
+      trace.push(['setup', builder.object, builder.context.material === builder.material, builder.material.wireframe]);
+      return super.setupOutput(builder, N.vec4(output.rgb.mul(N.materialReference('applicationGain', 'float')), output.a));
+    }
+  }
+  class Application extends T[family + 'Material'] {
+    constructor() { super(); this.type = 'WireframeExtension'; this.applicationGain = .375; this.applicationVariant = 0; }
+    customProgramCacheKey() { trace.push('key'); return super.customProgramCacheKey() + ':' + this.applicationVariant; }
+  }
+  if (registered) f.renderer.library.addMaterial(Extension, 'WireframeExtension');
+  const material = new (registered ? Application : Extension)(); material.wireframe = true;
+  const a = f.add(material), b = f.add(material);
+  a.object.position.x = 2; b.object.position.x = 11; f.scene.updateMatrixWorld();
+  const compare = item => {
+    const reference = f.reference(item), expected = trace.splice(0), descriptor = f.compile(item);
+    assert.deepEqual(trace.splice(0), expected, 'source setup and key callbacks retain their construction boundaries');
+    equalShaders(descriptor, reference);
+    assert.equal(descriptor.topology, material.wireframe ? 'lines' : 'triangles');
+    assert.equal(descriptor.wireframe, material.wireframe);
+    return {reference, descriptor};
+  };
+  const capture = (item, descriptor) => {
+    item.object.modelViewMatrix.multiplyMatrices(f.camera.matrixWorldInverse, item.object.matrixWorld);
+    item.object.normalMatrix.getNormalMatrix(item.object.modelViewMatrix);
+    f.referenceDraw(item, {fullLifecycle: true});
+    const packet = f.capture(item, descriptor, {captureGeometry() {}});
+    equalInstanceUniforms(f, item, descriptor, packet);
+    return packet;
+  };
+  const firstA = compare(a), firstB = compare(b);
+  assert.equal(firstA.reference, firstB.reference);
+  assert.notEqual(firstA.descriptor, firstB.descriptor);
+  const acceptedA = capture(a, firstA.descriptor), acceptedB = capture(b, firstB.descriptor);
+  const savedA = acceptedA.uniforms.map(bytes => bytes.slice()), savedB = acceptedB.uniforms.map(bytes => bytes.slice());
+  assert.ok(values(acceptedA).includes(.375)); assert.ok(values(acceptedA).includes(2)); assert.ok(values(acceptedB).includes(11));
+  material.applicationGain = .875; material.wireframe = false; f.renderer.info.calls++;
+  const filledA = compare(a), filledB = compare(b);
+  assert.equal(filledA.reference, firstA.reference); assert.equal(filledB.reference, firstB.reference);
+  assert.notEqual(filledA.descriptor, firstA.descriptor);
+  assert.ok(values(capture(a, filledA.descriptor)).includes(.875)); capture(b, filledB.descriptor);
+  assert.deepEqual(trace, [], 'wireframe-only pipeline changes do not reconstruct the shared source graph');
+  material.wireframe = true; f.renderer.info.calls++;
+  const wireA = compare(a), wireB = compare(b);
+  assert.equal(wireA.reference, firstA.reference); assert.equal(wireB.reference, firstB.reference);
+  assert.notEqual(wireA.descriptor, filledA.descriptor); capture(a, wireA.descriptor); capture(b, wireB.descriptor);
+  material.needsUpdate = true; f.renderer.info.calls++;
+  assert.equal(compare(a).descriptor, wireA.descriptor); assert.equal(compare(b).descriptor, wireB.descriptor);
+  material.wireframe = false; material.needsUpdate = true; f.renderer.info.calls++;
+  const invalidatedA = compare(a), invalidatedB = compare(b);
+  assert.notEqual(invalidatedA.reference, firstA.reference); assert.equal(invalidatedA.reference, invalidatedB.reference);
+  capture(a, invalidatedA.descriptor); capture(b, invalidatedB.descriptor);
+  a.object.dispatchEvent({type: 'dispose'}); f.renderer.info.calls++;
+  const rebuiltA = compare(a);
+  assert.notEqual(rebuiltA.descriptor, invalidatedA.descriptor); assert.equal(rebuiltA.reference, invalidatedB.reference);
+  assert.equal(compare(b).descriptor, invalidatedB.descriptor);
+  material.dispose(); assert.equal(f.programs.diagnostics.programs, 0);
+  assert.deepEqual(acceptedA.uniforms, savedA); assert.deepEqual(acceptedB.uniforms, savedB);
+});
+
+test('custom wireframe edge-layout changes retain the source builder and obey requested versions', t => {
+  const f = fixture(t); let setups = 0, keys = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { keys++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { setups++; return super.setupOutput(builder, output); }
+  }
+  const material = new Extension(); material.wireframe = true;
+  const item = f.add(material), geometry = item.object.geometry;
+  const reference = f.reference(item), descriptor = f.compile(item), counts = [setups, keys];
+  f.capture(item, descriptor);
+  geometry.index.array = new Uint16Array([0, 1, 2]); geometry.index.count = 3;
+  assert.equal(f.reference(item), reference);
+  assert.equal(f.compile(item), descriptor, 'unversioned CPU replacement keeps the source edge allocation');
+  f.capture(item, descriptor);
+  geometry.index.needsUpdate = true; f.renderer.info.calls++;
+  const resized = f.compile(item);
+  assert.notEqual(resized, descriptor); assert.equal(f.reference(item), reference);
+  equalShaders(resized, reference); f.capture(item, resized);
+  assert.equal(f.programs.geometry(resized).index.count, 6);
+  const position = geometry.attributes.position;
+  position.array = new Float32Array(65535 * 3); position.count = 65535;
+  geometry.index.needsUpdate = true; f.renderer.info.calls++;
+  const widened = f.compile(item);
+  assert.notEqual(widened, resized); assert.equal(f.reference(item), reference);
+  equalShaders(widened, reference); f.capture(item, widened);
+  assert.ok(f.programs.geometry(widened).index.array instanceof Uint32Array);
+  assert.deepEqual([setups, keys], counts, 'edge resizing changes no source material construction callbacks');
+});
+
+test('custom wireframes keep unsupported named attribute and geometry setup profiles effect-free', t => {
+  const f = fixture(t); let effects = 0;
+  class Extension extends T.MeshBasicNodeMaterial {
+    customProgramCacheKey() { effects++; return super.customProgramCacheKey(); }
+    setupOutput(builder, output) { effects++; return super.setupOutput(builder, output); }
+  }
+  const item = f.add(new Extension()); item.material.wireframe = true;
+  item.object.geometry.setAttribute('color', new T.Uint8BufferAttribute([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255], 3, true));
+  assert.throws(() => f.compile(item), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  const geometryMaterial = new T.MeshBasicNodeMaterial({wireframe: true});
+  geometryMaterial.geometryNode = N.Fn(() => {})().compute(1);
+  geometryMaterial.geometryNode.setup = builder => { effects++; return builder; };
+  geometryMaterial.customProgramCacheKey = () => { effects++; return 'geometry'; };
+  const customGeometry = f.add(geometryMaterial);
+  assert.throws(() => f.compile(customGeometry), {code: 'THREE_NODE_PROGRAM_HOOK'});
+  assert.equal(effects, 0); assert.equal(f.programs.diagnostics.programs, 0);
 });

@@ -116,7 +116,14 @@ export function createThreeNodeWireframes(three, {maxBytes = 64 * 1024 * 1024, f
       }
     }});
   }
-  return Object.freeze({register, capture, geometry: descriptor => stateOf(descriptor).view,
+  function matchesLayout(descriptor) {
+    const state = stateOf(descriptor), source = sourceOf(state.geometry), record = geometries.get(state.geometry);
+    // Unrequested CPU edits keep the source's previous edge allocation. Only
+    // a newly selected owner/version can change the compiled index layout.
+    const layout = record && matches(record, source) ? record.layout : layoutOf(source);
+    return layout.indexCount === state.layout.indexCount && layout.ArrayType === state.layout.ArrayType;
+  }
+  return Object.freeze({register, capture, matchesLayout, geometry: descriptor => stateOf(descriptor).view,
     byteLength: descriptor => stateOf(descriptor).layout.bytes,
     // Accepted packets and descriptors can outlive replacement in the program
     // cache. Their weakly held views retain private owners until no longer used.

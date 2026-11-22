@@ -2216,6 +2216,23 @@ index. Source range/group bounds are doubled before intersecting the captured
 edge extent. Batched ranges already include their source multiplier and are
 preserved directly. Polygon offset remains disabled for line primitives.
 
+Inherited and registered material extensions and custom program keys also
+compose with wireframe on their admitted CPU vertex geometry. Wireframe/fill
+switches select a fresh native topology descriptor while retaining the pinned
+source shader builder until its actual material/context invalidation boundary.
+Requested edge allocation changes likewise refresh native geometry without
+replaying setup or program-key callbacks. Generated `InstancedMesh` streams
+retain independent queued matrix and edge snapshots. Named storage,
+interleaved/normalized vertex reselection and application geometry setup remain
+outside this extension-wireframe profile.
+
+Source comparisons cover inherited/registered Basic, Standard and Physical
+shaders, per-object uniforms, shared construction, invalidation and disposal.
+Native draw recordings cover queued wireframe/fill/range changes, independent
+edge and uniform values, generated instance streams, resized edge allocations
+and the Uint16/Uint32 boundary. These checks establish shader and command
+behavior; browser pixels and hardware performance remain separate.
+
 Edge histories follow the source index identity and version, or position
 identity and version for nonindexed geometry. Rebuilding reads the entire CPU
 array, independently of original index upload ranges, and leaves those ranges
@@ -2465,7 +2482,7 @@ The callback must keep its admitted shared construction profile and cannot
 replace its selected geometry. Authored color/output graphs and existing
 material maps can be selected by the callback before source construction.
 Custom material lighting/context and geometry combinations, authored scene fog
-or environment nodes, clipping, wireframe, ArrayCamera and multiview retain the
+or environment nodes, clipping, ArrayCamera and multiview retain the
 shared owner's existing admission boundaries. Accessor-backed key properties
 are not admitted. A callback that leaves this domain keeps its JavaScript
 effects and fails before publishing a new GPU descriptor.

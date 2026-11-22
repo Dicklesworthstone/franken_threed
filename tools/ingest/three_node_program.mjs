@@ -1610,6 +1610,8 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // Transparent side passes retain separate render-object bindings. Their
     // builders share only when the source material/dynamic keys are identical,
     // including restored DoubleSide construction during compileAsync.
+    // Extension wireframes use the existing edge owner; named attribute
+    // reselection and application geometry setup retain separate profiles.
     if (!(geometrySetup
       ? [three.MeshBasicNodeMaterial.prototype, three.MeshStandardNodeMaterial.prototype,
         three.MeshPhysicalNodeMaterial.prototype].includes(prototype)
@@ -1624,7 +1626,7 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
         // keeps those bindings with their matrix/color owner across reuse.
         Object.keys(object.geometry.morphAttributes).length && (!extension ||
           !instanceExtension && object.count > 1 && object.morphTexture != null) || !extension && object.receiveShadow ||
-        !extension && prepared.transparent || prepared.wireframe || !extension && prepared.useTransmission ||
+        !extension && prepared.transparent || prepared.wireframe && (!extension || namedGeometry) || !extension && prepared.useTransmission ||
         !extension && !geometrySetup && prepared.lights !== true || prepared.isShadowPassMaterial === true ||
         (geometrySetup ? ['lightsNode', 'contextNode'] : extension ? ['geometryNode', 'lightsNode', 'contextNode']
           : [...GRAPH_SLOTS, 'contextNode']).some(name => prepared[name] != null) ||
@@ -1880,7 +1882,11 @@ export function createThreeNodePrograms({three, renderer, maxPrograms = 4096, ma
     // RenderObjects rechecks material keys only on needsUpdate or a dynamic
     // context change. A version-only change with the same source key retains
     // the very same builder nodes, including their captured PMREM texture.
+    // Topology and edge-layout changes select a new native descriptor without
+    // replaying the retained source shader's setup or cache-key callbacks.
     if (construction && previous?.sharedBuilder && previous.geometry === object.geometry &&
+        Object.entries(primitiveLayout(object, preparedMaterial)).every(([key, value]) => previous.descriptor[key] === value) &&
+        (!previous.descriptor.wireframe || wireframes.matchesLayout(previous.descriptor)) &&
         !previousState.namedGeometryDisposed && namedAttributesMatch(previousState) &&
         (!construction.namedGeometry || previousState.namedAttributes !== null) &&
         (sourceKey || previousState.sharedDynamic === construction.dynamic) &&
