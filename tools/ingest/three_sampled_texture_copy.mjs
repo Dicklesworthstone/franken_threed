@@ -168,7 +168,11 @@ export function copySampledTexture(renderer, sourceTexture, destinationTexture,
       if (producer && !destination.lease) fail('SOURCE', 'Raw producers on this path require an ordinary sampled destination');
       if (!producer) lease = inputs.captureBinding({texture: sourceTexture, isSampledTexture: true});
       const sourceShape = producer?.shape ?? inputs.copyShape(lease);
-      if (destination.lease && !producer && sourceLevel !== 0 && region === null)
+      if ([sourceShape, destination.shape].some(shape => (shape.blockWidth ?? 1) > 1 || (shape.blockHeight ?? 1) > 1) &&
+          !device.features?.has?.('core-features-and-limits'))
+        fail('FEATURE', 'Compressed texture copies require the device core-features-and-limits capability');
+      if (destination.lease && !producer && sourceLevel !== 0 && region === null &&
+          (sourceShape.blockWidth ?? 1) === 1 && (sourceShape.blockHeight ?? 1) === 1)
         fail('SOURCE', 'Ordinary sampled destinations require an explicit region for nonzero source mips');
       // The pinned native API defaults to base image width/height and ONE
       // layer, including for a layered or nonzero-mip source. Explicit boxes

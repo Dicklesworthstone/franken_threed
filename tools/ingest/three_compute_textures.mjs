@@ -622,8 +622,8 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
   function captureCopyDestination(texture, level = 0) {
     const shape = describe({texture, isSampledTexture: true}, {copyDestination: true});
     if (!Number.isSafeInteger(level) || level < 0 || level >= shape.levels ||
-        !['2d', '2d-array', '3d', 'cube'].includes(shape.viewDimension) || shape.blockUploads || shape.nativeMedia)
-      fail('COPY', 'Ordinary sampled copy destinations require an existing uncompressed 2D, array, volume or cube mip level');
+        !['2d', '2d-array', '3d', 'cube'].includes(shape.viewDimension) || shape.cube && shape.blockUploads || shape.nativeMedia)
+      fail('COPY', 'Ordinary sampled copy destinations require an existing 2D, array, volume or uncompressed cube mip level');
     // Cube sampling uses a cube view of six ordinary native array layers.
     // copyShape exposes those layers to the shared subresource planner; the
     // existing GPU seed preserves all faces/mips when a Source alias detaches.
@@ -857,6 +857,7 @@ export function createThreeComputeTextures({storage, poolFactory, targetFactory 
       const shape = sourcePool().inspect(snapshot.record.texture);
       return Object.freeze({width: shape.width, height: shape.height, depth: shape.layers,
         mipLevelCount: shape.levels, format: shape.format,
+        ...(shape.compressed ? {blockWidth: shape.blockWidth, blockHeight: shape.blockHeight} : {}),
         viewDimension: shape.cube ? '2d-array' : shape.viewDimension});
     },
     withTexture(snapshot, run) {

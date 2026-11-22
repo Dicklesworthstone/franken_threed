@@ -708,7 +708,9 @@ export function createGpuThreeTextures(device,{
           for(let level=0;level<d.levels;level++)native(()=>encoder.copyTextureToTexture(
             {texture:seed.r.resource.texture,mipLevel:level,origin:[0,0,0]},
             {texture:r.resource.texture,mipLevel:level,origin:[0,0,0]},
-            [Math.max(1,d.width>>level),Math.max(1,d.height>>level),d.volume?Math.max(1,d.layers>>level):d.layers]));
+            [Math.ceil(Math.max(1,d.width>>level)/(d.blockWidth??1))*(d.blockWidth??1),
+              Math.ceil(Math.max(1,d.height>>level)/(d.blockHeight??1))*(d.blockHeight??1),
+              d.volume?Math.max(1,d.layers>>level):d.layers]));
           native(()=>device.queue.submit([encoder.finish()]));
           if(copyOnly){r.resource.sourceVersion=t.source.version;r.version=t.version;}
         }

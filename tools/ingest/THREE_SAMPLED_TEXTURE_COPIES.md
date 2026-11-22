@@ -15,8 +15,9 @@ validation, integer formats where admitted, and mip-update behavior.
 Box2/Box3 regions and Vector2/Vector3 positions use mip-local texels. Source
 and destination mips may differ; arrays, cube faces, and volume slices keep
 independent XYZ extents. Native formats must match exactly. The source owner's
-existing image/format admission still applies; this does not add video, depth
-or compressed copy destinations.
+existing image/format admission still applies. Video and depth destinations
+retain their existing boundaries; compressed 2D/array destinations use the
+block-copy profile below.
 
 ## Ordinary sampled destinations
 
@@ -56,6 +57,43 @@ An omitted source region follows the pinned native API: base image width and
 height, exactly one slice. Explicit boxes select mip-local dimensions and
 multiple slices. Complete allocations, seed dependencies and queued versions
 remain charged to the existing shared budgets and disposal owners.
+
+## Compressed sampled destinations
+
+Native copies can update existing `CompressedTexture` and
+`CompressedArrayTexture` allocations in the already admitted BC, ETC/EAC and
+ASTC formats. KTX2's uncompressed RGBA8 `CompressedTexture` fallback also works.
+The renderer uses the shared sampled owner, so later graphics and compute
+reads observe the patched allocation without decompression, a conversion
+shader or CPU readback. Native source/destination formats must match. Compressed
+copies require both the format's existing compression feature and the device's
+`core-features-and-limits` capability; compressed uploads remain available
+independently of that copy capability.
+
+XY origins and copy extents must align to each format's texel blocks. Bounds
+use the physical, block-rounded extent of the selected mip. A BC mip whose
+logical image is 1x1 therefore needs a 4x4 copy box. Explicit boxes are never
+rounded or enlarged. An omitted box still follows pinned r186: base image
+width/height and one layer, even when a nonzero mip is selected. That default
+can fit a small compressed mip's physical block, and otherwise fails the normal
+bounds/alignment checks. The existing optional unaligned-base-allocation feature
+does not relax copy alignment.
+
+The first GPU write isolates a shared source alias by seeding every authored
+mip and array layer, including complete physical blocks at tiny mip levels.
+Subsequent writes reuse the private allocation. Queued source versions retain
+their captured block bytes; later `CompressedArrayTexture.layerUpdates` upload
+only the requested layers and preserve GPU patches elsewhere. Public CPU block
+arrays stay unchanged. Same-image copies require disjoint mip/layer subresources,
+and compressed cube destinations remain outside this profile. Mip generation
+stays disabled for compressed images; callers author their mip contents.
+
+`three_sampled_compressed_copy.test.mjs` exercises the real renderer facade and
+owners with a strict block-byte recording device, including pinned backend
+copy-command comparisons, native graphics bindings, alias isolation, queued
+partial layers, tiny mips, capability/alignment refusals and disposal. These
+checks verify bytes, residency and command order; they do not decode compressed
+pixels or establish browser shader execution or a performance result.
 
 ## Target destinations and submission
 

@@ -27,7 +27,12 @@ function extent(shape, level) {
       ![shape.width, shape.height, shape.depth, shape.mipLevelCount].every(n => natural(n) && n > 0))
     fail('SHAPE', 'Expected an admitted storage texture shape');
   if (!natural(level) || level >= shape.mipLevelCount) fail('LEVEL', 'Copy mip level is not allocated');
-  return [Math.max(1, Math.floor(shape.width / 2 ** level)), Math.max(1, Math.floor(shape.height / 2 ** level)),
+  const block = [shape.blockWidth ?? 1, shape.blockHeight ?? 1];
+  if (!block.every(n => natural(n) && n > 0)) fail('SHAPE', 'Expected positive native texel block dimensions');
+  // Compressed copies address physical blocks, including the padded edge of a
+  // small mip. Keep explicit source boxes unchanged; this only defines bounds.
+  return [Math.ceil(Math.max(1, Math.floor(shape.width / 2 ** level)) / block[0]) * block[0],
+    Math.ceil(Math.max(1, Math.floor(shape.height / 2 ** level)) / block[1]) * block[1],
     shape.viewDimension === '3d' ? Math.max(1, Math.floor(shape.depth / 2 ** level)) : shape.depth];
 }
 
@@ -58,6 +63,11 @@ export function inspectStorageTextureCopy(source, destination, region = null, po
   if (!size.every(natural) || !target.every(natural) || size.some((n, i) =>
     origin[i] > from[i] || n > from[i] - origin[i] || target[i] > to[i] || n > to[i] - target[i]))
     fail('BOUNDS', 'Copy region exceeds the source or destination mip');
+  for (const [shape, start] of [[source, origin], [destination, target]]) {
+    const block = [shape.blockWidth ?? 1, shape.blockHeight ?? 1];
+    if (block.some((n, axis) => start[axis] % n !== 0 || size[axis] % n !== 0))
+      fail('BLOCK', 'Texture copy origins and extents must align to the native texel blocks');
+  }
   const empty = size.some(n => n === 0);
   // WebGPU requires disjoint SUBRESOURCES, not just disjoint x/y rectangles.
   // Each 2D array layer is a subresource; a whole 3D mip is one subresource.
