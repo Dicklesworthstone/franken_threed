@@ -803,23 +803,15 @@ fn positive_automatic_pass_splitting_preserves_targets_and_depth_stencil() {
     assert!(!split[0].all_uses().iter().any(|u| u.resource_id == resolved));
     assert!(split[1].all_uses().iter().any(|u| u.resource_id == resolved && u.access.is_write()));
 
-    // Do not erase an intra-draw conflict or implicit state at a new pass boundary.
+    // Do not erase an intra-draw conflict or an invalid original bundle boundary.
     let mut variants = Vec::new();
     let mut within_draw = pass.clone();
     within_draw.draws[1].uses.push(ResourceUse::buffer_vertex(
         buf_v, DataVersion::INITIAL, Some(0), Some(64),
     ));
     variants.push(within_draw);
-    let mut viewport = pass.clone();
-    viewport.draws[0].viewport = Some([0, 0, 32, 32]);
-    variants.push(viewport);
-    let mut scissor = pass.clone();
-    scissor.draws[0].scissor = Some([0, 0, 16, 16]);
-    scissor.draws[0].scissor_test_enabled = true;
-    variants.push(scissor);
     let mut warm = pass.clone();
     warm.draws[1].assumes_warm_state = true;
-    variants.push(warm.clone());
     warm.draws[0] = Draw::new_bundle(0, 1, 1, pass.draws[0].uses.clone());
     variants.push(warm);
     let mut missing_stencil_store = pass.clone();
@@ -1171,17 +1163,14 @@ fn many_segments_allocate_unique_ids_and_rewire_other_split_families() {
 }
 
 #[test]
-fn later_split_boundaries_still_reject_implicit_state_and_within_draw_conflicts() {
+fn later_split_boundaries_still_reject_invalid_state_and_within_draw_conflicts() {
     let pass = pass_with_buffer_roles(1, &[false, true, false, true]);
     let mut variants = Vec::new();
-    let mut viewport = pass.clone();
-    viewport.draws[1].viewport = Some([0, 0, 32, 32]);
-    variants.push(viewport);
-    let mut scissor = pass.clone();
-    scissor.draws[1].scissor = Some([0, 0, 16, 16]);
-    scissor.draws[1].scissor_test_enabled = true;
-    variants.push(scissor);
+    let mut first_warm = pass.clone();
+    first_warm.draws[0].assumes_warm_state = true;
+    variants.push(first_warm);
     let mut warm = pass.clone();
+    warm.draws[1] = Draw::new_bundle(1, 42, 1, pass.draws[1].uses.clone());
     warm.draws[2].assumes_warm_state = true;
     variants.push(warm);
     let mut within_draw = pass;

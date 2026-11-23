@@ -361,7 +361,6 @@ fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
 
     let mut ranges = Vec::new();
     let mut start = 0;
-    let mut inherited_draw_state = false;
     for (idx, draw) in pass.draws.iter().enumerate() {
         let conflicts_with_prefix = draw.uses.iter().any(|current| {
             current.kind == ResourceKind::Buffer
@@ -375,16 +374,9 @@ fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
                     })
         });
         if conflicts_with_prefix {
-            // The graph cannot materialize implicit viewport/scissor or binding
-            // state. Every introduced boundary must be safe, including later ones.
-            if draw.assumes_warm_state || inherited_draw_state {
-                return None;
-            }
             ranges.push(start..idx);
             start = idx;
         }
-        inherited_draw_state |=
-            draw.viewport.is_some() || draw.scissor.is_some() || draw.scissor_test_enabled;
     }
     if ranges.is_empty() {
         return None;
@@ -397,9 +389,44 @@ fn output_preserving_split(pass: &Pass) -> Option<Vec<Pass>> {
     template.draws.clear();
     let mut segments = Vec::with_capacity(ranges.len());
     let last_index = ranges.len() - 1;
+    let mut viewport = None;
+    let mut scissor = None;
+    let mut previous_direct = false;
     for (index, range) in ranges.into_iter().enumerate() {
         let mut segment = template.clone();
-        segment.draws.extend_from_slice(&pass.draws[range]);
+        for (draw_index, original) in pass.draws[range].iter().enumerate() {
+            // Splitting must not repair an invalid source state: bundles clear
+            // bindings, and no bindings exist before the source's first draw.
+            if original.is_direct() && original.assumes_warm_state && !previous_direct {
+                return None;
+            }
+            previous_direct = original.is_direct();
+
+            // These are render-pass state changes, not per-draw defaults.
+            // Bundles leave viewport/scissor intact. An unspecified scissor
+            // likewise inherits clipping; only an explicit full-attachment
+            // rectangle with testing disabled clears a previously active clip.
+            viewport = original.viewport.or(viewport);
+            if original.scissor_test_enabled {
+                scissor = original.scissor.or(scissor);
+            } else if original.scissor.is_some() {
+                scissor = None;
+            }
+
+            let mut draw = original.clone();
+            if index > 0 && draw_index == 0 {
+                draw.viewport = viewport;
+                if let Some(rectangle) = scissor {
+                    draw.scissor = Some(rectangle);
+                    draw.scissor_test_enabled = true;
+                }
+                // Warm draws still declare their complete effective pipeline,
+                // resources and offsets. Preserve those declarations verbatim;
+                // a fresh encoder must bind them instead of reusing prior state.
+                draw.assumes_warm_state = false;
+            }
+            segment.draws.push(draw);
+        }
         for attachment in &mut segment.color_attachments {
             if index > 0 {
                 attachment.load_op = LoadOp::Load;

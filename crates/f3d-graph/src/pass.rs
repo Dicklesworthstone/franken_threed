@@ -417,19 +417,25 @@ pub struct Draw {
     pub kind: DrawKind,
     /// Whether this draw assumes warm/inherited pipeline and binding state from a preceding draw.
     ///
+    /// The effective `pipeline_id`, `uses` and `uniform_dynamic_offset` remain
+    /// fully declared even when this flag is true; it never elides their values.
+    /// A new pass boundary can therefore require rebinding those same values.
+    ///
     /// Invariant: WebGPU specification states that executing render bundles (`executeBundles`)
     /// resets all pipeline and bind group state on the render pass encoder.
     /// A direct draw following a bundle cannot assume warm state (`assumes_warm_state = true`)
     /// and must explicitly rebind (`assumes_warm_state = false`).
     pub assumes_warm_state: bool,
     /// Active viewport rectangle `[x, y, width, height]` for this draw call (§8.5).
-    /// `None` indicates the draw inherits the default pass/render-target viewport.
+    /// `None` preserves the preceding viewport, or the attachment-sized default
+    /// if no viewport has been set in the pass.
     /// `Some([x, y, width, height])` explicitly sets the viewport, allowing explicit zero-size viewports.
     pub viewport: Option<[u32; 4]>,
     /// Active scissor rectangle `[x, y, width, height]` for this draw call (§8.5).
     /// When `scissor_test_enabled` is true, this is the active clipping rectangle.
     /// When `scissor_test_enabled` is false, this is either `None` (unspecified) or `Some([0, 0, width, height])`
     /// representing the full attachment scissor needed to clear clipping after a previous scissor draw.
+    /// `None` never emits a state change, so it preserves any preceding clipping.
     pub scissor: Option<[u32; 4]>,
     /// Whether scissor test is enabled for this draw call.
     pub scissor_test_enabled: bool,
@@ -642,7 +648,8 @@ impl Draw {
     }
 
     /// Configure the active viewport rectangle for this draw call (§8.5).
-    /// `None` indicates the draw inherits the default pass/render-target viewport.
+    /// `None` preserves the preceding viewport, or the attachment-sized default
+    /// if no viewport has been set in the pass.
     #[must_use]
     pub const fn with_viewport(mut self, viewport: Option<[u32; 4]>) -> Self {
         self.viewport = viewport;
