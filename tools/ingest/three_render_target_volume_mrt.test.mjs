@@ -170,15 +170,64 @@ test('accepted volume MRT sampling generations survive resize until leases and f
   sampled.dispose(); f.owner.dispose(); destroyed(f);
 });
 
-test('volume MRT continues to refuse automatic mips, multisampling and history swaps before allocation', () => {
+test('volume MRT continues to refuse automatic mips and multisampling before allocation', () => {
   for (const edit of [source => { source.texture.generateMipmaps = true; },
     source => { source.textures[1].generateMipmaps = true; }, source => { source.samples = 4; }]) {
     const f = fixture(), source = target(); edit(source);
     assert.throws(() => f.owner.capture(source), {code: 'THREE_TARGET_UNSUPPORTED'});
     assert.equal(f.textures.length, 0); f.owner.dispose();
   }
-  const f = fixture(), source = target();
-  assert.throws(() => f.owner.registerNativePass({renderTarget: source, _textures: {output: source.texture},
-    _previousTextures: {output: color(source, 0)}}), {code: 'THREE_TARGET_UNSUPPORTED'});
-  assert.equal(f.textures.length, 0); f.owner.dispose();
+});
+
+test('native volume MRT histories retain mixed-format pyramids and independent current/previous slots', async () => {
+  const f = fixture(), source = target(), [a, b] = source.textures, alternate = [color(source, 0), color(source, 1)];
+  const pass = {renderTarget: source, _textures: {output: a, auxiliary: b},
+    _previousTextures: {output: alternate[0], auxiliary: alternate[1]}};
+  f.owner.registerNativePass(pass);
+  const first = f.owner.capture(source), previous = f.owner.captureNativeTexture(a);
+  f.owner.ensure(first);
+  assert.equal(f.owner.allocatedBytes, colorBytes * 2); assert.equal(f.textures.length, 4);
+  assert.deepEqual(f.textures.map(texture => [texture.dimension, texture.mipLevelCount]),
+    [['3d', 4], ['3d', 3], ['3d', 4], ['3d', 3]]);
+  source.textures[0] = pass._textures.output = alternate[0]; pass._previousTextures.output = a;
+  f.owner.registerNativePass(pass);
+  const next = f.owner.capture(source), current = f.owner.captureNativeTexture(alternate[0]);
+  assert.deepEqual(next.colorSlots, [1, 0]);
+  f.owner.withNativeTexture(previous, texture => f.owner.render(next, frame => {
+    assert.equal(frame.depthSlice, 1);
+    assert.notEqual(frame.colorViews[0].texture, texture);
+    assert.equal(frame.colorViews[1].texture, f.textures[1]);
+    assert.ok(frame.colorViews.every(view => view.descriptor.dimension === '3d' && view.descriptor.baseMipLevel === 1));
+  }, {mipLevel: 1, face: 1}));
+  f.owner.withNativeTexture(current, () => {
+    assert.throws(() => f.owner.render(next, () => assert.fail('sampled volume cannot be attached'), {face: 4}),
+      {code: 'THREE_TARGET_FEEDBACK'});
+  });
+  f.owner.copyColor(first, next, {sourceMipLevel: 1, destinationMipLevel: 1, sourceFace: 0, face: 0, depthOrArrayLayers: 2});
+  const copy = f.submissions.at(-1)[0].copies[0];
+  assert.equal(copy.source.texture, f.textures[0]); assert.equal(copy.destination.texture, f.textures[2]);
+  assert.deepEqual(copy.size, {width: 4, height: 2, depthOrArrayLayers: 2});
+  assert.equal(f.owner.allocatedBytes, colorBytes * 2, 'borrowed histories and copies allocate no replicas');
+  await f.owner.whenIdle(); f.owner.dispose(); destroyed(f);
+});
+
+test('volume history owner budgets reject both full pyramids before any native allocation', () => {
+  const f = fixture({maxBytes: colorBytes * 2 - 1}), source = target();
+  f.owner.registerNativePass({renderTarget: source, _textures: {output: source.textures[0], auxiliary: source.textures[1]},
+    _previousTextures: {output: color(source, 0), auxiliary: color(source, 1)}});
+  assert.throws(() => f.owner.ensure(f.owner.capture(source)), {code: 'THREE_TARGET_BUDGET'});
+  assert.equal(f.textures.length, 0); assert.equal(f.owner.allocatedBytes, 0);
+  f.owner.dispose();
+});
+
+test('volume history admission preserves explicit native and WebGL ownership boundaries', () => {
+  for (const flipY of [false, true]) {
+    const f = fixture({flipY}), source = target();
+    if (!flipY) source.isWebGL3DRenderTarget = true;
+    assert.throws(() => f.owner.registerNativePass({renderTarget: source, _textures: {output: source.texture},
+      _previousTextures: {output: color(source, 0)}}), {code: 'THREE_TARGET_UNSUPPORTED'});
+    assert.throws(() => f.owner.withNativeEffectTargets([source], () => assert.fail('wrong owner route')),
+      {code: 'THREE_TARGET_UNSUPPORTED'});
+    assert.equal(f.textures.length, 0); f.owner.dispose();
+  }
 });

@@ -108,7 +108,7 @@ test('volume admission validates all three dimensions and rejects incompatible m
   }
   const f = fixture(), target = make(f);
   for (const depth of [0, 257, .5]) assert.throws(() => target.resize(8, 4, depth), {code: 'GPU_TARGET_SIZE'});
-  assert.throws(() => target.reserveColorHistory([0]), {code: 'GPU_TARGET_UNSUPPORTED'});
+  assert.throws(() => target.reserveColorHistory([1]), {code: 'GPU_TARGET_ATTACHMENT'});
   assert.equal(target.failed, false); assert.equal(target.depth, 5); target.dispose();
   const thin = make(f, {width: 1, height: 1, volumeDepth: 16, mipLevelCount: 5, depthFormat: null});
   assert.equal(thin.allocatedBytes, (16 + 8 + 4 + 2 + 1) * 4); thin.dispose();
@@ -291,10 +291,87 @@ test('volume MRT generates only selected color mips and leaves authored neighbor
   assert.equal(target.generateMipmaps([1]), false, 'warm generated image is reused');
   assert.equal(target.generateMipmaps([0]), true, 'authored color needs an explicit request');
   assert.ok(f.calls.submissions.at(-1).passes.every(pass => pass.descriptor.colorAttachments[0].view.texture === color));
-  assert.throws(() => target.reserveColorHistory([1]), {code: 'GPU_TARGET_UNSUPPORTED'});
+  target.reserveColorHistory([1]);
+  let previous;
+  target.withTexture(texture => { previous = texture; }, {colorIndex: 1, colorSlots: [0, 1]});
+  assert.notEqual(previous, secondary); assert.equal(previous.dimension, '3d');
+  assert.ok(f.calls.submissions.at(-1).passes.every(pass =>
+    pass.descriptor.colorAttachments[0].view.texture === previous &&
+    pass.group.entries[0].resource.texture === previous));
+  assert.deepEqual(f.calls.submissions.at(-1).passes.map(pass => pass.descriptor.colorAttachments[0].depthSlice), [0, 1]);
   target.withFrame(frame => assert.equal(frame.depthSlice, 1), {mipLevel: 1, face: 1});
-  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 2);
+  assert.equal(target.failed, false); assert.equal(target.diagnostics.mipGenerations, 3);
   await target.whenIdle();
+});
+
+test('volume history MRT selects whole physical images at every shrinking mip and shares private depth', async t => {
+  const f = fixture(), target = make(f, {colorFormats: ['rgba8unorm', 'rgba16float'],
+    colorMipLevelCounts: [4, 3], depthArray: true});
+  t.after(() => target.dispose()); target.reserveColorHistory([0, 1]);
+  const colorBytes = 179 * 4 + 178 * 8, depths = new Map(), images = new Set();
+  assert.equal(target.allocatedBytes, colorBytes * 2 + 8 * 4 * 5 * 4);
+  for (const colorSlots of [[0, 0], [1, 0], [0, 1], [1, 1]])
+    for (const [mipLevel, slices] of [[0, 5], [1, 2], [2, 1]]) for (let face = 0; face < slices; face++) {
+      target.withFrame(frame => {
+        assert.equal(frame.depthSlice, face);
+        for (const view of frame.colorViews) {
+          images.add(view.texture); assert.equal(view.texture.dimension, '3d');
+          assert.equal(view.texture.size.depthOrArrayLayers, 5);
+          assert.deepEqual(view.descriptor, {dimension: '3d', baseMipLevel: mipLevel, mipLevelCount: 1});
+        }
+        const key = mipLevel + '/' + face;
+        if (depths.has(key)) assert.equal(frame.depthView, depths.get(key));
+        else depths.set(key, frame.depthView);
+      }, {colorSlots, mipLevel, face});
+    }
+  assert.equal(images.size, 4);
+  assert.equal(target.allocatedBytes, colorBytes * 2 + (32 + 8 + 2) * 5 * 4);
+  let expired;
+  target.withAttachments((colors, depth, histories, withFrame) => {
+    expired = withFrame;
+    withFrame(frame => {
+      assert.equal(frame.colorViews[0].texture, histories[0]);
+      assert.equal(frame.colorViews[1].texture, colors[1]);
+      assert.equal(frame.depthSlice, 1); assert.equal(frame.depthView, depths.get('1/1'));
+    }, {colorSlots: [1, 0], mipLevel: 1, face: 1});
+  });
+  assert.throws(() => expired(() => {}), {code: 'GPU_TARGET_BORROW'});
+  assert.throws(() => target.withFrame(() => assert.fail('invalid slice'), {colorSlots: [1, 1], mipLevel: 1, face: 2}),
+    {code: 'GPU_TARGET_FACE'});
+  await target.whenIdle(); target.dispose(); assert.ok(f.calls.textures.every(texture => texture.destroyed === 1));
+});
+
+test('volume histories charge complete XYZ pyramids before allocation and retain both images across resize', async t => {
+  const bytes = 179 * 4, limited = fixture(), denied = make(limited, {mipLevelCount: 4,
+    depthFormat: null, maxBytes: bytes * 2 - 1});
+  t.after(() => denied.dispose());
+  assert.throws(() => denied.reserveColorHistory([0]), {code: 'GPU_TARGET_BUDGET'});
+  assert.equal(limited.calls.textures.length, 1); assert.equal(denied.allocatedBytes, bytes);
+  denied.withFrame(() => {}, {face: 4});
+  const f = fixture(), target = make(f, {mipLevelCount: 4, depthFormat: null, copyDestination: true});
+  t.after(() => target.dispose()); target.reserveColorHistory([0]);
+  const copies = [], createEncoder = f.device.createCommandEncoder;
+  f.device.createCommandEncoder = () => ({...createEncoder(),
+    copyTextureToTexture(source, destination, size) { copies.push({source, destination, size}); }});
+  const current = target.selectColorSlots([0]), previous = target.selectColorSlots([1]);
+  current.copyFrom(previous, {sourceMipLevel: 1, destinationMipLevel: 1, sourceFace: 0, face: 0, depthOrArrayLayers: 2});
+  assert.notEqual(copies[0].source.texture, copies[0].destination.texture);
+  assert.deepEqual(copies[0].size, {width: 4, height: 2, depthOrArrayLayers: 2});
+  assert.throws(() => current.copyFrom(current, {sourceMipLevel: 1, destinationMipLevel: 1,
+    sourceFace: 0, face: 1, width: 1, height: 1}), {code: 'GPU_TARGET_FEEDBACK'});
+  let finish;
+  f.device.queue.onSubmittedWorkDone = () => new Promise(resolve => { finish = resolve; });
+  const old = f.calls.textures.slice(); target.resize(8, 4, 7);
+  assert.equal(target.allocatedBytes, (179 + 251) * 4 * 2);
+  assert.ok(old.every(texture => texture.destroyed === 0));
+  previous.withFrame(frame => {
+    assert.equal(frame.colorView.texture.dimension, '3d'); assert.equal(frame.colorView.texture.size.depthOrArrayLayers, 7);
+    assert.equal(frame.depthSlice, 6);
+  }, {face: 6});
+  finish(); f.device.queue.onSubmittedWorkDone = () => Promise.resolve(); await target.whenIdle();
+  assert.ok(old.every(texture => texture.destroyed === 1));
+  assert.equal(target.allocatedBytes, 251 * 4 * 2);
+  target.dispose(); assert.ok(f.calls.textures.every(texture => texture.destroyed === 1));
 });
 
 for (const [width, height, volumeDepth] of [[8, 4, 5], [7, 5, 3], [1, 1, 9]])

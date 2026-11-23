@@ -495,12 +495,13 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
   function sourceDisposed(entry, event) {
     if (event?.target === entry.target) depthInitialized.delete(entry.target);
     const resize = nativeResizes.get(entry.target);
+    const volumeResize = resize?.dynamic && entry.shape.volume && positive(entry.target.depth);
     const matchesSize = resize && (resize.dynamic
       ? extent(entry.target.width) && extent(entry.target.height) &&
-        (entry.target.width !== resize.width || entry.target.height !== resize.height)
+        (entry.target.width !== resize.width || entry.target.height !== resize.height || volumeResize && entry.target.depth !== resize.depth)
       : entry.target.width === resize.width && entry.target.height === resize.height);
     if (resize && event?.target === entry.target && (!resize.event || resize.event === event) &&
-        matchesSize && entry.target.depth === resize.depth) {
+        matchesSize && (entry.target.depth === resize.depth || volumeResize)) {
       const shape = resize.shape ??= sourceShape(entry.target, entry);
       if ((entry.historyGroup ? shape.textures.every((texture, index) => entry.historyGroup.pairs[index]?.includes(texture)) : sameColors(shape, entry.shape)) && shape.depthTexture === entry.shape.depthTexture &&
           shape.depthFormat === entry.shape.depthFormat &&
@@ -559,6 +560,7 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
         (flipY || color.sourceVersion === color.texture.version));
     const base = group?.sourceShape ?? group?.shape;
     const frozenHistory = group?.mipInitialized && base.width === (target.width || 1) && base.height === (target.height || 1) &&
+      (!base.volume || base.layers === target.depth) &&
       base.sampleCount === (target.samples === 4 ? 4 : 1) && base.textures.length === target.textures.length &&
       target.textures.every(texture => group.mipProfiles.get(texture)?.sourceVersion === texture.version);
     const shape = inspectThreeRenderTarget(target, three, {cubeMipLevelCount: frozen ? entry.shape.mipLevelCount : null,
@@ -685,8 +687,8 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     const shape = {...inspected, key: inspected.colors.map(color => color.historyKey).join('|')};
     const names = Object.keys(node._previousTextures ?? {});
     if (!names.length) return;
-    if (shape.volume || shape.webglCube)
-      fail('UNSUPPORTED', 'Native pass histories require ordinary 2D, 2D-array or native cube color attachments');
+    if (shape.webglCube || shape.volume && (shape.webglVolume || flipY))
+      fail('UNSUPPORTED', 'Native pass histories require ordinary 2D, 2D-array, native cube or native 3D color attachments');
     nativePasses.set(target, node);
     let group = historyGroups.get(target);
     if (group && (!historyShape(group, shape) || group.node !== node)) {
@@ -1336,8 +1338,9 @@ export function createThreeRenderTargets(three, {getDevice, maxTargets = 256, ma
     // an actual size change can preserve their attachments and formats.
     const scopes = [...new Set(targets)].map(target => {
       if (!(target instanceof three.RenderTarget)) fail('SOURCE', 'Expected a source RenderTarget');
-      if (target.isWebGLCubeRenderTarget || target.isRenderTarget3D || target.isWebGL3DRenderTarget || target.texture?.isData3DTexture)
-        fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D, 2D-array or native cube targets');
+      if (target.isWebGLCubeRenderTarget || target.isWebGL3DRenderTarget ||
+          flipY && (target.isRenderTarget3D || target.texture?.isData3DTexture))
+        fail('UNSUPPORTED', 'Native effect resize scopes require ordinary 2D, 2D-array, native cube or native 3D targets');
       if (entries.has(target)) inspectThreeRenderTarget(target, three);
       if (nativeResizes.has(target)) fail('REENTRANT', 'Cannot reenter a source target resize');
       const scope = {width: target.width, height: target.height, depth: target.depth,

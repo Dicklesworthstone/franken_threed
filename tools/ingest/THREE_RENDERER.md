@@ -1581,7 +1581,7 @@ select a longer chain on one color. Volume mip extents shrink in XYZ; depth
 attachments retain their independent 2D/array allocation. The added production
 owner/compute recording tests cover these paths, budgets and resize lifetimes;
 they do not extend the browser pixel evidence above. Automatic volume generation,
-volume history, cube MRT and WebGL-authored MRT mip pyramids remain excluded.
+cube MRT and WebGL-authored MRT mip pyramids remain excluded.
 See [THREE_RENDER_TARGETS.md](./THREE_RENDER_TARGETS.md) for the current profiles.
 
 ## Native mipmapped pass histories
@@ -1636,6 +1636,23 @@ exactly on Chromium 151.0.7922.34 / SwiftShader, with zero GPU/browser errors.
 The added layered MRT mip coverage described above is verified by owner
 recording tests and is not part of this browser comparison. Sampled multisampled
 array depth, cube histories and volume histories remain outside this profile.
+
+Native 3D PassNode histories now retain complete current/previous volume images,
+including independently authored MRT mip chains. Public PassNode subclasses can
+render each mip-local Z slice while sampling their previous volume through a
+standard Texture3DNode, then expose the current volume to the RenderPipeline.
+The original PassNode texture cloning and rotation methods remain in control.
+Each attachment uses a 3D view and the pass's depthSlice; swapping history does
+not copy texels or reinterpret slices as array layers. These native targets
+remain single-sampled, with automatic volume mip generation excluded.
+
+Recognized effect resizes preserve accepted generations across XYZ changes,
+including depth-only changes that alter the legal mip chain. Both physical
+volumes remain charged until pending readers and GPU work finish; explicit
+disposal still invalidates the generation. Forty-three focused owner and real
+RenderPipeline recording-device checks cover temporal feedback, mixed-format
+MRT, budgets, queued resizes and borrowed-pair retirement. This volume coverage
+does not extend the browser pixel comparisons above or claim a speedup.
 
 ## Registered native output color spaces
 

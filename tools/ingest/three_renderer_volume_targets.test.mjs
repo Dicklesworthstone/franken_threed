@@ -67,6 +67,149 @@ function assertSource(f, descriptor) {
   assert.equal(canonical(descriptor.fragment), canonical(source.fragmentShader));
 }
 
+// An ordinary PassNode sizes a 2D output. This source subclass owns the volume
+// extent and slice loop; its original PassNode texture methods still rotate the
+// complete current/previous images once per NodeFrame update.
+class VolumeHistoryPass extends T.PassNode {
+  constructor(scene, camera, depth = 5) {
+    super(T.PassNode.COLOR, scene, camera, {samples: 0, depthBuffer: false});
+    this.slices = depth; this.updates = 0; this.levels = 3;
+    this.renderTarget = new T.RenderTarget3D(8, 4, depth, {type: T.HalfFloatType, depthBuffer: false});
+    this.renderTarget.texture.name = 'output';
+    this.renderTarget.texture.mipmaps = [{}, {}, {}];
+    this._textures = {output: this.renderTarget.texture};
+    this.getPreviousTextureNode();
+    this.currentSample = N.texture3D(this.getTexture('output'), N.vec3(.5)).level(1);
+    this.previousSample = N.texture3D(this.getPreviousTexture('output'), N.vec3(.5)).level(1);
+  }
+  setSize(width, height) { this.renderTarget.setSize(width, height, this.slices); }
+  setup(builder) { super.setup(builder); return this.currentSample; }
+  updateBefore(frame) {
+    this.previousSample.value = this.getTexture('output');
+    super.updateBefore(frame);
+    this.currentSample.value = this.getTexture('output');
+    const r = frame.renderer, target = r.getRenderTarget(), face = r.getActiveCubeFace(), mip = r.getActiveMipmapLevel();
+    try {
+      for (let level = 0; level < this.levels; level++)
+        for (let slice = level === 0 ? 1 : 0; slice < Math.max(1, this.slices >> level); slice++) {
+          r.setRenderTarget(this.renderTarget, slice, level); r.render(this.scene, this.camera);
+        }
+    } finally { r.setRenderTarget(target, face, mip); }
+    this.updates++;
+  }
+}
+
+test('RenderPipeline executes whole-volume history feedback through original PassNode rotation and 3D sampling', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = new VolumeHistoryPass(f.scene, f.camera);
+  const weight = N.uniform(.5).setName('volumeHistoryFeedback');
+  f.material.colorNode = pass.previousSample.rgb.mul(weight).add(N.vec3(.125, .25, .375));
+  const pipeline = new T.RenderPipeline(f.renderer, pass);
+  t.after(() => { pipeline.dispose(); pass.dispose(); });
+  const generations = [];
+  for (let frame = 0; frame < 3; frame++) {
+    const before = f.device.passes.length;
+    f.renderer._nodes.nodeFrame.update(); pipeline.render(); await f.renderer.waitForGPU();
+    const passes = f.device.passes.slice(before).filter(p => p.draws.length), producer = passes.filter(p =>
+      p.desc.colorAttachments[0].view.texture.dimension === '3d');
+    assert.deepEqual(producer.map(p => [p.desc.colorAttachments[0].view.baseMipLevel,
+      p.desc.colorAttachments[0].depthSlice]), [[0, 0], [0, 1], [0, 2], [0, 3], [0, 4], [1, 0], [1, 1], [2, 0]]);
+    const destination = producer[0].desc.colorAttachments[0].view.texture;
+    assert.ok(producer.every(p => p.desc.colorAttachments[0].view.texture === destination));
+    for (const p of producer) {
+      const draw = p.draws[0], input = textureEntries(draw).find(entry => entry.resource.dimension === '3d').resource;
+      assert.notEqual(input.texture, destination, 'every slice samples the other complete temporal volume');
+      if (frame) assert.equal(input.texture, generations[frame - 1]);
+      assert.equal(input.mipLevelCount, 3); assert.match(draw.pipeline.fragment.module.code, /textureSampleLevel/);
+    }
+    const output = passes.at(-1).draws[0];
+    assert.equal(textureEntries(output)[0].resource.texture, destination);
+    assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+    generations.push(destination);
+  }
+  assert.equal(pass.updates, 3); assert.equal(generations[0], generations[2]);
+  assert.notEqual(generations[0], generations[1]);
+  assert.equal(f.textures.filter(texture => texture.dimension === '3d').length, 2);
+  assert.equal(pass.getPreviousTexture('output'), pass.previousSample.value);
+  assert.equal(pass.getTexture('output'), pass.currentSample.value);
+  assert.equal(pass.getTextureNode().value, pass.getTexture('output'));
+  assert.equal(pass.getPreviousTextureNode().value, pass.getPreviousTexture('output'));
+});
+
+test('queued RenderPipeline volume histories retain XYZ generations across source effect resizes', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = new VolumeHistoryPass(f.scene, f.camera), pipeline = new T.RenderPipeline(f.renderer, pass);
+  f.material.colorNode = pass.previousSample.rgb.mul(.5).add(N.vec3(.125));
+  t.after(() => { pipeline.dispose(); pass.dispose(); });
+  pipeline.render();
+  f.renderer.setSize(20, 12, false); pass.slices = 2;
+  f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  // A Z-only resize has its own dispose event even when the canvas is unchanged.
+  pass.slices = 7; f.renderer._nodes.nodeFrame.update(); pipeline.render();
+  await f.renderer.waitForGPU();
+  const consumers = drawPasses(f.device).filter(p => p.desc.colorAttachments[0].view.texture.dimension !== '3d');
+  assert.deepEqual(consumers.map(p => {
+    const volume = textureEntries(p.draws[0])[0].resource.texture;
+    return [volume.width, volume.height, volume.depthOrArrayLayers];
+  }), [[32, 32, 5], [20, 12, 2], [20, 12, 7]]);
+  const producers = drawPasses(f.device).filter(p => p.desc.colorAttachments[0].view.texture.dimension === '3d');
+  assert.deepEqual([5, 2, 7].map(depth => producers.filter(p =>
+    p.desc.colorAttachments[0].view.texture.depthOrArrayLayers === depth).length), [8, 4, 11]);
+  for (const p of producers) {
+    const output = p.desc.colorAttachments[0].view.texture;
+    const input = textureEntries(p.draws[0])[0].resource.texture;
+    assert.notEqual(input, output);
+    assert.deepEqual([input.width, input.height, input.depthOrArrayLayers],
+      [output.width, output.height, output.depthOrArrayLayers]);
+  }
+  assert.equal(pass.updates, 3); assert.equal(pass.renderTarget.depth, 7);
+  assert.equal(pass.getPreviousTexture('output').image.depth, 7);
+  assert.equal(f.renderer.getRenderTarget(), null); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('borrowed volume history pairs preserve old XYZ mip layouts until both leases and the GPU fence finish', async t => {
+  const f = fixture(t); await f.renderer.init();
+  const pass = new VolumeHistoryPass(f.scene, f.camera, 9), target = pass.renderTarget, owner = f.renderer._targets;
+  t.after(() => pass.dispose()); target.setSize(1, 1, 9);
+  const sources = [pass.getTexture('output'), pass.getPreviousTexture('output')];
+  for (const texture of sources) texture.mipmaps = [{}, {}, {}, {}];
+  owner.registerNativePass(pass);
+  const oldBindings = sources.map(texture => owner.captureNativeTexture(texture));
+  const releases = oldBindings.map(binding => owner.retainGeneration(binding.entry));
+  let oldImages;
+  owner.withNativeTextures(oldBindings, values => { oldImages = sources.map(texture => values.get(texture)); });
+  assert.equal(owner.allocatedBytes, 16 * 8 * 2);
+  let finish;
+  const completed = f.device.queue.onSubmittedWorkDone, pending = new Promise(resolve => { finish = resolve; });
+  f.device.queue.onSubmittedWorkDone = () => pending;
+  let next;
+  try {
+    for (const texture of sources) texture.mipmaps = [{}, {}];
+    owner.withNativeEffectTargets([target], () => target.setSize(1, 1, 2));
+    owner.registerNativePass(pass);
+    next = sources.map(texture => owner.captureNativeTexture(texture));
+    owner.withNativeTextures(next, values => {
+      for (const texture of sources) {
+        const image = values.get(texture);
+        assert.equal(image.dimension, '3d'); assert.equal(image.depthOrArrayLayers, 2); assert.equal(image.mipLevelCount, 2);
+      }
+    });
+    owner.withNativeTextures(oldBindings, values => {
+      assert.deepEqual(sources.map(texture => values.get(texture)), oldImages);
+      assert.ok(oldImages.every(image => image.depthOrArrayLayers === 9 && image.mipLevelCount === 4));
+    });
+    assert.equal(owner.allocatedBytes, (16 + 3) * 8 * 2);
+    releases[0](); releases[1]();
+    assert.ok(oldImages.every(image => !image.destroyed));
+  } finally {
+    releases[0](); releases[1](); f.device.queue.onSubmittedWorkDone = completed; finish();
+  }
+  await owner.whenIdle(); await owner.whenIdle();
+  assert.ok(oldImages.every(image => image.destroyed)); assert.equal(owner.allocatedBytes, 3 * 8 * 2);
+  target.dispose();
+  assert.throws(() => owner.withNativeTexture(next[0], () => {}), {code: 'THREE_TARGET_STALE'});
+});
+
 test('queued volume renders retain slices, including zero, with one shared 2D depth attachment', async t => {
   const f = fixture(t), volume = target(t); await f.renderer.init();
   for (const slice of [4, 0, 2]) { f.renderer.setRenderTarget(volume, slice); f.renderer.render(f.scene, f.camera); }
