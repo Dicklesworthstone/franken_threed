@@ -54,8 +54,8 @@ opaque receivers remain under the compiler's conservative construction routing.
 Opaque renderer access, unknown extensions, native-context observations and
 prototype mutation still prevent the mixed build route.
 
-Mixed routes require a separate, bounded resource proof. One closed application
-module may construct independent source and native renderers using the verified
+Mixed routes require a separate, bounded resource proof. A closed static ESM
+application may construct independent source and native renderers using the verified
 pinned Three builds. Locally allocated canvases, scenes, cameras, materials,
 geometries and render targets carry their ownership through immutable aliases,
 records, arrays, conditional selections, constructor arguments, renderer methods
@@ -65,12 +65,21 @@ keeps the connected renderers on the source route while a third independent
 renderer may still use the native backend. Route decisions record `groupId` and
 the `connected-group-constraint` reason when a source requirement propagates.
 
-This additional proof covers at most 128 KiB and 12,000 syntax nodes in one static
-application module. Data access is restricted to a small verified public field
+This additional proof covers at most 128 application modules, 128 KiB of combined
+source and 12,000 syntax nodes in an acyclic static graph. Named/default imports,
+named reexports and fixed namespace selections carry the actual allocation's
+identity across modules. Equal source bytes at different module URLs remain
+separate allocations. A shared imported target, canvas, scene descendant or later
+material texture assignment joins every affected owner before construction.
+Decisions retain each original module and constructor span, including identical
+constructor expressions that require different routes.
+
+Data access is restricted to a small verified public field
 set; method functions cannot be extracted or used as mutable storage. Unknown
 properties, shared material defines, implicit Sprite geometry, getters, mutable
-bindings, imported application helpers, dynamic modules, unknown callback
-parameters, native observations and exported connected resources retain the
+bindings, resource-returning factories, parameterized helpers, wildcard exports,
+cyclic or dynamic modules, unknown callback parameters, native observations and
+connected resources exported from the application root retain the
 whole source application. HTML must also exclude untracked scripts, event handlers
 and child browsing contexts. Dynamic DOM code/markup mutation is refused. These
 requirements apply equally to mixed explicit `forceWebGL: true` selections;
@@ -95,7 +104,8 @@ the original application modules, evaluation effects and construction spans
 remain intact in production emission. Both WebGPU-authored and WebGL-authored
 applications can use this route when their construction decisions share the
 native route. Mixed source/native modules additionally require the resource proof
-above; its current single-module boundary retains multi-module mixed applications.
+above; parameterized factories and setup helpers still retain the source route
+when that proof cannot establish their allocation and resource identities.
 
 Closed synchronous setup helpers may also accept a renderer factory callback.
 Every call must supply the same immutable function for that parameter, and the

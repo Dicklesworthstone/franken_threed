@@ -94,6 +94,45 @@ test('mixed imported consumers retain source until shared resource ownership is 
     'new WebGPURenderer({forceWebGL:true})', JSON.stringify(result.rendererRoute.decisions[1]));
 });
 
+test('relocated static modules preserve shared exact resources beside an independent native renderer', async t => {
+  host(t);
+  const f=fixture({
+    'assets.mjs': `import {RenderTarget} from 'three'; const target=new RenderTarget(8,8); export default target;`,
+    'resources.mjs': `export {default as current} from './assets.mjs';`,
+    'native.mjs': `import {WebGPURenderer} from 'three'; import target from './assets.mjs';
+      export const coupled=new WebGPURenderer({antialias:false}); coupled.setRenderTarget(target);
+      export const isolated=new WebGPURenderer({antialias:false}); isolated.setSize(48,32,false);`,
+    'legacy.mjs': `import {WebGPURenderer} from 'three'; import * as resources from './resources.mjs';
+      const source=new WebGPURenderer({forceWebGL:true,antialias:false});
+      source.setRenderTarget(resources.current); export default source;`,
+    'main.mjs': `import {WebGPURenderer} from 'three'; import {coupled,isolated} from './native.mjs';
+      import source from './legacy.mjs';
+      export const nativeFlags=[coupled.isF3DRenderer===true,isolated.isF3DRenderer===true,source.isF3DRenderer===true];
+      export const identities=[coupled instanceof WebGPURenderer,isolated instanceof WebGPURenderer,source instanceof WebGPURenderer];
+      export const shared=coupled.getRenderTarget()===source.getRenderTarget();
+      export function dispose(){isolated.dispose();}`,
+  });
+  const result=await buildApplication(f.entry,path.join(f.dir,'candidate'),{routeWebGPURenderer:true});
+  assert.equal(result.rendererRoute.routed,true,result.rendererRoute.reason);
+  const sites=result.rendererRoute.decisions;
+  assert.deepEqual(sites.map(site=>site.route),['exact-backend','general-webgpu','exact-backend']);
+  assert.equal(sites[0].groupId,sites[2].groupId);
+  assert.notEqual(sites[0].groupId,sites[1].groupId);
+  assert.equal(fileslice(f,'native.mjs',sites[0].sourceSpan),'new WebGPURenderer({antialias:false})');
+  assert.equal(fileslice(f,'native.mjs',sites[1].sourceSpan),'new WebGPURenderer({antialias:false})');
+  assert.notEqual(sites[0].sourceSpan.start.offset,sites[1].sourceSpan.start.offset,
+    'identical same-module constructor text keeps distinct exact/native decisions');
+  assert.equal(result.rendererRoute.exactConstructionSites.length,2);
+  const relocated=path.join(f.dir,'relocated');
+  fs.cpSync(result.outDir,relocated,{recursive:true});
+  const app=await import(pathToFileURL(path.join(relocated,result.entryFiles[0])).href);
+  t.after(()=>app.dispose());
+  assert.deepEqual(app.nativeFlags,[false,true,false],
+    'the coupled and source-selected sites construct the genuine upstream owner');
+  assert.deepEqual(app.identities,[true,true,true]);
+  assert.equal(app.shared,true,'both exact owners see the actual imported RenderTarget singleton');
+});
+
 test('WebGL-authored modular applications retain native-context requirements across helpers', async () => {
   const f = fixture({
     'setup.mjs': 'export function setup(r) { r.setSize(24,16,false); return r; }',

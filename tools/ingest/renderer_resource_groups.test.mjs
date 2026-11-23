@@ -12,6 +12,7 @@ import {buildApplication} from './build_application.mjs';
 import {evaluateGraphRoutes} from './route_bridge.mjs';
 import {decideRendererRoute} from '../compat/route_decider.mjs';
 import {resolveClosedRendererGroups} from './renderer_resource_groups.mjs';
+import {closeRendererModuleOwnership} from './renderer_module_ownership.mjs';
 
 const upstream = new URL('../../upstream/three.js/', import.meta.url);
 const webgpu = new URL('build/three.webgpu.js', upstream).href;
@@ -24,7 +25,7 @@ function load(id) {
   const code = fs.readFileSync(new URL(id), 'utf8'), ast = parse(code, {sourceType: 'module', ecmaVersion: 'latest'});
   const imports = ast.body.filter(node => node.source).map(node => ({specifier: node.source.value,
     resolved_id: new URL(node.source.value, id).href, module_type: 'javascript'}));
-  pinned.set(id, {id, content_hash: hash(code), static_imports: imports, dynamic_imports: []});
+  pinned.set(id, {id, content_hash: hash(code), static_imports: imports, static_exports: [], dynamic_imports: []});
   imports.forEach(request => load(request.resolved_id));
 }
 load(webgpu); load(webgl);
@@ -47,6 +48,121 @@ function fixture(body) {
   return {graph, decisions, sources, resolve: () => resolveClosedRendererGroups(graph, sources, decisions, upstream.href)};
 }
 const routes = result => result?.map(site => site.route);
+
+async function moduleFixture(files) {
+  const modules = new Map(structuredClone([...pinned])), inputs = new Map();
+  const resolve = (specifier, id) => specifier === 'three/webgpu' ? webgpu :
+    specifier === 'three/legacy' ? webgl : new URL(specifier, id).href;
+  for (const [name, code] of Object.entries(files)) {
+    const id = new URL(name, entry).href, analysis = analyzeModuleAst(code, id);
+    const requests = [...analysis.staticImports,
+      ...analysis.staticExports.filter(value => value.specifier).map(value => ({specifier: value.specifier}))]
+      .map(request => ({...request, resolved_id: resolve(request.specifier, id), module_type: 'javascript'}));
+    modules.set(id, {id, module_type: 'javascript', content_hash: hash(code),
+      static_imports: requests, static_exports: analysis.staticExports, dynamic_imports: analysis.dynamicImports,
+      renderer_construction_sites: analysis.renderer_construction_sites,
+      routing_facts: analysis.routing_facts, routingFacts: analysis.routing_facts});
+    inputs.set(id, {code, sourceUrl: id, offsets: {}});
+  }
+  await closeRendererModuleOwnership(modules, inputs, [entry], {packageRootUrl: upstream.href});
+  const graph = {entry_type: 'module', root_entries: [entry], package_root_url: upstream.href,
+    external_modules: [], modules: Object.fromEntries(modules)};
+  const decisions = evaluateGraphRoutes(graph, decideRendererRoute, {packageRootUrl: upstream.href,
+    generalWebGPUAvailable: true, hostCapabilities: {hasWebGPU: true, hasWebGL: true}})
+    .map(({moduleId, constructorName, decision}) => ({moduleId, constructorName, ...decision}));
+  const sources = {read: id => inputs.get(id)};
+  return {graph, inputs, decisions, resolve: () => resolveClosedRendererGroups(graph, sources, decisions, upstream.href)};
+}
+
+test('static modules preserve independent renderer owners and original construction sites', async () => {
+  const files = {
+    'main.mjs': `import {native} from './native.mjs'; import source from './legacy.mjs';
+      native.setSize(32,24,false); source.setSize(16,8,false);
+      export const flags=[native.isF3DRenderer===true,source.isF3DRenderer===true];
+      export function dispose(){native.dispose();source.dispose();}`,
+    'native.mjs': `import * as GPU from 'three/webgpu';
+      export const native=new GPU.WebGPURenderer({antialias:false});
+      const scene=new GPU.Scene(); const camera=new GPU.PerspectiveCamera(); native.render(scene,camera);`,
+    'legacy.mjs': `import * as GPU from 'three/webgpu';
+      const source=new GPU.WebGPURenderer({forceWebGL:true});
+      const scene=new GPU.Scene(); const camera=new GPU.PerspectiveCamera(); source.render(scene,camera);
+      export default source;`,
+  };
+  const f=await moduleFixture(files), before=structuredClone(f.graph), result=f.resolve();
+  assert.deepEqual(routes(result), ['general-webgpu','exact-backend']);
+  assert.notEqual(result[0].groupId,result[1].groupId);
+  assert.deepEqual(result.map(site=>site.sourceSpan),f.decisions.map(site=>site.sourceSpan));
+  assert.deepEqual(result.map(site=>site.moduleId),f.decisions.map(site=>site.moduleId));
+  assert.deepEqual(f.graph,before,'group resolution does not mutate source graphs or route facts');
+});
+
+test('named/default reexports and namespace imports carry shared target history across modules', async () => {
+  const f=await moduleFixture({
+    'main.mjs': `import {first,isolated} from './native.mjs'; import {source} from './legacy.mjs';
+      first.clear(); isolated.clear(); source.clear();`,
+    'assets.mjs': `import * as GPU from 'three/webgpu'; const target=new GPU.RenderTarget(8,8); export default target;`,
+    'aliases.mjs': `export {default as current} from './assets.mjs';`,
+    'native.mjs': `import * as GPU from 'three/webgpu'; import target from './assets.mjs';
+      export const first=new GPU.WebGPURenderer(); export const isolated=new GPU.WebGPURenderer();
+      first.setRenderTarget(target);`,
+    'legacy.mjs': `import * as GPU from 'three/webgpu'; import * as assets from './aliases.mjs';
+      export const source=new GPU.WebGPURenderer({forceWebGL:true}); source.setRenderTarget(assets.current);`,
+  });
+  const result=f.resolve();
+  assert.deepEqual(routes(result),['exact-backend','general-webgpu','exact-backend']);
+  assert.equal(result[0].groupId,result[2].groupId);
+  assert.notEqual(result[0].groupId,result[1].groupId);
+  assert.ok(result[0].reasons.includes('connected-group-constraint'));
+  assert.deepEqual(result.map(site=>site.sourceSpan),f.decisions.map(site=>site.sourceSpan),
+    'same-type constructions retain their separate original source spans');
+});
+
+test('byte-identical resource modules remain separate allocations while URL aliases share identity', async () => {
+  const resource=`import * as GPU from 'three/webgpu'; export const target=new GPU.RenderTarget(8,8);`;
+  const files={
+    'main.mjs': PRELUDE + TWO + `import {target as left} from './left.mjs'; import {target as right} from './right.mjs';
+      native.setRenderTarget(left); exact.setRenderTarget(right);`,
+    'left.mjs':resource, 'right.mjs':resource,
+  };
+  const independent=await moduleFixture(files);
+  assert.deepEqual(routes(independent.resolve()),['general-webgpu','exact-backend']);
+  files['right.mjs']=`export {target} from './left.mjs';`;
+  const shared=await moduleFixture(files);
+  assert.deepEqual(routes(shared.resolve()),['exact-backend','exact-backend']);
+});
+
+test('cross-module scene/material aliases and later texture assignments couple all owners', async () => {
+  const f=await moduleFixture({
+    'main.mjs': PRELUDE + TWO + `import {scene,material} from './scene.mjs'; import {target} from './target.mjs';
+      native.render(scene,new GPU.PerspectiveCamera()); material.map=target.texture; exact.setRenderTarget(target);`,
+    'scene.mjs': `import * as GPU from 'three/webgpu'; export const material=new GPU.MeshBasicMaterial();
+      export const scene=new GPU.Scene(); scene.add(new GPU.Mesh(new GPU.BoxGeometry(),material));`,
+    'target.mjs': `import * as GPU from 'three/webgpu'; export const target=new GPU.RenderTarget(8,8);`,
+  });
+  assert.deepEqual(routes(f.resolve()),['exact-backend','exact-backend']);
+});
+
+test('module provenance retains cyclic, mutable, dynamic, escaped and unknown resource graphs', async () => {
+  const main=PRELUDE + TWO + `import {target} from './asset.mjs'; native.setRenderTarget(target);`;
+  const asset=`import * as GPU from 'three/webgpu'; export const target=new GPU.RenderTarget(8,8);`;
+  for (const files of [
+    {'main.mjs':main, 'asset.mjs':asset+`import './main.mjs';`},
+    {'main.mjs':main, 'asset.mjs':asset.replace('const target','let target')},
+    {'main.mjs':main, 'asset.mjs':asset+`import(location.hash.slice(1));`},
+    {'main.mjs':main+`export {target};`, 'asset.mjs':asset},
+    {'main.mjs':main, 'asset.mjs':asset+`plugin(target);`},
+    {'main.mjs':main, 'asset.mjs':asset+`target.texture=external.texture;`},
+    {'main.mjs':main, 'asset.mjs':`export * from './actual.mjs';`, 'actual.mjs':asset},
+    {'main.mjs':main.replace('native.setRenderTarget(target);','native.setRenderTarget(target());'),
+      'asset.mjs':`import * as GPU from 'three/webgpu'; export function target(){return new GPU.RenderTarget(8,8);}`},
+  ]) {
+    const f=await moduleFixture(files);
+    assert.equal(f.resolve(),null,JSON.stringify(files));
+  }
+  const changed=await moduleFixture({'main.mjs':main,'asset.mjs':asset});
+  changed.inputs.set(new URL('asset.mjs',entry).href,{code:asset+'\n'});
+  assert.equal(changed.resolve(),null,'every resolved source must match its own graph hash');
+});
 
 test('independent local renderers, canvases, scenes and immutable aliases form separate groups', () => {
   const f = fixture(`const canvas = document.createElement('canvas'); const otherCanvas = document.createElement('canvas');

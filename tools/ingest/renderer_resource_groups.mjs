@@ -1,7 +1,7 @@
 /** A bounded allocation/provenance proof for independent mixed renderers.
  *
- * This supplements, never weakens, the existing whole-graph escape proof. One
- * closed application module may contain exact and native renderers when every
+ * This supplements, never weakens, the existing whole-graph escape proof. A
+ * closed static ESM graph may contain exact and native renderers when every
  * object they consume has a known local origin. All shared objects conservatively
  * couple their users, including CPU assets; no immutability is guessed. Source
  * statements and constructor arguments are never evaluated or rewritten here.
@@ -95,69 +95,133 @@ export function resolveClosedRendererGroups(graph, moduleSources, decisions, pac
   try {
     if (graph.root_entries?.length !== 1 || graph.external_modules?.length || decisions.length < 2 ||
         decisions.some(site => !['WebGLRenderer', 'WebGPURenderer'].includes(site.constructorName)) || !closedDocument(graph)) return null;
-    const modules = Object.values(graph.modules), libraries = new Set(), applications = [];
+    const modules = Object.values(graph.modules), libraries = new Set(), applications = new Map();
     for (const module of modules) {
       if (isInternalLibraryModule(module.id, packageRootUrl)) {
         if (!isPinnedRendererBuild(module) || module.dynamic_imports.length) return null;
         libraries.add(module.id);
-      } else applications.push(module);
+      } else applications.set(module.id, module);
     }
-    if (applications.length !== 1 || applications[0].id !== graph.root_entries[0]) return null;
+    if (!applications.has(graph.root_entries[0]) || applications.size > 128) return null;
     for (const module of modules.filter(module => libraries.has(module.id)))
       if (module.static_imports.some(request => !libraries.has(request.resolved_id) ||
           new URL(request.specifier, module.id).href !== request.resolved_id)) return null;
-    const module = applications[0], facts = module.routing_facts;
-    if (module.analysis_complete === false || module.module_type !== 'javascript' || module.dynamic_imports.length ||
-        facts.has_opaque_gl_escapes || facts.has_native_context_access || facts.has_unresolved_context_access ||
-        facts.escapes.length || module.static_imports.some(request => !libraries.has(request.resolved_id))) return null;
-    const code = moduleSources.read(module.id).code;
-    if (module.content_hash !== 'sha256:' + createHash('sha256').update(code).digest('hex') || code.length > 128 * 1024) return null;
-    const localSites = analyzeModuleAst(code, module.id).renderer_construction_sites;
-    if (localSites.length !== decisions.length || decisions.some(site => site.moduleId !== module.id)) return null;
-    const sites = new Map(localSites.map((site, index) => {
-      const original = module.renderer_construction_sites[index];
-      const decision = decisions.find(value => value.sourceSpan.start.offset === original.source_span.start.offset);
-      if (!decision || decision.constructorName !== site.constructor_name) reject();
-      return [site.source_span.start.offset, {id: `renderer:${index}`, decision}];
-    }));
-    const ast = acorn.parse(code, {ecmaVersion: 'latest', sourceType: 'module'});
-    const nodes = [], bindings = new Map(), enclosing = new WeakMap();
+    // Module URL, not source bytes or a local identifier, owns every binding and
+    // allocation. Equal source at separate URLs must not share renderer groups.
+    const contexts = new Map(), sites = new Map(), nodes = [], enclosing = new WeakMap(), owners = new WeakMap();
     const groups = new ConnectedCompatibilityGroups(), rendererIds = new Set();
-    const define = (name, source, scope) => { if (bindings.has(name)) reject(); bindings.set(name, {source, scope}); };
-    walk.fullAncestor(ast, (node, _state, ancestors) => {
-      nodes.push(node);
-      enclosing.set(node, [...ancestors]);
-      const scope = ancestors.slice(0, -1).findLast(parent => ['Program', 'BlockStatement'].includes(parent.type));
-      if (nodes.length > 12000) reject();
-      if (node.type === 'ImportDeclaration') {
-        const request = module.static_imports.find(value => value.specifier === node.source.value);
-        if (!request || !libraries.has(request.resolved_id)) reject();
-        for (const item of node.specifiers) {
-          if (item.type === 'ImportNamespaceSpecifier') define(item.local.name, {kind: 'namespace'}, ast);
-          else if (item.type === 'ImportSpecifier' && CONSTRUCTORS.has(item.imported.name ?? item.imported.value))
-            define(item.local.name, {kind: 'constructor', name: item.imported.name ?? item.imported.value}, ast);
-          else reject();
-        }
-      } else if (node.type === 'VariableDeclaration') {
-        if (node.kind !== 'const') reject();
-        for (const item of node.declarations) {
-          if (item.id.type !== 'Identifier' || !item.init) reject();
-          define(item.id.name, item.init, scope);
-        }
-      } else if (node.type === 'FunctionDeclaration') {
-        if (!node.id) reject();
-        define(node.id.name, node, scope);
+    let sourceBytes = 0;
+    for (const module of applications.values()) {
+      const facts = module.routing_facts;
+      if (module.analysis_complete === false || module.module_type !== 'javascript' || module.dynamic_imports.length ||
+          module.postprocessing_transform || module.gpu_computation_transform ||
+          facts.has_opaque_gl_escapes || facts.has_native_context_access || facts.has_unresolved_context_access ||
+          facts.escapes.length || module.static_imports.some(request =>
+            request.module_type !== 'javascript' || !libraries.has(request.resolved_id) && !applications.has(request.resolved_id))) return null;
+      const code = moduleSources.read(module.id).code;
+      sourceBytes += Buffer.byteLength(code);
+      if (module.content_hash !== 'sha256:' + createHash('sha256').update(code).digest('hex') || sourceBytes > 128 * 1024) return null;
+      const localSites = analyzeModuleAst(code, module.id).renderer_construction_sites;
+      const localDecisions = decisions.filter(site => site.moduleId === module.id);
+      if (localSites.length !== localDecisions.length || localSites.length !== module.renderer_construction_sites.length) return null;
+      for (const [index, site] of localSites.entries()) {
+        const original = module.renderer_construction_sites[index];
+        const matches = localDecisions.filter(value => value.sourceSpan.start.offset === original.source_span.start.offset &&
+          value.sourceSpan.end.offset === original.source_span.end.offset);
+        if (matches.length !== 1 || matches[0].constructorName !== site.constructor_name ||
+            original.constructor_name !== site.constructor_name) return null;
+        sites.set(`${module.id}\0${site.source_span.start.offset}`, {id: `renderer:${sites.size}`, decision: matches[0]});
       }
-      if (['ClassDeclaration', 'ClassExpression', 'ImportExpression', 'SwitchStatement', 'ForStatement', 'ForOfStatement', 'ForInStatement',
-        'WhileStatement', 'DoWhileStatement', 'WithStatement', 'ThisExpression', 'Super', 'YieldExpression', 'TaggedTemplateExpression'].includes(node.type) ||
-          node.type === 'Identifier' && node.name === 'arguments' || node.type === 'CatchClause' && node.param) reject();
-    });
-    const memo = new WeakMap(), pending = new WeakSet(), exports = [], returns = [];
+      contexts.set(module.id, {module, ast: acorn.parse(code, {ecmaVersion: 'latest', sourceType: 'module'}),
+        bindings: new Map(), exports: new Map()});
+    }
+    if (sites.size !== decisions.length) return null;
+    // Cycles and disconnected code need a distinct initialization/entry proof.
+    // This walk admits only the complete acyclic static application region.
+    const reached = new Set(), visiting = new Set();
+    const visit = id => {
+      if (libraries.has(id) || reached.has(id)) return;
+      if (visiting.has(id) || visiting.size >= 64) reject();
+      visiting.add(id);
+      for (const request of applications.get(id).static_imports) visit(request.resolved_id);
+      visiting.delete(id); reached.add(id);
+    };
+    visit(graph.root_entries[0]);
+    if (reached.size !== applications.size) return null;
+    for (const context of contexts.values()) {
+      const {module, ast, bindings} = context;
+      const define = (name, source, scope) => { if (bindings.has(name)) reject(); bindings.set(name, {source, scope}); };
+      const imported = (specifier, name) => {
+        const requests = module.static_imports.filter(request => request.specifier === specifier);
+        if (!requests.length || requests.some(request => request.resolved_id !== requests[0].resolved_id)) reject();
+        const id = requests[0].resolved_id;
+        if (libraries.has(id)) {
+          if (name === '*') return {kind: 'namespace'};
+          if (!CONSTRUCTORS.has(name)) reject();
+          return {kind: 'constructor', name};
+        }
+        return name === '*' ? {kind: 'module-namespace', id} : {imported: {id, name}};
+      };
+      const expose = (name, source) => {
+        if (context.exports.has(name)) reject();
+        // acorn-walk does not visit the local identifiers in export specifiers.
+        if (source.type === 'Identifier' && !owners.has(source)) {
+          owners.set(source, context); enclosing.set(source, [ast]);
+        }
+        context.exports.set(name, source);
+      };
+      walk.fullAncestor(ast, (node, _state, ancestors) => {
+        nodes.push(node);
+        enclosing.set(node, [...ancestors]);
+        owners.set(node, context);
+        const scope = ancestors.slice(0, -1).findLast(parent => ['Program', 'BlockStatement'].includes(parent.type));
+        if (nodes.length > 12000) reject();
+        if (node.type === 'ImportDeclaration') {
+          for (const item of node.specifiers) {
+            const name = item.type === 'ImportNamespaceSpecifier' ? '*' :
+              item.type === 'ImportDefaultSpecifier' ? 'default' : item.imported.name ?? item.imported.value;
+            define(item.local.name, imported(node.source.value, name), ast);
+          }
+        } else if (node.type === 'VariableDeclaration') {
+          if (node.kind !== 'const') reject();
+          for (const item of node.declarations) {
+            if (item.id.type !== 'Identifier' || !item.init) reject();
+            define(item.id.name, item.init, scope);
+          }
+        } else if (node.type === 'FunctionDeclaration') {
+          if (!node.id) reject();
+          define(node.id.name, node, scope);
+        } else if (node.type === 'ExportNamedDeclaration') {
+          for (const item of node.specifiers) expose(item.exported.name ?? item.exported.value,
+            node.source ? imported(node.source.value, item.local.name ?? item.local.value) : item.local);
+          for (const item of node.declaration?.declarations ?? []) expose(item.id.name, item.init);
+          if (node.declaration?.type === 'FunctionDeclaration') expose(node.declaration.id.name, node.declaration);
+        } else if (node.type === 'ExportDefaultDeclaration') {
+          expose('default', node.declaration);
+        }
+        if (['ClassDeclaration', 'ClassExpression', 'ImportExpression', 'SwitchStatement', 'ForStatement', 'ForOfStatement', 'ForInStatement',
+          'WhileStatement', 'DoWhileStatement', 'WithStatement', 'ThisExpression', 'Super', 'YieldExpression', 'TaggedTemplateExpression',
+          'ExportAllDeclaration'].includes(node.type) ||
+            node.type === 'Identifier' && node.name === 'arguments' || node.type === 'CatchClause' && node.param) reject();
+      });
+    }
+    const memo = new WeakMap(), pending = new WeakSet(), resolvingExports = new Set(), returns = [];
+    const exported = (id, name) => {
+      const key = `${id}\0${name}`, source = contexts.get(id)?.exports.get(name);
+      if (!source || resolvingExports.has(key) || resolvingExports.size >= 64) reject();
+      resolvingExports.add(key);
+      const result = bindingValue(source);
+      resolvingExports.delete(key);
+      return result;
+    };
+    const bindingValue = source => source.imported ? exported(source.imported.id, source.imported.name) :
+      source.kind ? source : value(source);
+    const siteKey = node => `${owners.get(node).module.id}\0${node.start}`;
     const connect = (left, right) => {
       for (const a of left.ids ?? []) for (const b of right.ids ?? []) groups.union(a, b);
     };
     const object = node => {
-      const site = sites.get(node.start), id = site?.id ?? `object:${node.start}`;
+      const key = siteKey(node), site = sites.get(key), id = site?.id ?? `object:${key}`;
       if (site) { groups.registerRenderer(id, site.decision.route); rendererIds.add(id); }
       else groups.registerResource(id, true);
       return {kind: 'object', ids: [id]};
@@ -173,10 +237,11 @@ export function resolveClosedRendererGroups(graph, moduleSources, decisions, pac
       switch (node.type) {
         case 'Literal': if (node.regex || typeof node.value === 'bigint') reject(); result = scalar; break;
         case 'Identifier': {
+          const {bindings, ast} = owners.get(node);
           if (bindings.has(node.name)) {
             const {source, scope} = bindings.get(node.name);
             if (!(enclosing.get(node) ?? [ast]).includes(scope)) reject();
-            result = source.kind ? source : read(source);
+            result = source.kind || source.imported ? bindingValue(source) : read(source);
           } else if (node.name === 'document') result = {kind: 'document'};
           else if (node.name === 'Math') result = {kind: 'math'};
           else if (ARRAYS.has(node.name)) result = {kind: 'constructor', name: node.name};
@@ -187,7 +252,7 @@ export function resolveClosedRendererGroups(graph, moduleSources, decisions, pac
         case 'NewExpression': {
           const ctor = read(node.callee);
           if (ctor.kind !== 'constructor' || node.arguments.some(item => item.type === 'SpreadElement')) reject();
-          if (['WebGLRenderer', 'WebGPURenderer'].includes(ctor.name) && !sites.has(node.start)) reject();
+          if (['WebGLRenderer', 'WebGPURenderer'].includes(ctor.name) && !sites.has(siteKey(node))) reject();
           result = {...object(node), allocationType: ctor.name};
           for (const argument of node.arguments) connect(result, data(read(argument)));
           break;
@@ -207,6 +272,8 @@ export function resolveClosedRendererGroups(graph, moduleSources, decisions, pac
           if (owner.kind === 'namespace') {
             if (!CONSTRUCTORS.has(name)) reject();
             result = {kind: 'constructor', name};
+          } else if (owner.kind === 'module-namespace') {
+            result = exported(owner.id, name);
           } else if (owner.kind === 'document') {
             if (!['body', 'documentElement', 'createElement', 'createElementNS', 'appendChild', 'append', 'prepend'].includes(name)) reject();
             result = {kind: 'document', name};
@@ -299,19 +366,13 @@ export function resolveClosedRendererGroups(graph, moduleSources, decisions, pac
       else if (node.type === 'ExpressionStatement') value(node.expression);
       else if (node.type === 'IfStatement') data(value(node.test));
       else if (node.type === 'ReturnStatement' || node.type === 'ThrowStatement') returns.push(node.argument);
-      else if (node.type === 'ExportDefaultDeclaration') exports.push(node.declaration);
-      else if (node.type === 'ExportNamedDeclaration') {
-        if (node.source) reject();
-        for (const item of node.specifiers) exports.push(item.local);
-        for (const item of node.declaration?.declarations ?? []) exports.push(item.init);
-      } else if (node.type === 'ExportAllDeclaration') reject();
     }
     // Returning a data object can reveal it through a callback or source helper.
-    // Scalar-only diagnostics and closed zero-argument frame functions may be
-    // exported; no renderer-connected object may cross the module boundary.
+    // Internal ESM exports stay inside the proved graph; its public root still
+    // cannot expose a renderer-connected object to an untracked consumer.
     for (const node of returns) if (value(node).kind !== 'scalar') reject();
-    for (const node of exports) {
-      const output = value(node);
+    for (const name of contexts.get(graph.root_entries[0]).exports.keys()) {
+      const output = exported(graph.root_entries[0], name);
       if (output.kind === 'callback' || output.kind === 'scalar') continue;
       if (output.kind !== 'object' || output.ids.some(id => groups.getGroupMembers(id).some(member => rendererIds.has(member)))) reject();
     }
