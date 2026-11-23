@@ -214,6 +214,46 @@ test('native worker ESM keeps lazy/shared identities, transfers and alias semant
   }
 });
 
+test('relocated workers dispatch destructured lazy kernels with native transfers and transactional fallback', async t => {
+  const f=fixture({
+    'kernel.mjs':kernelSource,
+    'state.mjs':workerFiles['state.mjs'],
+    'left.mjs':"export {advance} from './kernel.mjs';export const extra=0;",
+    'right.mjs':"export {advance} from './kernel.mjs';export const extra=3;",
+    'worker.mjs':`import {value,bump} from './state.mjs';
+      onmessage=async event=>{
+        const {out,velocity,gain,left}=event.data,order=['before'];
+        const {advance:step,extra}=await import(left?'./left.mjs':'./right.mjs');
+        const {advance:again}=await import('./kernel.mjs');order.push('resumed');
+        step(out,velocity,gain);again(out,velocity,gain+extra);bump();order.push('after');
+        const transfer=out.buffer===velocity.buffer?[out.buffer]:[out.buffer,velocity.buffer];
+        postMessage({out,velocity,order,value,same:step===again,source:step.toString(),host:typeof document},transfer);
+      };`,
+  });
+  const compiled=emitGraph(f,'compiled',{specializeNumeric:true});
+  const exhausted=emitGraph(f,'budget',{specializeNumeric:{maxIterations:1}});
+  const consumer=compiled.graph.numericUnits.find(unit=>unit.sourceName===f.url('worker.mjs'));
+  assert.equal(consumer.importedCalls.filter(call=>call.receiverSemantics==='unbound-destructured-import-value').length,2);
+  const relocated=path.join(f.root,'relocated');fs.renameSync(compiled.output,relocated);
+  const native=await launch(t,pathToFileURL(path.join(relocated,compiled.graph.entryFile)).href);
+  const unavailable=await launch(t,pathToFileURL(path.join(relocated,compiled.graph.entryFile)).href,true);
+  const reference=await launch(t,f.url('worker.mjs')),fallback=await launch(t,exhausted.entry);
+  let iteration=0;
+  for(const Type of [Float64Array,Float32Array])for(const alias of [false,true]) {
+    const expected=await send(reference,packet(Type,alias,alias));
+    const actual=await send(native,packet(Type,alias,alias));
+    const absent=await send(unavailable,packet(Type,alias,alias));
+    const limited=await send(fallback,packet(Type,alias,alias));
+    assert.deepEqual(actual.value,expected.value);assert.deepEqual(absent.value,expected.value);
+    assert.deepEqual(limited.value,expected.value);
+    assert.deepEqual(actual.value.order,['before','resumed','after']);assert.equal(actual.value.same,true);
+    assert.equal(actual.value.value,++iteration);assert.equal(actual.calls,iteration*2);
+    assert.equal(expected.calls,0);assert.equal(absent.calls,0);assert.equal(limited.calls,0);
+    assert.ok(limited.instances>0,'budget rollback follows an actual native attempt');
+    assert.equal(actual.value.out.buffer===actual.value.velocity.buffer,alias);
+  }
+});
+
 async function applicationWorker(t, moduleUrl, documentUrl) {
   const prior=Object.getOwnPropertyDescriptor(globalThis,'Worker');
   globalThis.Worker=class {constructor(url,options){this.url=new URL(String(url),documentUrl);this.options=options;}};

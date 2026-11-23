@@ -271,6 +271,7 @@ export function specializeNumericModule(
   // value; only the binding's inert reread is proven, never its properties.
   const importedBindings = new Map();
   const namespaceBindings = new Map();
+  const destructuredImports = new Map();
   const bindings = numericLoopScopeBindings();
   const addNamespace = (name, owner, metadata) => {
     if (!namespaceBindings.has(name)) namespaceBindings.set(name, new Map());
@@ -321,17 +322,39 @@ export function specializeNumericModule(
     walk.fullAncestor(ast, (declaration, _state, ancestors) => {
       if (declaration.type !== "VariableDeclaration" || declaration.kind !== "const") return;
       for (const variable of declaration.declarations) {
-        if (variable.id.type !== "Identifier" || variable.init?.type !== "AwaitExpression" ||
+        if (variable.init?.type !== "AwaitExpression" ||
             variable.init.argument.type !== "ImportExpression") continue;
-        const owner = [...ancestors].reverse().find(scope => bindings(scope, variable.id).has(variable.id.name));
-        if (!owner) continue;
         const imported = variable.init.argument;
-        addNamespace(variable.id.name, owner, {
+        const metadata = {
           moduleSpecifier: imported.source.type === "Literal" && typeof imported.source.value === "string"
             ? imported.source.value : null,
           importSourceSpan: span(imported),
-          receiverSemantics: "original-dynamic-import-value",
-        });
+        };
+        if (variable.id.type === "Identifier") {
+          const owner = [...ancestors].reverse().find(scope => bindings(scope, variable.id).has(variable.id.name));
+          if (owner) addNamespace(variable.id.name, owner, {...metadata,
+            receiverSemantics: "original-dynamic-import-value"});
+        } else if (variable.id.type === "ObjectPattern") {
+          const properties = variable.id.properties.map(property => {
+            if (property.type !== "Property") return null;
+            const importedName = !property.computed && property.key.type === "Identifier" ? property.key.name
+              : property.key.type === "Literal" && typeof property.key.value === "string" ? property.key.value : null;
+            const local = property.value.type === "AssignmentPattern" ? property.value.left : property.value;
+            return importedName !== null && local.type === "Identifier" ? {importedName, local} : null;
+          });
+          if (properties.some(property => !property)) continue;
+          // Destructuring, getters and defaults still execute exactly once at
+          // the original await. Only later direct calls are routed; the value
+          // may come from arbitrary then-export assimilation or a default, so
+          // native admission always uses the evaluated function identity.
+          for (const {importedName, local} of properties) {
+            const owner = [...ancestors].reverse().find(scope => bindings(scope, local).has(local.name));
+            if (!owner) continue;
+            if (!destructuredImports.has(local.name)) destructuredImports.set(local.name, new Map());
+            destructuredImports.get(local.name).set(owner, {...metadata, importedName,
+              receiverSemantics: "unbound-destructured-import-value"});
+          }
+        }
       }
     });
     // Alias discovery may overapproximate reachability, never the target proof.
@@ -346,6 +369,14 @@ export function specializeNumericModule(
       }
     }
   }
+  const destructuredCalls = new Map();
+  if (destructuredImports.size) walk.fullAncestor(ast, (call, _state, ancestors) => {
+    if (call.type !== "CallExpression" || call.optional || call.callee.type !== "Identifier" ||
+        !destructuredImports.has(call.callee.name)) return;
+    const owner = [...ancestors].reverse().find(scope => bindings(scope, call.callee).has(call.callee.name));
+    const binding = destructuredImports.get(call.callee.name).get(owner);
+    if (binding) destructuredCalls.set(call, binding);
+  });
   // Hoisted declarations are initialized throughout module evaluation. Const
   // helpers need a later registration point: until all reachable initializers
   // execute, an undefined token retains the original call and its TDZ behavior.
@@ -442,7 +473,7 @@ export function specializeNumericModule(
     // spend a second root on a private expression used only by that graph.
     const nativeRegions = expressionRoot ? report.candidates.filter(item => item.route === "guarded-numeric-wasm")
       .flatMap(item => [item.sourceSpan, ...(item.scalarHelpers ?? []).map(helper => helper.sourceSpan)]) : [];
-    const sites = calls.filter(call => call.callee.name === name &&
+    const sites = calls.filter(call => call.callee.name === name && !destructuredCalls.has(call) &&
       !nativeRegions.some(region => region && inside(region, call)));
     // Uncalled delegating wrappers offer no route in local-call mode. Avoid
     // adding irrelevant candidates solely because one of their callees loops.
@@ -739,18 +770,25 @@ export function specializeNumericModule(
     runtimeImports.push(...planned.runtimeImports);
   }
   if (crossModule) {
-    const sites = calls.filter(call => importedBindings.has(call.callee.name) &&
-      !preservedSourceRegions.some(region => region && inside(region, call)));
+    const selectedCalls = new Map(calls.filter(call => importedBindings.has(call.callee.name) &&
+      !preservedSourceRegions.some(region => region && inside(region, call)))
+      .map(call => [call, importedBindings.get(call.callee.name)]));
+    for (const [call, binding] of destructuredCalls) {
+      if (!preservedSourceRegions.some(region => region && inside(region, call)) &&
+          !edits.some(edit => edit.start <= call.start && edit.end >= call.end))
+        selectedCalls.set(call, binding);
+    }
+    const sites = [...selectedCalls];
     if (sites.length) {
       const importedDispatchName = fresh("imported_dispatch"), helperName = fresh("imported_call");
       runtimeImports.push(`dispatchImportedNumericCall as ${importedDispatchName}`);
       helpers.push(`function ${helperName}(callee, ...args) { return ${importedDispatchName}(callee, args); }`);
-      for (const call of sites) {
+      for (const [call, binding] of sites) {
         edits.push({ start: call.callee.start, end: call.callee.end, text: helperName });
         const pos = callParen(call);
         edits.push({ start: pos, end: pos, text: `${source.slice(call.callee.start, call.callee.end)},` });
         report.importedCalls.push({
-          ...importedBindings.get(call.callee.name), localName: call.callee.name,
+          ...binding, localName: call.callee.name,
           sourceSpan: span(call), route: "shared-identity-lookup-with-retained-fallback",
         });
       }

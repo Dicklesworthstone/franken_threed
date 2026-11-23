@@ -107,6 +107,26 @@ exceptions. Native admission uses the resulting function identity. Registry
 misses and every guard failure retain the selected function and actual receiver,
 including when an argument replaces the receiver's method.
 
+Immutable destructured imports can use the same shared producer:
+
+```js
+export async function loadSimulation(preview) {
+  const { integrate: step, fallback = step } =
+    await import(preview ? './preview.mjs' : './simulation.mjs');
+  return (positions, velocity, dt) => step(positions, velocity, dt);
+}
+```
+
+This accepts shallow `const` object patterns with fixed named or string-literal
+keys, aliases and defaults. The original destructuring retains getter/default
+evaluation, initialization order and exceptions, even for arbitrary then-export
+values. Direct calls preserve the selected function and their undefined receiver;
+they do not reread the module property. A later export/property change therefore
+does not replace an already initialized destructured binding. Native function
+identity, lexical shadowing and temporal-dead-zone checks remain mandatory.
+The same path works in emitted module workers, including relocated output and
+the original JavaScript fallback when Wasm is unavailable or a budget is exhausted.
+
 Native type selection and all existing ownership, bounds, Math, alias, scalar,
 and transaction guards still apply on every invocation. Same-type aliases use
 ordered shared scratch storage. Late bounds failures and exhausted native work
@@ -149,7 +169,7 @@ Only direct, nonoptional calls through named/default imports, proven static
 namespace imports or the immutable awaited-import bindings above are rewritten.
 Arbitrary object methods, dynamic member names, optional calls, constructors,
 tagged calls and indirect callback invocation remain JavaScript. Mutable
-awaited-import bindings, destructured imports, import promise callbacks and
+awaited-import bindings, nested/rest/dynamic-key destructuring, import promise callbacks and
 direct `(await import(...)).method(...)` expressions remain outside this proof.
 Uninstrumented outside callers still call the original function normally.
 

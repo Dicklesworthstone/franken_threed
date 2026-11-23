@@ -321,10 +321,165 @@ test('then-export import values preserve proxy reads, selected callees, receiver
   assert.equal(files.reports['consumer.mjs'].importedCalls.length,5);
 });
 
+test('destructured awaited exports retain aliases, defaults and closures while sharing native producers',async()=>{
+  const files=graph({
+    'state.mjs':`export let evaluations=0;export function enter(){evaluations++;}`,
+    'producer.mjs':`import {enter} from './state.mjs';enter();${UPDATE}
+      export {advance,advance as default,advance as 'advance vertices'};
+      export function context(...args){return [this,args];}`,
+    'bridge.mjs':`export * from './producer.mjs';export {default} from './producer.mjs';`,
+    'consumer.mjs':`import * as state from './state.mjs';export {state};
+      export async function load(bridge,events){events.push('before');
+        const {advance:step,default:second=step,['advance vertices']:third,context:contextCall}=
+          await import((events.push('select'),bridge?'./bridge.mjs':'./producer.mjs'));
+        events.push('resumed');return {step,second,third,
+          frame(out,input,dt){step(out,input,dt);second(out,input,dt);third(out,input,dt);},
+          context(...args){return contextCall(...args);}};
+      }`,
+    'top.mjs':`const {advance:step}=await import('./producer.mjs');export {step};
+      export function frame(out,input,dt){return step(out,input,dt);}`,
+  });
+  const consumer=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  assert.equal(consumer.state.evaluations,0);let producer;
+  for(const bridge of [false,true]) {
+    const events=[],expectedEvents=[];
+    const pending=consumer.load(bridge,events),referencePending=original.load(bridge,expectedEvents);
+    events.push('caller');expectedEvents.push('caller');
+    const app=await pending,reference=await referencePending;
+    assert.deepEqual(events,['before','select','caller','resumed']);assert.deepEqual(events,expectedEvents);
+    producer??=app.step;
+    assert.equal(app.step,producer);assert.equal(app.second,producer);assert.equal(app.third,producer);
+    assert.equal(app.step.toString(),reference.step.toString());
+    if(!bridge)assert.equal(diagnostics(producer).initialized,false);
+    for(const Type of [Float32Array,Float64Array]) {
+      const values=new Type([1,2,3,4,5]),expected=values.slice();
+      app.frame(values.subarray(1),values.subarray(0,4),0.5);
+      reference.frame(expected.subarray(1),expected.subarray(0,4),0.5);
+      assert.deepEqual(values,expected);
+    }
+    const marker={},actual=app.context(marker,7),expected=reference.context(marker,7);
+    assert.equal(actual[0],undefined);assert.deepEqual(actual,expected);assert.equal(actual[1][0],marker);
+  }
+  const top=await files.load('top.mjs'),reference=await files.original('top.mjs');
+  const out=new Float64Array([1]),expected=out.slice(),input=new Float64Array([2]);
+  top.frame(out,input,3);reference.frame(expected,input,3);
+  assert.deepEqual(out,expected);assert.equal(top.step,producer);assert.equal(calls(producer),13);
+  assert.equal(consumer.state.evaluations,1);assert.equal(original.state.evaluations,1);
+  const sites=files.reports['consumer.mjs'].importedCalls;
+  assert.equal(sites.length,4);
+  assert.ok(sites.every(site=>site.receiverSemantics==='unbound-destructured-import-value'&&site.moduleSpecifier===null));
+  assert.equal(files.reports['top.mjs'].importedCalls[0].moduleSpecifier,'./producer.mjs');
+});
+
+test('destructured then-export values evaluate getters and defaults once, retaining exact unbound fallback',async()=>{
+  const files=graph({
+    'producer.mjs':SUM,
+    'state.mjs':`export const events=[],failure={kind:'getter'};export let replacement;
+      export function replace(value){replacement=value;}`,
+    'thenable.mjs':`import {sum} from './producer.mjs';import {events,failure,replacement} from './state.mjs';
+      export function then(resolve){resolve(new Proxy({}, {get(target,key){
+        if(key==='then')return undefined;events.push('get:'+key);
+        if(key==='run')return replacement??sum;
+        if(key==='context')return function(...args){return [this,args];};
+        if(key==='explode')throw failure;
+      }}));}`,
+    'null.mjs':`export function then(resolve){resolve(null);}`,
+    'consumer.mjs':`import * as state from './state.mjs';export {state};
+      export async function load(){
+        const {run:step,missing:alternate=(state.events.push('default'),step),context:contextCall}=
+          await import('./thenable.mjs');
+        return {step,frame(n){return step((state.events.push('argument'),n));},
+          defaults(n){return alternate(n);},context(...args){return contextCall(...args);},
+          failedArgument(produce){return step(produce());}};
+      }
+      export async function failed(){const {explode:step}=await import('./thenable.mjs');return step(3);}
+      export async function defaultTdz(){const {missing:step=late,run:late}=await import('./thenable.mjs');return step(3);}
+      export async function nullValue(){const {run:step}=await import('./null.mjs');return step(3);}`,
+  });
+  const consumer=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  const app=await consumer.load(),reference=await original.load();
+  assert.deepEqual(consumer.state.events,['get:run','get:missing','default','get:context']);
+  assert.deepEqual(consumer.state.events,original.state.events);
+  consumer.state.replace(()=>99);original.state.replace(()=>99);
+  assert.equal(app.frame(3),reference.frame(3));assert.equal(app.defaults(4),reference.defaults(4));
+  assert.equal(calls(app.step),2,'the destructured original stays selected after the property changes');
+  assert.deepEqual(app.context(5),[undefined,[5]]);assert.deepEqual(app.context(5),reference.context(5));
+  const marker={kind:'argument'};
+  assert.throws(()=>app.failedArgument(()=>{throw marker;}),error=>error===marker);
+  assert.throws(()=>reference.failedArgument(()=>{throw marker;}),error=>error===marker);
+  assert.equal(calls(app.step),2);
+  const replacement=function(...args){assert.equal(this,undefined);return [marker,args];};
+  consumer.state.replace(replacement);original.state.replace(replacement);
+  const replaced=await consumer.load(),referenceReplaced=await original.load();
+  assert.equal(replaced.step,replacement);assert.deepEqual(replaced.frame(7),referenceReplaced.frame(7));
+  assert.deepEqual(consumer.state.events,original.state.events);
+  for(const target of [consumer,original]) {
+    await assert.rejects(target.failed(),error=>error===target.state.failure);
+    await assert.rejects(target.defaultTdz(),ReferenceError);
+    await assert.rejects(target.nullValue(),TypeError);
+  }
+  assert.deepEqual(consumer.state.events,original.state.events);
+});
+
+test('destructured import dispatch respects lexical shadowing, TDZ and unsupported binding shapes',async()=>{
+  const files=graph({
+    'producer.mjs':SUM,
+    'consumer.mjs':`const {sum:step}=await import('./producer.mjs');export {step};
+      export function parameter(value=step(3)){var step;return value;}
+      export function discriminant(n){switch(step(n)){case 6:const step=0;return 6;default:return 0;}}
+      export async function nested(n){const {sum:step}=await import('./producer.mjs');return ()=>step(n);}
+      export async function header(n){for(const {sum:step}=await import('./producer.mjs');;)return step(n);}
+      export function shadow(step,n){return step(n);}
+      export function caught(value){try{throw value;}catch(step){return step(3);}}
+      export function hoisted(){if(false){var step;}return step(3);}
+      export async function mutable(n){let {sum:step}=await import('./producer.mjs');return step(n);}
+      export async function optional(n){const {sum:step}=await import('./producer.mjs');return step?.(n);}
+      export async function rest(n){const {sum:step,...other}=await import('./producer.mjs');return step(n);}
+      export async function computed(key,n){const {[key]:step}=await import('./producer.mjs');return step(n);}
+      export async function tdz(events){try{return step((events.push('argument'),3));}
+        finally{events.push('finally');}const {sum:step}=await import('./producer.mjs');}`,
+  });
+  const app=await files.load('consumer.mjs'),reference=await files.original('consumer.mjs');
+  assert.equal(app.parameter(),reference.parameter());assert.equal(app.discriminant(3),reference.discriminant(3));
+  assert.equal((await app.nested(3))(),(await reference.nested(3))());
+  assert.equal(await app.header(3),await reference.header(3));assert.equal(calls(app.step),4);
+  for(const name of ['shadow','caught','hoisted','mutable','optional','rest','computed'])
+    assert.equal(app[name].toString(),reference[name].toString(),name+' must retain original calls');
+  assert.equal(app.shadow(n=>n+1,3),4);assert.equal(app.caught(n=>n*2),6);
+  assert.throws(()=>app.hoisted(),TypeError);assert.throws(()=>reference.hoisted(),TypeError);
+  for(const name of ['mutable','optional','rest'])assert.equal(await app[name](3),await reference[name](3));
+  assert.equal(await app.computed('sum',3),await reference.computed('sum',3));
+  for(const target of [app,reference]) {
+    const events=[];await assert.rejects(target.tdz(events),ReferenceError);assert.deepEqual(events,['finally']);
+  }
+  assert.equal(calls(app.step),4);assert.equal(files.reports['consumer.mjs'].importedCalls.length,5);
+});
+
+test('destructured bindings shadow static imports without duplicate call edits',async()=>{
+  const files=graph({
+    'producer.mjs':SUM,
+    'local.mjs':`export function sum(n){let total=0;while(n>0){total+=n*2;n--;}return total;}`,
+    'consumer.mjs':`import {sum as step} from './local.mjs';export {step};
+      export const events=[];export function local(n){events.push(n);return step(n);}
+      export async function load(){const {sum:step}=await import('./producer.mjs');
+        return {step,run(n){return step(n);}};}`,
+  });
+  const consumer=await files.load('consumer.mjs'),original=await files.original('consumer.mjs');
+  const app=await consumer.load(),reference=await original.load();
+  assert.notEqual(app.step,consumer.step);
+  assert.equal(app.run(4),reference.run(4));assert.equal(app.run(4),10);
+  assert.equal(calls(app.step),2);assert.equal(calls(consumer.step),0);
+  assert.equal(consumer.local(4),original.local(4));assert.equal(consumer.local(4),20);
+  assert.equal(calls(app.step),2);assert.equal(calls(consumer.step),2);
+  assert.equal(files.reports['consumer.mjs'].importedCalls.length,2);
+  assert.equal(consumer.step.toString(),original.step.toString());
+});
+
 test('ordinary lazy builds relocate after namespace normalization and retain no-Wasm execution',async()=>{
   const files=graph({
     'producer.mjs':`${UPDATE}export {advance};`,
-    'frame.mjs':`import * as kernels from './producer.mjs';export function frame(out,input,dt){kernels.advance(out,input,dt);}`,
+    'frame.mjs':`import * as kernels from './producer.mjs';export let frames=0;
+      export function frame(out,input,dt){frames++;kernels.advance(out,input,dt);}`,
     'entry.mjs':`export const load=()=>import('./frame.mjs');`,
   });
   const source=path.join(files.root,'original'),output=path.join(files.root,'build');
@@ -347,13 +502,14 @@ test('ordinary lazy builds relocate after namespace normalization and retain no-
       for(let frame=0;frame<4;frame++){
         app.frame(a,input,1/60);reference.frame(expected,input.slice(),1/60);assert.deepEqual(a,expected);
       }
+      assert.equal(app.frames,4);assert.equal(app.frames,reference.frames);
       assert.equal(calls,${wasm?4:0});
     `],{encoding:'utf8',timeout:20000});
     assert.equal(execution.status,0,execution.stderr);
   }
 });
 
-test('bounded imported module choices dispatch awaited kernels after relocation with cold no-Wasm fallback',async()=>{
+for(const destructured of [false,true])test(`bounded module choices dispatch ${destructured?'destructured':'namespace'} awaited kernels after relocation with cold no-Wasm fallback`,async()=>{
   const files=graph({
     'routes.mjs':`export const primary='./primary.mjs';export default './secondary.mjs';`,
     'state.mjs':`export let evaluations=0;export function enter(){evaluations++;}`,
@@ -364,8 +520,8 @@ test('bounded imported module choices dispatch awaited kernels after relocation 
     'entry.mjs':`
       import secondary,{primary} from './routes.mjs';import * as state from './state.mjs';export {state};
       export async function frame(alternate,out,input,events){
-        events.push('before');const kernels=await import((events.push('select'),alternate?secondary:primary));
-        events.push('resumed');kernels.advance(out,input,kernels.gain);return kernels;
+        events.push('before');const ${destructured?'{advance,gain}':'kernels'}=await import((events.push('select'),alternate?secondary:primary));
+        events.push('resumed');${destructured?'advance(out,input,gain);return {advance};':'kernels.advance(out,input,kernels.gain);return kernels;'}
       }`,
   });
   const source=path.join(files.root,'original'),output=path.join(files.root,'build');
