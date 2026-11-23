@@ -697,7 +697,7 @@ function createThreeCompute(renderer, three) {
  * Before init(), source preparation follows upstream's asynchronous boundary. */
 export function withThreeCompute(Base, THREE) {
   Base = withStorageTextureCopies(Base);
-  const owners = new WeakMap();
+  const owners = new WeakMap(), computeCompletions = new WeakMap();
   const owner = renderer => {
     let value = owners.get(renderer);
     if (!value) { value = createThreeCompute(renderer, THREE); owners.set(renderer, value); }
@@ -862,6 +862,7 @@ export function withThreeCompute(Base, THREE) {
       if (this._isDeviceLost === true) return;
       check(this);
       assertThreeNativeComputeOutsideCapture(this);
+      const initialized = this._initialized, completion = computeCompletions.get(this);
       const list = listOf(nodes), size = Array.isArray(dispatchSize) ? dispatchSize.slice() : dispatchSize;
       const run = () => owner(this).compute(nodes, list, size, (issue, asynchronous) => submit(this, issue, asynchronous, true),
         () => this._computeTurn ? !!this._computeTurn.pending : !!(this._drain || this._preparing));
@@ -879,10 +880,27 @@ export function withThreeCompute(Base, THREE) {
           throw error;
         } finally { this._computeTurn = previous; }
       }, true, true);
+      if (completion) completion.pending = result;
       result?.catch(error => { this._deferredError ??= error; });
-      return result;
+      // The initialized source API is synchronous even when F3D must wait for
+      // an earlier render. Only the pre-init source call returns a Promise.
+      return initialized ? undefined : result;
     }
-    async computeAsync(nodes, dispatchSize = null) { await this.compute(nodes, dispatchSize); }
+    async computeAsync(nodes, dispatchSize = null) {
+      // Keep the public override call while observing its exact internal
+      // submission. Waiting for the whole renderer FIFO would also join later
+      // unrelated work. Restore the observer before yielding, including across
+      // nested computeAsync calls made by source initialization/update hooks.
+      const previous = computeCompletions.get(this), completion = {};
+      computeCompletions.set(this, completion);
+      let result;
+      try { result = this.compute(nodes, dispatchSize); }
+      finally {
+        if (previous) computeCompletions.set(this, previous);
+        else computeCompletions.delete(this);
+      }
+      await (result === undefined ? completion.pending : result);
+    }
     async compileComputeAsync(nodes, onProgress = null) {
       if (this._isDeviceLost === true) return;
       // Compilation can defer its resource capture until after the callback's

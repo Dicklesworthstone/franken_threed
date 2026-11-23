@@ -144,6 +144,94 @@ test('queued callback kernels retain per-call uniforms and storage consumers in 
   assert.equal(f.renderer._nodeCaptureBytes, 0);
 });
 
+test('initialized callback compute keeps the source undefined return value while submission is queued', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4'), results = [];
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('sync-callback-result');
+  f.material.colorNode = values.element(0).xyz;
+  f.object.onBeforeRender = () => results.push(f.renderer.compute(kernel));
+  t.after(() => kernel.dispose()); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera); f.renderer.render(f.scene, f.camera);
+  await drain(f.renderer);
+  assert.deepEqual(results, [undefined, undefined], 'internal preparation cannot change source callback control flow');
+  assert.equal(f.computes.length, 2); assert.equal(draws(f).length, 2);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('computeAsync keeps public overrides and waits for its submission without joining later rendering', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('async-call');
+  f.material.colorNode = N.vec3(.5);
+  const laterScene = new T.Scene(), laterMaterial = new T.MeshBasicNodeMaterial();
+  laterMaterial.colorNode = N.vec3(.25, .5, .75);
+  const laterObject = new T.Mesh(f.object.geometry, laterMaterial); laterObject.frustumCulled = false; laterScene.add(laterObject);
+  let releaseEarlier, enteredEarlier, release, entered, completed = false, calls = 0;
+  const earlierHeld = new Promise(resolve => { releaseEarlier = resolve; });
+  const earlierPreparing = new Promise(resolve => { enteredEarlier = resolve; });
+  const held = new Promise(resolve => { release = resolve; }), preparing = new Promise(resolve => { entered = resolve; });
+  t.after(() => { releaseEarlier(); release(); kernel.dispose(); laterMaterial.dispose(); });
+  await f.renderer.init();
+  const prepare = f.renderer._prepare;
+  f.renderer._prepare = function(destination, request) {
+    if (request?.scene === f.scene) {
+      enteredEarlier(); return earlierHeld.then(() => prepare.call(this, destination, request));
+    }
+    if (request?.scene === laterScene) {
+      entered(); return held.then(() => prepare.call(this, destination, request));
+    }
+    return prepare.call(this, destination, request);
+  };
+  const compute = f.renderer.compute;
+  f.renderer.compute = function(node, size) {
+    calls++; assert.equal(this, f.renderer); assert.equal(node, kernel);
+    const result = compute.call(this, node, size);
+    assert.equal(result, undefined); return result;
+  };
+  f.renderer.render(f.scene, f.camera);
+  const task = f.renderer.computeAsync(kernel); task.then(() => { completed = true; });
+  f.renderer.render(laterScene, f.camera);
+  await earlierPreparing; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, false, 'computeAsync must wait for its own queued submission');
+  assert.equal(f.computes.length, 0); releaseEarlier();
+  await preparing; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(completed, true, 'later rendering preparation cannot extend this compute call');
+  await task; assert.equal(calls, 1); assert.equal(f.computes.length, 1);
+  assert.deepEqual(f.events, ['render', 'async-call']);
+  release(); await drain(f.renderer);
+  assert.deepEqual(f.events, ['render', 'async-call', 'render']);
+  assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
+test('pre-init compute retains its source Promise and completes its accepted dispatch', async t => {
+  const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
+  const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('before-init');
+  t.after(() => kernel.dispose());
+  const pending = f.renderer.compute(kernel);
+  assert.ok(pending instanceof Promise); assert.equal(f.computes.length, 0);
+  await pending; await drain(f.renderer);
+  assert.equal(f.renderer._initialized, true); assert.deepEqual(f.events, ['before-init']);
+});
+
+test('nested async compute and a caught capture failure retain the outer submission completion', async t => {
+  const f = fixture(t, {background: false}); f.material.colorNode = N.vec3(.5);
+  const create = name => {
+    const values = N.instancedArray(1, 'vec4');
+    return N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName(name);
+  };
+  const child = create('nested-child'), invalid = create('nested-invalid'), outer = create('nested-outer');
+  let childTask, failedTask;
+  outer.onInit(() => {
+    failedTask = f.renderer.computeAsync(invalid, -1); failedTask.catch(() => {});
+    childTask = f.renderer.computeAsync(child);
+  });
+  t.after(() => { child.dispose(); invalid.dispose(); outer.dispose(); }); await f.renderer.init();
+  f.renderer.render(f.scene, f.camera);
+  await f.renderer.computeAsync(outer);
+  assert.deepEqual(f.events, ['render', 'nested-child', 'nested-outer']);
+  await childTask; await assert.rejects(failedTask, {code: 'THREE_COMPUTE_DISPATCH'});
+  assert.equal(f.renderer.compute(child), undefined); await drain(f.renderer);
+  assert.equal(f.events.at(-1), 'nested-child'); assert.equal(f.renderer._nodeCaptureBytes, 0);
+});
+
 test('accepted callback compute remains submitted when a later object callback throws', async t => {
   const f = fixture(t, {background: false}), values = N.instancedArray(1, 'vec4');
   const kernel = N.Fn(() => { values.element(0).assign(N.vec4(.25)); })().compute(1).setName('accepted-callback');

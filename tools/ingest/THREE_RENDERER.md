@@ -486,15 +486,21 @@ Calling that asynchronous preparation method inside an object callback remains
 refused because its resource capture may happen after the parent scope ends.
 Nested texture writes retain their existing restriction.
 
-The focused guards are covered by
-`node --test tools/ingest/three_node_capture.test.mjs`; 16 checks passed against
-the actual capture module in an independent V8 execution environment. Nine
-recording-device integration cases were added to
-`three_renderer_geometry_compute.test.mjs`, and
+Once initialized, `compute()` preserves the source's synchronous `undefined`
+return value, including when earlier rendering defers its submission.
+`computeAsync()` still observes its own submission and public `compute()`
+override without waiting for unrelated rendering queued afterward. A compute
+call before initialization retains its source Promise.
+
+The focused guards and recording-device integration cases pass under Node:
+`node --test tools/ingest/three_node_capture.test.mjs
+tools/ingest/three_renderer_geometry_compute.test.mjs`. They cover same-draw
+storage production, independent later dispatches, captured uniform versions,
+submission order, callback exceptions, and resource-overlap refusals.
 `node tests/e2e/webgpu_renderer/native_callback_compute.mjs` reuses the pinned
-source/candidate pixel runner with exact GPU storage readbacks. Those integration
-and browser checks were not run because the execution environment disconnected.
-No browser parity or acceleration claim is established by the guard checks.
+source/candidate pixel runner with exact GPU storage readbacks. Browser parity
+remains unverified: the available Chromium launcher has no executable behind
+it. Recording-device checks do not establish browser parity or acceleration.
 
 ## Native Scene lifecycle
 
