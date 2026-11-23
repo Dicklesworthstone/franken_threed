@@ -10,6 +10,7 @@
 
 import { IngestionParseError } from "./types.mjs";
 import { normalizeDocumentRoot, resolveDocumentUrl } from "./document_urls.mjs";
+import { normalizeSpecifierKey } from "./resolver.mjs";
 
 /**
  * Strips HTML comments while preserving characters and newlines
@@ -101,6 +102,50 @@ export function parseTagAttributes(attrString) {
   return attrs;
 }
 
+// Normalize identities before merging separate import maps. Keep original keys
+// and addresses for the resolver's prefix diagnostics and document-root checks.
+// Within one map, later equivalent keys still win; across maps, existing rules
+// (including blocked addresses) cannot be replaced by a later registration.
+function mergeSpecifierMaps(previous, incoming, baseUrl, documentRoot) {
+  if (Object.keys(previous).length === 0) return {...incoming};
+  const defined = new Set(Object.keys(previous).map(key =>
+    normalizeSpecifierKey(key, baseUrl, documentRoot)).filter(key => key !== null));
+  const additions = Object.entries(incoming).filter(([key]) => {
+    const normalized = normalizeSpecifierKey(key, baseUrl, documentRoot);
+    return normalized !== null && !defined.has(normalized);
+  });
+  return {...previous, ...Object.fromEntries(additions)};
+}
+
+function mergeScopeMaps(previous, incoming, baseUrl, documentRoot) {
+  // The resolver already normalizes a single map. Preserve its source shape,
+  // including the last scope when two spellings normalize to the same URL.
+  if (Object.keys(previous).length === 0) return {...incoming};
+  const normalizedScopes = scopes => {
+    const result = new Map();
+    for (const [prefix, entries] of Object.entries(scopes)) {
+      let url;
+      try { url = resolveDocumentUrl(prefix, baseUrl, documentRoot); }
+      catch (error) {
+        if (error.code?.startsWith("F3D_DOCUMENT_")) throw error;
+        continue;
+      }
+      result.set(url, {prefix, entries});
+    }
+    return result;
+  };
+  const existing = normalizedScopes(previous), result = {...previous};
+  for (const [url, {prefix, entries}] of normalizedScopes(incoming)) {
+    const old = existing.get(url);
+    // Define an own data property even for a scope literally named __proto__.
+    Object.defineProperty(result, old?.prefix ?? prefix, {
+      value: old ? mergeSpecifierMaps(old.entries, entries, baseUrl, documentRoot) : entries,
+      enumerable: true, configurable: true, writable: true,
+    });
+  }
+  return result;
+}
+
 /**
  * @typedef {Object} ModuleScriptEntry
  * @property {string} id - Canonical module URL or synthetic URL for inline scripts
@@ -189,10 +234,10 @@ export function parseHtmlEntries(rawHtmlContent, documentUrl, options = {}) {
       try {
         const parsed = JSON.parse(rawScriptBody.trim());
         if (parsed.imports && typeof parsed.imports === "object") {
-          importMap.imports = { ...importMap.imports, ...parsed.imports };
+          importMap.imports = mergeSpecifierMaps(importMap.imports, parsed.imports, effectiveBaseUrl, documentRoot);
         }
         if (parsed.scopes && typeof parsed.scopes === "object") {
-          importMap.scopes = { ...importMap.scopes, ...parsed.scopes };
+          importMap.scopes = mergeScopeMaps(importMap.scopes, parsed.scopes, effectiveBaseUrl, documentRoot);
         }
       } catch (err) {
         throw new IngestionParseError(

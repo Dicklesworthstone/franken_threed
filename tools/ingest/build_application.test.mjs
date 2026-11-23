@@ -2403,6 +2403,36 @@ test("extractJsModuleDependencies propagates actual parse error if neither modul
   );
 });
 
+test("buildApplication executes merged import-map routes after source and output relocation", async () => {
+  const scratch = makeScratch("f3d_app_merged_importmaps"), source = path.join(scratch, "source");
+  const output = path.join(scratch, "output"), relocated = path.join(scratch, "relocated");
+  fs.mkdirSync(path.join(source, "view"), {recursive: true});
+  const entry = path.join(source, "index.html"), viewUrl = pathToFileURL(path.join(source, "view") + path.sep).href;
+  const maps = [
+    {imports: {global: "./global.mjs"}, scopes: {"./view/": {choice: "./first.mjs"}}},
+    {imports: {global: "./wrong.mjs"}, scopes: {[viewUrl]: {choice: "./wrong.mjs", added: "./added.mjs"}}},
+  ];
+  fs.writeFileSync(entry, maps.map(value => `<script type="importmap">${JSON.stringify(value)}</script>`).join("\n") +
+    '\n<script type="module" src="./view/main.mjs"></script>');
+  fs.writeFileSync(path.join(source, "view/main.mjs"), `import * as chosen from 'choice';
+    import global from 'global'; import added from 'added';
+    export const result = [chosen.value, global, added];
+    export async function update() { const again = await import('choice'); again.increment();
+      return {same:again===chosen, value:chosen.value}; }`);
+  fs.writeFileSync(path.join(source, "first.mjs"), 'export let value=7; export function increment(){value++;}');
+  fs.writeFileSync(path.join(source, "global.mjs"), 'export default "global-first";');
+  fs.writeFileSync(path.join(source, "added.mjs"), 'export default "scope-added";');
+  fs.writeFileSync(path.join(source, "wrong.mjs"), 'throw new Error("Later import map replaced an existing rule");');
+  const graph = await buildModuleGraph(entry);
+  assert.equal(Object.keys(graph.modules).some(url => url.endsWith("/wrong.mjs")), false);
+  const built = await buildApplication(entry, output);
+  fs.renameSync(source, path.join(scratch, "source-unavailable"));
+  fs.renameSync(output, relocated);
+  const app = await import(pathToFileURL(path.join(relocated, built.entryFiles[0])).href);
+  assert.deepEqual(app.result, [7, "global-first", "scope-added"]);
+  assert.deepEqual(await app.update(), {same:true, value:8});
+});
+
 test("buildApplication preserves importmap verbatim alongside classic scripts with dynamic import", async () => {
   const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
   const scratch = makeScratch("f3d_app_importmap_classic");

@@ -114,7 +114,7 @@ function matchImportMap(specifier, referrerUrl, importMap, mapBaseUrl, documentR
  * @param {string} mapBaseUrl
  * @returns {string | null}
  */
-function normalizeSpecifierKey(key, mapBaseUrl, documentRoot) {
+export function normalizeSpecifierKey(key, mapBaseUrl, documentRoot) {
   if (key === "") return null;
   if (key.startsWith("/") || key.startsWith("./") || key.startsWith("../")) {
     try {

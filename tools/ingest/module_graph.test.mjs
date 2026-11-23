@@ -109,6 +109,92 @@ test("Import-map scope matching uses normalized priority and exact or directory 
   );
 });
 
+test("HTML import maps keep earlier mappings and merge later scope entries", () => {
+  const base = "https://example.com/app/index.html";
+  const first = {imports: {lib: "./first.js", retained: "./retained.js"},
+    scopes: {"./views/": {lib: "./scoped.js", retained: "./scope-retained.js"}}};
+  const second = {imports: {lib: "./wrong.js", added: "./added.js"},
+    scopes: {"./views/": {lib: "./wrong-scoped.js", added: "./scope-added.js"}}};
+  const parsed = parseHtmlEntries([first, second].map(value =>
+    `<script type="importmap">${JSON.stringify(value)}</script>`).join("\n"), base);
+  const resolve = (name, referrer = base) => resolveModuleSpecifier(name, referrer,
+    parsed.importMap, {mapBaseUrl: parsed.baseUrl});
+  assert.equal(resolve("lib"), new URL("./first.js", base).href);
+  assert.equal(resolve("retained"), new URL("./retained.js", base).href);
+  assert.equal(resolve("added"), new URL("./added.js", base).href);
+  const view = new URL("./views/main.js", base).href;
+  assert.equal(resolve("lib", view), new URL("./scoped.js", base).href);
+  assert.equal(resolve("retained", view), new URL("./scope-retained.js", base).href);
+  assert.equal(resolve("added", view), new URL("./scope-added.js", base).href);
+});
+
+test("HTML import-map merging compares normalized keys without changing single-map precedence", () => {
+  const base = "https://example.com/app/index.html";
+  const relative = "./views/../entry.js", absolute = "HTTPS://EXAMPLE.COM:443/app/entry.js";
+  const parseMaps = maps => parseHtmlEntries(maps.map(value =>
+    `<script type="importmap">${JSON.stringify(value)}</script>`).join(""), base).importMap;
+  const resolve = map => resolveModuleSpecifier("./entry.js", base, map, {mapBaseUrl: base});
+  for (const [a, b] of [[relative, absolute], [absolute, relative]]) {
+    const first = {imports: {[a]: "./first.js", [b]: "./within-first.js"}};
+    assert.deepEqual(parseMaps([first]), {...first, scopes: {}});
+    assert.equal(resolve(parseMaps([first])), new URL("./within-first.js", base).href);
+    assert.equal(resolve(parseMaps([first, {imports: {[a]: "./wrong.js"}}])),
+      new URL("./within-first.js", base).href);
+    assert.equal(resolve(parseMaps([{imports: {[a]: "./first.js"}}, {imports: {[b]: "./wrong.js"}}])),
+      new URL("./first.js", base).href);
+  }
+});
+
+test("HTML import-map scopes normalize within each map before merging across maps", () => {
+  const base = "https://example.com/app/index.html", view = "https://example.com/app/views/main.js";
+  const first = {scopes: {"./views/": {removed: "./removed.js", lib: "./wrong.js"},
+    "https://EXAMPLE.com:443/app/views/": {lib: "./first.js", retained: "./retained.js"}}};
+  const second = {scopes: {"./views/../views/": {ignored: "./ignored.js"},
+    "https://example.com/app/views/": {lib: "./wrong-later.js", added: "./added.js"}}};
+  const parseMaps = maps => parseHtmlEntries(maps.map(value =>
+    `<script type="importmap">${JSON.stringify(value)}</script>`).join(""), base).importMap;
+  assert.deepEqual(parseMaps([first]), {imports: {}, ...first});
+  const map = parseMaps([first, second]);
+  const resolve = name => resolveModuleSpecifier(name, view, map, {mapBaseUrl: base});
+  assert.equal(resolve("lib"), "https://example.com/app/first.js");
+  assert.equal(resolve("retained"), "https://example.com/app/retained.js");
+  assert.equal(resolve("added"), "https://example.com/app/added.js");
+  for (const name of ["removed", "ignored"]) assert.throws(() => resolve(name), IngestionResolutionError);
+});
+
+test("HTML import-map merging keeps null and invalid-target blocks ahead of later replacements", () => {
+  const base = "https://example.com/app/index.html";
+  const first = {imports: {blocked: null, nonstring: 4, bare: "unmapped", "prefix/": "./file.js",
+    good: "./good.js"}, scopes: {"./view/": {blocked: null}}};
+  const second = {imports: {blocked: "./later.js", nonstring: "./later.js", bare: "./later.js",
+    "prefix/": "./later/", good: null}, scopes: {"./view/": {blocked: "./later.js"}}};
+  const {importMap} = parseHtmlEntries([first, second].map(value =>
+    `<script type="importmap">${JSON.stringify(value)}</script>`).join(""), base);
+  const resolve = (name, referrer = base) => resolveModuleSpecifier(name, referrer, importMap, {mapBaseUrl: base});
+  for (const name of ["blocked", "nonstring", "bare", "prefix/child.js"])
+    assert.throws(() => resolve(name), IngestionResolutionError);
+  assert.throws(() => resolve("blocked", "https://example.com/app/view/main.js"), IngestionResolutionError);
+  assert.equal(resolve("good"), "https://example.com/app/good.js");
+});
+
+test("HTML import-map merge preserves own prototype-named mappings and ignores malformed scope URLs", () => {
+  const base = "https://example.com/app/index.html";
+  const {importMap} = parseHtmlEntries(`<script type="importmap">{
+    "imports":{"__proto__":"./first.js"},
+    "scopes":{"__proto__":{"constructor":"./scoped.js"},"https://[invalid":{"bad":"./bad.js"}}
+  }</script><script type="importmap">{
+    "imports":{"__proto__":"./wrong.js","constructor":"./added.js"},
+    "scopes":{"./__proto__":{"constructor":"./wrong.js","added":"./scope-added.js"}}
+  }</script>`, base);
+  assert.equal(Object.getPrototypeOf(importMap.imports), Object.prototype);
+  assert.equal(Object.getPrototypeOf(importMap.scopes), Object.prototype);
+  const resolve = (name, referrer = base) => resolveModuleSpecifier(name, referrer, importMap, {mapBaseUrl: base});
+  assert.equal(resolve("__proto__"), "https://example.com/app/first.js");
+  assert.equal(resolve("constructor"), "https://example.com/app/added.js");
+  assert.equal(resolve("constructor", "https://example.com/app/__proto__"), "https://example.com/app/scoped.js");
+  assert.equal(resolve("added", "https://example.com/app/__proto__"), "https://example.com/app/scope-added.js");
+});
+
 function makeScratchDir(prefix) {
   const dir = path.join(
     SCRATCH_BASE,
